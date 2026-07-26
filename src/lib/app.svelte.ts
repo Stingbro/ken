@@ -109,10 +109,8 @@ class AppStore {
   transcribeVideosOnIndex = $state(false);
 
   /** Whether the semantic (meaning-based) index is enabled for this project.
-   *  There's no getter command for this flag (see `api.setProjectFeature`),
-   *  so this is session-scoped only: it always starts `false` on project
-   *  activation and doesn't reflect a value persisted from an earlier
-   *  session. */
+   *  Persisted on the backend and read back via `api.getSemanticIndex` on
+   *  project activation (see `loadSemanticIndex`). */
   semanticIndex = $state(false);
 
   /** Live build/availability status of the semantic index, driven by the
@@ -264,14 +262,13 @@ class AppStore {
     this.scanError = null;
     this.syncState = "off";
     this.syncDetail = null;
-    // No getter for this flag (see the field doc comment) — reset to the
-    // off-by-default state on every project switch rather than carry over
-    // whatever the previously active project had.
-    this.semanticIndex = false;
+    // Live build/availability status is per-session — reset on every switch,
+    // then repopulated by the semantic-index-state event once it fires.
     this.semanticIndexState = null;
     this.loadProjectLocalState();
     void this.loadBackgroundIndex();
     void this.loadTranscribeOnIndex();
+    void this.loadSemanticIndex();
     void this.loadIgnored();
     void this.loadUnread();
     this.screen = "home";
@@ -304,10 +301,14 @@ class AppStore {
     await api.setTranscribeOnIndex(enabled);
   }
 
-  /** Toggle the semantic (meaning-based) search index. Persisted on the
-   *  backend (so ingestion honors it after a restart) but not readable back
-   *  today, so the on-screen toggle itself only reflects this session — see
-   *  the `semanticIndex` field doc comment. */
+  /** Read the persisted semantic-index preference for the open project. */
+  private async loadSemanticIndex() {
+    this.semanticIndex = await api.getSemanticIndex().catch(() => false);
+  }
+
+  /** Toggle the semantic (meaning-based) search index (persisted, so
+   *  ingestion honors it after a restart and the toggle reflects it on the
+   *  next project open). */
   async setSemanticIndex(enabled: boolean) {
     this.semanticIndex = enabled;
     if (!enabled) this.semanticIndexState = null;

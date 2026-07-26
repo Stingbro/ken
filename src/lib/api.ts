@@ -659,11 +659,12 @@ export const api = {
   getBackgroundIndex: () => invoke<boolean>("get_background_index"),
   setBackgroundIndex: (enabled: boolean) =>
     invoke<void>("set_background_index", { enabled }),
-  /** Toggle the `semanticIndex` project feature flag. There is currently no
-   *  getter command — only `set_project_feature` (write) exists, unlike the
-   *  `getBackgroundIndex`/`setBackgroundIndex` pair above — so callers can't
-   *  read back the persisted value on mount and must track it client-side
-   *  for the session (see `onSemanticIndexState` for build/availability). */
+  /// Whether the semantic (meaning-based) index is enabled for the active project.
+  getSemanticIndex: () => invoke<boolean>("get_semantic_index"),
+  /** Toggle the `semanticIndex` project feature flag. Paired with
+   *  `getSemanticIndex` above, mirroring the `getBackgroundIndex`/
+   *  `setBackgroundIndex` pair (see `onSemanticIndexState` for
+   *  build/availability updates). */
   setProjectFeature: (flag: "semanticIndex", value: boolean) =>
     invoke<void>("set_project_feature", { flag, value }),
   /// Whether videos are auto-transcribed on-device (Whisper) during indexing.

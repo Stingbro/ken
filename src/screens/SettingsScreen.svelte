@@ -320,9 +320,8 @@
       {/if}
       <p class="note">
         Finds files by what they mean, not just matching words, alongside the
-        usual keyword search. This only reflects the toggle for the current
-        visit — it can't be read back on the next app launch. Files already
-        indexed pick up semantic search on their next reindex, not instantly.
+        usual keyword search. Files already indexed pick up semantic search on
+        their next reindex, not instantly.
       </p>
     </div>
 

@@ -1307,6 +1307,20 @@ fn set_project_feature(
     apply_semantic_index_flag(&app, state.inner(), value)
 }
 
+/// Is the semantic (meaning-based) index enabled for the active project?
+/// Mirrors `get_background_index`/`get_transcribe_on_index`: reads the same
+/// `project.config.extra["semanticIndex"]` flag `set_project_feature`
+/// writes, via the `semantic_index_enabled` helper `activate()` already
+/// uses to decide whether to resume the build on open. Lets the frontend
+/// initialize the toggle from what was actually persisted instead of always
+/// starting it at `false` on project activation.
+#[tauri::command]
+fn get_semantic_index(state: State<SharedState>) -> CmdResult<bool> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    Ok(semantic_index_enabled(&active.project))
+}
+
 /// Error code the frontend matches on to offer a download instead of a
 /// failure: the file's bytes are still in the cloud.
 const CLOUD_ONLY_ERR: &str = "CLOUD_ONLY";
@@ -5524,6 +5538,7 @@ pub fn run() {
             search,
             hybrid_search,
             set_project_feature,
+            get_semantic_index,
             read_file,
             read_file_bytes,
             is_cloud_only,
