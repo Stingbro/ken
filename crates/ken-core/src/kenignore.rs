@@ -134,6 +134,26 @@ pub fn parse(text: &str) -> Vec<Rule> {
     rules
 }
 
+/// Returns the 1-based line numbers of lines that [`parse`] silently skips
+/// as malformed (a bare `~` or `!` with no pattern after it), so callers
+/// that want to surface a warning (e.g. src-tauri's `.kenignore` watcher)
+/// don't have to duplicate `parse`'s line-classification logic. Comments,
+/// blank lines, and well-formed rules (including `\~`/`\!` escapes) are
+/// never reported.
+pub fn malformed_lines(text: &str) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(i, raw_line)| {
+            let line = raw_line.trim_end();
+            if line == "~" || line == "!" {
+                Some(i + 1)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Classify `path` against one or more rule sets, folded in the given
 /// order (built-ins first, user `.kenignore` last, per D2) using
 /// gitignore's last-match-wins semantics: the last rule (across *all*

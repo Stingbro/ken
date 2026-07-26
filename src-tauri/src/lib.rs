@@ -15,9 +15,11 @@ use ken_core::db::{
     EventRow, FileRow, RunRow, SearchHit,
 };
 use ken_core::digest;
+use ken_core::embedder::Embedder;
 use ken_core::knowledge_model::{self, AutoBuildTracker};
 use ken_core::model;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
+use ken_core::kenignore;
 use ken_core::research;
 use ken_core::runner::{CancelToken, RunOutcome};
 use ken_core::hooks::HookListener;
@@ -26,6 +28,7 @@ use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, 
 use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
 use ken_core::scan::{self, ScanStats};
+use ken_core::search as hybrid_search_mod;
 use ken_core::sync::{self, SyncConfig, SyncEngine, SyncNotice};
 use ken_core::record::{self, CaptureSource, LinearResampler, RecorderState, Source};
 use ken_core::transcript;
@@ -49,6 +52,26 @@ struct ActiveProject {
     search_db: Arc<Mutex<Db>>,
     _watch: WatchHandle,
     engine: Arc<IngestEngine>,
+    /// Live on/off handle for the semantic-index build step, mirroring
+    /// `EngineConfig::semantic_embedder`. A clone of the same `Arc<Mutex<..>>`
+    /// passed into `IngestEngine::start` at activation time, kept here so
+    /// `set_project_feature("semanticIndex", ..)` and `hybrid_search` can
+    /// read/toggle it without restarting the engine (see `EngineConfig`'s
+    /// doc comment in ken-core for why this is safe to clone and mutate from
+    /// outside the engine's worker thread).
+    semantic_embedder: Arc<Mutex<Option<Box<dyn Embedder + Send>>>>,
+    /// Cancel token for an in-flight manually-triggered `rebuild_semantic_index`
+    /// call spawned by `set_project_feature("semanticIndex", true)`. `None`
+    /// when no manual build is running (recipe-triggered builds inside
+    /// `execute_ingest` use their own per-run token and aren't tracked here).
+    /// Set when the build thread is spawned, cleared when it finishes;
+    /// `set_project_feature("semanticIndex", false)` cancels it if present.
+    semantic_build_cancel: Arc<Mutex<Option<CancelToken>>>,
+    /// One-time latch for the ~50k `chunks` row-count guardrail (semantic-index
+    /// task 2.4): flips to `true` the first time the threshold is crossed so
+    /// the "large project" warning event fires once per activation, not on
+    /// every subsequent build/incremental update.
+    semantic_index_warned_large: Arc<AtomicBool>,
     chat_engine: Option<Arc<ChatEngine>>,
     /// Shared connection for chat persistence from event threads.
     chat_db: Arc<Mutex<Db>>,
@@ -69,6 +92,9 @@ struct ActiveProject {
     _ocr_worker: StopOnDrop,
     /// Stops the background cloud-hydration worker when this project closes.
     _bg_hydrate: StopOnDrop,
+    /// Stops the `.kenignore` change poller (kenignore task 2.2) when this
+    /// project closes.
+    _kenignore_watch: StopOnDrop,
     /// Live research runs: chat/session id → cancel token.
     research: Arc<Mutex<std::collections::HashMap<String, CancelToken>>>,
     /// Video transcription bookkeeping shared by the manual command and the
@@ -151,6 +177,15 @@ struct SyncStateEvent {
     detail: Option<String>,
 }
 
+/// kenignore task 2.2: emitted when the `.kenignore` poller notices a
+/// change and finds lines `ken_core::kenignore::parse` silently skips (a
+/// bare `~` or `!` with no pattern after it). 1-based line numbers.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KenignoreWarningEvent {
+    malformed_lines: Vec<usize>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TreeData {
@@ -192,6 +227,185 @@ type CmdResult<T> = Result<T, String>;
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// Payload for the `semantic-index-state` event (semantic-index task 2.3).
+/// Serializes with a `state` discriminant field so the frontend can switch
+/// on `payload.state`: `{"state":"building","done":1,"total":10}`,
+/// `{"state":"ready"}`, `{"state":"unavailable","reason":"..."}`,
+/// `{"state":"warning","reason":"..."}`.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum SemanticIndexStateEvent {
+    Building { done: usize, total: usize },
+    Ready,
+    Unavailable { reason: String },
+    /// One-time guardrail warning (semantic-index task 2.4 / spike
+    /// `S4-knn-latency.md`): distinct from `Unavailable` so the frontend
+    /// doesn't mistake "search may be slower" for "search is off".
+    Warning { reason: String },
+}
+
+/// Effective `semanticIndex` flag for a project. The proposal doc describes
+/// a "project.json `features` override > global settings" layering with a
+/// pointer to a `features/multi-project/README.md` flag mechanism, but no
+/// such file or global-settings layer exists anywhere in this codebase
+/// (confirmed by repo-wide search) — it's dangling text. The real,
+/// established convention for per-project boolean feature flags is
+/// `bg_hydrate.rs`'s `background_index_enabled`: a single flag read
+/// straight off `project.config.extra`. This mirrors that exactly, except
+/// semantic indexing needs a local embedding model and heavier background
+/// work, so — unlike `backgroundIndex` — it defaults to *off* until the
+/// user opts in via `set_project_feature`.
+fn semantic_index_enabled(project: &Project) -> bool {
+    project
+        .config
+        .extra
+        .get("semanticIndex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Build the embedder used for semantic indexing, or `None` if this build
+/// has no embedding model available. `ken-app` depends on `ken-core` with
+/// `default-features = false`, which excludes the `local-llm` feature (and
+/// with it `LlamaEmbedder`) — there is no Vulkan-capable llama.cpp backend
+/// available to this build. `FakeEmbedder` is deliberately NOT substituted
+/// here: it would silently return meaningless hash-based vectors for real
+/// search results instead of failing loudly. Callers must treat `None` as
+/// "semantic index unavailable in this build" and emit
+/// `semantic-index-state` `unavailable {reason}` rather than degrading
+/// silently.
+fn build_semantic_embedder() -> Option<Box<dyn Embedder + Send>> {
+    None
+}
+
+/// semantic-index task 2.4 / spike `S4-knn-latency.md`: once a project's
+/// `chunks` table crosses ~50k rows, KNN latency starts to degrade. This
+/// never blocks or disables search — it's a one-time, latched warning so
+/// the UI can tell the user why things feel slower. Call after each build
+/// or incremental update completes, not per search.
+const LARGE_SEMANTIC_INDEX_CHUNK_THRESHOLD: i64 = 50_000;
+
+fn maybe_warn_large_index(app: &AppHandle, db: &Db, warned: &Arc<AtomicBool>) {
+    if warned.load(Ordering::SeqCst) {
+        return;
+    }
+    let Ok(count) = db.chunk_count() else { return };
+    if count >= LARGE_SEMANTIC_INDEX_CHUNK_THRESHOLD && !warned.swap(true, Ordering::SeqCst) {
+        let _ = app.emit(
+            "semantic-index-state",
+            SemanticIndexStateEvent::Warning {
+                reason: format!(
+                    "large project ({count} chunks) — semantic search may be slower"
+                ),
+            },
+        );
+    }
+}
+
+/// Turn the semantic index on or off for the active project (semantic-index
+/// task 2.1). Mirrors `reindex`'s pattern: lock only long enough to snapshot
+/// the `Arc` handles needed, release the lock, then do the real work
+/// (background rebuild) on a detached thread with its own `Db::open` handle
+/// so the IPC thread and the global state mutex are never held for the
+/// duration of an embedding pass. Called both from `set_project_feature`
+/// and from `activate()` on project open, so a project that already had the
+/// flag on resumes without the user having to retoggle it.
+fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool) -> CmdResult<()> {
+    let (project, base, embedder_slot, cancel_slot, warned_large) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        (
+            active.project.clone(),
+            guard.base_dir.clone(),
+            active.semantic_embedder.clone(),
+            active.semantic_build_cancel.clone(),
+            active.semantic_index_warned_large.clone(),
+        )
+    };
+
+    if !enabled {
+        // Turning off: drop the live embedder (this alone stops future
+        // recipe-triggered rebuilds, since `engine.rs` only rebuilds when
+        // the slot is `Some`) and cancel any rebuild currently in flight.
+        // Existing chunk/vector tables are left in place per the proposal —
+        // toggling back on resumes rather than starting over.
+        embedder_slot.lock().unwrap().take();
+        if let Some(token) = cancel_slot.lock().unwrap().take() {
+            token.cancel();
+        }
+        return Ok(());
+    }
+
+    let Some(embedder) = build_semantic_embedder() else {
+        let _ = app.emit(
+            "semantic-index-state",
+            SemanticIndexStateEvent::Unavailable {
+                reason: "embedding model not available in this build".into(),
+            },
+        );
+        return Ok(());
+    };
+
+    // Install the live embedder so future recipe-triggered ingest runs
+    // auto-rebuild; then kick an immediate background backfill for content
+    // that was already indexed before the flag was turned on. Installing
+    // the embedder alone would only affect the *next* ingest run, which may
+    // be arbitrarily delayed.
+    *embedder_slot.lock().unwrap() = Some(embedder);
+
+    let token = CancelToken::new();
+    if let Some(old) = cancel_slot.lock().unwrap().replace(token.clone()) {
+        old.cancel();
+    }
+
+    let bg_app = app.clone();
+    let bg_embedder_slot = embedder_slot.clone();
+    std::thread::spawn(move || {
+        let mut db = match Db::open(&base, project.config.id) {
+            Ok(db) => db,
+            Err(e) => {
+                let _ = bg_app.emit(
+                    "semantic-index-state",
+                    SemanticIndexStateEvent::Unavailable { reason: e.to_string() },
+                );
+                return;
+            }
+        };
+        let mut guard = bg_embedder_slot.lock().unwrap();
+        let Some(embedder) = guard.as_deref_mut() else {
+            // Flag was turned off again before this thread got to run.
+            return;
+        };
+        let progress_app = bg_app.clone();
+        let result =
+            engine::rebuild_semantic_index(&project, &mut db, embedder, &token, |done, total| {
+                let _ = progress_app.emit(
+                    "semantic-index-state",
+                    SemanticIndexStateEvent::Building { done, total },
+                );
+            });
+        drop(guard);
+        match result {
+            Ok(true) => {
+                let _ = bg_app.emit("semantic-index-state", SemanticIndexStateEvent::Ready);
+                maybe_warn_large_index(&bg_app, &db, &warned_large);
+            }
+            Ok(false) => {
+                // Cancelled (flag toggled off mid-build) — the disable path
+                // already told the frontend, so no event here.
+            }
+            Err(e) => {
+                let _ = bg_app.emit(
+                    "semantic-index-state",
+                    SemanticIndexStateEvent::Unavailable { reason: e.to_string() },
+                );
+            }
+        }
+    });
+
+    Ok(())
 }
 
 /// Activate a project: register it, open its DB, start the watcher, and
@@ -284,12 +498,32 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     };
     let engine_app = app.clone();
     let ingest_chat_db = chat_db.clone();
+    // Live on/off handle for the semantic-index build step (semantic-index
+    // task 2.1). Cloned before being moved into `EngineConfig` so the same
+    // `Arc<Mutex<..>>` can also live on `ActiveProject`, letting
+    // `set_project_feature`/`hybrid_search` read or toggle it without
+    // restarting the engine — see `EngineConfig::semantic_embedder`'s doc
+    // comment in ken-core for why cloning the Arc (not the config) is safe.
+    let semantic_embedder: Arc<Mutex<Option<Box<dyn Embedder + Send>>>> =
+        Arc::new(Mutex::new(None));
+    let engine_semantic_embedder = semantic_embedder.clone();
+    // One-time latch for the ~50k chunk guardrail (semantic-index task 2.4).
+    // Created here (not inline in the `ActiveProject` literal below) so the
+    // same Arc can also be checked from the ingest-event closure right below,
+    // covering the recipe-triggered incremental rebuild path in addition to
+    // the manual background rebuild in `apply_semantic_index_flag`.
+    let semantic_index_warned_large = Arc::new(AtomicBool::new(false));
+    let engine_warned_large = semantic_index_warned_large.clone();
+    let engine_search_db = search_db.clone();
     let engine = Arc::new(
         IngestEngine::start(
             project.root.clone(),
             watch_db_path.clone(),
             hooks.clone(),
-            EngineConfig::default(),
+            EngineConfig {
+                semantic_embedder: engine_semantic_embedder,
+                ..EngineConfig::default()
+            },
             move |ev: IngestEvent| {
                 // Ingest runs surface as system sessions in the chat drawer.
                 if let Some(sid) = &ev.session_id {
@@ -323,6 +557,41 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                     });
                     if let Ok(Some(updated)) = db.get_chat(sid) {
                         let _ = engine_app.emit("chat-updated", updated);
+                    }
+                }
+                // The engine already drives `rebuild_semantic_index` itself
+                // for recipe-triggered runs when an embedder is installed
+                // (see `engine.rs`'s ingest step) — it has no dedicated event
+                // for that, just these two `activity` strings, so translate
+                // them into `semantic-index-state` here (semantic-index task
+                // 2.3). The explicit background rebuild in
+                // `apply_semantic_index_flag` emits the same event directly.
+                if let Some(activity) = ev.activity.as_deref() {
+                    if let Some(rest) = activity.strip_prefix("Embedding chunks: ") {
+                        if let Some((done_s, total_s)) = rest.split_once('/') {
+                            if let (Ok(done), Ok(total)) =
+                                (done_s.parse::<usize>(), total_s.parse::<usize>())
+                            {
+                                let _ = engine_app.emit(
+                                    "semantic-index-state",
+                                    SemanticIndexStateEvent::Building { done, total },
+                                );
+                                if total > 0 && done == total {
+                                    if let Ok(db) = engine_search_db.lock() {
+                                        maybe_warn_large_index(&engine_app, &db, &engine_warned_large);
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Some(reason) =
+                        activity.strip_prefix("Semantic index rebuild failed: ")
+                    {
+                        let _ = engine_app.emit(
+                            "semantic-index-state",
+                            SemanticIndexStateEvent::Unavailable {
+                                reason: reason.to_string(),
+                            },
+                        );
                     }
                 }
                 let _ = engine_app.emit("ingest-run-changed", ev);
@@ -401,6 +670,10 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
 
     let auto_knowledge = Arc::new(AutoBuildTracker::new());
 
+    // kenignore task 2.2 needs its own `Db` handle later (see the poller
+    // below), so grab a clone before `watch::start` moves `watch_db_path`.
+    let kenignore_db_path = watch_db_path.clone();
+
     let emit_app = app.clone();
     let watch_engine = engine.clone();
     let watch_sync = sync_engine.clone();
@@ -424,6 +697,65 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     )
     .map_err(err)?;
 
+    // kenignore task 2.2: `watch::start` above deliberately never fires for
+    // `.kenignore` itself — `relevant_path` in ken-core's `watch.rs` filters
+    // out any path component starting with `.` (the same rule that skips
+    // `.git`, editor swap files, etc.), and narrowing that shared filter
+    // just for this one file risks un-filtering something else. So this is
+    // a second, much narrower poller: every 2s, check whether `.kenignore`
+    // changed (mtime+len), and if so re-scan.
+    //
+    // Tier-transition diffing for pre-existing, untouched files (ken-core
+    // task 1.6) isn't implemented yet, so this covers the feasible subset
+    // only: `scan::scan` re-reads `.kenignore` fresh (via
+    // `Project::kenignore_rules`, which always reads from disk) and applies
+    // the new rules to every file it walks from this point on. Files that
+    // already have a DB row and aren't otherwise touched keep their old
+    // tier until they're next modified or a manual `reindex` runs.
+    let kenignore_stop = Arc::new(AtomicBool::new(false));
+    {
+        let kenignore_path = project.root.join(".kenignore");
+        let db_path = kenignore_db_path;
+        let poll_project = project.clone();
+        let emit_app = app.clone();
+        let stop = kenignore_stop.clone();
+        std::thread::spawn(move || {
+            fn snapshot(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+                let meta = std::fs::metadata(path).ok()?;
+                Some((meta.modified().ok()?, meta.len()))
+            }
+            let mut last = snapshot(&kenignore_path);
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(2));
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let current = snapshot(&kenignore_path);
+                if current == last {
+                    continue;
+                }
+                last = current;
+
+                let text = std::fs::read_to_string(&kenignore_path).unwrap_or_default();
+                let malformed = kenignore::malformed_lines(&text);
+                if !malformed.is_empty() {
+                    let _ = emit_app.emit(
+                        "kenignore-warning",
+                        KenignoreWarningEvent {
+                            malformed_lines: malformed,
+                        },
+                    );
+                }
+
+                if let Ok(mut db) = Db::open_at(&db_path) {
+                    if let Ok(stats) = scan::scan(&poll_project, &mut db) {
+                        let _ = emit_app.emit("index-updated", stats);
+                    }
+                }
+            }
+        });
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let ocr_stop = Arc::new(AtomicBool::new(false));
     let bg_stop = Arc::new(AtomicBool::new(false));
@@ -434,6 +766,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         search_db,
         _watch: watch,
         engine,
+        semantic_embedder,
+        semantic_build_cancel: Arc::new(Mutex::new(None)),
+        semantic_index_warned_large,
         chat_engine,
         chat_db,
         sync: sync_engine.clone(),
@@ -445,10 +780,20 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         _extraction_worker: StopOnDrop(stop.clone()),
         _ocr_worker: StopOnDrop(ocr_stop.clone()),
         _bg_hydrate: StopOnDrop(bg_stop.clone()),
+        _kenignore_watch: StopOnDrop(kenignore_stop.clone()),
         research: Arc::new(Mutex::new(std::collections::HashMap::new())),
         transcripts: Arc::new(Mutex::new(TranscriptJobs::default())),
     });
     drop(guard);
+
+    // semantic-index task 2.1: resume the semantic index on open if the
+    // project already had `semanticIndex` turned on in a previous session
+    // (the flag persists in `project.config.extra`, but the live embedder
+    // slot in `ActiveProject` always starts empty). Best-effort — a project
+    // opening should never fail because of this.
+    if semantic_index_enabled(&project) {
+        let _ = apply_semantic_index_flag(app, state, true);
+    }
 
     // Fetch teammates' updates right after opening.
     sync_engine.pull_now();
@@ -818,6 +1163,148 @@ async fn search(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// One path-grouped hit from `hybrid_search`. Mirrors `ken_core::search::HybridHit`
+/// but adds `tier` (kenignore task 2.4, so the frontend can badge search-only
+/// hits) and serializes `source` as a lowercase string instead of a Rust enum.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HybridSearchHitDto {
+    path: String,
+    chunk_id: i64,
+    snippet: String,
+    source: &'static str,
+    /// `0` = Full, `1` = SearchOnly (matches `chunks.tier` / `kenignore::Tier`
+    /// minus `Ignore`, which never has a row to badge). `None` if the chunk
+    /// row's tier couldn't be looked up (shouldn't normally happen for a hit
+    /// that came from the chunks tables themselves).
+    tier: Option<i64>,
+}
+
+/// Chunk-level hybrid (keyword + semantic) search (semantic-index task 2.2).
+/// Always runs FTS. Also runs a KNN pass — merged in via
+/// `ken_core::search::merge_hits`'s "B4 FTS-priority fill" (FTS hits keep
+/// their order and snippet; KNN only fills in paths FTS missed) — but only
+/// when the project's `semanticIndex` flag is on, the DB actually has a
+/// vector index (`vec_available`), and a live embedder is installed; in any
+/// other case this transparently degrades to the exact plain-FTS results
+/// `search` would give, per the proposal's "flag off ... → exact current FTS
+/// path" requirement. Every hit is annotated with its stored `chunks.tier`
+/// (kenignore task 2.4) so the frontend can badge search-only matches.
+#[tauri::command]
+async fn hybrid_search(
+    state: State<'_, SharedState>,
+    query: String,
+    limit: Option<usize>,
+) -> CmdResult<Vec<HybridSearchHitDto>> {
+    let limit = limit.unwrap_or(30);
+    let (search_db, semantic_on, embedder_slot) = {
+        let guard = state.lock().unwrap();
+        let active = guard.active.as_ref().ok_or("no project open")?;
+        (
+            active.search_db.clone(),
+            semantic_index_enabled(&active.project),
+            active.semantic_embedder.clone(),
+        )
+    };
+
+    // Embedding the query needs `&mut` on the embedder and can call into a
+    // local model, so it's kept off the async executor same as the DB work
+    // below — do both inside the one `spawn_blocking` closure.
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = search_db.lock().unwrap();
+
+        let fts_hits = db.search_chunks_fts(&query, limit).map_err(err)?;
+
+        let vec_hits = if semantic_on && db.vec_available() {
+            let query_vec = {
+                let mut guard = embedder_slot.lock().unwrap();
+                guard
+                    .as_deref_mut()
+                    .and_then(|embedder| embedder.embed(&[query.clone()]).ok())
+                    .and_then(|mut v| v.pop())
+            };
+            match query_vec {
+                Some(qv) => db
+                    .semantic_search(&qv, limit)
+                    .map_err(err)?
+                    .into_iter()
+                    .map(|(chunk_id, path, text, distance)| hybrid_search_mod::VecHit {
+                        chunk_id,
+                        path,
+                        text,
+                        distance,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        let merged = hybrid_search_mod::merge_hits(&fts_hits, &vec_hits);
+        let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
+        let tiers = db.chunk_tiers(&chunk_ids).map_err(err)?;
+
+        Ok(merged
+            .into_iter()
+            .map(|h| {
+                let tier = tiers.get(&h.chunk_id).copied();
+                let source = match h.source {
+                    hybrid_search_mod::Source::Keyword => "keyword",
+                    hybrid_search_mod::Source::Semantic => "semantic",
+                    hybrid_search_mod::Source::Both => "both",
+                };
+                HybridSearchHitDto {
+                    path: h.path,
+                    chunk_id: h.chunk_id,
+                    snippet: h.snippet,
+                    source,
+                    tier,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Flip a per-project boolean feature flag (semantic-index task 2.1). Only
+/// `semanticIndex` is recognized today; unknown flags are rejected rather
+/// than silently ignored so a frontend typo surfaces immediately instead of
+/// quietly doing nothing.
+#[tauri::command]
+fn set_project_feature(
+    app: AppHandle,
+    state: State<SharedState>,
+    flag: String,
+    value: bool,
+) -> CmdResult<()> {
+    if flag != "semanticIndex" {
+        return Err(format!("unknown feature flag: {flag}"));
+    }
+
+    let mut project = {
+        let guard = state.lock().unwrap();
+        guard.active.as_ref().ok_or("no project open")?.project.clone()
+    };
+    project
+        .config
+        .extra
+        .insert(flag, serde_json::Value::Bool(value));
+    project.save().map_err(err)?;
+
+    // Keep the in-memory copy (read by `semantic_index_enabled` elsewhere,
+    // e.g. a future re-open) in sync with what was just persisted.
+    {
+        let mut guard = state.lock().unwrap();
+        if let Some(active) = guard.active.as_mut() {
+            active.project = project.clone();
+        }
+    }
+
+    apply_semantic_index_flag(&app, state.inner(), value)
 }
 
 /// Error code the frontend matches on to offer a download instead of a
@@ -5035,6 +5522,8 @@ pub fn run() {
             set_folder_selection,
             get_tree,
             search,
+            hybrid_search,
+            set_project_feature,
             read_file,
             read_file_bytes,
             is_cloud_only,

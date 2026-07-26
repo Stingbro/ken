@@ -810,6 +810,39 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Chunk-tier lookup for a set of chunk ids (kenignore task 2.4): the
+    /// src-tauri `hybrid_search` command uses this to badge each hit with
+    /// its `chunks.tier` (ken-core's `kenignore::Tier` numeric values — `0`
+    /// = Full, `1` = SearchOnly; `Ignore` rows are never stored) without
+    /// recomputing classification itself. Ids not found in `chunks` are
+    /// simply absent from the returned map.
+    pub fn chunk_tiers(&self, chunk_ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
+        let mut out = std::collections::HashMap::new();
+        if chunk_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id, tier FROM chunks WHERE id IN ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk_ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, tier) = row?;
+            out.insert(id, tier);
+        }
+        Ok(out)
+    }
+
+    /// Total row count in `chunks` (semantic-index task 2.4's ~50k guardrail
+    /// check). A cheap `COUNT(*)`, meant to be called once after each
+    /// build/incremental update — not per search.
+    pub fn chunk_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?)
+    }
+
     /// Insert or update a file's index entry. `text` is the extracted
     /// content (empty for metadata-only/failed files); `name` is the
     /// filename tokenized for name search.

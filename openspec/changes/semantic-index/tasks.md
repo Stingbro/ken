@@ -187,22 +187,81 @@
 
 ## 2. src-tauri
 
-- [ ] 2.1 Flag plumbing: read effective `semanticIndex` on
+- [x] 2.1 Flag plumbing: read effective `semanticIndex` on
       `open_project` (project.json `features` override > global
       settings); expose `set_project_feature(flag, value)` command
       writing the override and scheduling a build/stop
-- [ ] 2.2 `hybrid_search(query, limit)` command: embed query
+      — **Implemented** in `src-tauri/src/lib.rs`. **Doc drift note:**
+      the "project.json `features` override > global settings"
+      two-layer design (and its pointer to a
+      `features/multi-project/README.md` flag mechanism) does not
+      exist anywhere in this codebase — repo-wide search confirms it's
+      dangling/aspirational text, the only other occurrence being the
+      same reference in `proposal.md`. Followed the real, established
+      per-project-flag convention instead (`bg_hydrate.rs`'s
+      `background_index_enabled`): a single boolean read straight off
+      `project.config.extra["semanticIndex"]`, defaulting to `false`
+      (opt-in, unlike `backgroundIndex`) via new `semantic_index_enabled`.
+      `set_project_feature(flag, value)` validates `flag ==
+      "semanticIndex"`, writes the override into `project.config.extra`,
+      persists via `project.save()`, syncs the in-memory `ActiveProject`
+      copy, then calls `apply_semantic_index_flag` to
+      schedule/stop the build. `activate()` also calls
+      `apply_semantic_index_flag(.., true)` on project open when the
+      persisted flag is already on, so a re-opened project resumes
+      without the user retoggling it.
+- [x] 2.2 `hybrid_search(query, limit)` command: embed query
       (Interactive), FTS + KNN + `rrf_merge`, camelCase results;
       flag off or `vec_available` false → exact current FTS path
-- [ ] 2.3 `semantic-index-state` event (`building {done,total}` /
+      — **Implemented** in `src-tauri/src/lib.rs`. **Doc drift note:**
+      uses `ken_core::search::merge_hits`, not `rrf_merge` — per
+      ken-core task 1.7/S7b, RRF was tried and explicitly rejected in
+      favor of "B4 FTS-priority fill"; `rrf_merge` no longer exists in
+      the codebase. Mirrors the existing `search` command's
+      lock-clone-unlock-then-`spawn_blocking` pattern. Always runs
+      `db.search_chunks_fts`; additionally runs KNN
+      (`embedder.embed(&[query])` → `db.semantic_search`) only when
+      `semantic_index_enabled(&project)` is true, `db.vec_available()`
+      is true, and a live embedder is installed — any other case
+      degrades to exactly the same FTS-only results `search` would
+      return. Results are a new local camelCase DTO
+      (`HybridSearchHitDto`: `path`, `chunkId`, `snippet`,
+      `source` ("keyword"/"semantic"/"both"), `tier`), since none of
+      `ken_core::search`'s types (`FtsHit`/`VecHit`/`HybridHit`/
+      `Source`) derive `Serialize`.
+- [x] 2.3 `semantic-index-state` event (`building {done,total}` /
       `ready` / `unavailable {reason}`), emitted from the engine step;
       register commands
-- [ ] 2.4 Phase 0 addition (D2, `spikes/S4-knn-latency.md`): guardrail
+      — **Implemented.** `SemanticIndexStateEvent` enum
+      (`#[serde(tag = "state", rename_all = "camelCase")]`) emits
+      `{"state":"building","done":..,"total":..}`,
+      `{"state":"ready"}`, `{"state":"unavailable","reason":".."}`,
+      and (task 2.4) `{"state":"warning","reason":".."}`. Wired from
+      two sites: the recipe-triggered incremental path (the
+      `IngestEvent` closure in `activate()`, matching on the engine's
+      `"Embedding chunks: {done}/{total}"` / `"Semantic index rebuild
+      failed: {e}"` activity strings) and `apply_semantic_index_flag`'s
+      own background rebuild thread (manual toggle / on-open resume).
+      `hybrid_search` and `set_project_feature` registered in
+      `tauri::generate_handler![...]`.
+- [x] 2.4 Phase 0 addition (D2, `spikes/S4-knn-latency.md`): guardrail
       check after each build/incremental update — if a project's
       `chunks` row count crosses ~50k, emit a one-time warning event
       (reuse the `unavailable`-style event shape with a distinct
       reason) so the UI can surface "large project, search may slow
       down" instead of silently degrading; does not block search
+      — **Implemented** as `maybe_warn_large_index` +
+      `LARGE_SEMANTIC_INDEX_CHUNK_THRESHOLD = 50_000`, latched via
+      `ActiveProject.semantic_index_warned_large: Arc<AtomicBool>` so
+      it fires at most once per session. Called after both build paths
+      complete (recipe-triggered incremental path and
+      `apply_semantic_index_flag`'s background thread). Reuses the
+      `semantic-index-state` event shape with a distinct `"warning"`
+      state tag rather than overloading `"unavailable"`, so the
+      frontend doesn't confuse "search may be slower" with "search is
+      off". Also confirmed `hybrid_search`'s tier field (task 2.4's
+      other half, shared with kenignore 2.4) sources `chunks.tier`
+      directly via `db.chunk_tiers()` — no reclassification needed.
 
 ## 3. Frontend
 

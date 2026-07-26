@@ -6,6 +6,13 @@
       `parse(text) -> Vec<Rule>` (gitignore semantics + `~`/`!`
       prefixes, comments, blanks, `\~`/`\!` escapes, malformed
       lines skipped with warnings); register in `lib.rs`
+      — `parse()` itself skips malformed lines silently (no
+      warning mechanism); added `malformed_lines(text) ->
+      Vec<usize>` alongside it (src-tauri task 2.2) so callers that
+      want to warn don't have to duplicate `parse`'s line
+      classification. `lib.rs` here means `ken-core`'s
+      `crates/ken-core/src/lib.rs` module registration, already
+      done; not to be confused with `src-tauri/src/lib.rs`.
 - [x] 1.2 `kenignore.rs`: `classify(path, is_dir, rule_sets) ->
       Tier` — hard-ignore short-circuit, then built-in rule sets +
       user rules folded last-match-wins, default `Full`
@@ -40,20 +47,61 @@
 
 ## 2. src-tauri
 
-- [ ] 2.1 Load `.kenignore` (when present) on project open; compose
+- [x] 2.1 Load `.kenignore` (when present) on project open; compose
       rule sets per member; classification wired into the ingest
       engine's walk
-- [ ] 2.2 Watcher: `.kenignore` change ⇒ re-parse, diff, enqueue
+      — no new code needed: `Project::kenignore_rules()` re-reads
+      `.kenignore` fresh from disk on every call (no caching), and
+      `scan::scan` already composes `[built_in_rule_sets(),
+      project.kenignore_rules()]` and calls `classify()` per path
+      on every scan — the initial scan that runs on project open
+      picks this up automatically. "Compose rule sets per member"
+      is dangling text about a multi-project feature that doesn't
+      exist in this codebase (confirmed: zero hits for "member" in
+      `project.rs`), same doc-drift already noted for semantic-index.
+- [x] 2.2 Watcher: `.kenignore` change ⇒ re-parse, diff, enqueue
       scoped transitions through the existing queue/debounce/cancel
       machinery; malformed-line warning event
+      — implemented the feasible subset. The general project
+      watcher (`ken_core::watch::start`, wired in `activate()`)
+      never fires for `.kenignore` itself: its `relevant_path`
+      filter deliberately skips any path component starting with
+      `.` (same rule that skips `.git`, swap files, etc.), so
+      `.kenignore` edits alone never trigger a rescan today. Added
+      a second, narrow poller thread in `activate()` (stopped via
+      the existing `StopOnDrop` pattern, new `_kenignore_watch`
+      field on `ActiveProject`) that checks `.kenignore`'s
+      mtime+len every 2s; on change it re-scans via `scan::scan`
+      (which re-reads `.kenignore` fresh) and re-emits the existing
+      `index-updated` event with the resulting `ScanStats`. This is
+      "re-parse ⇒ rescan," not "diff ⇒ enqueue scoped transitions":
+      true old→new tier diffing (ken-core task 1.6, deliberately
+      deferred, not implemented at the ken-core layer) would be
+      needed to scope the rescan down to just the paths whose tier
+      changed. Until 1.6 lands, files that already have a DB row
+      and aren't otherwise touched keep their old tier until next
+      modified or a manual `reindex`. New `kenignore::malformed_lines`
+      helper (ken-core, purely additive) plus a new `kenignore-warning`
+      event (payload: `{ malformedLines: number[] }`, 1-based line
+      numbers) cover the warning half of this task.
 - [ ] 2.3 Profiler draft flow (gated by `profiler`): heuristic
       classification ⇒ proposed `.kenignore` with explanatory
       comments; no existing file ⇒ full draft for approval;
       existing file ⇒ additions-only diff appended under a
       `# proposed by ken profiler` marker on approval; never
       deletes or reorders user lines
-- [ ] 2.4 Search results carry tier so the frontend can badge
+      — deferred, not a bug: no profiler module exists anywhere in
+      this codebase yet (confirmed by repo-wide search), matching
+      task 1.5's note that profiler doc sampling has nothing to
+      gate yet. This task needs the profiler module to exist first;
+      nothing to wire it into at the src-tauri layer today.
+- [x] 2.4 Search results carry tier so the frontend can badge
       search-only hits
+      — already done under semantic-index task 2.4:
+      `HybridSearchHitDto.tier: Option<i64>` (`src-tauri/src/lib.rs`,
+      the `hybrid_search` command), populated per-hit from
+      `db.chunk_tiers(&chunk_ids)`. `0` = Full, `1` = SearchOnly;
+      `Ignore` never has a chunk row to badge.
 
 ## 3. ken-mcp
 
