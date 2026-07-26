@@ -1184,8 +1184,10 @@ struct HybridSearchHitDto {
 
 /// Chunk-level hybrid (keyword + semantic) search (semantic-index task 2.2).
 /// Always runs FTS. Also runs a KNN pass — merged in via
-/// `ken_core::search::merge_hits`'s "B4 FTS-priority fill" (FTS hits keep
-/// their order and snippet; KNN only fills in paths FTS missed) — but only
+/// `ken_core::search::merge_and_rerank`: "B4 FTS-priority fill" (FTS hits keep
+/// their order and snippet; KNN only fills in paths FTS missed) followed by a
+/// deterministic precision rerank (filename/path/snippet token matches,
+/// semantic proximity, agreement bonus) — the KNN pass only runs
 /// when the project's `semanticIndex` flag is on, the DB actually has a
 /// vector index (`vec_available`), and a live embedder is installed; in any
 /// other case this transparently degrades to the exact plain-FTS results
@@ -1243,7 +1245,7 @@ async fn hybrid_search(
             Vec::new()
         };
 
-        let merged = hybrid_search_mod::merge_hits(&fts_hits, &vec_hits);
+        let merged = hybrid_search_mod::merge_and_rerank(&fts_hits, &vec_hits, &query);
         let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
         let tiers = db.chunk_tiers(&chunk_ids).map_err(err)?;
 

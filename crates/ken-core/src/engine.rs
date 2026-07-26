@@ -1648,9 +1648,10 @@ mod tests {
         wait_status(&r.events, "cancelled", 10);
     }
 
-    /// Runs `search_chunks_fts` + `semantic_search` + `search::merge_hits`
-    /// for a query — the same three building blocks task 2.2's
-    /// `hybrid_search` command is expected to compose.
+    /// Runs `search_chunks_fts` + `semantic_search` + `search::merge_and_rerank`
+    /// for a query — the same building blocks task 2.2's `hybrid_search`
+    /// command is expected to compose, with results always reranked before
+    /// return (S7b Condition C).
     fn hybrid_search(db: &Db, embedder: &mut FakeEmbedder, query: &str) -> Vec<search::HybridHit> {
         let fts_hits: Vec<FtsHit> = db.search_chunks_fts(query, 10).unwrap();
         let query_vec = embedder.embed(&[query.to_string()]).unwrap().remove(0);
@@ -1665,7 +1666,7 @@ mod tests {
                 distance,
             })
             .collect();
-        search::merge_hits(&fts_hits, &vec_hits)
+        search::merge_and_rerank(&fts_hits, &vec_hits, query)
     }
 
     #[test]
