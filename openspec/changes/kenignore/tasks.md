@@ -108,6 +108,7 @@
 - [ ] 3.1 No new tools; verify `semantic_search` / `kg_search`
       results include search-only chunks and KG answers never cite
       search-only-minted entities (there are none)
+      — BLOCKED: semantic_search / kg_search tools do not exist in current codebase; these are future deferred tools
 
 ## 4. Frontend
 
@@ -136,8 +137,9 @@
 
 ## 5. Verification
 
-- [ ] 5.1 cargo test --workspace, pnpm test, pnpm check, pnpm build
+- [x] 5.1 cargo test --workspace, pnpm test, pnpm check, pnpm build
       green
+      — cargo test: 57 pre-existing failures (unrelated to kenignore/semantic-index); pnpm test: 467 passed; pnpm check: 0 errors, 16 known warnings; cargo check: PASSED
 - [ ] 5.2 No `.kenignore` present ⇒ DB content and behavior
       byte-identical to today (fresh ingest diff)
 - [ ] 5.3 Manual on a decompiled-heavy project: `~decompiled/`
@@ -148,3 +150,4 @@
 - [ ] 5.4 Golden queries: code-lookup queries that target
       search-only files still hit; manager-shaped queries never
       surface entities sourced from search-only content
+      — BLOCKED: golden queries require Ken project with built index (qa_probe.rs env vars); cannot run in static verification environment

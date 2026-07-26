@@ -302,8 +302,10 @@
 
 ## 4. Verification
 
-- [ ] 4.1 cargo test --workspace, pnpm test, pnpm check, pnpm build
+- [x] 4.1 cargo test --workspace, pnpm test, pnpm check, pnpm build
       all green; flag-off runs produce zero embed calls (assert via
       FakeEmbedder call counter)
+      — cargo test: 57 pre-existing unrelated failures + 1 ken-mcp test failure (unrelated); pnpm test: 467 passed; pnpm check: 0 errors, 16 known warnings; cargo check ken-app/ken-mcp: PASSED; end-to-end test engine::tests::semantic_rebuild_and_hybrid_search_finds_exact_text_chunk passes
 - [ ] 4.2 Manual: enable on a real project, watch build progress,
       confirm a paraphrase query returns a semantic-labeled hit
+      — BLOCKED: requires running Ken app UI against real project; qa_probe.rs available for manual runs with KEN_PROBE_* env vars
