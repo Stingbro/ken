@@ -292,11 +292,11 @@
       card pattern exactly. Backing state (`semanticIndex`,
       `semanticIndexState`, `setSemanticIndex()`, and the
       `onSemanticIndexState`/`onKenignoreWarning` listener registrations)
-      lives in `src/lib/app.svelte.ts`. Since `set_project_feature` has
-      no getter counterpart, `semanticIndex` is tracked client-side only
-      and resets to `false` on every project activation; the card's copy
-      says so explicitly rather than implying it persists across
-      restarts. The status line renders `building` as "N of M files"
+      lives in `src/lib/app.svelte.ts`. A follow-up added the
+      `get_semantic_index` getter command, so `semanticIndex` is now
+      read back from `.ken/project.json` on every project activation
+      and the toggle persists across restarts (the card's copy was
+      updated to match). The status line renders `building` as "N of M files"
       progress text and `unavailable`/`warning` as their quiet `reason`
       string; `ready` renders nothing (no bare spinner in any state).
 
