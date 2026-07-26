@@ -6,6 +6,7 @@ import {
   type ProjectInfo,
   type RegistryEntryStatus,
   type ScanStats,
+  type SemanticIndexState,
   type SyncStateName,
 } from "./api";
 import {
@@ -107,6 +108,17 @@ class AppStore {
    *  default — Whisper is slow). Shared so Settings reflects it instantly. */
   transcribeVideosOnIndex = $state(false);
 
+  /** Whether the semantic (meaning-based) index is enabled for this project.
+   *  There's no getter command for this flag (see `api.setProjectFeature`),
+   *  so this is session-scoped only: it always starts `false` on project
+   *  activation and doesn't reflect a value persisted from an earlier
+   *  session. */
+  semanticIndex = $state(false);
+
+  /** Live build/availability status of the semantic index, driven by the
+   *  `semantic-index-state` event. `null` until the first event arrives. */
+  semanticIndexState = $state<SemanticIndexState | null>(null);
+
   /** Files the user has ignored (per-user, app-data, never synced). Their
    *  issues are hidden but they stay indexed and searchable. */
   ignored = $state<string[]>([]);
@@ -189,6 +201,17 @@ class AppStore {
       this.scanning = false;
       this.scanError = message;
     });
+    await api.onSemanticIndexState((ev) => {
+      this.semanticIndexState = ev;
+    });
+    // Non-intrusive: log for now rather than a toast/banner component, since
+    // no such pattern exists elsewhere in the app yet. Still surfaces the
+    // 1-based malformed line numbers for anyone checking devtools.
+    await api.onKenignoreWarning((malformedLines) => {
+      console.warn(
+        `.kenignore: skipped malformed line(s) ${malformedLines.join(", ")}`,
+      );
+    });
     await api.onSyncState((ev) => {
       this.syncState = ev.state;
       this.syncDetail = ev.detail;
@@ -241,6 +264,11 @@ class AppStore {
     this.scanError = null;
     this.syncState = "off";
     this.syncDetail = null;
+    // No getter for this flag (see the field doc comment) — reset to the
+    // off-by-default state on every project switch rather than carry over
+    // whatever the previously active project had.
+    this.semanticIndex = false;
+    this.semanticIndexState = null;
     this.loadProjectLocalState();
     void this.loadBackgroundIndex();
     void this.loadTranscribeOnIndex();
@@ -274,6 +302,16 @@ class AppStore {
   async setTranscribeVideosOnIndex(enabled: boolean) {
     this.transcribeVideosOnIndex = enabled;
     await api.setTranscribeOnIndex(enabled);
+  }
+
+  /** Toggle the semantic (meaning-based) search index. Persisted on the
+   *  backend (so ingestion honors it after a restart) but not readable back
+   *  today, so the on-screen toggle itself only reflects this session — see
+   *  the `semanticIndex` field doc comment. */
+  async setSemanticIndex(enabled: boolean) {
+    this.semanticIndex = enabled;
+    if (!enabled) this.semanticIndexState = null;
+    await api.setProjectFeature("semanticIndex", enabled);
   }
 
   /** Restore tabs + favorites + recents for the current project from localStorage. */

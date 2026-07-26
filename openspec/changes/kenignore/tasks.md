@@ -113,8 +113,26 @@
 
 - [ ] 4.1 Profiler review UI: proposed `.kenignore` (or additions
       diff) rendered for approve/dismiss before any write
-- [ ] 4.2 Subtle "search-only" badge on search results from
+      — deferred: no profiler backend exists anywhere in the codebase
+      (no command, no event, nothing under `crates/**` or `src-tauri/**`
+      producing a proposed `.kenignore`/diff to review). There is
+      nothing for this UI to call or render against, so building it
+      now would only be placeholder/dead UI. Leaving unchecked until
+      the profiler backend lands; revisit this task once it does.
+- [x] 4.2 Subtle "search-only" badge on search results from
       search-only-tier chunks
+      — `src/search/SearchOverlay.svelte` renders a "search-only" tag
+      when `hit.tier === 1` (tier 0 = Full, no badge; `null` = lookup
+      failure, treated as no badge, same as tier 0). Bundled into the
+      same hit-row markup as the semantic-index work (3.2 in
+      `semantic-index/tasks.md`) since both read from the same
+      `HybridSearchHitDto`. The `kenignore-warning` event
+      (`{ malformedLines: number[] }`, 1-based line numbers) is wired
+      up via `api.onKenignoreWarning` in `src/lib/app.svelte.ts` and
+      surfaced as `console.warn` — no toast/banner component exists
+      anywhere in `src/` (confirmed via a case-insensitive grep for
+      "toast|banner"), and adding one was out of scope for a single
+      dev-facing warning given the "avoid new dependencies" constraint.
 
 ## 5. Verification
 

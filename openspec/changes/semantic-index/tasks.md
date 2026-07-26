@@ -265,14 +265,40 @@
 
 ## 3. Frontend
 
-- [ ] 3.1 `api.ts`: `HybridHit` type, `hybridSearch` wrapper,
+- [x] 3.1 `api.ts`: `HybridHit` type, `hybridSearch` wrapper,
       `onSemanticIndexState` listener, `setProjectFeature` wrapper
-- [ ] 3.2 Search overlay: route through `hybridSearch`; "semantic"
+      — also added `onKenignoreWarning` while covering the backend
+      contract in full (kenignore 2.2's warning event has no other
+      frontend consumer). `SemanticIndexState` mirrors the Rust
+      internally-tagged enum (`state` field, four variants) exactly.
+- [x] 3.2 Search overlay: route through `hybridSearch`; "semantic"
       mini-chip on `semantic`/`both` hits; unchanged rendering when
       flag off
-- [ ] 3.3 Features disclosure in project settings / folder-select:
+      — `src/search/SearchOverlay.svelte` now calls `api.hybridSearch`
+      and keys/opens hits by `path` (was `relPath`/`SearchHit`).
+      `HybridSearchHitDto` has no `kind` field (unlike the old
+      `SearchHit`), so a new `kindForPath()` helper in `src/lib/format.ts`
+      mirrors `FileKind::from_path` (`crates/ken-core/src/extract.rs`)
+      client-side to still pick a glyph — kept as a single exported
+      function with a comment tying it back to the Rust match so the
+      two stay in lockstep if extensions are added later. Bundled the
+      search-only badge (kenignore 4.2) into the same hit row since
+      both read from the same `HybridSearchHitDto`.
+- [x] 3.3 Features disclosure in project settings / folder-select:
       `semanticIndex` toggle with description, building/unavailable
       status line fed by the event
+      — added a "Semantic search" card to `src/screens/SettingsScreen.svelte`,
+      copying the existing `backgroundIndex`/`transcribeVideosOnIndex`
+      card pattern exactly. Backing state (`semanticIndex`,
+      `semanticIndexState`, `setSemanticIndex()`, and the
+      `onSemanticIndexState`/`onKenignoreWarning` listener registrations)
+      lives in `src/lib/app.svelte.ts`. Since `set_project_feature` has
+      no getter counterpart, `semanticIndex` is tracked client-side only
+      and resets to `false` on every project activation; the card's copy
+      says so explicitly rather than implying it persists across
+      restarts. The status line renders `building` as "N of M files"
+      progress text and `unavailable`/`warning` as their quiet `reason`
+      string; `ready` renders nothing (no bare spinner in any state).
 
 ## 4. Verification
 

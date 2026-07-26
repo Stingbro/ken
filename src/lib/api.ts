@@ -38,6 +38,27 @@ export interface SearchHit {
   rank: number;
 }
 
+/** A hit from `hybrid_search` (keyword FTS + semantic, merged). `source` is
+ *  `"keyword"`, `"semantic"`, or `"both"`. `tier` mirrors `chunks.tier`:
+ *  `0` = full, `1` = search-only, `null` = unexpected lookup failure (treat
+ *  as no badge, same as `0`). */
+export interface HybridHit {
+  path: string;
+  chunkId: number;
+  snippet: string;
+  source: string;
+  tier: number | null;
+}
+
+/** Mirrors the Rust `SemanticIndexStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`) exactly — each
+ *  variant carries only the fields that enum case has. */
+export type SemanticIndexState =
+  | { state: "building"; done: number; total: number }
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string }
+  | { state: "warning"; reason: string };
+
 export interface ScanStats {
   added: number;
   updated: number;
@@ -513,6 +534,11 @@ export const api = {
   getTree: () => invoke<TreeData>("get_tree"),
   search: (query: string, limit = 30) =>
     invoke<SearchHit[]>("search", { query, limit }),
+  /** Keyword FTS merged with semantic (when the `semanticIndex` feature is
+   *  on for the project); transparently degrades to FTS-only results when
+   *  it's off, so callers can always route through this instead of `search`. */
+  hybridSearch: (query: string, limit = 30) =>
+    invoke<HybridHit[]>("hybrid_search", { query, limit }),
   readFile: (relPath: string) => invoke<string>("read_file", { relPath }),
   readFileBytes: (relPath: string) =>
     invoke<ArrayBuffer>("read_file_bytes", { relPath }),
@@ -633,6 +659,13 @@ export const api = {
   getBackgroundIndex: () => invoke<boolean>("get_background_index"),
   setBackgroundIndex: (enabled: boolean) =>
     invoke<void>("set_background_index", { enabled }),
+  /** Toggle the `semanticIndex` project feature flag. There is currently no
+   *  getter command — only `set_project_feature` (write) exists, unlike the
+   *  `getBackgroundIndex`/`setBackgroundIndex` pair above — so callers can't
+   *  read back the persisted value on mount and must track it client-side
+   *  for the session (see `onSemanticIndexState` for build/availability). */
+  setProjectFeature: (flag: "semanticIndex", value: boolean) =>
+    invoke<void>("set_project_feature", { flag, value }),
   /// Whether videos are auto-transcribed on-device (Whisper) during indexing.
   getTranscribeOnIndex: () => invoke<boolean>("get_transcribe_on_index"),
   setTranscribeOnIndex: (enabled: boolean) =>
@@ -703,6 +736,18 @@ export const api = {
     listen<null>("review-changed", () => fn()),
   onScanError: (fn: (message: string) => void): Promise<UnlistenFn> =>
     listen<string>("scan-error", (e) => fn(e.payload)),
+  onSemanticIndexState: (
+    fn: (ev: SemanticIndexState) => void,
+  ): Promise<UnlistenFn> =>
+    listen<SemanticIndexState>("semantic-index-state", (e) => fn(e.payload)),
+  /** Fires when a `.kenignore` edit has malformed lines; payload is the
+   *  1-based line numbers that were skipped. */
+  onKenignoreWarning: (
+    fn: (malformedLines: number[]) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ malformedLines: number[] }>("kenignore-warning", (e) =>
+      fn(e.payload.malformedLines),
+    ),
   onDigestUpdated: (fn: (digest: DigestDto) => void): Promise<UnlistenFn> =>
     listen<DigestDto>("digest-updated", (e) => fn(e.payload)),
   onDigestGenerating: (fn: () => void): Promise<UnlistenFn> =>

@@ -1,16 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
-  import { api, type QuickAnswer, type SearchHit } from "../lib/api";
+  import { api, type QuickAnswer, type HybridHit } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
+  import { kindForPath } from "../lib/format";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
 
   let query = $state("");
-  let hits = $state<SearchHit[]>([]);
+  let hits = $state<HybridHit[]>([]);
   let selected = $state(0);
   let searched = $state(false);
   let input: HTMLInputElement;
@@ -113,7 +114,7 @@
       searched = false;
       return;
     }
-    const found = await api.search(q, 30);
+    const found = await api.hybridSearch(q, 30);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
     hits = found;
@@ -121,8 +122,8 @@
     selected = 0;
   }
 
-  function openHit(hit: SearchHit | undefined) {
-    if (hit) app.openInFiles(hit.relPath);
+  function openHit(hit: HybridHit | undefined) {
+    if (hit) app.openInFiles(hit.path);
   }
 
   /** ⌘↵ — hand the query to a fresh chat in the drawer. */
@@ -208,18 +209,29 @@
   {#if hits.length > 0}
     <div class="section">Matches</div>
     <div class="results">
-      {#each hits as hit, i (hit.relPath)}
+      {#each hits as hit, i (hit.path)}
         <button
           class="hit"
           class:selected={i === selected}
           onclick={() => openHit(hit)}
           onmouseenter={() => (selected = i)}
         >
-          <FileGlyph kind={hit.kind} />
+          <FileGlyph kind={kindForPath(hit.path)} />
           <span class="hit-body">
             <span class="snippet">{@html renderSearchSnippet(hit.snippet)}</span>
-            <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
-            <span class="path mono" title={hit.relPath}>{hit.relPath.split("/").pop() || hit.relPath}</span>
+            <span class="meta">
+              <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
+              <span class="path mono" title={hit.path}>{hit.path.split("/").pop() || hit.path}</span>
+              {#if hit.source === "semantic" || hit.source === "both"}
+                <span class="tag tag-semantic" title="Matched by meaning, not just keywords">semantic</span>
+              {/if}
+              {#if hit.tier === 1}
+                <span
+                  class="tag tag-search-only"
+                  title="Kept searchable by .kenignore but excluded from AI answers and the knowledge map"
+                >search-only</span>
+              {/if}
+            </span>
           </span>
           {#if i === selected}
             <span class="enter mono">↵</span>
@@ -341,12 +353,33 @@
     padding: 0 2px;
     color: inherit;
   }
+  .meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
   .path {
     font-size: 11.5px;
     color: var(--ink-tertiary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .tag {
+    flex: none;
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--ink-tertiary);
+    background: var(--sunken);
+  }
+  .tag-semantic {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
   }
   .enter {
     font-size: 11px;

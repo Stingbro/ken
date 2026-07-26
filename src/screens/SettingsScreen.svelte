@@ -292,6 +292,41 @@
     </div>
 
     <div class="card">
+      <div class="card-title">Semantic search</div>
+      <div class="row">
+        <label class="radio">
+          <input
+            type="checkbox"
+            checked={app.semanticIndex}
+            onchange={(e) =>
+              void app.setSemanticIndex(e.currentTarget.checked)}
+          />
+          Search by meaning, not just keywords
+        </label>
+      </div>
+      {#if app.semanticIndex && app.semanticIndexState}
+        {#if app.semanticIndexState.state === "building"}
+          <p class="note">
+            Building the semantic index — {app.semanticIndexState.done} of
+            {app.semanticIndexState.total} files.
+          </p>
+        {:else if app.semanticIndexState.state === "unavailable"}
+          <p class="note">
+            Not available right now: {app.semanticIndexState.reason}
+          </p>
+        {:else if app.semanticIndexState.state === "warning"}
+          <p class="note">{app.semanticIndexState.reason}</p>
+        {/if}
+      {/if}
+      <p class="note">
+        Finds files by what they mean, not just matching words, alongside the
+        usual keyword search. This only reflects the toggle for the current
+        visit — it can't be read back on the next app launch. Files already
+        indexed pick up semantic search on their next reindex, not instantly.
+      </p>
+    </div>
+
+    <div class="card">
       <div class="card-title">Sync &amp; collaboration</div>
       {#if sync?.mode === "git"}
         <div class="row">
