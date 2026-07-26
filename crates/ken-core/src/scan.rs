@@ -115,8 +115,15 @@ fn is_transient_error(error: &str) -> bool {
 pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
 
-    // What's on disk (rel_path -> size, mtime, cloud placeholder?)
-    let mut on_disk: HashMap<String, (i64, i64, bool)> = HashMap::new();
+    // kenignore (D2): built-ins first, user `.kenignore` appended last so a
+    // `!` line can override them. Loaded once per scan, not per file —
+    // `classify` is pure and re-parsing per path would be wasted work.
+    let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let user_rules = project.kenignore_rules();
+    let rule_sets: [&[crate::kenignore::Rule]; 2] = [&built_in_rules, &user_rules];
+
+    // What's on disk (rel_path -> size, mtime, cloud placeholder?, tier)
+    let mut on_disk: HashMap<String, (i64, i64, bool, crate::kenignore::Tier)> = HashMap::new();
     let walker = ignore::WalkBuilder::new(&project.root)
         .hidden(true) // skip dotfiles: .git, .ken, .DS_Store…
         .git_ignore(false) // knowledge folders aren't code repos
@@ -141,6 +148,13 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         if project.is_excluded(&rel_str) {
             continue;
         }
+        // kenignore D3: "Ignore-tier paths simply never produce rows —
+        // identical to today's exclusion path." Skip exactly like `excluded`
+        // above so an ignored file leaves no file/FTS row either.
+        let tier = crate::kenignore::classify(&rel_str, false, &rule_sets);
+        if tier == crate::kenignore::Tier::Ignore {
+            continue;
+        }
         if let Ok(meta) = path.metadata() {
             let mtime = meta
                 .modified()
@@ -148,7 +162,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            on_disk.insert(rel_str, (meta.len() as i64, mtime, cloud::is_dataless(&meta)));
+            on_disk.insert(rel_str, (meta.len() as i64, mtime, cloud::is_dataless(&meta), tier));
         }
     }
 
@@ -169,7 +183,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     }
 
     // Adds/updates
-    for (rel, (size, mtime, dataless)) in &on_disk {
+    for (rel, (size, mtime, dataless, tier)) in &on_disk {
         match indexed.get(rel) {
             Some((s, m, status, error)) if s == size
                 && m == mtime
@@ -181,7 +195,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
             Some(_) => stats.updated += 1,
             None => stats.added += 1,
         }
-        let status = index_one(project, db, rel, *size, *mtime, *dataless)?;
+        let status = index_one(project, db, rel, *size, *mtime, *dataless, *tier)?;
         if status == STATUS_FAILED {
             stats.failed += 1;
         }
@@ -206,6 +220,7 @@ fn index_one(
     size: i64,
     mtime: i64,
     dataless: bool,
+    tier: crate::kenignore::Tier,
 ) -> Result<&'static str> {
     let abs = project.root.join(rel);
     let kind = FileKind::from_path(&abs);
@@ -229,8 +244,13 @@ fn index_one(
     db.upsert_file(rel, kind.as_str(), size, mtime, status, error.as_deref(), &text)?;
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
-    // churn without a content change never re-runs extraction.
-    if status == STATUS_INDEXED {
+    // churn without a content change never re-runs extraction. kenignore D3/
+    // task 1.5: search-only files are searchable but never enter the
+    // knowledge model, so extraction is gated to full-tier only. FTS (the
+    // upsert_file call above) and OCR (the enqueue below) both stay
+    // tier-blind (both tiers are searchable) — only this extraction enqueue
+    // is gated.
+    if status == STATUS_INDEXED && tier == crate::kenignore::Tier::Full {
         let hash = crate::knowledge_model::content_hash(&text);
         db.enqueue_extraction_if_changed(rel, &hash)?;
     }
@@ -264,6 +284,16 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     let excluded = project.is_excluded(rel)
         || is_hidden_rel(rel)
         || rel.rsplit('/').next().is_some_and(is_office_lock_name);
+    // kenignore D3: an Ignore-tier path is treated exactly like `excluded` —
+    // no row at all. This is a basic per-event check, not D4's fuller
+    // old-tier -> new-tier transition diffing (deleting stale KM
+    // contributions on Full->SearchOnly, etc.) — that belongs to task 1.6 and
+    // the src-tauri watcher work, out of scope here.
+    let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let user_rules = project.kenignore_rules();
+    let rule_sets: [&[crate::kenignore::Rule]; 2] = [&built_in_rules, &user_rules];
+    let tier = crate::kenignore::classify(rel, false, &rule_sets);
+    let excluded = excluded || tier == crate::kenignore::Tier::Ignore;
     if !excluded && abs.is_file() {
         let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
         let mtime = meta
@@ -273,7 +303,7 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let dataless = cloud::is_dataless(&meta);
-        index_one(project, db, rel, meta.len() as i64, mtime, dataless)?;
+        index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
         Ok(true)
     } else if db.get_file(rel)?.is_some() {
         db.remove_file(rel)?;
@@ -357,7 +387,7 @@ mod tests {
         let meta = project.root.join("note.md").metadata().unwrap();
         let status = index_one(
             &project, &mut db, "note.md",
-            meta.len() as i64, 0, false,
+            meta.len() as i64, 0, false, crate::kenignore::Tier::Full,
         ).unwrap();
         assert_eq!(status, STATUS_INDEXED);
         // The file is now queued with the hash of its extracted text.
@@ -368,7 +398,7 @@ mod tests {
 
         // Re-indexing identical content does NOT re-queue once it's done.
         db.mark_extraction_done("note.md", &crate::knowledge_model::content_hash("Priya leads billing."), 1).unwrap();
-        index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false).unwrap();
+        index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false, crate::kenignore::Tier::Full).unwrap();
         assert!(db.next_pending_extraction().unwrap().is_none());
     }
 
@@ -380,7 +410,7 @@ mod tests {
         // An image (no EXIF text): enqueued for OCR.
         fs::write(project.root.join("photo.png"), b"not really a png").unwrap();
         let meta = project.root.join("photo.png").metadata().unwrap();
-        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("photo.png".to_string()),
@@ -393,7 +423,7 @@ mod tests {
         // An SVG is vector-only — the OCR bridge can't rasterize it — so skip.
         fs::write(project.root.join("logo.svg"), b"<svg></svg>").unwrap();
         let m = project.root.join("logo.svg").metadata().unwrap();
-        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none(), "SVG must not enqueue OCR");
 
         // The fixture PDF has only a one-line text layer (sparse) — exactly the
@@ -402,7 +432,7 @@ mod tests {
         // covered directly by `pdf_low_text_heuristic`.)
         let pdf = project.root.join("vendor/contract.pdf");
         let pm = pdf.metadata().unwrap();
-        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("vendor/contract.pdf".to_string()),
@@ -419,16 +449,16 @@ mod tests {
         let meta = project.root.join("photo.png").metadata().unwrap();
         let (size, mtime) = (meta.len() as i64, 5);
 
-        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime, false, crate::kenignore::Tier::Full).unwrap();
         let (rel, hash) = db.next_pending_ocr().unwrap().unwrap();
         db.mark_ocr_done(&rel, &hash, &[]).unwrap();
 
         // Same (size, mtime): re-indexing does NOT re-OCR.
-        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime, false, crate::kenignore::Tier::Full).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none(), "unchanged image must not re-OCR");
 
         // A changed mtime (new version) re-queues it.
-        index_one(&project, &mut db, "photo.png", size, mtime + 1, false).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime + 1, false, crate::kenignore::Tier::Full).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("photo.png".to_string())
@@ -483,7 +513,7 @@ mod tests {
         let (_dir, project) = temp_project();
         let mut db = Db::open_in_memory().unwrap();
 
-        let status = index_one(&project, &mut db, "notes/meeting.md", 120, 7, true).unwrap();
+        let status = index_one(&project, &mut db, "notes/meeting.md", 120, 7, true, crate::kenignore::Tier::Full).unwrap();
 
         assert_eq!(status, STATUS_CLOUD_ONLY);
         let row = db.get_file("notes/meeting.md").unwrap().unwrap();

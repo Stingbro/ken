@@ -128,6 +128,18 @@ impl Project {
         })
     }
 
+    /// Load and parse this project's `.kenignore` (project root, not
+    /// `.ken/`) into rules per kenignore design D6/D1. Missing file reads as
+    /// empty rules, not an error — most projects won't have one. This is the
+    /// "user rule set" tier in D2's precedence order; callers combine it with
+    /// any built-in rule sets (task 1.3) via `kenignore::classify`'s
+    /// `rule_sets` slice, user rules last so they can override built-ins.
+    pub fn kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
+        let path = self.root.join(".kenignore");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        crate::kenignore::parse(&text)
+    }
+
     /// Rename the project, rewriting `.ken/project.json`. The invalid-name
     /// check runs before any write, so a rejected name leaves the config
     /// untouched. The user-level registry is a separate store the caller
