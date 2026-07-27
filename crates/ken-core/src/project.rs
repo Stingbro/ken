@@ -161,6 +161,27 @@ impl Project {
         self.save()
     }
 
+    /// Effective exclusion set (project-profiler D3): user `excluded` ∪ the
+    /// stored profile's `excludes`, additive only — a profile exclude never
+    /// replaces or removes a user entry. `profiler_enabled` is the caller's
+    /// already-resolved `profiler` flag value (see `features::effective_flag`);
+    /// this method has no `AppSettings` access of its own, so passing `false`
+    /// reproduces plain `excluded`-only behavior exactly, which is how
+    /// flag-off inertness holds even when a profile file is present on disk
+    /// (spec: "flag off is inert").
+    pub fn effective_excluded(&self, profiler_enabled: bool) -> Vec<String> {
+        let mut set = self.config.excluded.clone();
+        if profiler_enabled {
+            let profile = crate::profiler::ProjectProfile::load(&self.root);
+            for ex in profile.excludes {
+                if !set.iter().any(|e| e == &ex) {
+                    set.push(ex);
+                }
+            }
+        }
+        set
+    }
+
     /// Resolve a project-relative path, refusing anything that escapes the
     /// project root (`..`, absolute paths).
     pub fn resolve(&self, rel_path: &str) -> Result<PathBuf> {
@@ -244,6 +265,38 @@ mod tests {
         assert!(p.is_excluded("archive"));
         assert!(!p.is_excluded("archive-2/notes.md"));
         assert!(!p.is_excluded("notes/archive.md"));
+    }
+
+    #[test]
+    fn effective_excluded_unions_profile_excludes_only_when_enabled() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.excluded = vec!["archive".into()];
+
+        // No profile file yet: enabled or not, effective set is just user excluded.
+        assert_eq!(p.effective_excluded(true), vec!["archive".to_string()]);
+        assert_eq!(p.effective_excluded(false), vec!["archive".to_string()]);
+
+        let mut profile = crate::profiler::ProjectProfile::default();
+        profile.excludes = vec!["target/".to_string()];
+        profile.save(&p.root).unwrap();
+
+        // Flag off: the profile file is not read at all (spec: flag off is inert).
+        assert_eq!(p.effective_excluded(false), vec!["archive".to_string()]);
+        // Flag on: additive union, user entry first.
+        assert_eq!(p.effective_excluded(true), vec!["archive".to_string(), "target/".to_string()]);
+    }
+
+    #[test]
+    fn effective_excluded_never_duplicates_an_overlapping_entry() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.excluded = vec!["target/".to_string()];
+        let mut profile = crate::profiler::ProjectProfile::default();
+        profile.excludes = vec!["target/".to_string()];
+        profile.save(&p.root).unwrap();
+
+        assert_eq!(p.effective_excluded(true), vec!["target/".to_string()]);
     }
 
     #[test]

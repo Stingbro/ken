@@ -2,8 +2,9 @@
 //! single source of truth: command validation and UI rendering both derive
 //! from it, so an unknown flag is rejected in one place and no switch can be
 //! shown that does nothing. Only *implemented* flags are registered — product
-//! docs list more (profiler, ...), but each lands here in the change that
-//! ships it.
+//! docs may list more, but each lands here in the change that ships it (e.g.
+//! `profiler`, registered by the project-profiler change's ken-core layer;
+//! its src-tauri/frontend wiring is a later phase of that same change).
 
 use serde_json::Value;
 
@@ -43,6 +44,14 @@ pub const FLAGS: &[FlagDef] = &[
         default: false,
         description: "Open a parent folder's sibling projects together, \
                       each with its own DB, engine, and watcher.",
+    },
+    FlagDef {
+        name: "profiler",
+        scope: FlagScope::Project,
+        default: false,
+        description: "Analyze each project's shape (deterministic scan, \
+                      optional local-LLM refinement) to tune semantic-index \
+                      chunking, exclusions, and knowledge extraction.",
     },
 ];
 
@@ -104,11 +113,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_semantic_index_and_workspace() {
-        assert_eq!(FLAGS.len(), 2);
+    fn registry_has_semantic_index_workspace_and_profiler() {
+        assert_eq!(FLAGS.len(), 3);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
-        assert!(flag("profiler").is_none());
+        let profiler = flag("profiler").expect("profiler flag registered");
+        assert_eq!(profiler.scope, FlagScope::Project);
+        assert!(!profiler.default);
     }
 
     #[test]

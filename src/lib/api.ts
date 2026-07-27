@@ -60,6 +60,41 @@ export type SemanticIndexState =
   | { state: "unavailable"; reason: string; project_id?: string }
   | { state: "warning"; reason: string; project_id?: string };
 
+/** Frontend view of `ken_core::profiler::ProjectProfile`, mirroring the Rust
+ *  `ProfileDto` (`#[serde(rename_all = "camelCase")]`) — project-profiler
+ *  task 3.1. `chunking` and the internal `generated_hash` aren't exposed;
+ *  `handEdited` is `ProjectProfile::is_hand_edited()`, true when the on-disk
+ *  file has diverged from the hash Ken stamped on its own last write (design
+ *  D2) — `profile_project` refuses to overwrite such a profile rather than
+ *  clobbering the user's edits. */
+export interface ProjectProfile {
+  kind: "code" | "docs" | "mixed" | "media";
+  summary: string;
+  languages: string[];
+  excludes: string[];
+  focusHints: string[];
+  handEdited: boolean;
+}
+
+/** Mirrors the Rust `ProfileStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape as
+ *  `SemanticIndexState` above. Delivered two ways (project-profiler task
+ *  2.1/2.2): scoped to an open member via `emit_member` (`project_id` set,
+ *  `path` absent) for `profile_project`, or scoped to a workspace-creation
+ *  candidate folder that isn't a project yet (`path` set, `project_id`
+ *  absent) for `profile_candidates` — callers tell the two apart by which
+ *  key accompanies the event. */
+export type ProfileState =
+  | { state: "scanning"; project_id?: string; path?: string }
+  | { state: "refining"; project_id?: string; path?: string }
+  | {
+      state: "ready";
+      profile: ProjectProfile;
+      project_id?: string;
+      path?: string;
+    }
+  | { state: "error"; reason: string; project_id?: string; path?: string };
+
 export interface ScanStats {
   added: number;
   updated: number;
@@ -731,6 +766,22 @@ export const api = {
    *  exists). One call feeds both the onboarding disclosure and Settings. */
   listFeatures: (projectId?: string) =>
     invoke<FeatureInfo[]>("list_features", { projectId }),
+  /** Profile one open member (deterministic scan, then optional
+   *  Background-priority local-LLM refinement), written to
+   *  `.ken/index-profile.json`. Gated server-side on the project-scoped
+   *  `profiler` flag and rejects while a profile of this project is already
+   *  running; `projectId` omitted profiles the focused member. Returns as
+   *  soon as the background pass starts — progress arrives via
+   *  `onProfileState` events keyed by `project_id` (project-profiler task
+   *  2.1). */
+  profileProject: (projectId?: string) =>
+    invoke<void>("profile_project", { projectId }),
+  /** Profile workspace-creation candidate folders that aren't projects yet
+   *  (concurrency 2, per-candidate failures never block the others) —
+   *  project-profiler task 2.2. Progress arrives via `onProfileState`
+   *  events keyed by `path` instead of `project_id`. */
+  profileCandidates: (paths: string[]) =>
+    invoke<void>("profile_candidates", { paths }),
   /// Whether videos are auto-transcribed on-device (Whisper) during indexing.
   getTranscribeOnIndex: () => invoke<boolean>("get_transcribe_on_index"),
   setTranscribeOnIndex: (enabled: boolean) =>
@@ -805,6 +856,10 @@ export const api = {
     fn: (ev: SemanticIndexState) => void,
   ): Promise<UnlistenFn> =>
     listen<SemanticIndexState>("semantic-index-state", (e) => fn(e.payload)),
+  /** Fires for both `profile_project` (project_id-keyed) and
+   *  `profile_candidates` (path-keyed) — see `ProfileState`. */
+  onProfileState: (fn: (ev: ProfileState) => void): Promise<UnlistenFn> =>
+    listen<ProfileState>("profile-state", (e) => fn(e.payload)),
   /** Fires when a `.kenignore` edit has malformed lines. */
   onKenignoreWarning: (
     fn: (ev: KenignoreWarning) => void,

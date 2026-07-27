@@ -32,6 +32,12 @@ pub enum ChunkMode {
     /// Line-based fixed-size blocks, no overlap. Source code and other
     /// structured/dense text.
     Code,
+    /// Never chunked or embedded. The file still keyword-searches (that's
+    /// driven by kenignore's tier, not this), but produces zero semantic
+    /// chunks — used by project-profiler pattern entries (e.g. `*.log`) to
+    /// opt noisy/generated text out of embedding without excluding it
+    /// entirely.
+    Skip,
 }
 
 /// How a file should be split into chunks. Per-path selection lives in
@@ -59,6 +65,18 @@ impl Default for IndexProfile {
     }
 }
 
+/// Prose-ish extensions: markdown, plain text, extracted PDF text. Module
+/// level (not just local to `default_for`) so other modules can classify by
+/// the same taxonomy instead of duplicating it — project-profiler's doc-ratio
+/// scan and default chunking table reuse this exact list.
+pub const PROSE_EXTS: &[&str] = &["md", "mdx", "txt", "pdf"];
+/// Source-code and other structured/dense-text extensions. See [`PROSE_EXTS`].
+pub const CODE_EXTS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "h", "cc", "cpp",
+    "hpp", "cs", "rb", "php", "swift", "kt", "kts", "sql", "sh", "bash", "ps1", "toml", "yaml",
+    "yml", "json", "css", "scss", "html", "svelte", "vue",
+];
+
 impl IndexProfile {
     /// v1 default profile selection by file extension: prose-ish formats
     /// (markdown, plain text, extracted PDF text) get the prose profile;
@@ -70,12 +88,6 @@ impl IndexProfile {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        const PROSE_EXTS: &[&str] = &["md", "mdx", "txt", "pdf"];
-        const CODE_EXTS: &[&str] = &[
-            "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "h", "cc",
-            "cpp", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "sql", "sh", "bash", "ps1",
-            "toml", "yaml", "yml", "json", "css", "scss", "html", "svelte", "vue",
-        ];
         if PROSE_EXTS.contains(&ext.as_str()) {
             IndexProfile {
                 mode: ChunkMode::Prose,
@@ -126,6 +138,7 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
     let pieces = match profile.mode {
         ChunkMode::Prose => chunk_prose(text, profile),
         ChunkMode::Code => chunk_code(text, profile),
+        ChunkMode::Skip => Vec::new(),
     };
 
     pieces
@@ -273,6 +286,12 @@ mod tests {
         assert_eq!(p.mode, ChunkMode::Code);
         assert_eq!(p.target_tokens, 500);
         assert_eq!(p.overlap_pct, 0.0);
+    }
+
+    #[test]
+    fn skip_mode_produces_no_chunks() {
+        let profile = IndexProfile { mode: ChunkMode::Skip, target_tokens: 350, overlap_pct: 0.0 };
+        assert!(chunk_file("noisy.log", "line one\nline two\nline three\n", &profile).is_empty());
     }
 
     #[test]

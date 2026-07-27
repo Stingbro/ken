@@ -1,6 +1,12 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type FeatureInfo, type RegistryEntryStatus } from "../lib/api";
+  import {
+    api,
+    type FeatureInfo,
+    type ProjectProfile,
+    type RegistryEntryStatus,
+  } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
@@ -52,6 +58,30 @@
   let featureChoices = $state<Record<string, boolean>>({});
   let featuresOpen = $state(false);
 
+  // project-profiler task 3.2: minimal "analyzing" affordance for the
+  // chosen (not-yet-a-project) folder, driven by `profile_candidates` +
+  // `onProfileState` (path-keyed — see api.ts's `ProfileState`). Only a
+  // single candidate is ever in flight here (this flow creates one project
+  // at a time); a real multi-candidate workspace-creation checklist is
+  // deferred (tasks.md 3.2 note) — Phase 2 never built the picker UI it'd
+  // need.
+  let candidateProfileState = $state<"scanning" | "refining" | "ready" | "error" | null>(null);
+  let candidateProfile = $state<ProjectProfile | null>(null);
+  // Hides the affordance locally without cancelling the backend scan (no
+  // cancel-profile command exists) — "skip" here means "stop waiting to see
+  // it," which is honest since project creation was never gated on it.
+  let analysisDismissed = $state(false);
+  let unlistenProfile: (() => void) | undefined;
+
+  onMount(() => {
+    void api.onProfileState((ev) => {
+      if (ev.path !== pendingPath) return;
+      if (ev.state === "ready") candidateProfile = ev.profile;
+      candidateProfileState = ev.state;
+    }).then((fn) => (unlistenProfile = fn));
+    return () => unlistenProfile?.();
+  });
+
   async function chooseFolder() {
     error = null;
     const folder = await openDialog({
@@ -62,10 +92,20 @@
     pendingPath = folder;
     pendingName = folder.split("/").pop() ?? "My project";
     featuresOpen = false;
+    candidateProfileState = null;
+    candidateProfile = null;
+    analysisDismissed = false;
     try {
       const all = await api.listFeatures();
       features = all.filter((f) => f.scope === "project");
       featureChoices = Object.fromEntries(features.map((f) => [f.name, f.effective]));
+      // `profile_candidates` isn't flag-gated server-side (the folder isn't a
+      // project yet, so there's no per-project override to read) — per its
+      // lib.rs doc comment, callers are expected to check the *global*
+      // `profiler` default themselves first.
+      if (all.find((f) => f.name === "profiler")?.effective) {
+        void api.profileCandidates([folder]);
+      }
     } catch {
       features = [];
       featureChoices = {};
@@ -132,6 +172,31 @@
             }}
           />
         </label>
+
+        {#if !analysisDismissed && (candidateProfileState === "scanning" || candidateProfileState === "refining" || (candidateProfileState === "ready" && candidateProfile))}
+          <div class="analyzing" role="status" aria-live="polite">
+            {#if candidateProfileState === "ready" && candidateProfile}
+              <span class="kind-badge">{candidateProfile.kind}</span>
+              {#if candidateProfile.summary}
+                <span class="analyzing-text">{candidateProfile.summary}</span>
+              {/if}
+            {:else}
+              <span class="mini-spinner"></span>
+              <span class="analyzing-text">
+                {candidateProfileState === "refining"
+                  ? "Refining analysis…"
+                  : "Analyzing project…"}
+              </span>
+              <button
+                type="button"
+                class="skip-analysis"
+                onclick={() => (analysisDismissed = true)}
+              >
+                Skip
+              </button>
+            {/if}
+          </div>
+        {/if}
 
         {#if features.length > 0}
           <div class="features">
@@ -304,6 +369,58 @@
   .confirm-actions {
     display: flex;
     gap: 8px;
+  }
+  .analyzing {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--sunken);
+    font-size: 12.5px;
+  }
+  .mini-spinner {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    border: 2px solid color-mix(in srgb, var(--ink-tertiary) 35%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: profile-spin 0.7s linear infinite;
+  }
+  @keyframes profile-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .kind-badge {
+    flex: none;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+  .analyzing-text {
+    color: var(--ink-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .skip-analysis {
+    flex: none;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-tertiary);
+  }
+  .skip-analysis:hover {
+    color: var(--ink-secondary);
   }
   .features {
     display: flex;

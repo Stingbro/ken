@@ -1,9 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { app } from "../lib/app.svelte";
+  import { app, forFocused } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { theme, type ThemeMode } from "../lib/theme.svelte";
-  import { api, type McpInfo, type SyncStatus, type ModelStatus, type FeatureInfo } from "../lib/api";
+  import {
+    api,
+    type McpInfo,
+    type SyncStatus,
+    type ModelStatus,
+    type FeatureInfo,
+    type ProjectProfile,
+  } from "../lib/api";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
@@ -34,6 +41,31 @@
   // overrides (see openspec/changes/feature-flags/design.md D5).
   let features = $state<FeatureInfo[]>([]);
   let featuresBusy = $state<string | null>(null);
+
+  // project-profiler task 3.3: project profile card. There's no read-only
+  // "get current profile" command (only `profile_project`, which re-scans),
+  // so this card starts empty and only shows data once the user has
+  // triggered Analyze/Re-analyze this session — a follow-up read command
+  // would let it show a previously-generated profile on load instead.
+  let profileState = $state<"scanning" | "refining" | "ready" | "error" | null>(null);
+  let profileResult = $state<ProjectProfile | null>(null);
+  let profileError = $state<string | null>(null);
+  const profilerFlag = $derived(features.find((f) => f.name === "profiler"));
+  const profilerEnabled = $derived(profilerFlag?.effective ?? false);
+
+  /** Kick off `profile_project` for the active project. The command itself
+   *  only spawns the background scan/refine/save pass and can reject
+   *  synchronously (flag off, already profiling, bad id) — `profile-state`
+   *  events (filtered to this project below) carry the actual progress. */
+  async function analyzeProject() {
+    profileError = null;
+    try {
+      await api.profileProject(app.project?.id);
+    } catch (e) {
+      profileState = "error";
+      profileError = String(e);
+    }
+  }
 
   const themeOptions: { value: ThemeMode; title: string }[] = [
     { value: "light", title: "Light" },
@@ -66,7 +98,21 @@
     void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
     void refreshModels();
     void loadFeatures();
-    return () => clearTimeout(copyTimer);
+    let unlistenProfile: (() => void) | undefined;
+    void api.onProfileState((ev) => {
+      // `profile_project` events are project_id-keyed (`emit_member`); no
+      // `path` ever accompanies them (that's the `profile_candidates`
+      // shape) — reuse the same focused-member filter the rest of the app
+      // store uses for member-scoped events.
+      if (!forFocused(ev.project_id)) return;
+      profileState = ev.state;
+      if (ev.state === "ready") profileResult = ev.profile;
+      if (ev.state === "error") profileError = ev.reason;
+    }).then((fn) => (unlistenProfile = fn));
+    return () => {
+      clearTimeout(copyTimer);
+      unlistenProfile?.();
+    };
   });
 
   async function loadFeatures() {
@@ -220,6 +266,81 @@
         files themselves.
       </p>
     </div>
+
+    {#if profilerEnabled}
+      <div class="card">
+        <div class="card-title">Project profile</div>
+        <p class="note">
+          Ken scans this project's shape — code vs. docs, languages, build
+          output to exclude — to tune indexing and knowledge extraction.
+        </p>
+
+        {#if profileState === "scanning" || profileState === "refining"}
+          <div class="row">
+            <span class="mini-spinner" aria-hidden="true"></span>
+            <span class="soft">
+              {profileState === "refining" ? "Refining analysis…" : "Scanning…"}
+            </span>
+          </div>
+        {/if}
+
+        {#if profileResult}
+          <div class="row">
+            <span class="chip mono">{profileResult.kind}</span>
+            {#if profileResult.languages.length > 0}
+              <span class="soft">{profileResult.languages.join(", ")}</span>
+            {/if}
+          </div>
+          {#if profileResult.summary}
+            <p class="note">{profileResult.summary}</p>
+          {/if}
+          {#if profileResult.excludes.length > 0}
+            <div class="row"><span class="label">Excludes</span>
+              <span class="soft">added by the profiler, additive to yours above</span>
+            </div>
+            <div class="folders">
+              {#each profileResult.excludes as path (path)}
+                <div class="folder ignored">
+                  <span class="mono">{path}</span>
+                  <button
+                    class="btn btn-small"
+                    disabled
+                    title="Removing a single profiler-added exclude isn't wired up yet — it needs a backend command to persist the override (project-profiler tasks.md 3.3 follow-up). Delete .ken/index-profile.json and re-analyze to reset all of them."
+                  >
+                    Remove
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        {/if}
+
+        {#if profileState === "error" && profileError}
+          <p class="note warn">
+            {#if profileError.includes("hand-edited")}
+              This project's <span class="mono small">.ken/index-profile.json</span>
+              has been hand-edited, so Ken won't overwrite it automatically.
+              Delete that file to let Ken generate a fresh one, or keep your
+              edits as they are. (A proper "re-analyze and overwrite, with
+              confirmation" flow needs a backend force parameter that doesn't
+              exist yet.)
+            {:else}
+              Couldn't analyze this project: {profileError}
+            {/if}
+          </p>
+        {/if}
+
+        <div class="row">
+          <button
+            class="btn btn-small"
+            onclick={analyzeProject}
+            disabled={profileState === "scanning" || profileState === "refining"}
+          >
+            {profileResult ? "Re-analyze" : "Analyze project"}
+          </button>
+        </div>
+      </div>
+    {/if}
 
     <div class="card">
       <div class="card-title">Watched folders</div>
@@ -808,6 +929,20 @@
   }
   .note.warn {
     color: var(--needs-input-text);
+  }
+  .mini-spinner {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    border: 2px solid color-mix(in srgb, var(--ink-tertiary) 35%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: profile-spin 0.7s linear infinite;
+  }
+  @keyframes profile-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
   .mcp-head {
     display: flex;
