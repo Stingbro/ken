@@ -15,9 +15,11 @@
 //!   feature.
 //!
 //! nomic-embed-text expects task prefixes: documents are embedded with
-//! `search_document:` and queries with `search_query:`. Both real and fake
-//! embedders expose [`Embedder::embed`] for documents; the real one adds an
-//! inherent `embed_query` for the query side.
+//! `search_document:` and queries with `search_query:`. [`Embedder::embed`]
+//! is the document side; [`Embedder::embed_query`] is the query side. The
+//! default `embed_query` just embeds the raw text (which keeps the fake
+//! embedder's document/query exact-match property), while [`LlamaEmbedder`]
+//! overrides it to apply the `search_query:` prefix.
 
 use crate::Result;
 
@@ -38,6 +40,17 @@ pub trait Embedder {
     /// `"fake-hash-8"`. Persisted in meta so we can detect when the embedding
     /// model changed and the index must be rebuilt.
     fn model_id(&self) -> String;
+
+    /// Embed a single *query* (the `search_query:` side for models with task
+    /// prefixes). The default embeds the raw text like a document, which is
+    /// exactly right for prefix-free embedders such as [`FakeEmbedder`] —
+    /// document and query vectors for the same string stay identical.
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.embed(&[text.to_string()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::Other("embedder returned no vector for query".into()))
+    }
 }
 
 /// L2-normalize a vector in place. A zero vector is left untouched (its norm is
@@ -220,11 +233,42 @@ mod llama {
         fn model_id(&self) -> String {
             self.model_id.clone()
         }
+
+        fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+            // Delegate to the inherent method so the `search_query:` prefix is
+            // applied (the trait default embeds raw text).
+            LlamaEmbedder::embed_query(self, text)
+        }
     }
 }
 
 #[cfg(feature = "local-llm")]
 pub use llama::LlamaEmbedder;
+
+/// Build the real embedder from the installed Embedding-category model, the
+/// same shape as `local_llm::make_real_engine`: `None` when the app-data dir
+/// is unknown or no model is installed, and a load failure on a present file
+/// also yields `None` (reported on stderr) so search degrades to FTS-only
+/// instead of erroring.
+#[cfg(feature = "local-llm")]
+pub fn installed_embedding_model() -> Option<Box<dyn Embedder + Send>> {
+    let base = crate::local_llm::base_dir()?;
+    let path = crate::model::selected_model_path(&base, crate::model::ModelCategory::Embedding)?;
+    match LlamaEmbedder::load(&path, "nomic-embed-text-v1.5") {
+        Ok(e) => Some(Box::new(e)),
+        Err(e) => {
+            eprintln!("semantic search disabled: {e}");
+            None
+        }
+    }
+}
+
+/// Feature-off stub: this build has no on-device embedding model, so semantic
+/// search is simply unavailable. (Same-signature pair, like `llm_status`.)
+#[cfg(not(feature = "local-llm"))]
+pub fn installed_embedding_model() -> Option<Box<dyn Embedder + Send>> {
+    None
+}
 
 #[cfg(test)]
 mod tests {

@@ -578,7 +578,7 @@ pub fn init(base_dir: PathBuf) {
 }
 
 #[allow(dead_code)]
-fn base_dir() -> Option<PathBuf> {
+pub(crate) fn base_dir() -> Option<PathBuf> {
     BASE_DIR.get()?.lock().unwrap().clone()
 }
 
