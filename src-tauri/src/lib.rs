@@ -42,7 +42,7 @@ enum TerminalHandle {
     Attached,
 }
 
-struct ActiveProject {
+struct MemberRuntime {
     project: Project,
     db: Db,
     /// Dedicated read-only connection for `search`, on its OWN mutex so a
@@ -125,7 +125,8 @@ impl Drop for StopOnDrop {
 struct AppState {
     base_dir: PathBuf,
     hooks: Option<Arc<HookListener>>,
-    active: Option<ActiveProject>,
+    members: std::collections::HashMap<uuid::Uuid, MemberRuntime>,
+    focused: Option<uuid::Uuid>,
     /// Global feature-flag defaults, loaded from `settings.json` at startup and
     /// held behind the same lock as the rest of app state.
     app_settings: ken_core::settings::AppSettings,
@@ -143,6 +144,30 @@ struct AppState {
 }
 
 type SharedState = Arc<Mutex<AppState>>;
+
+/// Look up the runtime for a member project. `None` means "the sole open
+/// project" - today's single-project semantics. Callers migrate to passing
+/// real ids as multi-project lands (S9 step list / workspace design).
+fn member<'a>(state: &'a AppState, id: Option<uuid::Uuid>) -> Result<&'a MemberRuntime, &'static str> {
+    match id.or(state.focused) {
+        None => Err("no project open"),
+        Some(resolved) => state
+            .members
+            .get(&resolved)
+            .ok_or(if id.is_some() { "project not open" } else { "no project open" }),
+    }
+}
+
+/// Mutable twin of [`member`].
+fn member_mut<'a>(state: &'a mut AppState, id: Option<uuid::Uuid>) -> Result<&'a mut MemberRuntime, &'static str> {
+    match id.or(state.focused) {
+        None => Err("no project open"),
+        Some(resolved) => state
+            .members
+            .get_mut(&resolved)
+            .ok_or(if id.is_some() { "project not open" } else { "no project open" }),
+    }
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -232,6 +257,37 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// Wraps a member-scoped event's payload with `project_id`, flattened in
+/// alongside the payload's own fields so a payload of `{"foo":1}` becomes
+/// `{"project_id":"...","foo":1}` — every existing field stays top-level and
+/// listeners written against the old flat shape keep working unchanged.
+/// `Clone` is required because `AppHandle::emit`'s own bound
+/// (`Emitter::emit<S: Serialize + Clone>`) demands it of whatever it's
+/// given — every payload passed through here already satisfies it, since
+/// the same bound applied when these were emitted directly.
+#[derive(Clone, Serialize)]
+struct MemberEventEnvelope<T: Serialize> {
+    project_id: uuid::Uuid,
+    #[serde(flatten)]
+    payload: T,
+}
+
+/// Emit an event scoped to one project/member (S9 step 5, event envelope).
+/// Fires the SAME event name as a plain `app.emit`, but wraps the payload so
+/// a multi-project-aware frontend can tell which project it came from
+/// without every emit site threading routing logic itself. Event names are
+/// unchanged — only per-project (member-context) events should go through
+/// this; genuinely app-global events (model download progress, recording,
+/// app lifecycle) should keep using `app.emit` directly.
+///
+/// Only call this with a payload that serializes to a JSON object (a struct
+/// or map). A scalar, array, or unit (`()`) payload isn't an object to
+/// flatten `project_id` into — `serde_json` would error trying — so those
+/// events are deliberately left as plain `app.emit` at their call sites.
+fn emit_member(app: &AppHandle, project_id: uuid::Uuid, event: &str, payload: impl Serialize + Clone) {
+    let _ = app.emit(event, MemberEventEnvelope { project_id, payload });
+}
+
 /// Payload for the `semantic-index-state` event (semantic-index task 2.3).
 /// Serializes with a `state` discriminant field so the frontend can switch
 /// on `payload.state`: `{"state":"building","done":1,"total":10}`,
@@ -277,13 +333,20 @@ fn build_semantic_embedder() -> Option<Box<dyn Embedder + Send>> {
 /// or incremental update completes, not per search.
 const LARGE_SEMANTIC_INDEX_CHUNK_THRESHOLD: i64 = 50_000;
 
-fn maybe_warn_large_index(app: &AppHandle, db: &Db, warned: &Arc<AtomicBool>) {
+fn maybe_warn_large_index(
+    app: &AppHandle,
+    project_id: uuid::Uuid,
+    db: &Db,
+    warned: &Arc<AtomicBool>,
+) {
     if warned.load(Ordering::SeqCst) {
         return;
     }
     let Ok(count) = db.chunk_count() else { return };
     if count >= LARGE_SEMANTIC_INDEX_CHUNK_THRESHOLD && !warned.swap(true, Ordering::SeqCst) {
-        let _ = app.emit(
+        emit_member(
+            app,
+            project_id,
             "semantic-index-state",
             SemanticIndexStateEvent::Warning {
                 reason: format!(
@@ -305,7 +368,7 @@ fn maybe_warn_large_index(app: &AppHandle, db: &Db, warned: &Arc<AtomicBool>) {
 fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool) -> CmdResult<()> {
     let (project, base, embedder_slot, cancel_slot, warned_large) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         (
             active.project.clone(),
             guard.base_dir.clone(),
@@ -328,8 +391,12 @@ fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool
         return Ok(());
     }
 
+    let project_id = project.config.id;
+
     let Some(embedder) = build_semantic_embedder() else {
-        let _ = app.emit(
+        emit_member(
+            app,
+            project_id,
             "semantic-index-state",
             SemanticIndexStateEvent::Unavailable {
                 reason: "embedding model not installed — download it in Settings".into(),
@@ -356,7 +423,9 @@ fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool
         let mut db = match Db::open(&base, project.config.id) {
             Ok(db) => db,
             Err(e) => {
-                let _ = bg_app.emit(
+                emit_member(
+                    &bg_app,
+                    project_id,
                     "semantic-index-state",
                     SemanticIndexStateEvent::Unavailable { reason: e.to_string() },
                 );
@@ -371,7 +440,9 @@ fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool
         let progress_app = bg_app.clone();
         let result =
             engine::rebuild_semantic_index(&project, &mut db, embedder, &token, |done, total| {
-                let _ = progress_app.emit(
+                emit_member(
+                    &progress_app,
+                    project_id,
                     "semantic-index-state",
                     SemanticIndexStateEvent::Building { done, total },
                 );
@@ -379,15 +450,17 @@ fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool
         drop(guard);
         match result {
             Ok(true) => {
-                let _ = bg_app.emit("semantic-index-state", SemanticIndexStateEvent::Ready);
-                maybe_warn_large_index(&bg_app, &db, &warned_large);
+                emit_member(&bg_app, project_id, "semantic-index-state", SemanticIndexStateEvent::Ready);
+                maybe_warn_large_index(&bg_app, project_id, &db, &warned_large);
             }
             Ok(false) => {
                 // Cancelled (flag toggled off mid-build) — the disable path
                 // already told the frontend, so no event here.
             }
             Err(e) => {
-                let _ = bg_app.emit(
+                emit_member(
+                    &bg_app,
+                    project_id,
                     "semantic-index-state",
                     SemanticIndexStateEvent::Unavailable { reason: e.to_string() },
                 );
@@ -400,7 +473,16 @@ fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool
 
 /// Activate a project: register it, open its DB, start the watcher, and
 /// kick off a background scan that reports through events.
-fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult<ProjectInfo> {
+///
+/// `clear_others` controls whether pre-existing entries in `state.members`
+/// are dropped first: `true` (single-project mode — `create_project` /
+/// `open_project`) keeps the map at <=1 entry, matching the pre-workspace
+/// behavior exactly; `false` (`open_member`, workspace flag on) leaves other
+/// open members running so the map can hold more than one.
+fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others: bool) -> CmdResult<ProjectInfo> {
+    // Captured up front (Uuid is Copy) so every per-project event closure
+    // below can move its own copy in without borrowing `project` itself.
+    let project_id = project.config.id;
     // The asset protocol streams this project's videos to the webview with
     // range support and no JS memory copy. Grant its root at runtime — project
     // roots are chosen by the user, so the static config scope can't name them.
@@ -490,7 +572,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let ingest_chat_db = chat_db.clone();
     // Live on/off handle for the semantic-index build step (semantic-index
     // task 2.1). Cloned before being moved into `EngineConfig` so the same
-    // `Arc<Mutex<..>>` can also live on `ActiveProject`, letting
+    // `Arc<Mutex<..>>` can also live on `MemberRuntime`, letting
     // `set_project_feature`/`hybrid_search` read or toggle it without
     // restarting the engine — see `EngineConfig::semantic_embedder`'s doc
     // comment in ken-core for why cloning the Arc (not the config) is safe.
@@ -498,7 +580,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         Arc::new(Mutex::new(None));
     let engine_semantic_embedder = semantic_embedder.clone();
     // One-time latch for the ~50k chunk guardrail (semantic-index task 2.4).
-    // Created here (not inline in the `ActiveProject` literal below) so the
+    // Created here (not inline in the `MemberRuntime` literal below) so the
     // same Arc can also be checked from the ingest-event closure right below,
     // covering the recipe-triggered incremental rebuild path in addition to
     // the manual background rebuild in `apply_semantic_index_flag`.
@@ -546,7 +628,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                         ..row
                     });
                     if let Ok(Some(updated)) = db.get_chat(sid) {
-                        let _ = engine_app.emit("chat-updated", updated);
+                        emit_member(&engine_app, project_id, "chat-updated", updated);
                     }
                 }
                 // The engine already drives `rebuild_semantic_index` itself
@@ -562,13 +644,15 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                             if let (Ok(done), Ok(total)) =
                                 (done_s.parse::<usize>(), total_s.parse::<usize>())
                             {
-                                let _ = engine_app.emit(
+                                emit_member(
+                                    &engine_app,
+                                    project_id,
                                     "semantic-index-state",
                                     SemanticIndexStateEvent::Building { done, total },
                                 );
                                 if total > 0 && done == total {
                                     if let Ok(db) = engine_search_db.lock() {
-                                        maybe_warn_large_index(&engine_app, &db, &engine_warned_large);
+                                        maybe_warn_large_index(&engine_app, project_id, &db, &engine_warned_large);
                                     }
                                 }
                             }
@@ -576,7 +660,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                     } else if let Some(reason) =
                         activity.strip_prefix("Semantic index rebuild failed: ")
                     {
-                        let _ = engine_app.emit(
+                        emit_member(
+                            &engine_app,
+                            project_id,
                             "semantic-index-state",
                             SemanticIndexStateEvent::Unavailable {
                                 reason: reason.to_string(),
@@ -584,7 +670,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                         );
                     }
                 }
-                let _ = engine_app.emit("ingest-run-changed", ev);
+                emit_member(&engine_app, project_id, "ingest-run-changed", ev);
             },
         )
         .map_err(err)?,
@@ -605,7 +691,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                     ChatUpdate::Message { chat_id, role, content } => {
                         let id = db.append_chat_message(&chat_id, &role, &content, now).unwrap_or(0);
                         let _ = db.touch_chat(&chat_id, now);
-                        let _ = chat_app.emit("chat-message", ChatMessage {
+                        emit_member(&chat_app, project_id, "chat-message", ChatMessage {
                             id,
                             chat_id,
                             role,
@@ -617,7 +703,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                         let _ = db.set_chat_field(&chat_id, ChatField::Status, &status);
                         if let Some(d) = detail {
                             let _ = db.append_chat_message(&chat_id, "activity", &d, now);
-                            let _ = chat_app.emit("chat-message", ChatMessage {
+                            emit_member(&chat_app, project_id, "chat-message", ChatMessage {
                                 id: 0,
                                 chat_id: chat_id.clone(),
                                 role: "activity".into(),
@@ -626,7 +712,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                             });
                         }
                         if let Ok(Some(row)) = db.get_chat(&chat_id) {
-                            let _ = chat_app.emit("chat-updated", row);
+                            emit_member(&chat_app, project_id, "chat-updated", row);
                         }
                     }
                 }
@@ -645,12 +731,14 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
             SyncConfig::default(),
             move |notice| match notice {
                 SyncNotice::State { state, detail } => {
-                    let _ = sync_app.emit("sync-state", SyncStateEvent {
+                    emit_member(&sync_app, project_id, "sync-state", SyncStateEvent {
                         state: state.as_str().into(),
                         detail,
                     });
                 }
                 SyncNotice::ReviewChanged => {
+                    // Unit payload — nothing to flatten `project_id` into, so
+                    // this stays a plain, unscoped emit (S9 step 5 skip list).
                     let _ = sync_app.emit("review-changed", ());
                 }
             },
@@ -682,7 +770,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                 watch_knowledge.changed();
             }
             enqueue_transcriptions(&emit_app, &watch_state, &stats.videos_needing_transcript);
-            let _ = emit_app.emit("index-updated", stats.clone());
+            emit_member(&emit_app, project_id, "index-updated", stats.clone());
         },
     )
     .map_err(err)?;
@@ -729,7 +817,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                 let text = std::fs::read_to_string(&kenignore_path).unwrap_or_default();
                 let malformed = kenignore::malformed_lines(&text);
                 if !malformed.is_empty() {
-                    let _ = emit_app.emit(
+                    emit_member(
+                        &emit_app,
+                        project_id,
                         "kenignore-warning",
                         KenignoreWarningEvent {
                             malformed_lines: malformed,
@@ -739,7 +829,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
 
                 if let Ok(mut db) = Db::open_at(&db_path) {
                     if let Ok(stats) = scan::scan(&poll_project, &mut db) {
-                        let _ = emit_app.emit("index-updated", stats);
+                        emit_member(&emit_app, project_id, "index-updated", stats);
                     }
                 }
             }
@@ -750,7 +840,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let ocr_stop = Arc::new(AtomicBool::new(false));
     let bg_stop = Arc::new(AtomicBool::new(false));
     let info = ProjectInfo::of(&project);
-    guard.active = Some(ActiveProject {
+    let runtime = MemberRuntime {
         project: project.clone(),
         db,
         search_db,
@@ -773,13 +863,23 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
         _kenignore_watch: StopOnDrop(kenignore_stop.clone()),
         research: Arc::new(Mutex::new(std::collections::HashMap::new())),
         transcripts: Arc::new(Mutex::new(TranscriptJobs::default())),
-    });
+    };
+    // clear-before-insert keeps the map at <=1 entry (single-project mode) and
+    // drops the old runtime only after the new one is fully built, matching the
+    // previous single-assignment drop timing. Skipped when `clear_others` is
+    // false so a workspace member joins the others already open.
+    let focus_id = runtime.project.config.id;
+    if clear_others {
+        guard.members.clear();
+    }
+    guard.members.insert(focus_id, runtime);
+    guard.focused = Some(focus_id);
     drop(guard);
 
     // semantic-index task 2.1: resume the semantic index on open if the
     // project already had `semanticIndex` turned on in a previous session
     // (the flag persists in the project's `features` map, but the live
-    // embedder slot in `ActiveProject` always starts empty). Best-effort — a
+    // embedder slot in `MemberRuntime` always starts empty). Best-effort — a
     // project opening should never fail because of this.
     let resume_semantic = {
         let guard = state.lock().unwrap();
@@ -801,6 +901,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     let scan_project = project.clone();
     std::thread::spawn(move || {
         if let Ok(mut db) = Db::open(&base, scan_project.config.id) {
+            // Unit and scalar-string payloads — nothing for `emit_member` to
+            // flatten `project_id` into, so these stay plain (S9 step 5 skip
+            // list: "scan-started" is `()`, "scan-error" is a bare string).
             let _ = scan_app.emit("scan-started", ());
             match scan::scan(&scan_project, &mut db) {
                 Ok(stats) => {
@@ -809,7 +912,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                         scan_knowledge.changed();
                     }
                     enqueue_transcriptions(&scan_app, &scan_state, &stats.videos_needing_transcript);
-                    let _ = scan_app.emit("index-updated", stats);
+                    emit_member(&scan_app, project_id, "index-updated", stats);
                 }
                 Err(e) => {
                     let _ = scan_app.emit("scan-error", e.to_string());
@@ -908,7 +1011,7 @@ fn background_hydrate_worker(
         // being open means this tick is stale (the drop guard will stop us).
         let (base, project, engine, sync, auto_knowledge) = {
             let guard = state.lock().unwrap();
-            let Some(active) = guard.active.as_ref() else {
+            let Some(active) = guard.members.values().next() else {
                 continue;
             };
             if active.project.config.id != project_id {
@@ -948,7 +1051,7 @@ fn background_hydrate_worker(
                 continue;
             };
 
-            match hydrate_emitting(&app, &rel, &abs, BG_HYDRATE_DEADLINE) {
+            match hydrate_emitting(&app, project_id, &rel, &abs, BG_HYDRATE_DEADLINE) {
                 Ok(()) => {
                     backoff.remove(&rel);
                     // Re-index off the global lock, on a private handle: a
@@ -965,7 +1068,9 @@ fn background_hydrate_worker(
                         engine.sources_changed(paths.clone());
                         sync.changed(paths.clone());
                         auto_knowledge.changed();
-                        let _ = app.emit(
+                        emit_member(
+                            &app,
+                            project_id,
                             "index-updated",
                             ScanStats {
                                 changed_paths: paths,
@@ -1001,13 +1106,66 @@ fn create_project(
     name: String,
 ) -> CmdResult<ProjectInfo> {
     let project = Project::create(std::path::Path::new(&path), &name).map_err(err)?;
-    activate(&app, &state, project)
+    activate(&app, &state, project, true)
 }
 
 #[tauri::command]
 fn open_project(app: AppHandle, state: State<SharedState>, path: String) -> CmdResult<ProjectInfo> {
     let project = Project::open(std::path::Path::new(&path)).map_err(err)?;
-    activate(&app, &state, project)
+    activate(&app, &state, project, true)
+}
+
+/// Effective `workspace` flag: the global-scope registry default overridden
+/// by `settings.json`'s `features` map. Mirrors the global-layer read in
+/// `list_features` — a global-scope flag has no project layer to consult.
+fn workspace_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    let default = ken_core::features::flag("workspace")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("workspace")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Open an additional project alongside whatever is already open, without
+/// disturbing it (S9 step 6 / `workspace` change). Gated on the global
+/// `workspace` flag — off, this is a no-op error so a stray call can't grow
+/// `state.members` past one entry outside workspace mode. The asset-protocol
+/// scope grant for the member's root happens inside `activate`, same as
+/// `open_project` — nothing to duplicate here.
+#[tauri::command]
+fn open_member(app: AppHandle, state: State<SharedState>, path: String) -> CmdResult<ProjectInfo> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err("workspace disabled".into());
+        }
+    }
+    let project = Project::open(std::path::Path::new(&path)).map_err(err)?;
+    activate(&app, &state, project, false)
+}
+
+/// Close one member of an open workspace, leaving the others running. Gated
+/// on the global `workspace` flag like `open_member`. If the closed member
+/// was focused, focus falls to an arbitrary remaining member (or `None` if
+/// it was the last one) — `MemberRuntime`'s `Drop`/`StopOnDrop` fields stop
+/// its watcher and background workers.
+#[tauri::command]
+fn close_member(state: State<SharedState>, project_id: String) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err("workspace disabled".into());
+    }
+    let uuid: uuid::Uuid = project_id.parse().map_err(err)?;
+    if guard.members.remove(&uuid).is_none() {
+        return Err("project not open".into());
+    }
+    if guard.focused == Some(uuid) {
+        guard.focused = guard.members.keys().next().copied();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1047,9 +1205,7 @@ fn rename_project(
 
     // Rewrite `.ken/project.json`, validating first — an invalid name aborts
     // here before either store is touched.
-    let info = if let Some(active) =
-        guard.active.as_mut().filter(|a| a.project.config.id == uuid)
-    {
+    let info = if let Some(active) = guard.members.get_mut(&uuid) {
         active.project.set_name(&name).map_err(err)?;
         ProjectInfo::of(&active.project)
     } else {
@@ -1076,7 +1232,7 @@ fn last_project_id(state: State<SharedState>) -> CmdResult<Option<String>> {
 #[tauri::command]
 fn current_project(state: State<SharedState>) -> CmdResult<Option<ProjectInfo>> {
     let guard = state.lock().unwrap();
-    Ok(guard.active.as_ref().map(|a| ProjectInfo::of(&a.project)))
+    Ok(guard.members.values().next().map(|a| ProjectInfo::of(&a.project)))
 }
 
 #[tauri::command]
@@ -1086,21 +1242,22 @@ fn set_folder_selection(
     excluded: Vec<String>,
 ) -> CmdResult<ProjectInfo> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     active.project.set_excluded(excluded).map_err(err)?;
     let stats = scan::scan(&active.project, &mut active.db).map_err(err)?;
     let info = ProjectInfo::of(&active.project);
+    let project_id = active.project.config.id;
     let videos = stats.videos_needing_transcript.clone();
     drop(guard);
     enqueue_transcriptions(&app, state.inner(), &videos);
-    let _ = app.emit("index-updated", stats);
+    emit_member(&app, project_id, "index-updated", stats);
     Ok(info)
 }
 
 #[tauri::command]
 fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     let files = active.db.list_files().map_err(err)?;
 
     // Folders straight from disk so excluded/empty ones still show.
@@ -1145,7 +1302,7 @@ async fn search(
     // without serializing against every other command and background worker.
     let search_db = {
         let guard = state.lock().unwrap();
-        guard.active.as_ref().ok_or("no project open")?.search_db.clone()
+        member(&guard, None)?.search_db.clone()
     };
     // Run the (potentially expensive — a short/common query can touch many
     // rows) DB work on the blocking pool. As a synchronous command this ran on
@@ -1197,7 +1354,7 @@ async fn hybrid_search(
     let limit = limit.unwrap_or(30);
     let (search_db, semantic_on, embedder_slot) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         (
             active.search_db.clone(),
             semantic_index_enabled(&guard.app_settings, &active.project),
@@ -1287,7 +1444,7 @@ fn set_project_feature(
 
     let mut project = {
         let guard = state.lock().unwrap();
-        guard.active.as_ref().ok_or("no project open")?.project.clone()
+        member(&guard, None)?.project.clone()
     };
     project
         .config
@@ -1304,7 +1461,7 @@ fn set_project_feature(
     // e.g. a future re-open) in sync with what was just persisted.
     {
         let mut guard = state.lock().unwrap();
-        if let Some(active) = guard.active.as_mut() {
+        if let Some(active) = guard.members.values_mut().next() {
             active.project = project.clone();
         }
     }
@@ -1407,8 +1564,9 @@ fn list_features(
         let guard = state.lock().unwrap();
         let active = match &project_id {
             Some(id) => guard
-                .active
-                .as_ref()
+                .members
+                .values()
+                .next()
                 .filter(|a| a.project.config.id.to_string() == *id)
                 .map(|a| a.project.clone()),
             None => None,
@@ -1475,7 +1633,7 @@ fn list_features(
 #[tauri::command]
 fn get_semantic_index(state: State<SharedState>) -> CmdResult<bool> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     Ok(semantic_index_enabled(&guard.app_settings, &active.project))
 }
 
@@ -1489,7 +1647,7 @@ const CLOUD_ONLY_ERR: &str = "CLOUD_ONLY";
 /// command in the app.
 fn resolve_path(state: &State<SharedState>, rel_path: &str) -> CmdResult<PathBuf> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     active.project.resolve(rel_path).map_err(err)
 }
 
@@ -1531,6 +1689,7 @@ struct HydrationProgress {
 /// goes out so the UI can treat 100% as "the bytes are here".
 fn hydrate_emitting(
     app: &AppHandle,
+    project_id: uuid::Uuid,
     rel_path: &str,
     abs: &Path,
     deadline: Duration,
@@ -1543,7 +1702,9 @@ fn hydrate_emitting(
         let now_ms = start.elapsed().as_millis() as u64;
         let done = total > 0 && downloaded >= total;
         if done || throttle.should_emit(downloaded, total, now_ms) {
-            let _ = app.emit(
+            emit_member(
+                &app,
+                project_id,
                 "hydration-progress",
                 HydrationProgress { rel_path: rel.clone(), downloaded, total },
             );
@@ -1562,21 +1723,12 @@ async fn hydrate_file(
     rel_path: String,
 ) -> CmdResult<()> {
     let abs = resolve_path(&state, &rel_path)?;
-    let path = abs.clone();
-    let progress_app = app.clone();
-    let progress_rel = rel_path.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        hydrate_emitting(&progress_app, &progress_rel, &path, cloud::DEFAULT_DEADLINE)
-    })
-    .await
-    .map_err(err)?
-    .map_err(err)?;
 
-    // Snapshot everything the re-index and its notifications need, then drop
-    // the global lock immediately.
+    // Snapshot everything the download, re-index, and notifications need, then
+    // drop the global lock immediately — none of this may hold it.
     let (base, project, engine, sync, auto_knowledge) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         (
             guard.base_dir.clone(),
             active.project.clone(),
@@ -1586,6 +1738,16 @@ async fn hydrate_file(
         )
     };
     let project_id = project.config.id;
+
+    let path = abs.clone();
+    let progress_app = app.clone();
+    let progress_rel = rel_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        hydrate_emitting(&progress_app, project_id, &progress_rel, &path, cloud::DEFAULT_DEADLINE)
+    })
+    .await
+    .map_err(err)?
+    .map_err(err)?;
 
     // The bytes are here now. Re-index so the content becomes searchable;
     // hydration changes neither size nor mtime, so nothing else would notice.
@@ -1611,7 +1773,9 @@ async fn hydrate_file(
         engine.sources_changed(paths.clone());
         sync.changed(paths.clone());
         auto_knowledge.changed();
-        let _ = app.emit(
+        emit_member(
+            &app,
+            project_id,
             "index-updated",
             ScanStats {
                 changed_paths: paths,
@@ -1630,7 +1794,7 @@ fn save_file(
     content: String,
 ) -> CmdResult<i64> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     std::fs::write(&abs, &content).map_err(err)?;
     // Index immediately — no need to wait for the watcher debounce.
@@ -1667,7 +1831,7 @@ fn save_file(
 #[tauri::command]
 fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRowDto>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let mut row = active.db.get_file(&rel_path).map_err(err)?;
     // Read-time authority over `kind`: the column is STORED at index time, so a
     // file whose classification changed after it was indexed (e.g. `.vtt` moving
@@ -1686,7 +1850,7 @@ fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<Fi
 #[tauri::command]
 fn extracted_text(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     Ok(ken_core::extract::extract(&abs)
         .map(|e| e.text)
@@ -1714,7 +1878,7 @@ struct OcrRegionDto {
 #[tauri::command]
 fn get_ocr_regions(state: State<SharedState>, rel_path: String) -> CmdResult<Vec<OcrRegionDto>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let rows = active.db.get_ocr_regions(&rel_path).map_err(err)?;
     Ok(rows
         .into_iter()
@@ -1737,7 +1901,7 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
     // hangs.
     let (project, base, sync, knowledge, running) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         (
             active.project.clone(),
             guard.base_dir.clone(),
@@ -1751,6 +1915,7 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
         return Ok(ScanStats::default());
     }
 
+    let project_id = project.config.id;
     let bg_app = app.clone();
     let bg_state = state.inner().clone();
     std::thread::spawn(move || {
@@ -1771,7 +1936,7 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
                             &bg_state,
                             &stats.videos_needing_transcript,
                         );
-                        let _ = bg_app.emit("index-updated", stats);
+                        emit_member(&bg_app, project_id, "index-updated", stats);
                     }
                     Err(e) => {
                         let _ = bg_app.emit("scan-error", e.to_string());
@@ -1795,7 +1960,7 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
 #[tauri::command]
 fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_path(abs.to_string_lossy(), None::<&str>)
@@ -2031,7 +2196,7 @@ fn record_start(
     }
     let (root, base) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("Open a project first.")?;
+        let active = member(&guard, None).map_err(|_| "Open a project first.")?;
         (active.project.root.clone(), guard.base_dir.clone())
     };
     let slot = { state.lock().unwrap().record.clone() };
@@ -2252,6 +2417,9 @@ fn finish_recording(
     duration: Duration,
 ) -> CmdResult<()> {
     use chrono::{Datelike, Local, Timelike};
+    // Best-effort: the project may have switched by the time transcription
+    // starts, so `transcript-progress` below just falls back to unscoped.
+    let transcribe_project_id = state.lock().unwrap().members.values().next().map(|a| a.project.config.id);
     let now = Local::now();
     let (y, mo, d, h, mi) = (now.year(), now.month(), now.day(), now.hour(), now.minute());
     let recordings = root.join("Recordings");
@@ -2322,6 +2490,7 @@ fn finish_recording(
                         }
                         emit_transcript_phase(
                             &app,
+                            transcribe_project_id,
                             &rel,
                             transcript::TranscriptPhase::Transcribing(overall),
                         );
@@ -2385,16 +2554,24 @@ fn finish_recording(
     let sys_rel = sys_moved.map(|(_, rel)| rel);
 
     // Index the new files so they're searchable + automation-eligible.
-    {
+    let project_id = {
         let mut guard = state.lock().unwrap();
-        if let Some(active) = guard.active.as_mut() {
+        let id = guard.members.values().next().map(|a| a.project.config.id);
+        if let Some(active) = guard.members.values_mut().next() {
             let _ = scan::refresh_path(&active.project, &mut active.db, &md_rel);
             for rel in [mic_rel, sys_rel].into_iter().flatten() {
                 let _ = scan::refresh_path(&active.project, &mut active.db, &rel);
             }
         }
+        id
+    };
+    match project_id {
+        Some(id) => emit_member(&app, id, "index-updated", ScanStats::default()),
+        // Project closed mid-save — nothing to scope the event to.
+        None => {
+            let _ = app.emit("index-updated", ScanStats::default());
+        }
     }
-    let _ = app.emit("index-updated", ScanStats::default());
 
     if let Some(e) = failure {
         let _ = app.emit(
@@ -2434,7 +2611,7 @@ fn move_file(
 ) -> CmdResult<()> {
     let (from_abs, to_abs) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         let from_abs = active.project.resolve(&from_rel).map_err(err)?;
         let to_abs = active.project.resolve(&to_rel).map_err(err)?;
         (from_abs, to_abs)
@@ -2478,16 +2655,17 @@ fn move_file(
     }
 
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     if from_is_dir {
         // Drop the old subtree's rows, then rescan so every child re-indexes at
         // its new path (unchanged files elsewhere are skipped by the scanner).
         active.db.remove_folder(&from_rel).map_err(err)?;
+        let project_id = active.project.config.id;
         let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
         let videos = stats.videos_needing_transcript.clone();
         drop(guard);
         enqueue_transcriptions(&app, state.inner(), &videos);
-        let _ = app.emit("index-updated", stats);
+        emit_member(&app, project_id, "index-updated", stats);
     } else {
         scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
         scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
@@ -2518,7 +2696,7 @@ fn deindex_removed(project: &Project, db: &mut Db, rel: &str, is_dir: bool) -> k
 fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let abs = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         active.project.resolve(&rel_path).map_err(err)?
     };
 
@@ -2531,10 +2709,11 @@ fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> C
     trash::delete(&abs).map_err(err)?;
 
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     deindex_removed(&active.project, &mut active.db, &rel_path, is_dir).map_err(err)?;
+    let project_id = active.project.config.id;
     drop(guard);
-    let _ = app.emit("index-updated", ScanStats::default());
+    emit_member(&app, project_id, "index-updated", ScanStats::default());
     Ok(())
 }
 
@@ -2545,7 +2724,7 @@ fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> C
 #[tauri::command]
 fn create_folder(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     if abs.exists() {
         let name = rel_path.rsplit('/').next().unwrap_or(&rel_path);
@@ -2567,7 +2746,7 @@ fn create_folder(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 #[tauri::command]
 fn create_document(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     let desired_abs = active.project.resolve(&rel_path).map_err(err)?;
     let dir = desired_abs
         .parent()
@@ -2671,7 +2850,7 @@ fn project_folders(root: &std::path::Path) -> Vec<String> {
 fn import_begin(state: State<SharedState>, src_path: String) -> CmdResult<ImportDto> {
     let root = {
         let guard = state.lock().unwrap();
-        guard.active.as_ref().ok_or("no project open")?.project.root.clone()
+        member(&guard, None)?.project.root.clone()
     };
     let src = PathBuf::from(&src_path);
     if !src.is_file() {
@@ -2708,7 +2887,7 @@ async fn import_classify(
 ) -> CmdResult<PlacementDto> {
     let root = {
         let guard = state.lock().unwrap();
-        guard.active.as_ref().ok_or("no project open")?.project.root.clone()
+        member(&guard, None)?.project.root.clone()
     };
     let default = || PlacementDto { folder: String::new(), is_new: false, rationale: None };
     let Some(binary) = ken_core::runner::discover_claude() else {
@@ -2769,7 +2948,7 @@ fn import_commit(
 ) -> CmdResult<String> {
     let (root, project, engine, sync, auto_knowledge) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         (
             active.project.root.clone(),
             active.project.clone(),
@@ -2809,7 +2988,7 @@ fn import_commit(
 
     let changed = {
         let mut guard = state.lock().unwrap();
-        let active = guard.active.as_mut().ok_or("no project open")?;
+        let active = member_mut(&mut guard, None)?;
         scan::refresh_path(&active.project, &mut active.db, &final_rel).map_err(err)?
     };
     if changed {
@@ -2817,7 +2996,9 @@ fn import_commit(
         engine.sources_changed(paths.clone());
         sync.changed(paths.clone());
         auto_knowledge.changed();
-        let _ = app.emit(
+        emit_member(
+            &app,
+            project.config.id,
             "index-updated",
             ScanStats { changed_paths: paths, ..Default::default() },
         );
@@ -2830,7 +3011,7 @@ fn import_commit(
 fn import_cancel(state: State<SharedState>, import_id: String) -> CmdResult<()> {
     let root = {
         let guard = state.lock().unwrap();
-        guard.active.as_ref().ok_or("no project open")?.project.root.clone()
+        member(&guard, None)?.project.root.clone()
     };
     let _ = std::fs::remove_dir_all(ken_core::import::staging_dir(&root, &import_id));
     Ok(())
@@ -2890,7 +3071,7 @@ fn shell_word(s: &str) -> String {
 #[tauri::command]
 fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let root = active.project.root.to_string_lossy().into_owned();
     let binary_path = find_ken_mcp().map(|p| p.to_string_lossy().into_owned());
     // When the binary isn't found the strings still render with the bare
@@ -2930,7 +3111,7 @@ to read them."
 #[tauri::command]
 fn file_mtime(state: State<SharedState>, rel_path: String) -> CmdResult<i64> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     Ok(abs
         .metadata()
@@ -2995,20 +3176,35 @@ struct TranscriptProgress {
     pct: Option<u8>,
 }
 
-fn emit_transcript_phase(app: &AppHandle, rel: &str, phase: transcript::TranscriptPhase) {
+/// `project_id` is `None` only for the recording-finish path, where the
+/// active project is looked up once, best-effort, before transcription
+/// starts (see `finish_recording`) — everywhere else it's always known.
+fn emit_transcript_phase(
+    app: &AppHandle,
+    project_id: Option<uuid::Uuid>,
+    rel: &str,
+    phase: transcript::TranscriptPhase,
+) {
     let (phase, pct) = match phase {
         transcript::TranscriptPhase::Extracting => ("extracting", None),
         transcript::TranscriptPhase::Transcribing(p) => ("transcribing", Some(p)),
     };
-    let _ = app.emit(
-        "transcript-progress",
-        TranscriptProgress { rel_path: rel.to_string(), phase: phase.into(), pct },
-    );
+    let payload = TranscriptProgress { rel_path: rel.to_string(), phase: phase.into(), pct };
+    match project_id {
+        Some(id) => emit_member(app, id, "transcript-progress", payload),
+        None => {
+            let _ = app.emit("transcript-progress", payload);
+        }
+    }
 }
 
 /// A `ProgressFn` that forwards to `transcript-progress`, dropping repeated
 /// percents (Whisper's callback re-fires the same value between segments).
-fn transcript_progress_sink(app: AppHandle, rel: String) -> transcript::ProgressFn {
+fn transcript_progress_sink(
+    app: AppHandle,
+    project_id: uuid::Uuid,
+    rel: String,
+) -> transcript::ProgressFn {
     let last = std::sync::atomic::AtomicI32::new(-1);
     std::sync::Arc::new(move |phase| {
         if let transcript::TranscriptPhase::Transcribing(p) = phase {
@@ -3016,7 +3212,7 @@ fn transcript_progress_sink(app: AppHandle, rel: String) -> transcript::Progress
                 return;
             }
         }
-        emit_transcript_phase(&app, &rel, phase);
+        emit_transcript_phase(&app, Some(project_id), &rel, phase);
     })
 }
 
@@ -3036,7 +3232,7 @@ struct TranscriptDto {
 fn video_transcript(state: State<SharedState>, rel_path: String) -> CmdResult<TranscriptDto> {
     let (abs, root, generating) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         let abs = active.project.resolve(&rel_path).map_err(err)?;
         let generating = active.transcripts.lock().unwrap().in_flight.contains(&rel_path);
         (abs, active.project.root.clone(), generating)
@@ -3064,7 +3260,7 @@ fn video_transcript(state: State<SharedState>, rel_path: String) -> CmdResult<Tr
 fn generate_transcript(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let (root, base, project_id, jobs) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         active.project.resolve(&rel_path).map_err(err)?; // reject path escape
         (
             active.project.root.clone(),
@@ -3115,7 +3311,7 @@ fn enqueue_transcriptions(app: &AppHandle, state: &SharedState, rels: &[String])
     }
     let (root, base, project_id, jobs) = {
         let guard = state.lock().unwrap();
-        let Some(active) = guard.active.as_ref() else {
+        let Some(active) = guard.members.values().next() else {
             return;
         };
         // Auto-transcription during indexing is opt-in (off by default). The
@@ -3169,7 +3365,8 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
     }
     let app = app.clone();
     std::thread::spawn(move || {
-        let on_progress = transcript_progress_sink(app.clone(), job.rel_path.clone());
+        let on_progress =
+            transcript_progress_sink(app.clone(), job.project_id, job.rel_path.clone());
         let result = transcript::generate_and_cache_with_progress(
             &job.ffmpeg, &job.model, &job.root, &job.rel_path, on_progress,
         );
@@ -3177,17 +3374,19 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
             Ok(_) => {
                 // Re-index the video so the fresh transcript is searchable.
                 let mut guard = job.state.lock().unwrap();
-                if let Some(active) = guard.active.as_mut() {
+                if let Some(active) = guard.members.values_mut().next() {
                     if active.project.config.id == job.project_id {
                         let _ = scan::refresh_path(&active.project, &mut active.db, &job.rel_path);
                     }
                 }
                 drop(guard);
-                let _ = app.emit("index-updated", ScanStats::default());
+                emit_member(&app, job.project_id, "index-updated", ScanStats::default());
             }
             Err(e) => {
                 job.jobs.lock().unwrap().attempted.insert(job.rel_path.clone());
                 if !job.quiet {
+                    // Scalar string payload — nothing to flatten `project_id`
+                    // into (S9 step 5 skip list), so this stays plain.
                     let _ = app.emit("transcript-error", e.to_string());
                 }
             }
@@ -3375,8 +3574,9 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
                     let enabled = {
                         let guard = state.lock().unwrap();
                         guard
-                            .active
-                            .as_ref()
+                            .members
+                            .values()
+                            .next()
                             .map(|a| semantic_index_enabled(&guard.app_settings, &a.project))
                             .unwrap_or(false)
                     };
@@ -3488,7 +3688,7 @@ fn kebab(name: &str) -> String {
 #[tauri::command]
 fn list_ingests(state: State<SharedState>) -> CmdResult<Vec<IngestSummary>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let now = engine::now_epoch();
     let mut out = Vec::new();
     for entry in recipe::list(&active.project).map_err(err)? {
@@ -3513,7 +3713,7 @@ fn list_ingests(state: State<SharedState>) -> CmdResult<Vec<IngestSummary>> {
 #[tauri::command]
 fn get_ingest(state: State<SharedState>, slug: String) -> CmdResult<IngestDetail> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let recipe = recipe::load_slug(&active.project, &slug).map_err(err)?;
     let runs = active.db.list_runs(&slug, 20).map_err(err)?;
     let resolved_rules = recipe::resolve_rules(&recipe, &active.project);
@@ -3523,7 +3723,7 @@ fn get_ingest(state: State<SharedState>, slug: String) -> CmdResult<IngestDetail
 #[tauri::command]
 fn save_ingest(state: State<SharedState>, form: IngestForm) -> CmdResult<Recipe> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let slug = match form.slug {
         Some(s) => s,
         None => {
@@ -3571,14 +3771,14 @@ fn save_ingest(state: State<SharedState>, form: IngestForm) -> CmdResult<Recipe>
 #[tauri::command]
 fn delete_ingest(state: State<SharedState>, slug: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     recipe::delete(&active.project, &slug).map_err(err)
 }
 
 #[tauri::command]
 fn run_ingest(state: State<SharedState>, slug: String, full: Option<bool>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     active.engine.trigger(&slug, full.unwrap_or(true));
     Ok(())
 }
@@ -3586,7 +3786,7 @@ fn run_ingest(state: State<SharedState>, slug: String, full: Option<bool>) -> Cm
 #[tauri::command]
 fn cancel_run(state: State<SharedState>, slug: String, kind: Option<String>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     // Default to Ingest for older callers; automations pass kind="automation".
     let kind = match kind.as_deref() {
         Some("automation") => engine::RunKind::Automation,
@@ -3599,9 +3799,11 @@ fn cancel_run(state: State<SharedState>, slug: String, kind: Option<String>) -> 
 /// Tell listeners (ingests + review stores) a run changed outside the
 /// engine — approvals and discards resolve runs from a command, not a run
 /// thread, so the engine never emits for them.
-fn emit_run_changed(app: &AppHandle, db: &Db, run_id: i64) {
+fn emit_run_changed(app: &AppHandle, project_id: uuid::Uuid, db: &Db, run_id: i64) {
     if let Ok(Some(run)) = db.get_run(run_id) {
-        let _ = app.emit(
+        emit_member(
+            app,
+            project_id,
             "ingest-run-changed",
             IngestEvent::at(&run.kind, &run.slug, run_id, run.session_id, &run.status, run.summary),
         );
@@ -3611,27 +3813,27 @@ fn emit_run_changed(app: &AppHandle, db: &Db, run_id: i64) {
 #[tauri::command]
 fn approve_run(app: AppHandle, state: State<SharedState>, run_id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     engine::approve_run(&active.project, &mut active.db, run_id).map_err(err)?;
     // Applied files land on disk; index them promptly.
     let _ = scan::scan(&active.project, &mut active.db);
-    emit_run_changed(&app, &active.db, run_id);
+    emit_run_changed(&app, active.project.config.id, &active.db, run_id);
     Ok(())
 }
 
 #[tauri::command]
 fn discard_run(app: AppHandle, state: State<SharedState>, run_id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     engine::discard_run(&active.project, &mut active.db, run_id).map_err(err)?;
-    emit_run_changed(&app, &active.db, run_id);
+    emit_run_changed(&app, active.project.config.id, &active.db, run_id);
     Ok(())
 }
 
 #[tauri::command]
 fn pending_approvals(state: State<SharedState>) -> CmdResult<Vec<RunRow>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     active.db.runs_with_status("pending_approval").map_err(err)
 }
 
@@ -3663,14 +3865,14 @@ fn default_true_cmd() -> bool {
 #[tauri::command]
 fn list_automations(state: State<SharedState>) -> CmdResult<Vec<Automation>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     automation::list_ok(&active.project).map_err(err)
 }
 
 #[tauri::command]
 fn get_automation(state: State<SharedState>, slug: String) -> CmdResult<AutomationDetail> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let automation = automation::load_slug(&active.project, &slug).map_err(err)?;
     let runs = active.db.list_runs_of_kind(&slug, "automation", 20).map_err(err)?;
     Ok(AutomationDetail { automation, runs })
@@ -3679,7 +3881,7 @@ fn get_automation(state: State<SharedState>, slug: String) -> CmdResult<Automati
 #[tauri::command]
 fn save_automation(state: State<SharedState>, form: AutomationForm) -> CmdResult<Automation> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let slug = match form.slug {
         Some(s) => s,
         None => {
@@ -3715,14 +3917,14 @@ fn save_automation(state: State<SharedState>, form: AutomationForm) -> CmdResult
 #[tauri::command]
 fn delete_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     automation::delete(&active.project, &slug).map_err(err)
 }
 
 #[tauri::command]
 fn run_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     active.engine.run_automation(&slug);
     Ok(())
 }
@@ -3730,7 +3932,7 @@ fn run_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
 #[tauri::command]
 fn approve_automation_proposal(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     engine::approve_automation_proposal(&active.engine, &mut active.db, item_id).map_err(err)?;
     let _ = app.emit("review-changed", ());
     Ok(())
@@ -3739,7 +3941,7 @@ fn approve_automation_proposal(app: AppHandle, state: State<SharedState>, item_i
 #[tauri::command]
 fn discard_automation_proposal(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     engine::discard_automation_proposal(&mut active.db, item_id).map_err(err)?;
     let _ = app.emit("review-changed", ());
     Ok(())
@@ -3800,7 +4002,7 @@ fn stored_kind(kind: &str) -> String {
 #[tauri::command]
 fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let now = engine::now_epoch();
     let mut items: Vec<InboxItem> = Vec::new();
 
@@ -3971,7 +4173,7 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
 #[tauri::command]
 fn resolve_review_item(state: State<SharedState>, id: i64) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     active
         .db
         .resolve_review_item(id, engine::now_epoch())
@@ -3983,7 +4185,7 @@ fn resolve_review_item(state: State<SharedState>, id: i64) -> CmdResult<()> {
 /// Load the current project's private user-state from app-data. Helper for the
 /// ignore commands so each one reads/writes the same non-synced file.
 fn load_user_state(guard: &AppState) -> CmdResult<(std::path::PathBuf, uuid::Uuid, UserState)> {
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(guard, None)?;
     let base = guard.base_dir.clone();
     let id = active.project.config.id;
     let us = UserState::load(&base, id);
@@ -4037,7 +4239,7 @@ fn index_versions(files: &[FileRow]) -> Vec<(String, (i64, i64))> {
 #[tauri::command]
 fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let files = active.db.list_files().map_err(err)?;
     let (base, id, mut us) = load_user_state(&guard)?;
     let index = index_versions(&files);
@@ -4054,7 +4256,7 @@ fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
 #[tauri::command]
 fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let Some(row) = active.db.get_file(&rel_path).map_err(err)? else {
         return Ok(()); // not indexed (yet) — nothing to mark
     };
@@ -4069,7 +4271,7 @@ fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 #[tauri::command]
 fn mark_all_seen(state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let files = active.db.list_files().map_err(err)?;
     let (base, id, mut us) = load_user_state(&guard)?;
     if us.mark_all_seen(&index_versions(&files)) {
@@ -4112,14 +4314,14 @@ fn sync_status_of(project: &Project) -> SyncStatus {
 #[tauri::command]
 fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     Ok(sync_status_of(&active.project))
 }
 
 #[tauri::command]
 fn set_sync_auto(app: AppHandle, state: State<SharedState>, auto: bool) -> CmdResult<SyncStatus> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     let mut obj = active
         .project
         .config
@@ -4137,7 +4339,7 @@ fn set_sync_auto(app: AppHandle, state: State<SharedState>, auto: bool) -> CmdRe
 
     let status = sync_status_of(&active.project);
     // Reflect the toggle in the dot immediately; a fresh pull confirms.
-    let _ = app.emit("sync-state", SyncStateEvent {
+    emit_member(&app, active.project.config.id, "sync-state", SyncStateEvent {
         state: if status.active { "synced" } else { "off" }.into(),
         detail: None,
     });
@@ -4150,7 +4352,7 @@ fn set_sync_auto(app: AppHandle, state: State<SharedState>, auto: bool) -> CmdRe
 #[tauri::command]
 fn sync_now(state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     active.sync.sync_now();
     Ok(())
 }
@@ -4175,7 +4377,7 @@ fn resolve_conflict(
     content: Option<String>,
 ) -> CmdResult<String> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     let item = active
         .db
         .get_review_item(item_id)
@@ -4229,7 +4431,7 @@ fn resolve_conflict_copy(
     resolution: String,
 ) -> CmdResult<String> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     let item = active
         .db
         .get_review_item(item_id)
@@ -4292,7 +4494,7 @@ fn resolve_conflict_copy(
 #[tauri::command]
 fn set_ingest_runner_mode(state: State<SharedState>, mode: String) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     if mode != "hidden-tui" && mode != "headless" {
         return Err("unknown runner mode".into());
     }
@@ -4308,7 +4510,7 @@ fn set_ingest_runner_mode(state: State<SharedState>, mode: String) -> CmdResult<
 #[tauri::command]
 fn get_background_index(state: State<SharedState>) -> CmdResult<bool> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     Ok(ken_core::bg_hydrate::background_index_enabled(&active.project))
 }
 
@@ -4318,7 +4520,7 @@ fn get_background_index(state: State<SharedState>) -> CmdResult<bool> {
 #[tauri::command]
 fn set_background_index(state: State<SharedState>, enabled: bool) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     active
         .project
         .config
@@ -4331,7 +4533,7 @@ fn set_background_index(state: State<SharedState>, enabled: bool) -> CmdResult<(
 #[tauri::command]
 fn get_transcribe_on_index(state: State<SharedState>) -> CmdResult<bool> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     Ok(transcript::transcribe_on_index_enabled(&active.project))
 }
 
@@ -4342,7 +4544,7 @@ fn get_transcribe_on_index(state: State<SharedState>) -> CmdResult<bool> {
 #[tauri::command]
 fn set_transcribe_on_index(state: State<SharedState>, enabled: bool) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = guard.active.as_mut().ok_or("no project open")?;
+    let active = member_mut(&mut guard, None)?;
     active
         .project
         .config
@@ -4425,7 +4627,7 @@ fn local_hour() -> u32 {
 /// fallback without calling Claude.
 fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let Some(active) = guard.active.as_mut() else {
+    let Some(active) = guard.members.values_mut().next() else {
         return Ok(());
     };
     let today = local_date_today();
@@ -4465,7 +4667,7 @@ fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> C
             .map_err(err)?;
         done(&running);
         if let Ok(Some(row)) = active.db.get_digest(&today) {
-            let _ = app.emit("digest-updated", digest_dto(&row));
+            emit_member(app, active.project.config.id, "digest-updated", digest_dto(&row));
         }
         return Ok(());
     }
@@ -4500,8 +4702,9 @@ fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> C
         let still_active = || {
             let guard = thread_state.lock().unwrap();
             guard
-                .active
-                .as_ref()
+                .members
+                .values()
+                .next()
                 .is_some_and(|a| a.project.config.id == project_id)
         };
         match outcome {
@@ -4510,7 +4713,7 @@ fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> C
                     let _ = db.upsert_digest(&today, &text, engine::now_epoch());
                     if let Ok(Some(row)) = db.get_digest(&today) {
                         if still_active() {
-                            let _ = thread_app.emit("digest-updated", digest_dto(&row));
+                            emit_member(&thread_app, project_id, "digest-updated", digest_dto(&row));
                         }
                     }
                 }
@@ -4538,7 +4741,7 @@ fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> C
 #[tauri::command]
 fn current_digest(state: State<SharedState>) -> CmdResult<Option<DigestDto>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     Ok(active
         .db
         .get_digest(&local_date_today())
@@ -4620,12 +4823,13 @@ async fn quick_answer(
     // supersede counter (microseconds), then release it so the FTS query and the
     // per-source excerpt reads run on the dedicated read-only handle off the lock
     // (mirrors the `search` command), never freezing the UI event loop.
-    let (search_db, root, qa_gen, claude) = {
+    let (search_db, root, project_id, qa_gen, claude) = {
         let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
+        let active = member(&guard, None)?;
         (
             active.search_db.clone(),
             active.project.root.clone(),
+            active.project.config.id,
             guard.qa_gen.clone(),
             ken_core::runner::discover_claude(),
         )
@@ -4676,7 +4880,9 @@ async fn quick_answer(
                 if qa_gen.load(Ordering::SeqCst) != my_gen {
                     return false; // superseded by a newer query
                 }
-                let _ = app.emit(
+                emit_member(
+                    &app,
+                    project_id,
                     "quick-answer-delta",
                     QuickAnswerDelta { query: query.clone(), delta: piece.to_string() },
                 );
@@ -4689,7 +4895,9 @@ async fn quick_answer(
             ) {
                 Ok(text) if qa_gen.load(Ordering::SeqCst) == my_gen => {
                     let parsed = digest::parse_digest(&text);
-                    let _ = app.emit(
+                    emit_member(
+                        &app,
+                        project_id,
                         "quick-answer",
                         QuickAnswerEvent { query, body: parsed.body, sources: parsed.sources },
                     );
@@ -4698,7 +4906,7 @@ async fn quick_answer(
                 Err(_) => {
                     // Runtime load/inference failure → fall back to Claude,
                     // still honouring the generation id.
-                    run_claude_quick_answer(app, root, claude, query, sources, qa_gen, my_gen);
+                    run_claude_quick_answer(app, project_id, root, claude, query, sources, qa_gen, my_gen);
                 }
             }
         });
@@ -4710,7 +4918,7 @@ async fn quick_answer(
         return Ok(false); // neither local nor Claude — stop asking
     };
     std::thread::spawn(move || {
-        run_claude_quick_answer(app, root, Some(binary), query, sources, qa_gen, my_gen);
+        run_claude_quick_answer(app, project_id, root, Some(binary), query, sources, qa_gen, my_gen);
     });
     Ok(true)
 }
@@ -4719,6 +4927,7 @@ async fn quick_answer(
 /// supersede generation id so a stale answer never lands in the card.
 fn run_claude_quick_answer(
     app: AppHandle,
+    project_id: uuid::Uuid,
     root: std::path::PathBuf,
     claude: Option<std::path::PathBuf>,
     query: String,
@@ -4739,7 +4948,9 @@ fn run_claude_quick_answer(
             return; // superseded
         }
         let parsed = digest::parse_digest(&text);
-        let _ = app.emit(
+        emit_member(
+            &app,
+            project_id,
             "quick-answer",
             QuickAnswerEvent { query, body: parsed.body, sources: parsed.sources },
         );
@@ -4816,7 +5027,7 @@ struct KnowledgeModelState {
 #[tauri::command]
 fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let (entities, edges) = active.db.list_entities_with_edges().map_err(err)?;
     let (analyzed, total) = active.db.extraction_coverage().map_err(err)?;
     let failed = active.db.extraction_failed_count().map_err(err)?;
@@ -4846,7 +5057,7 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
 #[tauri::command]
 fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let Some(binary) = ken_core::runner::discover_claude() else {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     };
@@ -4888,11 +5099,11 @@ fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
     // while it reads must survive into the next rebuild.
     job.tracker.build_started(Instant::now());
 
-    let _ = app.emit("knowledge-model-state", KnowledgeModelState {
+    let project_id = job.project.config.id;
+    emit_member(app, project_id, "knowledge-model-state", KnowledgeModelState {
         state: "building".into(),
         detail: None,
     });
-    let project_id = job.project.config.id;
     let thread_app = app.clone();
     std::thread::spawn(move || {
         let today = local_date_today();
@@ -4925,7 +5136,7 @@ fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
                 detail: Some(detail),
             },
         };
-        let _ = thread_app.emit("knowledge-model-state", event);
+        emit_member(&thread_app, project_id, "knowledge-model-state", event);
         // Stamp the attempt BEFORE clearing the guard: a later manual rebuild
         // must never see "not running" together with a stale attempt clock, or
         // a failing build could restart immediately.
@@ -4988,7 +5199,7 @@ fn extraction_worker(
         // (slow) generation so IPC stays responsive.
         let base = {
             let guard = state.lock().unwrap();
-            match guard.active.as_ref() {
+            match guard.members.values().next() {
                 Some(active) if active.project.config.id == project_id => {
                     guard.base_dir.clone()
                 }
@@ -5075,7 +5286,7 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
         // Vision pass so IPC stays responsive.
         let (base, root) = {
             let guard = state.lock().unwrap();
-            match guard.active.as_ref() {
+            match guard.members.values().next() {
                 Some(active) if active.project.config.id == project_id => {
                     (guard.base_dir.clone(), active.project.root.clone())
                 }
@@ -5100,7 +5311,7 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
             // Queue empty: flush a trailing throttled emit, self-heal errored
             // rows that still have retries, then idle.
             if pending_emit {
-                let _ = app.emit("index-updated", ScanStats::default());
+                emit_member(&app, project_id, "index-updated", ScanStats::default());
                 last_emit = Instant::now();
                 pending_emit = false;
             }
@@ -5145,7 +5356,7 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
                 if db.mark_ocr_done(&rel, &hash, &rows).is_ok() {
                     pending_emit = true;
                     if last_emit.elapsed() >= Duration::from_millis(750) {
-                        let _ = app.emit("index-updated", ScanStats::default());
+                        emit_member(&app, project_id, "index-updated", ScanStats::default());
                         last_emit = Instant::now();
                         pending_emit = false;
                     }
@@ -5172,7 +5383,7 @@ fn is_pdf(rel: &str) -> bool {
 #[tauri::command]
 fn list_chats(state: State<SharedState>) -> CmdResult<Vec<ChatRow>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let result = active.chat_db.lock().unwrap().list_chats().map_err(err);
     result
 }
@@ -5180,7 +5391,7 @@ fn list_chats(state: State<SharedState>) -> CmdResult<Vec<ChatRow>> {
 #[tauri::command]
 fn chat_transcript(state: State<SharedState>, chat_id: String) -> CmdResult<Vec<ChatMessage>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let result = active.chat_db.lock().unwrap().chat_messages(&chat_id).map_err(err);
     result
 }
@@ -5188,7 +5399,7 @@ fn chat_transcript(state: State<SharedState>, chat_id: String) -> CmdResult<Vec<
 #[tauri::command]
 fn create_chat(app: AppHandle, state: State<SharedState>) -> CmdResult<ChatRow> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let now = engine::now_epoch();
     let row = ChatRow {
         id: uuid::Uuid::new_v4().to_string(),
@@ -5202,7 +5413,7 @@ fn create_chat(app: AppHandle, state: State<SharedState>) -> CmdResult<ChatRow> 
         model: None,
     };
     active.chat_db.lock().unwrap().upsert_chat(&row).map_err(err)?;
-    let _ = app.emit("chat-updated", row.clone());
+    emit_member(&app, active.project.config.id, "chat-updated", row.clone());
     Ok(row)
 }
 
@@ -5216,7 +5427,7 @@ fn send_chat_message(
     focused_file: Option<String>,
 ) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let engine_arc = active
         .chat_engine
         .as_ref()
@@ -5239,7 +5450,7 @@ fn send_chat_message(
         let had_messages = !db.chat_messages(&chat_id).map_err(err)?.is_empty();
         let id = db.append_chat_message(&chat_id, "user", &text, now).map_err(err)?;
         let _ = db.touch_chat(&chat_id, now);
-        let _ = app.emit("chat-message", ChatMessage {
+        emit_member(&app, active.project.config.id, "chat-message", ChatMessage {
             id,
             chat_id: chat_id.clone(),
             role: "user".into(),
@@ -5250,7 +5461,7 @@ fn send_chat_message(
             let title: String = text.chars().take(40).collect();
             let _ = db.set_chat_field(&chat_id, ChatField::Title, title.trim());
             if let Ok(Some(updated)) = db.get_chat(&chat_id) {
-                let _ = app.emit("chat-updated", updated);
+                emit_member(&app, active.project.config.id, "chat-updated", updated);
             }
         }
         (had_messages, row)
@@ -5273,11 +5484,11 @@ fn send_chat_message(
 #[tauri::command]
 fn rename_chat(app: AppHandle, state: State<SharedState>, chat_id: String, title: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let mut db = active.chat_db.lock().unwrap();
     db.set_chat_field(&chat_id, ChatField::Title, title.trim()).map_err(err)?;
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
-        let _ = app.emit("chat-updated", row);
+        emit_member(&app, active.project.config.id, "chat-updated", row);
     }
     Ok(())
 }
@@ -5285,11 +5496,11 @@ fn rename_chat(app: AppHandle, state: State<SharedState>, chat_id: String, title
 #[tauri::command]
 fn set_chat_pinned(app: AppHandle, state: State<SharedState>, chat_id: String, pinned: bool) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let mut db = active.chat_db.lock().unwrap();
     db.set_chat_flag(&chat_id, ChatFlag::Pinned, pinned).map_err(err)?;
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
-        let _ = app.emit("chat-updated", row);
+        emit_member(&app, active.project.config.id, "chat-updated", row);
     }
     Ok(())
 }
@@ -5300,14 +5511,14 @@ fn set_chat_pinned(app: AppHandle, state: State<SharedState>, chat_id: String, p
 #[tauri::command]
 fn set_chat_model(app: AppHandle, state: State<SharedState>, chat_id: String, model: Option<String>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     // Store only a validated alias; anything else clears to the default so we
     // never persist a string we'd refuse to pass to the CLI.
     let alias = model.as_deref().and_then(chat::valid_model_alias);
     let mut db = active.chat_db.lock().unwrap();
     db.set_chat_model(&chat_id, alias).map_err(err)?;
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
-        let _ = app.emit("chat-updated", row);
+        emit_member(&app, active.project.config.id, "chat-updated", row);
     }
     Ok(())
 }
@@ -5315,7 +5526,7 @@ fn set_chat_model(app: AppHandle, state: State<SharedState>, chat_id: String, mo
 #[tauri::command]
 fn archive_chat(app: AppHandle, state: State<SharedState>, chat_id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     if let Some(engine) = &active.chat_engine {
         engine.stop(&chat_id);
     }
@@ -5323,7 +5534,7 @@ fn archive_chat(app: AppHandle, state: State<SharedState>, chat_id: String) -> C
     let mut db = active.chat_db.lock().unwrap();
     db.set_chat_flag(&chat_id, ChatFlag::Archived, true).map_err(err)?;
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
-        let _ = app.emit("chat-updated", row);
+        emit_member(&app, active.project.config.id, "chat-updated", row);
     }
     Ok(())
 }
@@ -5335,7 +5546,7 @@ struct PtyChunk {
     data: String, // base64
 }
 
-fn close_terminal(active: &ActiveProject, chat_id: &str) {
+fn close_terminal(active: &MemberRuntime, chat_id: &str) {
     match active.terminals.lock().unwrap().remove(chat_id) {
         Some(TerminalHandle::Own(mut pty)) => pty.kill(),
         Some(TerminalHandle::Attached) => pty_registry::detach(chat_id),
@@ -5347,7 +5558,7 @@ fn close_terminal(active: &ActiveProject, chat_id: &str) {
 fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: String) -> CmdResult<()> {
     use base64::Engine as _;
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
 
     // One process per session: stop conversation mode first.
     if let Some(engine) = &active.chat_engine {
@@ -5357,8 +5568,9 @@ fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: Strin
 
     let emit_app = app.clone();
     let id_for_data = chat_id.clone();
+    let project_id = active.project.config.id;
     let on_data = move |bytes: &[u8]| {
-        let _ = emit_app.emit("chat-pty-data", PtyChunk {
+        emit_member(&emit_app, project_id, "chat-pty-data", PtyChunk {
             chat_id: id_for_data.clone(),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
@@ -5381,7 +5593,7 @@ fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: Strin
         (had || row.kind == "ingest" || row.kind == "research", row)
     };
 
-    let pty = chat::attach_terminal(&binary, &active.project.root, &chat_id, resume, row.model.as_deref(), on_data_dup(app.clone(), chat_id.clone()))
+    let pty = chat::attach_terminal(&binary, &active.project.root, &chat_id, resume, row.model.as_deref(), on_data_dup(app.clone(), project_id, chat_id.clone()))
         .map_err(err)?;
     active.terminals.lock().unwrap().insert(chat_id.clone(), TerminalHandle::Own(pty));
 
@@ -5403,7 +5615,7 @@ fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: Strin
                 let _ = db.set_chat_field(&sid, ChatField::Status, status);
                 let _ = db.touch_chat(&sid, engine::now_epoch());
                 if let Ok(Some(row)) = db.get_chat(&sid) {
-                    let _ = status_app.emit("chat-updated", row);
+                    emit_member(&status_app, project_id, "chat-updated", row);
                 }
             }
         });
@@ -5413,10 +5625,10 @@ fn enter_terminal_mode(app: AppHandle, state: State<SharedState>, chat_id: Strin
 
 /// Second copy of the data emitter for the spawn path (the first was moved
 /// into the registry-attach attempt).
-fn on_data_dup(app: AppHandle, chat_id: String) -> impl Fn(&[u8]) + Send + 'static {
+fn on_data_dup(app: AppHandle, project_id: uuid::Uuid, chat_id: String) -> impl Fn(&[u8]) + Send + 'static {
     use base64::Engine as _;
     move |bytes: &[u8]| {
-        let _ = app.emit("chat-pty-data", PtyChunk {
+        emit_member(&app, project_id, "chat-pty-data", PtyChunk {
             chat_id: chat_id.clone(),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
@@ -5426,7 +5638,7 @@ fn on_data_dup(app: AppHandle, chat_id: String) -> impl Fn(&[u8]) + Send + 'stat
 #[tauri::command]
 fn leave_terminal_mode(state: State<SharedState>, chat_id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     close_terminal(active, &chat_id);
     if let Some(hooks) = &guard.hooks {
         hooks.unsubscribe(&chat_id);
@@ -5441,7 +5653,7 @@ fn chat_pty_input(state: State<SharedState>, chat_id: String, data: String) -> C
         .decode(&data)
         .map_err(err)?;
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let mut terminals = active.terminals.lock().unwrap();
     match terminals.get_mut(&chat_id) {
         Some(TerminalHandle::Own(pty)) => pty.input(&bytes).map_err(err),
@@ -5459,7 +5671,7 @@ fn chat_pty_input(state: State<SharedState>, chat_id: String, data: String) -> C
 #[tauri::command]
 fn chat_pty_resize(state: State<SharedState>, chat_id: String, rows: u16, cols: u16) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let mut terminals = active.terminals.lock().unwrap();
     if let Some(TerminalHandle::Own(pty)) = terminals.get_mut(&chat_id) {
         pty.resize(rows, cols).map_err(err)?;
@@ -5489,7 +5701,7 @@ fn start_research(
         .ok_or(ken_core::runner::MISSING_CLAUDE_HELP)?;
 
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let hooks = guard.hooks.clone().ok_or("hooks not running")?;
     let report_rel = research::plan_report(&active.project, &output_dir, &question).map_err(err)?;
 
@@ -5512,8 +5724,8 @@ fn start_research(
         db.upsert_chat(&row).map_err(err)?;
         let note = format!("Researching — the report will land at {report_rel}.");
         let id = db.append_chat_message(&chat_id, "activity", &note, now).unwrap_or(0);
-        let _ = app.emit("chat-updated", row.clone());
-        let _ = app.emit("chat-message", ChatMessage {
+        emit_member(&app, active.project.config.id, "chat-updated", row.clone());
+        emit_member(&app, active.project.config.id, "chat-message", ChatMessage {
             id,
             chat_id: chat_id.clone(),
             role: "activity".into(),
@@ -5526,6 +5738,7 @@ fn start_research(
     active.research.lock().unwrap().insert(chat_id.clone(), token.clone());
 
     let project = active.project.clone();
+    let project_id = active.project.config.id;
     let chat_db = active.chat_db.clone();
     let research_map = active.research.clone();
     drop(guard);
@@ -5540,7 +5753,7 @@ fn start_research(
             let _ = db.touch_chat(&sid, now);
             if let Some(note) = note {
                 let id = db.append_chat_message(&sid, "activity", &note, now).unwrap_or(0);
-                let _ = worker_app.emit("chat-message", ChatMessage {
+                emit_member(&worker_app, project_id, "chat-message", ChatMessage {
                     id,
                     chat_id: sid.clone(),
                     role: "activity".into(),
@@ -5549,7 +5762,7 @@ fn start_research(
                 });
             }
             if let Ok(Some(row)) = db.get_chat(&sid) {
-                let _ = worker_app.emit("chat-updated", row);
+                emit_member(&worker_app, project_id, "chat-updated", row);
             }
         };
 
@@ -5595,7 +5808,7 @@ fn start_research(
 #[tauri::command]
 fn cancel_research(state: State<SharedState>, chat_id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     if let Some(token) = active.research.lock().unwrap().get(&chat_id) {
         token.cancel();
     }
@@ -5607,7 +5820,7 @@ fn cancel_research(state: State<SharedState>, chat_id: String) -> CmdResult<()> 
 #[tauri::command]
 fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> {
     let guard = state.lock().unwrap();
-    let active = guard.active.as_ref().ok_or("no project open")?;
+    let active = member(&guard, None)?;
     let mut options = vec!["research".to_string()];
     if let Ok(entries) = std::fs::read_dir(&active.project.root) {
         let mut dirs: Vec<String> = entries
@@ -5683,7 +5896,8 @@ pub fn run() {
     let state: SharedState = Arc::new(Mutex::new(AppState {
         base_dir,
         hooks: None,
-        active: None,
+        members: std::collections::HashMap::new(),
+        focused: None,
         app_settings,
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
         qa_gen: Arc::new(AtomicU64::new(0)),
@@ -5708,7 +5922,7 @@ pub fn run() {
                 let state = window.state::<SharedState>();
                 let sync = {
                     let guard = state.lock().unwrap();
-                    guard.active.as_ref().map(|a| a.sync.clone())
+                    guard.members.values().next().map(|a| a.sync.clone())
                 };
                 if let Some(sync) = sync {
                     sync.pull_now();
@@ -5720,6 +5934,8 @@ pub fn run() {
             list_projects,
             create_project,
             open_project,
+            open_member,
+            close_member,
             forget_project,
             rename_project,
             last_project_id,

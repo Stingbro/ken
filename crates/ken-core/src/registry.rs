@@ -26,6 +26,10 @@ pub struct Registry {
     /// The project that was open last — reopened on launch.
     #[serde(default, rename = "lastProject", skip_serializing_if = "Option::is_none")]
     pub last_project: Option<Uuid>,
+    /// The workspace that was open last — reopened on launch. `serde(default)`
+    /// so registries written before the workspace flag existed still load.
+    #[serde(default, rename = "lastWorkspace", skip_serializing_if = "Option::is_none")]
+    pub last_workspace: Option<Uuid>,
 }
 
 /// A registry entry plus whether its folder still exists on disk.
@@ -159,6 +163,26 @@ mod tests {
         std::env::remove_var("KEN_DATA_DIR");
         let default = default_base_dir().unwrap();
         assert!(default.ends_with("ken"), "unexpected default: {default:?}");
+    }
+
+    #[test]
+    fn last_workspace_roundtrips_and_old_registry_still_loads() {
+        let app = tempdir().unwrap();
+
+        // A registry written before `lastWorkspace` existed must still load,
+        // defaulting the new field to `None`.
+        let old_json = r#"{"projects":[],"lastProject":null}"#;
+        fs::write(registry_path(app.path()), old_json).unwrap();
+        let loaded = Registry::load(app.path()).unwrap();
+        assert_eq!(loaded.last_workspace, None);
+
+        let mut reg = loaded;
+        let id = Uuid::new_v4();
+        reg.last_workspace = Some(id);
+        reg.save(app.path()).unwrap();
+
+        let reloaded = Registry::load(app.path()).unwrap();
+        assert_eq!(reloaded.last_workspace, Some(id));
     }
 
     #[test]

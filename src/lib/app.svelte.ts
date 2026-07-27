@@ -56,7 +56,16 @@ export type Screen =
   | "timeline"
   | "settings";
 
+/** A single open workspace member — same shape as a project (S9 step 7 /
+ *  `workspace` change). Kept as a distinct alias so member-specific fields
+ *  (status, etc., once `.ken-workspace/` lands) don't ripple through every
+ *  `ProjectInfo` use site. */
+export type MemberInfo = ProjectInfo;
+
 class AppStore {
+  /** The focused member. Kept as the pre-workspace field name/shape so every
+   *  existing read/write site keeps working unchanged — see `members` and
+   *  `focused` below for the workspace-aware view onto the same data. */
   project = $state<ProjectInfo | null>(null);
   registry = $state<RegistryEntryStatus[]>([]);
   screen = $state<Screen>("home");
@@ -87,6 +96,21 @@ class AppStore {
   /** The active tab's path — drives tree selection and the mounted editor. */
   get openFile(): string | null {
     return this.activeTab;
+  }
+
+  /** Every currently-open project. Until workspace mode has a real multi-open
+   *  UI (S9 step 7's frontend follow-ups), this is just `[project]` — derived,
+   *  never stored separately, so it can never drift from `project`. */
+  get members(): MemberInfo[] {
+    return this.project ? [this.project] : [];
+  }
+
+  /** The focused member's id, or null with nothing open. Event payloads that
+   *  carry an optional `project_id` (S9 step 5) are compared against this —
+   *  see `forFocused` below — to ignore events for a member other than the
+   *  one currently focused. */
+  get focused(): string | null {
+    return this.project?.id ?? null;
   }
 
   scanning = $state(false);
@@ -187,6 +211,7 @@ class AppStore {
     this.registry = await api.listProjects();
     this.project = await api.currentProject();
     await api.onIndexUpdated((stats) => {
+      if (!forFocused(stats.project_id)) return;
       this.scanning = false;
       this.lastScan = stats;
       this.lastScanAt = Date.now();
@@ -200,17 +225,20 @@ class AppStore {
       this.scanError = message;
     });
     await api.onSemanticIndexState((ev) => {
+      if (!forFocused(ev.project_id)) return;
       this.semanticIndexState = ev;
     });
     // Non-intrusive: log for now rather than a toast/banner component, since
     // no such pattern exists elsewhere in the app yet. Still surfaces the
     // 1-based malformed line numbers for anyone checking devtools.
-    await api.onKenignoreWarning((malformedLines) => {
+    await api.onKenignoreWarning((ev) => {
+      if (!forFocused(ev.project_id)) return;
       console.warn(
-        `.kenignore: skipped malformed line(s) ${malformedLines.join(", ")}`,
+        `.kenignore: skipped malformed line(s) ${ev.malformedLines.join(", ")}`,
       );
     });
     await api.onSyncState((ev) => {
+      if (!forFocused(ev.project_id)) return;
       this.syncState = ev.state;
       this.syncDetail = ev.detail;
     });
@@ -521,3 +549,12 @@ class AppStore {
 }
 
 export const app = new AppStore();
+
+/** True when `projectId` is absent — an unscoped/global event, always passed
+ *  through for backward compatibility — or equals the focused member's id.
+ *  Stores compare a member-scoped event's optional `project_id` (S9 step 5)
+ *  against this to ignore events for a workspace member other than the one
+ *  currently focused (S9 step 7 / `workspace` change). */
+export function forFocused(projectId: string | null | undefined): boolean {
+  return projectId == null || projectId === app.focused;
+}

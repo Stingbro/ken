@@ -52,12 +52,13 @@ export interface HybridHit {
 
 /** Mirrors the Rust `SemanticIndexStateEvent` internally-tagged enum
  *  (`#[serde(tag = "state", rename_all = "camelCase")]`) exactly — each
- *  variant carries only the fields that enum case has. */
+ *  variant carries only the fields that enum case has. `project_id` is set
+ *  when the event was emitted for a specific project/member (S9 step 5). */
 export type SemanticIndexState =
-  | { state: "building"; done: number; total: number }
-  | { state: "ready" }
-  | { state: "unavailable"; reason: string }
-  | { state: "warning"; reason: string };
+  | { state: "building"; done: number; total: number; project_id?: string }
+  | { state: "ready"; project_id?: string }
+  | { state: "unavailable"; reason: string; project_id?: string }
+  | { state: "warning"; reason: string; project_id?: string };
 
 export interface ScanStats {
   added: number;
@@ -65,6 +66,9 @@ export interface ScanStats {
   removed: number;
   failed: number;
   unchanged: number;
+  /** Set when `index-updated` was emitted for a specific project/member
+   *  (S9 step 5 event envelope); absent on app-global emits. */
+  project_id?: string;
 }
 
 export interface FolderInfo {
@@ -153,6 +157,8 @@ export interface IngestEvent {
   activity?: string | null;
   elapsedSecs?: number | null;
   etaSecs?: number | null;
+  /** Set on member-scoped emits of `ingest-run-changed` (S9 step 5). */
+  project_id?: string;
 }
 
 export interface Automation {
@@ -245,6 +251,8 @@ export type SyncStateName = "off" | "synced" | "syncing" | "attention";
 export interface SyncStateEvent {
   state: SyncStateName;
   detail: string | null;
+  /** Set on member-scoped emits of `sync-state` (S9 step 5). */
+  project_id?: string;
 }
 
 export interface SyncStatus {
@@ -269,6 +277,8 @@ export interface ChatRow {
   archived: boolean;
   /** Stable tier alias (see CHAT_MODELS), or null for the CLI's own default. */
   model: string | null;
+  /** Set on member-scoped emits of `chat-updated` (S9 step 5). */
+  project_id?: string;
 }
 
 /** Selectable chat models. Values are the CLI's stable tier aliases, which
@@ -288,11 +298,15 @@ export interface ChatMessage {
   role: "user" | "assistant" | "activity" | "divider";
   content: string;
   createdAt: number;
+  /** Set on member-scoped emits of `chat-message` (S9 step 5). */
+  project_id?: string;
 }
 
 export interface PtyChunk {
   chatId: string;
   data: string; // base64
+  /** Set on member-scoped emits of `chat-pty-data` (S9 step 5). */
+  project_id?: string;
 }
 
 export interface McpInfo {
@@ -310,6 +324,8 @@ export interface DigestDto {
   body: string;
   sources: string[];
   generatedAt: number;
+  /** Set on member-scoped emits of `digest-updated` (S9 step 5). */
+  project_id?: string;
 }
 
 /** A ⌘K quick answer, tied to the query it answered. */
@@ -317,12 +333,16 @@ export interface QuickAnswer {
   query: string;
   body: string;
   sources: string[];
+  /** Set on member-scoped emits of `quick-answer` (S9 step 5). */
+  project_id?: string;
 }
 
 /** One streamed chunk of a quick answer, tied to its query. */
 export interface QuickAnswerDelta {
   query: string;
   delta: string;
+  /** Set on member-scoped emits of `quick-answer-delta` (S9 step 5). */
+  project_id?: string;
 }
 
 /** A knowledge-model entity (Map node). */
@@ -390,6 +410,8 @@ export interface KnowledgeModelState {
   /** `idle` = an automatic build stopped without a model; not an error. */
   state: "building" | "ready" | "error" | "idle";
   detail: string | null;
+  /** Set on member-scoped emits of `knowledge-model-state` (S9 step 5). */
+  project_id?: string;
 }
 
 export interface ClaudeDoctor {
@@ -438,6 +460,9 @@ export interface TranscriptProgress {
   phase: "extracting" | "transcribing";
   /** 0–100; present only while transcribing. */
   pct: number | null;
+  /** Set when the emitting project was known (S9 step 5); absent for the
+   *  recording-finish path, which falls back to unscoped. */
+  project_id?: string;
 }
 
 /** Payload of the `hydration-progress` event. */
@@ -445,6 +470,8 @@ export interface HydrationProgress {
   relPath: string;
   downloaded: number;
   total: number;
+  /** Set on member-scoped emits of `hydration-progress` (S9 step 5). */
+  project_id?: string;
 }
 
 // ---- Record (on-device meeting recorder) ----
@@ -531,11 +558,27 @@ export interface FeatureInfo {
   effective: boolean;
 }
 
+/** Payload of the `kenignore-warning` event: 1-based line numbers a `.kenignore`
+ *  edit left malformed and skipped. */
+export interface KenignoreWarning {
+  malformedLines: number[];
+  /** Set on member-scoped emits (S9 step 5). */
+  project_id?: string;
+}
+
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   createProject: (path: string, name: string) =>
     invoke<ProjectInfo>("create_project", { path, name }),
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
+  /** Open an additional project alongside whatever is already open, without
+   *  closing it. Requires the `workspace` feature flag — rejects with
+   *  `"workspace disabled"` when it's off. */
+  openMember: (path: string) => invoke<ProjectInfo>("open_member", { path }),
+  /** Close one workspace member, leaving the others open. Same `workspace`
+   *  flag gate as `openMember`. */
+  closeMember: (projectId: string) =>
+    invoke<void>("close_member", { projectId }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
   renameProject: (id: string, name: string) =>
     invoke<ProjectInfo>("rename_project", { id, name }),
@@ -762,14 +805,11 @@ export const api = {
     fn: (ev: SemanticIndexState) => void,
   ): Promise<UnlistenFn> =>
     listen<SemanticIndexState>("semantic-index-state", (e) => fn(e.payload)),
-  /** Fires when a `.kenignore` edit has malformed lines; payload is the
-   *  1-based line numbers that were skipped. */
+  /** Fires when a `.kenignore` edit has malformed lines. */
   onKenignoreWarning: (
-    fn: (malformedLines: number[]) => void,
+    fn: (ev: KenignoreWarning) => void,
   ): Promise<UnlistenFn> =>
-    listen<{ malformedLines: number[] }>("kenignore-warning", (e) =>
-      fn(e.payload.malformedLines),
-    ),
+    listen<KenignoreWarning>("kenignore-warning", (e) => fn(e.payload)),
   onDigestUpdated: (fn: (digest: DigestDto) => void): Promise<UnlistenFn> =>
     listen<DigestDto>("digest-updated", (e) => fn(e.payload)),
   onDigestGenerating: (fn: () => void): Promise<UnlistenFn> =>

@@ -10,7 +10,7 @@ import {
   reconcile,
   type TranscriptEntry,
 } from "./chatEcho";
-import { app } from "./app.svelte";
+import { app, forFocused } from "./app.svelte";
 
 class ChatsStore {
   open = $state(false);
@@ -36,6 +36,7 @@ class ChatsStore {
 
   async init() {
     await api.onChatUpdated((row) => {
+      if (!forFocused(row.project_id)) return;
       const i = this.rows.findIndex((r) => r.id === row.id);
       if (row.archived) {
         if (i >= 0) this.rows = this.rows.toSpliced(i, 1);
@@ -51,6 +52,7 @@ class ChatsStore {
       this.resort();
     });
     await api.onChatMessage((msg) => {
+      if (!forFocused(msg.project_id)) return;
       if (msg.chatId === this.activeId) {
         this.transcript = reconcile(this.transcript, msg);
       }

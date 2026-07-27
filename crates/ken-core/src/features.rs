@@ -2,8 +2,8 @@
 //! single source of truth: command validation and UI rendering both derive
 //! from it, so an unknown flag is rejected in one place and no switch can be
 //! shown that does nothing. Only *implemented* flags are registered — product
-//! docs list more (workspace, profiler, ...), but each lands here in the
-//! change that ships it.
+//! docs list more (profiler, ...), but each lands here in the change that
+//! ships it.
 
 use serde_json::Value;
 
@@ -11,7 +11,8 @@ use crate::project::Project;
 use crate::settings::AppSettings;
 
 /// Which storage layer a flag's default lives in. `Workspace` is a reserved
-/// precedence slot only — no workspace concept exists in the codebase yet.
+/// precedence slot only — no flag reads from it yet (it will apply to
+/// per-member overrides once the workspace manifest carries them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagScope {
     Global,
@@ -28,13 +29,22 @@ pub struct FlagDef {
     pub description: &'static str,
 }
 
-pub const FLAGS: &[FlagDef] = &[FlagDef {
-    name: "semanticIndex",
-    scope: FlagScope::Project,
-    default: false,
-    description: "Meaning-based search using a local embedding model. \
-                  Requires downloading Nomic Embed v1.5 (~140 MB).",
-}];
+pub const FLAGS: &[FlagDef] = &[
+    FlagDef {
+        name: "semanticIndex",
+        scope: FlagScope::Project,
+        default: false,
+        description: "Meaning-based search using a local embedding model. \
+                      Requires downloading Nomic Embed v1.5 (~140 MB).",
+    },
+    FlagDef {
+        name: "workspace",
+        scope: FlagScope::Global,
+        default: false,
+        description: "Open a parent folder's sibling projects together, \
+                      each with its own DB, engine, and watcher.",
+    },
+];
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
 /// attempt to set it must be rejected.
@@ -94,9 +104,10 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_only_semantic_index() {
-        assert_eq!(FLAGS.len(), 1);
+    fn registry_has_semantic_index_and_workspace() {
+        assert_eq!(FLAGS.len(), 2);
         assert!(flag("semanticIndex").is_some());
+        assert!(flag("workspace").is_some());
         assert!(flag("profiler").is_none());
     }
 

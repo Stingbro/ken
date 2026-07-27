@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { api, type QuickAnswer, type HybridHit } from "../lib/api";
-  import { app } from "../lib/app.svelte";
+  import { app, forFocused } from "../lib/app.svelte";
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
@@ -43,6 +43,7 @@
     let unlistenDelta: UnlistenFn | undefined;
     void api
       .onQuickAnswer((qa) => {
+        if (!forFocused(qa.project_id)) return;
         answerCache.set(qa.query, qa);
         if (thinking === qa.query) thinking = null;
         if (qa.query === query.trim()) {
@@ -53,6 +54,7 @@
       .then((un) => (unlistenFinal = un));
     void api
       .onQuickAnswerDelta((ev) => {
+        if (!forFocused(ev.project_id)) return;
         if (ev.query !== query.trim()) return; // stale
         // First output for this query — the model is no longer "thinking".
         if (thinking === ev.query) thinking = null;
