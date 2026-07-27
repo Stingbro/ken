@@ -449,6 +449,115 @@ export interface KnowledgeModelState {
   project_id?: string;
 }
 
+/** Entity kinds shared by per-project (`EntityRow`) and workspace-KG global
+ *  entities — the proposal's own words: workspace-KG "kinds reuse the
+ *  per-project set". Duplicated as a literal union here (rather than
+ *  imported from `./knowledge`) to avoid a circular import back into this
+ *  module — federated-kg task 3.1. */
+type EntityKind = "person" | "organization" | "topic" | "decision" | "other";
+
+/** Mirrors `WorkspaceKgMemberStatusDto` (federated-kg task 2.2) — one open
+ *  member's staleness in `workspace_kg_overview`. */
+export interface WorkspaceKgMemberStatus {
+  projectId: string;
+  name: string;
+  /** This member's current `knowledge_model_built_at` watermark; `null` =
+   *  no knowledge model built yet. */
+  currentWatermark: number | null;
+  /** True when the workspace-KG's cached snapshot for this member is
+   *  missing or behind `currentWatermark` — the next build will re-read it
+   *  (spec: "unchanged members are skipped"). */
+  stale: boolean;
+}
+
+/** Mirrors `WorkspaceKgOverviewDto` (federated-kg task 2.2) — counts +
+ *  per-member staleness. */
+export interface WorkspaceKgOverview {
+  /** `null` before the first build ever completes. */
+  builtAt: number | null;
+  llmPasses: boolean;
+  globalEntities: number;
+  entityLinks: number;
+  edges: number;
+  /** Only currently-open members — no workspace manifest exists yet to
+   *  enumerate members that aren't open (see Rust doc comment on
+   *  `WorkspaceKgOverviewDto`). */
+  members: WorkspaceKgMemberStatus[];
+}
+
+/** Mirrors `WorkspaceKgEdgeDto` — one edge in a `workspace_kg_entity` wiki
+ *  page, an out-link or a back-link depending which list it's in.
+ *  `otherId`/`otherName` always name the OTHER endpoint (design D4:
+ *  back-links are `global_edges` queried in reverse, not a separate table). */
+export interface WorkspaceKgEdge {
+  id: number;
+  otherId: number;
+  otherName: string;
+  relation: string;
+  weight: number;
+  /** `"imported"` | `"cooccur"` | `"llm"`. */
+  provenance: string;
+}
+
+/** Mirrors `WorkspaceKgPointerDto` — a `doc_pointers` row: a "mentioned in"
+ *  entry pointing into one member's file. */
+export interface WorkspaceKgPointer {
+  projectId: string;
+  relPath: string;
+  snippet: string;
+  /** `ken://<project-id>/<rel-path>` (design D4 addressing). */
+  uri: string;
+  /** True if this pointer's file is confirmed missing on disk. Only
+   *  checkable for a currently-open member; a pointer into a closed member
+   *  is never flagged stale by this field alone (never a crash either way). */
+  stale: boolean;
+}
+
+/** Mirrors `WorkspaceKgEntityDto` — the full wiki-page payload for one
+ *  global entity in a single call (federated-kg task 2.2 / design D4: "the
+ *  frontend never joins") — summary, both edge directions, and per-project
+ *  doc pointers. */
+export interface WorkspaceKgEntity {
+  id: number;
+  kind: EntityKind;
+  name: string;
+  summary: string;
+  updatedAt: number;
+  /** `kg://<id>` (design D4 addressing). */
+  uri: string;
+  outLinks: WorkspaceKgEdge[];
+  backLinks: WorkspaceKgEdge[];
+  pointers: WorkspaceKgPointer[];
+}
+
+/** Mirrors `WorkspaceKgSearchHitDto` — one `workspace_kg_search` hit. */
+export interface WorkspaceKgSearchHit {
+  id: number;
+  kind: EntityKind;
+  name: string;
+  summary: string;
+  uri: string;
+}
+
+/** Mirrors the Rust `WorkspaceKgStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape
+ *  convention as `SemanticIndexState` above. `building` is only ever
+ *  emitted once up front (`done: 0`) — the ken-core build has no per-member
+ *  progress callback yet (see Rust doc comment on `WorkspaceKgStateEvent`),
+ *  so `total` (the real member count) is the only progress signal today. */
+export type WorkspaceKgState =
+  | { state: "building"; done: number; total: number }
+  | {
+      state: "ready";
+      globalEntities: number;
+      entityLinks: number;
+      importedEdges: number;
+      cooccurEdges: number;
+      llmEdges: number;
+      llmPasses: boolean;
+    }
+  | { state: "unavailable"; reason: string };
+
 export interface ClaudeDoctor {
   found: boolean;
   path: string | null;
@@ -800,6 +909,25 @@ export const api = {
   knowledgeModel: () => invoke<KnowledgeModel>("knowledge_model"),
   refreshKnowledgeModel: () => invoke<void>("refresh_knowledge_model"),
 
+  /** Manually rebuild the workspace knowledge graph now (federated-kg task
+   *  3.1). Returns as soon as the build thread is spawned; progress and
+   *  outcome arrive via `onWorkspaceKgState` events. Rejects if the
+   *  `federatedKg` flag is off, or a build is already running. */
+  rebuildWorkspaceKg: () => invoke<void>("rebuild_workspace_kg"),
+  /** Workspace-KG summary: counts + per-member staleness. Rejects with the
+   *  flag-off error before `kg.sqlite` is ever opened. */
+  workspaceKgOverview: () =>
+    invoke<WorkspaceKgOverview>("workspace_kg_overview"),
+  /** The full wiki-page payload for one global entity — summary, out-links,
+   *  back-links, and per-project doc pointers in one call. */
+  workspaceKgEntity: (id: number) =>
+    invoke<WorkspaceKgEntity>("workspace_kg_entity", { id }),
+  /** Case-insensitive substring search over global entity names + summaries
+   *  (name matches ranked above summary-only matches), capped at 50 hits.
+   *  An empty/whitespace-only query always returns `[]` (no "list all"). */
+  workspaceKgSearch: (query: string) =>
+    invoke<WorkspaceKgSearchHit[]>("workspace_kg_search", { query }),
+
   listChats: () => invoke<ChatRow[]>("list_chats"),
   chatTranscript: (chatId: string) =>
     invoke<ChatMessage[]>("chat_transcript", { chatId }),
@@ -881,6 +1009,14 @@ export const api = {
     listen<KnowledgeModelState>("knowledge-model-state", (e) => fn(e.payload)),
   onKnowledgeUpdated: (fn: () => void): Promise<UnlistenFn> =>
     listen<null>("knowledge-updated", () => fn()),
+  /** `workspace-kg-state`: `building` (once, up front) → `ready` |
+   *  `unavailable` (federated-kg task 3.1). App-global — a workspace-KG
+   *  build spans every open member, so unlike `onKnowledgeModelState` there
+   *  is no `project_id` to filter on. */
+  onWorkspaceKgState: (
+    fn: (ev: WorkspaceKgState) => void,
+  ): Promise<UnlistenFn> =>
+    listen<WorkspaceKgState>("workspace-kg-state", (e) => fn(e.payload)),
   onModelDownloadProgress: (
     fn: (ev: ModelProgress) => void,
   ): Promise<UnlistenFn> =>

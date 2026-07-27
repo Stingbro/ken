@@ -146,6 +146,19 @@ struct AppState {
     /// The single in-progress recording, if any (app-global: one recorder at a
     /// time). Holds its own state/writers behind its mutex.
     record: Arc<Mutex<Option<RecordSession>>>,
+    /// federated-kg task 2.1: true while a `build_workspace_kg` run is in
+    /// flight. App-global (not per-member) because one build spans every
+    /// open member at once — mirrors `MemberRuntime::reindex_running`'s
+    /// single-guard discipline, just at the workspace scope instead of the
+    /// project scope.
+    workspace_kg_running: Arc<AtomicBool>,
+    /// Cancel token for the in-flight workspace-KG build, if any — mirrors
+    /// `MemberRuntime::semantic_build_cancel`'s replace-and-cancel slot.
+    workspace_kg_cancel: Arc<Mutex<Option<CancelToken>>>,
+    /// Debounce generation counter for the 30s workspace-KG auto-trigger
+    /// (mirrors `qa_gen`: "a newer request bumps it so the older one sees a
+    /// mismatch and stands down"). See `schedule_workspace_kg_debounce`.
+    workspace_kg_debounce_gen: Arc<AtomicU64>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -1164,6 +1177,29 @@ fn workspace_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
         .unwrap_or(default)
 }
 
+/// Effective `federatedKg` flag (federated-kg task 2.3): the global-scope
+/// registry default overridden by `settings.json`'s `features` map, AND-ed
+/// with `workspace_enabled` (proposal: "Requires workspace" — federation is
+/// meaningless with a single open project). Reads straight from the global
+/// layer like `workspace_enabled` does: the design calls `federatedKg`
+/// "workspace-level, in workspace.json features", but no `workspace.json`/
+/// workspace-manifest module exists yet in this codebase (same deviation
+/// `workspace_kg_db.rs` notes for `WorkspaceKgDb::open`), so `settings.json`
+/// is the only durable home this flag has today.
+fn federated_kg_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    if !workspace_enabled(app_settings) {
+        return false;
+    }
+    let default = ken_core::features::flag("federatedKg")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("federatedKg")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
 /// Open an additional project alongside whatever is already open, without
 /// disturbing it (S9 step 6 / `workspace` change). Gated on the global
 /// `workspace` flag — off, this is a no-op error so a stray call can't grow
@@ -1525,10 +1561,19 @@ fn set_global_feature(state: State<SharedState>, flag: String, value: bool) -> C
     };
     settings
         .features
-        .insert(flag, serde_json::Value::Bool(value));
+        .insert(flag.clone(), serde_json::Value::Bool(value));
     settings.save(&base_dir).map_err(err)?;
     let mut guard = state.lock().unwrap();
     guard.app_settings = settings;
+    // federated-kg task 2.3: turning the flag off cancels any workspace-KG
+    // build in flight, mirroring `apply_semantic_index_flag`'s cancel on
+    // disable. A build already past its flush is unaffected (kg.sqlite is
+    // left as the last completed graph, per design D1 — always safe).
+    if flag == "federatedKg" && !value {
+        if let Some(token) = guard.workspace_kg_cancel.lock().unwrap().take() {
+            token.cancel();
+        }
+    }
     Ok(())
 }
 
@@ -5400,6 +5445,7 @@ fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResu
         running: active.knowledge_running.clone(),
         tracker: active.auto_knowledge.clone(),
         quiet_failure: false,
+        state: state.inner().clone(),
     };
     drop(guard);
 
@@ -5417,6 +5463,11 @@ struct KnowledgeBuild {
     tracker: Arc<AutoBuildTracker>,
     /// Automatic builds report failure as `idle`, not `error`.
     quiet_failure: bool,
+    /// federated-kg task 2.1: needed only to re-check `federatedKg`/
+    /// `workspace` after this build finishes, to decide whether to schedule
+    /// the debounced workspace-KG auto-trigger (checked fresh here rather
+    /// than cached, since either flag could change while this build ran).
+    state: SharedState,
 }
 
 /// Start one build thread, or report that one is already in flight. The
@@ -5468,14 +5519,480 @@ fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
                 detail: Some(detail),
             },
         };
+        // federated-kg task 2.1 / spec "member knowledge-model completion in
+        // workspace mode SHALL trigger a debounced (30s) build": snapshot
+        // BEFORE `event` moves into `emit_member` below.
+        let succeeded = event.state == "ready";
         emit_member(&thread_app, project_id, "knowledge-model-state", event);
         // Stamp the attempt BEFORE clearing the guard: a later manual rebuild
         // must never see "not running" together with a stale attempt clock, or
         // a failing build could restart immediately.
         job.tracker.build_finished(Instant::now());
         job.running.store(false, Ordering::SeqCst);
+        if succeeded {
+            let trigger = {
+                let guard = job.state.lock().unwrap();
+                federated_kg_enabled(&guard.app_settings)
+            };
+            if trigger {
+                schedule_workspace_kg_debounce(&thread_app, &job.state);
+            }
+        }
     });
     true
+}
+
+// ===========================================================================
+// federated-kg (openspec/changes/federated-kg) task 2.1-2.2: workspace-KG
+// build orchestration and read commands. `federatedKg` gating (task 2.3)
+// lives in `federated_kg_enabled` above; every entry point below checks it
+// before touching `kg.sqlite`.
+// ===========================================================================
+
+/// Production `FederationLlm` (federated-kg task 2.1): wraps
+/// `local_llm::generate_stream` at Background priority — the same call
+/// `scan_and_profile`'s refinement pass and `extraction_worker`'s `generate`
+/// closure make, just behind the trait `federation.rs` defines instead of a
+/// closure (federation's merge/adjudication/linking passes need a `&self`
+/// value they can hold across the whole build, not a one-shot closure). A
+/// thin unit struct: `complete` carries no state of its own.
+struct AppFederationLlm;
+
+impl ken_core::federation::FederationLlm for AppFederationLlm {
+    fn complete(&self, prompt: &str) -> ken_core::Result<String> {
+        let mut sink = |_: &str| true;
+        ken_core::local_llm::generate_stream(prompt, ken_core::local_llm::Priority::Background, &mut sink)
+    }
+}
+
+/// Payload for the `workspace-kg-state` event (federated-kg task 2.1),
+/// mirroring `SemanticIndexStateEvent`'s tag shape:
+/// `{"state":"building","done":0,"total":3}`, `{"state":"ready",...counts}`,
+/// `{"state":"unavailable","reason":"..."}`. Emitted with plain `app.emit`
+/// (not `emit_member`) since a workspace-KG build spans every open member
+/// at once — it has no single owning `project_id` to scope the event to.
+///
+/// Deviation (see final report): `build_workspace_kg` (ken-core) runs its
+/// per-member snapshot phase synchronously with no progress callback, so
+/// this command layer can only observe "started" and "finished" — `Building`
+/// is emitted once up front with `done: 0`, not ticked per member as the
+/// build actually progresses. `total` is still real per-member information
+/// (the member count), which is what task 2.1 asks this event to carry.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum WorkspaceKgStateEvent {
+    Building { done: usize, total: usize },
+    Ready {
+        global_entities: usize,
+        entity_links: usize,
+        imported_edges: usize,
+        cooccur_edges: usize,
+        llm_edges: usize,
+        llm_passes: bool,
+    },
+    Unavailable { reason: String },
+}
+
+/// How long a burst of member knowledge-model completions is allowed to
+/// settle before the workspace-KG auto-trigger actually fires (spec:
+/// "debounced (30 s)").
+const WORKSPACE_KG_DEBOUNCE: Duration = Duration::from_secs(30);
+
+/// Schedule the debounced workspace-KG auto-trigger (federated-kg task 2.1).
+/// Bumps `AppState::workspace_kg_debounce_gen` and spawns a timer thread that
+/// sleeps out the window before checking whether it's still the most recent
+/// request — mirrors `AppState::qa_gen`'s "a newer request invalidates the
+/// older one" pattern. A burst of member completions inside the window
+/// therefore collapses into exactly one build, fired 30s after the LAST
+/// completion (true debounce, not a fixed-interval throttle).
+fn schedule_workspace_kg_debounce(app: &AppHandle, state: &SharedState) {
+    let gen_counter = state.lock().unwrap().workspace_kg_debounce_gen.clone();
+    let my_gen = gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+    let bg_app = app.clone();
+    let bg_state = state.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(WORKSPACE_KG_DEBOUNCE);
+        if gen_counter.load(Ordering::SeqCst) != my_gen {
+            return; // superseded by a later completion's own timer
+        }
+        start_workspace_kg_build(&bg_app, &bg_state);
+    });
+}
+
+/// Start one workspace-KG build, or report that one is already in flight
+/// (federated-kg task 2.1). Shared by `rebuild_workspace_kg` (manual) and
+/// `schedule_workspace_kg_debounce`'s timer so the two entry points can
+/// never stack two builds — mirrors `start_knowledge_build`'s single
+/// `AtomicBool` guard, and `apply_semantic_index_flag`'s replace-and-cancel
+/// `CancelToken` slot, at the workspace scope. Re-checks `federatedKg`
+/// itself (not just at the call site) so a debounce timer that fires after
+/// the flag was turned off mid-window is a no-op, per task 2.3's "no
+/// auto-trigger" when off.
+///
+/// Deviation (see final report): no `workspace.rs`/manifest exists yet to
+/// enumerate a workspace's members (proposal.md assumes one), so "members"
+/// here is simply every project currently open in `AppState::members` — a
+/// member that isn't open this session is invisible to the build until it
+/// is. Each member is read through its own fresh `Db::open_read_only`
+/// handle, the same way `ken-mcp` reads a project — never the live
+/// `MemberRuntime::db`/`search_db` handles — so a slow build never contends
+/// a member's own write connection or requires holding the global lock
+/// across it.
+fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
+    let (base_dir, running, cancel_slot, mut member_ids, enabled) = {
+        let guard = state.lock().unwrap();
+        (
+            guard.base_dir.clone(),
+            guard.workspace_kg_running.clone(),
+            guard.workspace_kg_cancel.clone(),
+            guard.members.keys().copied().collect::<Vec<_>>(),
+            federated_kg_enabled(&guard.app_settings),
+        )
+    };
+    if !enabled || running.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    // Deterministic member order (design D3 / spec "delete and rebuild"
+    // determinism) — `HashMap` iteration order isn't, so sort explicitly.
+    member_ids.sort();
+
+    let token = CancelToken::new();
+    if let Some(old) = cancel_slot.lock().unwrap().replace(token.clone()) {
+        old.cancel();
+    }
+
+    let _ = app.emit(
+        "workspace-kg-state",
+        WorkspaceKgStateEvent::Building { done: 0, total: member_ids.len() },
+    );
+
+    let thread_app = app.clone();
+    std::thread::spawn(move || {
+        let now = engine::now_epoch();
+        let llm_ready = matches!(
+            ken_core::local_llm::llm_status(),
+            ken_core::local_llm::LlmStatus::Ready
+        );
+        let federation_llm = AppFederationLlm;
+        let build = (|| -> ken_core::Result<ken_core::federation::BuildReport> {
+            let mut kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&base_dir)?;
+            let dbs = member_ids
+                .iter()
+                .map(|id| Db::open_read_only(&base_dir, *id).map(|db| (*id, db)))
+                .collect::<ken_core::Result<Vec<(uuid::Uuid, Db)>>>()?;
+            let members: Vec<ken_core::federation::Member> = dbs
+                .iter()
+                .map(|(id, db)| ken_core::federation::Member { project_id: *id, db })
+                .collect();
+            let llm: Option<&dyn ken_core::federation::FederationLlm> =
+                if llm_ready { Some(&federation_llm) } else { None };
+            ken_core::federation::build_workspace_kg(&mut kg, &members, llm, now, &token)
+        })();
+
+        let event = match build {
+            Ok(report) if report.cancelled => WorkspaceKgStateEvent::Unavailable {
+                reason: "workspace-KG build cancelled".into(),
+            },
+            Ok(report) => WorkspaceKgStateEvent::Ready {
+                global_entities: report.global_entities,
+                entity_links: report.entity_links,
+                imported_edges: report.imported_edges,
+                cooccur_edges: report.cooccur_edges,
+                llm_edges: report.llm_edges,
+                llm_passes: report.llm_passes,
+            },
+            Err(e) => WorkspaceKgStateEvent::Unavailable { reason: e.to_string() },
+        };
+        let _ = thread_app.emit("workspace-kg-state", event);
+        cancel_slot.lock().unwrap().take();
+        running.store(false, Ordering::SeqCst);
+    });
+    true
+}
+
+/// Manually rebuild the workspace knowledge graph now (federated-kg task
+/// 2.1). Mirrors `refresh_knowledge_model`: returns as soon as the build
+/// thread is spawned; progress and outcome arrive via `workspace-kg-state`
+/// events (`building` → `ready` | `unavailable`).
+#[tauri::command]
+fn rebuild_workspace_kg(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    let enabled = {
+        let guard = state.lock().unwrap();
+        federated_kg_enabled(&guard.app_settings)
+    };
+    if !enabled {
+        return Err("federatedKg flag is off".into());
+    }
+    if !start_workspace_kg_build(&app, state.inner()) {
+        return Err("a workspace-KG build is already running — give it a moment.".into());
+    }
+    Ok(())
+}
+
+/// One member's staleness in `workspace_kg_overview` (federated-kg task 2.2).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceKgMemberStatusDto {
+    project_id: String,
+    name: String,
+    /// This member's current `knowledge_model_built_at` watermark (`null` =
+    /// no knowledge model built yet).
+    current_watermark: Option<i64>,
+    /// True when the workspace-KG's cached snapshot for this member is
+    /// missing or behind `current_watermark` — i.e. the next build will
+    /// re-read it (spec: "unchanged members are skipped").
+    stale: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceKgOverviewDto {
+    /// `null` before the first build ever completes.
+    built_at: Option<i64>,
+    llm_passes: bool,
+    global_entities: usize,
+    entity_links: usize,
+    edges: usize,
+    /// Only currently-open members (task 2.1/2.2 deviation — no workspace
+    /// manifest to enumerate members that aren't open; see final report).
+    members: Vec<WorkspaceKgMemberStatusDto>,
+}
+
+/// Workspace-KG summary: counts + per-member staleness (federated-kg task
+/// 2.2). Flag-gated (task 2.3) — off returns an error before `kg.sqlite` is
+/// even opened, so a read alone can never create it.
+#[tauri::command]
+fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOverviewDto> {
+    let guard = state.lock().unwrap();
+    if !federated_kg_enabled(&guard.app_settings) {
+        return Err("federatedKg flag is off".into());
+    }
+    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&guard.base_dir).map_err(err)?;
+    let built_at = kg
+        .get_meta("workspace_kg_built_at")
+        .map_err(err)?
+        .and_then(|s| s.parse::<i64>().ok());
+    let llm_passes = kg.get_meta("llm_passes").map_err(err)?.as_deref() == Some("true");
+    let global_entities = kg.list_global_entities().map_err(err)?;
+    let mut entity_links = 0usize;
+    for e in &global_entities {
+        entity_links += kg.list_links_for_global(e.id).map_err(err)?.len();
+    }
+    let edges = kg.list_all_edges().map_err(err)?.len();
+
+    let mut members = Vec::with_capacity(guard.members.len());
+    for m in guard.members.values() {
+        let project_id = m.project.config.id;
+        let current_watermark = m.db.knowledge_model_built_at().map_err(err)?;
+        let cached = kg.get_watermark(project_id).map_err(err)?;
+        let stale = cached != Some(current_watermark);
+        members.push(WorkspaceKgMemberStatusDto {
+            project_id: project_id.to_string(),
+            name: m.project.config.name.clone(),
+            current_watermark,
+            stale,
+        });
+    }
+    members.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(WorkspaceKgOverviewDto {
+        built_at,
+        llm_passes,
+        global_entities: global_entities.len(),
+        entity_links,
+        edges,
+        members,
+    })
+}
+
+/// One edge in a `workspace_kg_entity` wiki page — either an out-link (this
+/// entity is `src`) or a back-link (this entity is `dst`); `other_id`/
+/// `other_name` always name the OTHER endpoint (design D4: back-links are
+/// `global_edges` queried in the reverse direction, not a separate table).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceKgEdgeDto {
+    id: i64,
+    other_id: i64,
+    other_name: String,
+    relation: String,
+    weight: f64,
+    /// `"imported"` | `"cooccur"` | `"llm"`.
+    provenance: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceKgPointerDto {
+    project_id: String,
+    rel_path: String,
+    snippet: String,
+    /// `ken://<project-id>/<rel-path>` (design D4 addressing).
+    uri: String,
+    /// True if this pointer's file is confirmed missing on disk. Only
+    /// checkable for a currently-open member (task 2.2 deviation — no
+    /// workspace manifest to resolve a closed member's root); a pointer
+    /// into a member that isn't open is never flagged stale by this field
+    /// alone (spec: "or is marked stale if the file no longer exists —
+    /// never a crash" — never crashing is satisfied unconditionally; the
+    /// staleness *signal* is best-effort until member enumeration lands).
+    stale: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceKgEntityDto {
+    id: i64,
+    kind: String,
+    name: String,
+    summary: String,
+    updated_at: i64,
+    /// `kg://<id>` (design D4 addressing).
+    uri: String,
+    out_links: Vec<WorkspaceKgEdgeDto>,
+    back_links: Vec<WorkspaceKgEdgeDto>,
+    pointers: Vec<WorkspaceKgPointerDto>,
+}
+
+/// The full wiki-page payload for one global entity in a single call
+/// (federated-kg task 2.2 / spec "Every global entity is a wiki page" +
+/// design D4: "the frontend never joins") — summary, both edge directions,
+/// and per-project doc pointers. Flag-gated (task 2.3).
+#[tauri::command]
+fn workspace_kg_entity(state: State<SharedState>, id: i64) -> CmdResult<WorkspaceKgEntityDto> {
+    let guard = state.lock().unwrap();
+    if !federated_kg_enabled(&guard.app_settings) {
+        return Err("federatedKg flag is off".into());
+    }
+    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&guard.base_dir).map_err(err)?;
+    let entity = kg
+        .get_global_entity(id)
+        .map_err(err)?
+        .ok_or_else(|| format!("no global entity {id}"))?;
+
+    let name_of = |kg: &ken_core::workspace_kg_db::WorkspaceKgDb, gid: i64| -> CmdResult<String> {
+        Ok(kg.get_global_entity(gid).map_err(err)?.map(|e| e.name).unwrap_or_default())
+    };
+    let out_links = kg
+        .list_edges_from(id)
+        .map_err(err)?
+        .into_iter()
+        .map(|e| {
+            Ok(WorkspaceKgEdgeDto {
+                id: e.id,
+                other_id: e.dst_global_id,
+                other_name: name_of(&kg, e.dst_global_id)?,
+                relation: e.relation,
+                weight: e.weight,
+                provenance: e.provenance,
+            })
+        })
+        .collect::<CmdResult<Vec<_>>>()?;
+    let back_links = kg
+        .list_edges_to(id)
+        .map_err(err)?
+        .into_iter()
+        .map(|e| {
+            Ok(WorkspaceKgEdgeDto {
+                id: e.id,
+                other_id: e.src_global_id,
+                other_name: name_of(&kg, e.src_global_id)?,
+                relation: e.relation,
+                weight: e.weight,
+                provenance: e.provenance,
+            })
+        })
+        .collect::<CmdResult<Vec<_>>>()?;
+
+    let pointers = kg
+        .list_pointers_for_global(id)
+        .map_err(err)?
+        .into_iter()
+        .map(|p| {
+            let stale = uuid::Uuid::parse_str(&p.project_id)
+                .ok()
+                .and_then(|pid| guard.members.get(&pid))
+                .map(|m| !m.project.root.join(&p.rel_path).exists())
+                .unwrap_or(false);
+            WorkspaceKgPointerDto {
+                uri: format!("ken://{}/{}", p.project_id, p.rel_path),
+                project_id: p.project_id,
+                rel_path: p.rel_path,
+                snippet: p.snippet,
+                stale,
+            }
+        })
+        .collect();
+
+    Ok(WorkspaceKgEntityDto {
+        uri: format!("kg://{}", entity.id),
+        id: entity.id,
+        kind: entity.kind,
+        name: entity.name,
+        summary: entity.summary,
+        updated_at: entity.updated_at,
+        out_links,
+        back_links,
+        pointers,
+    })
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceKgSearchHitDto {
+    id: i64,
+    kind: String,
+    name: String,
+    summary: String,
+    uri: String,
+}
+
+/// Cap on returned hits. No pagination — design's own scale bound (≤~3k
+/// entities even beyond ~15 members) makes a hard cap enough.
+const WORKSPACE_KG_SEARCH_LIMIT: usize = 50;
+
+/// Search global entity names + summaries (federated-kg task 2.2).
+///
+/// Deviation (see final report): `kg.sqlite`'s schema
+/// (`workspace_kg_db.rs`, out of this task's touch scope) has no FTS table
+/// — only plain `global_entities` rows — so this is a case-insensitive
+/// substring match over `list_global_entities()` done in Rust, the honest
+/// floor the proposal's "FTS over global entity names + summaries" degrades
+/// to until a schema migration adds one. Fine at workspace scale. Flag-gated
+/// (task 2.3).
+#[tauri::command]
+fn workspace_kg_search(state: State<SharedState>, query: String) -> CmdResult<Vec<WorkspaceKgSearchHitDto>> {
+    let guard = state.lock().unwrap();
+    if !federated_kg_enabled(&guard.app_settings) {
+        return Err("federatedKg flag is off".into());
+    }
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&guard.base_dir).map_err(err)?;
+    let mut hits: Vec<WorkspaceKgSearchHitDto> = kg
+        .list_global_entities()
+        .map_err(err)?
+        .into_iter()
+        .filter(|e| e.name.to_lowercase().contains(&q) || e.summary.to_lowercase().contains(&q))
+        .map(|e| WorkspaceKgSearchHitDto {
+            uri: format!("kg://{}", e.id),
+            id: e.id,
+            kind: e.kind,
+            name: e.name,
+            summary: e.summary,
+        })
+        .collect();
+    // Name matches rank above summary-only matches; stable by id within
+    // each tier for a deterministic result order.
+    hits.sort_by(|a, b| {
+        let a_name = a.name.to_lowercase().contains(&q);
+        let b_name = b.name.to_lowercase().contains(&q);
+        b_name.cmp(&a_name).then(a.id.cmp(&b.id))
+    });
+    hits.truncate(WORKSPACE_KG_SEARCH_LIMIT);
+    Ok(hits)
 }
 
 /// The incremental-Map worker: one per open project. Loops draining the
@@ -6248,6 +6765,9 @@ pub fn run() {
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
         qa_gen: Arc::new(AtomicU64::new(0)),
         record: Arc::new(Mutex::new(None)),
+        workspace_kg_running: Arc::new(AtomicBool::new(false)),
+        workspace_kg_cancel: Arc::new(Mutex::new(None)),
+        workspace_kg_debounce_gen: Arc::new(AtomicU64::new(0)),
     }));
 
     tauri::Builder::default()
@@ -6365,6 +6885,10 @@ pub fn run() {
             warm_llm,
             knowledge_model,
             refresh_knowledge_model,
+            rebuild_workspace_kg,
+            workspace_kg_overview,
+            workspace_kg_entity,
+            workspace_kg_search,
             list_chats,
             chat_transcript,
             create_chat,

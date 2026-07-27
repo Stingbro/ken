@@ -53,6 +53,15 @@ pub const FLAGS: &[FlagDef] = &[
                       optional local-LLM refinement) to tune semantic-index \
                       chunking, exclusions, and knowledge extraction.",
     },
+    FlagDef {
+        name: "federatedKg",
+        scope: FlagScope::Workspace,
+        default: false,
+        description: "Build a workspace-wide knowledge graph that federates \
+                      each open member's knowledge model into merged \
+                      entities, cross-project edges, and a wiki-page view. \
+                      Requires the workspace flag.",
+    },
 ];
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
@@ -114,12 +123,15 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 3);
+        assert_eq!(FLAGS.len(), 4);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);
+        let federated_kg = flag("federatedKg").expect("federatedKg flag registered");
+        assert_eq!(federated_kg.scope, FlagScope::Workspace);
+        assert!(!federated_kg.default);
     }
 
     #[test]

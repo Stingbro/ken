@@ -15,6 +15,7 @@ pub mod engine;
 pub mod error;
 pub mod extract;
 pub mod features;
+pub mod federation;
 pub mod fsops;
 pub mod hooks;
 pub mod import;
@@ -39,5 +40,6 @@ pub mod sync;
 pub mod transcript;
 pub mod user_state;
 pub mod watch;
+pub mod workspace_kg_db;
 
 pub use error::{Error, Result};
