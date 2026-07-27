@@ -48,6 +48,11 @@ pub struct ProjectConfig {
     /// (everything is included).
     #[serde(default)]
     pub excluded: Vec<String>,
+    /// Per-project feature-flag overrides; bool values keyed by flag name.
+    /// Absent map means no overrides. Older Kens that don't know this field
+    /// carry it through the `extra` flatten below.
+    #[serde(default)]
+    pub features: serde_json::Map<String, serde_json::Value>,
     /// Fields written by newer versions or other capabilities survive a
     /// round-trip through this one.
     #[serde(flatten)]
@@ -79,6 +84,7 @@ impl Project {
             name: name.to_string(),
             id: Uuid::new_v4(),
             excluded: Vec::new(),
+            features: serde_json::Map::new(),
             extra: serde_json::Map::new(),
         };
         let project = Project {
@@ -159,7 +165,9 @@ impl Project {
     /// project root (`..`, absolute paths).
     pub fn resolve(&self, rel_path: &str) -> Result<PathBuf> {
         let rel = Path::new(rel_path);
-        if rel.is_absolute()
+        // has_root() rather than is_absolute(): on Windows "/etc/passwd" is
+        // rooted but not absolute, yet join() would still escape the project.
+        if rel.has_root()
             || rel
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -205,12 +213,25 @@ mod tests {
         let mut v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         v["ingestRunner"] = "hidden-tui".into();
+        // A newer Ken also wrote a features map, including a flag this build
+        // doesn't recognize by name. It lives in the typed `features` field but
+        // must still survive a save round-trip unchanged.
+        v["features"] = serde_json::json!({ "semanticIndex": true, "futureFlag": true });
         fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
 
         let mut reopened = Project::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.config.features.get("semanticIndex").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            reopened.config.features.get("futureFlag").and_then(|x| x.as_bool()),
+            Some(true)
+        );
         reopened.set_excluded(vec!["archive".into()]).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("ingestRunner"), "extra field lost: {raw}");
+        assert!(raw.contains("futureFlag"), "features map lost: {raw}");
         drop(p);
     }
 
