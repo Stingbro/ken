@@ -3,7 +3,7 @@
   import { app } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { theme, type ThemeMode } from "../lib/theme.svelte";
-  import { api, type McpInfo, type SyncStatus, type ModelStatus } from "../lib/api";
+  import { api, type McpInfo, type SyncStatus, type ModelStatus, type FeatureInfo } from "../lib/api";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
@@ -30,6 +30,10 @@
   let models = $state<ModelStatus[]>([]);
   let modelsLoading = $state(true);
   let removing = $state<string | null>(null);
+  // Registry-driven feature flags: global defaults plus this project's
+  // overrides (see openspec/changes/feature-flags/design.md D5).
+  let features = $state<FeatureInfo[]>([]);
+  let featuresBusy = $state<string | null>(null);
 
   const themeOptions: { value: ThemeMode; title: string }[] = [
     { value: "light", title: "Light" },
@@ -61,8 +65,48 @@
     void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
     void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
     void refreshModels();
+    void loadFeatures();
     return () => clearTimeout(copyTimer);
   });
+
+  async function loadFeatures() {
+    features = await api.listFeatures(app.project?.id).catch(() => []);
+  }
+
+  /** Change a flag's global default (`settings.json`). Project-scoped flags
+   *  fall back to this when the active project has no override — refresh
+   *  `app.semanticIndex` too so the status display above stays coherent when
+   *  it's the default (rather than an override) that's driving it. */
+  async function setGlobalDefault(flag: FeatureInfo, value: boolean) {
+    featuresBusy = flag.name;
+    try {
+      await api.setGlobalFeature(flag.name, value);
+      if (flag.name === "semanticIndex") {
+        app.semanticIndex = await api.getSemanticIndex().catch(() => app.semanticIndex);
+      }
+      await loadFeatures();
+    } finally {
+      featuresBusy = null;
+    }
+  }
+
+  /** Set this project's override for a project-scoped flag. `semanticIndex`
+   *  routes through `app.setSemanticIndex` so `app.semanticIndexState`
+   *  (build/availability status, driven by its own event subscription)
+   *  keeps tracking the toggle instead of drifting from a second writer. */
+  async function setProjectOverride(flag: FeatureInfo, value: boolean) {
+    featuresBusy = flag.name;
+    try {
+      if (flag.name === "semanticIndex") {
+        await app.setSemanticIndex(value);
+      } else {
+        await api.setProjectFeature(flag.name, value);
+      }
+      await loadFeatures();
+    } finally {
+      featuresBusy = null;
+    }
+  }
 
   async function refreshModels() {
     modelsLoading = true;
@@ -292,40 +336,6 @@
     </div>
 
     <div class="card">
-      <div class="card-title">Semantic search</div>
-      <div class="row">
-        <label class="radio">
-          <input
-            type="checkbox"
-            checked={app.semanticIndex}
-            onchange={(e) =>
-              void app.setSemanticIndex(e.currentTarget.checked)}
-          />
-          Search by meaning, not just keywords
-        </label>
-      </div>
-      {#if app.semanticIndex && app.semanticIndexState}
-        {#if app.semanticIndexState.state === "building"}
-          <p class="note">
-            Building the semantic index — {app.semanticIndexState.done} of
-            {app.semanticIndexState.total} files.
-          </p>
-        {:else if app.semanticIndexState.state === "unavailable"}
-          <p class="note">
-            Not available right now: {app.semanticIndexState.reason}
-          </p>
-        {:else if app.semanticIndexState.state === "warning"}
-          <p class="note">{app.semanticIndexState.reason}</p>
-        {/if}
-      {/if}
-      <p class="note">
-        Finds files by what they mean, not just matching words, alongside the
-        usual keyword search. Files already indexed pick up semantic search on
-        their next reindex, not instantly.
-      </p>
-    </div>
-
-    <div class="card">
       <div class="card-title">Sync &amp; collaboration</div>
       {#if sync?.mode === "git"}
         <div class="row">
@@ -382,6 +392,65 @@
       {/if}
     </div>
     </section>
+
+    {#if features.length > 0}
+      <section class="group">
+        <div class="group-head">Features</div>
+        {#each features as flag (flag.name)}
+          <div class="card">
+            <div class="card-title">{flag.name}</div>
+            <div class="row">
+              <label class="radio">
+                <input
+                  type="checkbox"
+                  checked={flag.global}
+                  disabled={featuresBusy === flag.name}
+                  onchange={(e) =>
+                    void setGlobalDefault(flag, e.currentTarget.checked)}
+                />
+                On by default for every project
+              </label>
+            </div>
+            {#if flag.scope === "project"}
+              <div class="row">
+                <label class="radio">
+                  <input
+                    type="checkbox"
+                    checked={flag.projectOverride ?? flag.global}
+                    disabled={featuresBusy === flag.name}
+                    onchange={(e) =>
+                      void setProjectOverride(flag, e.currentTarget.checked)}
+                  />
+                  On for this project
+                </label>
+              </div>
+              <p class="note">
+                {#if flag.projectOverride === null}
+                  This project follows the global default above.
+                {:else}
+                  This project overrides the global default.
+                {/if}
+              </p>
+            {/if}
+            {#if flag.name === "semanticIndex" && flag.effective && app.semanticIndexState}
+              {#if app.semanticIndexState.state === "building"}
+                <p class="note">
+                  Building the semantic index — {app.semanticIndexState.done} of
+                  {app.semanticIndexState.total} files.
+                </p>
+              {:else if app.semanticIndexState.state === "unavailable"}
+                <p class="note">
+                  Not available right now: {app.semanticIndexState.reason}
+                </p>
+              {:else if app.semanticIndexState.state === "warning"}
+                <p class="note">{app.semanticIndexState.reason}</p>
+              {/if}
+            {/if}
+            <p class="note">{flag.description}</p>
+          </div>
+        {/each}
+      </section>
+    {/if}
 
     <section class="group">
       <div class="group-head">On this Mac</div>

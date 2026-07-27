@@ -1,10 +1,11 @@
 <script lang="ts">
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type RegistryEntryStatus } from "../lib/api";
+  import { api, type FeatureInfo, type RegistryEntryStatus } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Trash2 from "@lucide/svelte/icons/trash-2";
+  import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
@@ -44,6 +45,13 @@
   let pendingPath = $state<string | null>(null);
   let pendingName = $state("");
 
+  // Project-scoped feature flags offered during onboarding, plus the
+  // toggles the user actually changed from their default (only those are
+  // written once the project exists — see confirmCreate).
+  let features = $state<FeatureInfo[]>([]);
+  let featureChoices = $state<Record<string, boolean>>({});
+  let featuresOpen = $state(false);
+
   async function chooseFolder() {
     error = null;
     const folder = await openDialog({
@@ -53,12 +61,30 @@
     if (typeof folder !== "string") return;
     pendingPath = folder;
     pendingName = folder.split("/").pop() ?? "My project";
+    featuresOpen = false;
+    try {
+      const all = await api.listFeatures();
+      features = all.filter((f) => f.scope === "project");
+      featureChoices = Object.fromEntries(features.map((f) => [f.name, f.effective]));
+    } catch {
+      features = [];
+      featureChoices = {};
+    }
   }
 
   async function confirmCreate() {
     if (!pendingPath) return;
     try {
+      const changed = features.filter((f) => featureChoices[f.name] !== f.effective);
       await app.createProject(pendingPath, pendingName.trim() || "My project");
+      for (const f of changed) {
+        const value = featureChoices[f.name];
+        if (f.name === "semanticIndex") {
+          await app.setSemanticIndex(value);
+        } else {
+          await api.setProjectFeature(f.name, value);
+        }
+      }
     } catch (e) {
       error = String(e);
     }
@@ -106,6 +132,37 @@
             }}
           />
         </label>
+
+        {#if features.length > 0}
+          <div class="features">
+            <button
+              type="button"
+              class="features-toggle"
+              onclick={() => (featuresOpen = !featuresOpen)}
+              aria-expanded={featuresOpen}
+            >
+              <span class="chev" class:open={featuresOpen}>
+                <ChevronRight size={13} strokeWidth={2} />
+              </span>
+              Features
+            </button>
+            {#if featuresOpen}
+              <div class="features-body">
+                {#each features as flag (flag.name)}
+                  <label class="radio feature-row">
+                    <input type="checkbox" bind:checked={featureChoices[flag.name]} />
+                    <span class="feature-text">
+                      <span class="feature-name">{flag.name}</span>
+                      <span class="note">{flag.description}</span>
+                    </span>
+                  </label>
+                {/each}
+                <p class="note">You can change these later in Settings.</p>
+              </div>
+            {/if}
+          </div>
+        {/if}
+
         <div class="confirm-actions">
           <button class="btn btn-primary" onclick={confirmCreate}>Create project</button>
           <button class="btn btn-ghost" onclick={() => (pendingPath = null)}>Back</button>
@@ -247,6 +304,71 @@
   .confirm-actions {
     display: flex;
     gap: 8px;
+  }
+  .features {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .features-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    align-self: flex-start;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ink-tertiary);
+  }
+  .features-toggle:hover {
+    color: var(--ink-secondary);
+  }
+  .chev {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    transition: transform 0.15s ease;
+  }
+  .chev.open {
+    transform: rotate(90deg);
+  }
+  .features-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 2px 2px 0;
+  }
+  .radio {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .radio input {
+    accent-color: var(--accent);
+  }
+  .feature-row {
+    align-items: flex-start;
+  }
+  .feature-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .feature-name {
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+  .note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--ink-tertiary);
+    line-height: 1.5;
   }
   .error {
     font-size: 13px;

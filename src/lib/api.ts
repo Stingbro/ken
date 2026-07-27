@@ -519,6 +519,18 @@ export interface Placement {
   rationale: string | null;
 }
 
+/** A registered feature flag with its resolved values, as returned by
+ *  `listFeatures`. `projectOverride` is `null` when no project is given, the
+ *  flag isn't project-scoped, or the project hasn't set an override. */
+export interface FeatureInfo {
+  name: string;
+  scope: "global" | "project" | "workspace";
+  description: string;
+  global: boolean;
+  projectOverride: boolean | null;
+  effective: boolean;
+}
+
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   createProject: (path: string, name: string) =>
@@ -661,12 +673,21 @@ export const api = {
     invoke<void>("set_background_index", { enabled }),
   /// Whether the semantic (meaning-based) index is enabled for the active project.
   getSemanticIndex: () => invoke<boolean>("get_semantic_index"),
-  /** Toggle the `semanticIndex` project feature flag. Paired with
-   *  `getSemanticIndex` above, mirroring the `getBackgroundIndex`/
-   *  `setBackgroundIndex` pair (see `onSemanticIndexState` for
-   *  build/availability updates). */
-  setProjectFeature: (flag: "semanticIndex", value: boolean) =>
+  /** Toggle a project-scoped feature flag on the active project. Paired
+   *  with `getSemanticIndex` above for `semanticIndex`, mirroring the
+   *  `getBackgroundIndex`/`setBackgroundIndex` pair (see
+   *  `onSemanticIndexState` for build/availability updates). */
+  setProjectFeature: (flag: string, value: boolean) =>
     invoke<void>("set_project_feature", { flag, value }),
+  /** Set a feature flag's global default (`settings.json`). Project-scoped
+   *  flags fall back to this value when a project has no override. */
+  setGlobalFeature: (flag: string, value: boolean) =>
+    invoke<void>("set_global_feature", { flag, value }),
+  /** All registered feature flags, resolved for `projectId` (or with no
+   *  project context when omitted — used by onboarding before a project
+   *  exists). One call feeds both the onboarding disclosure and Settings. */
+  listFeatures: (projectId?: string) =>
+    invoke<FeatureInfo[]>("list_features", { projectId }),
   /// Whether videos are auto-transcribed on-device (Whisper) during indexing.
   getTranscribeOnIndex: () => invoke<boolean>("get_transcribe_on_index"),
   setTranscribeOnIndex: (enabled: boolean) =>

@@ -126,6 +126,9 @@ struct AppState {
     base_dir: PathBuf,
     hooks: Option<Arc<HookListener>>,
     active: Option<ActiveProject>,
+    /// Global feature-flag defaults, loaded from `settings.json` at startup and
+    /// held behind the same lock as the rest of app state.
+    app_settings: ken_core::settings::AppSettings,
     /// Model downloads are app-global (they live under the app-data dir, not a
     /// project), so their bookkeeping hangs off the top-level state: the set of
     /// model ids downloading right now (guards a second concurrent download of
@@ -246,38 +249,25 @@ enum SemanticIndexStateEvent {
     Warning { reason: String },
 }
 
-/// Effective `semanticIndex` flag for a project. The proposal doc describes
-/// a "project.json `features` override > global settings" layering with a
-/// pointer to a `features/multi-project/README.md` flag mechanism, but no
-/// such file or global-settings layer exists anywhere in this codebase
-/// (confirmed by repo-wide search) — it's dangling text. The real,
-/// established convention for per-project boolean feature flags is
-/// `bg_hydrate.rs`'s `background_index_enabled`: a single flag read
-/// straight off `project.config.extra`. This mirrors that exactly, except
-/// semantic indexing needs a local embedding model and heavier background
-/// work, so — unlike `backgroundIndex` — it defaults to *off* until the
-/// user opts in via `set_project_feature`.
-fn semantic_index_enabled(project: &Project) -> bool {
-    project
-        .config
-        .extra
-        .get("semanticIndex")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+/// Effective `semanticIndex` flag for a project — a thin call to the shared
+/// resolver, which layers project override > (reserved workspace slot) >
+/// global default > registry default, honoring the legacy top-level
+/// `extra["semanticIndex"]` key on the way.
+fn semantic_index_enabled(app_settings: &ken_core::settings::AppSettings, project: &Project) -> bool {
+    ken_core::features::effective_flag(app_settings, project, "semanticIndex")
 }
 
-/// Build the embedder used for semantic indexing, or `None` if this build
-/// has no embedding model available. `ken-app` depends on `ken-core` with
-/// `default-features = false`, which excludes the `local-llm` feature (and
-/// with it `LlamaEmbedder`) — there is no Vulkan-capable llama.cpp backend
-/// available to this build. `FakeEmbedder` is deliberately NOT substituted
-/// here: it would silently return meaningless hash-based vectors for real
-/// search results instead of failing loudly. Callers must treat `None` as
-/// "semantic index unavailable in this build" and emit
-/// `semantic-index-state` `unavailable {reason}` rather than degrading
-/// silently.
+/// Build the embedder used for semantic indexing, or `None` if no embedding
+/// model is available — either this build lacks the `local-llm` feature
+/// (e.g. the FTS-only `ken-mcp` sidecar), or the user hasn't downloaded the
+/// embedding model yet (Settings → Models), or the model file failed to
+/// load. `FakeEmbedder` is deliberately NOT substituted here: it would
+/// silently return meaningless hash-based vectors for real search results
+/// instead of failing loudly. Callers must treat `None` as "semantic index
+/// unavailable" and emit `semantic-index-state` `unavailable {reason}`
+/// rather than degrading silently.
 fn build_semantic_embedder() -> Option<Box<dyn Embedder + Send>> {
-    None
+    ken_core::embedder::installed_embedding_model()
 }
 
 /// semantic-index task 2.4 / spike `S4-knn-latency.md`: once a project's
@@ -342,7 +332,7 @@ fn apply_semantic_index_flag(app: &AppHandle, state: &SharedState, enabled: bool
         let _ = app.emit(
             "semantic-index-state",
             SemanticIndexStateEvent::Unavailable {
-                reason: "embedding model not available in this build".into(),
+                reason: "embedding model not installed — download it in Settings".into(),
             },
         );
         return Ok(());
@@ -788,10 +778,14 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
 
     // semantic-index task 2.1: resume the semantic index on open if the
     // project already had `semanticIndex` turned on in a previous session
-    // (the flag persists in `project.config.extra`, but the live embedder
-    // slot in `ActiveProject` always starts empty). Best-effort — a project
-    // opening should never fail because of this.
-    if semantic_index_enabled(&project) {
+    // (the flag persists in the project's `features` map, but the live
+    // embedder slot in `ActiveProject` always starts empty). Best-effort — a
+    // project opening should never fail because of this.
+    let resume_semantic = {
+        let guard = state.lock().unwrap();
+        semantic_index_enabled(&guard.app_settings, &project)
+    };
+    if resume_semantic {
         let _ = apply_semantic_index_flag(app, state, true);
     }
 
@@ -1206,7 +1200,7 @@ async fn hybrid_search(
         let active = guard.active.as_ref().ok_or("no project open")?;
         (
             active.search_db.clone(),
-            semantic_index_enabled(&active.project),
+            semantic_index_enabled(&guard.app_settings, &active.project),
             active.semantic_embedder.clone(),
         )
     };
@@ -1224,8 +1218,7 @@ async fn hybrid_search(
                 let mut guard = embedder_slot.lock().unwrap();
                 guard
                     .as_deref_mut()
-                    .and_then(|embedder| embedder.embed(&[query.clone()]).ok())
-                    .and_then(|mut v| v.pop())
+                    .and_then(|embedder| embedder.embed_query(&query).ok())
             };
             match query_vec {
                 Some(qv) => db
@@ -1272,10 +1265,13 @@ async fn hybrid_search(
     .map_err(|e| e.to_string())?
 }
 
-/// Flip a per-project boolean feature flag (semantic-index task 2.1). Only
-/// `semanticIndex` is recognized today; unknown flags are rejected rather
-/// than silently ignored so a frontend typo surfaces immediately instead of
-/// quietly doing nothing.
+/// Flip a per-project boolean feature flag. The flag must be registered and
+/// project-scoped (validated against the registry so a frontend typo surfaces
+/// immediately instead of quietly doing nothing). The value is written to the
+/// project's typed `features` map; for `semanticIndex` the legacy top-level
+/// `extra` key is removed in the same save, so first write migrates old files.
+/// Per-flag side effects run after persisting (semanticIndex resumes/stops the
+/// index build).
 #[tauri::command]
 fn set_project_feature(
     app: AppHandle,
@@ -1283,8 +1279,10 @@ fn set_project_feature(
     flag: String,
     value: bool,
 ) -> CmdResult<()> {
-    if flag != "semanticIndex" {
-        return Err(format!("unknown feature flag: {flag}"));
+    match ken_core::features::flag(&flag) {
+        Some(def) if def.scope == ken_core::features::FlagScope::Project => {}
+        Some(_) => return Err(format!("feature flag is not project-scoped: {flag}")),
+        None => return Err(format!("unknown feature flag: {flag}")),
     }
 
     let mut project = {
@@ -1293,8 +1291,13 @@ fn set_project_feature(
     };
     project
         .config
-        .extra
-        .insert(flag, serde_json::Value::Bool(value));
+        .features
+        .insert(flag.clone(), serde_json::Value::Bool(value));
+    // Lazy migration: the value now lives in the typed `features` map, so drop
+    // the legacy top-level key the old code wrote to `extra`.
+    if flag == "semanticIndex" {
+        project.config.extra.remove("semanticIndex");
+    }
     project.save().map_err(err)?;
 
     // Keep the in-memory copy (read by `semantic_index_enabled` elsewhere,
@@ -1306,21 +1309,174 @@ fn set_project_feature(
         }
     }
 
-    apply_semantic_index_flag(&app, state.inner(), value)
+    // Per-flag side effects.
+    if flag == "semanticIndex" {
+        apply_semantic_index_flag(&app, state.inner(), value)?;
+    }
+    Ok(())
+}
+
+/// Set a global (per-user) feature-flag default in `settings.json`. Accepts any
+/// registered flag regardless of scope: global-scoped flags live only here, and
+/// project-scoped flags use the global layer as their default when no project
+/// override is set. The durable write happens first; the in-memory
+/// `AppSettings` in `AppState` is updated only after it succeeds, so a failed
+/// save leaves state and disk consistent.
+#[tauri::command]
+fn set_global_feature(state: State<SharedState>, flag: String, value: bool) -> CmdResult<()> {
+    if ken_core::features::flag(&flag).is_none() {
+        return Err(format!("unknown feature flag: {flag}"));
+    }
+    let (base_dir, mut settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    settings
+        .features
+        .insert(flag, serde_json::Value::Bool(value));
+    settings.save(&base_dir).map_err(err)?;
+    let mut guard = state.lock().unwrap();
+    guard.app_settings = settings;
+    Ok(())
+}
+
+/// One registered flag's resolved state, for the Settings and onboarding UIs.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FeatureInfo {
+    name: String,
+    /// `global` | `project` | `workspace`.
+    scope: String,
+    description: String,
+    /// The global-layer value: `settings.json` if set, else the registry default.
+    global: bool,
+    /// The project's own override — `Some` only when a project-scoped flag is
+    /// explicitly set by the requested project (includes the legacy location).
+    project_override: Option<bool>,
+    /// Resolved value after applying the full precedence chain.
+    effective: bool,
+}
+
+fn scope_str(scope: ken_core::features::FlagScope) -> &'static str {
+    match scope {
+        ken_core::features::FlagScope::Global => "global",
+        ken_core::features::FlagScope::Project => "project",
+        ken_core::features::FlagScope::Workspace => "workspace",
+    }
+}
+
+/// The raw value the project layer contributes for `name`, or `None` if the
+/// project sets no override. Mirrors the project tiers of `effective_flag`: the
+/// typed `features` map, then the legacy `extra["semanticIndex"]` location.
+fn project_layer_value(project: &Project, name: &str) -> Option<bool> {
+    if let Some(v) = project
+        .config
+        .features
+        .get(name)
+        .and_then(serde_json::Value::as_bool)
+    {
+        return Some(v);
+    }
+    if name == "semanticIndex" {
+        if let Some(v) = project
+            .config
+            .extra
+            .get(name)
+            .and_then(serde_json::Value::as_bool)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// List every registered feature flag with its resolved state — one command
+/// feeds both the Settings section and the onboarding disclosure. With no
+/// `project_id`, only the global/registry layers are reflected (project
+/// overrides absent). With one, project-scoped flags also report that project's
+/// override and full effective value; the project is read from the active copy
+/// when it's open, otherwise loaded from disk via the registry.
+#[tauri::command]
+fn list_features(
+    state: State<SharedState>,
+    project_id: Option<String>,
+) -> CmdResult<Vec<FeatureInfo>> {
+    // Snapshot global settings and (if requested and open) the active project,
+    // without holding the lock across any file I/O below.
+    let (base_dir, app_settings, active_project) = {
+        let guard = state.lock().unwrap();
+        let active = match &project_id {
+            Some(id) => guard
+                .active
+                .as_ref()
+                .filter(|a| a.project.config.id.to_string() == *id)
+                .map(|a| a.project.clone()),
+            None => None,
+        };
+        (guard.base_dir.clone(), guard.app_settings.clone(), active)
+    };
+
+    // A requested project that isn't the open one is loaded from disk via the
+    // registry (mirrors `rename_project`), so overrides read true even when it
+    // isn't active.
+    let project = match (&project_id, active_project) {
+        (Some(_), Some(p)) => Some(p),
+        (Some(id), None) => {
+            let uuid = uuid::Uuid::parse_str(id).map_err(|_| "invalid project id".to_string())?;
+            let registry = Registry::load(&base_dir).map_err(err)?;
+            let entry = registry
+                .projects
+                .iter()
+                .find(|e| e.id == uuid)
+                .ok_or("unknown project")?;
+            Some(Project::open(&entry.path).map_err(err)?)
+        }
+        (None, _) => None,
+    };
+
+    let features = ken_core::features::FLAGS
+        .iter()
+        .map(|def| {
+            let global = app_settings
+                .features
+                .get(def.name)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(def.default);
+            let (project_override, effective) = match &project {
+                Some(p) if def.scope == ken_core::features::FlagScope::Project => (
+                    project_layer_value(p, def.name),
+                    ken_core::features::effective_flag(&app_settings, p, def.name),
+                ),
+                Some(p) => (
+                    None,
+                    ken_core::features::effective_flag(&app_settings, p, def.name),
+                ),
+                None => (None, global),
+            };
+            FeatureInfo {
+                name: def.name.to_string(),
+                scope: scope_str(def.scope).to_string(),
+                description: def.description.to_string(),
+                global,
+                project_override,
+                effective,
+            }
+        })
+        .collect();
+    Ok(features)
 }
 
 /// Is the semantic (meaning-based) index enabled for the active project?
-/// Mirrors `get_background_index`/`get_transcribe_on_index`: reads the same
-/// `project.config.extra["semanticIndex"]` flag `set_project_feature`
-/// writes, via the `semantic_index_enabled` helper `activate()` already
-/// uses to decide whether to resume the build on open. Lets the frontend
-/// initialize the toggle from what was actually persisted instead of always
+/// Mirrors `get_background_index`/`get_transcribe_on_index`: resolves the
+/// `semanticIndex` flag through `semantic_index_enabled` — the same helper
+/// `activate()` uses to decide whether to resume the build on open. Lets the
+/// frontend initialize the toggle from the effective value instead of always
 /// starting it at `false` on project activation.
 #[tauri::command]
 fn get_semantic_index(state: State<SharedState>) -> CmdResult<bool> {
     let guard = state.lock().unwrap();
     let active = guard.active.as_ref().ok_or("no project open")?;
-    Ok(semantic_index_enabled(&active.project))
+    Ok(semantic_index_enabled(&guard.app_settings, &active.project))
 }
 
 /// Error code the frontend matches on to offer a download instead of a
@@ -3092,6 +3248,7 @@ fn status_dto(
         category: match entry.category {
             model::ModelCategory::Transcription => "transcription".into(),
             model::ModelCategory::Language => "language".into(),
+            model::ModelCategory::Embedding => "embedding".into(),
         },
         tier: match entry.tier {
             model::ModelTier::Recommended => "recommended".into(),
@@ -3133,6 +3290,9 @@ fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
                 model::ModelCategory::Transcription => sel_trans.clone(),
                 model::ModelCategory::Language => {
                     model::selected(&base, model::ModelCategory::Language).id
+                }
+                model::ModelCategory::Embedding => {
+                    model::selected(&base, model::ModelCategory::Embedding).id
                 }
             };
             status_dto(&base, e, &selected_id)
@@ -3201,6 +3361,29 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
                 if is_language {
                     ken_core::local_llm::notify_model_installed();
                 }
+                // A newly installed Embedding model: if the active project has
+                // semanticIndex on, the earlier toggle/open bailed `unavailable`
+                // because the model file was missing — resume now, same as
+                // `activate()` does on open. The LLM service doesn't use this
+                // model, so no rearm.
+                let is_embedding = model::category_specs(model::ModelCategory::Embedding)
+                    .iter()
+                    .any(|s| s.id == spec.id);
+                if is_embedding {
+                    use tauri::Manager;
+                    let state = app.state::<SharedState>();
+                    let enabled = {
+                        let guard = state.lock().unwrap();
+                        guard
+                            .active
+                            .as_ref()
+                            .map(|a| semantic_index_enabled(&guard.app_settings, &a.project))
+                            .unwrap_or(false)
+                    };
+                    if enabled {
+                        let _ = apply_semantic_index_flag(&app, state.inner(), true);
+                    }
+                }
             }
             Err(e) => {
                 let _ = app.emit(
@@ -3231,13 +3414,17 @@ fn remove_model(state: State<SharedState>, id: String) -> CmdResult<()> {
     model::remove(&base, &spec).map_err(err)
 }
 
-/// Persist the user's chosen model for a category ("transcription" | "language").
+/// Persist the user's chosen model for a category
+/// ("transcription" | "language" | "embedding").
 #[tauri::command]
 fn set_model_selection(state: State<SharedState>, category: String, id: String) -> CmdResult<()> {
     let base = { state.lock().unwrap().base_dir.clone() };
     let cat = match category.as_str() {
         "transcription" => model::ModelCategory::Transcription,
         "language" => model::ModelCategory::Language,
+        // Embedding has a single catalog entry, so "switching" is a no-op for
+        // the live embedder — persisting the selection is all that's needed.
+        "embedding" => model::ModelCategory::Embedding,
         other => return Err(format!("unknown model category: {other}")),
     };
     model::set_selected(&base, cat, &id).map_err(err)?;
@@ -5492,10 +5679,12 @@ pub fn run() {
     // Hand the app-data dir to the on-device LLM so it can resolve/load the
     // installed model; this is the only wiring that activates the local path.
     ken_core::local_llm::init(base_dir.clone());
+    let app_settings = ken_core::settings::AppSettings::load(&base_dir);
     let state: SharedState = Arc::new(Mutex::new(AppState {
         base_dir,
         hooks: None,
         active: None,
+        app_settings,
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
         qa_gen: Arc::new(AtomicU64::new(0)),
         record: Arc::new(Mutex::new(None)),
@@ -5540,6 +5729,8 @@ pub fn run() {
             search,
             hybrid_search,
             set_project_feature,
+            set_global_feature,
+            list_features,
             get_semantic_index,
             read_file,
             read_file_bytes,
