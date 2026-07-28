@@ -19,6 +19,7 @@
 //! `db::db_path`'s `base.join(...)` pattern) rather than depending on a
 //! workspace handle type.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -432,6 +433,83 @@ impl WorkspaceKgDb {
         })
     }
 
+    // --- entity -> project ranking (kg-routing task 1.2) ---
+
+    /// Rank member projects by how strongly they're grounded in a set of
+    /// matched global entities — the read `routing::plan_route`'s KG-guided
+    /// tier uses to turn "these global entities matched the query" into
+    /// "search these member projects" (design: "ranked by link count and
+    /// pointer density"). For each project holding at least one
+    /// `entity_links` row for any id in `global_ids`: `link_count` is how
+    /// many of the matched entities that project participates in, and
+    /// `pointer_count` is the total `doc_pointers` rows for those same
+    /// entities in that project (a density signal — a project with more
+    /// grounding text for the matched entities, not just more of them,
+    /// ranks higher on ties). Ordered `link_count` DESC, `pointer_count`
+    /// DESC, `project_id` ASC (the last a deterministic tie-break with no
+    /// product meaning — routing.rs is the layer that decides what a tie
+    /// means, this is a plain read). Returns every scored project
+    /// uncapped; callers (`plan_route`) apply the "cap 3" policy so that
+    /// decision stays out of the storage layer. Empty `global_ids` returns
+    /// an empty `Vec` rather than every project (there is nothing to rank).
+    pub fn rank_projects_for_entities(&self, global_ids: &[i64]) -> Result<Vec<ProjectEntityRank>> {
+        if global_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = global_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+        let mut link_counts: HashMap<String, i64> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT project_id, COUNT(*) FROM entity_links
+                 WHERE global_id IN ({placeholders}) GROUP BY project_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(global_ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (project_id, count) = row?;
+                link_counts.insert(project_id, count);
+            }
+        }
+
+        let mut pointer_counts: HashMap<String, i64> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT project_id, COUNT(*) FROM doc_pointers
+                 WHERE global_id IN ({placeholders}) GROUP BY project_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(global_ids.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (project_id, count) = row?;
+                pointer_counts.insert(project_id, count);
+            }
+        }
+
+        let mut out: Vec<ProjectEntityRank> = link_counts
+            .into_iter()
+            .map(|(project_id, link_count)| {
+                let pointer_count = pointer_counts.get(&project_id).copied().unwrap_or(0);
+                ProjectEntityRank {
+                    project_id,
+                    link_count,
+                    pointer_count,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.link_count
+                .cmp(&a.link_count)
+                .then(b.pointer_count.cmp(&a.pointer_count))
+                .then(a.project_id.cmp(&b.project_id))
+        });
+        Ok(out)
+    }
+
     // --- member_snapshots (snapshot cache + incremental-rebuild watermark) ---
 
     /// The cached watermark for `project_id`, distinguishing "no cache row
@@ -550,6 +628,18 @@ pub struct DocPointerRow {
     pub snippet: String,
 }
 
+/// One project's ranking for a set of matched global entities (see
+/// [`WorkspaceKgDb::rank_projects_for_entities`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectEntityRank {
+    /// Member project id (`Uuid` as `to_string()`), matching
+    /// [`EntityLinkRow::project_id`]'s representation.
+    pub project_id: String,
+    pub link_count: i64,
+    pub pointer_count: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberSnapshotRow {
@@ -647,6 +737,51 @@ mod tests {
         // entity — the merge pass must resolve BEFORE inserting, not rely
         // on this as a race guard, but it still catches a logic bug.
         assert!(db.insert_entity_link(b, p1, 10, "A local").is_err());
+    }
+
+    #[test]
+    fn rank_projects_for_entities_orders_by_link_count_then_pointer_density() {
+        let db = WorkspaceKgDb::open_in_memory().unwrap();
+        let a = db.insert_global_entity("topic", "Shattered Realms", "sa", 1).unwrap();
+        let b = db.insert_global_entity("topic", "Priya", "sb", 1).unwrap();
+        let p_high = Uuid::new_v4(); // linked to both entities, 1 pointer
+        let p_mid = Uuid::new_v4(); // linked to one entity, 2 pointers (density beats a tie)
+        let p_low = Uuid::new_v4(); // linked to one entity, 0 pointers
+        let p_unrelated = Uuid::new_v4(); // no links to the matched entities at all
+
+        db.insert_entity_link(a, p_high, 1, "A@high").unwrap();
+        db.insert_entity_link(b, p_high, 2, "B@high").unwrap();
+        db.insert_doc_pointer(a, p_high, "notes/high.md", "").unwrap();
+
+        db.insert_entity_link(a, p_mid, 3, "A@mid").unwrap();
+        db.insert_doc_pointer(a, p_mid, "notes/mid1.md", "").unwrap();
+        db.insert_doc_pointer(a, p_mid, "notes/mid2.md", "").unwrap();
+
+        db.insert_entity_link(a, p_low, 4, "A@low").unwrap();
+        // p_unrelated gets no entity_links row at all — must not appear.
+
+        let ranked = db.rank_projects_for_entities(&[a, b]).unwrap();
+        let ids: Vec<String> = ranked.iter().map(|r| r.project_id.clone()).collect();
+        // p_high has 2 links (both matched entities) so it leads regardless
+        // of pointer density; p_mid and p_low both have 1 link, so pointer
+        // density (2 vs 0) breaks the tie.
+        assert_eq!(
+            ids,
+            vec![p_high.to_string(), p_mid.to_string(), p_low.to_string()]
+        );
+        assert_eq!(ranked[0].link_count, 2);
+        assert_eq!(ranked[0].pointer_count, 1);
+        assert_eq!(ranked[1].link_count, 1);
+        assert_eq!(ranked[1].pointer_count, 2);
+        assert_eq!(ranked[2].link_count, 1);
+        assert_eq!(ranked[2].pointer_count, 0);
+        assert!(!ids.contains(&p_unrelated.to_string()));
+    }
+
+    #[test]
+    fn rank_projects_for_entities_empty_input_is_empty_output() {
+        let db = WorkspaceKgDb::open_in_memory().unwrap();
+        assert!(db.rank_projects_for_entities(&[]).unwrap().is_empty());
     }
 
     #[test]

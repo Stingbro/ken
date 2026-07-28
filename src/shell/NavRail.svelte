@@ -2,6 +2,7 @@
   import type { Component } from "svelte";
   import { app, type Screen } from "../lib/app.svelte";
   import { review } from "../lib/review.svelte";
+  import WorkspaceSwitcher from "./WorkspaceSwitcher.svelte";
   import LayoutGrid from "@lucide/svelte/icons/layout-grid";
   import Files from "@lucide/svelte/icons/files";
   import SquareCheck from "@lucide/svelte/icons/square-check";
@@ -10,6 +11,9 @@
   import Clock from "@lucide/svelte/icons/clock";
   import Mic from "@lucide/svelte/icons/mic";
   import Settings from "@lucide/svelte/icons/settings";
+  import Boxes from "@lucide/svelte/icons/boxes";
+
+  let switcherOpen = $state(false);
 
   const items: { key: Screen; icon: Component; label: string }[] = [
     { key: "home", icon: LayoutGrid, label: "Home" },
@@ -23,6 +27,19 @@
 </script>
 
 <nav>
+  {#if app.workspace}
+    <button
+      class="ws-trigger"
+      class:active={switcherOpen}
+      onclick={() => (switcherOpen = !switcherOpen)}
+      title="{app.workspace.name} — switch project (Ctrl+P)"
+    >
+      <span class="icon"><Boxes size={16} strokeWidth={1.75} /></span>Projects
+    </button>
+    {#if switcherOpen}
+      <WorkspaceSwitcher close={() => (switcherOpen = false)} />
+    {/if}
+  {/if}
   {#each items as item (item.key)}
     {@const Icon = item.icon}
     <button
@@ -123,5 +140,11 @@
   }
   .settings {
     margin-top: auto;
+  }
+  .ws-trigger {
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    border-radius: 10px 10px 0 0;
   }
 </style>

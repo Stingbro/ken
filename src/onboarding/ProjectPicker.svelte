@@ -3,6 +3,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     api,
+    type Candidate,
     type FeatureInfo,
     type ProjectProfile,
     type RegistryEntryStatus,
@@ -145,6 +146,107 @@
     await api.forgetProject(id);
     await app.refreshRegistry();
   }
+
+  // ---- Workspace creation flow (workspace task 4.2) ----
+  // Flag-gated (app.workspaceFlagEnabled) parallel wizard to the single-
+  // folder flow above: parent folder → candidate checklist (existing
+  // projects pre-checked, marker/file-count captions, per-candidate
+  // include toggle) → name → the same Features disclosure pattern
+  // `confirmCreate` uses, filtered to workspace-scoped flags → create.
+  //
+  // No recent-workspaces section: `Registry` gained recent-workspace
+  // entries (workspace task 1.4) but no command reads them back to the
+  // frontend (grepped `src-tauri/src/lib.rs` for `workspace_statuses`/
+  // `registry.workspaces` — nothing registered). Deferred rather than
+  // invented; see final report.
+  type WsStep = "candidates" | "name";
+  let wsParent = $state<string | null>(null);
+  let wsStep = $state<WsStep>("candidates");
+  let wsCandidates = $state<Candidate[]>([]);
+  let wsIncluded = $state<Record<string, boolean>>({});
+  let wsName = $state("");
+  let wsFeatures = $state<FeatureInfo[]>([]);
+  let wsFeatureChoices = $state<Record<string, boolean>>({});
+  let wsFeaturesOpen = $state(false);
+  let wsBusy = $state(false);
+  let wsError = $state<string | null>(null);
+
+  async function chooseWorkspaceFolder() {
+    error = null;
+    const folder = await openDialog({
+      directory: true,
+      title: "Choose the parent folder that holds your projects",
+    });
+    if (typeof folder !== "string") return;
+    wsError = null;
+    wsParent = folder;
+    wsStep = "candidates";
+    wsBusy = true;
+    try {
+      wsCandidates = await api.discoverWorkspaceCandidates(folder);
+      wsIncluded = Object.fromEntries(wsCandidates.map((c) => [c.name, c.existing]));
+    } catch (e) {
+      wsError = String(e);
+      wsCandidates = [];
+    } finally {
+      wsBusy = false;
+    }
+  }
+
+  function wsToName() {
+    if (!wsParent) return;
+    wsName = wsParent.split("/").pop() ?? "Workspace";
+    wsStep = "name";
+    wsFeaturesOpen = false;
+    void api
+      .listFeatures()
+      .then((all) => {
+        wsFeatures = all.filter((f) => f.scope === "workspace");
+        wsFeatureChoices = Object.fromEntries(wsFeatures.map((f) => [f.name, f.effective]));
+      })
+      .catch(() => {
+        wsFeatures = [];
+        wsFeatureChoices = {};
+      });
+  }
+
+  async function confirmCreateWorkspace() {
+    if (!wsParent || wsBusy) return;
+    const members = wsCandidates.filter((c) => wsIncluded[c.name]).map((c) => c.name);
+    if (members.length === 0) {
+      wsError = "Choose at least one folder to include.";
+      return;
+    }
+    wsBusy = true;
+    wsError = null;
+    try {
+      const changed = wsFeatures.filter((f) => wsFeatureChoices[f.name] !== f.effective);
+      await app.createWorkspace(wsParent, wsName.trim() || "Workspace", members);
+      for (const f of changed) {
+        await api.setGlobalFeature(f.name, wsFeatureChoices[f.name]);
+      }
+    } catch (e) {
+      wsError = String(e);
+    } finally {
+      wsBusy = false;
+    }
+  }
+
+  function cancelWorkspaceFlow() {
+    wsParent = null;
+    wsStep = "candidates";
+    wsCandidates = [];
+    wsIncluded = {};
+    wsError = null;
+  }
+
+  function wsBack() {
+    if (wsStep === "name") {
+      wsStep = "candidates";
+    } else {
+      cancelWorkspaceFlow();
+    }
+  }
 </script>
 
 <div class="wrap" data-tauri-drag-region>
@@ -233,15 +335,111 @@
           <button class="btn btn-ghost" onclick={() => (pendingPath = null)}>Back</button>
         </div>
       </div>
+    {:else if wsParent}
+      <div class="confirm">
+        <div class="mono path">{wsParent}</div>
+
+        {#if wsStep === "candidates"}
+          <div class="ws-candidates">
+            {#if wsBusy}
+              <p class="note">Scanning folders…</p>
+            {:else if wsCandidates.length === 0}
+              <p class="note">No subfolders found in this parent.</p>
+            {:else}
+              {#each wsCandidates as c (c.name)}
+                <label class="radio feature-row">
+                  <input type="checkbox" bind:checked={wsIncluded[c.name]} />
+                  <span class="feature-text">
+                    <span class="feature-name ws-name">{c.name}</span>
+                    <span class="note">
+                      {c.existing ? "Existing Ken project" : "New"} · {c.fileCount}
+                      {c.fileCount === 1 ? "file" : "files"}{#if c.markers.length > 0} · {c.markers.join(", ")}{/if}
+                    </span>
+                  </span>
+                </label>
+              {/each}
+            {/if}
+          </div>
+          <div class="confirm-actions">
+            <button
+              class="btn btn-primary"
+              disabled={wsBusy || wsCandidates.length === 0}
+              onclick={wsToName}
+            >
+              Next
+            </button>
+            <button class="btn btn-ghost" onclick={cancelWorkspaceFlow}>Cancel</button>
+          </div>
+        {:else}
+          <label>
+            Workspace name
+            <input
+              bind:value={wsName}
+              onkeydown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") confirmCreateWorkspace();
+              }}
+            />
+          </label>
+
+          {#if wsFeatures.length > 0}
+            <div class="features">
+              <button
+                type="button"
+                class="features-toggle"
+                onclick={() => (wsFeaturesOpen = !wsFeaturesOpen)}
+                aria-expanded={wsFeaturesOpen}
+              >
+                <span class="chev" class:open={wsFeaturesOpen}>
+                  <ChevronRight size={13} strokeWidth={2} />
+                </span>
+                Features
+              </button>
+              {#if wsFeaturesOpen}
+                <div class="features-body">
+                  {#each wsFeatures as flag (flag.name)}
+                    <label class="radio feature-row">
+                      <input type="checkbox" bind:checked={wsFeatureChoices[flag.name]} />
+                      <span class="feature-text">
+                        <span class="feature-name">{flag.name}</span>
+                        <span class="note">{flag.description}</span>
+                      </span>
+                    </label>
+                  {/each}
+                  <p class="note">You can change these later in Settings.</p>
+                </div>
+              {/if}
+            </div>
+          {/if}
+
+          <div class="confirm-actions">
+            <button class="btn btn-primary" disabled={wsBusy} onclick={confirmCreateWorkspace}>
+              Create workspace
+            </button>
+            <button class="btn btn-ghost" onclick={wsBack}>Back</button>
+          </div>
+        {/if}
+
+        {#if wsError}
+          <div class="error">{wsError}</div>
+        {/if}
+      </div>
     {:else}
-      <button class="btn btn-primary big" onclick={chooseFolder}>Choose a folder…</button>
+      <div class="choose-row">
+        <button class="btn btn-primary big" onclick={chooseFolder}>Choose a folder…</button>
+        {#if app.workspaceFlagEnabled}
+          <button class="btn btn-ghost big" onclick={chooseWorkspaceFolder}>
+            Open a workspace…
+          </button>
+        {/if}
+      </div>
     {/if}
 
     {#if error}
       <div class="error">{error}</div>
     {/if}
 
-    {#if app.registry.length > 0 && !pendingPath}
+    {#if app.registry.length > 0 && !pendingPath && !wsParent}
       <div class="recent-label">Recent projects</div>
       <div class="recents">
         {#each app.registry as entry (entry.id)}
@@ -328,6 +526,21 @@
     font-size: 14px;
     align-self: flex-start;
     margin-top: 6px;
+  }
+  .choose-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .ws-candidates {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .feature-name.ws-name {
+    text-transform: none;
   }
   .confirm {
     background: var(--surface);

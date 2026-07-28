@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use ken_core::project::Project;
 use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, RulesOverride};
 use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
+use ken_core::routing;
 use ken_core::scan::{self, ScanStats};
 use ken_core::search as hybrid_search_mod;
 use ken_core::sync::{self, SyncConfig, SyncEngine, SyncNotice};
@@ -159,9 +160,118 @@ struct AppState {
     /// (mirrors `qa_gen`: "a newer request bumps it so the older one sees a
     /// mismatch and stands down"). See `schedule_workspace_kg_debounce`.
     workspace_kg_debounce_gen: Arc<AtomicU64>,
+    /// The open workspace's bookkeeping (`workspace` change, tasks 3.1/3.2):
+    /// the resolved manifest plus the resident-runtime LRU. `None` in
+    /// single-project mode — the enum-free equivalent of design.md D2's
+    /// `AppMode::Workspace` arm, layered onto the committed `members` map (S9
+    /// refactor) rather than replacing it with the D2 enum. Dormant members
+    /// live only here (project id + root); they gain a `MemberRuntime` lazily
+    /// on first focus.
+    workspace: Option<WorkspaceState>,
+    /// Caps concurrent member initial-scans at `WORKSPACE_INGEST_CONCURRENCY`
+    /// (task 3.1 / design D4: "ingest concurrency is capped at 2 members at a
+    /// time"). Shared by every `activate` scan thread — see [`IngestGate`].
+    ingest_gate: Arc<IngestGate>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
+
+/// Resident `MemberRuntime` cap for an open workspace (design D4 /
+/// task 3.1): fully activate up to this many members; the rest stay dormant
+/// (tracked, not resident) and open lazily on first focus, evicting the
+/// least-recently-focused resident when the cap would be exceeded.
+const WORKSPACE_RESIDENT_CAP: usize = 12;
+
+/// Max member initial-scans allowed to run at once (design D4 / task 3.1).
+const WORKSPACE_INGEST_CONCURRENCY: usize = 2;
+
+/// Friendly error returned by every workspace command when the global
+/// `workspace` flag is off (task 3.4). Mirrors `open_member`/`close_member`'s
+/// flag gate, just with launcher-ready wording.
+const WORKSPACE_DISABLED_MSG: &str =
+    "The workspace feature is off — turn it on in Settings → Features to open a workspace.";
+
+/// A counting semaphore capping how many member initial-scans run
+/// concurrently (task 3.1 / design D4). `std` has no semaphore, so this is
+/// the classic `Mutex<permits>` + `Condvar` pair — the same hand-rolled
+/// coordination discipline the rest of this file already leans on (atomics +
+/// generation counters like `qa_gen`/`workspace_kg_debounce_gen`). One
+/// instance lives on `AppState::ingest_gate`; each `activate` initial-scan
+/// thread `acquire`s a permit around its `scan::scan` call and releases it
+/// when the returned [`IngestPermit`] drops. With the cap at 2, a workspace
+/// opening N members runs at most two initial scans at once and the rest
+/// queue; single-project open (one scan, two permits free) never waits, so
+/// its behavior is unchanged.
+struct IngestGate {
+    permits: Mutex<usize>,
+    ready: std::sync::Condvar,
+}
+
+impl IngestGate {
+    fn new(max: usize) -> Self {
+        IngestGate {
+            permits: Mutex::new(max),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until a permit is free, take it, and return a guard that
+    /// releases the permit on drop.
+    fn acquire(self: &Arc<Self>) -> IngestPermit {
+        let mut permits = self.permits.lock().unwrap();
+        while *permits == 0 {
+            permits = self.ready.wait(permits).unwrap();
+        }
+        *permits -= 1;
+        IngestPermit { gate: self.clone() }
+    }
+}
+
+/// Releases its `IngestGate` permit when dropped (RAII), so a scan that
+/// panics or returns early still frees its slot.
+struct IngestPermit {
+    gate: Arc<IngestGate>,
+}
+
+impl Drop for IngestPermit {
+    fn drop(&mut self) {
+        let mut permits = self.gate.permits.lock().unwrap();
+        *permits += 1;
+        self.gate.ready.notify_one();
+    }
+}
+
+/// Bookkeeping for one open workspace (tasks 3.1/3.2). Holds the whole
+/// resolved `ken_core::workspace::Workspace` — manifest id/name/root plus each
+/// member's `Ok(Project)`/`Missing`/`Invalid` resolution — so the close path
+/// can hand it straight to `Registry::add_workspace` and the overview/focus
+/// paths can enumerate members (including dormant ones) without re-reading
+/// disk. `lru` tracks only the *resident* members (those with a live
+/// `MemberRuntime` in `AppState::members`), most-recently-focused last;
+/// eviction pops the front.
+struct WorkspaceState {
+    ws: ken_core::workspace::Workspace,
+    lru: Vec<uuid::Uuid>,
+}
+
+impl WorkspaceState {
+    /// Root folder of a resolvable member by project id — used to reopen a
+    /// dormant member on first focus.
+    fn member_root(&self, id: uuid::Uuid) -> Option<PathBuf> {
+        self.ws.members.iter().find_map(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) if p.config.id == id => Some(p.root.clone()),
+            _ => None,
+        })
+    }
+
+    /// Parent-relative member name (label) of a resolvable member by id.
+    fn member_name(&self, id: uuid::Uuid) -> Option<String> {
+        self.ws.members.iter().find_map(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) if p.config.id == id => Some(m.name.clone()),
+            _ => None,
+        })
+    }
+}
 
 /// Look up the runtime for a member project. `None` means "the sole open
 /// project" - today's single-project semantics. Callers migrate to passing
@@ -945,9 +1055,18 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     let scan_sync = sync_engine.clone();
     let scan_knowledge = auto_knowledge.clone();
     let scan_state = state.clone();
-    let base = { state.lock().unwrap().base_dir.clone() };
+    let (base, scan_gate) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.ingest_gate.clone())
+    };
     let scan_project = project.clone();
     std::thread::spawn(move || {
+        // Cap concurrent member initial-scans (task 3.1 / design D4). Single-
+        // project mode always has two free permits, so this never waits and
+        // open timing is unchanged; a workspace opening N members staggers
+        // them at most two at a time. `_permit` releases when this thread
+        // finishes its scan.
+        let _permit = scan_gate.acquire();
         if let Ok(mut db) = Db::open(&base, scan_project.config.id) {
             // Unit and scalar-string payloads — nothing for `emit_member` to
             // flatten `project_id` into, so these stay plain (S9 step 5 skip
@@ -1200,6 +1319,34 @@ fn federated_kg_enabled(app_settings: &ken_core::settings::AppSettings) -> bool 
         .unwrap_or(default)
 }
 
+/// Effective `kgRouting` flag (kg-routing task 2.1): the global-scope
+/// registry default overridden by `settings.json`'s `features` map, AND-ed
+/// with `workspace_enabled` like `federated_kg_enabled` (proposal:
+/// "Requires semanticIndex and workspace"). The `semanticIndex` half of that
+/// requirement is enforced per-member, not here: `route_search` reads each
+/// open member's actual `db.vec_available()` into `routing::MemberInfo::
+/// index_ready` (semantic-index task 2.2's own degrade-per-project
+/// discipline), so a workspace with only some members semantic-indexed still
+/// routes sensibly rather than an all-or-nothing global gate. Deliberately
+/// NOT AND-ed with `federated_kg_enabled` — design D1: "the KG a soft
+/// dependency" — `route_search` opens `WorkspaceKgDb` only when
+/// `federatedKg` is *also* on and passes `None` to `plan_route` otherwise,
+/// so the KG-guided tier is skipped (Named else Broadcast) rather than this
+/// flag refusing to work at all without it.
+fn kg_routing_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    if !workspace_enabled(app_settings) {
+        return false;
+    }
+    let default = ken_core::features::flag("kgRouting")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("kgRouting")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
 /// Open an additional project alongside whatever is already open, without
 /// disturbing it (S9 step 6 / `workspace` change). Gated on the global
 /// `workspace` flag — off, this is a no-op error so a stray call can't grow
@@ -1237,6 +1384,714 @@ fn close_member(state: State<SharedState>, project_id: String) -> CmdResult<()> 
         guard.focused = guard.members.keys().next().copied();
     }
     Ok(())
+}
+
+// ── Workspace mode (openspec/changes/workspace, tasks 3.1–3.4) ─────────────
+//
+// Built on the committed S9 shape (`AppState::members` map + `focused`), NOT
+// design.md D2's `AppMode { Single | Workspace }` enum — see tasks.md 2.1's
+// superseded note. `WorkspaceState` carries the enum's `Workspace` arm data
+// (config + resolved members) alongside the existing map instead of replacing
+// it, so single-project mode stays literally the old path.
+
+/// Payload for the app-global `workspace-state` event (task 3.1). Tag-shaped
+/// like `WorkspaceKgStateEvent`/`RoutedSearchStateEvent`, and app-global (a
+/// plain `app.emit`, not `emit_member`) because a workspace lifecycle spans
+/// every member at once and has no single owning project. Per-member
+/// transitions ride the separate `member-status` event.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum WorkspaceStateEvent {
+    /// Open/create started (members not yet activated).
+    Opening { name: String },
+    /// Open/create finished; the workspace is live.
+    Open { id: String, name: String },
+    /// Focus moved to a member (`focus_project` or open-time restore).
+    Focus { project_id: String },
+    /// The workspace was torn down (`close_workspace`).
+    Closed,
+}
+
+/// Payload for the `member-status` event (task 3.1). Emitted through
+/// `emit_member`, so the wire shape gains a flattened `project_id` on top of
+/// these fields (spec/brief: "member-status carries project_id"). Only the
+/// two *runtime* transitions a resolvable member goes through are events —
+/// `active` (gained a live `MemberRuntime`) and `dormant` (evicted / opened
+/// lazy-deferred). Missing/invalid members are reported through
+/// `workspace_overview`, which has no `project_id` to scope an event to.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+enum MemberStatusEvent {
+    Active { name: String },
+    Dormant { name: String },
+}
+
+/// One member's row in `workspace_overview` (task 3.2).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMemberDto {
+    /// Parent-relative folder name (the manifest member label).
+    name: String,
+    /// `Some` for resolvable (`Ok`) members, `None` for `missing`/`invalid`.
+    project_id: Option<String>,
+    /// `"active"` | `"dormant"` | `"missing"` | `"invalid"`.
+    status: &'static str,
+    /// The parse error for an `invalid` member; `None` otherwise.
+    reason: Option<String>,
+    /// Indexed file count, read off the member's DB. `Some` only for active
+    /// members (whose read handle is already open); dormant/missing/invalid
+    /// report `None` rather than paying to open a DB just for a count.
+    file_count: Option<usize>,
+}
+
+/// `workspace_overview` return shape (task 3.2): the manifest header plus the
+/// full member roster with per-member status and counts.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceOverviewDto {
+    id: String,
+    name: String,
+    root: String,
+    /// Focused member's project id, if any.
+    focused: Option<String>,
+    members: Vec<WorkspaceMemberDto>,
+}
+
+/// One hit in `search_all_projects` (task 3.3): a member's `SearchHit`
+/// labeled with its owning project id + name so the ⌘K "All projects" list
+/// can badge and route it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AllProjectsHitDto {
+    project_id: String,
+    member_name: String,
+    #[serde(flatten)]
+    hit: SearchHit,
+}
+
+/// One member's outcome in `search_all_projects` (task 3.3) — the honest
+/// per-member status list, mirroring `route_search`'s `member_status`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AllProjectsMemberStatusDto {
+    /// `Some` for resolvable members; `None` for missing/invalid.
+    project_id: Option<String>,
+    member_name: String,
+    /// `"searched"` (active, FTS ran) | `"dormant"` (skipped, not resident) |
+    /// `"missing"` | `"invalid"`.
+    status: &'static str,
+}
+
+/// `search_all_projects` return shape (task 3.3).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchAllProjectsDto {
+    results: Vec<AllProjectsHitDto>,
+    member_status: Vec<AllProjectsMemberStatusDto>,
+}
+
+/// Build the workspace overview (task 3.2). Snapshots each member's facts and
+/// the active members' read handles under one short lock, then releases the
+/// global guard before doing any DB `file_count` IO — lock-audit discipline:
+/// never hold the guard across a member loop doing IO.
+fn build_workspace_overview(state: &SharedState) -> CmdResult<WorkspaceOverviewDto> {
+    struct Snap {
+        name: String,
+        project_id: Option<uuid::Uuid>,
+        status: &'static str,
+        reason: Option<String>,
+        search_db: Option<Arc<Mutex<Db>>>,
+    }
+    let (id, name, root, focused, snaps) = {
+        let guard = state.lock().unwrap();
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let snaps: Vec<Snap> = ws
+            .ws
+            .members
+            .iter()
+            .map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => {
+                    let pid = p.config.id;
+                    let active = guard.members.contains_key(&pid);
+                    Snap {
+                        name: m.name.clone(),
+                        project_id: Some(pid),
+                        status: if active { "active" } else { "dormant" },
+                        reason: None,
+                        search_db: if active {
+                            guard.members.get(&pid).map(|rt| rt.search_db.clone())
+                        } else {
+                            None
+                        },
+                    }
+                }
+                ken_core::workspace::MemberStatus::Missing => Snap {
+                    name: m.name.clone(),
+                    project_id: None,
+                    status: "missing",
+                    reason: None,
+                    search_db: None,
+                },
+                ken_core::workspace::MemberStatus::Invalid(e) => Snap {
+                    name: m.name.clone(),
+                    project_id: None,
+                    status: "invalid",
+                    reason: Some(e.clone()),
+                    search_db: None,
+                },
+            })
+            .collect();
+        (
+            ws.ws.config.id.to_string(),
+            ws.ws.config.name.clone(),
+            ws.ws.root.to_string_lossy().into_owned(),
+            guard.focused.map(|f| f.to_string()),
+            snaps,
+        )
+    };
+    let members = snaps
+        .into_iter()
+        .map(|s| {
+            let file_count = s
+                .search_db
+                .as_ref()
+                .and_then(|db| db.lock().ok().and_then(|db| db.file_count().ok()))
+                .map(|c| c as usize);
+            WorkspaceMemberDto {
+                name: s.name,
+                project_id: s.project_id.map(|p| p.to_string()),
+                status: s.status,
+                reason: s.reason,
+                file_count,
+            }
+        })
+        .collect();
+    Ok(WorkspaceOverviewDto { id, name, root, focused, members })
+}
+
+/// Persist the open workspace into recents (best-effort): `add_workspace`
+/// with the current focus + now, and `last_workspace` for reopen-on-launch
+/// (task 3.4). Called on open/create and close so recents always reflect the
+/// most recent focus (spec: "reopen restores focus").
+fn record_workspace_recent(state: &SharedState) {
+    let (base, ws_core, focused) = {
+        let guard = state.lock().unwrap();
+        match guard.workspace.as_ref() {
+            Some(ws) => (guard.base_dir.clone(), ws.ws.clone(), guard.focused),
+            None => return,
+        }
+    };
+    if let Ok(mut reg) = Registry::load(&base) {
+        reg.add_workspace(&ws_core, focused, engine::now_epoch());
+        reg.last_workspace = Some(ws_core.config.id);
+        let _ = reg.save(&base);
+    }
+}
+
+/// Focus a workspace member, activating it if dormant and evicting the LRU
+/// front when that pushes residents past `WORKSPACE_RESIDENT_CAP` (task 3.2).
+/// Eviction is a plain `members.remove`, which drops the `MemberRuntime` —
+/// the exact same teardown `close_member` performs (its `StopOnDrop`/`Drop`
+/// fields stop the watcher and background workers). Shared by `focus_project`
+/// and the open/reopen focus-restore path. Never holds the global guard while
+/// calling `activate` (which locks internally).
+fn focus_member_inner(app: &AppHandle, state: &SharedState, id: uuid::Uuid) -> CmdResult<()> {
+    let resident = { state.lock().unwrap().members.contains_key(&id) };
+    if !resident {
+        // Dormant → activate now (lazy open, task 3.1). Root + label come from
+        // the resolved manifest held in `WorkspaceState`.
+        let (root, name) = {
+            let guard = state.lock().unwrap();
+            let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+            let root = ws.member_root(id).ok_or("unknown workspace member")?;
+            (root, ws.member_name(id).unwrap_or_default())
+        };
+        let project = Project::open(&root).map_err(err)?;
+        activate(app, state, project, false)?;
+        emit_member(app, id, "member-status", MemberStatusEvent::Active { name });
+    }
+    // Touch the LRU, set focus, and evict past the cap — one short lock.
+    let evicted = {
+        let mut guard = state.lock().unwrap();
+        guard.focused = Some(id);
+        match guard.workspace.as_mut() {
+            Some(ws) => {
+                ws.lru.retain(|x| *x != id);
+                ws.lru.push(id);
+                if ws.lru.len() > WORKSPACE_RESIDENT_CAP {
+                    // Front is least-recently-focused and never the id we just
+                    // pushed to the back, so this can't evict the new focus.
+                    Some(ws.lru.remove(0))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(ev) = evicted {
+        let name = {
+            let mut guard = state.lock().unwrap();
+            guard.members.remove(&ev); // drop runtime = close semantics
+            guard
+                .workspace
+                .as_ref()
+                .and_then(|ws| ws.member_name(ev))
+                .unwrap_or_default()
+        };
+        emit_member(app, ev, "member-status", MemberStatusEvent::Dormant { name });
+    }
+    let _ = app.emit(
+        "workspace-state",
+        WorkspaceStateEvent::Focus { project_id: id.to_string() },
+    );
+    Ok(())
+}
+
+/// Shared open/create path (task 3.1): tear down whatever is currently open,
+/// activate resolvable members up to the resident cap (the rest stay dormant),
+/// restore focus, and record recents. Returns the initial overview so the
+/// caller gets the workspace's state in one round-trip. Each `activate` runs
+/// off the global guard (it locks internally) — the loop never holds the
+/// guard, honoring the lock-audit rule.
+fn open_workspace_inner(
+    app: &AppHandle,
+    state: &SharedState,
+    ws: ken_core::workspace::Workspace,
+) -> CmdResult<WorkspaceOverviewDto> {
+    // Restore-focus target from recents (spec: "reopen restores focus"), read
+    // before we mutate any state.
+    let restore = {
+        let guard = state.lock().unwrap();
+        Registry::load(&guard.base_dir).ok().and_then(|r| {
+            r.workspaces
+                .iter()
+                .find(|w| w.id == ws.config.id)
+                .and_then(|w| w.last_focused)
+        })
+    };
+    // Tear down any currently-open project or workspace.
+    {
+        let mut guard = state.lock().unwrap();
+        guard.members.clear();
+        guard.focused = None;
+        guard.workspace = None;
+    }
+    let _ = app.emit(
+        "workspace-state",
+        WorkspaceStateEvent::Opening { name: ws.config.name.clone() },
+    );
+
+    // Resolvable (`Ok`) members, in manifest order.
+    let ok_members: Vec<(String, PathBuf, uuid::Uuid)> = ws
+        .members
+        .iter()
+        .filter_map(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) => {
+                Some((m.name.clone(), p.root.clone(), p.config.id))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Activate up to the cap; the rest stay dormant (their project id + root
+    // remain tracked in `WorkspaceState.ws` for lazy focus-time activation).
+    let mut resident_lru: Vec<uuid::Uuid> = Vec::new();
+    for (name, root, id) in ok_members.iter().take(WORKSPACE_RESIDENT_CAP) {
+        match Project::open(root) {
+            Ok(project) => {
+                activate(app, state, project, false)?;
+                resident_lru.push(*id);
+                emit_member(
+                    app,
+                    *id,
+                    "member-status",
+                    MemberStatusEvent::Active { name: name.clone() },
+                );
+            }
+            Err(e) => {
+                // Resolved `Ok` at manifest time but failed to reopen now
+                // (e.g. deleted between resolve and activate) — skipped, not
+                // fatal, matching `Workspace::open`'s per-member tolerance.
+                eprintln!("warning: workspace member {name} failed to open: {e}");
+            }
+        }
+    }
+    for (name, _root, id) in ok_members.iter().skip(WORKSPACE_RESIDENT_CAP) {
+        emit_member(
+            app,
+            *id,
+            "member-status",
+            MemberStatusEvent::Dormant { name: name.clone() },
+        );
+    }
+
+    // Install bookkeeping (holds the resolved manifest + resident LRU).
+    {
+        let mut guard = state.lock().unwrap();
+        guard.workspace = Some(WorkspaceState { ws, lru: resident_lru.clone() });
+        guard.focused = resident_lru.last().copied();
+    }
+
+    // Restore focus, or default to the first resident member. Routed through
+    // the shared focus path so a dormant restore target activates + evicts
+    // consistently.
+    let focus_target = restore
+        .filter(|rid| ok_members.iter().any(|(_, _, mid)| mid == rid))
+        .or_else(|| ok_members.first().map(|(_, _, id)| *id));
+    if let Some(t) = focus_target {
+        focus_member_inner(app, state, t)?;
+    }
+
+    record_workspace_recent(state);
+    let overview = build_workspace_overview(state)?;
+    let _ = app.emit(
+        "workspace-state",
+        WorkspaceStateEvent::Open {
+            id: overview.id.clone(),
+            name: overview.name.clone(),
+        },
+    );
+    Ok(overview)
+}
+
+/// Open an existing workspace (`<parent>/.ken-workspace/workspace.json`) and
+/// bring its members online (task 3.1). Flag-gated (task 3.4).
+#[tauri::command]
+fn open_workspace(
+    app: AppHandle,
+    state: State<SharedState>,
+    parent: String,
+) -> CmdResult<WorkspaceOverviewDto> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+    }
+    let ws = ken_core::workspace::Workspace::open(Path::new(&parent)).map_err(err)?;
+    open_workspace_inner(&app, state.inner(), ws)
+}
+
+/// Create a new workspace over `parent` from the selected member folder names,
+/// then open it (task 3.1). Flag-gated (task 3.4).
+#[tauri::command]
+fn create_workspace(
+    app: AppHandle,
+    state: State<SharedState>,
+    parent: String,
+    name: String,
+    members: Vec<String>,
+) -> CmdResult<WorkspaceOverviewDto> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+    }
+    let ws = ken_core::workspace::Workspace::create(Path::new(&parent), &name, &members)
+        .map_err(err)?;
+    open_workspace_inner(&app, state.inner(), ws)
+}
+
+/// Members + per-member status + counts for the open workspace (task 3.2).
+/// Flag-gated (task 3.4).
+#[tauri::command]
+fn workspace_overview(state: State<SharedState>) -> CmdResult<WorkspaceOverviewDto> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+    }
+    build_workspace_overview(state.inner())
+}
+
+/// Focus a member, activating a dormant one and LRU-evicting past the cap
+/// (task 3.2). Flag-gated (task 3.4).
+#[tauri::command]
+fn focus_project(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+    }
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
+    focus_member_inner(&app, state.inner(), uuid)
+}
+
+/// Immediate subfolder candidates for the workspace-creation UI (task 3.2) —
+/// a thin flag-gated wrapper over `ken_core::workspace::discover_candidates`.
+#[tauri::command]
+fn discover_workspace_candidates(
+    state: State<SharedState>,
+    parent: String,
+) -> CmdResult<Vec<ken_core::workspace::Candidate>> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+    }
+    ken_core::workspace::discover_candidates(Path::new(&parent)).map_err(err)
+}
+
+/// Close the open workspace, tearing down every member handle (task 3.2).
+/// `members.clear()` drops all runtimes; recents get the last focus + now.
+/// Flag-gated (task 3.4).
+#[tauri::command]
+fn close_workspace(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    let (base, ws_core, focused) = {
+        let mut guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.take().ok_or("no workspace open")?;
+        let focused = guard.focused.take();
+        guard.members.clear(); // drop every runtime = full teardown
+        (guard.base_dir.clone(), ws.ws, focused)
+    };
+    if let Ok(mut reg) = Registry::load(&base) {
+        reg.add_workspace(&ws_core, focused, engine::now_epoch());
+        reg.last_workspace = Some(ws_core.config.id);
+        let _ = reg.save(&base);
+    }
+    let _ = app.emit("workspace-state", WorkspaceStateEvent::Closed);
+    Ok(())
+}
+
+/// Adapt `route_search`'s output into `search_all_projects`'s existing wire
+/// shape (kg-routing task 2.2), so the flag-guarded delegation below is
+/// invisible to the frontend's `SearchAllProjectsDto` contract.
+/// `routing::RoutedHit` is chunk-level and carries no `kind`/`status`/BM25
+/// `rank` — those are `SearchHit`'s FILE-level fields — so this fills them
+/// in rather than leaving the adapted shape half-empty:
+///   - `relPath` = the hit's `path` (already forward-slash normalized).
+///   - `kind` = `ken_core::extract::FileKind::from_path(rel_path).as_str()`,
+///     the same pure, DB-free extension classifier `scan.rs` uses to set
+///     `files.kind` in the first place — the real value, not a guess, and no
+///     extra per-hit DB round trip.
+///   - `status` = `"indexed"` always: provably correct, not a placeholder —
+///     a `RoutedHit` only exists because `search_chunks_fts`/
+///     `semantic_search` matched a row in `chunks`, which is only ever
+///     populated for indexed files.
+///   - `rank` = the hit's 0-based position in the already-merged (RRF) list.
+///     Not a real BM25 score (design forbids comparing raw scores across
+///     members) but keeps the FTS branch's "lower = better" convention for
+///     anything downstream that sorts by it.
+///   - `snippet` = the hit's chunk text as-is. Unlike the FTS branch's
+///     `<mark>`-highlighted snippet, this carries no highlight spans —
+///     `routing::RoutedHit`/`HybridHit` don't carry them at this layer (the
+///     same limitation `hybrid_search`'s own DTO already has).
+///
+/// `member_status`: `route_search`'s per-member outcomes map onto the
+/// existing vocabulary (`"searched"` → `"searched"`; `"index-building"`/
+/// `"unavailable"` → `"dormant"`, the closest existing meaning — "this
+/// member contributed nothing to this search" — since the DTO has no room
+/// to say *why*). Workspace members the routing layer never sees at all —
+/// `missing`/`invalid` manifest entries, which never enter `AppState::
+/// members` — are appended from the manifest roster (`manifest_extras`) so
+/// the list stays complete for those two categories.
+///
+/// Known gap (see final report): an active/resident member that simply
+/// wasn't in the route plan's targets (e.g. a `Named`/`KgEntities` plan that
+/// picked 1-3 of N open members) does not appear in the adapted
+/// `member_status` at all — neither `"searched"` nor `"dormant"` fits
+/// ("dormant" means not-resident, which is false here), and the plan that
+/// WOULD explain the omission (`RouteSearchDto::plan`) has no field to ride
+/// in on `SearchAllProjectsDto`. Not fixed here to avoid widening a DTO the
+/// frontend already depends on without sign-off.
+fn adapt_route_search_to_all_projects(
+    dto: RouteSearchDto,
+    manifest_extras: Vec<AllProjectsMemberStatusDto>,
+) -> SearchAllProjectsDto {
+    let results = dto
+        .results
+        .into_iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let kind = ken_core::extract::FileKind::from_path(std::path::Path::new(&hit.path))
+                .as_str()
+                .to_string();
+            AllProjectsHitDto {
+                project_id: hit.project_id,
+                member_name: hit.member_name,
+                hit: SearchHit {
+                    rel_path: hit.path,
+                    kind,
+                    status: "indexed".to_string(),
+                    snippet: hit.snippet,
+                    rank: i as f64,
+                },
+            }
+        })
+        .collect();
+
+    let mut member_status: Vec<AllProjectsMemberStatusDto> = dto
+        .member_status
+        .into_iter()
+        .map(|s| {
+            let status = match s.status {
+                "searched" => "searched",
+                _ => "dormant",
+            };
+            AllProjectsMemberStatusDto {
+                project_id: Some(s.project_id),
+                member_name: s.member_name,
+                status,
+            }
+        })
+        .collect();
+    member_status.extend(manifest_extras);
+
+    SearchAllProjectsDto { results, member_status }
+}
+
+/// All-projects keyword search (task 3.3): fan `query` out over every ACTIVE
+/// member's FTS index, interleave the results round-robin by rank position
+/// (design D6: BM25 scores aren't comparable across corpora, so merge by
+/// each member's rank *position*, not raw score), and label every hit with
+/// its member. Dormant members are skipped and reported in `member_status`
+/// (honest per-member list, mirroring `route_search`). Flag-gated (task 3.4).
+///
+/// Follows the `search`/`hybrid_search` lock-audit template: clone each
+/// member's read-only `search_db` Arc under a brief lock, release the global
+/// guard, then run the FTS on the blocking pool so a query never serializes
+/// against other commands or the background workers.
+///
+/// kg-routing task 2.2 — the ONE flag-guarded call site: when `kgRouting`
+/// also resolves true, this delegates to `route_search` (reusing its plan +
+/// concurrent fan-out + RRF merge + `routed-search-state` events) and adapts
+/// the result into this command's existing DTO shape via
+/// `adapt_route_search_to_all_projects`, above. Everything from `let
+/// (actives, roster) = {` onward is the original path, untouched — flag off
+/// (or `kgRouting` off) runs it exactly as before, byte-identical.
+#[tauri::command]
+async fn search_all_projects(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    query: String,
+    limit: Option<usize>,
+) -> CmdResult<SearchAllProjectsDto> {
+    let limit = limit.unwrap_or(30);
+
+    let routed = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        kg_routing_enabled(&guard.app_settings)
+    };
+    if routed {
+        // `route_search` only ever sees `AppState::members` (currently
+        // open/active projects) — it has no concept of a workspace
+        // manifest's `missing`/`invalid` entries, so those two categories
+        // are read separately here and appended, keeping `member_status` as
+        // complete as the FTS branch's for those cases (see the adapter
+        // function's doc for the one case that's still lossy).
+        let manifest_extras: Vec<AllProjectsMemberStatusDto> = {
+            let guard = state.lock().unwrap();
+            let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+            ws.ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Missing => Some(AllProjectsMemberStatusDto {
+                        project_id: None,
+                        member_name: m.name.clone(),
+                        status: "missing",
+                    }),
+                    ken_core::workspace::MemberStatus::Invalid(_) => Some(AllProjectsMemberStatusDto {
+                        project_id: None,
+                        member_name: m.name.clone(),
+                        status: "invalid",
+                    }),
+                    ken_core::workspace::MemberStatus::Ok(_) => None,
+                })
+                .collect()
+        };
+        let dto = route_search(app, state, query, Some(limit)).await?;
+        return Ok(adapt_route_search_to_all_projects(dto, manifest_extras));
+    }
+
+    let (actives, roster) = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let mut actives: Vec<(uuid::Uuid, String, Arc<Mutex<Db>>)> = Vec::new();
+        let mut roster: Vec<AllProjectsMemberStatusDto> = Vec::new();
+        for m in &ws.ws.members {
+            match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => {
+                    let pid = p.config.id;
+                    if let Some(rt) = guard.members.get(&pid) {
+                        actives.push((pid, m.name.clone(), rt.search_db.clone()));
+                        roster.push(AllProjectsMemberStatusDto {
+                            project_id: Some(pid.to_string()),
+                            member_name: m.name.clone(),
+                            status: "searched",
+                        });
+                    } else {
+                        roster.push(AllProjectsMemberStatusDto {
+                            project_id: Some(pid.to_string()),
+                            member_name: m.name.clone(),
+                            status: "dormant",
+                        });
+                    }
+                }
+                ken_core::workspace::MemberStatus::Missing => roster.push(AllProjectsMemberStatusDto {
+                    project_id: None,
+                    member_name: m.name.clone(),
+                    status: "missing",
+                }),
+                ken_core::workspace::MemberStatus::Invalid(_) => roster.push(AllProjectsMemberStatusDto {
+                    project_id: None,
+                    member_name: m.name.clone(),
+                    status: "invalid",
+                }),
+            }
+        }
+        (actives, roster)
+    };
+
+    // Each active member's FTS, off the global lock on the blocking pool.
+    let q = query.clone();
+    let per_member: Vec<(String, String, Vec<SearchHit>)> =
+        tauri::async_runtime::spawn_blocking(move || {
+            actives
+                .into_iter()
+                .map(|(pid, name, db)| {
+                    let hits = db.lock().unwrap().search(&q, limit).unwrap_or_default();
+                    (pid.to_string(), name, hits)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Round-robin rank interleave: position 0 of every member, then 1, … up
+    // to `limit`. Each member's hits are already rank-ordered by `Db::search`.
+    let mut results: Vec<AllProjectsHitDto> = Vec::new();
+    let max_len = per_member.iter().map(|(_, _, h)| h.len()).max().unwrap_or(0);
+    'outer: for i in 0..max_len {
+        for (pid, name, hits) in &per_member {
+            if let Some(hit) = hits.get(i) {
+                results.push(AllProjectsHitDto {
+                    project_id: pid.clone(),
+                    member_name: name.clone(),
+                    hit: hit.clone(),
+                });
+                if results.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    Ok(SearchAllProjectsDto { results, member_status: roster })
 }
 
 #[tauri::command]
@@ -5995,6 +6850,359 @@ fn workspace_kg_search(state: State<SharedState>, query: String) -> CmdResult<Ve
     Ok(hits)
 }
 
+/// `RoutePlan` DTO for `route_search` (kg-routing task 2.1). `targets` are
+/// stringified `Uuid`s (matches every other project-id DTO field in this
+/// file, e.g. `WorkspaceKgOverviewDto::project_id`); `reason` self-tags so
+/// the frontend can switch on `reason.type`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutePlanDto {
+    targets: Vec<String>,
+    reason: RouteReasonDto,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum RouteReasonDto {
+    Named,
+    /// `entityIds`: the global entity ids (`kg.sqlite`) that selected these
+    /// targets — same ids the merged hits' `kgBreadcrumbs` are built from.
+    KgEntities { entity_ids: Vec<i64> },
+    Broadcast,
+}
+
+impl From<&routing::RouteReason> for RouteReasonDto {
+    fn from(r: &routing::RouteReason) -> Self {
+        match r {
+            routing::RouteReason::Named => RouteReasonDto::Named,
+            routing::RouteReason::KgEntities(ids) => RouteReasonDto::KgEntities { entity_ids: ids.clone() },
+            routing::RouteReason::Broadcast => RouteReasonDto::Broadcast,
+        }
+    }
+}
+
+impl From<&routing::RoutePlan> for RoutePlanDto {
+    fn from(p: &routing::RoutePlan) -> Self {
+        RoutePlanDto {
+            targets: p.targets.iter().map(|id| id.to_string()).collect(),
+            reason: (&p.reason).into(),
+        }
+    }
+}
+
+/// One merged, cited hit (kg-routing task 2.1). Mirrors `routing::RoutedHit`
+/// with the same string-source/camelCase conventions `HybridSearchHitDto`
+/// (semantic-index task 2.2) already uses for `source`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutedHitDto {
+    path: String,
+    chunk_id: i64,
+    snippet: String,
+    source: &'static str,
+    project_id: String,
+    member_name: String,
+    /// `ken://<project-id>/<rel-path>`.
+    address: String,
+    /// `kg://<entity-id>` per entity that selected this hit's plan; empty
+    /// unless the plan's reason was `KgEntities` (routing.rs module doc: "KG
+    /// breadcrumbs are plan-level, not per-hit").
+    kg_breadcrumbs: Vec<String>,
+}
+
+impl From<routing::RoutedHit> for RoutedHitDto {
+    fn from(h: routing::RoutedHit) -> Self {
+        let source = match h.source {
+            hybrid_search_mod::Source::Keyword => "keyword",
+            hybrid_search_mod::Source::Semantic => "semantic",
+            hybrid_search_mod::Source::Both => "both",
+        };
+        RoutedHitDto {
+            path: h.path,
+            chunk_id: h.chunk_id,
+            snippet: h.snippet,
+            source,
+            project_id: h.project_id.to_string(),
+            member_name: h.member_name,
+            address: h.address,
+            kg_breadcrumbs: h.kg_breadcrumbs,
+        }
+    }
+}
+
+/// One member's outcome in a `route_search` call (kg-routing task 2.1).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberStatusEntryDto {
+    project_id: String,
+    member_name: String,
+    /// `"searched"` | `"index-building"` | `"unavailable"` — spec's exact
+    /// per-member status vocabulary ("Fan-out hybrid search with rank-only
+    /// merge").
+    status: &'static str,
+}
+
+impl From<&routing::MemberStatusEntry> for MemberStatusEntryDto {
+    fn from(s: &routing::MemberStatusEntry) -> Self {
+        let status = match s.status {
+            routing::MemberStatus::Searched => "searched",
+            routing::MemberStatus::IndexBuilding => "index-building",
+            routing::MemberStatus::Unavailable => "unavailable",
+        };
+        MemberStatusEntryDto {
+            project_id: s.project_id.to_string(),
+            member_name: s.member_name.clone(),
+            status,
+        }
+    }
+}
+
+/// `route_search`'s return shape (kg-routing task 2.1 / proposal: "returning
+/// `{ plan, results, member_status }`"), mirroring `routing::ExecutionReport`
+/// field-for-field.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteSearchDto {
+    plan: RoutePlanDto,
+    results: Vec<RoutedHitDto>,
+    member_status: Vec<MemberStatusEntryDto>,
+}
+
+impl From<routing::ExecutionReport> for RouteSearchDto {
+    fn from(r: routing::ExecutionReport) -> Self {
+        RouteSearchDto {
+            plan: (&r.plan).into(),
+            results: r.results.into_iter().map(Into::into).collect(),
+            member_status: r.member_status.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Payload for the `routed-search-state` event (kg-routing task 2.1),
+/// mirroring `WorkspaceKgStateEvent`'s tag shape AND its "app-global, not
+/// `emit_member`" choice: a routed search spans every planned member at
+/// once (like a workspace-KG build), so it has no single owning `project_id`
+/// to scope the event to. `{"state":"planning"}`,
+/// `{"state":"searching","done":1,"total":3}`, `{"state":"done"}`.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum RoutedSearchStateEvent {
+    Planning,
+    Searching { done: usize, total: usize },
+    Done,
+}
+
+/// One workspace member's handles needed to plan and run a routed search
+/// (kg-routing task 2.1) — snapshotted under the state lock, then used after
+/// it's dropped so planning/embedding/searching never hold the global lock.
+/// Mirrors `hybrid_search`'s own "clone the `Arc<Mutex<Db>>`, release the
+/// guard, do the real work off it" discipline — the "search_db/spawn_blocking
+/// pattern (lock-audit template)" this task's brief names — generalized to
+/// every open member instead of just the focused one.
+struct RouteMemberSnapshot {
+    project_id: uuid::Uuid,
+    name: String,
+    search_db: Arc<Mutex<Db>>,
+    embedder_slot: Arc<Mutex<Option<Box<dyn Embedder + Send>>>>,
+}
+
+/// Route a query across every open workspace member and return the merged,
+/// cited results (kg-routing task 2.1): plan with `routing::plan_route`
+/// (KG-guided tier only when `federatedKg` is also on; Named/Broadcast
+/// otherwise — design D1's "soft dependency"), fan out `routing::
+/// search_member` per target concurrently on the blocking pool, merge with
+/// `routing::merge_routed`. Emits `routed-search-state` (`planning` →
+/// `searching m/n` → `done`) as an app-global event — see
+/// `RoutedSearchStateEvent`'s doc for why not `emit_member`.
+///
+/// Deviation (see final report): "members" = every project currently open
+/// in `AppState::members`, the same stand-in `start_workspace_kg_build`/
+/// `workspace_kg_overview` already use — no `workspace.rs` manifest exists
+/// yet to enumerate a workspace's members independent of what's open this
+/// session.
+///
+/// The query is embedded exactly once (design: "the query is embedded once
+/// and reused across all member KNN searches") via the focused member's
+/// `semantic_embedder` slot when a member is focused, else the first open
+/// member's — every open member's slot loads the same local embedding
+/// model, so any one is representative; the resulting vector (or `None` if
+/// embedding is unavailable) is cloned into every per-member search.
+/// `MemberInfo::index_ready`/`last_activity` (kg-routing ken-core task 1.1's
+/// doc comment) are read here from what `MemberRuntime` actually tracks:
+/// `index_ready` = `Db::vec_available()` (same readiness signal
+/// `hybrid_search` gates its KNN pass on); `last_activity` = the most recent
+/// `finished_at` across that member's `fresh` ingest runs (`features/
+/// multi-project/README.md`'s "recent activity ... most recent ingest
+/// completion timestamp" contract), via the existing `Db::runs_with_status`
+/// read — no new `Db` method needed.
+#[tauri::command]
+async fn route_search(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    query: String,
+    limit: Option<usize>,
+) -> CmdResult<RouteSearchDto> {
+    let limit = limit.unwrap_or(30);
+
+    let (base_dir, kg_enabled, embedder_slot, snapshots) = {
+        let guard = state.lock().unwrap();
+        if !kg_routing_enabled(&guard.app_settings) {
+            return Err("kgRouting flag is off".into());
+        }
+        let snapshots: Vec<RouteMemberSnapshot> = guard
+            .members
+            .values()
+            .map(|m| RouteMemberSnapshot {
+                project_id: m.project.config.id,
+                name: m.project.config.name.clone(),
+                search_db: m.search_db.clone(),
+                embedder_slot: m.semantic_embedder.clone(),
+            })
+            .collect();
+        if snapshots.is_empty() {
+            return Err("no project open".into());
+        }
+        let embedder_slot = guard
+            .focused
+            .and_then(|id| snapshots.iter().find(|s| s.project_id == id))
+            .or_else(|| snapshots.first())
+            .map(|s| s.embedder_slot.clone())
+            .expect("snapshots checked non-empty above");
+        (
+            guard.base_dir.clone(),
+            federated_kg_enabled(&guard.app_settings),
+            embedder_slot,
+            snapshots,
+        )
+    };
+
+    let _ = app.emit("routed-search-state", RoutedSearchStateEvent::Planning);
+
+    // Plan + embed on the blocking pool: `plan_route`'s KG read and
+    // `embed_query` can both touch disk / the local model.
+    let query_for_plan = query.clone();
+    let plan_snapshots: Vec<(uuid::Uuid, String, Arc<Mutex<Db>>)> = snapshots
+        .iter()
+        .map(|s| (s.project_id, s.name.clone(), s.search_db.clone()))
+        .collect();
+    let (plan, members, query_vec) = tauri::async_runtime::spawn_blocking(move || {
+        let members: Vec<routing::MemberInfo> = plan_snapshots
+            .iter()
+            .map(|(project_id, name, db)| {
+                let db = db.lock().unwrap();
+                let last_activity = db
+                    .runs_with_status("fresh")
+                    .ok()
+                    .and_then(|rows| rows.iter().filter_map(|r| r.finished_at).max())
+                    .unwrap_or(0);
+                routing::MemberInfo {
+                    project_id: *project_id,
+                    name: name.clone(),
+                    index_ready: db.vec_available(),
+                    last_activity,
+                }
+            })
+            .collect();
+
+        let kg = if kg_enabled {
+            ken_core::workspace_kg_db::WorkspaceKgDb::open(&base_dir).ok()
+        } else {
+            None
+        };
+        let plan = routing::plan_route(&query_for_plan, &members, kg.as_ref());
+
+        let query_vec = {
+            let mut guard = embedder_slot.lock().unwrap();
+            guard.as_deref_mut().and_then(|e| e.embed_query(&query_for_plan).ok())
+        };
+
+        (plan, members, query_vec)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let total = plan.targets.len();
+    let _ = app.emit(
+        "routed-search-state",
+        RoutedSearchStateEvent::Searching { done: 0, total },
+    );
+
+    let ready_by_id: std::collections::HashMap<uuid::Uuid, bool> =
+        members.iter().map(|m| (m.project_id, m.index_ready)).collect();
+    let name_by_id: std::collections::HashMap<uuid::Uuid, String> =
+        members.iter().map(|m| (m.project_id, m.name.clone())).collect();
+    let db_by_id: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> =
+        snapshots.into_iter().map(|s| (s.project_id, s.search_db)).collect();
+
+    // Concurrent fan-out (design D5: "per-member searches run concurrently"):
+    // every target's search is its own `spawn_blocking` task, started before
+    // any is awaited, so they run in parallel on the blocking pool rather
+    // than one after another.
+    let done_counter = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(total);
+    for target_id in plan.targets.clone() {
+        let name = name_by_id.get(&target_id).cloned().unwrap_or_default();
+        let index_ready = ready_by_id.get(&target_id).copied().unwrap_or(false);
+        let db = db_by_id.get(&target_id).cloned();
+        let query = query.clone();
+        let query_vec = query_vec.clone();
+        let counter = done_counter.clone();
+        let ev_app = app.clone();
+        handles.push(tauri::async_runtime::spawn_blocking(
+            move || -> routing::MemberHits {
+                let result = if let Some(db) = db {
+                    if !index_ready {
+                        routing::MemberHits {
+                            project_id: target_id,
+                            member_name: name,
+                            status: routing::MemberStatus::IndexBuilding,
+                            hits: Vec::new(),
+                        }
+                    } else {
+                        let db = db.lock().unwrap();
+                        match routing::search_member(&db, &query, query_vec.as_deref(), limit) {
+                            Ok(hits) => routing::MemberHits {
+                                project_id: target_id,
+                                member_name: name,
+                                status: routing::MemberStatus::Searched,
+                                hits,
+                            },
+                            Err(_) => routing::MemberHits {
+                                project_id: target_id,
+                                member_name: name,
+                                status: routing::MemberStatus::Unavailable,
+                                hits: Vec::new(),
+                            },
+                        }
+                    }
+                } else {
+                    routing::MemberHits {
+                        project_id: target_id,
+                        member_name: name,
+                        status: routing::MemberStatus::Unavailable,
+                        hits: Vec::new(),
+                    }
+                };
+                let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = ev_app.emit(
+                    "routed-search-state",
+                    RoutedSearchStateEvent::Searching { done, total },
+                );
+                result
+            },
+        ));
+    }
+
+    let mut member_hits = Vec::with_capacity(handles.len());
+    for h in handles {
+        member_hits.push(h.await.map_err(|e| e.to_string())?);
+    }
+
+    let report = routing::merge_routed(&plan, &member_hits, limit);
+    let _ = app.emit("routed-search-state", RoutedSearchStateEvent::Done);
+    Ok(report.into())
+}
+
 /// The incremental-Map worker: one per open project. Loops draining the
 /// extraction queue while the local model is ready, emitting a throttled
 /// `knowledge-updated` after each merged file. Every wait is short so a newly
@@ -6768,6 +7976,8 @@ pub fn run() {
         workspace_kg_running: Arc::new(AtomicBool::new(false)),
         workspace_kg_cancel: Arc::new(Mutex::new(None)),
         workspace_kg_debounce_gen: Arc::new(AtomicU64::new(0)),
+        workspace: None,
+        ingest_gate: Arc::new(IngestGate::new(WORKSPACE_INGEST_CONCURRENCY)),
     }));
 
     tauri::Builder::default()
@@ -6802,6 +8012,13 @@ pub fn run() {
             open_project,
             open_member,
             close_member,
+            open_workspace,
+            create_workspace,
+            workspace_overview,
+            focus_project,
+            discover_workspace_candidates,
+            close_workspace,
+            search_all_projects,
             forget_project,
             rename_project,
             last_project_id,
@@ -6889,6 +8106,7 @@ pub fn run() {
             workspace_kg_overview,
             workspace_kg_entity,
             workspace_kg_search,
+            route_search,
             list_chats,
             chat_transcript,
             create_chat,

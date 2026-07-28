@@ -27,6 +27,10 @@
       app.searchOpen = !app.searchOpen;
     } else if (e.key === "Escape" && app.searchOpen) {
       app.searchOpen = false;
+    } else if (e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "p" && app.workspace) {
+      // Cycle the focused workspace member (workspace task 4.3).
+      e.preventDefault();
+      void app.cycleFocusedMember();
     }
   }
 </script>

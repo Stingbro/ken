@@ -8,6 +8,7 @@ import {
   type ScanStats,
   type SemanticIndexState,
   type SyncStateName,
+  type WorkspaceOverview,
 } from "./api";
 import {
   addFavorite,
@@ -56,11 +57,17 @@ export type Screen =
   | "timeline"
   | "settings";
 
-/** A single open workspace member — same shape as a project (S9 step 7 /
- *  `workspace` change). Kept as a distinct alias so member-specific fields
- *  (status, etc., once `.ken-workspace/` lands) don't ripple through every
- *  `ProjectInfo` use site. */
-export type MemberInfo = ProjectInfo;
+/** One entry in `app.members` (workspace task 4.3). In Single mode (no
+ *  workspace open) this is just the one open project, `status: "active"`
+ *  always — a `ProjectInfo` subset, so that path stays the same shape it
+ *  always was. In Workspace mode it's sourced from `WorkspaceOverview.
+ *  members`: `id` is `null` for `missing`/`invalid` members (no resolvable
+ *  `ProjectHandle` to open). */
+export interface MemberInfo {
+  id: string | null;
+  name: string;
+  status: "active" | "dormant" | "missing" | "invalid";
+}
 
 class AppStore {
   /** The focused member. Kept as the pre-workspace field name/shape so every
@@ -98,18 +105,45 @@ class AppStore {
     return this.activeTab;
   }
 
-  /** Every currently-open project. Until workspace mode has a real multi-open
-   *  UI (S9 step 7's frontend follow-ups), this is just `[project]` — derived,
-   *  never stored separately, so it can never drift from `project`. */
+  /** The open workspace's overview (workspace task 4.3), or `null` when no
+   *  workspace is open — including Single mode, and whenever the
+   *  `workspace` flag is off. Populated by `openWorkspace`/`createWorkspace`
+   *  and kept live by the `workspace-state`/`member-status` events; `null`s
+   *  out on `close_workspace`. */
+  workspace = $state<WorkspaceOverview | null>(null);
+
+  /** Whether the global `workspace` flag resolves on — gates the launcher's
+   *  "Open a workspace" entry point and the nav-rail switcher (workspace
+   *  task 4.2/4.3). Read once at `init()`; a mid-session flag flip needs a
+   *  restart to take effect, same as every other global flag in this app. */
+  workspaceFlagEnabled = $state(false);
+
+  /** Every known member: in Workspace mode, the full roster from
+   *  `workspace.members` (workspace task 4.3 — click/`Ctrl+P` cycle target,
+   *  status dots); in Single mode, just the one open project as a
+   *  single-entry list — derived, never stored separately, so it can never
+   *  drift from `project`. */
   get members(): MemberInfo[] {
-    return this.project ? [this.project] : [];
+    if (this.workspace) {
+      return this.workspace.members.map((m) => ({
+        id: m.projectId,
+        name: m.name,
+        status: m.status,
+      }));
+    }
+    return this.project
+      ? [{ id: this.project.id, name: this.project.name, status: "active" }]
+      : [];
   }
 
   /** The focused member's id, or null with nothing open. Event payloads that
    *  carry an optional `project_id` (S9 step 5) are compared against this —
    *  see `forFocused` below — to ignore events for a member other than the
-   *  one currently focused. */
+   *  one currently focused. Workspace mode reads the manifest's `focused`
+   *  field directly (kept in step with `project.id` by `loadFocusedMemberState`
+   *  below); Single mode falls back to `project.id` unchanged. */
   get focused(): string | null {
+    if (this.workspace) return this.workspace.focused;
     return this.project?.id ?? null;
   }
 
@@ -241,6 +275,29 @@ class AppStore {
       if (!forFocused(ev.project_id)) return;
       this.syncState = ev.state;
       this.syncDetail = ev.detail;
+    });
+    // Workspace flag + lifecycle events (workspace task 4.1/4.3). Read once —
+    // a mid-session flip needs a restart, same as every other global flag.
+    this.workspaceFlagEnabled = await api
+      .listFeatures()
+      .then((flags) => flags.find((f) => f.name === "workspace")?.effective ?? false)
+      .catch(() => false);
+    await api.onWorkspaceState((ev) => {
+      if (ev.state === "closed") {
+        this.workspace = null;
+      } else if (ev.state === "open" || ev.state === "focus") {
+        void this.refreshWorkspaceOverview();
+      }
+      // "opening" carries no actionable state yet (members not activated) —
+      // the launcher shows its own inline progress via `member-status`.
+    });
+    await api.onMemberStatus(() => {
+      // A member's runtime transitioned (active/dormant) — refresh the
+      // roster so status dots stay live even when the transition didn't
+      // move focus (e.g. an LRU eviction triggered by someone else's
+      // focus change). No-ops when no workspace is open.
+      if (!this.workspace) return;
+      void this.refreshWorkspaceOverview();
     });
     // Wire the review inbox to its events here (app start), not on Review-tab
     // mount, so the nav badge stays live wherever the user is.
@@ -483,6 +540,122 @@ class AppStore {
 
   async createProject(path: string, name: string) {
     await this.activated(await api.createProject(path, name));
+  }
+
+  // ── Workspace (workspace change, task 4.3) ──────────────────────────────
+
+  /** Open an existing workspace manifest at `parent` (launcher flow). */
+  async openWorkspace(parent: string) {
+    const overview = await api.openWorkspace(parent);
+    this.workspace = overview;
+    await this.loadFocusedMemberState(overview);
+  }
+
+  /** Create a new workspace over `parent` from the selected member folder
+   *  names, then open it (launcher flow). */
+  async createWorkspace(parent: string, name: string, members: string[]) {
+    const overview = await api.createWorkspace(parent, name, members);
+    this.workspace = overview;
+    await this.loadFocusedMemberState(overview);
+  }
+
+  /** Switch focus to member `id` — the nav-rail switcher's click/`Ctrl+P`
+   *  cycle target. `focus_project` also fires `workspace-state`'s `focus`
+   *  event (handled in `init()`, routes back through
+   *  `refreshWorkspaceOverview`); awaiting the direct refresh here just
+   *  means the caller doesn't wait an extra event round-trip to see the
+   *  switch land. */
+  async focusMember(id: string) {
+    if (!this.workspace || this.workspace.focused === id) return;
+    await api.focusProject(id);
+    await this.refreshWorkspaceOverview();
+  }
+
+  /** Cycle focus to the next resolvable member, roster order (`Ctrl+P` —
+   *  workspace task 4.3). No-ops outside Workspace mode or with fewer than
+   *  two resolvable (non-`missing`/`invalid`) members. */
+  async cycleFocusedMember() {
+    if (!this.workspace) return;
+    const resolvable = this.members.filter(
+      (m): m is MemberInfo & { id: string } => m.id !== null,
+    );
+    if (resolvable.length < 2) return;
+    const idx = resolvable.findIndex((m) => m.id === this.focused);
+    const next = resolvable[(idx + 1) % resolvable.length];
+    await this.focusMember(next.id);
+  }
+
+  /** Close the open workspace, tearing down every member's runtime and
+   *  returning to the picker — the workspace equivalent of closing the
+   *  sole open project in Single mode (no such action exists there either;
+   *  Single mode only ever switches projects). */
+  async closeWorkspaceSession() {
+    await api.closeWorkspace();
+    this.workspace = null;
+    this.project = null;
+  }
+
+  /** Re-fetch the workspace roster (status dots, membership) and, if focus
+   *  moved, reload the newly-focused member's per-project caches. Called
+   *  from `workspace-state`'s `open`/`focus` events and `member-status`
+   *  events (workspace task 4.3: "screens reload their stores on the focus
+   *  workspace-state event"). */
+  private async refreshWorkspaceOverview() {
+    const overview = await api.workspaceOverview().catch(() => null);
+    if (!overview) return;
+    const focusChanged = this.workspace?.focused !== overview.focused;
+    this.workspace = overview;
+    if (focusChanged) await this.loadFocusedMemberState(overview);
+  }
+
+  /** Reload every per-project cache for the workspace's currently focused
+   *  member — the workspace-mode counterpart of `activated()` (same
+   *  refresh list: tabs/favorites/recents, background/transcribe/semantic
+   *  index settings, ignored/unread, the file tree, the review badge).
+   *  Kept as a separate method rather than folded into `activated()` so the
+   *  Single-mode path (`openProject`/`createProject`) stays byte-identical.
+   *
+   *  DEVIATION: no command returns a full `ProjectInfo` for a workspace
+   *  member other than the one just opened/created — `focus_project` and
+   *  `workspace_overview` only carry `name`/`projectId`/`status`. `root` is
+   *  still reconstructed exactly (`workspace.root + "/" + member.name` —
+   *  members are stored as parent-relative folder names, workspace design
+   *  D1), but `excluded`/`ingestRunner` have no per-member read path, so
+   *  they default (`[]`/`"headless"`, `ProjectInfo::of`'s own fallback)
+   *  rather than carrying over the PREVIOUS member's values, which would be
+   *  actively wrong. Settings' exclude-folder list and ingest-runner toggle
+   *  may show these defaults instead of a non-initial focused member's real
+   *  values until a per-member info command exists — the backend truth
+   *  itself is unaffected (every mutating command resolves "the project"
+   *  via `state.focused` regardless of what the frontend has cached). See
+   *  final report. */
+  private async loadFocusedMemberState(overview: WorkspaceOverview) {
+    const member = overview.members.find((m) => m.projectId === overview.focused);
+    if (!overview.focused || !member) {
+      this.project = null;
+      return;
+    }
+    this.project = {
+      id: overview.focused,
+      name: member.name,
+      root: `${overview.root}/${member.name}`,
+      excluded: [],
+      ingestRunner: "headless",
+    };
+    this.scanning = false;
+    this.scanError = null;
+    this.syncState = "off";
+    this.syncDetail = null;
+    this.semanticIndexState = null;
+    this.loadProjectLocalState();
+    void this.loadBackgroundIndex();
+    void this.loadTranscribeOnIndex();
+    void this.loadSemanticIndex();
+    void this.loadIgnored();
+    void this.loadUnread();
+    this.screen = "home";
+    await this.refreshTree();
+    void review.refresh();
   }
 
   async setExcluded(excluded: string[]) {

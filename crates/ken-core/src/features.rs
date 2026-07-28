@@ -62,6 +62,16 @@ pub const FLAGS: &[FlagDef] = &[
                       entities, cross-project edges, and a wiki-page view. \
                       Requires the workspace flag.",
     },
+    FlagDef {
+        name: "kgRouting",
+        scope: FlagScope::Workspace,
+        default: false,
+        description: "Route search across workspace members: aim directly \
+                      at a named project, via the workspace knowledge graph \
+                      when it isn't named, or broadcast when neither \
+                      applies — every result cited with a stable address. \
+                      Requires the workspace flag.",
+    },
 ];
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
@@ -123,7 +133,7 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 4);
+        assert_eq!(FLAGS.len(), 5);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
         let profiler = flag("profiler").expect("profiler flag registered");
@@ -132,6 +142,9 @@ mod tests {
         let federated_kg = flag("federatedKg").expect("federatedKg flag registered");
         assert_eq!(federated_kg.scope, FlagScope::Workspace);
         assert!(!federated_kg.default);
+        let kg_routing = flag("kgRouting").expect("kgRouting flag registered");
+        assert_eq!(kg_routing.scope, FlagScope::Workspace);
+        assert!(!kg_routing.default);
     }
 
     #[test]

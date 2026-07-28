@@ -710,6 +710,153 @@ export interface KenignoreWarning {
   project_id?: string;
 }
 
+// ---- Workspace (workspace change, task 4.1) ----
+
+/** Mirrors the Rust `Candidate` (`ken_core::workspace`, camelCase) — one
+ *  immediate subfolder of a prospective workspace parent, as surfaced by
+ *  `discover_workspace_candidates` for the creation checklist. */
+export interface Candidate {
+  name: string;
+  existing: boolean;
+  fileCount: number;
+  markers: string[];
+}
+
+export type WorkspaceMemberStatus = "active" | "dormant" | "missing" | "invalid";
+
+/** Mirrors `WorkspaceMemberDto` — one member's row in `workspace_overview`.
+ *  `projectId`/`fileCount` are `null` for `missing`/`invalid` members (no
+ *  resolvable `ProjectHandle`); `reason` carries the parse error only for
+ *  `invalid`. */
+export interface WorkspaceMember {
+  name: string;
+  projectId: string | null;
+  status: WorkspaceMemberStatus;
+  reason: string | null;
+  fileCount: number | null;
+}
+
+/** Mirrors `WorkspaceOverviewDto` — the open workspace's manifest header
+ *  plus the full member roster, as returned by `open_workspace`,
+ *  `create_workspace`, and `workspace_overview`. */
+export interface WorkspaceOverview {
+  id: string;
+  name: string;
+  root: string;
+  focused: string | null;
+  members: WorkspaceMember[];
+}
+
+/** Mirrors the Rust `WorkspaceStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`), app-global (plain
+ *  `app.emit`, no member envelope) — a workspace lifecycle spans every
+ *  member at once. */
+export type WorkspaceStateEvent =
+  | { state: "opening"; name: string }
+  | { state: "open"; id: string; name: string }
+  | { state: "focus"; projectId: string }
+  | { state: "closed" };
+
+/** Mirrors the Rust `MemberStatusEvent` internally-tagged enum
+ *  (`#[serde(tag = "status", rename_all = "camelCase")]`), delivered
+ *  through `emit_member` — the envelope adds `project_id` (snake_case, same
+ *  convention every other member-scoped event in this file already uses,
+ *  e.g. `ScanStats.project_id`). Only the two *runtime* transitions a
+ *  resolvable member goes through fire this event; `missing`/`invalid`
+ *  members are reported through `workspace_overview` instead. */
+export type MemberStatusEvent =
+  | { status: "active"; name: string; project_id: string }
+  | { status: "dormant"; name: string; project_id: string };
+
+/** One `search_all_projects` hit (`AllProjectsHitDto`, task 3.3) — a plain
+ *  `SearchHit` labeled with its owning member. */
+export interface AllProjectsHit extends SearchHit {
+  projectId: string;
+  memberName: string;
+}
+
+export type AllProjectsMemberSearchStatus =
+  | "searched"
+  | "dormant"
+  | "missing"
+  | "invalid";
+
+/** One member's outcome in `search_all_projects` — honest per-member
+ *  coverage, mirroring `RouteSearchResult`'s `memberStatus`. */
+export interface AllProjectsMemberStatus {
+  projectId: string | null;
+  memberName: string;
+  status: AllProjectsMemberSearchStatus;
+}
+
+/** Mirrors `SearchAllProjectsDto` — the all-projects keyword fan-out's
+ *  return shape. */
+export interface SearchAllProjectsResult {
+  results: AllProjectsHit[];
+  memberStatus: AllProjectsMemberStatus[];
+}
+
+// ---- kg-routing (kg-routing change, task 4.1) ----
+
+/** Mirrors the Rust `RouteReasonDto` internally-tagged enum
+ *  (`#[serde(tag = "type", rename_all = "camelCase")]`) — why `plan_route`
+ *  picked its targets. */
+export type RouteReason =
+  | { type: "named" }
+  | { type: "kgEntities"; entityIds: number[] }
+  | { type: "broadcast" };
+
+/** Mirrors `RoutePlanDto` — `targets` are stringified project ids. */
+export interface RoutePlan {
+  targets: string[];
+  reason: RouteReason;
+}
+
+/** Mirrors `RoutedHitDto` — one merged, cited hit from `route_search`.
+ *  `source` is `"keyword"` | `"semantic"` | `"both"` (same vocabulary as
+ *  `HybridHit.source`); `kgBreadcrumbs` is `kg://<entity-id>` per entity
+ *  that selected the plan (plan-level, not per-hit — see the Rust doc
+ *  comment on `RoutedHitDto`), empty unless the plan's reason was
+ *  `kgEntities`. */
+export interface RoutedHit {
+  path: string;
+  chunkId: number;
+  snippet: string;
+  source: string;
+  projectId: string;
+  memberName: string;
+  /** `ken://<project-id>/<rel-path>`. */
+  address: string;
+  kgBreadcrumbs: string[];
+}
+
+export type RouteMemberStatus = "searched" | "index-building" | "unavailable";
+
+/** Mirrors `MemberStatusEntryDto` — one member's outcome in a `route_search`
+ *  call. */
+export interface RouteMemberStatusEntry {
+  projectId: string;
+  memberName: string;
+  status: RouteMemberStatus;
+}
+
+/** Mirrors `RouteSearchDto` — `route_search`'s return shape: the plan, the
+ *  cross-member RRF-merged cited results, and per-member coverage. */
+export interface RouteSearchResult {
+  plan: RoutePlan;
+  results: RoutedHit[];
+  memberStatus: RouteMemberStatusEntry[];
+}
+
+/** Mirrors the Rust `RoutedSearchStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`), app-global like
+ *  `WorkspaceStateEvent` — a routed search spans every planned member at
+ *  once, no single owning project. */
+export type RoutedSearchStateEvent =
+  | { state: "planning" }
+  | { state: "searching"; done: number; total: number }
+  | { state: "done" };
+
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   createProject: (path: string, name: string) =>
@@ -723,6 +870,38 @@ export const api = {
    *  flag gate as `openMember`. */
   closeMember: (projectId: string) =>
     invoke<void>("close_member", { projectId }),
+
+  // ---- Workspace (workspace change, task 4.1) ----
+  /** Open an existing `.ken-workspace/` manifest at `parent`. Flag-gated on
+   *  `workspace`; activates every resolvable member up to the resident cap
+   *  and restores the last-focused member. Progress rides `workspace-state`
+   *  + `member-status`. */
+  openWorkspace: (parent: string) =>
+    invoke<WorkspaceOverview>("open_workspace", { parent }),
+  /** Create a new workspace manifest over `parent` from the selected member
+   *  folder names, then open it (same activation path as `openWorkspace`). */
+  createWorkspace: (parent: string, name: string, members: string[]) =>
+    invoke<WorkspaceOverview>("create_workspace", { parent, name, members }),
+  /** Members + per-member status + counts for the currently open workspace. */
+  workspaceOverview: () => invoke<WorkspaceOverview>("workspace_overview"),
+  /** Switch focus to `id`, activating a dormant member (LRU-evicting past
+   *  the resident cap) without closing any other member. Emits
+   *  `workspace-state`'s `focus` variant. */
+  focusProject: (id: string) => invoke<void>("focus_project", { id }),
+  /** Immediate subfolder candidates under `parent` for the workspace-creation
+   *  checklist — one level deep, tagged `existing`/`new` + file count +
+   *  repo markers. */
+  discoverWorkspaceCandidates: (parent: string) =>
+    invoke<Candidate[]>("discover_workspace_candidates", { parent }),
+  /** Close the open workspace, tearing down every member's runtime. */
+  closeWorkspace: () => invoke<void>("close_workspace"),
+  /** Keyword FTS fan-out over every ACTIVE workspace member, merged by
+   *  round-robin rank-position interleave and labeled per hit (design D6 —
+   *  BM25 scores aren't comparable across corpora). Requires `workspace`;
+   *  upgrades to `routeSearch` when `kgRouting` is also on (kg-routing
+   *  proposal: "same UI slot, richer results"). */
+  searchAllProjects: (query: string, limit = 30) =>
+    invoke<SearchAllProjectsResult>("search_all_projects", { query, limit }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
   renameProject: (id: string, name: string) =>
     invoke<ProjectInfo>("rename_project", { id, name }),
@@ -738,6 +917,13 @@ export const api = {
    *  it's off, so callers can always route through this instead of `search`. */
   hybridSearch: (query: string, limit = 30) =>
     invoke<HybridHit[]>("hybrid_search", { query, limit }),
+  /** Route `query` across every open workspace member (kg-routing task 4.1):
+   *  plan (Named/KG-guided/Broadcast), fan out hybrid search over the
+   *  targets, merge with cross-member RRF, and return cited `ken://`/
+   *  `kg://` addresses. Requires `kgRouting`. Progress rides
+   *  `routed-search-state`. */
+  routeSearch: (query: string, limit = 30) =>
+    invoke<RouteSearchResult>("route_search", { query, limit }),
   readFile: (relPath: string) => invoke<string>("read_file", { relPath }),
   readFileBytes: (relPath: string) =>
     invoke<ArrayBuffer>("read_file_bytes", { relPath }),
@@ -1017,6 +1203,24 @@ export const api = {
     fn: (ev: WorkspaceKgState) => void,
   ): Promise<UnlistenFn> =>
     listen<WorkspaceKgState>("workspace-kg-state", (e) => fn(e.payload)),
+  /** `workspace-state`: `opening` → `open` | `focus` | `closed`
+   *  (workspace task 4.1). App-global — a workspace lifecycle spans every
+   *  member at once, so there's no `project_id` to filter on. */
+  onWorkspaceState: (
+    fn: (ev: WorkspaceStateEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<WorkspaceStateEvent>("workspace-state", (e) => fn(e.payload)),
+  /** `member-status`: one resolvable member going `active` (gained a live
+   *  runtime) or `dormant` (evicted / lazy-deferred). Envelope carries
+   *  `project_id` like every other member-scoped event in this file. */
+  onMemberStatus: (fn: (ev: MemberStatusEvent) => void): Promise<UnlistenFn> =>
+    listen<MemberStatusEvent>("member-status", (e) => fn(e.payload)),
+  /** `routed-search-state`: `planning` → `searching m/n` → `done`
+   *  (kg-routing task 4.1). App-global like `onWorkspaceState`. */
+  onRoutedSearchState: (
+    fn: (ev: RoutedSearchStateEvent) => void,
+  ): Promise<UnlistenFn> =>
+    listen<RoutedSearchStateEvent>("routed-search-state", (e) => fn(e.payload)),
   onModelDownloadProgress: (
     fn: (ev: ModelProgress) => void,
   ): Promise<UnlistenFn> =>

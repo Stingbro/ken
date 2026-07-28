@@ -33,6 +33,7 @@ pub mod refresh;
 pub mod research;
 pub mod runner;
 pub mod registry;
+pub mod routing;
 pub mod scan;
 pub mod search;
 pub mod settings;
@@ -40,6 +41,7 @@ pub mod sync;
 pub mod transcript;
 pub mod user_state;
 pub mod watch;
+pub mod workspace;
 pub mod workspace_kg_db;
 
 pub use error::{Error, Result};
