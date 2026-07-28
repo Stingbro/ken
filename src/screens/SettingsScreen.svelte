@@ -2,6 +2,8 @@
   import { onMount } from "svelte";
   import { app, forFocused } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
+  import { memory } from "../lib/memory.svelte";
+  import { toWorkspaceAddress, unopenableReason } from "../lib/kenAddress";
   import { theme, type ThemeMode } from "../lib/theme.svelte";
   import {
     api,
@@ -98,6 +100,7 @@
     void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
     void refreshModels();
     void loadFeatures();
+    void memory.init();
     let unlistenProfile: (() => void) | undefined;
     void api.onProfileState((ev) => {
       // `profile_project` events are project_id-keyed (`emit_member`); no
@@ -211,6 +214,14 @@
   async function setRunnerMode(mode: "hidden-tui" | "headless") {
     runnerMode = mode;
     await api.setIngestRunnerMode(mode);
+  }
+
+  /** Distill-candidate card body preview — full text is available by
+   *  approving (it opens like any memory file afterward); the card itself
+   *  only needs enough to judge the proposal. */
+  function bodyPreview(body: string, max = 320): string {
+    const trimmed = body.trim();
+    return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
   }
 
   async function toggleFolder(relPath: string) {
@@ -573,6 +584,88 @@
       </section>
     {/if}
 
+    {#if memory.enabled}
+      <section class="group">
+        <div class="group-head">Memory</div>
+        <div class="card">
+          <div class="card-title">Journal distillation</div>
+          <p class="note">
+            Ken can review the workspace journal and draft candidate
+            long-term memories from anything that keeps recurring. Nothing
+            is written to <span class="mono small">memory/</span> until you
+            approve a candidate below.
+          </p>
+
+          {#if memory.phase === "planning" || memory.phase === "distilling"}
+            <div class="row">
+              <span class="mini-spinner" aria-hidden="true"></span>
+              <span class="soft">
+                {memory.phase === "planning" ? "Reading the journal…" : "Drafting candidates…"}
+              </span>
+            </div>
+          {/if}
+
+          {#if memory.phase === "error" && memory.errorReason}
+            <p class="note warn">Distillation failed: {memory.errorReason}</p>
+          {/if}
+
+          <div class="row">
+            <button
+              class="btn btn-small"
+              onclick={() => void memory.distill()}
+              disabled={memory.phase === "planning" || memory.phase === "distilling"}
+            >
+              {memory.phase === "planning" || memory.phase === "distilling"
+                ? "Distilling…"
+                : "Distill journal"}
+            </button>
+          </div>
+        </div>
+
+        {#each memory.candidates as c (c.slug)}
+          <div class="card">
+            <div class="card-title">{c.slug}</div>
+            <div class="row">
+              <span class="chip mono">.ken-workspace/memory/{c.slug}.md</span>
+            </div>
+            {#if c.description}
+              <p class="note">{c.description}</p>
+            {/if}
+            <pre class="memory-body">{bodyPreview(c.body)}</pre>
+            {#if c.sources.length > 0}
+              <div class="row"><span class="label">Sources</span></div>
+              <div class="folders">
+                {#each c.sources as src (src)}
+                  {@const reason = unopenableReason(toWorkspaceAddress(src))}
+                  <div class="folder ignored">
+                    <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>
+                      {src}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            <div class="row">
+              <button
+                class="btn btn-small"
+                onclick={() => void memory.resolve(c.slug, true)}
+                disabled={memory.resolvingSlug === c.slug}
+              >
+                Approve
+              </button>
+              <button
+                class="btn btn-small"
+                onclick={() => void memory.resolve(c.slug, false)}
+                disabled={memory.resolvingSlug === c.slug}
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        {/each}
+      </section>
+    {/if}
+
     <section class="group">
       <div class="group-head">On this Mac</div>
 
@@ -929,6 +1022,26 @@
   }
   .note.warn {
     color: var(--needs-input-text);
+  }
+  .memory-body {
+    margin: 0;
+    padding: 10px 12px;
+    background: var(--sunken);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  /* A `ken://workspace/...` source link that can't be opened yet (task 4.3 —
+     see src/lib/kenAddress.ts) — shown, not hidden, with a tooltip saying why. */
+  .disabled-link {
+    color: var(--ink-tertiary);
+    cursor: not-allowed;
   }
   .mini-spinner {
     width: 12px;

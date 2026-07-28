@@ -22,6 +22,7 @@ pub mod import;
 pub mod kenignore;
 pub mod knowledge_model;
 pub mod local_llm;
+pub mod memory;
 pub mod model;
 pub mod ocr;
 pub mod profiler;

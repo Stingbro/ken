@@ -10,12 +10,14 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use ken_core::db::Db;
 use ken_core::features;
+use ken_core::memory;
 use ken_core::profiler::{self, ProjectProfile};
 use ken_core::project::Project;
 use ken_core::registry::{self, Registry};
@@ -123,7 +125,8 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match name {
                 "search_knowledge" | "read_document" | "list_documents" | "list_projects"
-                | "kg_search" | "semantic_search" | "route_query" => {
+                | "kg_search" | "semantic_search" | "route_query"
+                | "memory_write" | "journal_append" => {
                     let outcome = call_tool(server, name, &args);
                     rpc_result(&id, tool_content(outcome))
                 }
@@ -312,6 +315,63 @@ picked the target when the knowledge graph did the routing.",
         }));
     }
 
+    // ken-memory (task 3.1) adds `memory_write`/`journal_append`, gated on
+    // `kenMemory` the same way the kgRouting block above gates its three
+    // tools — absent from the list entirely when the flag is off (spec.md
+    // "Flag-scoped activation": "register no memory tools on either
+    // surface").
+    if ken_memory_enabled(&AppSettings::load(&server.base_dir)) {
+        tools.push(json!({
+            "name": "memory_write",
+            "description": "Create or update one of Ken's own long-term \
+memory files — durable notes on ways of working, conventions, or standing \
+decisions, either workspace-wide or scoped to one project. Distinct from \
+the day-to-day journal (use journal_append for that): memories are small, \
+curated, and always kept in context, not a running log. `scope` is \
+\"workspace\" for a workspace-wide memory, or a Ken project name (from \
+list_projects) for a project-scoped one. `slug` names the file \
+(<slug>.md) and is the memory's identity. By default this creates a new \
+memory and errors if that slug already exists — pass mode \"replace\" to \
+update an existing memory's body instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "description": "\"workspace\", or a Ken project name for a project-scoped memory." },
+                    "slug": { "type": "string", "description": "File-name-safe identifier for the memory — creates <slug>.md." },
+                    "content": { "type": "string", "description": "The memory's body text." },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["create", "replace"],
+                        "description": "\"create\" (default): errors if the slug already exists. \"replace\": updates an existing memory's body (its slug must already exist)."
+                    }
+                },
+                "required": ["scope", "slug", "content"]
+            }
+        }));
+        tools.push(json!({
+            "name": "journal_append",
+            "description": "Append a timestamped entry to today's Ken \
+workspace journal — this is where agent tasks report their findings back \
+as they happen, creating the day's file if it doesn't exist yet. Cite \
+ken:// addresses for anything referenced so the entry stays traceable \
+after Ken reindexes it. Optionally tag the entry with the Ken project it \
+concerns and free-form tags.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The journal entry's text." },
+                    "project": { "type": "string", "description": "Ken project name this entry concerns, if any." },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Free-form tags for this entry."
+                    }
+                },
+                "required": ["text"]
+            }
+        }));
+    }
+
     Value::Array(tools)
 }
 
@@ -323,6 +383,8 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "kg_search" => kg_search(server, args),
         "semantic_search" => semantic_search(server, args),
         "route_query" => route_query(server, args),
+        "memory_write" => memory_write_tool(server, args),
+        "journal_append" => journal_append_tool(server, args),
         "search_knowledge" => {
             let query = require_str(args, "query")?;
             let limit = args
@@ -813,6 +875,89 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
     out
 }
 
+/// `memory_write` (task 3.1): create or replace a Ken long-term memory file
+/// via the same `ken_core::memory::write_memory` core the Ken chat tool of
+/// the same name is specified to use (design D5: "one write core, two tool
+/// surfaces"). Defense-in-depth: `tool_definitions` already hides this tool
+/// when `kenMemory` is off, but the flag is re-checked here too — same
+/// posture as `kg_search`/`semantic_search`/`route_query` above — since an
+/// MCP client can call any tool name whether or not `tools/list` advertised
+/// it.
+fn memory_write_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_memory_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("memory_write requires the kenMemory feature flag, which is off.".into());
+    }
+    let scope_arg = require_str(args, "scope")?;
+    let slug = require_str(args, "slug")?;
+    let content = require_str(args, "content")?;
+    // Judgment call: the docs (tasks.md 1.2 / spec.md) specify create-mode
+    // by default with an explicit `WriteMode::Replace` for updates — this
+    // tool exposes both rather than create-only, so an agent that wrote a
+    // memory earlier in a session can update it without a separate
+    // out-of-band path; "create" stays the default either way an MCP
+    // client omits `mode`.
+    let mode = match args.get("mode").and_then(Value::as_str) {
+        None | Some("create") => memory::WriteMode::Create,
+        Some("replace") => memory::WriteMode::Replace,
+        Some(other) => {
+            return Err(format!("invalid \"mode\" {other:?} — use \"create\" or \"replace\""))
+        }
+    };
+    let (today, _) = today_and_time_utc();
+
+    if scope_arg.eq_ignore_ascii_case("workspace") {
+        let workspace_root = resolve_workspace_root(server)?;
+        let scope = memory::MemoryScope::Workspace { workspace_root: &workspace_root };
+        let path = memory::write_memory(scope, &slug, &content, mode, &today)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Wrote workspace memory \"{slug}\" to {} (ken://workspace/memory/{slug}.md).",
+            path.display()
+        ))
+    } else {
+        let (project_id, project_root, project_name) = resolve_project_by_name(server, &scope_arg)?;
+        let scope = memory::MemoryScope::Project { project_root: &project_root };
+        let path = memory::write_memory(scope, &slug, &content, mode, &today)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Wrote memory \"{slug}\" to project \"{project_name}\" at {} ({}).",
+            path.display(),
+            ken_address(project_id, &format!(".ken/memory/{slug}.md"))
+        ))
+    }
+}
+
+/// `journal_append` (task 3.1): append a `## HH:MM` entry to today's Ken
+/// workspace journal via the same core `append_journal` the Ken chat tool
+/// uses — this is how agent-desktop closes the loop, reporting task
+/// findings back into Ken's searchable memory (spec: "agent-desktop reports
+/// back"). Same defense-in-depth flag re-check as `memory_write_tool`.
+fn journal_append_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_memory_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("journal_append requires the kenMemory feature flag, which is off.".into());
+    }
+    let text = require_str(args, "text")?;
+    let project = args
+        .get("project")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let workspace_root = resolve_workspace_root(server)?;
+    let (today, time_hhmm) = today_and_time_utc();
+    let path = memory::append_journal(&workspace_root, &text, project, &tags, &today, &time_hhmm)
+        .map_err(|e| format!("could not append to the journal: {e}"))?;
+    Ok(format!(
+        "Appended a {today} {time_hhmm} entry to the workspace journal ({}).",
+        path.display()
+    ))
+}
+
 fn source_label(source: Source) -> &'static str {
     match source {
         Source::Keyword => "keyword",
@@ -870,6 +1015,21 @@ fn kg_routing_enabled(app_settings: &AppSettings) -> bool {
     workspace_enabled(app_settings) && global_flag(app_settings, "kgRouting")
 }
 
+/// `kenMemory` (workspace-level, requires `workspace` — proposal.md
+/// "Flag"), gated exactly like `kg_routing_enabled` above. Note:
+/// `kenMemory` is not yet a registered entry in `ken_core::features::FLAGS`
+/// as of this layer — `openspec/changes/ken-memory/tasks.md` section 1
+/// (ken-core) has no task registering it there, unlike `kgRouting`'s own
+/// change, which registered its flag in ken-core before any tool surface
+/// read it. `global_flag`'s unregistered-name fallback (`default = false`)
+/// makes this correctly inert either way: off until both the registration
+/// and an explicit `true` in `settings.json`'s `features` map exist, and
+/// automatically picking up the real default the moment ken-core
+/// registers the flag — no ken-mcp change needed when that lands.
+fn ken_memory_enabled(app_settings: &AppSettings) -> bool {
+    workspace_enabled(app_settings) && global_flag(app_settings, "kenMemory")
+}
+
 /// Which project does this call target? Scoped servers always answer with
 /// their own; unscoped servers require the `project` argument.
 fn resolve_project(server: &Server, args: &Value) -> Result<(Project, Option<String>), String> {
@@ -919,6 +1079,64 @@ argument is required (a name or folder path). {available}"
     Ok((project, None))
 }
 
+/// The workspace ken-mcp should read/write memories and the journal for:
+/// Ken's registry `lastWorkspace` entry (task brief: "resolve the current
+/// workspace as last_workspace's entry; if none, the tools should return a
+/// clear 'no workspace' message"). Unlike `resolve_project`, there is no
+/// `--project`-style scoping flag for a workspace to fall back on — ken-mcp
+/// only ever knows "the workspace Ken last had open," mirroring how the app
+/// itself reopens `lastWorkspace` on launch.
+fn resolve_workspace_root(server: &Server) -> Result<PathBuf, String> {
+    let registry = Registry::load(&server.base_dir)
+        .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let id = registry.last_workspace.ok_or_else(|| {
+        "No Ken workspace is open — open a workspace folder in the Ken app first.".to_string()
+    })?;
+    registry
+        .workspaces
+        .iter()
+        .find(|w| w.id == id)
+        .map(|w| w.path.clone())
+        .ok_or_else(|| {
+            "No Ken workspace is open — open a workspace folder in the Ken app first.".to_string()
+        })
+}
+
+/// Resolve a project-scoped memory's project (id, root, name) by name from
+/// Ken's registry (task brief: "project scope needs the project root from
+/// the registry by name") — the same name-or-path matching `resolve_project`
+/// uses for the search tools' `project` argument, reused here for
+/// `memory_write`'s `scope` argument instead of a dedicated workspace
+/// member lookup (design.md doesn't scope memory projects to one open
+/// workspace's members; any registered project is a valid memory scope).
+/// The id comes along too so the caller can render a `ken://<id>/...`
+/// address in its confirmation, same as the workspace-scope branch does.
+fn resolve_project_by_name(server: &Server, name: &str) -> Result<(Uuid, PathBuf, String), String> {
+    let registry = Registry::load(&server.base_dir)
+        .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let entry = registry
+        .projects
+        .iter()
+        .find(|p| {
+            p.name.eq_ignore_ascii_case(name)
+                || p.path == Path::new(name)
+                || same_canonical(&p.path, Path::new(name))
+        })
+        .ok_or_else(|| {
+            let names: Vec<String> = registry.projects.iter().map(|p| p.name.clone()).collect();
+            let available = if names.is_empty() {
+                "No projects are registered yet — open a folder in the Ken app first.".to_string()
+            } else {
+                format!("Available projects: {}.", names.join(", "))
+            };
+            format!(
+                "\"{name}\" is neither \"workspace\" nor a registered project \
+name. {available}"
+            )
+        })?;
+    Ok((entry.id, entry.path.clone(), entry.name.clone()))
+}
+
 fn same_canonical(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -943,6 +1161,56 @@ fn floor_char_boundary_at(bytes: &[u8], at: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// UTC `(YYYY-MM-DD, HH:MM)` — the `today`/`time_hhmm` strings
+/// `ken_core::memory::write_memory`/`append_journal` take as
+/// caller-supplied arguments rather than reading the wall clock themselves
+/// (`memory.rs`'s module doc: "no date/time crate is a ken-core
+/// dependency"; neither `ken-core` nor `ken-mcp`'s `Cargo.toml` depends on
+/// `chrono`/`time`, and this task adds none). Judgment call, recorded
+/// honestly per the task brief: this is **UTC**, not the caller's local
+/// time zone — `std::time::SystemTime` has no timezone-aware conversion
+/// without a date crate. A journal entry appended late at night in a
+/// negative-UTC-offset zone can therefore land under the *next* UTC
+/// calendar day's file, and `## HH:MM` headers / a memory's `created`/
+/// `updated` fields read as UTC wall-clock, not the agent's local time.
+/// Entries stay correctly ordered and internally consistent regardless —
+/// only the human-facing date/time label can be a day off from "local
+/// today" — so this is acceptable for an MCP sidecar with no UI of its
+/// own, not a correctness bug.
+fn today_and_time_utc() -> (String, String) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = secs_of_day / 3600;
+    let mm = (secs_of_day % 3600) / 60;
+    (format!("{y:04}-{m:02}-{d:02}"), format!("{hh:02}:{mm:02}"))
+}
+
+/// Inverse of `ken_core::memory`'s private `days_from_civil` — Howard
+/// Hinnant's public-domain `civil_from_days`
+/// (https://howardhinnant.github.io/date_algorithms.html), converting a
+/// day count since 1970-01-01 back to a proleptic-Gregorian `(y, m, d)`.
+/// Not exported from `ken-core` (that module only ever needs the forward
+/// direction, to diff two caller-supplied `YYYY-MM-DD` dates for the
+/// archive roll) — duplicated here in miniature for this one caller rather
+/// than made `pub` there.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 #[cfg(test)]
@@ -1344,5 +1612,189 @@ mod tests {
         let (text_on, is_err) = tool(&mut fx.server, "list_projects", json!({}));
         assert!(!is_err, "{text_on}");
         assert!(text_on.contains("search ready"), "{text_on}");
+    }
+
+    // --- ken-memory (task 3.2) ---
+
+    /// `workspace`+`kenMemory` on, one registered workspace (`last_workspace`
+    /// resolved) and one registered project ("Atlas") — what the memory-tool
+    /// tests below need for both scope kinds. Tempdirs are returned so the
+    /// caller keeps them alive for the test's duration (same idiom as
+    /// `Fixture`'s `_base`/`_root` fields and `two_project_fixture`).
+    fn memory_fixture() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, Server) {
+        let base = tempfile::tempdir().unwrap();
+        let ws_parent = tempfile::tempdir().unwrap();
+        let proj_root = tempfile::tempdir().unwrap();
+
+        let workspace = ken_core::workspace::Workspace::create(ws_parent.path(), "WS", &[]).unwrap();
+        let project = Project::create(proj_root.path(), "Atlas").unwrap();
+
+        let mut registry = Registry::default();
+        registry.add(&project);
+        registry.add_workspace(&workspace, None, 0);
+        registry.last_workspace = Some(workspace.config.id);
+        registry.save(base.path()).unwrap();
+
+        let mut settings = AppSettings::default();
+        settings.features.insert("workspace".into(), true.into());
+        settings.features.insert("kenMemory".into(), true.into());
+        settings.save(base.path()).unwrap();
+
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        (base, ws_parent, proj_root, server)
+    }
+
+    #[test]
+    fn memory_tools_absent_and_erroring_when_flag_off() {
+        let mut fx = fixture(true); // default settings — kenMemory unset, off
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let names: Vec<_> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            "flag off must be byte-identical to pre-ken-memory tool list"
+        );
+
+        // Dispatch still recognizes the tool names and explains the flag
+        // rather than erroring opaquely (defense-in-depth, same posture as
+        // the kgRouting tools' flag-off test above).
+        for name in ["memory_write", "journal_append"] {
+            let (text, is_err) = tool(&mut fx.server, name, json!({}));
+            assert!(is_err, "{name}: {text}");
+            assert!(text.contains("kenMemory"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn memory_tools_appear_with_valid_schemas_when_flag_on() {
+        let (_base, _ws, _proj, mut server) = memory_fixture();
+        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let tools = reply["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"memory_write"), "{names:?}");
+        assert!(names.contains(&"journal_append"), "{names:?}");
+
+        let mw = tools.iter().find(|t| t["name"] == "memory_write").unwrap();
+        assert_eq!(mw["inputSchema"]["required"], json!(["scope", "slug", "content"]));
+        let ja = tools.iter().find(|t| t["name"] == "journal_append").unwrap();
+        assert_eq!(ja["inputSchema"]["required"], json!(["text"]));
+        for t in tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
+            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
+        }
+    }
+
+    #[test]
+    fn memory_write_lands_in_workspace_and_project_memory_dirs() {
+        let (_base, ws_parent, proj_root, mut server) = memory_fixture();
+
+        let (text, is_err) = tool(
+            &mut server,
+            "memory_write",
+            json!({"scope": "workspace", "slug": "ways-of-working", "content": "Ship small PRs."}),
+        );
+        assert!(!is_err, "{text}");
+        let ws_path = ws_parent.path().join(".ken-workspace/memory/ways-of-working.md");
+        assert!(ws_path.is_file(), "{}", ws_path.display());
+        let raw = std::fs::read_to_string(&ws_path).unwrap();
+        assert!(raw.contains("Ship small PRs."), "{raw}");
+        assert!(text.contains("ken://workspace/memory/ways-of-working.md"), "{text}");
+
+        // Create-mode collision errors and leaves the existing file untouched.
+        let (text2, is_err2) = tool(
+            &mut server,
+            "memory_write",
+            json!({"scope": "workspace", "slug": "ways-of-working", "content": "Different."}),
+        );
+        assert!(is_err2, "{text2}");
+        assert_eq!(std::fs::read_to_string(&ws_path).unwrap(), raw, "collision must not overwrite");
+
+        // Explicit replace mode swaps the body.
+        let (text3, is_err3) = tool(
+            &mut server,
+            "memory_write",
+            json!({"scope": "workspace", "slug": "ways-of-working", "content": "Updated body.", "mode": "replace"}),
+        );
+        assert!(!is_err3, "{text3}");
+        assert!(std::fs::read_to_string(&ws_path).unwrap().contains("Updated body."));
+
+        // Project scope, resolved by registry name.
+        let (text4, is_err4) = tool(
+            &mut server,
+            "memory_write",
+            json!({"scope": "Atlas", "slug": "conventions", "content": "One mob per file."}),
+        );
+        assert!(!is_err4, "{text4}");
+        let proj_path = proj_root.path().join(".ken/memory/conventions.md");
+        assert!(proj_path.is_file(), "{}", proj_path.display());
+        assert!(std::fs::read_to_string(&proj_path).unwrap().contains("One mob per file."));
+        assert!(text4.contains("ken://") && text4.contains(".ken/memory/conventions.md"), "{text4}");
+
+        // An unrecognized scope is a helpful error, not a panic or a
+        // silent workspace-folder write.
+        let (text5, is_err5) =
+            tool(&mut server, "memory_write", json!({"scope": "Nope", "slug": "x", "content": "y"}));
+        assert!(is_err5);
+        assert!(text5.contains("Nope"), "{text5}");
+    }
+
+    #[test]
+    fn journal_append_lands_in_workspace_journal_dir() {
+        let (_base, ws_parent, _proj, mut server) = memory_fixture();
+        let (text, is_err) = tool(
+            &mut server,
+            "journal_append",
+            json!({"text": "Completed the mob-loot audit.", "project": "Atlas", "tags": ["audit", "mobs"]}),
+        );
+        assert!(!is_err, "{text}");
+
+        let journal_dir = ws_parent.path().join(".ken-workspace/journal");
+        let entries: Vec<_> = std::fs::read_dir(&journal_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one journal file, today's");
+        let raw = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(raw.starts_with("## "), "{raw}");
+        assert!(raw.contains("Project: Atlas"), "{raw}");
+        assert!(raw.contains("Tags: audit, mobs"), "{raw}");
+        assert!(raw.contains("Completed the mob-loot audit."), "{raw}");
+    }
+
+    #[test]
+    fn memory_tools_require_a_workspace_to_be_open() {
+        // kenMemory on, but no workspace was ever registered/opened — no
+        // `last_workspace` to resolve, so both tools must fail with a clear
+        // message instead of panicking on a missing registry entry.
+        let base = tempfile::tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        settings.features.insert("workspace".into(), true.into());
+        settings.features.insert("kenMemory".into(), true.into());
+        settings.save(base.path()).unwrap();
+        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+
+        let (text, is_err) = tool(&mut server, "journal_append", json!({"text": "hi"}));
+        assert!(is_err, "{text}");
+        assert!(text.contains("No Ken workspace is open"), "{text}");
+
+        let (text, is_err) = tool(
+            &mut server,
+            "memory_write",
+            json!({"scope": "workspace", "slug": "x", "content": "y"}),
+        );
+        assert!(is_err, "{text}");
+        assert!(text.contains("No Ken workspace is open"), "{text}");
+    }
+
+    /// Cross-checked by hand against Howard Hinnant's reference algorithm at
+    /// two independently verified anchors: day 0 is the Unix epoch itself,
+    /// and day 10957 is 2000-01-01 (30 years incl. 7 leap days: 1972, 76,
+    /// 80, 84, 88, 92, 96 — 1970-01-01 + 30*365 + 7 = 10957).
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
     }
 }

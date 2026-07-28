@@ -20,6 +20,7 @@ use ken_core::knowledge_model::{self, AutoBuildTracker};
 use ken_core::model;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
 use ken_core::kenignore;
+use ken_core::memory;
 use ken_core::research;
 use ken_core::runner::{CancelToken, RunOutcome};
 use ken_core::hooks::HookListener;
@@ -172,6 +173,17 @@ struct AppState {
     /// (task 3.1 / design D4: "ingest concurrency is capped at 2 members at a
     /// time"). Shared by every `activate` scan thread — see [`IngestGate`].
     ingest_gate: Arc<IngestGate>,
+    /// ken-memory task 2.2: true while a `distill_journal` run is in flight —
+    /// mirrors `workspace_kg_running`'s single-`AtomicBool`-guard discipline,
+    /// at the workspace-journal scope instead.
+    memory_distill_running: Arc<AtomicBool>,
+    /// The most recent `distill_journal` run's proposed candidates, kept
+    /// server-side so `resolve_distill_candidate(slug, approve)` — whose own
+    /// contract (tasks.md 2.2) carries no body/description — can look up
+    /// what it's approving/dismissing by slug. Replaced wholesale by each
+    /// new `distill_journal` run; never persisted to disk (candidates are
+    /// ephemeral until approved, per D6 — approval is what makes one durable).
+    memory_distill_candidates: Arc<Mutex<Vec<memory::DistillCandidate>>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -1347,6 +1359,61 @@ fn kg_routing_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
         .unwrap_or(default)
 }
 
+/// Effective `kenMemory` flag (ken-memory task 2.4): the global-scope
+/// registry default overridden by `settings.json`'s `features` map, AND-ed
+/// with `workspace_enabled` like `federated_kg_enabled`/`kg_routing_enabled`
+/// (proposal: "Requires workspace"). Same durable-home deviation those two
+/// note: design calls this "workspace-level, requires workspace", but no
+/// workspace-manifest-scoped feature layer exists yet, so `settings.json`'s
+/// global layer is the only home. Gates every ken-memory command, the
+/// pseudo-member spin-up, and the chat injection — off means byte-identical
+/// to pre-feature behavior (spec "flag off is inert").
+fn ken_memory_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    if !workspace_enabled(app_settings) {
+        return false;
+    }
+    let default = ken_core::features::flag("kenMemory")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("kenMemory")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Display label given to the workspace pseudo-member's `Project::name`
+/// (ken-memory task 2.1) — shows up wherever a member's name flows through
+/// unchanged (route_search's `MemberInfo::name`, `search_all_projects`'
+/// hand-added roster entry below).
+const WORKSPACE_MEMORY_LABEL: &str = "Workspace Memory";
+
+/// Friendly error every ken-memory command returns when the flag is off
+/// (task 2.4 — mirrors `WORKSPACE_DISABLED_MSG`'s wording/role).
+const KEN_MEMORY_DISABLED_MSG: &str =
+    "Ken's memory is off — turn on kenMemory in Settings → Features to use it.";
+
+/// Namespace prefix for a dismissed distillation candidate's slug inside the
+/// pseudo-member's `UserState::ignored` set (see `resolve_distill_candidate`'s
+/// doc comment for why `ignored` — not a dedicated field — is the honest home
+/// available here).
+const DISMISSED_MEMORY_PREFIX: &str = "distill-dismissed:";
+
+/// The workspace pseudo-member's reserved project id, if a workspace is
+/// currently open (ken-memory task 2.1) — `None` when none is. Pure function
+/// of the open workspace's own id, independent of whether `kenMemory` is on
+/// or the pseudo-member is actually resident in `AppState::members`; callers
+/// that need residency check `guard.members.contains_key(..)`/`.get(..)`
+/// themselves. Centralizes the `memory::workspace_pseudo_member_id` call so
+/// every exclusion site (search fan-out, federation loops, profiler) derives
+/// the same id the same way.
+fn memory_pseudo_member_id(state: &AppState) -> Option<uuid::Uuid> {
+    state
+        .workspace
+        .as_ref()
+        .map(|ws| memory::workspace_pseudo_member_id(ws.ws.config.id))
+}
+
 /// Open an additional project alongside whatever is already open, without
 /// disturbing it (S9 step 6 / `workspace` change). Gated on the global
 /// `workspace` flag — off, this is a no-op error so a stray call can't grow
@@ -1648,6 +1715,103 @@ fn focus_member_inner(app: &AppHandle, state: &SharedState, id: uuid::Uuid) -> C
     Ok(())
 }
 
+/// Reverse of `kenignore::parse` (ken-memory task 2.1): render `Rule`s back
+/// to `.kenignore`-syntax lines (`Tier::Full` -> `!pattern`,
+/// `Tier::SearchOnly` -> `~pattern`, `Tier::Ignore` -> bare `pattern`). Lets
+/// `activate_memory_pseudo_member` hand `memory::workspace_builtin_rules()`
+/// to the existing `Project::kenignore_rules()`/`scan::scan` disk-read path
+/// completely unchanged — see that function's doc comment for why this file-
+/// based channel, not a new `rule_sets` parameter, is how the built-in rules
+/// reach `classify` here.
+fn render_builtin_kenignore(rules: &[kenignore::Rule]) -> String {
+    let mut out = String::from(
+        "# Auto-generated by Ken for the workspace-memory pseudo-member.\n\
+         # Regenerated every workspace open — do not hand-edit, it will be\n\
+         # overwritten. See ken_core::memory::workspace_builtin_rules().\n",
+    );
+    for r in rules {
+        let prefix = match r.tier {
+            kenignore::Tier::Full => "!",
+            kenignore::Tier::SearchOnly => "~",
+            kenignore::Tier::Ignore => "",
+        };
+        out.push_str(prefix);
+        out.push_str(&r.pattern);
+        out.push('\n');
+    }
+    out
+}
+
+/// Spin up the workspace pseudo-member's own `MemberRuntime` (ken-memory
+/// task 2.1 / design D3): one more `activate()` call, rooted at
+/// `.ken-workspace/` itself (`ws_root.join(workspace::CONFIG_DIR)`), under
+/// the deterministic reserved id `memory::workspace_pseudo_member_id(ws_id)`
+/// so reopening the same workspace always resolves to the same derived DB.
+///
+/// `.ken-workspace/` is guaranteed to already exist (a workspace can't be
+/// open without it), so the only folder created eagerly here is
+/// `.ken-workspace/.ken/` — this pseudo-project's own metadata folder, via
+/// `Project::save`, exactly like every other project has one.
+/// `memory/`/`journal/`/`tasks/` stay absent until the first write (task
+/// 2.1: "folders created lazily on first write, not on open").
+///
+/// Judgment call, recorded here rather than silently: this reuses `activate()`
+/// unchanged instead of a bespoke slim spin-up path. `activate()` is the one
+/// function that already builds a complete, correctly-wired `MemberRuntime`
+/// (engine + watcher + `search_db` + every background worker), so duplicating
+/// a parallel path risks subtle drift from it. Accepted side effects: the
+/// pseudo-member also gets a chat drawer (harmless — nothing opens a chat
+/// against it) and a passive sync engine (harmless — `.ken-workspace/` is
+/// never itself a git repo), and — like every `activate()` call — is added
+/// to the global project `Registry` and briefly becomes `AppState::focused`
+/// (the caller's later `focus_member_inner` call corrects focus back; the
+/// `Registry` entry means it *could* technically surface in a "recent
+/// projects" list outside the current workspace's own member list — not
+/// addressed here, out of this task's named exclusion list).
+fn activate_memory_pseudo_member(
+    app: &AppHandle,
+    state: &SharedState,
+    ws_root: &Path,
+    ws_id: uuid::Uuid,
+) -> CmdResult<()> {
+    let pseudo_id = memory::workspace_pseudo_member_id(ws_id);
+    let pseudo_root = ws_root.join(ken_core::workspace::CONFIG_DIR);
+
+    let project = if ken_core::project::config_path(&pseudo_root).exists() {
+        Project::open(&pseudo_root).map_err(err)?
+    } else {
+        let config = ken_core::project::ProjectConfig {
+            name: WORKSPACE_MEMORY_LABEL.to_string(),
+            id: pseudo_id,
+            excluded: Vec::new(),
+            features: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
+        };
+        let project = Project { root: pseudo_root.clone(), config };
+        project.save().map_err(err)?;
+        project
+    };
+
+    // D3's built-in tier rules (memory/ full, journal/+tasks/ search-only,
+    // workspace.json+kg.sqlite ignored), regenerated on every activation.
+    // `scan::scan`'s `rule_sets` is hardcoded to
+    // `[built_in_rule_sets(), user_rules]` with no third, per-member slot,
+    // and both `scan.rs`/`kenignore.rs` are outside this task's touch-
+    // boundary — so this writes the built-ins through the same
+    // `Project::kenignore_rules()` disk-read channel `scan::scan` already
+    // calls unmodified, via `render_builtin_kenignore` above. Best-effort:
+    // a write failure degrades this activation to "everything Full tier"
+    // (today's plain no-`.kenignore` default) rather than blocking the open.
+    let kenignore_path = pseudo_root.join(".kenignore");
+    let text = render_builtin_kenignore(&memory::workspace_builtin_rules());
+    if let Err(e) = std::fs::write(&kenignore_path, text) {
+        eprintln!("warning: failed to write workspace-memory pseudo-member .kenignore: {e}");
+    }
+
+    activate(app, state, project, false)?;
+    Ok(())
+}
+
 /// Shared open/create path (task 3.1): tear down whatever is currently open,
 /// activate resolvable members up to the resident cap (the rest stay dormant),
 /// restore focus, and record recents. Returns the initial overview so the
@@ -1693,6 +1857,35 @@ fn open_workspace_inner(
             _ => None,
         })
         .collect();
+
+    // ken-memory tasks 2.1/2.3: spin up the workspace pseudo-member and roll
+    // the journal archive when the flag resolves on. Run before the real
+    // members' activation loop below so `Registry::last_project` (which
+    // every `activate()` call overwrites — see `activate_memory_pseudo_
+    // member`'s doc comment) ends up on a real project rather than the
+    // pseudo-member's reserved id once the loop re-overwrites it; order here
+    // is purely about that side effect, not about `AppState::focused`
+    // correctness (the explicit `focus_member_inner` call at the end of this
+    // function fixes that regardless of order). Both steps are best-effort —
+    // a failure here must never fail `open_workspace`/`create_workspace`.
+    let kenmem_on = { state.lock().unwrap().app_settings.clone() };
+    if ken_memory_enabled(&kenmem_on) {
+        if let Err(e) = activate_memory_pseudo_member(app, state, &ws.root, ws.config.id) {
+            eprintln!("warning: workspace-memory pseudo-member failed to activate: {e}");
+        }
+        let roll_root = ws.root.clone();
+        std::thread::spawn(move || {
+            let today = local_date_today();
+            if let Err(e) = memory::roll_archive(&roll_root, &today) {
+                eprintln!("warning: journal archive roll failed: {e}");
+            }
+            // D6: an archive roll is also meant to *offer* distillation.
+            // Deferred — no frontend/event contract for "nudge the user to
+            // distill" exists yet in this codebase (task 2.3 asks only for
+            // the roll itself to run on open); `distill_journal` is still
+            // reachable on demand via its own command.
+        });
+    }
 
     // Activate up to the cap; the rest stay dormant (their project id + root
     // remain tracked in `WorkspaceState.ws` for lazy focus-time activation).
@@ -2052,6 +2245,25 @@ async fn search_all_projects(
                     member_name: m.name.clone(),
                     status: "invalid",
                 }),
+            }
+        }
+        // ken-memory task 2.1: the pseudo-member is deliberately never in
+        // `ws.ws.members` (kept out of the manifest/member list), so the
+        // loop above can never find it. Fold it into the FTS fan-out
+        // directly from `AppState::members` when resident — this is the one
+        // fan-out path that doesn't already reach it for free the way
+        // `route_search` does (it iterates `guard.members` directly with no
+        // filtering, so needs no change here).
+        if ken_memory_enabled(&guard.app_settings) {
+            if let Some(pseudo_id) = memory_pseudo_member_id(&guard) {
+                if let Some(rt) = guard.members.get(&pseudo_id) {
+                    actives.push((pseudo_id, WORKSPACE_MEMORY_LABEL.to_string(), rt.search_db.clone()));
+                    roster.push(AllProjectsMemberStatusDto {
+                        project_id: Some(pseudo_id.to_string()),
+                        member_name: WORKSPACE_MEMORY_LABEL.to_string(),
+                        status: "searched",
+                    });
+                }
             }
         }
         (actives, roster)
@@ -3107,6 +3319,13 @@ fn profile_project(
     let (root, excluded, resolved_id, running) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, target)?;
+        // ken-memory task 2.1 (D3): the workspace pseudo-member is excluded
+        // from profiler candidates. It's unreachable from the frontend today
+        // (never listed in `workspace_overview`), but this is the actual
+        // enforcement point, not just an absence-from-the-UI accident.
+        if Some(active.project.config.id) == memory_pseudo_member_id(&guard) {
+            return Err("the workspace-memory member can't be profiled".into());
+        }
         if !ken_core::features::effective_flag(&guard.app_settings, &active.project, "profiler") {
             return Err("profiler flag is off for this project".into());
         }
@@ -5846,6 +6065,13 @@ fn local_date_today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// `HH:MM`, local time — ken-memory task 2.2's `journal_append` caller-
+/// supplies-time param (`memory::append_journal`'s `time_hhmm`), same
+/// caller-passes-a-formatted-string discipline as `local_date_today` above.
+fn local_time_hhmm() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
+}
+
 fn local_hour() -> u32 {
     use chrono::Timelike;
     chrono::Local::now().hour()
@@ -6496,11 +6722,21 @@ fn schedule_workspace_kg_debounce(app: &AppHandle, state: &SharedState) {
 fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
     let (base_dir, running, cancel_slot, mut member_ids, enabled) = {
         let guard = state.lock().unwrap();
+        let pseudo_id = memory_pseudo_member_id(&guard);
         (
             guard.base_dir.clone(),
             guard.workspace_kg_running.clone(),
             guard.workspace_kg_cancel.clone(),
-            guard.members.keys().copied().collect::<Vec<_>>(),
+            // ken-memory task 2.1 (D3): never federated — the pseudo-
+            // member's own long-term memories get their own per-project
+            // knowledge model like any member, but that model never joins
+            // the workspace-wide KG in v1.
+            guard
+                .members
+                .keys()
+                .copied()
+                .filter(|id| Some(*id) != pseudo_id)
+                .collect::<Vec<_>>(),
             federated_kg_enabled(&guard.app_settings),
         )
     };
@@ -6635,9 +6871,13 @@ fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOver
     }
     let edges = kg.list_all_edges().map_err(err)?.len();
 
+    let pseudo_id = memory_pseudo_member_id(&guard);
     let mut members = Vec::with_capacity(guard.members.len());
     for m in guard.members.values() {
         let project_id = m.project.config.id;
+        if Some(project_id) == pseudo_id {
+            continue; // ken-memory task 2.1 (D3): never federated
+        }
         let current_watermark = m.db.knowledge_model_built_at().map_err(err)?;
         let cached = kg.get_watermark(project_id).map_err(err)?;
         let stale = cached != Some(current_watermark);
@@ -7203,6 +7443,314 @@ async fn route_search(
     Ok(report.into())
 }
 
+// ---------------------------------------------------------------------
+// ken-memory task 2.2: memory_write / journal_append / read_journal /
+// distill_journal / resolve_distill_candidate.
+// ---------------------------------------------------------------------
+
+/// Payload for the `memory-state` event (ken-memory task 2.2), mirroring
+/// `WorkspaceKgStateEvent`/`RoutedSearchStateEvent`'s tag shape
+/// (`{"state":"planning"}`, `{"state":"distilling"}`,
+/// `{"state":"ready","candidates":[...]}`, `{"state":"error","reason":"..."}`)
+/// and their "app-global, not `emit_member`" choice — a distillation run
+/// reads the whole workspace journal, with no single owning project.
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum MemoryStateEvent {
+    Planning,
+    Distilling,
+    Ready { candidates: Vec<memory::DistillCandidate> },
+    Error { reason: String },
+}
+
+/// One day's journal content, as returned by `read_journal`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalDayDto {
+    /// `YYYY-MM-DD`.
+    date: String,
+    content: String,
+}
+
+/// Create or replace a memory (ken-memory task 2.2 / design D5). `scope` is
+/// `"workspace"` (`.ken-workspace/memory/`) or `"project"` (the currently
+/// FOCUSED member's `.ken/memory/` — judgment call: the command takes no
+/// explicit `project_id`, matching how D4's context injection already scopes
+/// "project memories" to whichever member is focused, and keeping the tool
+/// surface small; a future multi-target `memory_write` could add an explicit
+/// id without breaking this contract, since "project" today unambiguously
+/// means "the focused one"). `mode` is `"create"` (slug must not exist) or
+/// `"replace"` (slug must exist) — `memory::WriteMode`'s two explicit
+/// intents, spelled out as strings at the command boundary.
+///
+/// Known gap (project scope only): `<project>/.ken/memory/` lives inside
+/// `.ken/`, which `scan.rs`'s `WalkBuilder` (`.hidden(true)`) and
+/// `watch.rs`'s `relevant_path` both hard-exclude (any path component
+/// starting with `.`) — outside this task's touch-boundary to fix. A
+/// project-scoped memory is written and immediately reflected by
+/// `list_memories`/chat injection (both read the filesystem directly, not
+/// the index), but never reaches that project's own FTS/semantic index or
+/// `ken://` search-resolved address. Only the workspace-scope tier is
+/// actually indexed (via the pseudo-member's own engine, rooted at
+/// `.ken-workspace` itself, which isn't nested under anything excluded).
+#[tauri::command]
+fn memory_write(
+    state: State<SharedState>,
+    scope: String,
+    slug: String,
+    content: String,
+    mode: String,
+) -> CmdResult<memory::Memory> {
+    let guard = state.lock().unwrap();
+    if !ken_memory_enabled(&guard.app_settings) {
+        return Err(KEN_MEMORY_DISABLED_MSG.into());
+    }
+    let write_mode = match mode.as_str() {
+        "create" => memory::WriteMode::Create,
+        "replace" => memory::WriteMode::Replace,
+        _ => return Err(format!("unknown memory write mode '{mode}' — use \"create\" or \"replace\"")),
+    };
+    let today = local_date_today();
+    let path = match scope.as_str() {
+        "workspace" => {
+            let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+            let mscope = memory::MemoryScope::Workspace { workspace_root: &ws_root };
+            memory::write_memory(mscope, &slug, &content, write_mode, &today).map_err(err)?
+        }
+        "project" => {
+            let active = member(&guard, None)?;
+            let mscope = memory::MemoryScope::Project { project_root: &active.project.root };
+            memory::write_memory(mscope, &slug, &content, write_mode, &today).map_err(err)?
+        }
+        _ => return Err(format!("unknown memory scope '{scope}' — use \"workspace\" or \"project\"")),
+    };
+    let raw = std::fs::read_to_string(&path).map_err(err)?;
+    Ok(memory::parse_memory(&slug, &raw))
+}
+
+/// Append a timestamped entry to today's journal file, creating it if absent
+/// (ken-memory task 2.2 / design D5) — the write MCP's `journal_append`
+/// delegates to the same `memory::append_journal` core once ken-mcp task 3.1
+/// lands (parallel session; not this file).
+#[tauri::command]
+fn journal_append(
+    state: State<SharedState>,
+    text: String,
+    project: Option<String>,
+    tags: Option<Vec<String>>,
+) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    if !ken_memory_enabled(&guard.app_settings) {
+        return Err(KEN_MEMORY_DISABLED_MSG.into());
+    }
+    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    memory::append_journal(
+        &ws_root,
+        &text,
+        project.as_deref(),
+        &tags.unwrap_or_default(),
+        &local_date_today(),
+        &local_time_hhmm(),
+    )
+    .map_err(err)?;
+    Ok(())
+}
+
+/// Recent journal content on demand (ken-memory task 2.2 / design D4: "the
+/// journal is NOT injected... a `read_journal(days_back?)` tool returns
+/// recent days on demand"). Walks back `days_back` calendar days (default 1
+/// = today only) from local today, checking `journal/` then
+/// `journal/archive/` for each date (spec: "archived journal stays
+/// findable") — a day with no file on either side is skipped, not an error.
+/// Most-recent-first.
+#[tauri::command]
+fn read_journal(state: State<SharedState>, days_back: Option<u32>) -> CmdResult<Vec<JournalDayDto>> {
+    let ws_root = {
+        let guard = state.lock().unwrap();
+        if !ken_memory_enabled(&guard.app_settings) {
+            return Err(KEN_MEMORY_DISABLED_MSG.into());
+        }
+        guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
+    };
+
+    let days_back = days_back.unwrap_or(1).max(1) as i64;
+    let today = chrono::Local::now().date_naive();
+    let dir = memory::journal_dir(&ws_root);
+    let archive_dir = memory::journal_archive_dir(&ws_root);
+    let mut out = Vec::new();
+    for i in 0..days_back {
+        let date = today - chrono::Duration::days(i);
+        let name = date.format("%Y-%m-%d").to_string();
+        let in_current = dir.join(format!("{name}.md"));
+        let path = if in_current.is_file() { in_current } else { archive_dir.join(format!("{name}.md")) };
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            out.push(JournalDayDto { date: name, content });
+        }
+    }
+    Ok(out)
+}
+
+/// Concatenate every current (non-archived) journal file, oldest first, each
+/// under a `## YYYY-MM-DD` heading — the "rolling window" `distill_journal`
+/// feeds `memory::compose_distill_prompt` (D6). Bounded to <= 30 days by
+/// construction: the archive roll (task 2.3) already moves anything older
+/// out of `journal/` before this ever runs, so no separate cutoff is needed
+/// here.
+fn journal_window_text(ws_root: &Path) -> String {
+    let dir = memory::journal_dir(ws_root);
+    let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    names.sort();
+    let mut out = String::new();
+    for name in names {
+        if let Ok(text) = std::fs::read_to_string(dir.join(&name)) {
+            out.push_str(&format!("## {name}\n{}\n\n", text.trim()));
+        }
+    }
+    out
+}
+
+/// Run a distillation pass over the current journal window (ken-memory task
+/// 2.2 / design D6): compose the prompt (journal window + existing workspace
+/// memory descriptions + previously-dismissed slugs, all as the dedupe
+/// guard), generate at Background priority on the local LLM — same call
+/// shape as `AppFederationLlm` — parse tolerantly, cap 5, and emit
+/// `memory-state` (`planning` → `distilling` → `ready`/`error`). Candidates
+/// are cached server-side (`AppState::memory_distill_candidates`) so
+/// `resolve_distill_candidate(slug, approve)` can look one up by slug alone,
+/// matching that command's own two-argument contract.
+#[tauri::command]
+fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    let (base_dir, ws_root, pseudo_id, running, candidates_slot) = {
+        let guard = state.lock().unwrap();
+        if !ken_memory_enabled(&guard.app_settings) {
+            return Err(KEN_MEMORY_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        (
+            guard.base_dir.clone(),
+            ws.ws.root.clone(),
+            memory::workspace_pseudo_member_id(ws.ws.config.id),
+            guard.memory_distill_running.clone(),
+            guard.memory_distill_candidates.clone(),
+        )
+    };
+    if running.swap(true, Ordering::SeqCst) {
+        return Err("a distillation run is already in progress".into());
+    }
+
+    let _ = app.emit("memory-state", MemoryStateEvent::Planning);
+    let bg_app = app.clone();
+    std::thread::spawn(move || {
+        let outcome = (|| -> Result<Vec<memory::DistillCandidate>, String> {
+            let window = journal_window_text(&ws_root);
+            let dismissed = UserState::load(&base_dir, pseudo_id).ignored;
+
+            let mut existing: Vec<(String, String)> =
+                memory::list_memories(&memory::workspace_memory_dir(&ws_root))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| (m.slug, m.description))
+                    .collect();
+            for tagged in &dismissed {
+                if let Some(slug) = tagged.strip_prefix(DISMISSED_MEMORY_PREFIX) {
+                    existing.push((slug.to_string(), "previously suggested and dismissed by the user".to_string()));
+                }
+            }
+
+            let prompt = memory::compose_distill_prompt(&window, &existing);
+            let _ = bg_app.emit("memory-state", MemoryStateEvent::Distilling);
+            let raw = ken_core::local_llm::generate_stream(
+                &prompt,
+                ken_core::local_llm::Priority::Background,
+                &mut |_tok| true,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut candidates = memory::parse_distill_candidates(&raw);
+            candidates.retain(|c| {
+                !dismissed.contains(&format!("{DISMISSED_MEMORY_PREFIX}{}", c.slug))
+            });
+            Ok(candidates)
+        })();
+
+        match outcome {
+            Ok(candidates) => {
+                *candidates_slot.lock().unwrap() = candidates.clone();
+                let _ = bg_app.emit("memory-state", MemoryStateEvent::Ready { candidates });
+            }
+            Err(reason) => {
+                let _ = bg_app.emit("memory-state", MemoryStateEvent::Error { reason });
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Approve or dismiss a distillation candidate by slug (ken-memory task 2.2
+/// / design D6). Approve writes it via `memory::write_memory` in `Create`
+/// mode at workspace scope (distillation candidates are always workspace-
+/// scope — the journal itself has no per-project home, design's Non-Goals:
+/// "per-project journals"); dismiss records the slug so `distill_journal`
+/// won't re-propose it. The command's own contract (tasks.md 2.2) is
+/// `(slug, approve)` only, so the candidate's body/description is looked up
+/// from the last `distill_journal` run's cache, not resent by the caller.
+///
+/// Judgment call on persistence: `UserState` (`ken_core::user_state`) is
+/// per-project, keyed by project id — there's no dedicated "workspace user
+/// state" store in this codebase. The honest workspace-level home available
+/// without touching `user_state.rs` (out of this task's touch-boundary) is
+/// the pseudo-member's OWN `UserState` (it already has a real project id,
+/// `memory::workspace_pseudo_member_id`), reusing its existing `ignored: BTreeSet<String>`
+/// field with a `distill-dismissed:` prefix so a dismissed candidate slug
+/// can never collide with an ignored file path (the pseudo-member has no
+/// review-issue concept of its own to ignore in the first place).
+#[tauri::command]
+fn resolve_distill_candidate(state: State<SharedState>, slug: String, approve: bool) -> CmdResult<()> {
+    let (base_dir, ws_root, pseudo_id, candidate) = {
+        let guard = state.lock().unwrap();
+        if !ken_memory_enabled(&guard.app_settings) {
+            return Err(KEN_MEMORY_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let candidate = guard
+            .memory_distill_candidates
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.slug == slug)
+            .cloned();
+        (
+            guard.base_dir.clone(),
+            ws.ws.root.clone(),
+            memory::workspace_pseudo_member_id(ws.ws.config.id),
+            candidate,
+        )
+    };
+
+    if approve {
+        let candidate = candidate.ok_or_else(|| {
+            format!("no pending distillation candidate named '{slug}' — run distill_journal again")
+        })?;
+        let mscope = memory::MemoryScope::Workspace { workspace_root: &ws_root };
+        memory::write_memory(mscope, &slug, &candidate.body, memory::WriteMode::Create, &local_date_today())
+            .map_err(err)?;
+    } else {
+        let mut us = UserState::load(&base_dir, pseudo_id);
+        us.ignore(format!("{DISMISSED_MEMORY_PREFIX}{slug}"));
+        us.save(&base_dir, pseudo_id).map_err(err)?;
+    }
+    Ok(())
+}
+
 /// The incremental-Map worker: one per open project. Loops draining the
 /// extraction queue while the local model is ready, emitting a throttled
 /// `knowledge-updated` after each merged file. Every wait is short so a newly
@@ -7537,16 +8085,46 @@ fn send_chat_message(
         }
         (had_messages, row)
     };
+    // ken-memory task 2.3: snapshot what's needed for the `## Memories`
+    // injection (project root, workspace root if open) while the guard is
+    // still held — `active`/`guard` don't outlive this block — then do the
+    // actual file reads after dropping it (lock-audit discipline: never do
+    // filesystem IO across the global lock).
+    let kenmem_ctx = ken_memory_enabled(&guard.app_settings).then(|| {
+        (
+            active.project.root.clone(),
+            guard.workspace.as_ref().map(|w| w.ws.root.clone()),
+        )
+    });
     drop(guard);
+
+    // Design D4: workspace-scope memories + the focused project's own,
+    // ordered/budgeted by `memory::build_injection`. Composed here rather
+    // than inside `chat::build_context_preamble` itself — that function
+    // lives in `ken-core/chat.rs`, outside this task's touch-boundary — so
+    // this is "extend build_context_preamble's USAGE with build_injection
+    // output", the closest available lever without editing ken-core.
+    let memories_block = kenmem_ctx.and_then(|(project_root, ws_root)| {
+        let mut mems = memory::list_memories(&memory::project_memory_dir(&project_root)).unwrap_or_default();
+        if let Some(ws_root) = ws_root {
+            mems.extend(memory::list_memories(&memory::workspace_memory_dir(&ws_root)).unwrap_or_default());
+        }
+        let block = memory::build_injection(&mems);
+        (!block.is_empty()).then_some(block)
+    });
 
     // The stored transcript keeps the user's raw text; the CLI additionally
     // gets a weak-hint preamble naming the files open on screen (when any),
     // clearly caveated as "not necessarily relevant".
     let open = open_files.unwrap_or_default();
-    let prompt = match chat::build_context_preamble(focused_file.as_deref(), &open) {
-        Some(preamble) => format!("{preamble}\n\n{text}"),
-        None => text.clone(),
-    };
+    let file_preamble = chat::build_context_preamble(focused_file.as_deref(), &open);
+    let mut prompt = text.clone();
+    if let Some(preamble) = file_preamble {
+        prompt = format!("{preamble}\n\n{prompt}");
+    }
+    if let Some(mems) = memories_block {
+        prompt = format!("{mems}\n\n{prompt}");
+    }
     engine_arc
         .send(&chat_id, &prompt, resume, row.model.as_deref())
         .map_err(err)
@@ -7978,6 +8556,8 @@ pub fn run() {
         workspace_kg_debounce_gen: Arc::new(AtomicU64::new(0)),
         workspace: None,
         ingest_gate: Arc::new(IngestGate::new(WORKSPACE_INGEST_CONCURRENCY)),
+        memory_distill_running: Arc::new(AtomicBool::new(false)),
+        memory_distill_candidates: Arc::new(Mutex::new(Vec::new())),
     }));
 
     tauri::Builder::default()
@@ -8132,6 +8712,11 @@ pub fn run() {
             record_resume,
             record_stop,
             record_cancel,
+            memory_write,
+            journal_append,
+            read_journal,
+            distill_journal,
+            resolve_distill_candidate,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Ken")

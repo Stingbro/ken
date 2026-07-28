@@ -558,6 +558,49 @@ export type WorkspaceKgState =
     }
   | { state: "unavailable"; reason: string };
 
+/** Mirrors ken-core's `Memory` (ken-memory task 1.1/2.2) — no `rename_all`
+ *  on the Rust struct, so field names pass through unchanged. `extra`
+ *  (unknown frontmatter keys, preserved on rewrite) is `#[serde(skip)]` on
+ *  the Rust side, so it never reaches the frontend. */
+export interface Memory {
+  slug: string;
+  description: string;
+  projects: string[];
+  created: string;
+  updated: string;
+  body: string;
+}
+
+/** Mirrors `JournalDayDto` — one day's journal content as returned by
+ *  `read_journal`, most-recent-first. */
+export interface JournalDay {
+  date: string;
+  content: string;
+}
+
+/** Mirrors ken-core's `DistillCandidate` (design D6) — one proposed
+ *  long-term memory awaiting approval. Always workspace-scope (the journal
+ *  has no per-project home); `sources` are journal-relative paths (e.g.
+ *  `journal/2026-07-24.md`) per `compose_distill_prompt`'s own output
+ *  contract, not full `ken://` addresses. */
+export interface DistillCandidate {
+  slug: string;
+  description: string;
+  body: string;
+  sources: string[];
+}
+
+/** Mirrors the Rust `MemoryStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape
+ *  convention as `WorkspaceKgState`/`SemanticIndexState` above. App-global
+ *  (a distillation run reads the whole workspace journal, no owning
+ *  project) — fired by `distill_journal`. */
+export type MemoryStateEvent =
+  | { state: "planning" }
+  | { state: "distilling" }
+  | { state: "ready"; candidates: DistillCandidate[] }
+  | { state: "error"; reason: string };
+
 export interface ClaudeDoctor {
   found: boolean;
   path: string | null;
@@ -1113,6 +1156,43 @@ export const api = {
    *  An empty/whitespace-only query always returns `[]` (no "list all"). */
   workspaceKgSearch: (query: string) =>
     invoke<WorkspaceKgSearchHit[]>("workspace_kg_search", { query }),
+
+  // ---- Memory (ken-memory task 4.1) ----
+  /** Create (`"create"`, slug must not exist) or replace (`"replace"`, slug
+   *  must exist) a memory at workspace scope (`.ken-workspace/memory/`) or
+   *  project scope (the focused member's `.ken/memory/`). Flag-gated on
+   *  `kenMemory`; rejects with a friendly message when the flag is off. */
+  memoryWrite: (
+    scope: "workspace" | "project",
+    slug: string,
+    content: string,
+    mode: "create" | "replace",
+  ) => invoke<Memory>("memory_write", { scope, slug, content, mode }),
+  /** Append a `## HH:MM` entry to today's journal file, creating it (and
+   *  `journal/`) if absent — how agent-desktop reports task findings back
+   *  via `ken-mcp`'s twin tool. */
+  journalAppend: (text: string, project?: string, tags?: string[]) =>
+    invoke<void>("journal_append", { text, project, tags }),
+  /** Recent journal days, most-recent-first, checking `journal/archive/` too
+   *  (spec: "archived journal stays findable"). `daysBack` omitted = today
+   *  only; a day with no file on either side is skipped, not an error. */
+  readJournal: (daysBack?: number) =>
+    invoke<JournalDay[]>("read_journal", { daysBack }),
+  /** Kick off a distillation pass over the current journal window. Returns
+   *  as soon as the background thread starts; progress/outcome arrive via
+   *  `onMemoryState` (`planning` → `distilling` → `ready`/`error`).
+   *  Rejects if a run is already in progress. */
+  distillJournal: () => invoke<void>("distill_journal"),
+  /** Approve (writes the candidate via `memoryWrite` in create mode, always
+   *  workspace scope) or dismiss (records the slug so it isn't re-proposed)
+   *  a distillation candidate by slug — looked up from the last
+   *  `distillJournal` run's server-side cache. */
+  resolveDistillCandidate: (slug: string, approve: boolean) =>
+    invoke<void>("resolve_distill_candidate", { slug, approve }),
+  /** `memory-state`: `planning` → `distilling` → `ready` (candidates) |
+   *  `error` (reason). App-global like `onWorkspaceKgState`. */
+  onMemoryState: (fn: (ev: MemoryStateEvent) => void): Promise<UnlistenFn> =>
+    listen<MemoryStateEvent>("memory-state", (e) => fn(e.payload)),
 
   listChats: () => invoke<ChatRow[]>("list_chats"),
   chatTranscript: (chatId: string) =>

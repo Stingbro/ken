@@ -72,6 +72,16 @@ pub const FLAGS: &[FlagDef] = &[
                       applies — every result cited with a stable address. \
                       Requires the workspace flag.",
     },
+    FlagDef {
+        name: "kenMemory",
+        scope: FlagScope::Workspace,
+        default: false,
+        description: "Ken's own working memory: long-term memory files, a \
+                      daily journal, and an approval-gated promotion pass, \
+                      indexed by a reserved workspace pseudo-member and \
+                      injected into chat context. Requires the workspace \
+                      flag.",
+    },
 ];
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
@@ -133,7 +143,7 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 5);
+        assert_eq!(FLAGS.len(), 6);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
         let profiler = flag("profiler").expect("profiler flag registered");
@@ -145,6 +155,9 @@ mod tests {
         let kg_routing = flag("kgRouting").expect("kgRouting flag registered");
         assert_eq!(kg_routing.scope, FlagScope::Workspace);
         assert!(!kg_routing.default);
+        let ken_memory = flag("kenMemory").expect("kenMemory flag registered");
+        assert_eq!(ken_memory.scope, FlagScope::Workspace);
+        assert!(!ken_memory.default);
     }
 
     #[test]
