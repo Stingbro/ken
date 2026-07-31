@@ -10,6 +10,7 @@ import {
   reconcile,
   type TranscriptEntry,
 } from "./chatEcho";
+import { parseQuestionPayload } from "./chatQuestion";
 import { app } from "./app.svelte";
 
 class ChatsStore {
@@ -115,6 +116,34 @@ class ChatsStore {
       // The send failed: pull the pending echo and show why, so the message
       // doesn't sit there looking sent.
       this.transcript = dropPending(this.transcript, tempId);
+      this.sendError = String(e);
+    }
+  }
+
+  /** Answer a pending AskUserQuestion card. Merges the answers into the local
+   *  transcript entry first so the card flips to answered instantly; the
+   *  backend re-emits the same message id with the authoritative content. */
+  async answerQuestion(messageId: number, answers: Record<string, string>) {
+    if (!this.activeId) return;
+    this.sendError = null;
+    const chatId = this.activeId;
+    const i = this.transcript.findIndex((m) => m.id === messageId);
+    if (i < 0) return;
+    const before = this.transcript[i];
+    const payload = parseQuestionPayload(before.content);
+    if (payload) {
+      const merged = { ...payload, answers: { ...(payload.answers ?? {}), ...answers } };
+      this.transcript = this.transcript.toSpliced(i, 1, {
+        ...before,
+        content: JSON.stringify(merged),
+      });
+    }
+    try {
+      await api.answerChatQuestion(chatId, messageId, answers);
+    } catch (e) {
+      // Put the unanswered card back so the user can retry.
+      const j = this.transcript.findIndex((m) => m.id === messageId);
+      if (j >= 0) this.transcript = this.transcript.toSpliced(j, 1, before);
       this.sendError = String(e);
     }
   }

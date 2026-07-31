@@ -66,6 +66,22 @@ describe("chat optimistic echo", () => {
     expect(t[1].content).toBe("different");
   });
 
+  it("replaces an existing message when the same id arrives with new content", () => {
+    let t = reconcile([], real(7, "question", '{"answers":null}'));
+    t = reconcile(t, real(7, "question", '{"answers":{"Q":"A"}}'));
+    expect(t).toHaveLength(1);
+    expect(t[0].content).toBe('{"answers":{"Q":"A"}}');
+  });
+
+  it("replaces in place, preserving order", () => {
+    let t = reconcile([], real(1, "user", "hi"));
+    t = reconcile(t, real(2, "question", "pending"));
+    t = reconcile(t, real(3, "assistant", "later"));
+    t = reconcile(t, real(2, "question", "answered"));
+    expect(t.map((m) => m.id)).toEqual([1, 2, 3]);
+    expect(t[1].content).toBe("answered");
+  });
+
   it("drops a pending message by temp id (send failure)", () => {
     const tid = nextTempId();
     const t = dropPending([optimisticUserMessage("c1", "oops", 1, tid)], tid);

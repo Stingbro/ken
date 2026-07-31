@@ -264,7 +264,7 @@ export const CHAT_MODELS: { label: string; value: string | null }[] = [
 export interface ChatMessage {
   id: number;
   chatId: string;
-  role: "user" | "assistant" | "activity" | "divider";
+  role: "user" | "assistant" | "activity" | "question" | "divider";
   content: string;
   createdAt: number;
 }
@@ -662,6 +662,11 @@ export const api = {
     focusedFile: string | null,
   ) =>
     invoke<void>("send_chat_message", { chatId, text, openFiles, focusedFile }),
+  answerChatQuestion: (
+    chatId: string,
+    messageId: number,
+    answers: Record<string, string>,
+  ) => invoke<void>("answer_chat_question", { chatId, messageId, answers }),
   renameChat: (chatId: string, title: string) =>
     invoke<void>("rename_chat", { chatId, title }),
   setChatPinned: (chatId: string, pinned: boolean) =>

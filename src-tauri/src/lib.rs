@@ -354,6 +354,19 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
                             created_at: now,
                         });
                     }
+                    ChatUpdate::Question { chat_id, payload } => {
+                        let id = db
+                            .append_chat_message(&chat_id, "question", &payload, now)
+                            .unwrap_or(0);
+                        let _ = db.touch_chat(&chat_id, now);
+                        let _ = chat_app.emit("chat-message", ChatMessage {
+                            id,
+                            chat_id,
+                            role: "question".into(),
+                            content: payload,
+                            created_at: now,
+                        });
+                    }
                     ChatUpdate::Status { chat_id, status, detail } => {
                         let _ = db.set_chat_field(&chat_id, ChatField::Status, &status);
                         if let Some(d) = detail {
@@ -4580,6 +4593,72 @@ fn send_chat_message(
         .map_err(err)
 }
 
+/// Answer a pending AskUserQuestion card. `answers` is keyed by the exact
+/// question text; a multi-select answer is a comma-separated list of labels and
+/// a free-text "Other" answer is just the typed string.
+#[tauri::command]
+fn answer_chat_question(
+    app: AppHandle,
+    state: State<SharedState>,
+    chat_id: String,
+    message_id: i64,
+    answers: std::collections::HashMap<String, String>,
+) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let engine_arc = active
+        .chat_engine
+        .as_ref()
+        .ok_or(ken_core::runner::MISSING_CLAUDE_HELP)?
+        .clone();
+
+    let msg = active
+        .chat_db
+        .lock()
+        .unwrap()
+        .chat_messages(&chat_id)
+        .map_err(err)?
+        .into_iter()
+        .find(|m| m.id == message_id)
+        .ok_or("question not found")?;
+    if msg.role != "question" {
+        return Err("that message is not a question".into());
+    }
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&msg.content).map_err(|e| format!("bad question payload: {e}"))?;
+    // A second answer would be written to a request the CLI already consumed.
+    if payload.get("answers").is_some_and(|a| !a.is_null()) {
+        return Err("this question has already been answered".into());
+    }
+    let request_id = payload["requestId"].as_str().unwrap_or_default().to_string();
+    let tool_use_id = payload["toolUseId"].as_str().unwrap_or_default().to_string();
+    let questions = payload["questions"].clone();
+    let answers = serde_json::to_value(&answers).map_err(err)?;
+
+    engine_arc
+        .answer_question(&chat_id, &request_id, &tool_use_id, questions, answers.clone())
+        .map_err(err)?;
+
+    let now = engine::now_epoch();
+    payload["answers"] = answers;
+    let content = payload.to_string();
+    let mut db = active.chat_db.lock().unwrap();
+    db.update_chat_message_content(message_id, &content).map_err(err)?;
+    let _ = app.emit("chat-message", ChatMessage {
+        id: message_id,
+        chat_id: chat_id.clone(),
+        role: "question".into(),
+        content,
+        created_at: msg.created_at,
+    });
+    let _ = db.set_chat_field(&chat_id, ChatField::Status, "working");
+    let _ = db.touch_chat(&chat_id, now);
+    if let Ok(Some(row)) = db.get_chat(&chat_id) {
+        let _ = app.emit("chat-updated", row);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn rename_chat(app: AppHandle, state: State<SharedState>, chat_id: String, title: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
@@ -5108,6 +5187,7 @@ pub fn run() {
             chat_transcript,
             create_chat,
             send_chat_message,
+            answer_chat_question,
             rename_chat,
             set_chat_pinned,
             set_chat_model,

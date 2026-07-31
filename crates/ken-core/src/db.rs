@@ -1263,6 +1263,16 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Rewrite one message's content in place (a `question` row gaining its
+    /// answers, so a transcript reload shows the choice already made).
+    pub fn update_chat_message_content(&self, message_id: i64, content: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET content = ?2 WHERE id = ?1",
+            params![message_id, content],
+        )?;
+        Ok(())
+    }
+
     pub fn chat_messages(&self, chat_id: &str) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, chat_id, role, content, created_at
@@ -2059,7 +2069,7 @@ pub struct ReviewItemRow {
 pub struct ChatMessage {
     pub id: i64,
     pub chat_id: String,
-    /// `user` | `assistant` | `activity` | `divider`
+    /// `user` | `assistant` | `activity` | `divider` | `question`
     pub role: String,
     pub content: String,
     pub created_at: i64,
@@ -3441,6 +3451,36 @@ mod tests {
 
         db.set_chat_flag("sess-1", ChatFlag::Archived, true).unwrap();
         assert_eq!(db.list_chats().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn question_message_content_updates_in_place() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_chat(&ChatRow {
+            id: "q-1".into(),
+            title: "Questions".into(),
+            kind: "user".into(),
+            pinned: false,
+            status: "done".into(),
+            created_at: 1,
+            last_active_at: 1,
+            archived: false,
+            model: None,
+        })
+        .unwrap();
+        let id = db
+            .append_chat_message("q-1", "question", r#"{"requestId":"r1"}"#, 2)
+            .unwrap();
+        let other = db.append_chat_message("q-1", "assistant", "hi", 3).unwrap();
+
+        db.update_chat_message_content(id, r#"{"requestId":"r1","answers":{"Color?":"Blue"}}"#)
+            .unwrap();
+        let msgs = db.chat_messages("q-1").unwrap();
+        let q = msgs.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(q.role, "question");
+        assert!(q.content.contains("\"answers\""));
+        // Only the targeted row changes.
+        assert_eq!(msgs.iter().find(|m| m.id == other).unwrap().content, "hi");
     }
 
     #[test]
