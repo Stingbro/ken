@@ -371,6 +371,23 @@
     </div>
 
     <div class="card">
+      <div class="card-title">Files list</div>
+      <div class="row">
+        <label class="radio">
+          <input
+            type="checkbox"
+            checked={app.followOpen}
+            onchange={(e) => app.setFollowOpen(e.currentTarget.checked)}
+          />
+          Highlight the open file in the files list
+        </label>
+      </div>
+      <p class="note">
+        The folder tree follows and expands to whichever file is open.
+      </p>
+    </div>
+
+    <div class="card">
       <div class="card-title">Offline models</div>
       <p class="note">These run on your Mac — nothing you say or store leaves it.</p>
       {#if modelsLoading}

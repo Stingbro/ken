@@ -34,8 +34,11 @@ import {
   loadSidebarWidth,
   saveSidebarWidth,
 } from "./sidebar";
+import { loadFollowOpen, saveFollowOpen } from "./followOpen";
 import {
+  closeAll as reduceCloseAll,
   closeOthers as reduceCloseOthers,
+  closeRight as reduceCloseRight,
   closeTab as reduceCloseTab,
   makePersistent as reduceMakePersistent,
   openTab as reduceOpenTab,
@@ -75,6 +78,10 @@ class AppStore {
 
   /** Files sidebar width in px — a window preference, so it spans projects. */
   sidebarWidth = $state(loadSidebarWidth());
+
+  /** Whether the Files tree follows the open file (expands + scrolls to it as
+   *  tabs change). A window preference, so it spans projects. */
+  followOpen = $state(loadFollowOpen());
 
   /** Chat drawer width in px — a window preference, so it spans projects. */
   chatWidth = $state(loadChatWidth());
@@ -165,6 +172,16 @@ class AppStore {
       this.unread = this.unread.filter((p) => p !== relPath);
     }
     await api.markSeen(relPath).catch(() => {});
+  }
+
+  /** Mark a whole folder's files seen ("Mark folder as viewed"). Clears the
+   *  subtree optimistically so the tree settles before the round-trip. */
+  async markFolderSeen(prefix: string) {
+    const under = prefix + "/";
+    this.unread = this.unread.filter(
+      (p) => p !== prefix && !p.startsWith(under),
+    );
+    await api.markSeenUnder(prefix).catch(() => {});
   }
 
   /** Clear every unread file at once ("Mark all as viewed"). */
@@ -340,11 +357,15 @@ class AppStore {
     this.applyTabState(reduceOpenTab({ tabs: this.fileTabs, active: this.activeTab }, path, persistent));
     this.recents = recordRecent(this.recents, path);
     if (this.project) saveRecents(this.project.id, this.recents);
+    // Reveal the path we were asked to open, not `activeTab` — the reducer owns
+    // which tab ends up active and could in principle land elsewhere.
+    if (this.followOpen) this.reveal(path);
   }
 
   activateTab(path: string) {
     this.activeTab = path;
     this.persistTabs();
+    if (this.followOpen) this.reveal(path);
   }
 
   closeTab(path: string) {
@@ -353,6 +374,14 @@ class AppStore {
 
   closeOtherTabs(path: string) {
     this.applyTabState(reduceCloseOthers({ tabs: this.fileTabs, active: this.activeTab }, path));
+  }
+
+  closeTabsToRight(path: string) {
+    this.applyTabState(reduceCloseRight({ tabs: this.fileTabs, active: this.activeTab }, path));
+  }
+
+  closeAllTabs() {
+    this.applyTabState(reduceCloseAll({ tabs: this.fileTabs, active: this.activeTab }));
   }
 
   makeTabPersistent(path: string) {
@@ -390,6 +419,12 @@ class AppStore {
    *  localStorage on every frame. */
   commitSidebarWidth() {
     saveSidebarWidth(this.sidebarWidth);
+  }
+
+  /** Toggle "files list follows the open file". */
+  setFollowOpen(value: boolean) {
+    this.followOpen = value;
+    saveFollowOpen(value);
   }
 
   // ── Chat drawer ───────────────────────────────────────────────────────

@@ -3415,6 +3415,20 @@ fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     Ok(())
 }
 
+/// Mark every indexed file under one folder seen ("Mark folder as viewed").
+/// `rel_path` is the folder; files directly at that path or beneath it count.
+#[tauri::command]
+fn mark_seen_under(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let files = active.db.list_files().map_err(err)?;
+    let (base, id, mut us) = load_user_state(&guard)?;
+    if us.mark_seen_under(&rel_path, &index_versions(&files)) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(())
+}
+
 /// Mark every currently-unread file seen ("Mark all as viewed").
 #[tauri::command]
 fn mark_all_seen(state: State<SharedState>) -> CmdResult<()> {
@@ -5193,6 +5207,7 @@ pub fn run() {
             list_ignored,
             unread_files,
             mark_seen,
+            mark_seen_under,
             mark_all_seen,
             sync_status,
             set_sync_auto,

@@ -620,6 +620,9 @@ export const api = {
   unreadFiles: () => invoke<string[]>("unread_files"),
   /// Record a file as seen at its current version (on open / "Mark as viewed").
   markSeen: (relPath: string) => invoke<void>("mark_seen", { relPath }),
+  /// Mark every indexed file under one folder seen.
+  markSeenUnder: (relPath: string) =>
+    invoke<void>("mark_seen_under", { relPath }),
   /// Mark every currently-unread file seen.
   markAllSeen: () => invoke<void>("mark_all_seen"),
   syncStatus: () => invoke<SyncStatus>("sync_status"),

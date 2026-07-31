@@ -153,6 +153,23 @@ impl UserState {
         (self.seen.clone(), self.baselined) != before
     }
 
+    /// Mark every currently-indexed file under `prefix` seen (the folder-level
+    /// "mark as viewed"). `prefix` is a project-relative folder path; a file
+    /// matches when it IS the prefix or sits beneath `prefix/`, so a sibling
+    /// folder sharing a name stem (`notes-old/`) is never swept in. Unlike
+    /// `mark_all_seen` this doesn't touch `baselined` — a partial sweep is not
+    /// a clean whole-project snapshot. Returns whether anything changed.
+    pub fn mark_seen_under(&mut self, prefix: &str, index: &[(String, FileVersion)]) -> bool {
+        let under = prefix.to_string() + "/";
+        let mut changed = false;
+        for (rel, ver) in index {
+            if rel == prefix || rel.starts_with(&under) {
+                changed |= self.mark_seen(rel.clone(), *ver);
+            }
+        }
+        changed
+    }
+
     /// Replace `seen` with exactly the index's current versions. Dropping files
     /// no longer indexed keeps the map from growing unbounded with deletions.
     fn snapshot(&mut self, index: &[(String, FileVersion)]) {
@@ -386,6 +403,37 @@ mod tests {
         assert!(state.mark_all_seen(&now));
         assert!(state.unread(&now).is_empty());
         assert!(state.baselined);
+    }
+
+    #[test]
+    fn mark_seen_under_clears_only_that_folder() {
+        let mut state = UserState::default();
+        state.baseline(&idx(&[("notes/a.md", 1, 100)]));
+        let now = idx(&[
+            ("notes/a.md", 1, 150),
+            ("notes/sub/b.md", 2, 200),
+            // Same stem, different folder — must NOT be swept in.
+            ("notes-old/c.md", 3, 300),
+            ("other.md", 4, 400),
+        ]);
+        assert_eq!(state.unread(&now).len(), 4);
+        assert!(state.mark_seen_under("notes", &now));
+        assert_eq!(
+            state.unread(&now),
+            vec!["notes-old/c.md".to_string(), "other.md".to_string()]
+        );
+        // Re-marking the same versions is a no-op.
+        assert!(!state.mark_seen_under("notes", &now));
+    }
+
+    #[test]
+    fn mark_seen_under_matches_the_prefix_itself() {
+        // A file path passed as the prefix marks just that file.
+        let mut state = UserState::default();
+        state.baseline(&idx(&[("a.md", 1, 100)]));
+        let now = idx(&[("a.md", 1, 150), ("b.md", 2, 200)]);
+        assert!(state.mark_seen_under("a.md", &now));
+        assert_eq!(state.unread(&now), vec!["b.md".to_string()]);
     }
 
     #[test]

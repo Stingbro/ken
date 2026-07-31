@@ -59,6 +59,12 @@
     const y = e.clientY;
     const fav = app.isFavorite(node.relPath);
     const kind = isFolder ? "folder" : "file";
+    // A folder is worth marking only when something inside it is still unread.
+    const hasUnread =
+      isFolder &&
+      app.unread.some(
+        (p) => p === node.relPath || p.startsWith(node.relPath + "/"),
+      );
     const items: MenuEntry[] = [
       {
         label: isFolder ? "Expand" : "Open",
@@ -121,6 +127,16 @@
               label: "Mark as viewed",
               icon: Check,
               onSelect: () => void app.markSeen(node.relPath),
+            },
+          ] as MenuEntry[])
+        : []),
+      ...(hasUnread
+        ? ([
+            "separator",
+            {
+              label: "Mark folder as viewed",
+              icon: CheckCheck,
+              onSelect: () => void app.markFolderSeen(node.relPath),
             },
           ] as MenuEntry[])
         : []),
