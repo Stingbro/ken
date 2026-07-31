@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dedupedDocName, siblingNames, validateName } from "./naming";
+import { dedupedDocName, dedupedLinkName, siblingNames, validateName } from "./naming";
 
 describe("sibling listing", () => {
   const paths = ["a.md", "Meetings/notes.md", "Meetings/2026", "Meetings/2026/deep.md", "Research"];
@@ -34,5 +34,18 @@ describe("default document name", () => {
   it("counts up past collisions (space + counter, per spec)", () => {
     expect(dedupedDocName(["Untitled.md"])).toBe("Untitled 2.md");
     expect(dedupedDocName(["Untitled.md", "Untitled 2.md"])).toBe("Untitled 3.md");
+  });
+});
+
+describe("default link name", () => {
+  it("starts at Untitled.url", () => {
+    expect(dedupedLinkName([])).toBe("Untitled.url");
+  });
+  it("counts up past collisions (space + counter, per spec)", () => {
+    expect(dedupedLinkName(["Untitled.url"])).toBe("Untitled 2.url");
+    expect(dedupedLinkName(["Untitled.url", "Untitled 2.url"])).toBe("Untitled 3.url");
+  });
+  it("counts only its own extension — documents don't crowd it out", () => {
+    expect(dedupedLinkName(["Untitled.md"])).toBe("Untitled.url");
   });
 });

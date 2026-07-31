@@ -1156,6 +1156,33 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
         .map_err(err)
 }
 
+/// Show a file in Finder/Explorer (selected, not opened). Same shape as
+/// `open_external`: the path is resolved against the project root here so the
+/// frontend never handles an absolute path.
+#[tauri::command]
+fn reveal_in_folder(state: State<SharedState>, app: AppHandle, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .reveal_item_in_dir(abs)
+        .map_err(err)
+}
+
+/// Open a web link in the system browser (e.g. the target of a `.url` file).
+/// Routed through Rust like `record_open_settings`, so validate the scheme
+/// server-side: only http(s) may open — never `file:` or an app scheme that
+/// would launch something local from indexed content.
+#[tauri::command]
+fn open_web_url(app: AppHandle, url: String) -> CmdResult<()> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("refused to open a non-web URL".into());
+    }
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_url(url, None::<&str>)
+        .map_err(err)
+}
+
 // ===========================================================================
 // Record: on-device meeting recorder session, commands, and throttled events.
 // The pure logic (state machine, downmix, resampler, WAV wrappers, merge) lives
@@ -5132,6 +5159,8 @@ pub fn run() {
             import_commit,
             import_cancel,
             open_external,
+            reveal_in_folder,
+            open_web_url,
             file_mtime,
             media_src,
             video_transcript,

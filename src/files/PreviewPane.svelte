@@ -8,6 +8,7 @@
   import PptxPreview from "./previews/PptxPreview.svelte";
   import HtmlPreview from "./previews/HtmlPreview.svelte";
   import VideoPreview from "./previews/VideoPreview.svelte";
+  import UrlPreview from "./previews/UrlPreview.svelte";
   import FallbackPreview from "./previews/FallbackPreview.svelte";
   import TooLargeNotice from "./previews/TooLargeNotice.svelte";
   import { isPreviewTooLarge } from "./previews/sizeGate";
@@ -17,7 +18,8 @@
     $props();
 
   // Some formats are routed by extension because the backend kind is coarse
-  // (e.g. .ipynb indexes as "binary", .html/.htm as "code", videos as "binary").
+  // (e.g. .ipynb indexes as "binary", .html/.htm as "code", videos as "binary")
+  // and because a stale index may still call a .url shortcut "binary".
   const ext = $derived(relPath.split(".").pop()?.toLowerCase() ?? "");
 
   const VIDEO_EXTS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi"]);
@@ -29,6 +31,8 @@
 
 {#if tooLarge}
   <TooLargeNotice {relPath} size={meta.size} />
+{:else if ext === "url"}
+  <UrlPreview {relPath} />
 {:else if ext === "ipynb"}
   <IpynbPreview {relPath} />
 {:else if VIDEO_EXTS.has(ext)}

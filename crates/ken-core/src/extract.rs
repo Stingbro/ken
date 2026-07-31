@@ -28,6 +28,9 @@ pub enum FileKind {
     Ipynb,
     Image,
     Video,
+    /// A Windows `.url` internet shortcut — an INI-ish stub whose only real
+    /// content is the link it points at.
+    Url,
     Binary,
 }
 
@@ -44,6 +47,7 @@ impl FileKind {
             FileKind::Ipynb => "ipynb",
             FileKind::Image => "image",
             FileKind::Video => "video",
+            FileKind::Url => "url",
             FileKind::Binary => "binary",
         }
     }
@@ -73,6 +77,7 @@ impl FileKind {
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" | "tif"
             | "svg" => FileKind::Image,
             "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => FileKind::Video,
+            "url" => FileKind::Url,
             _ => FileKind::Binary,
         }
     }
@@ -119,6 +124,7 @@ pub fn extract(path: &Path) -> Result<Extracted> {
         FileKind::Pdf => extract_pdf(path),
         FileKind::Ipynb => extract_ipynb(path),
         FileKind::Image => extract_image(path),
+        FileKind::Url => extract_url(path),
         // Handled above, before the size cap.
         FileKind::Video => Ok(Extracted::default()),
         FileKind::Binary => Ok(Extracted::default()),
@@ -130,6 +136,26 @@ fn extract_plain(path: &Path) -> Result<Extracted> {
     Ok(Extracted {
         text: String::from_utf8_lossy(&bytes).into_owned(),
         title: None,
+    })
+}
+
+/// A `.url` shortcut's searchable content is the URL it points at — the rest of
+/// the file (`[InternetShortcut]`, icon indexes) is noise no one searches for.
+fn extract_url(path: &Path) -> Result<Extracted> {
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    Ok(Extracted {
+        text: parse_internet_shortcut(&String::from_utf8_lossy(&bytes)).unwrap_or_default(),
+        title: None,
+    })
+}
+
+/// The value of the first `URL=` key in an `.url` file. Case-insensitive on the
+/// key (writers vary) and tolerant of surrounding whitespace; returns None when
+/// the file carries no link at all.
+pub fn parse_internet_shortcut(raw: &str) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("url").then(|| value.trim().to_string())
     })
 }
 
@@ -374,6 +400,40 @@ mod tests {
         // extract_plain returns the file verbatim (no VTT stripping here).
         assert!(out.text.contains("Budget approved by Priya"), "got: {}", out.text);
         assert!(out.text.contains("WEBVTT"));
+    }
+
+    #[test]
+    fn url_shortcut_indexes_its_link() {
+        assert_eq!(FileKind::from_path(Path::new("l/site.url")), FileKind::Url);
+        assert_eq!(FileKind::from_path(Path::new("l/site.URL")), FileKind::Url);
+        assert_eq!(FileKind::Url.as_str(), "url");
+        assert!(FileKind::Url.has_content());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vendor.url");
+        std::fs::write(
+            &path,
+            "[InternetShortcut]\r\nURL=https://langdonsoft.example/quotes\r\nIconIndex=0\r\n",
+        )
+        .unwrap();
+        let out = extract(&path).unwrap();
+        // Only the link — the INI scaffolding isn't worth indexing.
+        assert_eq!(out.text, "https://langdonsoft.example/quotes");
+    }
+
+    #[test]
+    fn url_parsing_is_tolerant_and_optional() {
+        assert_eq!(
+            parse_internet_shortcut("[InternetShortcut]\nurl = https://x.example/a \n").as_deref(),
+            Some("https://x.example/a")
+        );
+        // First URL key wins; a file with none extracts to nothing rather than
+        // failing (a malformed shortcut is still a valid, listable file).
+        assert_eq!(
+            parse_internet_shortcut("URL=https://a.example\nURL=https://b.example").as_deref(),
+            Some("https://a.example")
+        );
+        assert_eq!(parse_internet_shortcut("[InternetShortcut]\nIconIndex=0\n"), None);
     }
 
     #[test]

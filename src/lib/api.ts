@@ -543,6 +543,12 @@ export const api = {
   createDocument: (relPath: string) =>
     invoke<string>("create_document", { relPath }),
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
+  /// Show a file in Finder/Explorer rather than opening it.
+  revealInFolder: (relPath: string) =>
+    invoke<void>("reveal_in_folder", { relPath }),
+  /// Open an http(s) link in the system browser (anything else is refused by
+  /// the backend).
+  openWebUrl: (url: string) => invoke<void>("open_web_url", { url }),
 
   /// Copy an external file into a staging area so it can be previewed pre-placement.
   importBegin: (srcPath: string) =>
