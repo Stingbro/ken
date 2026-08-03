@@ -345,7 +345,7 @@ impl ProjectKind {
 /// One extension-pattern → chunking-strategy entry, e.g. `*.rs` → code mode.
 /// `ProjectProfile::chunking_for` looks these up by the target path's
 /// extension.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PatternProfile {
     /// `"*.<ext>"` — the only pattern shape `chunking_for` currently
     /// matches. Stored as a string (not just the bare extension) so a

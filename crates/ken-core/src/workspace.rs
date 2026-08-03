@@ -390,7 +390,9 @@ mod tests {
     #[test]
     fn discovery_excludes_junk_and_tags_existing_vs_new() {
         let dir = tempdir().unwrap();
-        // An already-adopted Ken project.
+        // An already-adopted Ken project. (`Project::create` adopts an
+        // existing folder — it never mkdirs — so the folder comes first.)
+        fs::create_dir_all(dir.path().join("existing")).unwrap();
         Project::create(&dir.path().join("existing"), "Existing").unwrap();
         // A plain repo, not yet a Ken project.
         fs::create_dir_all(dir.path().join("repo")).unwrap();
