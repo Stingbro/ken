@@ -52,6 +52,7 @@ export type Screen =
   | "files"
   | "review"
   | "ingests"
+  | "tasks"
   | "map"
   | "record"
   | "timeline"

@@ -82,6 +82,26 @@ pub const FLAGS: &[FlagDef] = &[
                       injected into chat context. Requires the workspace \
                       flag.",
     },
+    FlagDef {
+        name: "kenTasks",
+        scope: FlagScope::Workspace,
+        default: false,
+        description: "A shared task board (Kanban + a daily view) backed by \
+                      markdown files in the workspace and per-project \
+                      homes, with overarching goals, drag-drop status, and \
+                      MCP claim/complete tools for agent handoff. Requires \
+                      the workspace flag.",
+    },
+    FlagDef {
+        name: "kenFamilies",
+        scope: FlagScope::Global,
+        default: false,
+        description: "Team collaboration over a shared git repo: clone, \
+                      poll, and push a templated family repo that delivers \
+                      tasks and messages to teammates' inboxes and keeps \
+                      each member's board visible to the team. Uses the \
+                      system git CLI; no accounts, no server.",
+    },
 ];
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
@@ -143,7 +163,7 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 6);
+        assert_eq!(FLAGS.len(), 8);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
         let profiler = flag("profiler").expect("profiler flag registered");
@@ -158,6 +178,12 @@ mod tests {
         let ken_memory = flag("kenMemory").expect("kenMemory flag registered");
         assert_eq!(ken_memory.scope, FlagScope::Workspace);
         assert!(!ken_memory.default);
+        let ken_tasks = flag("kenTasks").expect("kenTasks flag registered");
+        assert_eq!(ken_tasks.scope, FlagScope::Workspace);
+        assert!(!ken_tasks.default);
+        let ken_families = flag("kenFamilies").expect("kenFamilies flag registered");
+        assert_eq!(ken_families.scope, FlagScope::Global);
+        assert!(!ken_families.default);
     }
 
     #[test]

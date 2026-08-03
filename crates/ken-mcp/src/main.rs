@@ -16,14 +16,17 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use ken_core::db::Db;
+use ken_core::family::{self, FamilyManifest, InboxKind, InboxTaskPayload, Lane, NewInboxItem};
+use ken_core::family_sync::{self, ConnectionState, GitTransport, PendingWrite, SyncEngine, SystemGit};
 use ken_core::features;
 use ken_core::memory;
 use ken_core::profiler::{self, ProjectProfile};
 use ken_core::project::Project;
-use ken_core::registry::{self, Registry};
+use ken_core::registry::{self, Registry, RegistryEntry};
 use ken_core::routing::{self, MemberHits, MemberInfo, MemberStatus, RouteReason};
 use ken_core::search::Source;
 use ken_core::settings::AppSettings;
+use ken_core::tasks;
 use ken_core::workspace_kg_db::WorkspaceKgDb;
 
 /// The protocol revision we implement. Newer revisions we know to be
@@ -126,7 +129,9 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
             match name {
                 "search_knowledge" | "read_document" | "list_documents" | "list_projects"
                 | "kg_search" | "semantic_search" | "route_query"
-                | "memory_write" | "journal_append" => {
+                | "memory_write" | "journal_append"
+                | "task_create" | "task_list" | "task_update" | "task_complete"
+                | "family_list" | "family_inbox" | "family_send" => {
                     let outcome = call_tool(server, name, &args);
                     rpc_result(&id, tool_content(outcome))
                 }
@@ -372,6 +377,197 @@ concerns and free-form tags.",
         }));
     }
 
+    // ken-tasks (task 3.1) adds the four task-lifecycle tools, gated on
+    // `kenTasks` the same way the kenMemory block above gates its two tools
+    // — absent from the list entirely when the flag is off (spec.md
+    // "Flag-scoped activation": "register no task tools on either
+    // surface").
+    if ken_tasks_enabled(&AppSettings::load(&server.base_dir)) {
+        let patch_fields_schema = json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "status": { "type": "string", "enum": ["backlog", "todo", "doing", "review", "done"] },
+                "kind": { "type": "string", "enum": ["human", "ai"] },
+                "assignee": { "type": "string", "description": "Who owns this task. Empty string clears it." },
+                "project": { "type": "string", "description": "Ken project name this task concerns." },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "due": { "type": "string", "description": "Due date, e.g. YYYY-MM-DD." },
+                "goal": { "type": "string", "description": "id of a goal (from tasks/goals/) this task tags." },
+                "board": { "type": "string", "enum": ["main", "daily"] }
+            }
+        });
+        tools.push(json!({
+            "name": "task_create",
+            "description": "Create a task on Ken's task board — a markdown \
+file with frontmatter, filed in the workspace's shared tasks home by \
+default. Status defaults to \"backlog\" (the intake column) and kind to \
+\"human\" when not given in `fields`. Pass `home` as a registered Ken \
+project name to file the task in that project's own `.ken/tasks/` home \
+instead (created on first use — this IS the opt-in for a per-repo task \
+home); omit it or pass \"workspace\" for the shared workspace home. Returns \
+the new task's id and ken:// address.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "The task's title." },
+                    "body": { "type": "string", "description": "Free markdown body — description, acceptance criteria, etc." },
+                    "home": { "type": "string", "description": "\"workspace\" (default) or a registered Ken project name to file this task in that project's .ken/tasks/ home." },
+                    "fields": patch_fields_schema.clone()
+                },
+                "required": ["title"]
+            }
+        }));
+        tools.push(json!({
+            "name": "task_list",
+            "description": "List tasks from Ken's task board — scans the \
+workspace tasks home, every registered project's `.ken/tasks/` home, and \
+(when the kenFamilies flag is also on) every member's board in every \
+family connection this device knows about — teammates' boards included, \
+for visibility, though only your own board accepts writes — merged into \
+one list. Filter by any combination of status, project, tag, assignee, \
+kind, goal, and board. To find unclaimed work, set `assignee` to \"none\" \
+(or \"unassigned\") — e.g. {\"kind\": \"ai\", \"assignee\": \"none\", \
+\"status\": \"todo\"} lists unclaimed AI-kind tasks ready to start. Each \
+result shows its id (use with task_update/task_complete) and ken:// \
+address.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "properties": {
+                            "status": { "type": "string", "enum": ["backlog", "todo", "doing", "review", "done"] },
+                            "project": { "type": "string" },
+                            "tag": { "type": "string" },
+                            "assignee": { "type": "string", "description": "An assignee name, or \"none\"/\"unassigned\" for unclaimed tasks." },
+                            "kind": { "type": "string", "enum": ["human", "ai"] },
+                            "goal": { "type": "string", "description": "id of a goal (from tasks/goals/)." },
+                            "board": { "type": "string", "enum": ["main", "daily"] }
+                        }
+                    }
+                }
+            }
+        }));
+        tools.push(json!({
+            "name": "task_update",
+            "description": "Patch a task's frontmatter by id (from \
+task_list) — rewrites only the keys given in `patch` plus `updated`; \
+everything else in the file, including hand-added keys and the body, is \
+left byte-for-byte untouched. This is also how an agent claims a task: \
+first call task_list to confirm the task is unclaimed (empty `assignee`), \
+then call task_update with `patch` set to {\"assignee\": \"<you>\", \
+\"status\": \"doing\"} — set both in the same call. Searches the workspace \
+tasks home, every registered project's task home, and every family board \
+task_list can see. A family board task only accepts the write when it is \
+your own board — Ken's write lanes refuse any patch aimed at a teammate's \
+board, even though task_list shows it to you.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The task's id, from task_list." },
+                    "patch": patch_fields_schema,
+                    "as": { "type": "string", "description": "Only needed when the task lives on a family board and this device's member identity for that family isn't already configured — your family member id (from family_list) to write as." }
+                },
+                "required": ["id"]
+            }
+        }));
+        tools.push(json!({
+            "name": "task_complete",
+            "description": "Finish a task by id (from task_list): sets \
+`status` to \"done\", bumps `updated`, and appends `report` under a \
+\"## Log\" heading in the task file with a timestamp — this is how \
+agent-desktop reports findings back after doing the work. When the \
+kenMemory feature is also on, this additionally writes a one-line summary \
+of the report to today's workspace journal, citing the task's ken:// \
+address, so the completion shows up in Ken's day-to-day record without a \
+separate journal_append call. Searches the workspace tasks home, every \
+registered project's task home, and every family board task_list can see \
+— same own-board-only write restriction as task_update, and a completed \
+family task is pushed to the family remote so teammates see it on their \
+next sync.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The task's id, from task_list." },
+                    "report": { "type": "string", "description": "Findings/summary of the completed work — appended to the task's ## Log." },
+                    "as": { "type": "string", "description": "Only needed when the task lives on a family board and this device's member identity for that family isn't already configured — your family member id (from family_list) to write as." }
+                },
+                "required": ["id", "report"]
+            }
+        }));
+    }
+
+    // ken-families (tasks 3.1-3.4): three new tools, gated on `kenFamilies`
+    // the same way the blocks above gate theirs — absent from the list
+    // entirely when the flag is off. `task_list`/`task_update`/
+    // `task_complete` above stay listed regardless of this flag (they are
+    // ken-tasks tools first); their *content* only grows family boards when
+    // `kenFamilies` is also on, mirroring how `list_projects` above enriches
+    // under `kgRouting` without moving behind it.
+    if ken_families_enabled(&AppSettings::load(&server.base_dir)) {
+        tools.push(json!({
+            "name": "family_list",
+            "description": "List this device's Ken family connections — \
+each connection's name and id, its members, which member you are (if \
+configured), and its local sync state (commits ahead/behind the remote, \
+whether the working tree is dirty, whether a rebase is stuck). Call this \
+first to get the family/member ids family_inbox and family_send need.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+        tools.push(json!({
+            "name": "family_inbox",
+            "description": "List items in your own inbox for one Ken \
+family connection (or every connection this device has a known identity \
+for, if `family` is omitted) — each item's id, kind (task/message/\
+notification), status (unread/seen/accepted/archived), sender, and title. \
+Read-only: calling this never changes an item's status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "family": { "type": "string", "description": "Family name or id, from family_list. Omitted: every family connection with a known identity." },
+                    "as": { "type": "string", "description": "Override which family member's inbox to read, when this device's identity for the family isn't already configured — a member id from family_list." }
+                }
+            }
+        }));
+        tools.push(json!({
+            "name": "family_send",
+            "description": "Deliver a task, message, or notification into \
+a teammate's inbox in a Ken family repo: creates exactly one new file \
+under their members/<id>/inbox/ and pushes it — the only cross-member \
+write Ken's write lanes allow (never an edit of anything the recipient \
+already owns). IMPORTANT: delivery is not assignment or acceptance. \
+Nothing sent by this tool enters the recipient's board, daily board, or \
+any agent-claimable queue by itself — for a task item, the recipient (or \
+their Ken) must explicitly accept it first; for a message or notification, \
+it just waits, unread, until they read or dismiss it. There is no \
+auto-accept in this system.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "family": { "type": "string", "description": "Family name or id, from family_list." },
+                    "to": { "type": "string", "description": "Recipient member id, from family_list." },
+                    "kind": { "type": "string", "enum": ["task", "message", "notification"] },
+                    "title": { "type": "string", "description": "Short title/subject line." },
+                    "body": { "type": "string", "description": "Free-form markdown body — the message text, or task context/brief." },
+                    "task": {
+                        "type": "object",
+                        "description": "Only meaningful when \"kind\" is \"task\" — the brief the recipient's accept flow copies onto a fresh board task. Defaults to \"title\"/kind \"human\" when omitted on a task item.",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "project": { "type": "string" },
+                            "tags": { "type": "array", "items": { "type": "string" } },
+                            "due": { "type": "string", "description": "Due date, e.g. YYYY-MM-DD." },
+                            "kind": { "type": "string", "enum": ["human", "ai"] }
+                        }
+                    },
+                    "as": { "type": "string", "description": "Override which family member is sending, when this device's identity for the family isn't already configured — a member id from family_list." }
+                },
+                "required": ["family", "to", "kind", "title"]
+            }
+        }));
+    }
+
     Value::Array(tools)
 }
 
@@ -385,6 +581,13 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "route_query" => route_query(server, args),
         "memory_write" => memory_write_tool(server, args),
         "journal_append" => journal_append_tool(server, args),
+        "task_create" => task_create_tool(server, args),
+        "task_list" => task_list_tool(server, args),
+        "task_update" => task_update_tool(server, args),
+        "task_complete" => task_complete_tool(server, args),
+        "family_list" => family_list_tool(server),
+        "family_inbox" => family_inbox_tool(server, args),
+        "family_send" => family_send_tool(server, args),
         "search_knowledge" => {
             let query = require_str(args, "query")?;
             let limit = args
@@ -958,6 +1161,505 @@ fn journal_append_tool(server: &Server, args: &Value) -> Result<String, String> 
     ))
 }
 
+// --- ken-tasks tools (task 3.1) ---
+//
+// The four tools share `ken_core::tasks`'s pure core with the (future) UI
+// and chat tools (design D4: "no new protocol: the four tools are the
+// lifecycle"). Every call re-checks `ken_tasks_enabled` — defense-in-depth,
+// same posture as the memory tools above, since an MCP client can invoke
+// any tool name whether or not `tools/list` advertised it.
+
+/// One member's board within one family connection, as an extra task home
+/// (task 3.4). Every manifest member's board is included, not just this
+/// device's own, so `task_list` shows the whole team's board for
+/// visibility — `family_authorize_write` is what actually restricts writes
+/// to `my_member_id`'s own board via `family::lane_check`.
+#[derive(Debug, Clone)]
+struct FamilyBoardHome {
+    family_id: Uuid,
+    family_name: String,
+    clone_root: PathBuf,
+    /// Whose board this home scans.
+    member_id: String,
+    /// This device's own member id in the family, if known — the only
+    /// identity a write to this home may lane-check as `member_id`.
+    my_member_id: Option<String>,
+}
+
+impl FamilyBoardHome {
+    fn board_dir(&self) -> PathBuf {
+        family::board_dir(&self.clone_root, &self.member_id)
+    }
+}
+
+/// Owned scan-home data for one call: the open workspace's tasks home,
+/// every registered project's `.ken/tasks/` home (task brief: "Scan across
+/// the workspace home AND every registered project's .ken/tasks/ home for
+/// list/update/complete"), and — task 3.4 — every member's board in every
+/// family connection this device knows about, when `kenFamilies` is on.
+/// `tasks::TaskHome` borrows its paths/names, so this owns them once and
+/// hands out borrowed `TaskHome`s from one place — homes with no `tasks/`
+/// folder yet simply contribute no tasks (`list_tasks`'s "missing folder
+/// reads as no tasks").
+///
+/// Family boards can't be represented as a `tasks::TaskHome` — that type's
+/// `tasks_dir()` always derives `.ken-workspace/tasks/` or
+/// `<project>/.ken/tasks/`, and a family board lives at
+/// `members/<id>/board/`, a shape `tasks.rs` (owned by another session this
+/// phase) has no variant for. `family_boards` is therefore scanned
+/// separately, in `scan_all`, using the same lower-level `tasks::parse_task`
+/// the two built-in homes use under the hood.
+struct TaskHomes {
+    workspace_root: PathBuf,
+    projects: Vec<RegistryEntry>,
+    family_boards: Vec<FamilyBoardHome>,
+}
+
+impl TaskHomes {
+    fn homes(&self) -> Vec<tasks::TaskHome<'_>> {
+        let mut out = vec![tasks::TaskHome::Workspace { workspace_root: &self.workspace_root }];
+        for p in &self.projects {
+            out.push(tasks::TaskHome::Project { project_root: &p.path, project: &p.name });
+        }
+        out
+    }
+
+    /// Every task across every home: the two built-in homes via
+    /// `tasks::scan_tasks`, plus each family board directly (task 3.4).
+    /// Duplicate ids collapse to the first occurrence, extending
+    /// `scan_tasks`'s own precedence rule across the combined set.
+    fn scan_all(&self) -> Result<Vec<tasks::Task>, String> {
+        let mut out = tasks::scan_tasks(&self.homes()).map_err(|e| e.to_string())?;
+        for fb in &self.family_boards {
+            for t in scan_family_board(fb)? {
+                if !out.iter().any(|x| x.id == t.id) {
+                    out.push(t);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Which family board a task found via `scan_all` came from, if any —
+    /// matched by `home_dir` (`tasks::parse_task` sets it from the file's
+    /// own parent, so it is exact regardless of which `HomeKind` the task
+    /// was tagged with).
+    fn family_origin(&self, task: &tasks::Task) -> Option<&FamilyBoardHome> {
+        self.family_boards.iter().find(|fb| fb.board_dir() == task.home_dir)
+    }
+
+    /// The `ken://` host for a task found via `scan_all`: the workspace
+    /// pseudo-host for workspace-home tasks, the owning project's registry
+    /// id for a per-repo task, or the family id (D6: `ken://<family-id>/…`)
+    /// for a family board task — `tasks::Task::address` takes this as an
+    /// argument because `tasks.rs` has no `Project`/family handle of its own
+    /// (mirrors `journal_summary_line`'s doc comment on the same point).
+    fn host_for(&self, task: &tasks::Task) -> String {
+        if let Some(fb) = self.family_origin(task) {
+            return fb.family_id.to_string();
+        }
+        if task.home == tasks::HomeKind::Workspace {
+            return memory::WORKSPACE_ADDRESS_ID.to_string();
+        }
+        for p in &self.projects {
+            if tasks::project_tasks_dir(&p.path) == task.home_dir {
+                return p.id.to_string();
+            }
+        }
+        // Shouldn't happen (every project-home task came from a home built
+        // out of `self.projects`), but degrade to the task's own `project`
+        // frontmatter value rather than panicking.
+        task.project.clone()
+    }
+
+    /// The repo/project-relative tail of a task's `ken://` address.
+    /// `Task::address_rel_path` can't express a family board's
+    /// `members/<id>/board/<file>` shape (it hardcodes the `.ken/tasks/`
+    /// layout project-home tasks use), so family-origin tasks compute their
+    /// own via `family::board_rel`.
+    fn address_rel_path(&self, task: &tasks::Task) -> String {
+        match self.family_origin(task) {
+            Some(fb) => format!("{}/{}", family::board_rel(&fb.member_id), task.file_name()),
+            None => task.address_rel_path(),
+        }
+    }
+
+    fn address_for(&self, task: &tasks::Task) -> String {
+        format!("ken://{}/{}", self.host_for(task), self.address_rel_path(task))
+    }
+}
+
+/// Parse every `.md` file directly in a family board (task 3.4) — the same
+/// shape as `tasks::list_tasks`'s body (not recursive; a missing folder
+/// reads as no tasks), reimplemented here because `tasks::list_tasks`
+/// requires a `tasks::TaskHome`, which a board dir can't be represented as
+/// (see `TaskHomes`'s doc comment). `tasks::parse_task` is the same public
+/// primitive `list_tasks` calls internally, so parsing itself doesn't drift.
+fn scan_family_board(fb: &FamilyBoardHome) -> Result<Vec<tasks::Task>, String> {
+    let dir = fb.board_dir();
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("could not read {}: {e}", dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let raw = std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+        out.push(tasks::parse_task(&path, tasks::HomeKind::Project, &fb.family_name, &raw));
+    }
+    Ok(out)
+}
+
+fn resolve_task_homes(server: &Server) -> Result<TaskHomes, String> {
+    let workspace_root = resolve_workspace_root(server)?;
+    let registry = Registry::load(&server.base_dir)
+        .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let mut family_boards = Vec::new();
+    if ken_families_enabled(&AppSettings::load(&server.base_dir)) {
+        for conn in discover_family_connections(server) {
+            if conn.manifest.check_supported().is_err() {
+                continue; // "needs a newer Ken": no sync, ingest, or write (spec)
+            }
+            for member in &conn.manifest.members {
+                let fb = FamilyBoardHome {
+                    family_id: conn.manifest.id,
+                    family_name: conn.manifest.name.clone(),
+                    clone_root: conn.clone_root.clone(),
+                    member_id: member.id.clone(),
+                    my_member_id: conn.my_member_id.clone(),
+                };
+                if fb.board_dir().is_dir() {
+                    family_boards.push(fb);
+                }
+            }
+        }
+    }
+    Ok(TaskHomes { workspace_root, projects: registry.projects, family_boards })
+}
+
+/// Shared by `task_create`'s `fields` and `task_update`'s `patch` — both
+/// are the same `TaskPatch` shape on the wire (tool schemas' `patch_fields_schema`).
+fn parse_task_patch(value: &Value) -> Result<tasks::TaskPatch, String> {
+    let obj = value.as_object();
+    let get_str = |key: &str| -> Option<String> {
+        obj.and_then(|o| o.get(key)).and_then(Value::as_str).map(str::to_string)
+    };
+    let status = match get_str("status") {
+        None => None,
+        Some(s) => Some(tasks::TaskStatus::parse(&s).ok_or_else(|| {
+            format!("invalid \"status\" {s:?} — use backlog, todo, doing, review, or done")
+        })?),
+    };
+    let kind = match get_str("kind") {
+        None => None,
+        Some(s) => {
+            Some(tasks::TaskKind::parse(&s).ok_or_else(|| format!("invalid \"kind\" {s:?} — use human or ai"))?)
+        }
+    };
+    let board = match get_str("board") {
+        None => None,
+        Some(s) => {
+            Some(tasks::BoardKind::parse(&s).ok_or_else(|| format!("invalid \"board\" {s:?} — use main or daily"))?)
+        }
+    };
+    let tags = obj.and_then(|o| o.get("tags")).and_then(Value::as_array).map(|arr| {
+        arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect::<Vec<_>>()
+    });
+    Ok(tasks::TaskPatch {
+        title: get_str("title"),
+        status,
+        kind,
+        assignee: get_str("assignee"),
+        project: get_str("project"),
+        tags,
+        due: get_str("due"),
+        goal: get_str("goal"),
+        board,
+    })
+}
+
+fn parse_task_filter(value: &Value) -> Result<tasks::TaskFilter, String> {
+    let obj = value.as_object();
+    let get_str = |key: &str| -> Option<String> {
+        obj.and_then(|o| o.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let status = match get_str("status") {
+        None => None,
+        Some(s) => Some(tasks::TaskStatus::parse(&s).ok_or_else(|| {
+            format!("invalid \"status\" {s:?} in filter — use backlog, todo, doing, review, or done")
+        })?),
+    };
+    let kind = match get_str("kind") {
+        None => None,
+        Some(s) => Some(
+            tasks::TaskKind::parse(&s).ok_or_else(|| format!("invalid \"kind\" {s:?} in filter — use human or ai"))?,
+        ),
+    };
+    let board = match get_str("board") {
+        None => None,
+        Some(s) => Some(
+            tasks::BoardKind::parse(&s)
+                .ok_or_else(|| format!("invalid \"board\" {s:?} in filter — use main or daily"))?,
+        ),
+    };
+    let assignee = get_str("assignee").map(|s| tasks::AssigneeFilter::parse(&s));
+    Ok(tasks::TaskFilter {
+        status,
+        project: get_str("project"),
+        tag: get_str("tag"),
+        assignee,
+        kind,
+        goal: get_str("goal"),
+        board,
+    })
+}
+
+/// `task_create` (task 3.1): file a new task on the board, in the
+/// workspace's shared home by default or a registered project's own
+/// `.ken/tasks/` home when `home` names one (D2: "folder existence is the
+/// opt-in" — `tasks::create_task` creates it on first write).
+fn task_create_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_tasks_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("task_create requires the kenTasks feature flag, which is off.".into());
+    }
+    let title = require_str(args, "title")?;
+    let body = args.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+    let fields = match args.get("fields") {
+        Some(v) => parse_task_patch(v)?,
+        None => tasks::TaskPatch::default(),
+    };
+    let home_arg = args
+        .get("home")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let homes = resolve_task_homes(server)?;
+    let (today, _) = today_and_time_utc();
+    let new = tasks::NewTask { id: None, title, body, fields };
+
+    let task = match home_arg {
+        None => {
+            let home = tasks::TaskHome::Workspace { workspace_root: &homes.workspace_root };
+            tasks::create_task(home, &new, &today).map_err(|e| e.to_string())?
+        }
+        Some(h) if h.eq_ignore_ascii_case("workspace") => {
+            let home = tasks::TaskHome::Workspace { workspace_root: &homes.workspace_root };
+            tasks::create_task(home, &new, &today).map_err(|e| e.to_string())?
+        }
+        Some(h) => {
+            let entry = homes.projects.iter().find(|p| p.name.eq_ignore_ascii_case(h)).ok_or_else(|| {
+                let names: Vec<String> = homes.projects.iter().map(|p| p.name.clone()).collect();
+                let available = if names.is_empty() {
+                    "No projects are registered yet.".to_string()
+                } else {
+                    format!("Available projects: {}.", names.join(", "))
+                };
+                format!("\"{h}\" is neither \"workspace\" nor a registered project name. {available}")
+            })?;
+            let home = tasks::TaskHome::Project { project_root: &entry.path, project: &entry.name };
+            tasks::create_task(home, &new, &today).map_err(|e| e.to_string())?
+        }
+    };
+
+    let host = homes.host_for(&task);
+    Ok(format!(
+        "Created task \"{}\" (id {}, status {}, kind {}) in the {} tasks home ({}).",
+        task.title,
+        task.id,
+        task.status.map(|s| s.as_str().to_string()).unwrap_or(task.status_raw.clone()),
+        task.kind.as_str(),
+        match task.home {
+            tasks::HomeKind::Workspace => "workspace",
+            tasks::HomeKind::Project => "project",
+        },
+        task.address(&host)
+    ))
+}
+
+/// `task_list` (task 3.1): the board's read side — every home, one merged,
+/// filtered list. `filter` matches the UI filter shape 1:1 (D4).
+fn task_list_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_tasks_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("task_list requires the kenTasks feature flag, which is off.".into());
+    }
+    let filter = match args.get("filter") {
+        Some(v) => parse_task_filter(v)?,
+        None => tasks::TaskFilter::default(),
+    };
+    let homes = resolve_task_homes(server)?;
+    let all = homes.scan_all()?;
+    let hits = tasks::filter_tasks(&all, &filter);
+    if hits.is_empty() {
+        return Ok("No tasks match that filter.".to_string());
+    }
+    let mut out = format!("{} task{} match:\n", hits.len(), if hits.len() == 1 { "" } else { "s" });
+    for t in hits {
+        let family_tag = homes
+            .family_origin(t)
+            .map(|fb| format!(" [family:{}/{}]", fb.family_name, fb.member_id))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n{} — \"{}\" [{}, {}] assignee={} project={} tags=[{}]{}{}{} — {}",
+            t.id,
+            t.title,
+            t.status.map(|s| s.as_str().to_string()).unwrap_or_else(|| format!("invalid:{}", t.status_raw)),
+            t.kind.as_str(),
+            if t.assignee.is_empty() { "none" } else { &t.assignee },
+            if t.project.is_empty() { "-" } else { &t.project },
+            t.tags.join(", "),
+            t.goal.as_deref().map(|g| format!(" goal={g}")).unwrap_or_default(),
+            if t.board == tasks::BoardKind::Daily { " [daily]" } else { "" },
+            family_tag,
+            homes.address_for(t)
+        ));
+    }
+    Ok(out)
+}
+
+/// `task_update` (task 3.1): patch by id, searching every home. This is the
+/// claim path (D4): call with `patch: {"assignee": "<you>", "status":
+/// "doing"}` after confirming via `task_list` that `assignee` is empty.
+///
+/// Task 3.4: when the found task lives on a family board,
+/// `family_authorize_write` lane-checks the write *before* anything touches
+/// disk — a patch aimed at a teammate's board is refused by
+/// `family::lane_check` itself, not by a convention this function could
+/// forget to enforce. A successful family write is then committed and
+/// pushed to the family remote (best-effort — see `push_family_board_write`).
+fn task_update_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_tasks_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("task_update requires the kenTasks feature flag, which is off.".into());
+    }
+    let id = require_str(args, "id")?;
+    let patch = match args.get("patch") {
+        Some(v) => parse_task_patch(v)?,
+        None => tasks::TaskPatch::default(),
+    };
+    let as_arg = opt_str(args, "as");
+    let homes = resolve_task_homes(server)?;
+    let all = homes.scan_all()?;
+    let target = tasks::find_by_id(&all, &id).ok_or_else(|| {
+        format!(
+            "no task with id {id:?} found in the workspace tasks home, any registered \
+project's task home, or any attached family board"
+        )
+    })?;
+    let path = target.path.clone();
+    let file_name = target.file_name();
+    let family_ctx = homes.family_origin(target).cloned();
+
+    let (today, _) = today_and_time_utc();
+    let mut sync_note = String::new();
+    if let Some(fb) = &family_ctx {
+        let (identity, rel_path) = family_authorize_write(fb, &file_name, as_arg.as_deref())?;
+        tasks::apply_patch(&path, &patch, &today).map_err(|e| e.to_string())?;
+        sync_note = push_family_board_write(fb, &identity, &rel_path, &path);
+    } else {
+        tasks::apply_patch(&path, &patch, &today).map_err(|e| e.to_string())?;
+    }
+
+    let all_after = homes.scan_all()?;
+    let updated = tasks::find_by_id(&all_after, &id)
+        .ok_or_else(|| "task was updated but could not be re-read".to_string())?;
+    Ok(format!(
+        "Updated task \"{}\" (id {}) — status={}, assignee={} ({}).{sync_note}",
+        updated.title,
+        id,
+        updated.status.map(|s| s.as_str().to_string()).unwrap_or_else(|| format!("invalid:{}", updated.status_raw)),
+        if updated.assignee.is_empty() { "none".to_string() } else { updated.assignee.clone() },
+        homes.address_for(updated)
+    ))
+}
+
+/// `task_complete` (task 3.1): the complete→journal flow (D4). Sets `done`,
+/// appends `report` under the task's `## Log` heading with a timestamp, and
+/// — when `kenMemory` is on — writes a one-line journal summary citing the
+/// task's `ken://` address via the same `journal_summary_line`/
+/// `memory::append_journal` core the ken-memory tools use. A journal-write
+/// failure is reported as a warning rather than failing the whole call: the
+/// task is already marked done and logged by that point, so surfacing it as
+/// a hard error would wrongly suggest the completion itself didn't happen.
+fn task_complete_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_tasks_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("task_complete requires the kenTasks feature flag, which is off.".into());
+    }
+    let id = require_str(args, "id")?;
+    let report = require_str(args, "report")?;
+    let as_arg = opt_str(args, "as");
+    let homes = resolve_task_homes(server)?;
+    let all = homes.scan_all()?;
+    let task = tasks::find_by_id(&all, &id).ok_or_else(|| {
+        format!(
+            "no task with id {id:?} found in the workspace tasks home, any registered \
+project's task home, or any attached family board"
+        )
+    })?;
+
+    let (today, time_hhmm) = today_and_time_utc();
+    // Task 3.4: same own-board-only enforcement as task_update — lane-check
+    // before the write, not after.
+    let family_ctx = homes.family_origin(task).cloned();
+    let mut sync_note = String::new();
+    if let Some(fb) = &family_ctx {
+        let (identity, rel_path) = family_authorize_write(fb, &task.file_name(), as_arg.as_deref())?;
+        tasks::complete_task(task, &report, &today, &time_hhmm).map_err(|e| e.to_string())?;
+        sync_note = push_family_board_write(fb, &identity, &rel_path, &task.path);
+    } else {
+        tasks::complete_task(task, &report, &today, &time_hhmm).map_err(|e| e.to_string())?;
+    }
+
+    let address = homes.address_for(task);
+    let mut msg = format!(
+        "Completed task \"{}\" (id {}) — status done, report appended under ## Log ({}).",
+        task.title, id, address
+    );
+
+    if ken_memory_enabled(&AppSettings::load(&server.base_dir)) {
+        // `journal_line_for_address` rather than `tasks::journal_summary_line`
+        // here (see its doc comment): the latter calls `Task::address`
+        // internally, which can't express a family board's path shape.
+        let line = journal_line_for_address(task, &address, &report);
+        let project_opt = if task.project.trim().is_empty() { None } else { Some(task.project.as_str()) };
+        match memory::append_journal(&homes.workspace_root, &line, project_opt, &[], &today, &time_hhmm) {
+            Ok(_) => msg.push_str(" Journal summary recorded."),
+            Err(e) => msg.push_str(&format!(" (warning: could not write journal summary: {e})")),
+        }
+    }
+    msg.push_str(&sync_note);
+    Ok(msg)
+}
+
+/// Same composition as `tasks::journal_summary_line`, but taking a
+/// precomputed `ken://` address rather than calling `Task::address`
+/// internally — that method hardcodes the `.ken/tasks/` shape project-home
+/// tasks use and cannot express a family board's `members/<id>/board/`
+/// path, so every `task_complete_tool` call (family-origin or not) builds
+/// its address via `TaskHomes::address_for` first and hands it in here.
+fn journal_line_for_address(task: &tasks::Task, address: &str, report: &str) -> String {
+    let excerpt = report.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let excerpt: String = if excerpt.chars().count() > 160 {
+        let cut: String = excerpt.chars().take(160).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        excerpt.to_string()
+    };
+    if excerpt.is_empty() {
+        format!("Completed task \"{}\" ({address})", task.title)
+    } else {
+        format!("Completed task \"{}\" — {excerpt} ({address})", task.title)
+    }
+}
+
 fn source_label(source: Source) -> &'static str {
     match source {
         Source::Keyword => "keyword",
@@ -1028,6 +1730,511 @@ fn kg_routing_enabled(app_settings: &AppSettings) -> bool {
 /// registers the flag — no ken-mcp change needed when that lands.
 fn ken_memory_enabled(app_settings: &AppSettings) -> bool {
     workspace_enabled(app_settings) && global_flag(app_settings, "kenMemory")
+}
+
+/// `kenTasks` (workspace-level, requires `workspace` — proposal.md
+/// "Flag"), gated exactly like `ken_memory_enabled` above, including the
+/// same tolerance for a not-yet-registered flag name: a parallel session is
+/// registering `kenTasks` in `ken_core::features::FLAGS` (task brief), and
+/// `global_flag`'s unregistered-name fallback (`default = false`) makes
+/// this correct regardless of which change lands first.
+fn ken_tasks_enabled(app_settings: &AppSettings) -> bool {
+    workspace_enabled(app_settings) && global_flag(app_settings, "kenTasks")
+}
+
+/// `kenFamilies` (tasks 3.1-3.4). Deliberately **not** gated behind
+/// `workspace` the way `ken_memory_enabled`/`ken_tasks_enabled` above are:
+/// proposal.md introduces it as a plain "New global flag `kenFamilies`",
+/// not "workspace-level, requires workspace" the way kenMemory/kenTasks are
+/// documented, and nothing in design.md or spec.md ties a family
+/// *connection* (a per-device app-data thing) to any one workspace being
+/// open — a connection can exist, sync, and be read from before a workspace
+/// is ever opened. Same registration-order tolerance as `ken_tasks_enabled`:
+/// a parallel session is registering `kenFamilies` in
+/// `ken_core::features::FLAGS`, and `global_flag`'s unregistered-name
+/// fallback (`default = false`) keeps this correct regardless of which
+/// change lands first.
+fn ken_families_enabled(app_settings: &AppSettings) -> bool {
+    global_flag(app_settings, "kenFamilies")
+}
+
+// --- ken-families tools (tasks 3.1-3.4) ---
+//
+// `family.rs`/`family_sync.rs` (section 1, another session, already
+// landed) own every decision that matters for safety: `lane_check` is what
+// actually refuses a cross-lane write, `commit_paths` is the only write
+// path, and `SyncEngine` is the only state machine that talks to git. This
+// layer's job is thin: discover what family clones exist on this device,
+// figure out which manifest member this device is, and turn that into
+// three read/write tools plus two extra homes for the existing task tools.
+// Every call re-checks `ken_families_enabled` — same defense-in-depth
+// posture as the memory/task tools above.
+
+/// One family connection this device knows about, discovered from disk
+/// (see `discover_family_connections`'s doc comment for why: task 2.1's
+/// settings-backed connection store had not landed in `src-tauri` as of
+/// this layer, confirmed by grepping `src-tauri/src/lib.rs` for
+/// "family"/"families" — zero hits — so this can't read it. `family.json`
+/// itself has no "who am I" field (it's the *shared*, synced manifest,
+/// identical in every member's clone), so identity is resolved separately
+/// per connection — see `my_member_id`'s doc comment).
+struct FamilyConnection {
+    /// The `families/<dir>` folder name under this device's app data
+    /// (design D1: `<app data>/ken/families/<family-id>/`) — usually the
+    /// manifest's own id as a string, but matched loosely by
+    /// `find_family_connection` (id, name, or this folder name) since
+    /// nothing enforces the two staying in sync on disk.
+    dir_name: String,
+    clone_root: PathBuf,
+    manifest: FamilyManifest,
+    /// This device's member id in this family, if it could be resolved —
+    /// see `settings_member_id` (best-effort, forward-compatible with
+    /// task 2.1's eventual settings shape) and its single-member fallback
+    /// in `discover_family_connections`. `None` means a tool that needs to
+    /// write (family_send, a family-board task_update/task_complete) must
+    /// be given an explicit `as` argument instead.
+    my_member_id: Option<String>,
+}
+
+/// `<base_dir>/families` — `base_dir` is already `<app data>/ken`
+/// (`registry::default_base_dir`), so this is exactly design D1's
+/// `<app data>/ken/families/`.
+fn families_root(server: &Server) -> PathBuf {
+    server.base_dir.join("families")
+}
+
+/// Every family connection this device has a local clone for.
+///
+/// **Judgment call, recorded honestly**: task 2.1 (the settings-backed
+/// connection store — remote URL, my member id, live-sync, attached
+/// workspace) has not landed in `src-tauri` as of this layer (verified by
+/// grep: no "family"/"families" hits anywhere under `src-tauri/src/`, nor
+/// in `settings.rs`/`features.rs`). Rather than block on that session or
+/// invent a second, competing store, this discovers connections the robust
+/// way available right now: scan `<base_dir>/families/*/family.json`
+/// directly. Every directory with a loadable manifest is a connection.
+/// This also means "attached to workspace" (D6, which gates *search
+/// indexing*, task 2.5 — a different concern from these MCP tools) isn't
+/// checked here: every on-disk connection contributes to family_list,
+/// family_inbox, family_send, and the task-tool board homes, regardless of
+/// any future attachment flag. When 2.1 lands, `settings_member_id` below
+/// already probes a couple of plausible future shapes for the identity
+/// half; the discovery half (which connections exist) would only need to
+/// prefer the settings list's `clonePath`s over this scan if their shapes
+/// ever disagree, which they should not (both describe the same disk
+/// state D1 defines).
+fn discover_family_connections(server: &Server) -> Vec<FamilyConnection> {
+    let root = families_root(server);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let settings = AppSettings::load(&server.base_dir);
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(manifest) = FamilyManifest::load(&path) else {
+            continue; // not a family clone (or unreadable) — skip, don't error the whole scan
+        };
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let my_member_id = settings_member_id(&settings, &manifest.id.to_string(), &dir_name).or_else(|| {
+            // No identity on record anywhere: a family with exactly one
+            // member is unambiguous (the solo/just-created case) — assume
+            // that member is this device. A multi-member family with no
+            // recorded identity stays `None` until an `as` argument or
+            // task 2.1's store supplies one.
+            match manifest.members.as_slice() {
+                [only] => Some(only.id.clone()),
+                _ => None,
+            }
+        });
+        out.push(FamilyConnection { dir_name, clone_root: path, manifest, my_member_id });
+    }
+    out.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name).then(a.dir_name.cmp(&b.dir_name)));
+    out
+}
+
+/// Best-effort, forward-compatible lookup for "which member am I in this
+/// family" from `settings.json`'s passthrough `extra` map, in case task
+/// 2.1's connection store has landed by the time this runs. Its exact
+/// shape isn't known to this layer (it's owned by a parallel session), so
+/// this tolerantly probes a few plausible key/field names rather than
+/// assuming one; anything that doesn't match falls through to `None`, and
+/// `discover_family_connections`'s single-member fallback (or an explicit
+/// `as` argument) takes over from there.
+fn settings_member_id(settings: &AppSettings, family_id: &str, dir_name: &str) -> Option<String> {
+    for list_key in ["familyConnections", "families", "family_connections"] {
+        let Some(arr) = settings.extra.get(list_key).and_then(Value::as_array) else {
+            continue;
+        };
+        for conn in arr {
+            let Some(obj) = conn.as_object() else { continue };
+            let id_matches = ["familyId", "family_id", "id"].iter().any(|k| {
+                obj.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.eq_ignore_ascii_case(family_id) || v.eq_ignore_ascii_case(dir_name))
+            });
+            if !id_matches {
+                continue;
+            }
+            for member_key in ["myMemberId", "my_member_id", "memberId", "member_id", "member"] {
+                if let Some(m) = obj.get(member_key).and_then(Value::as_str) {
+                    let m = m.trim();
+                    if !m.is_empty() {
+                        return Some(m.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the `family` tool argument (name or id, matched case-
+/// insensitively against a connection's manifest id, manifest name, or its
+/// `families/<dir>` folder name) to one connection.
+fn find_family_connection(server: &Server, family_arg: &str) -> Result<FamilyConnection, String> {
+    let conns = discover_family_connections(server);
+    conns
+        .into_iter()
+        .find(|c| {
+            c.dir_name.eq_ignore_ascii_case(family_arg)
+                || c.manifest.id.to_string().eq_ignore_ascii_case(family_arg)
+                || c.manifest.name.eq_ignore_ascii_case(family_arg)
+        })
+        .ok_or_else(|| {
+            let names: Vec<String> =
+                discover_family_connections(server).iter().map(|c| c.manifest.name.clone()).collect();
+            let available = if names.is_empty() {
+                "No family connections were found on this device.".to_string()
+            } else {
+                format!("Known families: {}.", names.join(", "))
+            };
+            format!("No family connection matches {family_arg:?}. {available}")
+        })
+}
+
+/// Which member this call acts as for `conn`: an explicit `as` argument
+/// (validated against the manifest) if given, else the connection's
+/// resolved identity, else a clear error telling the caller how to supply
+/// one (family_list's members list is where to find valid ids).
+fn resolve_family_identity(conn: &FamilyConnection, as_arg: Option<&str>) -> Result<String, String> {
+    if let Some(explicit) = as_arg {
+        let explicit = explicit.trim();
+        if !conn.manifest.has_member(explicit) {
+            return Err(format!(
+                "\"{explicit}\" is not a member of family \"{}\". Members: {}.",
+                conn.manifest.name,
+                conn.manifest.member_ids().join(", ")
+            ));
+        }
+        return Ok(explicit.to_string());
+    }
+    conn.my_member_id.clone().ok_or_else(|| {
+        format!(
+            "This device's member identity in family \"{}\" is not configured yet. \
+Pass \"as\" with one of this family's member ids ({}) to say who you are.",
+            conn.manifest.name,
+            conn.manifest.member_ids().join(", ")
+        )
+    })
+}
+
+fn opt_str(args: &Value, key: &str) -> Option<String> {
+    args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Task 3.4's enforcement point: may this device, acting as `identity` (an
+/// explicit `as` argument if given, else `fb.my_member_id`), write to
+/// `fb`'s board? Delegates to `family::lane_check` itself — the same
+/// function `commit_paths` runs on every real family commit — so a claim
+/// aimed at a teammate's board is refused by the lane rules, not by a
+/// separate check this function could get out of sync with. Returns the
+/// resolved identity and the write's repo-relative path on success, so
+/// callers don't recompute either.
+fn family_authorize_write(
+    fb: &FamilyBoardHome,
+    file_name: &str,
+    as_arg: Option<&str>,
+) -> Result<(String, String), String> {
+    let identity = as_arg.map(str::to_string).or_else(|| fb.my_member_id.clone()).ok_or_else(|| {
+        format!(
+            "cannot write to family \"{}\"'s board — this device's member identity for that \
+family isn't configured yet; pass \"as\" with your member id",
+            fb.family_name
+        )
+    })?;
+    let rel_path = format!("{}/{file_name}", family::board_rel(&fb.member_id));
+    family::lane_check(&identity, &rel_path, false)
+        .map_err(|v| format!("refused: {v} (family \"{}\")", fb.family_name))?;
+    Ok((identity, rel_path))
+}
+
+/// Commit and push a family board write that already landed on disk (task
+/// 3.4's "the completion is pushed for teammates to see"). Best-effort by
+/// design: the local file write already succeeded and is the operation's
+/// actual result, so any git failure here becomes a warning suffix on the
+/// tool's success message rather than failing the call — the same posture
+/// `task_complete_tool` already takes with journal-write failures.
+fn push_family_board_write(fb: &FamilyBoardHome, identity: &str, rel_path: &str, path: &Path) -> String {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => return format!(" (warning: written locally; could not read it back to sync: {e})"),
+    };
+    let mut git = match SystemGit::open(&fb.clone_root) {
+        Ok(g) => g,
+        Err(e) => return format!(" (warning: written locally; could not open the family clone to sync: {e})"),
+    };
+    let lane = Lane::member(identity);
+    let mut engine = SyncEngine::new();
+    if let Err(e) =
+        engine.commit(&mut git, &lane, &[PendingWrite::new(rel_path.to_string(), content)], "Ken: board update")
+    {
+        return format!(" (warning: written locally; could not commit to the family clone: {e})");
+    }
+    let report = engine.poll(&mut git);
+    match report.state {
+        ConnectionState::Idle => " Synced to the family remote.".to_string(),
+        other => format!(" (warning: committed locally but not pushed yet — {other:?}; will retry on the next sync)"),
+    }
+}
+
+fn parse_inbox_task_payload(v: &Value) -> Result<InboxTaskPayload, String> {
+    let obj = v.as_object().ok_or_else(|| "\"task\" must be an object".to_string())?;
+    let get_str = |k: &str| obj.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let tags: Vec<String> = obj
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let kind = get_str("kind");
+    Ok(InboxTaskPayload {
+        title: get_str("title"),
+        project: get_str("project"),
+        tags,
+        due: get_str("due"),
+        kind: if kind.is_empty() { "human".to_string() } else { kind },
+    })
+}
+
+/// `family_list` (task 3.1): every connection this device knows about, its
+/// members, this device's identity in it (if resolved), and its local sync
+/// state. Deliberately reads local git state only (`head_status` —
+/// ahead/behind/dirty/rebase) and never fetches: a list call should be
+/// cheap and side-effect-free, unlike family_send's deliver-and-push.
+fn family_list_tool(server: &Server) -> Result<String, String> {
+    if !ken_families_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("family_list requires the kenFamilies feature flag, which is off.".into());
+    }
+    let conns = discover_family_connections(server);
+    if conns.is_empty() {
+        return Ok("No family connections found on this device.".to_string());
+    }
+    let mut out = format!("{} family connection{}:\n", conns.len(), if conns.len() == 1 { "" } else { "s" });
+    for c in &conns {
+        out.push_str(&format!("\n{} (id {})\n", c.manifest.name, c.manifest.id));
+        if let Err(unsupported) = c.manifest.check_supported() {
+            out.push_str(&format!("  unavailable: {unsupported}\n"));
+            continue;
+        }
+        let identity = c.my_member_id.as_deref().unwrap_or("unknown — pass \"as\" to family_inbox/family_send");
+        out.push_str(&format!("  you are: {identity}\n"));
+        let members: Vec<String> = c
+            .manifest
+            .members
+            .iter()
+            .map(|m| {
+                let you = if Some(m.id.as_str()) == c.my_member_id.as_deref() { " (you)" } else { "" };
+                format!("{}{you}", m.id)
+            })
+            .collect();
+        out.push_str(&format!("  members: {}\n", members.join(", ")));
+        out.push_str(&format!("  clone: {}\n", c.clone_root.display()));
+        match family_sync::git_available() {
+            Err(reason) => out.push_str(&format!("  sync: unavailable — git is not usable ({reason})\n")),
+            Ok(_) => match SystemGit::open(&c.clone_root).and_then(|g| g.head_status()) {
+                Ok(status) => out.push_str(&format!(
+                    "  sync: {} ahead, {} behind, {}{}\n",
+                    status.ahead,
+                    status.behind,
+                    if status.dirty { "dirty" } else { "clean" },
+                    if status.rebase_in_progress { ", rebase in progress" } else { "" }
+                )),
+                Err(e) => out.push_str(&format!("  sync: could not read local git status ({e})\n")),
+            },
+        }
+    }
+    Ok(out)
+}
+
+/// `family_inbox` (task 3.2): this device's own inbox items for one family
+/// (or every family with a resolved identity, if `family` is omitted).
+/// Read-only by design — surfacing an item and marking it `seen`/
+/// `accepted`/`archived` are separate, deliberate actions (D4), not a side
+/// effect of listing.
+fn family_inbox_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_families_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("family_inbox requires the kenFamilies feature flag, which is off.".into());
+    }
+    let family_arg = opt_str(args, "family");
+    let as_arg = opt_str(args, "as");
+
+    let targets: Vec<FamilyConnection> = match &family_arg {
+        Some(f) => vec![find_family_connection(server, f)?],
+        None => discover_family_connections(server),
+    };
+    if targets.is_empty() {
+        return Ok("No family connections found on this device.".to_string());
+    }
+
+    let mut out = String::new();
+    for conn in &targets {
+        if let Err(unsupported) = conn.manifest.check_supported() {
+            out.push_str(&format!("{}: unavailable — {unsupported}\n", conn.manifest.name));
+            continue;
+        }
+        let identity = match resolve_family_identity(conn, as_arg.as_deref()) {
+            Ok(id) => id,
+            Err(e) => {
+                // A specific `family` argument that can't resolve an
+                // identity is the caller's problem to fix; omitted `family`
+                // just skips connections we don't know our identity in.
+                if family_arg.is_some() {
+                    return Err(e);
+                }
+                out.push_str(&format!("{}: {e}\n", conn.manifest.name));
+                continue;
+            }
+        };
+        let dir = family::inbox_dir(&conn.clone_root, &identity);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        files.sort();
+        if files.is_empty() {
+            out.push_str(&format!("{} (\"{identity}\"): inbox is empty.\n", conn.manifest.name));
+            continue;
+        }
+        out.push_str(&format!(
+            "{} (\"{identity}\") — {} item{}:\n",
+            conn.manifest.name,
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ));
+        for path in &files {
+            let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let raw = std::fs::read_to_string(path).unwrap_or_default();
+            let item = family::parse_inbox_item(&file_name, &raw);
+            out.push_str(&format!(
+                "\n  {} [{}, {}] from {} — \"{}\"{}",
+                item.id,
+                item.kind.map(|k| k.as_str()).unwrap_or(item.kind_raw.as_str()),
+                item.status.map(|s| s.as_str()).unwrap_or(item.status_raw.as_str()),
+                if item.from.is_empty() { "unknown" } else { &item.from },
+                item.title,
+                if item.malformed { " (malformed — shown as-is)" } else { "" }
+            ));
+        }
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        return Ok("No family connections with a known identity on this device — pass \"as\" or \
+\"family\" explicitly, or configure identity in Families settings."
+            .to_string());
+    }
+    Ok(out)
+}
+
+/// `family_send` (task 3.3): deliver one item into `to`'s inbox. **Locked
+/// (design D4 / spec "no auto-accept in v1"): this is delivery, not
+/// assignment.** The write is exactly lane rule 2 — one new file under
+/// `members/<to>/inbox/`, nothing else touched — enforced by
+/// `commit_paths`/`lane_check`, not by this function's own care. After the
+/// commit, `SyncEngine::poll` fetches, integrates, and pushes so the item
+/// actually reaches the recipient's next sync; a push failure degrades to
+/// a warning (the commit already happened locally and the next sync will
+/// retry it), matching `push_family_board_write`'s posture.
+fn family_send_tool(server: &Server, args: &Value) -> Result<String, String> {
+    if !ken_families_enabled(&AppSettings::load(&server.base_dir)) {
+        return Err("family_send requires the kenFamilies feature flag, which is off.".into());
+    }
+    let family_arg = require_str(args, "family")?;
+    let to = require_str(args, "to")?;
+    let kind_arg = require_str(args, "kind")?;
+    let title = require_str(args, "title")?;
+    let body = args.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+    let as_arg = opt_str(args, "as");
+
+    let kind = InboxKind::parse(&kind_arg)
+        .ok_or_else(|| format!("invalid \"kind\" {kind_arg:?} — use task, message, or notification"))?;
+    let task = match args.get("task") {
+        Some(v) if !v.is_null() => Some(parse_inbox_task_payload(v)?),
+        _ => None,
+    };
+
+    let conn = find_family_connection(server, &family_arg)?;
+    conn.manifest.check_supported().map_err(|e| e.to_string())?;
+    if !conn.manifest.has_member(&to) {
+        return Err(format!(
+            "\"{to}\" is not a member of family \"{}\". Members: {}.",
+            conn.manifest.name,
+            conn.manifest.member_ids().join(", ")
+        ));
+    }
+    let sender = resolve_family_identity(&conn, as_arg.as_deref())?;
+
+    let id = tasks::new_ulid();
+    let (today, time_hhmm) = today_and_time_utc();
+    let created = format!("{today}T{time_hhmm}:00Z");
+    let new = NewInboxItem {
+        id: Some(id.clone()),
+        kind: Some(kind),
+        from: sender.clone(),
+        title: title.clone(),
+        body,
+        task,
+    };
+    let content = family::render_inbox_item(&new, &id, &created);
+    let file_name = family::inbox_item_file_name(&id, kind, &title);
+    let rel_path = format!("{}/{file_name}", family::inbox_rel(&to));
+
+    let mut git = SystemGit::open(&conn.clone_root)
+        .map_err(|e| format!("could not open the family clone at {}: {e}", conn.clone_root.display()))?;
+    let lane = Lane::member(&sender);
+    let mut engine = SyncEngine::new();
+    engine
+        .commit(
+            &mut git,
+            &lane,
+            &[PendingWrite::new(rel_path.clone(), content)],
+            &format!("Ken: deliver {} to {to}", kind.as_str()),
+        )
+        .map_err(|e| format!("could not deliver to \"{to}\"'s inbox: {e}"))?;
+    let report = engine.poll(&mut git);
+
+    let mut msg = format!(
+        "Delivered a new {} item to \"{to}\"'s inbox in family \"{}\" ({rel_path}). This only \
+places the item in {to}'s inbox — delivery is not assignment or acceptance. {to} (or their Ken) \
+must explicitly accept a task item before it becomes a task on their board; a message or \
+notification just waits, unread, until {to} reads or dismisses it. Nothing here enters {to}'s \
+board, daily board, or any claimable queue automatically — there is no auto-accept.",
+        kind.as_str(),
+        conn.manifest.name
+    );
+    match report.state {
+        ConnectionState::Idle => msg.push_str(" Pushed to the family remote."),
+        other => msg.push_str(&format!(
+            " (warning: committed locally but not yet pushed — {other:?}; it will sync on the next poll)"
+        )),
+    }
+    Ok(msg)
 }
 
 /// Which project does this call target? Scoped servers always answer with
@@ -1788,6 +2995,321 @@ mod tests {
         assert!(text.contains("No Ken workspace is open"), "{text}");
     }
 
+    // --- ken-tasks (task 3.2) ---
+
+    /// `workspace`+`kenTasks` on, one registered workspace (`last_workspace`
+    /// resolved) and one registered project ("Atlas") — mirrors
+    /// `memory_fixture` for the task tools. `ken_memory` additionally turns
+    /// on `kenMemory` so the complete→journal flow can be exercised.
+    fn task_fixture(ken_memory: bool) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, Server) {
+        let base = tempfile::tempdir().unwrap();
+        let ws_parent = tempfile::tempdir().unwrap();
+        let proj_root = tempfile::tempdir().unwrap();
+
+        let workspace = ken_core::workspace::Workspace::create(ws_parent.path(), "WS", &[]).unwrap();
+        let project = Project::create(proj_root.path(), "Atlas").unwrap();
+
+        let mut registry = Registry::default();
+        registry.add(&project);
+        registry.add_workspace(&workspace, None, 0);
+        registry.last_workspace = Some(workspace.config.id);
+        registry.save(base.path()).unwrap();
+
+        let mut settings = AppSettings::default();
+        settings.features.insert("workspace".into(), true.into());
+        settings.features.insert("kenTasks".into(), true.into());
+        if ken_memory {
+            settings.features.insert("kenMemory".into(), true.into());
+        }
+        settings.save(base.path()).unwrap();
+
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        (base, ws_parent, proj_root, server)
+    }
+
+    #[test]
+    fn task_tools_absent_and_erroring_when_flag_off() {
+        let mut fx = fixture(true); // default settings — kenTasks unset, off
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let names: Vec<_> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            "flag off must be byte-identical to pre-ken-tasks tool list"
+        );
+
+        // Dispatch still recognizes the tool names and explains the flag
+        // rather than erroring opaquely (defense-in-depth, same posture as
+        // the memory tools' flag-off test above).
+        for name in ["task_create", "task_list", "task_update", "task_complete"] {
+            let (text, is_err) = tool(&mut fx.server, name, json!({}));
+            assert!(is_err, "{name}: {text}");
+            assert!(text.contains("kenTasks"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn task_tools_appear_with_valid_schemas_when_flag_on() {
+        let (_base, _ws, _proj, mut server) = task_fixture(false);
+        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let tools = reply["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for n in ["task_create", "task_list", "task_update", "task_complete"] {
+            assert!(names.contains(&n), "{names:?}");
+        }
+        let tc = tools.iter().find(|t| t["name"] == "task_create").unwrap();
+        assert_eq!(tc["inputSchema"]["required"], json!(["title"]));
+        let tl = tools.iter().find(|t| t["name"] == "task_list").unwrap();
+        assert_eq!(tl["inputSchema"]["type"], "object");
+        assert!(tl["inputSchema"]["properties"]["filter"]["properties"]["goal"].is_object());
+        let tu = tools.iter().find(|t| t["name"] == "task_update").unwrap();
+        assert_eq!(tu["inputSchema"]["required"], json!(["id"]));
+        let tcm = tools.iter().find(|t| t["name"] == "task_complete").unwrap();
+        assert_eq!(tcm["inputSchema"]["required"], json!(["id", "report"]));
+        for t in tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
+            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
+        }
+        // Tool descriptions must document the claim convention and the
+        // complete→journal flow (spec: "Tool descriptions SHALL state the
+        // claim convention").
+        assert!(tu["description"].as_str().unwrap().contains("unclaimed"));
+        assert!(tu["description"].as_str().unwrap().contains("doing"));
+        assert!(tcm["description"].as_str().unwrap().contains("kenMemory"));
+        assert!(tcm["description"].as_str().unwrap().contains("Log"));
+    }
+
+    #[test]
+    fn task_create_files_into_workspace_and_project_homes_and_is_findable_across_homes() {
+        let (_base, ws_parent, proj_root, mut server) = task_fixture(false);
+
+        // Workspace-home task (default `home`).
+        let (t1, e1) = tool(&mut server, "task_create", json!({"title": "Workspace task"}));
+        assert!(!e1, "{t1}");
+
+        // Per-repo task, filed via `home: "Atlas"` — a registered project
+        // name, not a home-kind literal.
+        let (t2, e2) = tool(&mut server, "task_create", json!({"title": "Atlas task", "home": "Atlas"}));
+        assert!(!e2, "{t2}");
+
+        let ws_dir = ws_parent.path().join(".ken-workspace/tasks");
+        assert_eq!(std::fs::read_dir(&ws_dir).unwrap().flatten().count(), 1, "workspace home");
+        let proj_dir = proj_root.path().join(".ken/tasks");
+        let proj_entries: Vec<_> = std::fs::read_dir(&proj_dir).unwrap().flatten().collect();
+        assert_eq!(proj_entries.len(), 1, "Atlas task must land in the project's own .ken/tasks/");
+        let proj_path = proj_entries[0].path();
+        let proj_raw = std::fs::read_to_string(&proj_path).unwrap();
+        assert!(proj_raw.contains("project: Atlas") || proj_raw.contains("project: 'Atlas'"), "{proj_raw}");
+        let atlas_id = proj_raw
+            .lines()
+            .find(|l| l.starts_with("id:"))
+            .unwrap()
+            .trim_start_matches("id:")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+
+        // task_list must see both homes merged into one list.
+        let (list_text, list_err) = tool(&mut server, "task_list", json!({}));
+        assert!(!list_err, "{list_text}");
+        assert!(list_text.contains("Workspace task"), "{list_text}");
+        assert!(list_text.contains("Atlas task"), "{list_text}");
+
+        // task_update must find the project-home task by id — the board
+        // scans the workspace home AND every registered project's home.
+        let (upd_text, upd_err) =
+            tool(&mut server, "task_update", json!({"id": atlas_id, "patch": {"assignee": "dev"}}));
+        assert!(!upd_err, "{upd_text}");
+        assert!(std::fs::read_to_string(&proj_path).unwrap().contains("assignee: dev"));
+
+        // task_complete must find it there too.
+        let (cmp_text, cmp_err) = tool(
+            &mut server,
+            "task_complete",
+            json!({"id": atlas_id, "report": "Done via cross-home lookup."}),
+        );
+        assert!(!cmp_err, "{cmp_text}");
+        let done = std::fs::read_to_string(&proj_path).unwrap();
+        assert!(done.contains("status: done"), "{done}");
+        assert!(done.contains("Done via cross-home lookup."), "{done}");
+    }
+
+    #[test]
+    fn task_list_filters_by_status_kind_and_unassigned() {
+        let (_base, _ws, _proj, mut server) = task_fixture(false);
+        let (c1, e1) = tool(&mut server, "task_create", json!({"title": "AI task one", "fields": {"kind": "ai"}}));
+        assert!(!e1, "{c1}");
+        let (c2, e2) = tool(&mut server, "task_create", json!({"title": "Human task", "fields": {"kind": "human"}}));
+        assert!(!e2, "{c2}");
+
+        let (text, is_err) =
+            tool(&mut server, "task_list", json!({"filter": {"kind": "ai", "assignee": "none"}}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("AI task one"), "{text}");
+        assert!(!text.contains("Human task"), "{text}");
+
+        let (text2, is_err2) = tool(&mut server, "task_list", json!({"filter": {"status": "backlog"}}));
+        assert!(!is_err2, "{text2}");
+        assert!(text2.contains("AI task one") && text2.contains("Human task"), "{text2}");
+
+        let (text3, is_err3) = tool(&mut server, "task_list", json!({"filter": {"status": "bogus"}}));
+        assert!(is_err3, "{text3}");
+        assert!(text3.contains("invalid"), "{text3}");
+    }
+
+    #[test]
+    fn task_update_claim_touches_only_assignee_status_updated() {
+        let (_base, ws_parent, _proj, mut server) = task_fixture(false);
+        let (text, is_err) = tool(
+            &mut server,
+            "task_create",
+            json!({
+                "title": "Investigate mob spawner",
+                "body": "Deep dive into the decompiled spawner logic.",
+                "fields": {"tags": ["mobs", "spawner"]}
+            }),
+        );
+        assert!(!is_err, "{text}");
+
+        let tasks_dir = ws_parent.path().join(".ken-workspace/tasks");
+        let entries: Vec<_> = std::fs::read_dir(&tasks_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one task file");
+        let path = entries[0].path();
+
+        // Hand-add an unknown key inside the frontmatter to prove it
+        // survives the patch untouched too (S6's byte-fidelity contract:
+        // "patches SHALL rewrite only the named keys plus updated").
+        let created = std::fs::read_to_string(&path).unwrap();
+        let before = created.replacen("kind: human\n", "kind: human\ncustom_field: keep-me\n", 1);
+        assert_ne!(before, created, "fixture assumption 'kind: human\\n' not found in:\n{created}");
+        std::fs::write(&path, &before).unwrap();
+
+        let id = before
+            .lines()
+            .find(|l| l.starts_with("id:"))
+            .unwrap()
+            .trim_start_matches("id:")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+
+        // The claim convention (spec/D4): set `assignee` + `status: doing`
+        // in one call after confirming the task is unclaimed.
+        let (text2, is_err2) = tool(
+            &mut server,
+            "task_update",
+            json!({"id": id, "patch": {"assignee": "agent-desktop", "status": "doing"}}),
+        );
+        assert!(!is_err2, "{text2}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let before_lines: Vec<&str> = before.lines().collect();
+        let after_lines: Vec<&str> = after.lines().collect();
+        assert_eq!(
+            before_lines.len(),
+            after_lines.len(),
+            "line count changed:\nbefore:\n{before}\nafter:\n{after}"
+        );
+
+        let mut changed_keys: Vec<String> = before_lines
+            .iter()
+            .zip(after_lines.iter())
+            .filter(|(b, a)| b != a)
+            .map(|(_, a)| a.split(':').next().unwrap_or("").trim().to_string())
+            .collect();
+        changed_keys.sort();
+        changed_keys.dedup();
+        // `updated` is always rewritten by `apply_patch`, but when the
+        // patch lands on the same UTC calendar day as creation the emitted
+        // line is byte-identical to what was already there, so it may or
+        // may not show up as a *diff* — only `assignee` and `status`
+        // (the claimed keys) are guaranteed to visibly change. Either way,
+        // nothing outside {assignee, status, updated} may appear.
+        let allowed: std::collections::HashSet<&str> = ["assignee", "status", "updated"].into_iter().collect();
+        assert!(
+            changed_keys.iter().all(|k| allowed.contains(k.as_str())),
+            "diff touched more than assignee/status/updated ({changed_keys:?}):\nbefore:\n{before}\nafter:\n{after}"
+        );
+        assert!(
+            changed_keys.contains(&"assignee".to_string()) && changed_keys.contains(&"status".to_string()),
+            "expected assignee and status to change ({changed_keys:?})"
+        );
+        assert!(after.contains("custom_field: keep-me"), "{after}");
+        assert!(after.contains("status: doing"), "{after}");
+        assert!(after.contains("assignee: agent-desktop"), "{after}");
+    }
+
+    #[test]
+    fn task_complete_appends_log_and_journal_summary() {
+        let (_base, ws_parent, _proj, mut server) = task_fixture(true);
+        let (text, is_err) =
+            tool(&mut server, "task_create", json!({"title": "Audit loot tables", "fields": {"kind": "ai"}}));
+        assert!(!is_err, "{text}");
+
+        let tasks_dir = ws_parent.path().join(".ken-workspace/tasks");
+        let entries: Vec<_> = std::fs::read_dir(&tasks_dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1);
+        let path = entries[0].path();
+        let raw0 = std::fs::read_to_string(&path).unwrap();
+        let id = raw0
+            .lines()
+            .find(|l| l.starts_with("id:"))
+            .unwrap()
+            .trim_start_matches("id:")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+
+        let (text2, is_err2) = tool(
+            &mut server,
+            "task_complete",
+            json!({"id": id, "report": "Loot tables match the decompiled drop weights."}),
+        );
+        assert!(!is_err2, "{text2}");
+        assert!(text2.contains("Journal summary recorded"), "{text2}");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("status: done"), "{raw}");
+        assert!(raw.contains("## Log"), "{raw}");
+        assert!(raw.contains("Loot tables match the decompiled drop weights."), "{raw}");
+
+        let journal_dir = ws_parent.path().join(".ken-workspace/journal");
+        let jentries: Vec<_> = std::fs::read_dir(&journal_dir).unwrap().flatten().collect();
+        assert_eq!(jentries.len(), 1, "expected exactly one journal file, today's");
+        let jraw = std::fs::read_to_string(jentries[0].path()).unwrap();
+        assert!(jraw.contains("Completed task \"Audit loot tables\""), "{jraw}");
+        assert!(jraw.contains("ken://workspace/tasks/"), "{jraw}");
+
+        // With kenMemory off, task_complete still succeeds but writes no
+        // journal entry and says nothing was recorded.
+        let (_base2, ws_parent2, _proj2, mut server2) = task_fixture(false);
+        let (text3, is_err3) =
+            tool(&mut server2, "task_create", json!({"title": "No journal task"}));
+        assert!(!is_err3, "{text3}");
+        let tasks_dir2 = ws_parent2.path().join(".ken-workspace/tasks");
+        let path2 = std::fs::read_dir(&tasks_dir2).unwrap().flatten().next().unwrap().path();
+        let raw2 = std::fs::read_to_string(&path2).unwrap();
+        let id2 = raw2
+            .lines()
+            .find(|l| l.starts_with("id:"))
+            .unwrap()
+            .trim_start_matches("id:")
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+        let (text4, is_err4) =
+            tool(&mut server2, "task_complete", json!({"id": id2, "report": "No journal expected."}));
+        assert!(!is_err4, "{text4}");
+        assert!(!text4.contains("Journal summary recorded"), "{text4}");
+        let journal_dir2 = ws_parent2.path().join(".ken-workspace/journal");
+        assert!(!journal_dir2.exists(), "kenMemory off must write no journal file");
+    }
+
     /// Cross-checked by hand against Howard Hinnant's reference algorithm at
     /// two independently verified anchors: day 0 is the Unix epoch itself,
     /// and day 10957 is 2000-01-01 (30 years incl. 7 leap days: 1972, 76,
@@ -1796,5 +3318,265 @@ mod tests {
     fn civil_from_days_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(10957), (2000, 1, 1));
+    }
+
+    // --- ken-families tools (tasks 3.1-3.4) ---
+
+    /// A server with `kenFamilies` on but no family connections on disk —
+    /// enough for the flag-off/flag-on tool-list tests, which never touch
+    /// `families/`.
+    fn family_flag_fixture() -> (tempfile::TempDir, Server) {
+        let base = tempfile::tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        settings.features.insert("kenFamilies".into(), true.into());
+        settings.save(base.path()).unwrap();
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        (base, server)
+    }
+
+    /// A real family connection: `<base>/families/<id>/` is a genuine git
+    /// clone of a local bare "remote", scaffolded via
+    /// `family::scaffold_family` and committed through
+    /// `Lane::bootstrap()` — the exact shape "Create family" produces in
+    /// production (D2/1.7). Two members: `"owner"` (this device — task 2.1's
+    /// settings store doesn't exist yet, so `discover_family_connections`'s
+    /// single-member fallback can't apply here; tests that need "owner" as
+    /// the resolved identity pass `as: "owner"` explicitly, exactly like a
+    /// caller would before that store lands) and `"sarah"` (a teammate,
+    /// used for the lane-refusal test). Returns `None` — never panics — when
+    /// `git` isn't usable in the sandbox, mirroring
+    /// `family_sync::system_git_drives_a_real_local_clone`'s own skip.
+    fn family_fixture(
+        with_tasks_workspace: bool,
+    ) -> Option<(tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, Server, Uuid, PathBuf)> {
+        if family_sync::git_available().is_err() {
+            return None;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let ws_parent = tempfile::tempdir().unwrap();
+        let bare = remote_dir.path().join("family.git");
+
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&bare)
+            .output();
+        match init {
+            Ok(o) if o.status.success() => {}
+            _ => return None,
+        }
+
+        let family_id = Uuid::new_v4();
+        let clone_root = base.path().join("families").join(family_id.to_string());
+        std::fs::create_dir_all(clone_root.parent().unwrap()).unwrap();
+        let clone_ok = std::process::Command::new("git")
+            .args(family_sync::clone_config_args())
+            .args(["clone", "--"])
+            .arg(&bare)
+            .arg(&clone_root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !clone_ok {
+            return None;
+        }
+
+        let mut git = SystemGit::new(&clone_root, "origin", "main");
+        git.identity =
+            Some(family_sync::GitIdentity { name: "Ken Test".into(), email: "ken@example.invalid".into() });
+        if git.configure_clone().is_err() {
+            return None;
+        }
+
+        let members = vec![family::FamilyMember::new("owner", "Owner"), family::FamilyMember::new("sarah", "Sarah")];
+        let scaffold = family::scaffold_family("Test Family", family_id, &members).unwrap();
+        let writes: Vec<PendingWrite> =
+            scaffold.iter().map(|f| PendingWrite::new(f.rel_path.clone(), f.content.clone())).collect();
+        git.commit_paths(&Lane::bootstrap(), &writes, "Create family").unwrap();
+        git.push().unwrap();
+
+        let mut registry = Registry::default();
+        if with_tasks_workspace {
+            let workspace = ken_core::workspace::Workspace::create(ws_parent.path(), "WS", &[]).unwrap();
+            registry.add_workspace(&workspace, None, 0);
+            registry.last_workspace = Some(workspace.config.id);
+        }
+        registry.save(base.path()).unwrap();
+
+        let mut settings = AppSettings::default();
+        settings.features.insert("kenFamilies".into(), true.into());
+        if with_tasks_workspace {
+            settings.features.insert("workspace".into(), true.into());
+            settings.features.insert("kenTasks".into(), true.into());
+        }
+        settings.save(base.path()).unwrap();
+
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        Some((base, remote_dir, ws_parent, server, family_id, clone_root))
+    }
+
+    #[test]
+    fn family_tools_absent_and_erroring_when_flag_off() {
+        let mut fx = fixture(true); // default settings — kenFamilies unset, off
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let names: Vec<_> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            "flag off must be byte-identical to pre-ken-families tool list"
+        );
+
+        for name in ["family_list", "family_inbox", "family_send"] {
+            let (text, is_err) = tool(&mut fx.server, name, json!({}));
+            assert!(is_err, "{name}: {text}");
+            assert!(text.contains("kenFamilies"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn family_tools_appear_with_valid_schemas_when_flag_on() {
+        let (_base, mut server) = family_flag_fixture();
+        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let tools = reply["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for n in ["family_list", "family_inbox", "family_send"] {
+            assert!(names.contains(&n), "{names:?}");
+        }
+        let fl = tools.iter().find(|t| t["name"] == "family_list").unwrap();
+        assert_eq!(fl["inputSchema"]["type"], "object");
+        let fi = tools.iter().find(|t| t["name"] == "family_inbox").unwrap();
+        assert!(fi["inputSchema"]["properties"]["family"].is_object());
+        let fs = tools.iter().find(|t| t["name"] == "family_send").unwrap();
+        assert_eq!(fs["inputSchema"]["required"], json!(["family", "to", "kind", "title"]));
+        assert!(fs["inputSchema"]["properties"]["task"]["properties"]["due"].is_object());
+        for t in tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
+            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
+        }
+        // LOCKED (design D4 / spec "no auto-accept in v1"): family_send's
+        // own description must say delivery is not assignment/acceptance.
+        let fs_desc = fs["description"].as_str().unwrap();
+        assert!(fs_desc.contains("not assignment"), "{fs_desc}");
+        assert!(fs_desc.to_lowercase().contains("no auto-accept"), "{fs_desc}");
+    }
+
+    #[test]
+    fn family_send_lands_a_new_file_in_the_recipient_inbox() {
+        let Some((_base, remote, _ws, mut server, _family_id, clone_root)) = family_fixture(false) else {
+            eprintln!("skipping: no usable git in this sandbox");
+            return;
+        };
+
+        let (text, is_err) = tool(
+            &mut server,
+            "family_send",
+            json!({
+                "family": "Test Family",
+                "to": "sarah",
+                "kind": "task",
+                "title": "Review the sync loop",
+                "body": "Please double-check the retry logic.",
+                "as": "owner"
+            }),
+        );
+        assert!(!is_err, "{text}");
+        assert!(text.contains("not assignment"), "{text}");
+        assert!(text.contains("no auto-accept") || text.contains("There is no auto-accept"), "{text}");
+
+        // The scaffold's `.gitkeep` marker (1.7) is also in this folder —
+        // only the new `.md` item is this test's concern.
+        let inbox_dir = clone_root.join("members/sarah/inbox");
+        let entries: Vec<_> = std::fs::read_dir(&inbox_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one new file should land in sarah's inbox");
+        let raw = std::fs::read_to_string(entries[0].path()).unwrap();
+        let file_name = entries[0].file_name().to_string_lossy().into_owned();
+        let item = family::parse_inbox_item(&file_name, &raw);
+        assert!(!item.malformed, "{raw}");
+        assert_eq!(item.kind, Some(family::InboxKind::Task));
+        assert_eq!(item.status, Some(family::InboxStatus::Unread));
+        assert_eq!(item.from, "owner");
+        assert_eq!(item.title, "Review the sync loop");
+
+        // And it was actually pushed to the "remote" — a fresh clone of the
+        // bare repo this fixture still holds a handle to sees it.
+        let verify_dir = clone_root.parent().unwrap().join("verify-clone");
+        let cloned = std::process::Command::new("git")
+            .args(["clone", "--"])
+            .arg(remote.path().join("family.git"))
+            .arg(&verify_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(cloned, "push should have reached the bare remote");
+        assert!(verify_dir.join("members/sarah/inbox").join(&file_name).is_file());
+    }
+
+    #[test]
+    fn task_update_lane_refuses_a_foreign_board_write_but_allows_own_board() {
+        let Some((_base, _remote, _ws, mut server, family_id, clone_root)) = family_fixture(true) else {
+            eprintln!("skipping: no usable git in this sandbox");
+            return;
+        };
+
+        // Seed one task file directly on each member's board — bypassing
+        // family_send/accept entirely, since this test is only about
+        // task_update's write-lane enforcement, not the acceptance flow.
+        let seed = |member: &str, id: &str, title: &str| {
+            let dir = clone_root.join(format!("members/{member}/board"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let content = format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: backlog\nkind: human\nassignee: {member}\n\
+project: ''\ntags: []\nboard: main\ncreated: '2026-08-01'\nupdated: '2026-08-01'\n---\n\nBody.\n"
+            );
+            std::fs::write(dir.join(format!("{id}-task.md")), content).unwrap();
+        };
+        seed("sarah", "01SARAHTASK", "Sarah's task");
+        seed("owner", "01OWNERTASK", "Owner's task");
+
+        // task_list must show both boards (visibility for the whole team).
+        let (list_text, list_err) = tool(&mut server, "task_list", json!({}));
+        assert!(!list_err, "{list_text}");
+        assert!(list_text.contains("Sarah's task"), "{list_text}");
+        assert!(list_text.contains("Owner's task"), "{list_text}");
+        assert!(list_text.contains(&format!("ken://{family_id}/members/sarah/board/")), "{list_text}");
+
+        // A claim aimed at sarah's board, acting as owner, is refused by
+        // the lane rules — not merely discouraged: the file on disk must be
+        // byte-for-byte untouched afterward.
+        let sarah_path = clone_root.join("members/sarah/board/01SARAHTASK-task.md");
+        let before = std::fs::read_to_string(&sarah_path).unwrap();
+        let (bad_text, bad_err) = tool(
+            &mut server,
+            "task_update",
+            json!({"id": "01SARAHTASK", "patch": {"assignee": "owner", "status": "doing"}, "as": "owner"}),
+        );
+        assert!(bad_err, "{bad_text}");
+        assert!(bad_text.contains("refused"), "{bad_text}");
+        let after = std::fs::read_to_string(&sarah_path).unwrap();
+        assert_eq!(before, after, "a lane-refused write must not touch the file");
+
+        // The same call against owner's own board succeeds, patches only
+        // the given keys, and pushes.
+        let (ok_text, ok_err) = tool(
+            &mut server,
+            "task_update",
+            json!({"id": "01OWNERTASK", "patch": {"assignee": "owner", "status": "doing"}, "as": "owner"}),
+        );
+        assert!(!ok_err, "{ok_text}");
+        let owner_path = clone_root.join("members/owner/board/01OWNERTASK-task.md");
+        let owner_raw = std::fs::read_to_string(&owner_path).unwrap();
+        assert!(owner_raw.contains("status: doing"), "{owner_raw}");
+        assert!(owner_raw.contains("title: \"Owner's task\"") || owner_raw.contains("title: Owner's task"), "{owner_raw}");
     }
 }

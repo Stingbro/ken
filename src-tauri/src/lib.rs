@@ -19,9 +19,12 @@ use ken_core::embedder::Embedder;
 use ken_core::knowledge_model::{self, AutoBuildTracker};
 use ken_core::model;
 use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
+use ken_core::family::{self, FamilyManifest, FamilyMember, Lane};
+use ken_core::family_sync::{self, GitTransport, PendingWrite, SystemGit};
 use ken_core::kenignore;
 use ken_core::memory;
 use ken_core::research;
+use ken_core::tasks;
 use ken_core::runner::{CancelToken, RunOutcome};
 use ken_core::hooks::HookListener;
 use ken_core::project::Project;
@@ -184,6 +187,44 @@ struct AppState {
     /// new `distill_journal` run; never persisted to disk (candidates are
     /// ephemeral until approved, per D6 — approval is what makes one durable).
     memory_distill_candidates: Arc<Mutex<Vec<memory::DistillCandidate>>>,
+    /// ken-tasks task 2.1: self-write dedupe registry for the task-board
+    /// poller. A mutating command inserts `path -> Some(content-hash)` right
+    /// after writing a task/goal file (or `path -> None` when the write
+    /// makes a path disappear, e.g. archiving), then emits `board-state`
+    /// itself. The poller's next tick consults this entry-by-entry: a match
+    /// means "already announced" (consumed, no second emit); anything left
+    /// over is a change nobody has announced yet (an agent's write, a hand
+    /// edit, a git pull, or a command whose emit hasn't landed yet) and gets
+    /// exactly one recompute + emit for the whole tick. See
+    /// `spawn_task_board_watch`'s doc comment for the full rationale.
+    task_recent_writes: Arc<Mutex<std::collections::HashMap<PathBuf, Option<u64>>>>,
+    /// ken-tasks task 2.3: true while a `plan_daily_tasks` run is in flight —
+    /// mirrors `memory_distill_running`'s single-guard discipline.
+    daily_plan_running: Arc<AtomicBool>,
+    /// The most recent `plan_daily_tasks` run's proposed candidates, keyed by
+    /// `DailyCandidate::key` so `resolve_daily_candidate(key, approve)` can
+    /// look one up — same ephemeral, replaced-wholesale-per-run contract as
+    /// `memory_distill_candidates`.
+    daily_plan_candidates: Arc<Mutex<Vec<DailyCandidate>>>,
+    /// ken-families task 2.3: one `family_sync::SyncEngine` per connection,
+    /// keyed by family id, living for the process's lifetime rather than
+    /// tied to any open workspace (families are a global-flag feature,
+    /// D6: "unattached connections still sync and notify"). Populated
+    /// lazily on first touch (`family_engine_handle`) so the same instance
+    /// backs both the poll loop and every on-demand command (`family_sync_
+    /// now`, accept/dismiss commits, `family_resolve_conflict`) — a fresh
+    /// engine per call would lose `ConnectionState::Conflict`/`Unavailable`
+    /// between ticks, defeating D1's "polling stops here until a human
+    /// resolves it".
+    family_engines: Arc<Mutex<std::collections::HashMap<uuid::Uuid, Arc<Mutex<family_sync::SyncEngine>>>>>,
+    /// ken-families task 2.3: the poll-loop stop signal per connection with
+    /// `liveSync` on, keyed by family id. `reconcile_family_pollers` is the
+    /// only writer — it recomputes the wanted set from `kenFamilies` +
+    /// each saved connection's `liveSync` after every mutation that could
+    /// change either, and drops (`StopOnDrop`) whatever's no longer wanted
+    /// — mirroring `WorkspaceState::task_watch`'s drop-stops-the-thread
+    /// discipline, fanned out over N connections instead of one workspace.
+    family_pollers: Arc<Mutex<std::collections::HashMap<uuid::Uuid, StopOnDrop>>>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -264,6 +305,12 @@ impl Drop for IngestPermit {
 struct WorkspaceState {
     ws: ken_core::workspace::Workspace,
     lru: Vec<uuid::Uuid>,
+    /// The task-board poller (ken-tasks task 2.1), if `kenTasks` resolved on
+    /// when this workspace opened. `None` when the flag is off — task 2.6:
+    /// "off => no watchers". Dropping `WorkspaceState` (workspace close or
+    /// switch) drops this too, which stops the poller thread via
+    /// `StopOnDrop` — no separate teardown call needed.
+    task_watch: Option<StopOnDrop>,
 }
 
 impl WorkspaceState {
@@ -1382,6 +1429,62 @@ fn ken_memory_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
         .unwrap_or(default)
 }
 
+/// Effective `kenTasks` flag (ken-tasks task 2.6): the global-scope registry
+/// default overridden by `settings.json`'s `features` map, AND-ed with
+/// `workspace_enabled` — same shape as `ken_memory_enabled`/
+/// `federated_kg_enabled`/`kg_routing_enabled` (proposal: "kenTasks
+/// (workspace-level, requires workspace)"), same durable-home deviation
+/// (no workspace-manifest-scoped feature layer exists yet, so `settings.
+/// json`'s global layer is the only home). Gates every task/goal command,
+/// the board poller, and (task 2.1) folder creation — off means byte-
+/// identical to pre-feature behavior (spec "flag off is inert").
+fn ken_tasks_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    if !workspace_enabled(app_settings) {
+        return false;
+    }
+    let default = ken_core::features::flag("kenTasks")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("kenTasks")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Friendly error every ken-tasks command returns when the flag is off
+/// (task 2.6 — mirrors `KEN_MEMORY_DISABLED_MSG`'s wording/role).
+const KEN_TASKS_DISABLED_MSG: &str =
+    "Ken's task board is off — turn on kenTasks in Settings → Features to use it.";
+
+/// Effective `kenFamilies` flag (ken-families task 2.6): the global-scope
+/// registry default overridden by `settings.json`'s `features` map — same
+/// shape as `workspace_enabled`. Deliberately NOT AND-ed with `workspace_
+/// enabled` the way `ken_memory_enabled`/`ken_tasks_enabled`/`federated_kg_
+/// enabled`/`kg_routing_enabled` are: the proposal registers this as a
+/// plain "global flag", not "workspace-level, requires workspace" — a
+/// family connection is a standalone collaboration bus (clone, poll, push)
+/// that MAY optionally attach to one open workspace for search (D6), but
+/// works — creates, joins, syncs, delivers inbox items — with no workspace
+/// open at all. Gates every family command, the poll scheduler, and clone
+/// creation — off means byte-identical to pre-feature behavior (spec
+/// "flag off is inert").
+fn ken_families_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    let default = ken_core::features::flag("kenFamilies")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("kenFamilies")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Friendly error every ken-families command returns when the flag is off
+/// (task 2.6 — mirrors `KEN_TASKS_DISABLED_MSG`'s wording/role).
+const KEN_FAMILIES_DISABLED_MSG: &str =
+    "Ken's families are off — turn on kenFamilies in Settings → Features to use them.";
+
 /// Display label given to the workspace pseudo-member's `Project::name`
 /// (ken-memory task 2.1) — shows up wherever a member's name flows through
 /// unchanged (route_search's `MemberInfo::name`, `search_all_projects`'
@@ -1887,6 +1990,26 @@ fn open_workspace_inner(
         });
     }
 
+    // ken-families task 2.5: activate every connection attached to this
+    // workspace as its own `kind: family` pseudo-member (D6), the same
+    // shape as the `kenMemory` block just above — see `activate_family_
+    // pseudo_member`'s doc comment for why. No ordering dependency on the
+    // `Registry::last_project` concern that block's comment describes
+    // (family pseudo-members key off the manifest's own family id, not a
+    // reserved id derived from `ws.config.id`), so this can run in any
+    // order relative to it; kept adjacent for readability. Best-effort per
+    // connection, matching the memory block's own failure handling.
+    if ken_families_enabled(&kenmem_on) {
+        for conn in family_connections(&kenmem_on)
+            .into_iter()
+            .filter(|c| c.attached_workspace_id == Some(ws.config.id))
+        {
+            if let Err(e) = activate_family_pseudo_member(app, state, &conn) {
+                eprintln!("warning: family pseudo-member '{}' failed to activate: {e}", conn.name);
+            }
+        }
+    }
+
     // Activate up to the cap; the rest stay dormant (their project id + root
     // remain tracked in `WorkspaceState.ws` for lazy focus-time activation).
     let mut resident_lru: Vec<uuid::Uuid> = Vec::new();
@@ -1922,8 +2045,24 @@ fn open_workspace_inner(
     // Install bookkeeping (holds the resolved manifest + resident LRU).
     {
         let mut guard = state.lock().unwrap();
-        guard.workspace = Some(WorkspaceState { ws, lru: resident_lru.clone() });
+        guard.workspace = Some(WorkspaceState { ws, lru: resident_lru.clone(), task_watch: None });
         guard.focused = resident_lru.last().copied();
+    }
+
+    // ken-tasks task 2.1: spin up the task-board poller now that
+    // `guard.workspace` is installed (every tick reads it). Off (`kenTasks`
+    // resolves false) means this is simply never spawned — task 2.6: "off
+    // => no watchers, no folders created" (nothing here ever creates the
+    // `tasks/`/`tasks/goals/` folders either; those come into being only
+    // when a task/goal is actually created). Best-effort like the
+    // ken-memory pseudo-member spin-up above — never fails
+    // `open_workspace`/`create_workspace`.
+    if ken_tasks_enabled(&kenmem_on) {
+        let handle = spawn_task_board_watch(app.clone(), state.clone());
+        let mut guard = state.lock().unwrap();
+        if let Some(ws_state) = guard.workspace.as_mut() {
+            ws_state.task_watch = Some(handle);
+        }
     }
 
     // Restore focus, or default to the first resident member. Routed through
@@ -2618,7 +2757,7 @@ fn set_project_feature(
 /// `AppSettings` in `AppState` is updated only after it succeeds, so a failed
 /// save leaves state and disk consistent.
 #[tauri::command]
-fn set_global_feature(state: State<SharedState>, flag: String, value: bool) -> CmdResult<()> {
+fn set_global_feature(app: AppHandle, state: State<SharedState>, flag: String, value: bool) -> CmdResult<()> {
     if ken_core::features::flag(&flag).is_none() {
         return Err(format!("unknown feature flag: {flag}"));
     }
@@ -2640,6 +2779,18 @@ fn set_global_feature(state: State<SharedState>, flag: String, value: bool) -> C
         if let Some(token) = guard.workspace_kg_cancel.lock().unwrap().take() {
             token.cancel();
         }
+    }
+    // ken-families task 2.6: "off => no timers" applies immediately, not
+    // just to connections created from now on — and flipping it back on
+    // should resume every `liveSync` connection's poller without a
+    // restart. Both directions reduce to the same reconciliation
+    // `family_create`/`family_join`/`family_set_live_sync`/`family_remove`
+    // already call; the lock must be released first since `reconcile_
+    // family_pollers` takes it again itself.
+    let families_flag_changed = flag == "kenFamilies";
+    drop(guard);
+    if families_flag_changed {
+        reconcile_family_pollers(&app, state.inner());
     }
     Ok(())
 }
@@ -7751,6 +7902,875 @@ fn resolve_distill_candidate(state: State<SharedState>, slug: String, approve: b
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// ken-tasks task 2.1: board scan + poller + self-write dedupe.
+// ---------------------------------------------------------------------
+
+/// The whole board, as sent to the frontend by `board_get` and the
+/// `board-state` event (task 2.2: "board state carries per-goal progress
+/// counts"). `tasks`/`goals` serialize via their own `Serialize` impls
+/// (`ken_core::tasks::Task`/`Goal`, already camelCase); `progress` is
+/// `goal_progress_all`'s `BTreeMap<goal id, Progress{done,total}>` — never
+/// stored, always recomputed (spec: "no progress value exists in any
+/// file").
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BoardStateDto {
+    tasks: Vec<tasks::Task>,
+    goals: Vec<tasks::Goal>,
+    needs_attention: Vec<tasks::NeedsAttention>,
+    progress: std::collections::BTreeMap<String, tasks::Progress>,
+}
+
+/// Every task home for an open workspace: `.ken-workspace/tasks/` plus every
+/// resolvable member's `<project>/.ken/tasks/` (design D2: "the board scans
+/// both and treats home as invisible plumbing"). Members are read straight
+/// from the manifest (`ws.members`), not `AppState::members` — a task home
+/// needs only a project's root + display name on disk, not a live
+/// `MemberRuntime`, so dormant members are scanned exactly like resident
+/// ones. The workspace-memory pseudo-member is never a manifest member (it
+/// is synthesized purely into `AppState::members` at activation time, never
+/// written to `workspace.json`), so it never needs excluding here.
+/// `base_dir`/`app_settings` (task 2.4) let this reach every family board
+/// attached to `ws` in addition to the workspace/project homes — see the
+/// loop below for why that can't be expressed as one more `tasks::TaskHome`.
+fn task_homes_scan(
+    ws: &ken_core::workspace::Workspace,
+    base_dir: &Path,
+    app_settings: &ken_core::settings::AppSettings,
+) -> Result<(Vec<tasks::Task>, Vec<tasks::Goal>), String> {
+    let member_infos: Vec<(PathBuf, String)> = ws
+        .members
+        .iter()
+        .filter_map(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) => Some((p.root.clone(), m.name.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut homes: Vec<tasks::TaskHome> = vec![tasks::TaskHome::Workspace { workspace_root: &ws.root }];
+    for (root, name) in &member_infos {
+        homes.push(tasks::TaskHome::Project { project_root: root, project: name });
+    }
+    let mut tasks_list = tasks::scan_tasks(&homes).map_err(err)?;
+    // ken-families task 2.4 (spec MODIFIED "Hybrid homes with one aggregated
+    // board"): family boards attached to THIS workspace are a third home.
+    // `tasks::TaskHome` has no variant that reaches `<clone>/members/<me>/
+    // board/` — its `Project` arm always resolves to `<project_root>/.ken/
+    // tasks`, and `tasks.rs` is outside this task's touch-boundary to add a
+    // variant — so each attached board is scanned directly via
+    // `list_family_board_tasks`, which calls the SAME `tasks::parse_task`
+    // `tasks::list_tasks` itself uses (only the tiny non-recursive
+    // directory-listing glue is duplicated, not the frontmatter parser).
+    // Dedup by id like `tasks::scan_tasks` does, first-home-wins.
+    if ken_families_enabled(app_settings) {
+        for conn in family_connections(app_settings)
+            .into_iter()
+            .filter(|c| c.attached_workspace_id == Some(ws.config.id))
+        {
+            let clone_root = family_clone_root(base_dir, conn.family_id);
+            let board_dir = family::board_dir(&clone_root, &conn.member_id);
+            for task in list_family_board_tasks(&board_dir, &conn.name) {
+                if !tasks_list.iter().any(|t| t.id == task.id) {
+                    tasks_list.push(task);
+                }
+            }
+        }
+    }
+    let goals = tasks::list_goals(&ws.root).map_err(err)?;
+    Ok((tasks_list, goals))
+}
+
+fn board_state_dto(
+    ws: &ken_core::workspace::Workspace,
+    base_dir: &Path,
+    app_settings: &ken_core::settings::AppSettings,
+) -> CmdResult<BoardStateDto> {
+    let (tasks_list, goals) = task_homes_scan(ws, base_dir, app_settings)?;
+    let needs_attention = tasks::needs_attention(&tasks_list, &goals);
+    let progress = tasks::goal_progress_all(&tasks_list, &goals);
+    Ok(BoardStateDto { tasks: tasks_list, goals, needs_attention, progress })
+}
+
+/// Resolve a `task_create`/`resolve_daily_candidate` `project_id` argument
+/// into that member's root + display name. Errors (rather than silently
+/// falling back to the workspace home) on an id that doesn't parse or isn't
+/// a resolvable member — a caller-supplied id that goes nowhere should never
+/// silently redirect a task into a home the caller didn't ask for.
+fn resolve_member_home(ws: &ken_core::workspace::Workspace, project_id: &str) -> Result<(PathBuf, String), String> {
+    let uuid: uuid::Uuid = project_id.parse().map_err(err)?;
+    ws.members
+        .iter()
+        .find_map(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) if p.config.id == uuid => Some((p.root.clone(), m.name.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| format!("project '{project_id}' is not an open member of this workspace"))
+}
+
+/// The project id that owns a per-repo task home directory — used by
+/// `task_complete` (task 2.4) to pick the `ken://` host for the journal
+/// summary line (design D4: "the owning project's id for per-repo tasks").
+/// Matched by directory, not by the task's own `project:` frontmatter value,
+/// because that field can name anything (design: "a workspace-home task's
+/// `project` key... a per-repo task needs no `project` key") — only
+/// `task.home_dir` reliably identifies which member's `.ken/tasks/` a task
+/// actually lives in.
+fn owning_member_id(ws: &ken_core::workspace::Workspace, home_dir: &Path) -> Option<uuid::Uuid> {
+    ws.members.iter().find_map(|m| match &m.status {
+        ken_core::workspace::MemberStatus::Ok(p)
+            if tasks::project_tasks_dir(&p.root).as_path() == home_dir =>
+        {
+            Some(p.config.id)
+        }
+        _ => None,
+    })
+}
+
+/// Cheap non-cryptographic content hash (std `DefaultHasher`/SipHash — no
+/// new crate needed; this cache is runtime-only, never persisted or
+/// compared across a process restart, so SipHash's lack of a version
+/// guarantee doesn't matter). Used for both the poller's tick-to-tick
+/// snapshot and `AppState::task_recent_writes`'s self-write registry, so a
+/// command's freshly-written hash and the poller's next-observed hash are
+/// always computed the same way.
+fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+fn hash_file(path: &Path) -> Option<u64> {
+    std::fs::read(path).ok().map(|b| content_hash(&b))
+}
+
+/// A content-hash snapshot of every `.md` file directly inside every
+/// watched task/goal directory (task 2.1) — `workspace_tasks_dir`,
+/// `goals_dir`, and each resolvable member's `project_tasks_dir`. Listing is
+/// non-recursive, matching `list_tasks`'/`list_goals`' own semantics, so
+/// `archive/` subfolders are naturally excluded: an archived task leaving
+/// the flat listing shows up as a removal here, exactly like a delete would.
+/// A directory that doesn't exist yet (a per-repo home nobody has opted
+/// into, or `tasks/goals/` before the first goal) contributes nothing
+/// rather than erroring — same "missing folder reads as no tasks" tolerance
+/// `ken_core::tasks` itself uses.
+fn task_board_file_snapshot(ws: &ken_core::workspace::Workspace) -> std::collections::BTreeMap<PathBuf, u64> {
+    let mut dirs: Vec<PathBuf> = vec![tasks::workspace_tasks_dir(&ws.root), tasks::goals_dir(&ws.root)];
+    for m in &ws.members {
+        if let ken_core::workspace::MemberStatus::Ok(p) = &m.status {
+            dirs.push(tasks::project_tasks_dir(&p.root));
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for dir in &dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "md") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    out.insert(path, content_hash(&bytes));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Recompute the whole board and emit it app-global (mirrors
+/// `MemoryStateEvent`'s "app-global, not `emit_member`" choice — the board
+/// aggregates every home, with no single owning project). Best-effort: a
+/// scan error (e.g. a home vanishing mid-read) is logged and swallowed
+/// rather than crashing the poller or a mutating command's write path.
+/// Follows the snapshot-under-guard-then-drop discipline: the `AppState`
+/// lock is held only long enough to clone the resolved `Workspace`, never
+/// across the filesystem scan itself.
+fn emit_board_state(app: &AppHandle, state: &SharedState) {
+    let (ws, base_dir, app_settings) = {
+        let guard = state.lock().unwrap();
+        if !ken_tasks_enabled(&guard.app_settings) {
+            return;
+        }
+        match guard.workspace.as_ref() {
+            Some(w) => (w.ws.clone(), guard.base_dir.clone(), guard.app_settings.clone()),
+            None => return,
+        }
+    };
+    match board_state_dto(&ws, &base_dir, &app_settings) {
+        Ok(dto) => {
+            let _ = app.emit("board-state", dto);
+        }
+        Err(e) => eprintln!("warning: task board scan failed: {e}"),
+    }
+}
+
+/// Record that a mutating command just wrote (`expect_present`) or removed
+/// (archive/rollover-archive) `path`, then emit the fresh board immediately
+/// so the UI updates without waiting for the poller's next tick. See
+/// `spawn_task_board_watch`'s doc comment for how the poller consults this
+/// registry to skip a redundant second emit for the very same change.
+fn note_task_write_and_emit(app: &AppHandle, state: &SharedState, path: PathBuf, expect_present: bool) {
+    let recent_writes = { state.lock().unwrap().task_recent_writes.clone() };
+    let expect = if expect_present { hash_file(&path) } else { None };
+    recent_writes.lock().unwrap().insert(path, expect);
+    emit_board_state(app, state);
+}
+
+/// How often the task-board poller re-snapshots the watched directories
+/// (task 2.1). 1.2s: short enough that an external edit (agent-desktop, git
+/// pull, hand edit) feels close to live, long enough that scanning a
+/// workspace's task homes on every tick is free.
+const TASK_BOARD_POLL_INTERVAL: Duration = Duration::from_millis(1200);
+
+/// The task board's file watcher (task 2.1). `ken-core::watch` (the `notify`
+/// crate) is unavailable here on purpose: `notify` is a `ken-core`-only
+/// dependency, `src-tauri/Cargo.toml` has no direct dependency on it, and
+/// Cargo.toml is outside this task's touch-boundary — so this follows the
+/// SAME polling discipline `activate()`'s `.kenignore` watcher already
+/// uses (a plain sleep loop over a content-hash snapshot), just scoped to
+/// every task/goal directory in the open workspace instead of one file.
+/// Content hash, not mtime: Windows mtime granularity is too coarse to
+/// trust alone (the same reasoning `tasks::apply_edits`'s concurrency guard
+/// documents for its own fingerprint).
+///
+/// Runs for the open workspace's lifetime; `WorkspaceState::task_watch`
+/// (a `StopOnDrop`) stops it when the workspace closes or switches — no
+/// separate teardown call needed. Never spawned at all when `kenTasks`
+/// resolves off at workspace-open time (task 2.6: "off => no watchers").
+///
+/// **Self-write dedupe by content hash** (task 2.1's explicit ask): every
+/// mutating command writes its file, registers the resulting content hash
+/// (or `None` for a path it just made disappear) in
+/// `AppState::task_recent_writes`, and calls `emit_board_state` itself for
+/// instant feedback. Each tick here diffs the previous snapshot against the
+/// current one path-by-path; for every path that changed, the registry is
+/// consulted FIRST: a match means "a command already announced this exact
+/// change" — the entry is consumed (removed) and no second emit happens for
+/// it. Anything left unmatched — an agent's write, a hand edit, a `git
+/// pull`, or simply a command whose own emit hasn't landed yet — makes the
+/// whole tick "unexplained", which triggers exactly one recompute + emit
+/// covering every change observed that tick (batched, not per-path). This
+/// is deliberately per-path-content-hash rather than a single whole-board
+/// hash: it is what design.md's risk section means by "Ken's own writes
+/// come back as watcher events; the board model dedupes by content hash so
+/// self-writes are no-ops" — a *truly* no-op rewrite (byte-identical
+/// output) never even reaches this poller, because `tasks::apply_edits`
+/// itself skips writing when the patched text equals the original (see its
+/// doc comment); this registry handles the remaining case, a *real* write
+/// whose resulting content a command has already broadcast.
+fn spawn_task_board_watch(app: AppHandle, state: SharedState) -> StopOnDrop {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    std::thread::spawn(move || {
+        let mut last: std::collections::BTreeMap<PathBuf, u64> = {
+            let guard = state.lock().unwrap();
+            guard.workspace.as_ref().map(|w| task_board_file_snapshot(&w.ws)).unwrap_or_default()
+        };
+        while !stop_thread.load(Ordering::SeqCst) {
+            std::thread::sleep(TASK_BOARD_POLL_INTERVAL);
+            if stop_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            let (ws, recent_writes) = {
+                let guard = state.lock().unwrap();
+                (
+                    guard.workspace.as_ref().map(|w| w.ws.clone()),
+                    guard.task_recent_writes.clone(),
+                )
+            };
+            let Some(ws) = ws else {
+                continue; // no workspace open this tick (closing/switching) — try again
+            };
+            let current = task_board_file_snapshot(&ws);
+            if current == last {
+                continue;
+            }
+            let mut unexplained = false;
+            {
+                let mut writes = recent_writes.lock().unwrap();
+                for (path, hash) in &current {
+                    if last.get(path) != Some(hash) {
+                        if writes.get(path) == Some(&Some(*hash)) {
+                            writes.remove(path);
+                        } else {
+                            unexplained = true;
+                        }
+                    }
+                }
+                for path in last.keys() {
+                    if !current.contains_key(path) && writes.get(path) != Some(&None) {
+                        unexplained = true;
+                    }
+                    if !current.contains_key(path) {
+                        writes.remove(path);
+                    }
+                }
+            }
+            last = current;
+            if unexplained {
+                emit_board_state(&app, &state);
+            }
+        }
+    });
+    StopOnDrop(stop)
+}
+
+// ---------------------------------------------------------------------
+// ken-tasks task 2.2: task_create / task_list / task_update /
+// task_complete / task_archive / board_get / goal_create / goal_update /
+// goal_list. All flag-gated by `kenTasks` (task 2.6) and require an open
+// workspace (proposal: "kenTasks (workspace-level, requires workspace)").
+// ---------------------------------------------------------------------
+
+/// Create a task file (task 2.2). Home is the workspace default unless
+/// `project_id` names a resolvable member, in which case it lands in that
+/// member's `<project>/.ken/tasks/` (created on first write — task 2.6:
+/// "off => ... no folders created", so this is the only thing that ever
+/// creates the folder, and only when the flag is on).
+#[tauri::command]
+fn task_create(
+    app: AppHandle,
+    state: State<SharedState>,
+    title: String,
+    body: Option<String>,
+    fields: Option<tasks::TaskPatch>,
+    project_id: Option<String>,
+) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let today = local_date_today();
+    let new = tasks::NewTask {
+        id: None,
+        title,
+        body: body.unwrap_or_default(),
+        fields: fields.unwrap_or_default(),
+    };
+    let task = match &project_id {
+        Some(pid) => {
+            let (root, name) = resolve_member_home(&ws.ws, pid)?;
+            tasks::create_task(tasks::TaskHome::Project { project_root: &root, project: &name }, &new, &today)
+                .map_err(err)?
+        }
+        None => tasks::create_task(tasks::TaskHome::Workspace { workspace_root: &ws.ws.root }, &new, &today)
+            .map_err(err)?,
+    };
+    let path = task.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(task)
+}
+
+/// List tasks across every home, optionally filtered (task 2.2) — the same
+/// `TaskFilter`/`filter_tasks` the board UI, `task_list` (MCP), and the
+/// daily/goal views all share (design D4).
+#[tauri::command]
+fn task_list(state: State<SharedState>, filter: Option<tasks::TaskFilter>) -> CmdResult<Vec<tasks::Task>> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    Ok(match filter {
+        Some(f) => tasks::filter_tasks(&tasks_list, &f).into_iter().cloned().collect(),
+        None => tasks_list,
+    })
+}
+
+/// Patch a task by id (task 2.2) — drag-drop is `task_update(id, { status:
+/// ... })`, which through `apply_patch` rewrites only `status` + `updated`
+/// (spec: "drag-drop touches two keys").
+#[tauri::command]
+fn task_update(app: AppHandle, state: State<SharedState>, id: String, patch: tasks::TaskPatch) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let task = tasks::find_by_id(&tasks_list, &id).cloned().ok_or_else(|| format!("no task with id '{id}'"))?;
+    let today = local_date_today();
+    tasks::apply_patch(&task.path, &patch, &today).map_err(err)?;
+    let (tasks_list2, _g2) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let updated = tasks::find_by_id(&tasks_list2, &id).cloned().ok_or("task vanished after update")?;
+    let path = task.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(updated)
+}
+
+/// Complete a task (task 2.2): `tasks::complete_task` sets `done`, bumps
+/// `updated`, and appends `report` under `## Log`; then (task 2.4) — when
+/// `kenMemory` is on — a one-line journal summary is appended, cleanly
+/// skipped when it's off. The journal write is best-effort: a failure there
+/// is logged, not propagated, so the primary action (the task IS done, the
+/// log entry IS written) can't be undone by a secondary integration hiccup.
+#[tauri::command]
+fn task_complete(app: AppHandle, state: State<SharedState>, id: String, report: String) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let task = tasks::find_by_id(&tasks_list, &id).cloned().ok_or_else(|| format!("no task with id '{id}'"))?;
+    let today = local_date_today();
+    let time = local_time_hhmm();
+    tasks::complete_task(&task, &report, &today, &time).map_err(err)?;
+
+    if ken_memory_enabled(&guard.app_settings) {
+        let host = match task.home {
+            tasks::HomeKind::Workspace => memory::WORKSPACE_ADDRESS_ID.to_string(),
+            tasks::HomeKind::Project => owning_member_id(&ws.ws, &task.home_dir)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| memory::WORKSPACE_ADDRESS_ID.to_string()),
+        };
+        let line = tasks::journal_summary_line(&task, &host, &report);
+        if let Err(e) = memory::append_journal(&ws.ws.root, &line, None, &[], &today, &time) {
+            eprintln!("warning: task_complete journal summary failed: {e}");
+        }
+    }
+
+    let (tasks_list2, _g2) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let completed = tasks::find_by_id(&tasks_list2, &id).cloned().ok_or("task vanished after completion")?;
+    let path = task.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(completed)
+}
+
+/// Archive a task (task 2.2): moves the file to `<its own home>/archive/
+/// YYYY-MM/` (design D2). The returned `Task` is reparsed at its new path;
+/// reusing `task.project` (already resolved, explicit-or-defaulted) as the
+/// reparse's `default_project` is always correct — when the file's own
+/// `project:` key was explicit, the default is never consulted; when it was
+/// empty, `task.project` already equals what the default would resolve to
+/// again.
+#[tauri::command]
+fn task_archive(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let task = tasks::find_by_id(&tasks_list, &id).cloned().ok_or_else(|| format!("no task with id '{id}'"))?;
+    let today = local_date_today();
+    let archived_path = tasks::archive_task(&task, &today).map_err(err)?;
+    let raw = std::fs::read_to_string(&archived_path).map_err(err)?;
+    let archived = tasks::parse_task(&archived_path, task.home, &task.project, &raw);
+    let old_path = task.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), old_path, false);
+    Ok(archived)
+}
+
+/// The whole board on demand (task 2.2) — the Tasks tab's initial load and
+/// manual-refresh path; live updates after that arrive via `board-state`.
+#[tauri::command]
+fn board_get(state: State<SharedState>) -> CmdResult<BoardStateDto> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    board_state_dto(&ws.ws, &guard.base_dir, &guard.app_settings)
+}
+
+/// Create a goal (task 2.2 / design D7) — always the workspace home; goals
+/// have no per-repo counterpart.
+#[tauri::command]
+fn goal_create(
+    app: AppHandle,
+    state: State<SharedState>,
+    title: String,
+    body: Option<String>,
+    status: Option<tasks::GoalStatus>,
+) -> CmdResult<tasks::Goal> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let today = local_date_today();
+    let new = tasks::NewGoal { id: None, title, body: body.unwrap_or_default(), status };
+    let goal = tasks::create_goal(&ws.ws.root, &new, &today).map_err(err)?;
+    let path = goal.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(goal)
+}
+
+/// Patch a goal by id (task 2.2) — title and/or status only (`GoalPatch`);
+/// same never-rewrite-an-unrecognized-status guard as tasks.
+#[tauri::command]
+fn goal_update(app: AppHandle, state: State<SharedState>, id: String, patch: tasks::GoalPatch) -> CmdResult<tasks::Goal> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let goals = tasks::list_goals(&ws.ws.root).map_err(err)?;
+    let goal = goals.iter().find(|g| g.id == id).cloned().ok_or_else(|| format!("no goal with id '{id}'"))?;
+    let today = local_date_today();
+    tasks::apply_goal_patch(&goal.path, &patch, &today).map_err(err)?;
+    let goals2 = tasks::list_goals(&ws.ws.root).map_err(err)?;
+    let updated = goals2.into_iter().find(|g| g.id == id).ok_or("goal vanished after update")?;
+    let path = goal.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(updated)
+}
+
+/// List every goal in the workspace home (task 2.2).
+#[tauri::command]
+fn goal_list(state: State<SharedState>) -> CmdResult<Vec<tasks::Goal>> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    tasks::list_goals(&ws.ws.root).map_err(err)
+}
+
+// ---------------------------------------------------------------------
+// ken-tasks task 2.3: daily-board proposals (plan_daily_tasks /
+// resolve_daily_candidate) and new-day rollover (daily_rollover_candidates
+// / resolve_daily_rollover). Mirrors ken-memory's distill/resolve shape
+// (design D5's own cross-reference: "same propose/approve pattern as
+// memory promotion").
+//
+// Scope note: design D5 names the trigger "on request ('plan my day')" —
+// recognizing that phrase in a chat message is `chat.rs`/frontend wiring,
+// outside src-tauri's touch-boundary for this phase (and outside this
+// task's checklist, which only lists src-tauri commands). `plan_daily_
+// tasks` is the command that surface is expected to call; nothing here
+// runs on its own.
+// ---------------------------------------------------------------------
+
+/// One drafted daily-board candidate (design D5). Not yet a file — `key` is
+/// a run-local handle (`slugify(title)`, deduped within the run) so
+/// `resolve_daily_candidate` can approve/dismiss by name alone, mirroring
+/// `memory::DistillCandidate::slug`'s role.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DailyCandidate {
+    key: String,
+    title: String,
+    body: String,
+    project: Option<String>,
+    tags: Vec<String>,
+}
+
+/// Payload for the `daily-plan-state` event, mirroring `MemoryStateEvent`'s
+/// shape and app-global choice (a planning run reads the whole workspace
+/// journal plus every resident member's recent activity, with no single
+/// owning project).
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum DailyPlanStateEvent {
+    Planning,
+    Ready { candidates: Vec<DailyCandidate> },
+    Error { reason: String },
+}
+
+const MAX_DAILY_CANDIDATES: usize = 5;
+
+/// The `plan_daily_tasks` prompt (design D5): recent journal content (when
+/// `kenMemory` is on — off, this section just reads "none" rather than
+/// failing, since ken-tasks "functions without" ken-memory per design's
+/// Context) plus each resident member's recent finished-ingest summaries,
+/// asking for at most `MAX_DAILY_CANDIDATES` small, day-sized items. Same
+/// prose-then-JSON shape as `memory::compose_distill_prompt` so the same
+/// tolerant parse strategy applies.
+fn compose_daily_prompt(journal_recent: &str, recent_activity: &[String]) -> String {
+    let mut p = String::from(
+        "You are Ken, helping plan today's daily task board. Read the recent \
+journal notes and recent project activity below and propose AT MOST 5 \
+small, day-sized task candidates — quick things to do or discuss today, \
+not deep work. When nothing stands out, propose nothing.\n\n",
+    );
+    p.push_str("Recent journal:\n");
+    p.push_str(if journal_recent.trim().is_empty() { "- none\n" } else { journal_recent });
+    p.push_str("\nRecent project activity:\n");
+    if recent_activity.is_empty() {
+        p.push_str("- none\n");
+    } else {
+        for line in recent_activity {
+            p.push_str(&format!("- {line}\n"));
+        }
+    }
+    p.push_str(
+        "\nRespond with ONLY a JSON object of this shape:\n\
+{\"candidates\":[{\"title\":\"...\",\"body\":\"...\",\"project\":\"...\",\"tags\":[\"...\"]}]}\n\
+`project` and `tags` are optional — omit or leave empty when not applicable.\n",
+    );
+    p
+}
+
+/// Tolerant parse of the daily-plan LLM output, same shape as
+/// `memory::parse_distill_candidates`. Assigns each candidate a `key`
+/// (`slugify(title)`, deduped within this batch with a `-2`, `-3`, …
+/// suffix) since the raw JSON carries no id of its own.
+fn parse_daily_candidates(raw: &str) -> Vec<DailyCandidate> {
+    let Some(start) = raw.find('{') else { return Vec::new() };
+    let Some(end) = raw.rfind('}').filter(|e| *e > start) else { return Vec::new() };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
+        return Vec::new();
+    };
+    let empty = Vec::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in value["candidates"].as_array().unwrap_or(&empty) {
+        if out.len() >= MAX_DAILY_CANDIDATES {
+            break;
+        }
+        let title = item["title"].as_str().unwrap_or("").trim().to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let body = item["body"].as_str().unwrap_or("").trim().to_string();
+        let project = item["project"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let tags: Vec<String> = item["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let base = tasks::slugify(&title);
+        let mut key = base.clone();
+        let mut n = 2;
+        while used.contains(&key) {
+            key = format!("{base}-{n}");
+            n += 1;
+        }
+        used.insert(key.clone());
+        out.push(DailyCandidate { key, title, body, project, tags });
+    }
+    out
+}
+
+/// Draft daily-board candidates on demand (task 2.3 / design D5:
+/// "Population: on request... and only then — nothing autonomous").
+#[tauri::command]
+fn plan_daily_tasks(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    let (ws_root, kenmem_on, recent_activity, running, candidates_slot) = {
+        let guard = state.lock().unwrap();
+        if !ken_tasks_enabled(&guard.app_settings) {
+            return Err(KEN_TASKS_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let ws_root = ws.ws.root.clone();
+        let pseudo_id = memory::workspace_pseudo_member_id(ws.ws.config.id);
+        // Recent ingest activity (design D5): only resident members have an
+        // open `Db` to query — a dormant member's history isn't worth
+        // activating it just for a nice-to-have prompt input.
+        let since = engine::now_epoch() - 24 * 3600;
+        let mut activity = Vec::new();
+        for (id, rt) in guard.members.iter() {
+            if *id == pseudo_id {
+                continue;
+            }
+            let name = ws.member_name(*id).unwrap_or_else(|| rt.project.config.name.clone());
+            if let Ok(runs) = rt.db.runs_finished_since(since) {
+                for run in runs.into_iter().filter(|r| r.status == "fresh") {
+                    let summary = run.summary.unwrap_or_else(|| format!("{} ingest completed", run.slug));
+                    activity.push(format!("{name}: {summary}"));
+                }
+            }
+        }
+        (
+            ws_root,
+            ken_memory_enabled(&guard.app_settings),
+            activity,
+            guard.daily_plan_running.clone(),
+            guard.daily_plan_candidates.clone(),
+        )
+    };
+    if running.swap(true, Ordering::SeqCst) {
+        return Err("a daily-planning run is already in progress".into());
+    }
+
+    let _ = app.emit("daily-plan-state", DailyPlanStateEvent::Planning);
+    let bg_app = app.clone();
+    std::thread::spawn(move || {
+        let outcome = (|| -> Result<Vec<DailyCandidate>, String> {
+            let journal_recent = if kenmem_on {
+                let dir = memory::journal_dir(&ws_root);
+                let archive_dir = memory::journal_archive_dir(&ws_root);
+                let today = chrono::Local::now().date_naive();
+                let mut text = String::new();
+                for i in 0..2i64 {
+                    let date = today - chrono::Duration::days(i);
+                    let name = date.format("%Y-%m-%d").to_string();
+                    let in_current = dir.join(format!("{name}.md"));
+                    let path = if in_current.is_file() { in_current } else { archive_dir.join(format!("{name}.md")) };
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        text.push_str(&format!("## {name}\n{}\n\n", content.trim()));
+                    }
+                }
+                text
+            } else {
+                String::new()
+            };
+            let prompt = compose_daily_prompt(&journal_recent, &recent_activity);
+            let raw = ken_core::local_llm::generate_stream(
+                &prompt,
+                ken_core::local_llm::Priority::Background,
+                &mut |_tok| true,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(parse_daily_candidates(&raw))
+        })();
+
+        match outcome {
+            Ok(candidates) => {
+                *candidates_slot.lock().unwrap() = candidates.clone();
+                let _ = bg_app.emit("daily-plan-state", DailyPlanStateEvent::Ready { candidates });
+            }
+            Err(reason) => {
+                let _ = bg_app.emit("daily-plan-state", DailyPlanStateEvent::Error { reason });
+            }
+        }
+        running.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// Approve or dismiss a daily-plan candidate by `key` (task 2.3). Approve
+/// creates a `board: daily` task file via the same `create_task` core as
+/// `task_create` (workspace home, or a member's home when `project_id`
+/// names one); dismiss just drops it from the cache.
+///
+/// Judgment call: unlike `resolve_distill_candidate`'s dismiss, this keeps
+/// no durable "don't re-propose" record. Design's daily-board rules specify
+/// only on-request population and a rollover ritual — no dedupe-across-runs
+/// contract like distillation's — so a dismissed candidate simply won't
+/// reappear until the next `plan_daily_tasks` run drafts something new
+/// (which, being a fresh LLM pass over the current journal/activity window,
+/// rarely repeats a just-dismissed item verbatim anyway). Simpler than
+/// piggy-backing on the pseudo-member's `UserState::ignored`, and nothing
+/// in the spec asks for it.
+#[tauri::command]
+fn resolve_daily_candidate(
+    app: AppHandle,
+    state: State<SharedState>,
+    key: String,
+    approve: bool,
+    project_id: Option<String>,
+) -> CmdResult<Option<tasks::Task>> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let candidate = {
+        let mut slot = guard.daily_plan_candidates.lock().unwrap();
+        let found = slot.iter().position(|c| c.key == key);
+        found.map(|i| slot.remove(i))
+    };
+    if !approve {
+        return Ok(None);
+    }
+    let candidate = candidate
+        .ok_or_else(|| format!("no pending daily candidate named '{key}' — run plan_daily_tasks again"))?;
+    let today = local_date_today();
+    let new = tasks::NewTask {
+        id: None,
+        title: candidate.title,
+        body: candidate.body,
+        fields: tasks::TaskPatch {
+            board: Some(tasks::BoardKind::Daily),
+            project: candidate.project.clone(),
+            tags: Some(candidate.tags),
+            ..Default::default()
+        },
+    };
+    let task = match &project_id {
+        Some(pid) => {
+            let (root, name) = resolve_member_home(&ws.ws, pid)?;
+            tasks::create_task(tasks::TaskHome::Project { project_root: &root, project: &name }, &new, &today)
+                .map_err(err)?
+        }
+        None => tasks::create_task(tasks::TaskHome::Workspace { workspace_root: &ws.ws.root }, &new, &today)
+            .map_err(err)?,
+    };
+    let path = task.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(Some(task))
+}
+
+/// Daily tasks eligible for the new-day rollover prompt (task 2.3 / design
+/// D5) — `board: daily`, not done, `updated` before today. Purely derived
+/// from a fresh scan; nothing is written or cached, so calling this
+/// repeatedly (e.g. the frontend re-checking after each resolution) is
+/// always safe and self-correcting: a task the user just rolled/promoted/
+/// archived simply won't be in the next call's result.
+#[tauri::command]
+fn daily_rollover_candidates(state: State<SharedState>) -> CmdResult<Vec<tasks::Task>> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let today = local_date_today();
+    Ok(tasks::rollover_candidates(&tasks_list, &today).into_iter().cloned().collect())
+}
+
+/// Apply one task's rollover resolution (task 2.3): roll (bump `updated`
+/// only, staying on the daily board), promote (`board: main`), or archive.
+/// Never auto-called — the frontend drives one call per task per design
+/// D5's "each gets an independent roll / promote / archive choice".
+///
+/// Judgment call on the "first open of a new day" trigger (design D5): this
+/// phase adds no persisted "last rollover check" marker. `open_workspace_
+/// inner` doesn't push a rollover prompt of its own; instead, `daily_
+/// rollover_candidates` is naturally empty once every stale task has been
+/// resolved (`Roll` bumps `updated` to today, `Promote`/`Archive` remove it
+/// from the daily board entirely), so a frontend that calls it once per
+/// workspace-open gets the "first open of the day" behavior for free in the
+/// common one-open-per-day case, without src-tauri needing to track dates
+/// itself. A user who reopens the same workspace multiple times in one day
+/// without resolving the prompt will see it resurface each time — a safe
+/// (if mildly repetitive) default, not a nag that can lose data.
+#[tauri::command]
+fn resolve_daily_rollover(
+    app: AppHandle,
+    state: State<SharedState>,
+    id: String,
+    choice: tasks::Rollover,
+) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_tasks_enabled(&guard.app_settings) {
+        return Err(KEN_TASKS_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals) = task_homes_scan(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let task = tasks::find_by_id(&tasks_list, &id).cloned().ok_or_else(|| format!("no task with id '{id}'"))?;
+    let today = local_date_today();
+    let new_path = tasks::apply_rollover(&task, choice, &today).map_err(err)?;
+    let raw = std::fs::read_to_string(&new_path).map_err(err)?;
+    let resolved = tasks::parse_task(&new_path, task.home, &task.project, &raw);
+    let stayed = new_path == task.path;
+    let old_path = task.path.clone();
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), old_path, stayed);
+    Ok(resolved)
+}
+
 /// The incremental-Map worker: one per open project. Loops draining the
 /// extraction queue while the local model is ready, emitting a throttled
 /// `knowledge-updated` after each merged file. Every wait is short so a newly
@@ -8535,6 +9555,1027 @@ fn refresh_ken_mcp() {
     }
 }
 
+// ---------------------------------------------------------------------
+// ken-families tasks 2.1-2.6: connection store, clone/create/join, poll
+// scheduler, accept/dismiss, attach-to-workspace. All gated by
+// `kenFamilies` (task 2.6) — every command below checks `ken_families_
+// enabled` first and returns `KEN_FAMILIES_DISABLED_MSG` when it's off,
+// mirroring `KEN_TASKS_DISABLED_MSG`'s role for ken-tasks.
+// ---------------------------------------------------------------------
+
+/// One family connection (task 2.1): remote URL, which manifest member this
+/// device is, the live-sync toggle, poll interval, and an optional attached
+/// workspace.
+///
+/// **Storage judgment call**: `AppSettings` (`crates/ken-core/src/
+/// settings.rs`) has exactly one structured field (`features`) plus a
+/// flattened `extra` forward-compat map — there is no typed home for a list
+/// of connections, and adding one means editing `settings.rs`, which is
+/// outside this task's touch-boundary (owned by another session). So
+/// connections live wholesale as one JSON array under `AppSettings::extra
+/// ["familyConnections"]` (`family_connections`/`save_family_connections`
+/// below) — riding the SAME channel `extra`'s own doc comment describes
+/// ("forward-compat passthrough for keys this build doesn't know about"),
+/// just repurposed as *this* build's actual storage for a key `settings.rs`
+/// itself never models. This is honest, not a hack: `extra` round-trips
+/// unknown keys byte-for-byte specifically so a capability like this one can
+/// use it as a durable home without waiting on a `settings.rs` change.
+/// Trade-off recorded: reads/writes are all-or-nothing (`serde_json::from_
+/// value::<Vec<FamilyConnection>>` fails wholesale on any one malformed
+/// entry, unlike a corrupt individual inbox item which only ever affects
+/// itself) — accepted because this file is Ken-written only, never hand-
+/// edited or shared with a teammate, so the corruption surface is far
+/// smaller than the family repo's own per-file tolerance guarantees.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FamilyConnection {
+    family_id: uuid::Uuid,
+    /// The manifest's own `name`, cached here so the settings page and the
+    /// Tasks-tab filter chip don't need a manifest read just to label a
+    /// connection; `family_manifest_get` is still the source of truth for
+    /// the member roster.
+    name: String,
+    remote_url: String,
+    /// Which manifest member id THIS device is (D5).
+    member_id: String,
+    #[serde(default)]
+    live_sync: bool,
+    #[serde(default = "default_family_poll_interval_secs")]
+    poll_interval_secs: u64,
+    #[serde(default)]
+    attached_workspace_id: Option<uuid::Uuid>,
+}
+
+/// Design.md D1: "every `poll_interval` (default 120s)".
+fn default_family_poll_interval_secs() -> u64 {
+    120
+}
+
+/// Design.md D1 open question: "Poll interval default: 120s (bounds
+/// 30s–30min)".
+const FAMILY_POLL_INTERVAL_MIN_SECS: u64 = 30;
+const FAMILY_POLL_INTERVAL_MAX_SECS: u64 = 1800;
+
+/// Read every saved connection from `AppSettings::extra["familyConnections"]`
+/// — see `FamilyConnection`'s doc comment for why this key, not a typed
+/// field, is the storage channel. Missing key or malformed JSON reads as no
+/// connections (same "corrupt file loads as defaults" tolerance `AppSettings
+/// ::load` itself uses), never a panic or an error the caller has to handle.
+fn family_connections(app_settings: &ken_core::settings::AppSettings) -> Vec<FamilyConnection> {
+    app_settings
+        .extra
+        .get("familyConnections")
+        .and_then(|v| serde_json::from_value::<Vec<FamilyConnection>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the full connection list and refresh `AppState::app_settings` to
+/// match — same "write succeeds, then update the in-memory copy" ordering
+/// `set_global_feature` uses, so a failed save never leaves disk and memory
+/// disagreeing.
+fn save_family_connections(state: &SharedState, connections: Vec<FamilyConnection>) -> CmdResult<()> {
+    let (base_dir, mut settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    let value = serde_json::to_value(&connections).map_err(err)?;
+    settings.extra.insert("familyConnections".to_string(), value);
+    settings.save(&base_dir).map_err(err)?;
+    state.lock().unwrap().app_settings = settings;
+    Ok(())
+}
+
+fn find_family_connection(
+    app_settings: &ken_core::settings::AppSettings,
+    family_id: uuid::Uuid,
+) -> CmdResult<FamilyConnection> {
+    family_connections(app_settings)
+        .into_iter()
+        .find(|c| c.family_id == family_id)
+        .ok_or_else(|| format!("no family connection '{family_id}'"))
+}
+
+/// `<app data>/ken/families/<family-id>/` (design D1) — `base_dir` here IS
+/// `<app data>/ken` already (`ken_core::registry::default_base_dir` joins
+/// `"ken"` onto the OS data dir), so this is just one more join.
+fn family_clone_root(base_dir: &Path, family_id: uuid::Uuid) -> PathBuf {
+    base_dir.join("families").join(family_id.to_string())
+}
+
+/// Run `git` directly for the one-time steps that happen *before* a
+/// `family_sync::SystemGit` transport exists — `git init`/`git clone`/`git
+/// remote add` (task 2.2). `family_sync.rs` deliberately has no seam for
+/// these: D1 pins `SystemGit` to driving an *already-cloned* working tree,
+/// so getting that tree onto disk in the first place is this task's own
+/// small helper — using the same prompt-suppression env vars `family_sync::
+/// SystemGit::run` uses (S8 Q4) so a spawned `git` never hangs on a
+/// credential prompt here either.
+///
+/// Unlike `family_sync`'s own (private) `short_detail` — a settings-page
+/// summary line, trimmed and capped at 400 chars — this surfaces stderr
+/// **verbatim** (task 2.2: "surfacing git stderr verbatim on failure"): an
+/// auth failure or a "repository not found" during create/join is exactly
+/// the message the user needs to read in full, not a summary.
+fn family_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    let out = cmd
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.trim().is_empty() {
+            Err(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(stderr.into_owned())
+        }
+    }
+}
+
+/// A fresh `SyncEngine`'s starting state for a clone already on disk (task
+/// 2.3): `Unavailable` when `git` itself is missing, or when the manifest
+/// declares a `template` newer than this Ken supports (spec: "needs a newer
+/// Ken... no sync, ingest, or write runs against the clone"); `Idle`
+/// otherwise. Called once per family id, the first time anything asks for
+/// its engine (`family_engine_handle`) — including after a process restart,
+/// since `AppState::family_engines` starts empty every run.
+fn family_engine_initial_state(clone_root: &Path) -> family_sync::SyncEngine {
+    if let Err(reason) = family_sync::git_available() {
+        return family_sync::SyncEngine::unavailable(reason);
+    }
+    match FamilyManifest::load(clone_root) {
+        Ok(m) => match m.check_supported() {
+            Ok(()) => family_sync::SyncEngine::new(),
+            Err(e) => family_sync::SyncEngine::unavailable(e.to_string()),
+        },
+        Err(e) => family_sync::SyncEngine::unavailable(err(e)),
+    }
+}
+
+/// The one `SyncEngine` instance for a family id, created on first touch and
+/// shared by the poll loop and every on-demand command thereafter — see
+/// `AppState::family_engines`'s doc comment for why a fresh engine per call
+/// would be wrong (it would lose `Conflict`/`Unavailable` between ticks).
+fn family_engine_handle(
+    state: &SharedState,
+    family_id: uuid::Uuid,
+    clone_root: &Path,
+) -> Arc<Mutex<family_sync::SyncEngine>> {
+    let engines = { state.lock().unwrap().family_engines.clone() };
+    let mut map = engines.lock().unwrap();
+    map.entry(family_id)
+        .or_insert_with(|| Arc::new(Mutex::new(family_engine_initial_state(clone_root))))
+        .clone()
+}
+
+/// Non-recursive `.md` listing of one inbox directory, sorted by filename,
+/// each parsed via `family::parse_inbox_item` (which never fails — a
+/// malformed file just comes back with `malformed: true`, per D4). Plain
+/// `std::fs` reads, not `GitTransport::read`: listing/parsing is read-only
+/// and never dirties the working tree, so it doesn't need a transport
+/// instance (which also does a remote/branch probe on construction) at all
+/// — only writes go through `GitTransport` in this file.
+fn list_inbox_items(dir: &Path) -> Vec<(PathBuf, family::InboxItem)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let file_name = path.file_name()?.to_string_lossy().to_string();
+            Some((path.clone(), family::parse_inbox_item(&file_name, &raw)))
+        })
+        .collect()
+}
+
+/// Non-recursive `.md` scan of one family board directory (task 2.4), sorted
+/// by filename — the exact listing shape `tasks::list_tasks` uses for its
+/// own `TaskHome::Project` arm, duplicated here only because a family board
+/// isn't reachable through any `TaskHome` variant (see `task_homes_scan`'s
+/// doc comment). The frontmatter parser itself is NOT duplicated —
+/// `tasks::parse_task` (the same function `list_tasks` calls) does that, so
+/// a family board task parses byte-for-byte like a per-repo one.
+/// `HomeKind::Project` is reused rather than inventing a `HomeKind::Family`
+/// (also outside this task's touch-boundary); `project_label` (the family's
+/// display name) fills the same `default_project` role a real project's
+/// name would.
+fn list_family_board_tasks(dir: &Path, project_label: &str) -> Vec<tasks::Task> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let raw = std::fs::read_to_string(&path).ok()?;
+            Some(tasks::parse_task(&path, tasks::HomeKind::Project, project_label, &raw))
+        })
+        .collect()
+}
+
+/// `created`/`updated` timestamps for inbox items (D4: "iso datetime"),
+/// unlike tasks' plain `YYYY-MM-DD` `local_date_today` — the first place in
+/// this codebase that needs a full timestamp rather than a date.
+fn iso_datetime_now() -> String {
+    chrono::Local::now().to_rfc3339()
+}
+
+/// One connection's resolved state, as the (future) Families settings page
+/// reads it: the saved settings half plus the live `SyncEngine` state.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FamilyConnectionDto {
+    connection: FamilyConnection,
+    state: family_sync::ConnectionState,
+}
+
+/// The `family-sync` app event (task 2.3: "emits events for new inbox
+/// items, board changes, sync errors"), emitted app-global after every poll
+/// tick and every on-demand command that touches the transport — mirrors
+/// `board-state`'s own "app-global, no single owning project" choice.
+/// `unread_inbox_count` is the mechanism for "new inbox items": rather than
+/// a stateful tick-to-tick diff (out of scope for this task's poll-loop
+/// shape), the frontend diffs successive counts itself — simple, and
+/// correct for the common case (a) since the tray never removes items
+/// except via this device's own accept/dismiss actions, which already know
+/// what changed locally. "Board changes" for this device's OWN board are
+/// covered by `emit_board_state` (called alongside this event whenever a
+/// workspace has this connection attached), since board sync only ever
+/// affects this device's own board file in the rare cross-device case (D1:
+/// "one clone per device").
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FamilySyncEvent {
+    family_id: uuid::Uuid,
+    report: family_sync::SyncReport,
+    unread_inbox_count: usize,
+}
+
+fn emit_family_sync(
+    app: &AppHandle,
+    family_id: uuid::Uuid,
+    report: &family_sync::SyncReport,
+    clone_root: &Path,
+    member_id: &str,
+) {
+    let unread = list_inbox_items(&family::inbox_dir(clone_root, member_id))
+        .into_iter()
+        .filter(|(_, item)| item.status == Some(family::InboxStatus::Unread))
+        .count();
+    let _ = app.emit(
+        "family-sync",
+        FamilySyncEvent { family_id, report: report.clone(), unread_inbox_count: unread },
+    );
+}
+
+/// Per-connection poll timer (task 2.3), mirroring `spawn_task_board_watch`'s
+/// one-thread-per-resource shape. Sleeps in short slices so a stop request
+/// (dropping the `StopOnDrop` in `AppState::family_pollers`) lands within a
+/// fraction of a second rather than after a full (up to 30-minute) interval.
+/// Rechecks `kenFamilies` every tick rather than trusting the thread's own
+/// existence to imply the flag is on: `reconcile_family_pollers` stops every
+/// poller outright when the flag goes off, but a tick already mid-sleep when
+/// that happens finishes its current wait first — this guard turns that race
+/// into a no-op tick instead of one extra git process, honoring "off => no
+/// git process runs" even in that narrow window.
+fn spawn_family_poll(
+    app: AppHandle,
+    state: SharedState,
+    family_id: uuid::Uuid,
+    clone_root: PathBuf,
+    engine: Arc<Mutex<family_sync::SyncEngine>>,
+    interval: Duration,
+) -> StopOnDrop {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    std::thread::spawn(move || {
+        let slice = Duration::from_millis(500);
+        'outer: loop {
+            let mut waited = Duration::ZERO;
+            while waited < interval {
+                if stop_thread.load(Ordering::SeqCst) {
+                    break 'outer;
+                }
+                std::thread::sleep(slice);
+                waited += slice;
+            }
+            if !ken_families_enabled(&state.lock().unwrap().app_settings) {
+                continue;
+            }
+            let member_id = {
+                let guard = state.lock().unwrap();
+                family_connections(&guard.app_settings)
+                    .into_iter()
+                    .find(|c| c.family_id == family_id)
+                    .map(|c| c.member_id)
+            };
+            let Some(member_id) = member_id else {
+                // The connection was removed since this poller was started;
+                // `reconcile_family_pollers` will drop this thread's
+                // `StopOnDrop` shortly, but there's no reason to keep
+                // polling a clone nobody's tracking anymore.
+                break;
+            };
+            let Ok(mut transport) = SystemGit::open(&clone_root) else { continue };
+            let report = { engine.lock().unwrap().poll(&mut transport) };
+            emit_family_sync(&app, family_id, &report, &clone_root, &member_id);
+            emit_board_state(&app, &state);
+        }
+    });
+    StopOnDrop(stop)
+}
+
+/// Reconcile the running per-connection poll timers (task 2.3) against the
+/// `kenFamilies` flag and each connection's own `liveSync` toggle. Called
+/// after every mutation that could change either input — `set_global_
+/// feature`, `family_create`/`family_join`, `family_remove`, `family_set_
+/// live_sync`, `family_set_poll_interval` — rather than threading
+/// incremental start/stop calls through each call site individually.
+fn reconcile_family_pollers(app: &AppHandle, state: &SharedState) {
+    let (base_dir, settings, pollers) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone(), guard.family_pollers.clone())
+    };
+    let wanted: Vec<FamilyConnection> = if ken_families_enabled(&settings) {
+        family_connections(&settings).into_iter().filter(|c| c.live_sync).collect()
+    } else {
+        Vec::new()
+    };
+    let wanted_ids: std::collections::HashSet<uuid::Uuid> = wanted.iter().map(|c| c.family_id).collect();
+    let mut map = pollers.lock().unwrap();
+    // Dropping a `StopOnDrop` here stops its thread — no separate teardown
+    // call needed, same as `WorkspaceState::task_watch`.
+    map.retain(|id, _| wanted_ids.contains(id));
+    for conn in wanted {
+        if map.contains_key(&conn.family_id) {
+            continue;
+        }
+        let clone_root = family_clone_root(&base_dir, conn.family_id);
+        let engine = family_engine_handle(state, conn.family_id, &clone_root);
+        let secs = conn.poll_interval_secs.clamp(FAMILY_POLL_INTERVAL_MIN_SECS, FAMILY_POLL_INTERVAL_MAX_SECS);
+        let stop =
+            spawn_family_poll(app.clone(), state.clone(), conn.family_id, clone_root, engine, Duration::from_secs(secs));
+        map.insert(conn.family_id, stop);
+    }
+}
+
+/// Ingest a family clone as a `kind: family` search member (task 2.5, D6):
+/// a real `Project` rooted at the clone directory itself, project id = the
+/// manifest id (so `ken://<family-id>/<rel-path>` addressing falls out of
+/// the existing per-project addressing for free), with the family-scoped
+/// tier rules (1.6) written out as a generated `.kenignore` through the SAME
+/// disk-read channel `activate_memory_pseudo_member` established
+/// (`render_builtin_kenignore` -> `Project::kenignore_rules()` ->
+/// `scan::scan`). Required here because `family::family_builtin_rules()` is
+/// deliberately NOT folded into `kenignore::built_in_rule_sets()` (1.6's own
+/// note: that hook is parameterless and would leak `members/**`/
+/// `shared/**` tiers onto every ordinary project). The generated file is
+/// never staged by any `PendingWrite`, so it's never committed — `write_
+/// and_commit` only ever `git add`s the exact paths it's given (never
+/// `-A`), matching the "no-human repo" guarantee.
+///
+/// Judgment call, same one `activate_memory_pseudo_member`'s doc comment
+/// records: this reuses `activate()` unchanged rather than a bespoke slim
+/// spin-up path, for the same reason (it's the one function that wires a
+/// complete, correctly-wired `MemberRuntime`). Same accepted side effects
+/// too (a harmless chat drawer nobody opens; a `Registry` entry).
+fn activate_family_pseudo_member(
+    app: &AppHandle,
+    state: &SharedState,
+    conn: &FamilyConnection,
+) -> CmdResult<()> {
+    let base_dir = { state.lock().unwrap().base_dir.clone() };
+    let clone_root = family_clone_root(&base_dir, conn.family_id);
+    let manifest = FamilyManifest::load(&clone_root).map_err(err)?;
+
+    let project = if ken_core::project::config_path(&clone_root).exists() {
+        Project::open(&clone_root).map_err(err)?
+    } else {
+        let config = ken_core::project::ProjectConfig {
+            name: format!("Family: {}", manifest.name),
+            id: conn.family_id,
+            excluded: Vec::new(),
+            features: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
+        };
+        let project = Project { root: clone_root.clone(), config };
+        project.save().map_err(err)?;
+        project
+    };
+
+    let kenignore_path = clone_root.join(".kenignore");
+    let text = render_builtin_kenignore(&family::family_builtin_rules());
+    if let Err(e) = std::fs::write(&kenignore_path, text) {
+        eprintln!("warning: failed to write family pseudo-member .kenignore: {e}");
+    }
+
+    activate(app, state, project, false)?;
+    Ok(())
+}
+
+/// Create a new family repo (task 2.2): scaffold the template (1.7) and
+/// commit + push it into a brand-new local repo whose remote is
+/// `remote_url` — an empty repo the user already created on their git host
+/// (this command only ever creates the local clone and its first commit/
+/// push; design.md draws the hosting line at "whatever remote the team
+/// already uses works"). The creating user becomes the family's first —
+/// and therefore owner (D3: "the manifest's first member") — member.
+#[tauri::command]
+fn family_create(
+    state: State<SharedState>,
+    name: String,
+    member_name: String,
+    remote_url: String,
+) -> CmdResult<FamilyConnectionDto> {
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    if let Err(reason) = family_sync::git_available() {
+        return Err(format!("git is unavailable: {reason}"));
+    }
+    let remote_url = remote_url.trim().to_string();
+    if remote_url.is_empty() {
+        return Err("a family needs a remote URL — create an empty repo on your git host first".into());
+    }
+    let member_id = family::normalize_member_id(&member_name).map_err(err)?;
+    let owner = FamilyMember::new(member_id.clone(), member_name.trim());
+    let family_id = uuid::Uuid::new_v4();
+    let members = vec![owner];
+    let files = family::scaffold_family(&name, family_id, &members).map_err(err)?;
+
+    let clone_root = family_clone_root(&base_dir, family_id);
+    std::fs::create_dir_all(&clone_root).map_err(err)?;
+    let clone_root_str = clone_root.to_string_lossy().to_string();
+    let cfg = family_sync::clone_config_args();
+    let mut init_args: Vec<&str> = cfg.iter().map(String::as_str).collect();
+    init_args.extend(["init", "--initial-branch=main", &clone_root_str]);
+    family_git(None, &init_args)?;
+    family_git(Some(&clone_root), &["remote", "add", "origin", &remote_url])?;
+
+    let mut transport = SystemGit::new(&clone_root, "origin", "main");
+    transport.configure_clone().map_err(err)?;
+    let writes: Vec<PendingWrite> =
+        files.into_iter().map(|f| PendingWrite::new(f.rel_path, f.content)).collect();
+    transport.commit_paths(&Lane::bootstrap(), &writes, "Create family").map_err(err)?;
+    match transport.push().map_err(err)? {
+        family_sync::PushOutcome::Failed { detail } => return Err(detail),
+        family_sync::PushOutcome::NonFastForward { detail } => {
+            return Err(format!("push rejected: {detail}"))
+        }
+        _ => {}
+    }
+
+    let connection = FamilyConnection {
+        family_id,
+        name: name.trim().to_string(),
+        remote_url,
+        member_id,
+        live_sync: false,
+        poll_interval_secs: default_family_poll_interval_secs(),
+        attached_workspace_id: None,
+    };
+    let mut connections = family_connections(&settings);
+    connections.push(connection.clone());
+    save_family_connections(&state, connections)?;
+    let engine = family_engine_handle(&state, family_id, &clone_root);
+    let engine_state = engine.lock().unwrap().state().clone();
+    Ok(FamilyConnectionDto { connection, state: engine_state })
+}
+
+/// Clone an existing family and either select an already-listed member or
+/// append a new one (task 2.2, D2 "join appends, never rewrites"). The clone
+/// lands in a temp folder first — the target path is keyed by the manifest's
+/// own family id (D1: one clone per device), which isn't known until after
+/// the clone completes and `family.json` is read — then moves into place.
+#[tauri::command]
+fn family_join(
+    state: State<SharedState>,
+    remote_url: String,
+    existing_member_id: Option<String>,
+    new_member_name: Option<String>,
+) -> CmdResult<FamilyConnectionDto> {
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    if let Err(reason) = family_sync::git_available() {
+        return Err(format!("git is unavailable: {reason}"));
+    }
+    let remote_url = remote_url.trim().to_string();
+    if remote_url.is_empty() {
+        return Err("a remote URL is required to join a family".into());
+    }
+
+    let families_dir = base_dir.join("families");
+    std::fs::create_dir_all(&families_dir).map_err(err)?;
+    let temp_dir = families_dir.join(format!("_joining-{}", uuid::Uuid::new_v4()));
+    let temp_str = temp_dir.to_string_lossy().to_string();
+    let cfg = family_sync::clone_config_args();
+    let mut clone_args: Vec<&str> = cfg.iter().map(String::as_str).collect();
+    clone_args.extend(["clone", "--", &remote_url, &temp_str]);
+    if let Err(e) = family_git(None, &clone_args) {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Err(e);
+    }
+
+    let manifest = match FamilyManifest::load(&temp_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(err(e));
+        }
+    };
+    let family_id = manifest.id;
+    let clone_root = family_clone_root(&base_dir, family_id);
+    if clone_root.exists() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return Err("this family is already joined on this device".into());
+    }
+    std::fs::rename(&temp_dir, &clone_root).map_err(err)?;
+
+    let mut transport = SystemGit::open(&clone_root).map_err(err)?;
+    transport.configure_clone().map_err(err)?;
+
+    // D2: "a manifest declaring a `template` version newer than this Ken
+    // supports SHALL make the connection unavailable... no sync attempted"
+    // — that includes the member-append write below, which this build has
+    // no business making against a repo shape it can't fully understand.
+    let supported = manifest.check_supported().is_ok();
+    let member_id = if !supported {
+        existing_member_id.unwrap_or_default()
+    } else if let Some(id) = existing_member_id.as_deref() {
+        if !manifest.has_member(id) {
+            return Err(format!("'{id}' is not a member of this family"));
+        }
+        id.to_string()
+    } else {
+        let name = new_member_name
+            .ok_or("either an existing member id or a new member name is required")?;
+        let id = family::normalize_member_id(&name).map_err(err)?;
+        if manifest.has_member(&id) {
+            return Err(format!(
+                "'{id}' is already a member of this family — join as that member instead"
+            ));
+        }
+        let mut after = manifest.clone();
+        after.add_member(FamilyMember::new(id.clone(), name.trim())).map_err(err)?;
+        family::manifest_append_only(&manifest, &after).map_err(err)?;
+        let write = PendingWrite::new(family::MANIFEST_FILE, after.to_json().map_err(err)?);
+        transport
+            .commit_paths(&Lane::member(&id), &[write], &format!("{id} joins the family"))
+            .map_err(err)?;
+        match transport.push().map_err(err)? {
+            family_sync::PushOutcome::Failed { detail } => return Err(detail),
+            family_sync::PushOutcome::NonFastForward { detail } => {
+                return Err(format!("push rejected: {detail}"))
+            }
+            _ => {}
+        }
+        id
+    };
+
+    let connection = FamilyConnection {
+        family_id,
+        name: manifest.name.clone(),
+        remote_url,
+        member_id,
+        live_sync: false,
+        poll_interval_secs: default_family_poll_interval_secs(),
+        attached_workspace_id: None,
+    };
+    let mut connections = family_connections(&settings);
+    connections.push(connection.clone());
+    save_family_connections(&state, connections)?;
+    let engine = family_engine_handle(&state, family_id, &clone_root);
+    let engine_state = engine.lock().unwrap().state().clone();
+    Ok(FamilyConnectionDto { connection, state: engine_state })
+}
+
+/// Every saved connection with its live sync state (task 2.1/2.3). The
+/// on-disk clone is never touched here — connection settings plus whatever
+/// `family_engine_handle` already has cached.
+#[tauri::command]
+fn family_list(state: State<SharedState>) -> CmdResult<Vec<FamilyConnectionDto>> {
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    Ok(family_connections(&settings)
+        .into_iter()
+        .map(|connection| {
+            let clone_root = family_clone_root(&base_dir, connection.family_id);
+            let engine = family_engine_handle(&state, connection.family_id, &clone_root);
+            let engine_state = engine.lock().unwrap().state().clone();
+            FamilyConnectionDto { connection, state: engine_state }
+        })
+        .collect())
+}
+
+/// The full manifest for one connection (member roster, owner, template
+/// version) — a settings-page convenience read, not part of the connection
+/// store itself.
+#[tauri::command]
+fn family_manifest_get(state: State<SharedState>, family_id: String) -> CmdResult<FamilyManifest> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    find_family_connection(&settings, id)?;
+    FamilyManifest::load(&family_clone_root(&base_dir, id)).map_err(err)
+}
+
+/// Forget a connection (task 2.2) — mirrors `forget_project`'s "never
+/// deletes files" discipline: the on-disk clone under app data is left in
+/// place (re-joining later would find it, though today's `family_join`
+/// treats an existing directory as "already joined" rather than adopting
+/// it — a known rough edge, not addressed by this task). Stops the poller,
+/// drops the cached engine, and detaches the pseudo-member if it's resident.
+#[tauri::command]
+fn family_remove(app: AppHandle, state: State<SharedState>, family_id: String) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let settings = { state.lock().unwrap().app_settings.clone() };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let connections = family_connections(&settings);
+    if !connections.iter().any(|c| c.family_id == id) {
+        return Err(format!("no family connection '{family_id}'"));
+    }
+    let remaining: Vec<FamilyConnection> = connections.into_iter().filter(|c| c.family_id != id).collect();
+    save_family_connections(&state, remaining)?;
+    {
+        let guard = state.lock().unwrap();
+        guard.family_engines.lock().unwrap().remove(&id);
+    }
+    state.lock().unwrap().members.remove(&id);
+    reconcile_family_pollers(&app, state.inner());
+    Ok(())
+}
+
+/// Toggle live sync for one connection (task 2.1/2.3); starts or stops its
+/// poller via `reconcile_family_pollers`.
+#[tauri::command]
+fn family_set_live_sync(app: AppHandle, state: State<SharedState>, family_id: String, live_sync: bool) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let settings = { state.lock().unwrap().app_settings.clone() };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let mut connections = family_connections(&settings);
+    let conn = connections
+        .iter_mut()
+        .find(|c| c.family_id == id)
+        .ok_or_else(|| format!("no family connection '{family_id}'"))?;
+    conn.live_sync = live_sync;
+    save_family_connections(&state, connections)?;
+    reconcile_family_pollers(&app, state.inner());
+    Ok(())
+}
+
+/// Change one connection's poll interval, clamped to design.md D1's 30s–30min
+/// bounds; restarts its poller (if live) with the new interval.
+#[tauri::command]
+fn family_set_poll_interval(app: AppHandle, state: State<SharedState>, family_id: String, secs: u64) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let settings = { state.lock().unwrap().app_settings.clone() };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let mut connections = family_connections(&settings);
+    let conn = connections
+        .iter_mut()
+        .find(|c| c.family_id == id)
+        .ok_or_else(|| format!("no family connection '{family_id}'"))?;
+    conn.poll_interval_secs = secs.clamp(FAMILY_POLL_INTERVAL_MIN_SECS, FAMILY_POLL_INTERVAL_MAX_SECS);
+    save_family_connections(&state, connections)?;
+    reconcile_family_pollers(&app, state.inner());
+    Ok(())
+}
+
+/// "Sync now" (task 2.3): the same fetch -> rebase-integrate -> push cycle
+/// the poller runs, on demand, against the SAME cached engine (so a manual
+/// sync and the poller can't disagree about connection state).
+#[tauri::command]
+fn family_sync_now(app: AppHandle, state: State<SharedState>, family_id: String) -> CmdResult<family_sync::SyncReport> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let conn = find_family_connection(&settings, id)?;
+    let clone_root = family_clone_root(&base_dir, id);
+    let engine = family_engine_handle(&state, id, &clone_root);
+    let mut transport = SystemGit::open(&clone_root).map_err(err)?;
+    let report = { engine.lock().unwrap().poll(&mut transport) };
+    emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
+    emit_board_state(&app, state.inner());
+    Ok(report)
+}
+
+/// Clear a conflict after the user has resolved the clone by hand (D1:
+/// "never auto-resolve... require manual resolution"). Only ever clears
+/// `ConnectionState::Conflict`; a no-op on any other state.
+#[tauri::command]
+fn family_resolve_conflict(state: State<SharedState>, family_id: String) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let clone_root = family_clone_root(&base_dir, id);
+    let engine = family_engine_handle(&state, id, &clone_root);
+    engine.lock().unwrap().resolved();
+    Ok(())
+}
+
+/// Attach a connection to a workspace (task 2.5). Persists immediately; if
+/// `workspace_id` is the CURRENTLY open workspace, also activates the
+/// pseudo-member right away (mirrors `activate_memory_pseudo_member`'s call
+/// site) so the UI reflects it without a reopen. Otherwise it takes effect
+/// the next time that workspace opens (`open_workspace_inner`'s own
+/// attached-connections loop).
+#[tauri::command]
+fn family_attach_workspace(
+    app: AppHandle,
+    state: State<SharedState>,
+    family_id: String,
+    workspace_id: String,
+) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let ws_id: uuid::Uuid = workspace_id.parse().map_err(err)?;
+    let settings = { state.lock().unwrap().app_settings.clone() };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let mut connections = family_connections(&settings);
+    let conn = connections
+        .iter_mut()
+        .find(|c| c.family_id == id)
+        .ok_or_else(|| format!("no family connection '{family_id}'"))?;
+    conn.attached_workspace_id = Some(ws_id);
+    let conn = conn.clone();
+    save_family_connections(&state, connections)?;
+
+    let currently_open = { state.lock().unwrap().workspace.as_ref().map(|w| w.ws.config.id) };
+    if currently_open == Some(ws_id) {
+        if let Err(e) = activate_family_pseudo_member(&app, &state, &conn) {
+            eprintln!("warning: family pseudo-member failed to activate: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Detach a connection from its workspace (task 2.5). Persists immediately
+/// and drops the pseudo-member's `MemberRuntime` if it's resident right
+/// now — removing it from `AppState::members` runs every `Drop` impl the
+/// runtime holds (extraction/OCR/kenignore workers, watcher), the same
+/// teardown any other member close relies on.
+#[tauri::command]
+fn family_detach_workspace(state: State<SharedState>, family_id: String) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let settings = { state.lock().unwrap().app_settings.clone() };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let mut connections = family_connections(&settings);
+    let conn = connections
+        .iter_mut()
+        .find(|c| c.family_id == id)
+        .ok_or_else(|| format!("no family connection '{family_id}'"))?;
+    conn.attached_workspace_id = None;
+    save_family_connections(&state, connections)?;
+    state.lock().unwrap().members.remove(&id);
+    Ok(())
+}
+
+/// This device's own inbox for one family (task 2.4) — `members/<me>/
+/// inbox/`, never a teammate's (lanes make a teammate's inbox unreadable to
+/// us in the git-write sense; nothing stops a local read, but there is no
+/// reason for one, and this command doesn't offer it).
+#[tauri::command]
+fn family_inbox_list(state: State<SharedState>, family_id: String) -> CmdResult<Vec<family::InboxItem>> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let conn = find_family_connection(&settings, id)?;
+    let clone_root = family_clone_root(&base_dir, id);
+    let dir = family::inbox_dir(&clone_root, &conn.member_id);
+    Ok(list_inbox_items(&dir).into_iter().map(|(_, item)| item).collect())
+}
+
+/// Patch one inbox item's status — `seen`/`archived` (D4's dismiss path);
+/// `accepted` is reserved for `family_accept_task`, which needs to write
+/// the board task in the same commit, so this refuses that transition
+/// rather than leaving an item `accepted` with no board task to match it.
+///
+/// Writes through `GitTransport::commit_paths`, never `family::apply_inbox_
+/// status`'s direct-disk write: `commit_paths` is documented as "the only
+/// sanctioned way to write to a family repo", and a direct write here would
+/// leave the change uncommitted until some later commit happened to
+/// re-stage the same path — this way every write is commit-then-push in one
+/// step, consistent with every other mutation in this file.
+#[tauri::command]
+fn family_set_item_status(
+    app: AppHandle,
+    state: State<SharedState>,
+    family_id: String,
+    item_id: String,
+    status: String,
+) -> CmdResult<family::InboxItem> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let new_status = family::InboxStatus::parse(&status)
+        .ok_or_else(|| format!("unknown inbox status '{status}'"))?;
+    if new_status == family::InboxStatus::Accepted {
+        return Err("use family_accept_task to accept a task item".into());
+    }
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let conn = find_family_connection(&settings, id)?;
+    let clone_root = family_clone_root(&base_dir, id);
+    let inbox_dir = family::inbox_dir(&clone_root, &conn.member_id);
+    let (item_path, _item) = list_inbox_items(&inbox_dir)
+        .into_iter()
+        .find(|(_, it)| it.id == item_id)
+        .ok_or_else(|| format!("no inbox item '{item_id}'"))?;
+    let raw = std::fs::read_to_string(&item_path).map_err(err)?;
+    let file_name = item_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let updated = iso_datetime_now();
+    let new_text = family::set_status_text(&raw, new_status, &updated);
+    let rel_path = format!("{}/{file_name}", family::inbox_rel(&conn.member_id));
+
+    let mut transport = SystemGit::open(&clone_root).map_err(err)?;
+    let engine = family_engine_handle(&state, id, &clone_root);
+    {
+        let mut eng = engine.lock().unwrap();
+        eng.commit(
+            &mut transport,
+            &Lane::member(&conn.member_id),
+            &[PendingWrite::new(rel_path, new_text.clone())],
+            &format!("Mark inbox item {item_id} {status}"),
+        )
+        .map_err(err)?;
+    }
+    let report = { engine.lock().unwrap().poll(&mut transport) };
+    emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
+    Ok(family::parse_inbox_item(&file_name, &new_text))
+}
+
+/// Accept a task inbox item (task 2.4, D4's acceptance gate): mints a new
+/// board task in `members/<me>/board/` and marks the inbox item `accepted`,
+/// both in one commit (`family::accept_task` returns both file contents for
+/// exactly this reason) — so the repo never has a half-accepted state
+/// where one file changed and the other didn't. Refreshes the merged Tasks
+/// board immediately (best-effort) if this connection is attached to the
+/// open workspace and `kenTasks` is on, same instant-feedback discipline
+/// `note_task_write_and_emit` gives an ordinary task write.
+#[tauri::command]
+fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: String, item_id: String) -> CmdResult<tasks::Task> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let conn = find_family_connection(&settings, id)?;
+    let clone_root = family_clone_root(&base_dir, id);
+    let inbox_dir = family::inbox_dir(&clone_root, &conn.member_id);
+    let (item_path, _item) = list_inbox_items(&inbox_dir)
+        .into_iter()
+        .find(|(_, it)| it.id == item_id)
+        .ok_or_else(|| format!("no inbox item '{item_id}'"))?;
+    let raw = std::fs::read_to_string(&item_path).map_err(err)?;
+    let file_name = item_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+
+    let today = local_date_today();
+    let time = local_time_hhmm();
+    let task_id = tasks::new_ulid();
+    let accepted = family::accept_task(&raw, &conn.member_id, &task_id, &today, &time).map_err(err)?;
+
+    let inbox_rel_path = format!("{}/{file_name}", family::inbox_rel(&conn.member_id));
+    let writes = vec![
+        PendingWrite::new(accepted.board_rel_path.clone(), accepted.board_content.clone()),
+        PendingWrite::new(inbox_rel_path, accepted.inbox_content),
+    ];
+    let mut transport = SystemGit::open(&clone_root).map_err(err)?;
+    let engine = family_engine_handle(&state, id, &clone_root);
+    {
+        let mut eng = engine.lock().unwrap();
+        eng.commit(
+            &mut transport,
+            &Lane::member(&conn.member_id),
+            &writes,
+            &format!("Accept task from inbox item {}", accepted.item_id),
+        )
+        .map_err(err)?;
+    }
+    let report = { engine.lock().unwrap().poll(&mut transport) };
+    emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
+
+    let board_path = clone_root.join(&accepted.board_rel_path);
+    let task = tasks::parse_task(&board_path, tasks::HomeKind::Project, &conn.name, &accepted.board_content);
+    emit_board_state(&app, state.inner());
+    Ok(task)
+}
+
+/// Push back on an inbox item (D4): creates a new message item in the
+/// SENDER's inbox (lane rule 2 — never a modification of their files) and
+/// leaves the original item exactly as it was. "The original item stays
+/// yours to mark seen/accepted/archived" (D4) is deliberately a separate
+/// action (`family_set_item_status`), not bundled into this one — push-back
+/// is "reply", not "reply and also change my own status", so this command
+/// does exactly the one lane-2 write it claims to.
+#[tauri::command]
+fn family_push_back(app: AppHandle, state: State<SharedState>, family_id: String, item_id: String, note: String) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let conn = find_family_connection(&settings, id)?;
+    let clone_root = family_clone_root(&base_dir, id);
+    let inbox_dir = family::inbox_dir(&clone_root, &conn.member_id);
+    let (_path, item) = list_inbox_items(&inbox_dir)
+        .into_iter()
+        .find(|(_, it)| it.id == item_id)
+        .ok_or_else(|| format!("no inbox item '{item_id}'"))?;
+    if item.from.trim().is_empty() {
+        return Err("this item has no sender to push back to".into());
+    }
+    let new_item = family::push_back_item(&item, &conn.member_id, &note);
+    let new_id = tasks::new_ulid();
+    let created = iso_datetime_now();
+    let content = family::render_inbox_item(&new_item, &new_id, &created);
+    let file_name =
+        family::inbox_item_file_name(&new_id, new_item.kind.unwrap_or(family::InboxKind::Message), &new_item.title);
+    let rel_path = format!("{}/{file_name}", family::inbox_rel(item.from.trim()));
+
+    let mut transport = SystemGit::open(&clone_root).map_err(err)?;
+    let engine = family_engine_handle(&state, id, &clone_root);
+    {
+        let mut eng = engine.lock().unwrap();
+        eng.commit(
+            &mut transport,
+            &Lane::member(&conn.member_id),
+            &[PendingWrite::new(rel_path, content)],
+            &format!("Push back on {item_id}"),
+        )
+        .map_err(err)?;
+    }
+    let report = { engine.lock().unwrap().poll(&mut transport) };
+    emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
+    Ok(())
+}
+
 pub fn run() {
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
@@ -8558,6 +10599,11 @@ pub fn run() {
         ingest_gate: Arc::new(IngestGate::new(WORKSPACE_INGEST_CONCURRENCY)),
         memory_distill_running: Arc::new(AtomicBool::new(false)),
         memory_distill_candidates: Arc::new(Mutex::new(Vec::new())),
+        task_recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        daily_plan_running: Arc::new(AtomicBool::new(false)),
+        daily_plan_candidates: Arc::new(Mutex::new(Vec::new())),
+        family_engines: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        family_pollers: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }));
 
     tauri::Builder::default()
@@ -8566,8 +10612,18 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(state)
-        .setup(|_app| {
+        .setup(|app| {
             std::thread::spawn(refresh_ken_mcp);
+            // ken-families task 2.3: resume every saved connection's poller
+            // on startup (only those with `liveSync` on, and only when
+            // `kenFamilies` itself resolved on at load — task 2.6: "flag
+            // off is inert... with saved connections present"). Reuses the
+            // same reconciliation `set_global_feature`/every family_*
+            // mutator calls, so startup and every later change agree.
+            use tauri::Manager;
+            let app_handle = app.handle().clone();
+            let shared_state = app_handle.state::<SharedState>().inner().clone();
+            reconcile_family_pollers(&app_handle, &shared_state);
             Ok(())
         })
         // Focus = "the user is back" — the moment to fetch teammates'
@@ -8717,6 +10773,34 @@ pub fn run() {
             read_journal,
             distill_journal,
             resolve_distill_candidate,
+            task_create,
+            task_list,
+            task_update,
+            task_complete,
+            task_archive,
+            board_get,
+            goal_create,
+            goal_update,
+            goal_list,
+            plan_daily_tasks,
+            resolve_daily_candidate,
+            daily_rollover_candidates,
+            resolve_daily_rollover,
+            family_create,
+            family_join,
+            family_list,
+            family_manifest_get,
+            family_remove,
+            family_set_live_sync,
+            family_set_poll_interval,
+            family_sync_now,
+            family_resolve_conflict,
+            family_attach_workspace,
+            family_detach_workspace,
+            family_inbox_list,
+            family_set_item_status,
+            family_accept_task,
+            family_push_back,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Ken")

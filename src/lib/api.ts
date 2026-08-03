@@ -900,6 +900,272 @@ export type RoutedSearchStateEvent =
   | { state: "searching"; done: number; total: number }
   | { state: "done" };
 
+// ---- ken-tasks (ken-tasks change, task 4.1) ----
+
+export type TaskStatus = "backlog" | "todo" | "doing" | "review" | "done";
+export type TaskKind = "human" | "ai";
+export type BoardKind = "main" | "daily";
+export type GoalStatus = "active" | "done" | "dropped";
+export type TaskHomeKind = "workspace" | "project";
+
+/** Mirrors the Rust `AssigneeFilter` enum — no explicit `tag`/`content` on
+ *  the Rust side, so serde's default *externally tagged* representation
+ *  applies: the unit variant `Unassigned` serializes as the bare string
+ *  `"unassigned"`; the newtype variant `Named(String)` as `{ named: "..." }`. */
+export type AssigneeFilter = "unassigned" | { named: string };
+
+/** Mirrors `ken_core::tasks::TaskFilter` (camelCase, every field optional —
+ *  absent means "don't filter on this"). Shared shape for `task_list` and
+ *  the Tasks tab's own client-side filtering (`tasks.svelte.ts`). */
+export interface TaskFilter {
+  status?: TaskStatus;
+  project?: string;
+  tag?: string;
+  assignee?: AssigneeFilter;
+  kind?: TaskKind;
+  goal?: string;
+  board?: BoardKind;
+}
+
+/** Mirrors `ken_core::tasks::TaskPatch` — every field absent means "leave
+ *  alone"; there is no "remove key" variant (clearing a value means setting
+ *  it to `""`). Drag-drop sends only `{ status }` (S6 byte-fidelity: a
+ *  patch must never touch a key it didn't mean to change). */
+export interface TaskPatch {
+  title?: string;
+  status?: TaskStatus;
+  kind?: TaskKind;
+  assignee?: string;
+  project?: string;
+  tags?: string[];
+  due?: string;
+  goal?: string;
+  board?: BoardKind;
+}
+
+/** Mirrors `ken_core::tasks::Task` (camelCase). `path`/`homeDir` are
+ *  absolute OS paths (Rust `PathBuf`) — never rendered raw in the UI, only
+ *  used to derive a project-relative path for opening the file (see
+ *  `tasks.svelte.ts`'s `openFile`). `statusRaw`/`kindRaw`/`boardRaw` carry
+ *  the on-disk string verbatim even when it's out of vocabulary — what
+ *  drives the needs-attention tray. */
+export interface Task {
+  id: string;
+  title: string;
+  status: TaskStatus | null;
+  statusRaw: string;
+  kind: TaskKind;
+  kindRaw: string;
+  assignee: string;
+  project: string;
+  tags: string[];
+  due: string | null;
+  goal: string | null;
+  board: BoardKind;
+  boardRaw: string;
+  created: string;
+  updated: string;
+  body: string;
+  path: string;
+  home: TaskHomeKind;
+  homeDir: string;
+}
+
+/** Mirrors the Rust `AttentionReason` enum (`#[serde(tag = "reason",
+ *  content = "value", rename_all = "camelCase")]`). */
+export type AttentionReason =
+  | { reason: "invalidStatus"; value: string }
+  | { reason: "invalidKind"; value: string }
+  | { reason: "invalidBoard"; value: string }
+  | { reason: "unknownGoal"; value: string };
+
+/** Mirrors `ken_core::tasks::NeedsAttention`. */
+export interface NeedsAttention {
+  id: string;
+  title: string;
+  path: string;
+  reasons: AttentionReason[];
+}
+
+/** Mirrors `ken_core::tasks::Goal` — no assignee, no claim lifecycle. */
+export interface Goal {
+  id: string;
+  title: string;
+  status: GoalStatus | null;
+  statusRaw: string;
+  created: string;
+  updated: string;
+  body: string;
+  path: string;
+}
+
+/** Mirrors `ken_core::tasks::GoalPatch`. */
+export interface GoalPatch {
+  title?: string;
+  status?: GoalStatus;
+}
+
+/** Mirrors `ken_core::tasks::Progress` — derived goal progress (done/total),
+ *  never stored in any file. */
+export interface Progress {
+  done: number;
+  total: number;
+}
+
+/** Mirrors the Rust `BoardStateDto` — `board_get`'s return shape and the
+ *  `board-state` event payload. `progress` is keyed by goal id. */
+export interface BoardStateDto {
+  tasks: Task[];
+  goals: Goal[];
+  needsAttention: NeedsAttention[];
+  progress: Record<string, Progress>;
+}
+
+/** Mirrors the Rust `Rollover` enum (`#[serde(rename_all = "camelCase")]`)
+ *  — the three per-task daily-rollover resolutions (design D5), never
+ *  auto-applied. */
+export type Rollover = "roll" | "promote" | "archive";
+
+/** Mirrors the Rust `DailyCandidate` — one drafted daily-board item awaiting
+ *  approval (not yet a file); `key` is a run-local handle for
+ *  `resolveDailyCandidate`. */
+export interface DailyCandidate {
+  key: string;
+  title: string;
+  body: string;
+  project: string | null;
+  tags: string[];
+}
+
+/** Mirrors the Rust `DailyPlanStateEvent` internally-tagged enum
+ *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape
+ *  convention as `MemoryStateEvent`. App-global — a planning run reads the
+ *  whole workspace journal, no single owning project. */
+export type DailyPlanStateEvent =
+  | { state: "planning" }
+  | { state: "ready"; candidates: DailyCandidate[] }
+  | { state: "error"; reason: string };
+
+// ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
+
+/** Mirrors the Rust `FamilyConnection` (camelCase) — one saved connection's
+ *  settings half; live sync status comes separately in
+ *  `FamilyConnectionDto.state`. */
+export interface FamilyConnection {
+  familyId: string;
+  name: string;
+  remoteUrl: string;
+  memberId: string;
+  liveSync: boolean;
+  pollIntervalSecs: number;
+  attachedWorkspaceId: string | null;
+}
+
+/** Mirrors `ken_core::family_sync::ConnectionState` (`#[serde(tag = "state",
+ *  rename_all = "camelCase")]`) — externally tagged on a `state` field, with
+ *  each non-unit variant's own fields sitting alongside it. `Conflict` and
+ *  `Unavailable` are terminal-until-a-human-acts (see design.md D1/D7):
+ *  `Conflict` offers `familyResolveConflict`, `Unavailable` offers nothing. */
+export type FamilyConnectionState =
+  | { state: "idle" }
+  | { state: "syncing" }
+  | { state: "conflict"; detail: string }
+  | { state: "error"; detail: string }
+  | { state: "unavailable"; reason: string };
+
+/** Mirrors `FamilyConnectionDto` — one connection's settings plus its live
+ *  `SyncEngine` state, as `familyList`/`familyCreate`/`familyJoin` return it. */
+export interface FamilyConnectionDto {
+  connection: FamilyConnection;
+  state: FamilyConnectionState;
+}
+
+/** Mirrors `ken_core::family_sync::IntegrateOutcome`
+ *  (`#[serde(tag = "outcome", rename_all = "camelCase")]`). */
+export type FamilyIntegrateOutcome =
+  | { outcome: "upToDate" }
+  | { outcome: "fastForward"; commits: number }
+  | { outcome: "rebased"; commits: number }
+  | { outcome: "conflict"; detail: string };
+
+/** Mirrors `ken_core::family_sync::PushOutcome` (same tagging convention). */
+export type FamilyPushOutcome =
+  | { outcome: "upToDate" }
+  | { outcome: "pushed"; commits: number }
+  | { outcome: "nonFastForward"; detail: string }
+  | { outcome: "failed"; detail: string };
+
+/** Mirrors `ken_core::family_sync::SyncReport` — one poll/sync-now cycle's
+ *  outcome, the payload behind the tray badge and the settings page's "last
+ *  sync" line. */
+export interface FamilySyncReport {
+  state: FamilyConnectionState;
+  ran: boolean;
+  integrated: FamilyIntegrateOutcome | null;
+  pushed: FamilyPushOutcome | null;
+  pushRetried: boolean;
+}
+
+/** The `family-sync` app event — emitted after every poll tick and every
+ *  on-demand command that touches a connection's transport. `unreadInboxCount`
+ *  is THIS device's own inbox count for that family (task 2.3's diff-able
+ *  count, not a stateful server-side delta). */
+export interface FamilySyncEvent {
+  familyId: string;
+  report: FamilySyncReport;
+  unreadInboxCount: number;
+}
+
+/** Mirrors `ken_core::family::FamilyMember`. */
+export interface FamilyMember {
+  id: string;
+  name: string;
+}
+
+/** Mirrors `ken_core::family::FamilyManifest` (plain field names, no
+ *  camelCase rename needed — every field is already a single lowercase
+ *  word). */
+export interface FamilyManifest {
+  id: string;
+  name: string;
+  template: number;
+  members: FamilyMember[];
+}
+
+export type FamilyInboxKind = "task" | "message" | "notification";
+export type FamilyInboxStatus = "unread" | "seen" | "accepted" | "archived";
+
+/** Mirrors `ken_core::family::InboxTaskPayload` (`#[serde(default)]`, plain
+ *  field names). */
+export interface FamilyInboxTaskPayload {
+  title: string;
+  project: string;
+  tags: string[];
+  due: string;
+  kind: string;
+}
+
+/** Mirrors `ken_core::family::InboxItem` (camelCase). `kind`/`status` are
+ *  `null` when the file's raw value is outside the vocabulary —
+ *  `kindRaw`/`statusRaw` always carry what was actually on disk, and
+ *  `malformed` marks a file whose frontmatter block couldn't be parsed at
+ *  all (D4: "shown raw in the tray, never crash, never be rewritten"). */
+export interface FamilyInboxItem {
+  id: string;
+  kind: FamilyInboxKind | null;
+  kindRaw: string;
+  from: string;
+  status: FamilyInboxStatus | null;
+  statusRaw: string;
+  created: string;
+  updated: string;
+  title: string;
+  task: FamilyInboxTaskPayload | null;
+  body: string;
+  malformed: boolean;
+  fileName: string;
+}
+
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   createProject: (path: string, name: string) =>
@@ -1366,4 +1632,129 @@ export const api = {
     fn: (ev: RecordErrorEvent) => void,
   ): Promise<UnlistenFn> =>
     listen<RecordErrorEvent>("record-error", (e) => fn(e.payload)),
+
+  // ---- ken-tasks (ken-tasks change, task 4.1) ----
+  /** Create a task file — workspace home by default, or `projectId`'s
+   *  `<project>/.ken/tasks/` when given. `fields.status` omitted defaults to
+   *  `backlog`, the intake column. Flag-gated on `kenTasks`. */
+  taskCreate: (title: string, body?: string, fields?: TaskPatch, projectId?: string) =>
+    invoke<Task>("task_create", { title, body, fields, projectId }),
+  /** List tasks across every home, optionally filtered — the same
+   *  `TaskFilter` shape the board UI mirrors client-side. */
+  taskList: (filter?: TaskFilter) => invoke<Task[]>("task_list", { filter }),
+  /** Patch a task by id. Drag-drop sends only `{ status }` — the S6
+   *  byte-fidelity contract depends on patches naming only the keys that
+   *  actually changed; never send a whole-task patch. */
+  taskUpdate: (id: string, patch: TaskPatch) => invoke<Task>("task_update", { id, patch }),
+  /** Set `done`, append `report` under `## Log`, and (when `kenMemory` is
+   *  on) write a one-line journal summary. This is the agent/MCP-facing
+   *  completion path; the board's own drag-to-done interaction uses
+   *  `taskUpdate({ status: "done" })` instead, per task 4.3. */
+  taskComplete: (id: string, report: string) =>
+    invoke<Task>("task_complete", { id, report }),
+  /** Move a task file to `<its own home>/archive/YYYY-MM/`. */
+  taskArchive: (id: string) => invoke<Task>("task_archive", { id }),
+  /** The whole board on demand — the Tasks tab's initial load and manual
+   *  refresh; live updates after that arrive via `onBoardState`. */
+  boardGet: () => invoke<BoardStateDto>("board_get"),
+  /** Create a goal (workspace home only — goals have no per-repo home). */
+  goalCreate: (title: string, body?: string, status?: GoalStatus) =>
+    invoke<Goal>("goal_create", { title, body, status }),
+  /** Patch a goal by id — title and/or status only. */
+  goalUpdate: (id: string, patch: GoalPatch) => invoke<Goal>("goal_update", { id, patch }),
+  /** Every goal in the workspace home. */
+  goalList: () => invoke<Goal[]>("goal_list"),
+  /** Draft daily-board candidates from recent journal content + activity
+   *  ("plan my day" — on request only, never autonomous). Returns as soon
+   *  as the background pass starts; progress/outcome arrive via
+   *  `onDailyPlanState`. Rejects if a run is already in progress. */
+  planDailyTasks: () => invoke<void>("plan_daily_tasks"),
+  /** Approve (creates the `board: daily` task file, workspace home unless
+   *  `projectId` names a member) or dismiss a drafted candidate by `key`,
+   *  looked up from the last `planDailyTasks` run's server-side cache. */
+  resolveDailyCandidate: (key: string, approve: boolean, projectId?: string) =>
+    invoke<Task | null>("resolve_daily_candidate", { key, approve, projectId }),
+  /** Daily tasks eligible for the new-day rollover prompt (`board: daily`,
+   *  not done, `updated` before today). Purely derived — safe to call
+   *  repeatedly (e.g. after each per-task resolution). */
+  dailyRolloverCandidates: () => invoke<Task[]>("daily_rollover_candidates"),
+  /** Apply one task's rollover resolution: roll forward (bump `updated`
+   *  only), promote to the main board, or archive. Never auto-called — one
+   *  explicit choice per task. */
+  resolveDailyRollover: (id: string, choice: Rollover) =>
+    invoke<Task>("resolve_daily_rollover", { id, choice }),
+
+  /** `board-state`: the whole board, re-emitted after every mutating
+   *  command and on every watcher-detected external change (agent writes,
+   *  hand edits, `git pull`). App-global — the board aggregates every home,
+   *  with no single owning project. */
+  onBoardState: (fn: (dto: BoardStateDto) => void): Promise<UnlistenFn> =>
+    listen<BoardStateDto>("board-state", (e) => fn(e.payload)),
+  /** `daily-plan-state`: `planning` → `ready` (candidates) | `error`
+   *  (reason), driven by `planDailyTasks`. */
+  onDailyPlanState: (fn: (ev: DailyPlanStateEvent) => void): Promise<UnlistenFn> =>
+    listen<DailyPlanStateEvent>("daily-plan-state", (e) => fn(e.payload)),
+
+  // ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
+  /** Scaffold + commit a brand-new family repo whose remote is `remoteUrl`
+   *  (an empty repo the user already created on their git host); the
+   *  creator becomes the family's first — and owner — member. Rejects with
+   *  a friendly message when `kenFamilies` is off or `git` is unavailable. */
+  familyCreate: (name: string, memberName: string, remoteUrl: string) =>
+    invoke<FamilyConnectionDto>("family_create", { name, memberName, remoteUrl }),
+  /** Clone an existing family. Pass `existingMemberId` when you're already
+   *  in the manifest, or `newMemberName` to be appended (join appends,
+   *  never rewrites — D2). */
+  familyJoin: (remoteUrl: string, existingMemberId?: string, newMemberName?: string) =>
+    invoke<FamilyConnectionDto>("family_join", { remoteUrl, existingMemberId, newMemberName }),
+  /** Every saved connection with its live sync state. */
+  familyList: () => invoke<FamilyConnectionDto[]>("family_list"),
+  /** The full manifest (member roster, owner, template version) for one
+   *  connection — a settings-page convenience read. */
+  familyManifestGet: (familyId: string) => invoke<FamilyManifest>("family_manifest_get", { familyId }),
+  /** Forget a connection (stops its poller, drops the cached engine,
+   *  detaches the pseudo-member). Never deletes the on-disk clone. */
+  familyRemove: (familyId: string) => invoke<void>("family_remove", { familyId }),
+  /** Toggle live sync for one connection; starts/stops its poller. */
+  familySetLiveSync: (familyId: string, liveSync: boolean) =>
+    invoke<void>("family_set_live_sync", { familyId, liveSync }),
+  /** Change one connection's poll interval in seconds (clamped server-side
+   *  to design.md D1's 30s–30min bounds). */
+  familySetPollInterval: (familyId: string, secs: number) =>
+    invoke<void>("family_set_poll_interval", { familyId, secs }),
+  /** Run the fetch → rebase-integrate → push cycle on demand ("Sync now"). */
+  familySyncNow: (familyId: string) => invoke<FamilySyncReport>("family_sync_now", { familyId }),
+  /** Clear a `Conflict` state after the user has resolved the clone by
+   *  hand (D1: "never auto-resolve"). No-op on any other state. */
+  familyResolveConflict: (familyId: string) => invoke<void>("family_resolve_conflict", { familyId }),
+  /** Attach a connection to a workspace — the clone joins search as a
+   *  `kind: family` member once that workspace is open. */
+  familyAttachWorkspace: (familyId: string, workspaceId: string) =>
+    invoke<void>("family_attach_workspace", { familyId, workspaceId }),
+  /** Detach a connection from its workspace; drops the pseudo-member if
+   *  it's currently resident. */
+  familyDetachWorkspace: (familyId: string) => invoke<void>("family_detach_workspace", { familyId }),
+  /** This device's own inbox for one family (`members/<me>/inbox/`). */
+  familyInboxList: (familyId: string) => invoke<FamilyInboxItem[]>("family_inbox_list", { familyId }),
+  /** Patch one inbox item's status — `seen`/`archived` only;
+   *  `accepted` is reserved for `familyAcceptTask`. */
+  familySetItemStatus: (familyId: string, itemId: string, status: FamilyInboxStatus) =>
+    invoke<FamilyInboxItem>("family_set_item_status", { familyId, itemId, status }),
+  /** Accept a `task` inbox item (D4's acceptance gate): mints a new board
+   *  task in `members/<me>/board/` and marks the inbox item `accepted`, in
+   *  one commit. The ONLY way an incoming task can ever enter the board —
+   *  there is no auto-accept path anywhere in this API. */
+  familyAcceptTask: (familyId: string, itemId: string) =>
+    invoke<Task>("family_accept_task", { familyId, itemId }),
+  /** Push back on an inbox item: creates a new message item in the
+   *  SENDER's inbox (lane rule 2) and leaves the original item's status
+   *  untouched — call `familySetItemStatus` separately if you also want to
+   *  mark the original seen/archived. */
+  familyPushBack: (familyId: string, itemId: string, note: string) =>
+    invoke<void>("family_push_back", { familyId, itemId, note }),
+  /** `family-sync`: emitted after every poll tick and every on-demand
+   *  command that touches a connection's transport. App-global, like
+   *  `board-state` — a family connection has no single owning project. */
+  onFamilySync: (fn: (ev: FamilySyncEvent) => void): Promise<UnlistenFn> =>
+    listen<FamilySyncEvent>("family-sync", (e) => fn(e.payload)),
 };

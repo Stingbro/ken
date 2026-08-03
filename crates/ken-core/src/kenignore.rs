@@ -188,12 +188,25 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
 /// `.kenignore` (D2 step 2 — built-ins first, user rules appended after so a
 /// `!` line can override them). Per design.md D2/1.3, this is meant to hold
 /// per-member pseudo-tier rules from ken-memory and the `~.ken/tasks/`
-/// search-only rule from ken-tasks. **Neither feature exists in this
-/// codebase yet** (no `openspec/changes/ken-memory` or `ken-tasks`, no
-/// corresponding module) — this returns an empty rule set as an honest
-/// placeholder so callers (`scan::scan`, `scan::refresh_path`) already have
-/// the D2-correct plug point wired in. Fill this in when those features
-/// land instead of threading a new parameter through every call site.
+/// search-only rule from ken-tasks. It stays an empty rule set, on purpose:
+/// every built-in rule those features actually needed turned out to be
+/// **scoped to one member**, and this function is parameterless and folded
+/// into *every* project's classify call (`scan::scan`,
+/// `scan::refresh_path`), so putting them here would apply one member's
+/// semantics to all of them.
+///
+/// The per-member rule sets live next to the feature that owns them, and
+/// whoever ingests that member folds them into that classify call's
+/// `rule_sets` — the same seam `Project::kenignore_rules()` uses for the
+/// user tier:
+///
+/// - `memory::workspace_builtin_rules()` — the workspace pseudo-member
+///   (ken-memory 1.6).
+/// - `family::family_builtin_rules()` — a family clone (ken-families 1.6).
+///
+/// This still returns empty rather than being deleted: it is the
+/// D2-correct plug point for a rule that really is global to every
+/// project, and callers already thread it through.
 pub fn built_in_rule_sets() -> Vec<Rule> {
     Vec::new()
 }

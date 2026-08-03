@@ -3,6 +3,7 @@
   import { app, forFocused } from "../lib/app.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { memory } from "../lib/memory.svelte";
+  import { families } from "../lib/families.svelte";
   import { toWorkspaceAddress, unopenableReason } from "../lib/kenAddress";
   import { theme, type ThemeMode } from "../lib/theme.svelte";
   import {
@@ -12,6 +13,7 @@
     type ModelStatus,
     type FeatureInfo,
     type ProjectProfile,
+    type FamilyConnectionState,
   } from "../lib/api";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import Copy from "@lucide/svelte/icons/copy";
@@ -52,6 +54,18 @@
   let profileState = $state<"scanning" | "refining" | "ready" | "error" | null>(null);
   let profileResult = $state<ProjectProfile | null>(null);
   let profileError = $state<string | null>(null);
+
+  // ken-families task 4.1: create/join form fields. Both forms stay in
+  // this screen's own local state (not the store) since they're
+  // transient input, discarded on a successful submit or on navigating
+  // away — `families.svelte.ts` only holds durable connection state.
+  let familyCreateName = $state("");
+  let familyCreateMemberName = $state("");
+  let familyCreateRemote = $state("");
+  let familyJoinRemote = $state("");
+  let familyJoinMode = $state<"existing" | "new">("existing");
+  let familyJoinMemberId = $state("");
+  let familyJoinNewName = $state("");
   const profilerFlag = $derived(features.find((f) => f.name === "profiler"));
   const profilerEnabled = $derived(profilerFlag?.effective ?? false);
 
@@ -101,6 +115,7 @@
     void refreshModels();
     void loadFeatures();
     void memory.init();
+    void families.init();
     let unlistenProfile: (() => void) | undefined;
     void api.onProfileState((ev) => {
       // `profile_project` events are project_id-keyed (`emit_member`); no
@@ -222,6 +237,85 @@
   function bodyPreview(body: string, max = 320): string {
     const trimmed = body.trim();
     return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+  }
+
+  // ── ken-families task 4.1: connection list actions ─────────────────────
+
+  function familyStateLabel(state: FamilyConnectionState): string {
+    switch (state.state) {
+      case "idle":
+        return "Synced";
+      case "syncing":
+        return "Syncing…";
+      case "conflict":
+        return "Conflict";
+      case "error":
+        return "Error";
+      case "unavailable":
+        return "Unavailable";
+    }
+  }
+
+  async function toggleFamilyLiveSync(familyId: string, on: boolean) {
+    await families.setLiveSync(familyId, on);
+  }
+
+  async function setFamilyPollInterval(familyId: string, secs: number) {
+    if (!Number.isFinite(secs) || secs <= 0) return;
+    await families.setPollInterval(familyId, Math.round(secs));
+  }
+
+  async function familySyncNowClick(familyId: string) {
+    await families.syncNow(familyId).catch(() => {
+      // The connection's own card shows the resulting error/conflict
+      // state (from the `family-sync` event or the re-fetched DTO) —
+      // no separate toast needed here.
+    });
+  }
+
+  async function resolveFamilyConflict(familyId: string) {
+    await families.resolveConflict(familyId);
+  }
+
+  async function attachFamilyWorkspace(familyId: string) {
+    if (!app.workspace) return;
+    await families.attachWorkspace(familyId, app.workspace.id);
+  }
+
+  async function detachFamilyWorkspace(familyId: string) {
+    await families.detachWorkspace(familyId);
+  }
+
+  async function removeFamilyConnection(familyId: string) {
+    await families.remove(familyId);
+  }
+
+  async function submitFamilyCreate() {
+    const name = familyCreateName.trim();
+    const memberName = familyCreateMemberName.trim();
+    const remoteUrl = familyCreateRemote.trim();
+    if (!name || !memberName || !remoteUrl) return;
+    await families.create(name, memberName, remoteUrl);
+    familyCreateName = "";
+    familyCreateMemberName = "";
+    familyCreateRemote = "";
+  }
+
+  async function submitFamilyJoin() {
+    const remoteUrl = familyJoinRemote.trim();
+    if (!remoteUrl) return;
+    if (familyJoinMode === "existing") {
+      const id = familyJoinMemberId.trim();
+      if (!id) return;
+      await families.join(remoteUrl, id, undefined);
+      familyJoinMemberId = "";
+    } else {
+      const name = familyJoinNewName.trim();
+      if (!name) return;
+      await families.join(remoteUrl, undefined, name);
+      familyJoinNewName = "";
+    }
+    familyJoinRemote = "";
   }
 
   async function toggleFolder(relPath: string) {
@@ -666,6 +760,246 @@
       </section>
     {/if}
 
+    {#if families.enabled}
+      <section class="group">
+        <div class="group-head">Families</div>
+        <div class="card">
+          <div class="card-title">What a family is</div>
+          <p class="note">
+            A family is a shared git repo your team's Ken instances sync
+            through — a task or message you send lands in a teammate's
+            inbox, never directly on their board. They decide whether to
+            accept it. <span class="mono small">shared/</span> is team
+            knowledge and joins search once a connection is attached to a
+            workspace.
+          </p>
+          {#if families.loading && families.connections.length === 0}
+            <p class="note">Loading connections…</p>
+          {:else if families.loadError}
+            <p class="note warn">Couldn't load connections: {families.loadError}</p>
+          {:else if families.connections.length === 0}
+            <p class="note">No families yet — create one or join your team's below.</p>
+          {/if}
+        </div>
+
+        {#each families.connections as dto (dto.connection.familyId)}
+          <div class="card">
+            <div class="card-title">{dto.connection.name}</div>
+
+            <div class="row">
+              <span class="label">State</span>
+              <span class="state-badge state-{dto.state.state}">
+                <span class="state-dot"></span>
+                {familyStateLabel(dto.state)}
+              </span>
+            </div>
+
+            {#if dto.state.state === "conflict"}
+              <p class="note warn">
+                Sync stopped — a rebase conflict needs a human. Resolve it
+                by hand in the clone, then confirm below.
+              </p>
+              <p class="note mono small">{dto.state.detail}</p>
+              <div class="row">
+                <button
+                  class="btn btn-small"
+                  onclick={() => void resolveFamilyConflict(dto.connection.familyId)}
+                >
+                  I resolved it by hand
+                </button>
+              </div>
+            {:else if dto.state.state === "unavailable"}
+              <!-- Muted, not "warn" amber: unlike Conflict, there is
+                   nothing to click here — the state badge above already
+                   carries the visual distinction (gray dot vs. red). -->
+              <p class="note">
+                {dto.state.reason.toLowerCase().includes("git")
+                  ? `Git isn't on PATH: ${dto.state.reason}. Install git and restart Ken to reconnect this family.`
+                  : dto.state.reason}
+              </p>
+            {:else if dto.state.state === "error"}
+              <p class="note warn">Last sync failed: {dto.state.detail}</p>
+            {/if}
+
+            <div class="row">
+              <span class="label">Remote</span>
+              <span class="chip mono small">{dto.connection.remoteUrl}</span>
+            </div>
+            <div class="row">
+              <span class="label">You are</span>
+              <span class="soft">{dto.connection.memberId}</span>
+            </div>
+
+            <div class="row">
+              <label class="radio">
+                <input
+                  type="checkbox"
+                  checked={dto.connection.liveSync}
+                  disabled={dto.state.state === "unavailable"}
+                  onchange={(e) =>
+                    void toggleFamilyLiveSync(dto.connection.familyId, e.currentTarget.checked)}
+                />
+                Sync automatically
+              </label>
+              <button
+                class="btn btn-small sync-now"
+                disabled={families.syncingIds.has(dto.connection.familyId) ||
+                  dto.state.state === "unavailable" ||
+                  dto.state.state === "conflict"}
+                onclick={() => void familySyncNowClick(dto.connection.familyId)}
+              >
+                {families.syncingIds.has(dto.connection.familyId) ? "Syncing…" : "Sync now"}
+              </button>
+            </div>
+
+            <div class="row">
+              <span class="label">Poll every</span>
+              <input
+                type="number"
+                class="poll-input"
+                min="30"
+                max="1800"
+                step="10"
+                value={dto.connection.pollIntervalSecs}
+                disabled={dto.state.state === "unavailable"}
+                onchange={(e) => void setFamilyPollInterval(dto.connection.familyId, e.currentTarget.valueAsNumber)}
+              />
+              <span class="soft">seconds (30s–30min)</span>
+            </div>
+
+            <div class="row">
+              <span class="label">Workspace</span>
+              {#if dto.connection.attachedWorkspaceId && app.workspace?.id === dto.connection.attachedWorkspaceId}
+                <span class="chip">{app.workspace.name}</span>
+                <button
+                  class="btn btn-small"
+                  onclick={() => void detachFamilyWorkspace(dto.connection.familyId)}
+                >
+                  Detach
+                </button>
+              {:else if dto.connection.attachedWorkspaceId}
+                <span
+                  class="soft disabled-link"
+                  title="Attached to a different workspace than the one open now (id {dto.connection.attachedWorkspaceId}). Open that workspace to see it in search, or detach here."
+                >
+                  Attached to another workspace
+                </span>
+                <button
+                  class="btn btn-small"
+                  onclick={() => void detachFamilyWorkspace(dto.connection.familyId)}
+                >
+                  Detach
+                </button>
+              {:else if app.workspace}
+                <button
+                  class="btn btn-small"
+                  onclick={() => void attachFamilyWorkspace(dto.connection.familyId)}
+                >
+                  Attach to "{app.workspace.name}"
+                </button>
+              {:else}
+                <span
+                  class="soft disabled-link"
+                  title="Open a workspace first — an attached family's shared/ folder joins that workspace's search and knowledge graph."
+                >
+                  Open a workspace to attach
+                </span>
+              {/if}
+            </div>
+
+            <div class="row">
+              <button
+                class="btn btn-small remove"
+                onclick={() => void removeFamilyConnection(dto.connection.familyId)}
+                title="Forgets this connection's settings — the on-disk clone is left in place."
+              >
+                Forget
+              </button>
+            </div>
+          </div>
+        {/each}
+
+        <div class="card">
+          <div class="card-title">Create a family</div>
+          <p class="note">
+            Create an empty repo on your git host first (GitHub, Gitea, a
+            bare repo on a NAS — anything you already push to), then paste
+            its URL here. Ken scaffolds the family template into it and
+            makes you the first (owner) member.
+          </p>
+          <div class="row">
+            <span class="label">Name</span>
+            <input class="text-input" bind:value={familyCreateName} placeholder="e.g. Acme Team" />
+          </div>
+          <div class="row">
+            <span class="label">You</span>
+            <input class="text-input" bind:value={familyCreateMemberName} placeholder="Your display name" />
+          </div>
+          <div class="row">
+            <span class="label">Remote</span>
+            <input class="text-input" bind:value={familyCreateRemote} placeholder="git@host:team/family.git" />
+          </div>
+          {#if families.createError}
+            <p class="note warn">{families.createError}</p>
+          {/if}
+          <div class="row">
+            <button class="btn btn-small" onclick={() => void submitFamilyCreate()} disabled={families.createBusy}>
+              {families.createBusy ? "Creating…" : "Create family"}
+            </button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Join a family</div>
+          <div class="row">
+            <span class="label">Remote</span>
+            <input class="text-input" bind:value={familyJoinRemote} placeholder="git@host:team/family.git" />
+          </div>
+          <div class="row">
+            <label class="radio">
+              <input
+                type="radio"
+                name="family-join-mode"
+                checked={familyJoinMode === "existing"}
+                onchange={() => (familyJoinMode = "existing")}
+              />
+              I'm already a member
+            </label>
+            <label class="radio">
+              <input
+                type="radio"
+                name="family-join-mode"
+                checked={familyJoinMode === "new"}
+                onchange={() => (familyJoinMode = "new")}
+              />
+              I'm new to this family
+            </label>
+          </div>
+          {#if familyJoinMode === "existing"}
+            <div class="row">
+              <span class="label">Member id</span>
+              <input class="text-input" bind:value={familyJoinMemberId} placeholder="e.g. sarah" />
+            </div>
+            <p class="note">Ask a teammate for your member id — it's the short slug the manifest already knows you by.</p>
+          {:else}
+            <div class="row">
+              <span class="label">Your name</span>
+              <input class="text-input" bind:value={familyJoinNewName} placeholder="Your display name" />
+            </div>
+            <p class="note">You'll be appended to the family's member list.</p>
+          {/if}
+          {#if families.joinError}
+            <p class="note warn">{families.joinError}</p>
+          {/if}
+          <div class="row">
+            <button class="btn btn-small" onclick={() => void submitFamilyJoin()} disabled={families.joinBusy}>
+              {families.joinBusy ? "Joining…" : "Join family"}
+            </button>
+          </div>
+        </div>
+      </section>
+    {/if}
+
     <section class="group">
       <div class="group-head">On this Mac</div>
 
@@ -1042,6 +1376,67 @@
   .disabled-link {
     color: var(--ink-tertiary);
     cursor: not-allowed;
+  }
+  /* ken-families task 4.1: connection state badge. Idle/syncing are
+     informational; conflict and unavailable are deliberately distinct
+     colors (danger vs. muted) since one needs a click and the other
+     needs nothing at all — see the "I resolved it by hand" button vs.
+     the plain reason text below each. */
+  .state-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .state-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    flex: none;
+    background: var(--ink-tertiary);
+  }
+  .state-idle .state-dot {
+    background: var(--healthy);
+  }
+  .state-syncing .state-dot {
+    background: var(--accent);
+  }
+  .state-conflict {
+    color: var(--danger);
+  }
+  .state-conflict .state-dot {
+    background: var(--danger);
+  }
+  .state-error {
+    color: var(--needs-input-text);
+  }
+  .state-error .state-dot {
+    background: var(--needs-input);
+  }
+  .state-unavailable {
+    color: var(--ink-tertiary);
+  }
+  .text-input {
+    flex: 1;
+    min-width: 0;
+    font-family: inherit;
+    font-size: 12.5px;
+    padding: 6px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .poll-input {
+    width: 72px;
+    font-family: inherit;
+    font-size: 12.5px;
+    padding: 6px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink);
   }
   .mini-spinner {
     width: 12px;

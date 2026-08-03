@@ -9,6 +9,7 @@
   import FilesScreen from "../screens/FilesScreen.svelte";
   import ReviewScreen from "../screens/ReviewScreen.svelte";
   import IngestsScreen from "../screens/IngestsScreen.svelte";
+  import TasksScreen from "../screens/TasksScreen.svelte";
   import MapScreen from "../screens/MapScreen.svelte";
   import TimelineScreen from "../screens/TimelineScreen.svelte";
   import RecordScreen from "../screens/RecordScreen.svelte";
@@ -54,6 +55,9 @@
       {/if}
       {#if visited.has("ingests")}
         <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
+      {/if}
+      {#if visited.has("tasks")}
+        <div class="pane" hidden={app.screen !== "tasks"}><TasksScreen /></div>
       {/if}
       {#if visited.has("map")}
         <div class="pane" hidden={app.screen !== "map"}><MapScreen /></div>
