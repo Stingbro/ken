@@ -369,58 +369,220 @@ before starting. Two sequencing rules this file encodes:
 
 ## 2. src-tauri
 
-- [ ] 2.1 Pipeline state: load definitions on workspace open (flag
+- [x] 2.1 Pipeline state: load definitions on workspace open (flag
       on), watch `.ken-workspace/pipelines/` with the existing
       content-hash self-write dedupe, and fold pipelines into the
       board state so `board-state` carries lanes, per-lane counts,
       block summaries, and the extended tray; flag-gated by
       `kenPipeline` (requires `workspace` + `kenTasks`)
-- [ ] 2.2 Ledger state: scan `runs/` on open, watch it, derive the
+      - `ken_pipeline_enabled` AND-s in `ken_tasks_enabled` (which itself
+        AND-s `workspace_enabled`), so one check transitively requires
+        both flags per the registry description.
+      - Judgment call: no second poller/watcher thread. `.ken-workspace/
+        pipelines/` and `runs/` are folded into the SAME content-hash
+        snapshot + self-write registry the ken-tasks board watcher
+        already uses (`task_board_file_snapshot` widened to also list
+        them when the flag is on), per the brief's "reuse the Phase 7
+        ken-tasks poller pattern... rather than inventing a second
+        mechanism".
+      - Judgment call, flagged rather than silently decided: when
+        `kenPipeline` is off, `board_state_dto` never calls `pipeline::
+        resolve_board` or `needs_attention_with_pipelines` (not merely
+        "with an empty pipeline list") — a `kenTasks`-only workspace's
+        computation is byte-identical to before this feature. The five
+        new `BoardStateDto` fields (`pipelines`, `pipelineFields`,
+        `pipelineLaneCounts`, `blocked`) still appear on the wire (empty),
+        since `BoardStateDto` is one shared shape for both surfaces — this
+        is the one place 5.2's "byte-identical" is read as "identical
+        computation" rather than "identical JSON payload"; see `board_
+        state_dto`'s doc comment.
+- [x] 2.2 Ledger state: scan `runs/` on open, watch it, derive the
       queue view, mark stale `running` records at startup; emit
       `pipeline-runs` events alongside `board-state`
-- [ ] 2.3 Commands — read: `pipeline_list_defs`, `pipeline_board`
+      - **Ruling on the flagged stale-detection shape (1.11's note for
+        2.2 to review):** adopted as-is, with one concrete resolution for
+        what "the caller's own running set" means in a process that never
+        spawns a runner (D14/OPEN-1). `WorkspaceState::pipeline_known_
+        running` is populated by `spawn_task_board_watch`'s poller itself
+        noticing a run-ledger file change TO `outcome: running` between
+        two ticks (a dedicated runs-only snapshot, diffed separately from
+        the merged board+pipeline+runs snapshot the self-write gate
+        uses). Concretely: a `running` record already on disk at
+        workspace-open is stale until this session's own poller later
+        observes some OTHER change to it (impossible, since a genuinely
+        still-running record won't change again until it closes) —
+        i.e. it stays stale for the rest of THIS Ken window, exactly
+        D13's "no live run after restart" read literally for a runner
+        that spawns nothing. A run that transitions queued→running
+        WHILE this Ken window is open (an external `pipeline_claim` via
+        ken-mcp) IS observed and becomes known/non-stale for the rest of
+        the session. This is more permissive than "always stale" (which
+        would falsely flag every long-running external-agent session
+        after a Ken restart) and strictly conservative on restart (which
+        is D13's actual ask). Recorded here per the session brief's "adopt
+        or adjust it, and record your reasoning".
+      - `pipeline-runs` is emitted from inside `emit_board_state` (not a
+        second emit call site), so the two events always share one
+        recompute and can't drift out of sync with each other.
+- [x] 2.3 Commands — read: `pipeline_list_defs`, `pipeline_board`
       (lane-ordered board state), `pipeline_runs`, `pipeline_digest`,
       `pipeline_blockers(ticket_id)` (the resolved chain, root first)
-- [ ] 2.4 Commands — write: `pipeline_kickoff(ticket_id)` →
+      - `pipeline_list_defs` additionally returns each definition's
+        `validate_pipeline` issues (not literally asked for, but the
+        natural discovery point for a bad definition file).
+      - `pipeline_blockers` returns `{direct, chain}`: `direct` is the
+        ticket's own `blocked_by`, `chain` is the full root-first walk
+        built locally over `BlockGraph::blockers`'s public accessor —
+        `pipeline::root_blockers` only returns the leaves, not the
+        intermediate links, and ken-core exposes no "full chain" function
+        (crates/** read-only this session).
+- [x] 2.4 Commands — write: `pipeline_kickoff(ticket_id)` →
       `admit()` → confirmation payload or a `queued`/`running` run
       record; `pipeline_advance(ticket_id, outcome, report)` →
       `advance()` → patch (`status`, `bounces`, and the block fields
       when the cap trips) + `## Log` append + run record close;
       `pipeline_cancel_run(run_id)`. **Manual kickoff only in this
       pass (D6)** — no transition fires without a user action
-- [ ] 2.5 Commands — block/unblock: `pipeline_block(ticket_id,
+      - `pipeline_kickoff(ticket_id, confirmed: bool)`: first call (or
+        `confirmed: false`) with an `Admission::Confirm` verdict returns
+        the confirmation payload and writes nothing; a second call with
+        `confirmed: true` proceeds. `Admission::Start`/`Queued` always
+        write a run record with `outcome: queued` regardless (D14: Ken
+        never spawns anything itself, so "start" vs "queue" is informational
+        only — surfaced as a `ready: bool` on the DTO).
+      - `pipeline_advance` gained an `artifacts: Option<Vec<String>>`
+        param beyond the literal 2.4 signature — flagged: without it,
+        `RunRecord.artifacts` could never be set by anything, and D9 asks
+        a run record to say which destination each output went to.
+      - The run closed by `pipeline_advance` is found by ticket id + open
+        (`queued`/`running`) outcome on the ledger, not by an explicit
+        run id parameter (2.4's own signature has none) — best-effort: a
+        ticket advanced with no matching open run still advances (D13:
+        "derived, not owned").
+- [x] 2.5 Commands — block/unblock: `pipeline_block(ticket_id,
       {blocked_by?, reason?})` and `pipeline_unblock(ticket_id,
       {clear_deps?, clear_reason?})`, both routed through 1.6/1.7 so
       cycle detection and `return_lane` capture cannot be bypassed;
       the cycle refusal surfaces the path in the error shown to the
       user
-- [ ] 2.6 Unblock trigger (D5, OPEN-10): when any ticket reaches a
+      - Judgment call: `BlockRequest::now` (Deserialize, so a caller
+        technically could set it) is always overwritten server-side with
+        `iso_datetime_now()` before calling `pipeline::block` — a
+        caller-supplied clock is the wrong trust boundary for
+        `blocked_at`, which the digest ages tickets by.
+- [x] 2.6 Unblock trigger (D5, OPEN-10): when any ticket reaches a
       terminal lane, run `evaluate_unblocks` over the (small) set of
       tickets naming it and move each freed ticket to its
       `return_lane` with `EntryKind::Unblock` — which means it waits
       at a confirmation, never starts. Run the same evaluation once
       on workspace open so nothing is missed across restarts. **Add
       an assertion/test that this path cannot reach `Start`.**
-- [ ] 2.7 Sign-off flow: `pipeline_signoff(ticket_id, decision,
+      - `apply_unblocks_for` fans out `evaluate_unblocks` over EVERY
+        loaded pipeline (not just the terminal ticket's own), since a
+        dependent may belong to a different pipeline than the ticket that
+        just finished — `evaluate_unblocks` only ever checks one pipeline
+        at a time. Noted limitation inherited from ken-core 1.10 (not
+        fixable here, pipeline.rs is read-only): `is_terminal` resolves a
+        blocker's lane against the DEPENDENT's pipeline, so a blocker
+        that finished in a genuinely different pipeline is never seen as
+        terminal. Out of this session's touch scope; flagged for the
+        ken-core owner.
+      - `apply_unblocks_for`/`run_unblock_sweep` never call `pipeline::
+        admit()` at all in this pass — they only apply the ready-made
+        `Unblocked.patch` (move to `return_lane`), and 2.12 (the only
+        thing that would ever auto-admit a freshly-entered lane) is
+        gated off. The required test, `unblocked_ticket_never_admits_to_
+        start` (in `lib.rs`'s `mod tests`), is therefore a forward-looking
+        regression guard for when that gate lifts, not a test of any
+        code path that exists yet: it asserts `pipeline::admit(..,
+        EntryKind::Unblock)` never returns `Start`, even for an
+        `auto`-kickoff lane in an `auto: true` pipeline.
+- [x] 2.7 Sign-off flow: `pipeline_signoff(ticket_id, decision,
       comment?)` implementing accept / accept-with-comments (creates
       the child ticket *and* advances the parent) / reject (bounce)
-- [ ] 2.8 Idea flow: documentation-lane proposals go through 1.13;
+      - Accept-with-comments writes the parent's transition log line AND
+        the sign-off comment note in ONE guarded write (`apply_
+        transition`'s `extra_log` param), matching D11's "both things
+        happen... in the same action" at the file level, not just the
+        command level.
+- [x] 2.8 Idea flow: documentation-lane proposals go through 1.13;
       wire the semantic path to the existing search surface when
       `semanticIndex`/`federatedKg` are on and the FTS path when they
       are not; near-duplicate ⇒ log append on the matched ticket, no
       new file
-- [ ] 2.9 Artifacts: create `artifacts/<ticket-id>/` lazily with its
+      - **Underspecified, reported rather than decided:** neither
+        design.md nor tasks.md states what actually TRIGGERS an idea
+        proposal from the documentation lane (no report-body wire format,
+        no dedicated MCP tool in section 3's list). Implemented as a
+        standalone command, `pipeline_propose_idea(ticket_id, title,
+        body)`, that any caller (future MCP tool, chat command, or UI)
+        can invoke explicitly with an already-decided title/body — mirrors
+        the MCP pull model's "the agent decides, Ken records" shape used
+        everywhere else in this design. The actual trigger wiring (does
+        the documentation lane's agent call an MCP tool per idea? is
+        there a report-body convention Ken parses?) is not decided here.
+      - **Judgment call, flagged as a deliberate scope/risk trade-off:**
+        the FTS/normalized-title fallback is fully implemented and always
+        runs (every in-scope ticket is offered to `dedupe_idea` with
+        `score: None`, so its own Jaccard title score decides — this
+        alone satisfies "dedupe degrades without the index"). When the
+        workspace-memory pseudo-member is resident (`kenMemory` on), the
+        candidate pool is additionally WIDENED with a plain keyword FTS
+        hit (`db.search_chunks_fts`) over ticket bodies, catching a
+        body-only match a title-only Jaccard would miss — but every
+        widened hit is STILL scored via the same title fallback, not a
+        real embedding distance. True semantic KNN scoring (`db.
+        semantic_search`) is deliberately NOT wired: its distance metric
+        has no established distance-to-`[0,1]`-similarity convention
+        anywhere in this codebase, and inventing one risks silently
+        miscalibrating `pipeline::DEDUPE_THRESHOLD` (tuned assuming a
+        Jaccard-shaped score). Consequence: `semanticIndex`/`federatedKg`
+        are NOT literally read as the gate for the widening step;
+        pseudo-member residency (itself gated by `kenMemory`) is used as
+        the practical precondition instead. Recommend a follow-up change
+        if true semantic dedupe scoring is wanted.
+- [x] 2.9 Artifacts: create `artifacts/<ticket-id>/` lazily with its
       manifest; expose `pipeline_artifacts(ticket_id)` and a
       `pipeline_prune_artifacts(ticket_id)` action; **verify no write
       path can place an artifact inside a member repo**
-- [ ] 2.10 ken-memory integration: `pipeline_digest` writes through
+      - Added `pipeline_register_artifact(ticket_id, filename)` beyond
+        the literal task list — without SOME command that lazily creates
+        the folder+manifest, nothing ever would (section 2's list names
+        `pipeline_artifacts` read + `pipeline_prune_artifacts`, not a
+        writer). Idempotent: appends `filename` to an existing manifest's
+        `files` list rather than duplicating it.
+      - Verification is structural, not just tested: every artifact path
+        in this session's code is built from `pipeline::artifact_ticket_
+        dir(ws_root, ticket_id)` = `.ken-workspace/artifacts/<ticket-id>/`
+        — there is no parameter or branch anywhere in `pipeline_
+        artifacts`/`pipeline_register_artifact`/`pipeline_prune_
+        artifacts` that could redirect a write into a project member's
+        own tree.
+- [x] 2.10 ken-memory integration: `pipeline_digest` writes through
       `journal_append` when `kenMemory` is on; skipped cleanly when
       off
-- [ ] 2.11 Indexing: `.ken-workspace/pipelines/` and `runs/` ride the
+      - **Flagged, not silently decided:** the spec line names no dedupe
+        rule, so `pipeline_digest` journals on EVERY call — a UI that
+        polls this command to render a live digest panel will write to
+        the journal repeatedly. A once-per-day dedupe (e.g. skip if
+        today's journal already has a `pipeline-digest`-tagged entry)
+        would be a reasonable follow-up but is a product decision this
+        session isn't positioned to make silently.
+- [x] 2.11 Indexing: `.ken-workspace/pipelines/` and `runs/` ride the
       pseudo-member at **search-only** tier (same rule as `tasks/`);
       `artifacts/` is excluded from indexing (binaries + throwaway),
       except its `manifest.md` and any `walkthrough.md` at
       search-only
+      - `memory::workspace_builtin_rules()` (ken-core, read-only this
+        session) can't be extended directly, so this is a sibling rule
+        list (`pipeline_kenignore_rules`, in `lib.rs`) appended to it —
+        only when `kenPipeline` is on — before both are handed to
+        `render_builtin_kenignore` at pseudo-member activation.
+        `/artifacts/` is `Ignore` first, with the two `manifest.md`/
+        `walkthrough.md` globs appended AFTER it so last-match-wins
+        (kenignore.rs D1) lets them punch through the broad ignore.
+      - `activate_memory_pseudo_member` gained an `app_settings` param to
+        make this flag check possible at its one call site.
 - [ ] 2.12 **Gated on 5.4 passing**: auto-transitions — on lane entry
       with `kickoff: auto` *and* pipeline `auto: true`, run `admit()`
       and start or queue. Ship `auto: false` in the scaffold; do not

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+﻿use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ use ken_core::hooks::HookListener;
 use ken_core::project::Project;
 use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, RulesOverride};
 use ken_core::registry::{Registry, RegistryEntryStatus};
+use ken_core::pipeline;
 use ken_core::pty_registry;
 use ken_core::routing;
 use ken_core::scan::{self, ScanStats};
@@ -311,6 +312,19 @@ struct WorkspaceState {
     /// switch) drops this too, which stops the poller thread via
     /// `StopOnDrop` — no separate teardown call needed.
     task_watch: Option<StopOnDrop>,
+    /// ken-pipeline task 2.2: run ids `spawn_task_board_watch`'s poller has
+    /// itself observed transition into `running` *during this workspace
+    /// session*. See that function's doc comment for the full ruling on why
+    /// this — not "did this Ken process spawn the run" — is what
+    /// `pipeline::derive_queue`'s `known_running_ids` means here: v1's `mcp`
+    /// runner (D14) means Ken never spawns a run itself, so the only signal
+    /// this process ever has is "did my own poller see this run appear/
+    /// change to `running` since I opened this workspace". Starts empty on
+    /// every workspace open — by construction, every `running` record
+    /// already on disk at open time is stale until proven otherwise this
+    /// session (D13's "no live run after restart", generalized to "no live
+    /// run this Ken window has evidence for").
+    pipeline_known_running: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl WorkspaceState {
@@ -1457,6 +1471,35 @@ fn ken_tasks_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
 const KEN_TASKS_DISABLED_MSG: &str =
     "Ken's task board is off — turn on kenTasks in Settings → Features to use it.";
 
+/// Effective `kenPipeline` flag (ken-pipeline task 2.1): the global-scope
+/// registry default overridden by `settings.json`'s `features` map, AND-ed
+/// with `ken_tasks_enabled` — the registry description states "Requires the
+/// workspace and kenTasks flags", and `ken_tasks_enabled` already AND-s in
+/// `workspace_enabled`, so this transitively requires both without
+/// re-checking `workspace_enabled` a second time. Gates every pipeline
+/// command on both surfaces, the pipeline/run watchers, the scaffold write,
+/// and the pseudo-member's pipeline-scoped `.kenignore` rules (task 2.11) —
+/// off means byte-identical to pre-feature (plain ken-tasks) behavior (spec
+/// "flag off is inert").
+fn ken_pipeline_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
+    if !ken_tasks_enabled(app_settings) {
+        return false;
+    }
+    let default = ken_core::features::flag("kenPipeline")
+        .map(|f| f.default)
+        .unwrap_or(false);
+    app_settings
+        .features
+        .get("kenPipeline")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// Friendly error every ken-pipeline command returns when the flag is off
+/// (mirrors `KEN_TASKS_DISABLED_MSG`'s wording/role).
+const KEN_PIPELINE_DISABLED_MSG: &str =
+    "Ken's pipeline board is off — turn on kenPipeline in Settings → Features to use it.";
+
 /// Effective `kenFamilies` flag (ken-families task 2.6): the global-scope
 /// registry default overridden by `settings.json`'s `features` map — same
 /// shape as `workspace_enabled`. Deliberately NOT AND-ed with `workspace_
@@ -1871,11 +1914,34 @@ fn render_builtin_kenignore(rules: &[kenignore::Rule]) -> String {
 /// `Registry` entry means it *could* technically surface in a "recent
 /// projects" list outside the current workspace's own member list — not
 /// addressed here, out of this task's named exclusion list).
+/// ken-pipeline task 2.11: the tier rules folded into the workspace pseudo-
+/// member's `.kenignore` when `kenPipeline` is on (see the call site in
+/// `activate_memory_pseudo_member`). `memory::workspace_builtin_rules` lives
+/// in `crates/ken-core` (read-only for this session), so — same as
+/// `pipeline_patch_edits` below has to reproduce `TaskPatch::edits()`
+/// rather than call it — this is a sibling rule-set appended in
+/// `render_builtin_kenignore`'s input rather than a change to that function.
+/// `/artifacts/` is `Ignore` first (binaries + throwaway output — design D9)
+/// and the two `manifest.md`/`walkthrough.md` globs are `SearchOnly`
+/// *after* it, so last-match-wins (kenignore.rs D1) lets them punch through
+/// the broad ignore for exactly the two files a human or QA lane needs
+/// findable, without indexing screenshots/videos/traces.
+fn pipeline_kenignore_rules() -> Vec<kenignore::Rule> {
+    vec![
+        kenignore::Rule { tier: kenignore::Tier::SearchOnly, pattern: "/pipelines/".to_string() },
+        kenignore::Rule { tier: kenignore::Tier::SearchOnly, pattern: "/runs/".to_string() },
+        kenignore::Rule { tier: kenignore::Tier::Ignore, pattern: "/artifacts/".to_string() },
+        kenignore::Rule { tier: kenignore::Tier::SearchOnly, pattern: "/artifacts/**/manifest.md".to_string() },
+        kenignore::Rule { tier: kenignore::Tier::SearchOnly, pattern: "/artifacts/**/walkthrough.md".to_string() },
+    ]
+}
+
 fn activate_memory_pseudo_member(
     app: &AppHandle,
     state: &SharedState,
     ws_root: &Path,
     ws_id: uuid::Uuid,
+    app_settings: &ken_core::settings::AppSettings,
 ) -> CmdResult<()> {
     let pseudo_id = memory::workspace_pseudo_member_id(ws_id);
     let pseudo_root = ws_root.join(ken_core::workspace::CONFIG_DIR);
@@ -1906,7 +1972,21 @@ fn activate_memory_pseudo_member(
     // a write failure degrades this activation to "everything Full tier"
     // (today's plain no-`.kenignore` default) rather than blocking the open.
     let kenignore_path = pseudo_root.join(".kenignore");
-    let text = render_builtin_kenignore(&memory::workspace_builtin_rules());
+    let mut rules = memory::workspace_builtin_rules();
+    // ken-pipeline task 2.11: `pipelines/` and `runs/` ride the pseudo-member
+    // at search-only tier, same rule as `tasks/` above; `artifacts/` is
+    // excluded (binaries + throwaway output) except each ticket's
+    // `manifest.md`/`walkthrough.md` at search-only. Appended, never
+    // inserted, so last-match-wins (kenignore.rs D1) lets the broad
+    // `/artifacts/` ignore be overridden by the two narrower rules that
+    // follow it. Flag-gated: off means these three lines are never added,
+    // so a `kenTasks`-only workspace's pseudo-member `.kenignore` is
+    // byte-identical to before this feature (task 2.11 / 5.2's "off => ...
+    // no extra watchers" extended to "no extra indexing rules").
+    if ken_pipeline_enabled(app_settings) {
+        rules.extend(pipeline_kenignore_rules());
+    }
+    let text = render_builtin_kenignore(&rules);
     if let Err(e) = std::fs::write(&kenignore_path, text) {
         eprintln!("warning: failed to write workspace-memory pseudo-member .kenignore: {e}");
     }
@@ -1973,7 +2053,7 @@ fn open_workspace_inner(
     // a failure here must never fail `open_workspace`/`create_workspace`.
     let kenmem_on = { state.lock().unwrap().app_settings.clone() };
     if ken_memory_enabled(&kenmem_on) {
-        if let Err(e) = activate_memory_pseudo_member(app, state, &ws.root, ws.config.id) {
+        if let Err(e) = activate_memory_pseudo_member(app, state, &ws.root, ws.config.id, &kenmem_on) {
             eprintln!("warning: workspace-memory pseudo-member failed to activate: {e}");
         }
         let roll_root = ws.root.clone();
@@ -2045,7 +2125,12 @@ fn open_workspace_inner(
     // Install bookkeeping (holds the resolved manifest + resident LRU).
     {
         let mut guard = state.lock().unwrap();
-        guard.workspace = Some(WorkspaceState { ws, lru: resident_lru.clone(), task_watch: None });
+        guard.workspace = Some(WorkspaceState {
+            ws,
+            lru: resident_lru.clone(),
+            task_watch: None,
+            pipeline_known_running: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+        });
         guard.focused = resident_lru.last().copied();
     }
 
@@ -2062,6 +2147,24 @@ fn open_workspace_inner(
         let mut guard = state.lock().unwrap();
         if let Some(ws_state) = guard.workspace.as_mut() {
             ws_state.task_watch = Some(handle);
+        }
+    }
+
+    // ken-pipeline tasks 2.1/2.6/2.11: scaffold `default.md` on first enable
+    // and run the workspace-open unblock sweep (D5/OPEN-10: "a full
+    // re-evaluation still runs on workspace open so nothing is missed
+    // across restarts"), now that `guard.workspace` is installed. Off means
+    // neither runs — task 2.1's own flag gate: no `pipelines/` folder, no
+    // scaffold file, no sweep. Best-effort, like the two blocks above.
+    if ken_pipeline_enabled(&kenmem_on) {
+        let ws_root = { state.lock().unwrap().workspace.as_ref().map(|w| w.ws.root.clone()) };
+        if let Some(ws_root) = ws_root {
+            if let Err(e) = ensure_pipeline_scaffold(&ws_root) {
+                eprintln!("warning: pipeline scaffold write failed: {e}");
+            }
+            if let Err(e) = run_unblock_sweep(app, state) {
+                eprintln!("warning: pipeline workspace-open unblock sweep failed: {e}");
+            }
         }
     }
 
@@ -7920,6 +8023,53 @@ struct BoardStateDto {
     goals: Vec<tasks::Goal>,
     needs_attention: Vec<tasks::NeedsAttention>,
     progress: std::collections::BTreeMap<String, tasks::Progress>,
+    // -- ken-pipeline task 2.1: "board-state carries lanes, per-lane
+    // counts, block summaries, and the extended tray". Empty/absent in
+    // every field below when `kenPipeline` is off (or a pipeline-less
+    // board), so a `kenTasks`-only workspace's `board-state` payload keeps
+    // its four original keys' worth of *meaning* — these are additive keys
+    // a pre-ken-pipeline frontend simply never reads, not a change to any
+    // existing key's shape (see the "judgment call" note on
+    // `board_state_dto` below for the byte-identical trade-off this makes).
+    /// Every loaded pipeline definition, in file order — column order is
+    /// definition order (D1), so the frontend renders `pipelines[i].lanes`
+    /// directly with no re-sorting.
+    pipelines: Vec<pipeline::Pipeline>,
+    /// The ken-pipeline half of each pipeline ticket's frontmatter
+    /// (`TicketFields`, ken-pipeline task 1.5), keyed by ticket id —
+    /// `Task::extra()` isn't serialized (it's `#[serde(skip)]`, read-side
+    /// only), so this is the one place `scope`/`verify`/`model`/`bounces`/
+    /// `blocked_by`/etc. reach the frontend at all. Only pipeline tickets
+    /// (`task.lane.is_some()`) get an entry.
+    pipeline_fields: std::collections::BTreeMap<String, pipeline::TicketFields>,
+    /// `pipeline id -> lane id -> ticket count`, for a column-count badge
+    /// without the frontend re-deriving it from `tasks`.
+    pipeline_lane_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>,
+    /// One entry per ticket currently carrying block evidence
+    /// (`pipeline::has_block_evidence`), root blocker(s) included so the
+    /// blocked badge/tray doesn't need a second round-trip
+    /// (`pipeline_blockers`) just to render.
+    blocked: Vec<BlockedSummaryDto>,
+}
+
+/// One row of `BoardStateDto::blocked` (ken-pipeline task 2.1).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockedSummaryDto {
+    ticket_id: String,
+    title: String,
+    project: String,
+    /// Always `Some` for a ticket blocked through `pipeline::block` (D5:
+    /// "a blocked ticket without a return lane is unconstructable"); `None`
+    /// only for a hand-edit orphan already flagged `UnknownReturnLane` in
+    /// `needs_attention`.
+    return_lane: Option<String>,
+    blocked_by: Vec<String>,
+    block_reason: Option<String>,
+    blocked_at: Option<String>,
+    /// `pipeline::root_blockers` — the root of the dependency chain, not
+    /// the nearest link (1.15's "the subtle part").
+    root_blockers: Vec<String>,
 }
 
 /// Every task home for an open workspace: `.ken-workspace/tasks/` plus every
@@ -7983,15 +8133,83 @@ fn task_homes_scan(
     Ok((tasks_list, goals))
 }
 
+/// Scan the whole board plus every loaded pipeline definition, resolving
+/// each pipeline ticket's `lane`/`status` (ken-pipeline task 2.1's "switch
+/// your call sites to [the pipeline-aware variants] and call `resolve_board`
+/// after `scan_tasks`"). The one thing every pipeline-aware command below
+/// shares with `board_state_dto`.
+///
+/// Judgment call, recorded once here rather than at every call site: when
+/// `kenPipeline` is off this returns `pipelines: vec![]` and never calls
+/// `pipeline::resolve_board` at all — not merely "with an empty pipeline
+/// list" — so a `kenTasks`-only workspace's `tasks_list` is byte-identical
+/// to plain `task_homes_scan`, even for the theoretical edge case of a task
+/// file that already happens to carry a stray `pipeline:` key. Section 5.2's
+/// "flag off is byte-identical" is read here as "identical computation, not
+/// merely identical when no ticket opts in".
+fn scan_board_with_pipelines(
+    ws: &ken_core::workspace::Workspace,
+    base_dir: &Path,
+    app_settings: &ken_core::settings::AppSettings,
+) -> CmdResult<(Vec<tasks::Task>, Vec<tasks::Goal>, Vec<pipeline::Pipeline>)> {
+    let (mut tasks_list, goals) = task_homes_scan(ws, base_dir, app_settings)?;
+    let pipelines = if ken_pipeline_enabled(app_settings) {
+        let loaded = pipelines_scan(&ws.root);
+        pipeline::resolve_board(&mut tasks_list, &loaded);
+        loaded
+    } else {
+        Vec::new()
+    };
+    Ok((tasks_list, goals, pipelines))
+}
+
 fn board_state_dto(
     ws: &ken_core::workspace::Workspace,
     base_dir: &Path,
     app_settings: &ken_core::settings::AppSettings,
 ) -> CmdResult<BoardStateDto> {
-    let (tasks_list, goals) = task_homes_scan(ws, base_dir, app_settings)?;
-    let needs_attention = tasks::needs_attention(&tasks_list, &goals);
+    let (tasks_list, goals, pipelines) = scan_board_with_pipelines(ws, base_dir, app_settings)?;
+    let needs_attention = tasks::needs_attention_with_pipelines(&tasks_list, &goals, &pipelines);
     let progress = tasks::goal_progress_all(&tasks_list, &goals);
-    Ok(BoardStateDto { tasks: tasks_list, goals, needs_attention, progress })
+
+    let mut pipeline_fields = std::collections::BTreeMap::new();
+    let mut pipeline_lane_counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
+        std::collections::BTreeMap::new();
+    let mut blocked = Vec::new();
+    if !pipelines.is_empty() {
+        let graph = pipeline::BlockGraph::from_tasks(&tasks_list);
+        for t in &tasks_list {
+            let Some(lane) = &t.lane else { continue };
+            let fields = pipeline::ticket_fields(t);
+            if let Some(pid) = &fields.pipeline {
+                *pipeline_lane_counts.entry(pid.clone()).or_default().entry(lane.clone()).or_insert(0) += 1;
+            }
+            if pipeline::has_block_evidence(t) {
+                blocked.push(BlockedSummaryDto {
+                    ticket_id: t.id.clone(),
+                    title: t.title.clone(),
+                    project: t.project.clone(),
+                    return_lane: fields.return_lane.clone(),
+                    blocked_by: fields.blocked_by.clone(),
+                    block_reason: fields.block_reason.clone(),
+                    blocked_at: fields.blocked_at.clone(),
+                    root_blockers: pipeline::root_blockers(&graph, &t.id),
+                });
+            }
+            pipeline_fields.insert(t.id.clone(), fields);
+        }
+    }
+
+    Ok(BoardStateDto {
+        tasks: tasks_list,
+        goals,
+        needs_attention,
+        progress,
+        pipelines,
+        pipeline_fields,
+        pipeline_lane_counts,
+        blocked,
+    })
 }
 
 /// Resolve a `task_create`/`resolve_daily_candidate` `project_id` argument
@@ -8070,19 +8288,44 @@ fn hash_file(path: &Path) -> Option<u64> {
 
 /// A content-hash snapshot of every `.md` file directly inside every
 /// watched task/goal directory (task 2.1) — `workspace_tasks_dir`,
-/// `goals_dir`, and each resolvable member's `project_tasks_dir`. Listing is
-/// non-recursive, matching `list_tasks`'/`list_goals`' own semantics, so
+/// `goals_dir`, and each resolvable member's `project_tasks_dir`, PLUS
+/// (ken-pipeline task 2.1/2.2, when `app_settings` resolves `kenPipeline`
+/// on) `.ken-workspace/pipelines/*.md` and every `.ken-workspace/runs/
+/// YYYY-MM/*.md`. One merged snapshot, not a second poller: task 2.2 asks
+/// to "reuse the Phase 7 ken-tasks poller pattern... rather than inventing
+/// a second mechanism", and folding the pipeline/run directories into this
+/// same content-hash map means `spawn_task_board_watch`'s one thread, one
+/// self-write registry (`AppState::task_recent_writes`, which every
+/// pipeline-writing command below also writes through), and one
+/// unexplained-change gate cover both. Listing is non-recursive within each
+/// leaf directory, matching `list_tasks`'/`list_goals`' own semantics, so
 /// `archive/` subfolders are naturally excluded: an archived task leaving
-/// the flat listing shows up as a removal here, exactly like a delete would.
-/// A directory that doesn't exist yet (a per-repo home nobody has opted
-/// into, or `tasks/goals/` before the first goal) contributes nothing
-/// rather than erroring — same "missing folder reads as no tasks" tolerance
+/// the flat listing shows up as a removal here, exactly like a delete
+/// would. A directory that doesn't exist yet (a per-repo home nobody has
+/// opted into, `tasks/goals/` before the first goal, or `pipelines/`/
+/// `runs/` before the scaffold/first run) contributes nothing rather than
+/// erroring — same "missing folder reads as no tasks" tolerance
 /// `ken_core::tasks` itself uses.
-fn task_board_file_snapshot(ws: &ken_core::workspace::Workspace) -> std::collections::BTreeMap<PathBuf, u64> {
+fn task_board_file_snapshot(
+    ws: &ken_core::workspace::Workspace,
+    app_settings: &ken_core::settings::AppSettings,
+) -> std::collections::BTreeMap<PathBuf, u64> {
     let mut dirs: Vec<PathBuf> = vec![tasks::workspace_tasks_dir(&ws.root), tasks::goals_dir(&ws.root)];
     for m in &ws.members {
         if let ken_core::workspace::MemberStatus::Ok(p) = &m.status {
             dirs.push(tasks::project_tasks_dir(&p.root));
+        }
+    }
+    if ken_pipeline_enabled(app_settings) {
+        dirs.push(pipeline::pipelines_dir(&ws.root));
+        let runs_dir = pipeline::runs_dir(&ws.root);
+        if let Ok(months) = std::fs::read_dir(&runs_dir) {
+            for month in months.flatten() {
+                let p = month.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                }
+            }
         }
     }
     let mut out = std::collections::BTreeMap::new();
@@ -8109,13 +8352,18 @@ fn task_board_file_snapshot(ws: &ken_core::workspace::Workspace) -> std::collect
 /// lock is held only long enough to clone the resolved `Workspace`, never
 /// across the filesystem scan itself.
 fn emit_board_state(app: &AppHandle, state: &SharedState) {
-    let (ws, base_dir, app_settings) = {
+    let (ws, base_dir, app_settings, known_running) = {
         let guard = state.lock().unwrap();
         if !ken_tasks_enabled(&guard.app_settings) {
             return;
         }
         match guard.workspace.as_ref() {
-            Some(w) => (w.ws.clone(), guard.base_dir.clone(), guard.app_settings.clone()),
+            Some(w) => (
+                w.ws.clone(),
+                guard.base_dir.clone(),
+                guard.app_settings.clone(),
+                w.pipeline_known_running.clone(),
+            ),
             None => return,
         }
     };
@@ -8124,6 +8372,19 @@ fn emit_board_state(app: &AppHandle, state: &SharedState) {
             let _ = app.emit("board-state", dto);
         }
         Err(e) => eprintln!("warning: task board scan failed: {e}"),
+    }
+    // ken-pipeline task 2.2: "emit `pipeline-runs` events alongside
+    // `board-state`" — folded into the same recompute rather than a second
+    // emit call site, so the two events are always in sync with each other
+    // and with whatever change just triggered this recompute.
+    if ken_pipeline_enabled(&app_settings) {
+        let runs = run_ledger_scan(&ws.root);
+        let (mut tasks_list, _goals) = task_homes_scan(&ws, &base_dir, &app_settings).unwrap_or_default();
+        let pipelines = pipelines_scan(&ws.root);
+        pipeline::resolve_board(&mut tasks_list, &pipelines);
+        let ids = known_running.lock().unwrap().clone();
+        let queue = pipeline::derive_queue(&tasks_list, &pipelines, &runs, &ids);
+        let _ = app.emit("pipeline-runs", queue);
     }
 }
 
@@ -8185,26 +8446,69 @@ fn spawn_task_board_watch(app: AppHandle, state: SharedState) -> StopOnDrop {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     std::thread::spawn(move || {
-        let mut last: std::collections::BTreeMap<PathBuf, u64> = {
+        let (mut last, mut last_runs) = {
             let guard = state.lock().unwrap();
-            guard.workspace.as_ref().map(|w| task_board_file_snapshot(&w.ws)).unwrap_or_default()
+            let app_settings = guard.app_settings.clone();
+            let snap = guard
+                .workspace
+                .as_ref()
+                .map(|w| task_board_file_snapshot(&w.ws, &app_settings))
+                .unwrap_or_default();
+            let runs_snap = guard
+                .workspace
+                .as_ref()
+                .filter(|_| ken_pipeline_enabled(&app_settings))
+                .map(|w| run_ledger_file_snapshot(&w.ws.root))
+                .unwrap_or_default();
+            (snap, runs_snap)
         };
         while !stop_thread.load(Ordering::SeqCst) {
             std::thread::sleep(TASK_BOARD_POLL_INTERVAL);
             if stop_thread.load(Ordering::SeqCst) {
                 break;
             }
-            let (ws, recent_writes) = {
+            let (ws, recent_writes, app_settings, known_running) = {
                 let guard = state.lock().unwrap();
                 (
                     guard.workspace.as_ref().map(|w| w.ws.clone()),
                     guard.task_recent_writes.clone(),
+                    guard.app_settings.clone(),
+                    guard.workspace.as_ref().map(|w| w.pipeline_known_running.clone()),
                 )
             };
             let Some(ws) = ws else {
                 continue; // no workspace open this tick (closing/switching) — try again
             };
-            let current = task_board_file_snapshot(&ws);
+            // ken-pipeline task 2.2: track which `running` run records THIS
+            // session's poller has itself seen appear/change since the last
+            // tick — see `WorkspaceState::pipeline_known_running`'s doc
+            // comment for the full ruling. Tracked from a dedicated
+            // runs-only snapshot (not the merged `current` below), reset to
+            // empty whenever the flag reads off so a later re-enable starts
+            // clean rather than diffing against a stale snapshot.
+            if ken_pipeline_enabled(&app_settings) {
+                let current_runs = run_ledger_file_snapshot(&ws.root);
+                if let Some(known_running) = &known_running {
+                    let mut known = known_running.lock().unwrap();
+                    for (path, hash) in &current_runs {
+                        if last_runs.get(path) != Some(hash) {
+                            if let Ok(raw) = std::fs::read_to_string(path) {
+                                let record = pipeline::parse_run(path, &raw);
+                                if record.outcome == Some(pipeline::RunOutcome::Running) {
+                                    known.insert(record.id);
+                                } else {
+                                    known.remove(&record.id);
+                                }
+                            }
+                        }
+                    }
+                }
+                last_runs = current_runs;
+            } else {
+                last_runs = std::collections::BTreeMap::new();
+            }
+
+            let current = task_board_file_snapshot(&ws, &app_settings);
             if current == last {
                 continue;
             }
@@ -8796,6 +9100,1364 @@ fn resolve_daily_rollover(
     drop(guard);
     note_task_write_and_emit(&app, state.inner(), old_path, stayed);
     Ok(resolved)
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2: src-tauri layer (openspec/changes/ken-pipeline).
+// Everything below is flag-gated by `ken_pipeline_enabled` (task 2.1),
+// which AND-s in `ken_tasks_enabled`/`workspace_enabled`. `pipeline.rs`
+// (ken-core) is pure — no filesystem, no clock, no watcher — so this layer
+// owns the clock (`local_date_today`/`iso_datetime_now`), the ledger
+// files, the events, and the confirmation UX, exactly as design.md's
+// "src-tauri owns the clock, the ledger files, the events, and the
+// confirmation UX" states. Every write funnels through `pipeline::admit`/
+// `advance`/`block`/`unblock` — this layer never re-derives gate logic.
+// ---------------------------------------------------------------------
+
+/// `.ken-workspace/pipelines/*.md`, parsed and sorted by filename for
+/// determinism (mirrors `tasks::list_tasks`'s own convention). A missing
+/// `pipelines/` folder (flag just turned on, scaffold not yet written) or
+/// an unreadable file reads as "no pipelines" rather than an error — the
+/// same "missing folder ⇒ no tasks" tolerance `ken_core::tasks` uses.
+fn pipelines_scan(ws_root: &Path) -> Vec<pipeline::Pipeline> {
+    let dir = pipeline::pipelines_dir(ws_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|raw| pipeline::parse_pipeline(&p, &raw)))
+        .collect()
+}
+
+/// Every run record under `.ken-workspace/runs/YYYY-MM/*.md`, with its
+/// path (needed to close/cancel a specific run — `RunRecord` itself
+/// carries no path, only `id`). Monthly folders are listed one level deep,
+/// matching D13's `runs/YYYY-MM/<ulid>.md` layout.
+fn run_ledger_scan_with_paths(ws_root: &Path) -> Vec<(PathBuf, pipeline::RunRecord)> {
+    let mut out = Vec::new();
+    let runs_dir = pipeline::runs_dir(ws_root);
+    let Ok(months) = std::fs::read_dir(&runs_dir) else { return out };
+    for month in months.flatten() {
+        let month_path = month.path();
+        if !month_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&month_path) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "md") {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    out.push((path.clone(), pipeline::parse_run(&path, &raw)));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_ledger_scan(ws_root: &Path) -> Vec<pipeline::RunRecord> {
+    run_ledger_scan_with_paths(ws_root).into_iter().map(|(_, r)| r).collect()
+}
+
+/// Content-hash snapshot of every run-ledger file, the run-ledger half of
+/// `task_board_file_snapshot`'s merged snapshot (task 2.2) and also used
+/// standalone by `spawn_task_board_watch`'s `known_running_ids` tracking
+/// (a dedicated runs-only diff, separate from the merged board+pipeline+
+/// runs snapshot the self-write-dedupe gate uses).
+fn run_ledger_file_snapshot(ws_root: &Path) -> std::collections::BTreeMap<PathBuf, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    let runs_dir = pipeline::runs_dir(ws_root);
+    let Ok(months) = std::fs::read_dir(&runs_dir) else { return out };
+    for month in months.flatten() {
+        let month_path = month.path();
+        if !month_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&month_path) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "md") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    out.insert(path, content_hash(&bytes));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Write `.ken-workspace/pipelines/default.md` on first enable only
+/// (design: "First enable scaffolds `.ken-workspace/pipelines/default.md`
+/// with the twelve lanes"). `scaffold_default_pipeline`'s own `exists`
+/// parameter is this caller's job to compute — the pure ken-core function
+/// does no I/O of its own — so a user's already-edited pipeline is never
+/// touched, and the `pipelines/` folder itself is created only at the
+/// moment content is actually about to be written into it (task 2.1's
+/// "off => no folders created" extended to "on, but a definition already
+/// exists => no folder churn either").
+fn ensure_pipeline_scaffold(ws_root: &Path) -> CmdResult<()> {
+    let path = pipeline::pipeline_path(ws_root, "default");
+    if let Some(content) = pipeline::scaffold_default_pipeline(path.exists()) {
+        let dir = pipeline::pipelines_dir(ws_root);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        std::fs::write(&path, content).map_err(err)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Shared write plumbing. `TaskPatch::edits()` (the private renderer
+// `apply_patch_with_pipelines` uses) has no body-append hook, and
+// crates/** is read-only for this session, so a pipeline transition/
+// block/unblock — which must combine a frontmatter patch with a `## Log`
+// line in ONE guarded write (`tasks::apply_edits`'s whole point) — cannot
+// go through `apply_patch_with_pipelines` as-is. `pipeline_patch_edits`
+// below reproduces `TaskPatch::edits()`'s exact field list, key order, and
+// `lane`/`status` mutual-exclusivity rule (read off `tasks.rs` directly),
+// using the same `pub` `scalar_lines`/`seq_lines` renderers, so the
+// rendered bytes are identical to what `apply_patch_with_pipelines` would
+// have produced for the same patch — this is a reproduction of public
+// rendering rules, not a second patch core.
+// ---------------------------------------------------------------------
+
+fn pipeline_patch_edits(patch: &tasks::TaskPatch) -> Vec<(&'static str, Vec<String>)> {
+    let mut out: Vec<(&'static str, Vec<String>)> = Vec::new();
+    if let Some(v) = &patch.title {
+        out.push(("title", tasks::scalar_lines("title", v)));
+    }
+    if let Some(v) = &patch.lane {
+        out.push(("status", tasks::scalar_lines("status", v)));
+    } else if let Some(v) = patch.status {
+        out.push(("status", tasks::scalar_lines("status", v.as_str())));
+    }
+    if let Some(v) = patch.kind {
+        out.push(("kind", tasks::scalar_lines("kind", v.as_str())));
+    }
+    if let Some(v) = &patch.assignee {
+        out.push(("assignee", tasks::scalar_lines("assignee", v)));
+    }
+    if let Some(v) = &patch.project {
+        out.push(("project", tasks::scalar_lines("project", v)));
+    }
+    if let Some(v) = &patch.tags {
+        out.push(("tags", tasks::seq_lines("tags", v)));
+    }
+    if let Some(v) = &patch.due {
+        out.push(("due", tasks::scalar_lines("due", v)));
+    }
+    if let Some(v) = &patch.goal {
+        out.push(("goal", tasks::scalar_lines("goal", v)));
+    }
+    if let Some(v) = patch.board {
+        out.push(("board", tasks::scalar_lines("board", v.as_str())));
+    }
+    if let Some(v) = &patch.pipeline {
+        out.push(("pipeline", tasks::scalar_lines("pipeline", v)));
+    }
+    if let Some(v) = &patch.model {
+        out.push(("model", tasks::scalar_lines("model", v)));
+    }
+    if let Some(v) = &patch.agent {
+        out.push(("agent", tasks::scalar_lines("agent", v)));
+    }
+    if let Some(v) = &patch.scope {
+        out.push(("scope", tasks::seq_lines("scope", v)));
+    }
+    if let Some(v) = &patch.verify {
+        out.push(("verify", tasks::scalar_lines("verify", v)));
+    }
+    if let Some(v) = patch.bounces {
+        out.push(("bounces", tasks::scalar_lines("bounces", &v.to_string())));
+    }
+    if let Some(v) = &patch.return_lane {
+        out.push(("return_lane", tasks::scalar_lines("return_lane", v)));
+    }
+    if let Some(v) = &patch.blocked_by {
+        out.push(("blocked_by", tasks::seq_lines("blocked_by", v)));
+    }
+    if let Some(v) = &patch.block_reason {
+        out.push(("block_reason", tasks::scalar_lines("block_reason", v)));
+    }
+    if let Some(v) = &patch.blocked_at {
+        out.push(("blocked_at", tasks::scalar_lines("blocked_at", v)));
+    }
+    if let Some(v) = &patch.parent {
+        out.push(("parent", tasks::scalar_lines("parent", v)));
+    }
+    if let Some(v) = &patch.spawned_by {
+        out.push(("spawned_by", tasks::scalar_lines("spawned_by", v)));
+    }
+    if let Some(v) = &patch.origin {
+        out.push(("origin", tasks::scalar_lines("origin", v)));
+    }
+    if let Some(v) = &patch.projects {
+        out.push(("projects", tasks::seq_lines("projects", v)));
+    }
+    if let Some(v) = &patch.target {
+        out.push(("target", tasks::scalar_lines("target", v)));
+    }
+    out
+}
+
+/// The addition `tasks::apply_edits`'s `append_body` closure returns: a
+/// `## Log` heading (only if the body doesn't already have one, mirroring
+/// `tasks::compose_log_entry`) plus `line` verbatim. Unlike `compose_log_
+/// entry` (a `### <date> <time>` sub-heading wrapping a full agent report,
+/// task_complete's shape) this is the terser single-line-per-transition
+/// shape `pipeline::Transition`/`Block`/`UnblockOutcome::Released` already
+/// compose (`"programmer → tester (pass)"`, `"blocked · returns to
+/// programmer — ..."`). `line` may itself be multi-line (e.g. a transition
+/// log line plus a sign-off comment note in one write); each of its own
+/// lines still lands under the one shared `## Log` heading.
+fn compose_pipeline_log_addition(body: &str, line: &str) -> String {
+    let has_heading = body.lines().any(|l| l.trim_end().eq_ignore_ascii_case(tasks::LOG_HEADING));
+    let mut out = String::new();
+    if !has_heading {
+        out.push_str(tasks::LOG_HEADING);
+        out.push_str("\n\n");
+    }
+    out.push_str(line.trim());
+    out.push('\n');
+    out
+}
+
+/// Apply a `TaskPatch` (as composed by `pipeline::advance`/`block`/
+/// `unblock`) plus an optional `## Log` addition, in one guarded write —
+/// the pipeline-aware, body-append-capable sibling of `tasks::
+/// apply_patch_with_pipelines` this session had to reproduce rather than
+/// call (see the block comment above `pipeline_patch_edits`). Same guard
+/// as that function: refuses to touch a ticket whose on-disk lane/status
+/// this pipeline set can't resolve, unless the patch itself resolves it
+/// (`patch.sets_status()`) — "never write around a lane it can't
+/// validate" (D2), reproduced verbatim rather than weakened.
+fn apply_pipeline_patch(
+    path: &Path,
+    patch: &tasks::TaskPatch,
+    updated: &str,
+    pipelines: &[pipeline::Pipeline],
+    log_addition: Option<&str>,
+) -> CmdResult<()> {
+    let raw = std::fs::read_to_string(path).map_err(err)?;
+    let mut current = tasks::parse_task(path, tasks::HomeKind::Workspace, "", &raw);
+    pipeline::resolve_task_lane(&mut current, pipelines);
+    if current.has_invalid_status() && !patch.sets_status() {
+        return Err(format!(
+            "ticket '{}' has an unrecognized lane — resolve it before patching other keys",
+            current.id
+        ));
+    }
+    let mut edits = pipeline_patch_edits(patch);
+    edits.push(("updated", tasks::scalar_lines("updated", updated)));
+    match log_addition {
+        Some(line) => {
+            let f = |body: &str| compose_pipeline_log_addition(body, line);
+            tasks::apply_edits(path, &edits, Some(&f)).map_err(err)
+        }
+        None => tasks::apply_edits(path, &edits, None).map_err(err),
+    }
+}
+
+/// A ticket by id that is genuinely a pipeline ticket with a resolved lane
+/// (`Task::lane.is_some()` — set only by `pipeline::resolve_task_lane`/
+/// `resolve_board` when both the ticket's `pipeline:` id and its `status`
+/// lane resolve). A classic ticket, or a pipeline ticket sitting in an
+/// unknown lane/pipeline, is refused here rather than partially handled —
+/// those belong to the needs-attention tray, not a run.
+fn find_pipeline_ticket<'a>(tasks_list: &'a [tasks::Task], id: &str) -> CmdResult<&'a tasks::Task> {
+    let t = tasks::find_by_id(tasks_list, id).ok_or_else(|| format!("no task with id '{id}'"))?;
+    if t.lane.is_none() {
+        return Err(format!(
+            "ticket '{id}' is not a pipeline ticket, or its lane/pipeline could not be resolved — check the needs-attention tray"
+        ));
+    }
+    Ok(t)
+}
+
+/// Apply a `Transition::Moved`/`Blocked`'s patch+log; `Refused` becomes a
+/// `CmdResult` error with no write. `extra_log`, when given, is appended
+/// on the SAME line-set as the transition's own log line (one write) —
+/// used by sign-off's accept-with-comments, which appends both the
+/// transition and the comment note to the parent in one guarded write
+/// (D11: "The comment is also appended to the parent's `## Log`").
+fn apply_transition(
+    path: &Path,
+    transition: &pipeline::Transition,
+    pipelines: &[pipeline::Pipeline],
+    today: &str,
+    extra_log: Option<&str>,
+) -> CmdResult<()> {
+    let (patch, log) = match transition {
+        pipeline::Transition::Moved { patch, log, .. } => (patch, log.clone()),
+        pipeline::Transition::Blocked { patch, log, .. } => (patch, log.clone()),
+        pipeline::Transition::Refused { reason } => return Err(describe_transition_refusal(reason)),
+    };
+    let full_log = match extra_log {
+        Some(x) => format!("{log}\n{x}"),
+        None => log,
+    };
+    apply_pipeline_patch(path, patch, today, pipelines, Some(&full_log))
+}
+
+/// The most recent still-open (`queued`/`running`) run for a ticket — the
+/// one `pipeline_advance` closes. A ticket normally has at most one open
+/// run at a time (the concurrency cap + one-kickoff-at-a-time UX), so
+/// "most recently started" is a reasonable tie-break for the rare case of
+/// more than one.
+fn find_open_run<'a>(runs: &'a [pipeline::RunRecord], ticket_id: &str) -> Option<&'a pipeline::RunRecord> {
+    runs.iter()
+        .filter(|r| {
+            r.ticket.eq_ignore_ascii_case(ticket_id)
+                && matches!(r.outcome, Some(pipeline::RunOutcome::Queued) | Some(pipeline::RunOutcome::Running))
+        })
+        .max_by(|a, b| a.started.cmp(&b.started))
+}
+
+/// Close a run record: `ended`/`outcome`/(optionally) `artifacts` as
+/// frontmatter edits, the agent's `report` appended as the body (`tasks::
+/// patch_text`'s `append_body` — the run's body starts empty at kickoff,
+/// so this is the report becoming the whole body, not a duplicate
+/// heading/entry the way a ticket's `## Log` needs). Reuses `tasks::
+/// patch_text` directly rather than `pipeline::patch_run_text` (which
+/// hard-codes `append_body: None`) because closing a run is exactly the
+/// one write that needs both a frontmatter patch AND a body write at once.
+fn close_run_record(path: &Path, outcome: pipeline::RunOutcome, report: &str, artifacts: &[String]) -> CmdResult<()> {
+    let raw = std::fs::read_to_string(path).map_err(err)?;
+    let now = iso_datetime_now();
+    let mut edits: Vec<(&str, Vec<String>)> = vec![
+        ("ended", tasks::scalar_lines("ended", &now)),
+        ("outcome", tasks::scalar_lines("outcome", outcome.as_str())),
+    ];
+    if !artifacts.is_empty() {
+        edits.push(("artifacts", tasks::seq_lines("artifacts", artifacts)));
+    }
+    let next = tasks::patch_text(&raw, &edits, Some(report));
+    std::fs::write(path, next).map_err(err)
+}
+
+// -- Readable error strings for the ken-core refusal/issue enums that do
+// NOT derive `Serialize` (only the "successful outcome" shapes do — see
+// each type's own derive line in pipeline.rs). Converting rather than
+// deriving: crates/** is read-only this session, and a `CmdResult<T> =
+// Result<T, String>` error is exactly what every other command in this
+// file already returns, so this keeps pipeline commands consistent with
+// the rest rather than introducing a typed-error wire shape nothing else
+// here uses. --
+
+fn describe_block_refusal(r: &pipeline::BlockRefusal) -> String {
+    match r {
+        pipeline::BlockRefusal::NoBlockedLane => "this pipeline declares no blocked lane".to_string(),
+        pipeline::BlockRefusal::UnknownLane(s) => format!("ticket's current status '{s}' names no lane"),
+        pipeline::BlockRefusal::MissingReturnLane => {
+            "ticket is already blocked but its return lane is missing or orphaned — resolve it in the needs-attention tray first".to_string()
+        }
+        pipeline::BlockRefusal::Empty => "neither a dependency nor a reason was given".to_string(),
+        pipeline::BlockRefusal::PathBlocker(s) => {
+            format!("'{s}' looks like a path, not a ticket id — blocked_by must hold ticket ULIDs")
+        }
+        pipeline::BlockRefusal::MalformedBlocker(s) => format!("'{s}' is not a valid ticket ULID"),
+        pipeline::BlockRefusal::SelfBlock(s) => format!("a ticket cannot block itself ('{s}')"),
+        pipeline::BlockRefusal::Cycle(c) => format!("blocking on this would close a dependency cycle: {}", c.render()),
+    }
+}
+
+fn describe_unblock_refusal(r: &pipeline::UnblockRefusal) -> String {
+    match r {
+        pipeline::UnblockRefusal::NotBlocked => "ticket is not blocked".to_string(),
+        pipeline::UnblockRefusal::MissingReturnLane => {
+            "ticket's return lane is missing or names a lane the pipeline no longer declares".to_string()
+        }
+        pipeline::UnblockRefusal::Empty => "neither clearDeps nor clearReason was set".to_string(),
+    }
+}
+
+fn describe_transition_refusal(r: &pipeline::TransitionRefusal) -> String {
+    match r {
+        pipeline::TransitionRefusal::UnknownLane(s) => format!("ticket's status '{s}' names no lane"),
+        pipeline::TransitionRefusal::NoEdge { lane, outcome } => {
+            format!("lane '{lane}' declares no {} edge", outcome.as_str())
+        }
+        pipeline::TransitionRefusal::UnknownTarget { lane, target } => {
+            format!("lane '{lane}' points to unknown lane '{target}'")
+        }
+        pipeline::TransitionRefusal::NoBlockedLane => {
+            "this pipeline declares no blocked lane to escalate the retry-cap breach into".to_string()
+        }
+    }
+}
+
+fn describe_signoff_refusal(r: &pipeline::SignoffRefusal) -> String {
+    match r {
+        pipeline::SignoffRefusal::NotHumanLane(s) => format!("ticket is not sitting in a human sign-off lane ('{s}')"),
+        pipeline::SignoffRefusal::EmptyComment => "a comment is required for accept-with-comments".to_string(),
+        pipeline::SignoffRefusal::NoOnPass(s) => format!("lane '{s}' declares no on_pass edge"),
+        pipeline::SignoffRefusal::NoTodoLane => {
+            "this pipeline declares no lane literally named 'todo' for the child ticket".to_string()
+        }
+    }
+}
+
+fn describe_idea_refusal(r: &pipeline::IdeaRefusal) -> String {
+    match r {
+        pipeline::IdeaRefusal::MissingCitation => "an idea needs a spawned_by citation".to_string(),
+        pipeline::IdeaRefusal::EmptyTitle => "an idea needs a title".to_string(),
+        pipeline::IdeaRefusal::NoIdeasLane => "this pipeline declares no 'ideas' lane".to_string(),
+    }
+}
+
+/// ken-pipeline task 2.6: which dependents of `terminal_ticket_id` free up
+/// across EVERY loaded pipeline (`pipeline::evaluate_unblocks` only checks
+/// one pipeline at a time; a dependent may belong to a different pipeline
+/// than the ticket that just finished, so this fans out over all of
+/// them). Pure file-writing — no `AppHandle`/`SharedState` — so callers can
+/// batch the returned paths into ONE `note_pipeline_writes_and_emit` call
+/// after their own state guard is dropped (`std::sync::Mutex` isn't
+/// reentrant; see that function's doc comment).
+///
+/// Every write here goes through `EntryKind::Unblock`'s real-world
+/// manifestation: `Unblocked::patch` moves the ticket straight to `return_
+/// lane`, and nothing downstream of this function ever calls `pipeline::
+/// admit` to try to start it — task 2.12 (auto-transitions) is gated off
+/// in this pass, so there is no code path from here to a run at all yet.
+/// `unblock_patch_never_reaches_start` below is the regression guard for
+/// when that gate lifts.
+fn apply_unblocks_for(
+    tasks_list: &[tasks::Task],
+    pipelines: &[pipeline::Pipeline],
+    terminal_ticket_id: &str,
+) -> Vec<PathBuf> {
+    let today = local_date_today();
+    let mut written = Vec::new();
+    for p in pipelines {
+        for u in pipeline::evaluate_unblocks(tasks_list, p, terminal_ticket_id) {
+            let Some(t) = tasks::find_by_id(tasks_list, &u.ticket_id) else { continue };
+            let log = format!("unblocked · returning to {}", u.return_lane);
+            match apply_pipeline_patch(&t.path, &u.patch, &today, pipelines, Some(&log)) {
+                Ok(()) => written.push(t.path.clone()),
+                Err(e) => eprintln!("warning: failed to apply unblock patch for '{}': {e}", u.ticket_id),
+            }
+        }
+    }
+    written
+}
+
+/// The workspace-open sweep (D5/OPEN-10: "a full re-evaluation still runs
+/// on workspace open so nothing is missed across restarts"), covering
+/// every pipeline's whole board rather than one terminal ticket. Called
+/// with no outer guard held (see `open_workspace_inner`'s call site), so
+/// it is free to lock/unlock `state` itself.
+fn run_unblock_sweep(app: &AppHandle, state: &SharedState) -> CmdResult<()> {
+    let (ws, base_dir, app_settings) = {
+        let guard = state.lock().unwrap();
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        (ws.ws.clone(), guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws, &base_dir, &app_settings)?;
+    let today = local_date_today();
+    let mut written: Vec<(PathBuf, bool)> = Vec::new();
+    for p in &pipelines {
+        for u in pipeline::evaluate_all_unblocks(&tasks_list, p) {
+            let Some(t) = tasks::find_by_id(&tasks_list, &u.ticket_id) else { continue };
+            let log = format!("unblocked · returning to {}", u.return_lane);
+            match apply_pipeline_patch(&t.path, &u.patch, &today, &pipelines, Some(&log)) {
+                Ok(()) => written.push((t.path.clone(), true)),
+                Err(e) => eprintln!("warning: workspace-open unblock sweep failed for '{}': {e}", u.ticket_id),
+            }
+        }
+    }
+    note_pipeline_writes_and_emit(app, state, &written);
+    Ok(())
+}
+
+/// Register a batch of already-written pipeline-command paths into the
+/// self-write dedupe registry and emit the board (+ `pipeline-runs`) once,
+/// covering every file the batch touched. **Must only be called after the
+/// caller's own `SharedState` guard has been dropped** — every helper
+/// this touches (`AppState::task_recent_writes`, `emit_board_state`) locks
+/// `state` itself, and `std::sync::Mutex` is not reentrant. Batched rather
+/// than one `note_task_write_and_emit` per path (which a multi-write
+/// command like `pipeline_advance`'s "patch + close run + unblock N
+/// dependents" would otherwise need) so one logical action is exactly one
+/// recompute + one pair of events, not N of each.
+fn note_pipeline_writes_and_emit(app: &AppHandle, state: &SharedState, writes: &[(PathBuf, bool)]) {
+    if writes.is_empty() {
+        return;
+    }
+    let recent_writes = { state.lock().unwrap().task_recent_writes.clone() };
+    {
+        let mut w = recent_writes.lock().unwrap();
+        for (path, expect_present) in writes {
+            let expect = if *expect_present { hash_file(path) } else { None };
+            w.insert(path.clone(), expect);
+        }
+    }
+    emit_board_state(app, state);
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2.3: read commands.
+// ---------------------------------------------------------------------
+
+/// One loaded pipeline definition plus `validate_pipeline`'s findings —
+/// not asked for verbatim by task 2.3, but `pipeline_list_defs` is the
+/// natural place for a human to discover a bad definition file (D1: "a
+/// bad definition must not take the board down" — it also shouldn't be
+/// silently invisible). Flagged as an addition beyond the literal task
+/// list in the final report.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineDefDto {
+    #[serde(flatten)]
+    def: pipeline::Pipeline,
+    issues: Vec<pipeline::PipelineIssue>,
+}
+
+#[tauri::command]
+fn pipeline_list_defs(state: State<SharedState>) -> CmdResult<Vec<PipelineDefDto>> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    Ok(pipelines_scan(&ws_root)
+        .into_iter()
+        .map(|def| {
+            let issues = pipeline::validate_pipeline(&def);
+            PipelineDefDto { def, issues }
+        })
+        .collect())
+}
+
+/// Lane-ordered board state (task 2.3) — the pipeline view's dedicated
+/// entry point, gated on `kenPipeline` specifically (not just `kenTasks`)
+/// so the frontend has a clear "is the pipeline surface itself available"
+/// signal separate from `board_get`. Returns the exact same `BoardStateDto`
+/// shape `board_get`/`board-state` do; "lane-ordered" is a property of
+/// `pipelines[i].lanes` (D1: lane order is column order), not a different
+/// sort of `tasks`.
+#[tauri::command]
+fn pipeline_board(state: State<SharedState>) -> CmdResult<BoardStateDto> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    board_state_dto(&ws.ws, &guard.base_dir, &guard.app_settings)
+}
+
+#[tauri::command]
+fn pipeline_runs(state: State<SharedState>) -> CmdResult<pipeline::RunQueue> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let ws_root = ws.ws.root.clone();
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let runs = run_ledger_scan(&ws_root);
+    let known = ws.pipeline_known_running.lock().unwrap().clone();
+    Ok(pipeline::derive_queue(&tasks_list, &pipelines, &runs, &known))
+}
+
+/// The resolved blocker chain for a ticket (task 2.3: "the resolved
+/// chain, root first"). `direct` is the ticket's own `blocked_by`;
+/// `chain` is every id between the ticket and its root blocker(s), root
+/// first — built locally from `BlockGraph::blockers`'s public accessor
+/// (`pipeline::root_blockers` only returns the leaves, not the
+/// intermediate links, and ken-core exposes no "full chain" function of
+/// its own; crates/** is read-only this session, so this is application-
+/// layer composition over an already-public accessor, not a
+/// reimplementation of `check_cycle`/`root_blockers`'s own graph logic).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineBlockersDto {
+    ticket_id: String,
+    direct: Vec<String>,
+    chain: Vec<String>,
+}
+
+/// Depth-first over `BlockGraph::blockers`, collecting every node in
+/// post-order (so a root — a node with no blockers of its own — is
+/// pushed before the link that depends on it) and de-duplicated via a
+/// `seen` set — the same cycle-safety discipline `check_cycle`/`root_
+/// blockers` use, so a hand-edited cyclic graph still terminates here.
+fn blocker_chain(graph: &pipeline::BlockGraph, ticket_id: &str) -> Vec<String> {
+    fn walk(graph: &pipeline::BlockGraph, id: &str, seen: &mut std::collections::BTreeSet<String>, out: &mut Vec<String>) {
+        for b in graph.blockers(id) {
+            if seen.insert(b.to_ascii_lowercase()) {
+                walk(graph, b, seen, out);
+                out.push(b.clone());
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    walk(graph, ticket_id, &mut seen, &mut out);
+    out
+}
+
+#[tauri::command]
+fn pipeline_blockers(state: State<SharedState>, ticket_id: String) -> CmdResult<PipelineBlockersDto> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals, _pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let ticket = tasks::find_by_id(&tasks_list, &ticket_id).ok_or_else(|| format!("no task with id '{ticket_id}'"))?;
+    let direct = pipeline::ticket_fields(ticket).blocked_by;
+    let graph = pipeline::BlockGraph::from_tasks(&tasks_list);
+    let chain = blocker_chain(&graph, &ticket_id);
+    Ok(PipelineBlockersDto { ticket_id, direct, chain })
+}
+
+// -- Digest DTOs: `pipeline::Digest` and its entry structs deliberately
+// don't derive `Serialize` (see pipeline.rs's own derive lines — they're
+// plain `Debug, Clone, PartialEq` internal composition types), so this is
+// the field-for-field camelCase mirror `pipeline_digest` returns. --
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestAwaitingReviewDto {
+    ticket_id: String,
+    title: String,
+    updated: String,
+    run_count: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestUnblockedDto {
+    ticket_id: String,
+    title: String,
+    return_lane: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestBlockedDto {
+    ticket_id: String,
+    title: String,
+    blocked_at: Option<String>,
+    root_blockers: Vec<String>,
+    block_reason: Option<String>,
+    run_count: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestMovedDto {
+    ticket_id: String,
+    title: String,
+    lane: String,
+    run_count: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestIdeaDto {
+    ticket_id: String,
+    title: String,
+    spawned_by: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineDigestDto {
+    awaiting_review: Vec<DigestAwaitingReviewDto>,
+    newly_unblocked: Vec<DigestUnblockedDto>,
+    blocked: Vec<DigestBlockedDto>,
+    moved_today: Vec<DigestMovedDto>,
+    new_ideas: Vec<DigestIdeaDto>,
+    stale_runs: Vec<pipeline::RunRecord>,
+    /// `pipeline::render_digest_markdown`'s output — "the one renderer
+    /// chat/MCP/`journal_append` all call" — included directly so the
+    /// frontend/journal never re-derive their own markdown from the
+    /// structured groups above.
+    markdown: String,
+}
+
+fn digest_to_dto(digest: &pipeline::Digest, today: &str) -> PipelineDigestDto {
+    PipelineDigestDto {
+        awaiting_review: digest
+            .awaiting_review
+            .iter()
+            .map(|e| DigestAwaitingReviewDto {
+                ticket_id: e.ticket_id.clone(),
+                title: e.title.clone(),
+                updated: e.updated.clone(),
+                run_count: e.run_count,
+            })
+            .collect(),
+        newly_unblocked: digest
+            .newly_unblocked
+            .iter()
+            .map(|e| DigestUnblockedDto {
+                ticket_id: e.ticket_id.clone(),
+                title: e.title.clone(),
+                return_lane: e.return_lane.clone(),
+            })
+            .collect(),
+        blocked: digest
+            .blocked
+            .iter()
+            .map(|e| DigestBlockedDto {
+                ticket_id: e.ticket_id.clone(),
+                title: e.title.clone(),
+                blocked_at: e.blocked_at.clone(),
+                root_blockers: e.root_blockers.clone(),
+                block_reason: e.block_reason.clone(),
+                run_count: e.run_count,
+            })
+            .collect(),
+        moved_today: digest
+            .moved_today
+            .iter()
+            .map(|e| DigestMovedDto {
+                ticket_id: e.ticket_id.clone(),
+                title: e.title.clone(),
+                lane: e.lane.clone(),
+                run_count: e.run_count,
+            })
+            .collect(),
+        new_ideas: digest
+            .new_ideas
+            .iter()
+            .map(|e| DigestIdeaDto {
+                ticket_id: e.ticket_id.clone(),
+                title: e.title.clone(),
+                spawned_by: e.spawned_by.clone(),
+            })
+            .collect(),
+        stale_runs: digest.stale_runs.clone(),
+        markdown: pipeline::render_digest_markdown(digest, today),
+    }
+}
+
+/// The daily update (task 2.3), and (task 2.10) a best-effort `journal_
+/// append` when `kenMemory` is on. `day` overrides "today" for viewing a
+/// past day's digest retroactively; defaults to `local_date_today()`.
+///
+/// Judgment call / flagged, not silently decided: the spec line this
+/// implements ("`pipeline_digest` ... SHALL also write the digest through
+/// `journal_append` when `kenMemory` is on") names no dedupe rule, so this
+/// journals on EVERY call — a UI that polls this command (e.g. to render a
+/// live digest panel) will write to the journal repeatedly. A once-per-day
+/// dedupe (e.g. skip if today's journal already has a `pipeline-digest`
+/// tagged entry) would be a reasonable follow-up but is a product decision
+/// this session isn't positioned to make silently.
+#[tauri::command]
+fn pipeline_digest(state: State<SharedState>, day: Option<String>) -> CmdResult<PipelineDigestDto> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let ws_root = ws.ws.root.clone();
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let runs = run_ledger_scan(&ws_root);
+    let known_running = ws.pipeline_known_running.lock().unwrap().clone();
+    let today = day.unwrap_or_else(local_date_today);
+    let digest = pipeline::compose_digest(&tasks_list, &pipelines, &runs, &known_running, &today);
+    let dto = digest_to_dto(&digest, &today);
+
+    if ken_memory_enabled(&guard.app_settings) {
+        let time = local_time_hhmm();
+        if let Err(e) = memory::append_journal(&ws_root, &dto.markdown, None, &["pipeline-digest".to_string()], &today, &time) {
+            eprintln!("warning: pipeline digest journal write failed: {e}");
+        }
+    }
+    Ok(dto)
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2.4: kickoff / advance / cancel-run. Manual kickoff
+// only in this pass (D6) — no transition fires without a user action;
+// `pipeline_kickoff`'s own admission check is the only thing that can
+// ever authorise a run, and it always calls `pipeline::admit`.
+// ---------------------------------------------------------------------
+
+/// `pipeline_kickoff`'s verdict. D14: Ken never spawns a process itself —
+/// a kickoff that isn't refused or awaiting confirmation always writes a
+/// run record with `outcome: queued`, whether or not the concurrency cap
+/// is currently free; `ready` is purely informational (can an agent claim
+/// it the instant it lands, or is it genuinely waiting behind other work).
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PipelineKickoffOutcome {
+    Queued {
+        run_id: String,
+        ready: bool,
+        running: usize,
+        cap: u32,
+    },
+    /// The confirmation dialog's own payload (D3: "a dialog showing lane,
+    /// agent, model, scope, and verify command must be accepted") — the
+    /// intent diff, not a generic "are you sure". The caller re-calls
+    /// `pipeline_kickoff` with `confirmed: true` once the human accepts.
+    NeedsConfirm {
+        reason: pipeline::ConfirmReason,
+        lane: String,
+        agent: Option<String>,
+        model: Option<String>,
+        scope: Vec<String>,
+        verify: Option<String>,
+    },
+    Refused {
+        reason: pipeline::RefusalReason,
+    },
+}
+
+#[tauri::command]
+fn pipeline_kickoff(
+    app: AppHandle,
+    state: State<SharedState>,
+    ticket_id: String,
+    confirmed: bool,
+) -> CmdResult<PipelineKickoffOutcome> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let ws_root = ws.ws.root.clone();
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &ticket_id)?;
+    let fields = pipeline::ticket_fields(ticket);
+    let pipeline_id = fields.pipeline.clone().ok_or("ticket has no pipeline")?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or("pipeline not loaded")?;
+    let lane = pipeline::resolve_lane(pl, &ticket.status_raw).ok_or("ticket's lane could not be resolved")?;
+    let runs = run_ledger_scan(&ws_root);
+    let admission = pipeline::admit(ticket, lane, pl, &runs, pipeline::EntryKind::Kickoff);
+
+    match admission {
+        pipeline::Admission::Refused { reason } => Ok(PipelineKickoffOutcome::Refused { reason }),
+        pipeline::Admission::Confirm { reason } if !confirmed => Ok(PipelineKickoffOutcome::NeedsConfirm {
+            reason,
+            lane: lane.id.clone(),
+            agent: lane.agent.clone(),
+            model: fields.model.clone().or_else(|| lane.model.clone()),
+            scope: fields.scope.clone(),
+            verify: fields.verify.clone(),
+        }),
+        // Start, Queued{..}, or a Confirm the human already accepted: all
+        // three write the run record — D14 means Ken itself never
+        // distinguishes "start" from "queue" by doing anything different.
+        _ => {
+            let running = pipeline::running_runs(&runs);
+            let cap = pl.concurrency_cap;
+            let now = iso_datetime_now();
+            let record = pipeline::RunRecord {
+                id: tasks::new_ulid(),
+                ticket: ticket.id.clone(),
+                pipeline: pl.id.clone(),
+                lane: lane.id.clone(),
+                agent: lane.agent.clone().unwrap_or_default(),
+                model: fields.model.clone().or_else(|| lane.model.clone()).unwrap_or_default(),
+                scope: fields.scope.clone(),
+                verify: fields.verify.clone().unwrap_or_default(),
+                started: now.clone(),
+                ended: String::new(),
+                outcome: Some(pipeline::RunOutcome::Queued),
+                outcome_raw: "queued".to_string(),
+                artifacts: Vec::new(),
+                report: String::new(),
+            };
+            let month = pipeline::run_month(&now);
+            let dir = pipeline::run_month_dir(&ws_root, &month);
+            let path = pipeline::run_path(&ws_root, &month, &record.id);
+            std::fs::create_dir_all(&dir).map_err(err)?;
+            std::fs::write(&path, pipeline::compose_run(&record)).map_err(err)?;
+            drop(guard);
+            note_task_write_and_emit(&app, state.inner(), path, true);
+            Ok(PipelineKickoffOutcome::Queued {
+                run_id: record.id,
+                ready: running < cap as usize,
+                running,
+                cap,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineAdvanceDto {
+    task: tasks::Task,
+    transition: pipeline::Transition,
+}
+
+/// `pipeline_advance(ticket_id, outcome, report)` (task 2.4): resolve the
+/// target lane via `pipeline::advance` (bounce accounting + cap-breach
+/// block all live there — never re-derived here), apply the resulting
+/// patch + `## Log` line, close whichever run record is currently open
+/// for this ticket (best-effort — a ticket advanced with no matching run
+/// on the ledger still advances, D13's "derived, not owned"), and — when
+/// the ticket landed in a `terminal: true` lane — run the task 2.6
+/// unblock trigger for its dependents. `artifacts` is an addition beyond
+/// the literal 2.4 signature (flagged in the final report): without it,
+/// `RunRecord.artifacts` could never be set by anything, and D9 asks a
+/// run record to say "which destination each output went to".
+#[tauri::command]
+fn pipeline_advance(
+    app: AppHandle,
+    state: State<SharedState>,
+    ticket_id: String,
+    outcome: pipeline::AdvanceOutcome,
+    report: String,
+    artifacts: Option<Vec<String>>,
+) -> CmdResult<PipelineAdvanceDto> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let ws_root = ws.ws.root.clone();
+    let base_dir = guard.base_dir.clone();
+    let app_settings = guard.app_settings.clone();
+
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &base_dir, &app_settings)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &ticket_id)?;
+    let path = ticket.path.clone();
+    let pipeline_id = pipeline::ticket_fields(ticket).pipeline.clone().ok_or("ticket has no pipeline")?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or("pipeline not loaded")?.clone();
+
+    let today = local_date_today();
+    let now = iso_datetime_now();
+    let transition = pipeline::advance(ticket, &pl, outcome, &now);
+    if let pipeline::Transition::Refused { reason } = &transition {
+        return Err(describe_transition_refusal(reason));
+    }
+    apply_transition(&path, &transition, &pipelines, &today, None)?;
+    let mut writes: Vec<(PathBuf, bool)> = vec![(path.clone(), true)];
+
+    let runs = run_ledger_scan(&ws_root);
+    if let Some(open_run) = find_open_run(&runs, &ticket_id) {
+        let run_outcome = match &transition {
+            pipeline::Transition::Blocked { .. } => pipeline::RunOutcome::Blocked,
+            _ => match outcome {
+                pipeline::AdvanceOutcome::Pass => pipeline::RunOutcome::Pass,
+                pipeline::AdvanceOutcome::Fail => pipeline::RunOutcome::Fail,
+            },
+        };
+        let month = pipeline::run_month(&open_run.started);
+        let run_path = pipeline::run_path(&ws_root, &month, &open_run.id);
+        let arts = artifacts.unwrap_or_default();
+        match close_run_record(&run_path, run_outcome, &report, &arts) {
+            Ok(()) => writes.push((run_path, true)),
+            Err(e) => eprintln!("warning: failed to close run '{}': {e}", open_run.id),
+        }
+    }
+
+    // ken-pipeline task 2.6: reaching a terminal lane resolves dependents.
+    if let pipeline::Transition::Moved { to, .. } = &transition {
+        if pl.lane(to).map(|l| l.terminal).unwrap_or(false) {
+            if let Ok((tasks_after, _g, pipelines_after)) = scan_board_with_pipelines(&ws.ws, &base_dir, &app_settings) {
+                for p in apply_unblocks_for(&tasks_after, &pipelines_after, &ticket_id) {
+                    writes.push((p, true));
+                }
+            }
+        }
+    }
+
+    let (tasks_list2, _g2, _p2) = scan_board_with_pipelines(&ws.ws, &base_dir, &app_settings)?;
+    let task = tasks::find_by_id(&tasks_list2, &ticket_id).cloned().ok_or("ticket vanished after advance")?;
+    drop(guard);
+    note_pipeline_writes_and_emit(&app, state.inner(), &writes);
+    Ok(PipelineAdvanceDto { task, transition })
+}
+
+/// Cancel a still-open (`queued`/`running`) run (task 2.4). A closed run
+/// (`pass`/`fail`/`blocked`/already `cancelled`) is refused rather than
+/// silently re-closed — the ledger is append-only history, not a mutable
+/// status a second cancel should be able to stomp on.
+#[tauri::command]
+fn pipeline_cancel_run(app: AppHandle, state: State<SharedState>, run_id: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    let (path, record) = run_ledger_scan_with_paths(&ws_root)
+        .into_iter()
+        .find(|(_, r)| r.id == run_id)
+        .ok_or_else(|| format!("no run with id '{run_id}'"))?;
+    if !matches!(record.outcome, Some(pipeline::RunOutcome::Queued) | Some(pipeline::RunOutcome::Running)) {
+        return Err(format!("run '{run_id}' is already closed"));
+    }
+    close_run_record(&path, pipeline::RunOutcome::Cancelled, "cancelled by user", &[])?;
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2.5: block / unblock. Both route through 1.6/1.7
+// (`pipeline::block`/`unblock`) so cycle detection and `return_lane`
+// capture cannot be bypassed — this layer never re-derives either.
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+fn pipeline_block(
+    app: AppHandle,
+    state: State<SharedState>,
+    ticket_id: String,
+    request: pipeline::BlockRequest,
+) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &ticket_id)?;
+    let pipeline_id = pipeline::ticket_fields(ticket).pipeline.clone().ok_or("ticket has no pipeline")?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or("pipeline not loaded")?;
+    let graph = pipeline::BlockGraph::from_tasks(&tasks_list);
+    // The server stamps `now` — `BlockRequest` is `Deserialize` (so the
+    // frontend's JSON could technically set it), but trusting a caller-
+    // supplied clock for `blocked_at` (which the digest ages tickets by)
+    // is the wrong trust boundary; overridden here rather than silently
+    // trusted or rejected.
+    let request = pipeline::BlockRequest { now: iso_datetime_now(), ..request };
+    let outcome = pipeline::block(ticket, pl, &graph, &request);
+    let (patch, log) = match outcome {
+        pipeline::BlockOutcome::Blocked { patch, log, .. } => (patch, log),
+        pipeline::BlockOutcome::Refused { reason } => return Err(describe_block_refusal(&reason)),
+    };
+    let path = ticket.path.clone();
+    let today = local_date_today();
+    apply_pipeline_patch(&path, &patch, &today, &pipelines, Some(&log))?;
+    let (tasks_list2, _g2, _p2) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let updated = tasks::find_by_id(&tasks_list2, &ticket_id).cloned().ok_or("ticket vanished after block")?;
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(updated)
+}
+
+#[tauri::command]
+fn pipeline_unblock(
+    app: AppHandle,
+    state: State<SharedState>,
+    ticket_id: String,
+    request: pipeline::UnblockRequest,
+) -> CmdResult<tasks::Task> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &ticket_id)?;
+    let pipeline_id = pipeline::ticket_fields(ticket).pipeline.clone().ok_or("ticket has no pipeline")?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or("pipeline not loaded")?;
+    let outcome = pipeline::unblock(ticket, pl, &request);
+    let (patch, log) = match outcome {
+        pipeline::UnblockOutcome::Released { patch, log, .. } => (patch, Some(log)),
+        pipeline::UnblockOutcome::StillBlocked { patch, .. } => (patch, None),
+        pipeline::UnblockOutcome::Refused { reason } => return Err(describe_unblock_refusal(&reason)),
+    };
+    let path = ticket.path.clone();
+    let today = local_date_today();
+    apply_pipeline_patch(&path, &patch, &today, &pipelines, log.as_deref())?;
+    let (tasks_list2, _g2, _p2) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let updated = tasks::find_by_id(&tasks_list2, &ticket_id).cloned().ok_or("ticket vanished after unblock")?;
+    drop(guard);
+    note_task_write_and_emit(&app, state.inner(), path, true);
+    Ok(updated)
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2.7: sign-off (D11). `human: true` lanes have no
+// agent and no kickoff — this command IS the review action.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PipelineSignoffDecision {
+    Accept,
+    AcceptWithComments,
+    Reject,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineSignoffDto {
+    parent: tasks::Task,
+    /// `Some` only for `AcceptWithComments` (D11: "a new ticket in the
+    /// `todo` lane").
+    child: Option<tasks::Task>,
+}
+
+#[tauri::command]
+fn pipeline_signoff(
+    app: AppHandle,
+    state: State<SharedState>,
+    ticket_id: String,
+    decision: PipelineSignoffDecision,
+    comment: Option<String>,
+) -> CmdResult<PipelineSignoffDto> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let ws_root = ws.ws.root.clone();
+    let base_dir = guard.base_dir.clone();
+    let app_settings = guard.app_settings.clone();
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &base_dir, &app_settings)?;
+    let parent = find_pipeline_ticket(&tasks_list, &ticket_id)?;
+    let pipeline_id = pipeline::ticket_fields(parent).pipeline.clone().ok_or("ticket has no pipeline")?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or("pipeline not loaded")?.clone();
+    let today = local_date_today();
+    let now = iso_datetime_now();
+    let parent_path = parent.path.clone();
+    let mut writes: Vec<(PathBuf, bool)> = Vec::new();
+
+    let child_id: Option<String> = match decision {
+        PipelineSignoffDecision::Accept => {
+            let transition = pipeline::advance(parent, &pl, pipeline::AdvanceOutcome::Pass, &now);
+            apply_transition(&parent_path, &transition, &pipelines, &today, None)?;
+            writes.push((parent_path.clone(), true));
+            None
+        }
+        PipelineSignoffDecision::Reject => {
+            // The lane's `on_fail` edge (D11) — counts as a bounce like any
+            // other backward transition, via the same `pipeline::advance`
+            // no duplicated bounce/cap logic.
+            let transition = pipeline::advance(parent, &pl, pipeline::AdvanceOutcome::Fail, &now);
+            apply_transition(&parent_path, &transition, &pipelines, &today, None)?;
+            writes.push((parent_path.clone(), true));
+            None
+        }
+        PipelineSignoffDecision::AcceptWithComments => {
+            let comment_text = comment.unwrap_or_default();
+            let signoff = pipeline::compose_signoff_child(parent, &pl, &comment_text, &now).map_err(|e| describe_signoff_refusal(&e))?;
+            // Both things happen in one action (D11): the parent advances
+            // AND the comment lands in its `## Log`, in the SAME write as
+            // the transition's own log line.
+            apply_transition(&parent_path, &signoff.parent_transition, &pipelines, &today, Some(&signoff.parent_log))?;
+            writes.push((parent_path.clone(), true));
+            let child = tasks::create_task(tasks::TaskHome::Workspace { workspace_root: &ws_root }, &signoff.child, &today).map_err(err)?;
+            writes.push((child.path.clone(), true));
+            Some(child.id)
+        }
+    };
+
+    let (tasks_list2, _g2, _p2) = scan_board_with_pipelines(&ws.ws, &base_dir, &app_settings)?;
+    let parent_updated = tasks::find_by_id(&tasks_list2, &ticket_id).cloned().ok_or("ticket vanished after sign-off")?;
+    let child_updated = child_id.and_then(|cid| tasks::find_by_id(&tasks_list2, &cid).cloned());
+    drop(guard);
+    note_pipeline_writes_and_emit(&app, state.inner(), &writes);
+    Ok(PipelineSignoffDto { parent: parent_updated, child: child_updated })
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2.8: the documentation lane's idea flow (D7). Dedupe
+// scope is the idea's project plus any linked project (D7/D12).
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum PipelineIdeaOutcome {
+    Landed { task: tasks::Task },
+    NearDuplicate { ticket_id: String, score: f32 },
+}
+
+/// Propose an idea citing `ticket_id` (D7: "a required `spawned_by:`
+/// citation"), dedupe it against existing in-scope tickets, and either
+/// land it in the `ideas` lane or append a near-duplicate note to the
+/// matched ticket's `## Log`.
+///
+/// **Judgment call, flagged rather than silently decided**: this always
+/// runs the always-correct FTS/title fallback (every in-scope ticket is
+/// offered to `pipeline::dedupe_idea` with `score: None`, so its own
+/// `normalized_title_score` decides — this alone satisfies "dedupe
+/// degrades without the index... FTS plus normalized title matching").
+/// When the workspace-memory pseudo-member is resident (i.e. `kenMemory`
+/// is on), the candidate pool is additionally WIDENED with a plain
+/// keyword FTS hit (`db.search_chunks_fts`) over ticket bodies — catching
+/// a body-only match a title-only Jaccard would miss — but every widened
+/// hit is STILL scored via the same title fallback, not a real embedding
+/// distance. True semantic KNN scoring (`db.semantic_search`) is
+/// deliberately NOT wired: its distance metric has no established
+/// distance-to-`[0,1]`-similarity convention anywhere in this codebase,
+/// and inventing one here risks silently miscalibrating
+/// `pipeline::DEDUPE_THRESHOLD` (tuned assuming a Jaccard-shaped score).
+/// `semanticIndex`/`federatedKg` are therefore not literally read as the
+/// gate for the widening step; pseudo-member residency (itself gated by
+/// `kenMemory`) is used as the practical precondition instead.
+#[tauri::command]
+fn pipeline_propose_idea(app: AppHandle, state: State<SharedState>, ticket_id: String, title: String, body: String) -> CmdResult<PipelineIdeaOutcome> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let ws_root = ws.ws.root.clone();
+    let (tasks_list, _goals, pipelines) = scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+    let spawner = find_pipeline_ticket(&tasks_list, &ticket_id)?;
+    let fields = pipeline::ticket_fields(spawner);
+    let pipeline_id = fields.pipeline.clone().ok_or("ticket has no pipeline")?;
+
+    let candidate = pipeline::propose_idea(&title, &body, &ticket_id, &spawner.project, &fields.projects, &pipeline_id)
+        .map_err(|e| describe_idea_refusal(&e))?;
+
+    let linked: Vec<&str> = ws.ws.config.linked_projects(&candidate.project);
+    let mut scope_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut candidates: Vec<pipeline::DedupeCandidate> = Vec::new();
+    for t in &tasks_list {
+        if t.id == ticket_id || !pipeline::in_dedupe_scope(&candidate.project, &t.project, &linked) {
+            continue;
+        }
+        if scope_ids.insert(t.id.clone()) {
+            candidates.push(pipeline::DedupeCandidate { ticket_id: t.id.clone(), title: t.title.clone(), project: t.project.clone(), score: None });
+        }
+    }
+    if let Some(pseudo_id) = memory_pseudo_member_id(&guard) {
+        if let Some(rt) = guard.members.get(&pseudo_id) {
+            if let Ok(db) = rt.search_db.lock() {
+                if let Ok(hits) = db.search_chunks_fts(&candidate.title, 20) {
+                    for hit in hits {
+                        if let Some(t) = tasks_list.iter().find(|t| t.home == tasks::HomeKind::Workspace && t.address_rel_path() == hit.path) {
+                            if t.id != ticket_id && pipeline::in_dedupe_scope(&candidate.project, &t.project, &linked) && scope_ids.insert(t.id.clone()) {
+                                candidates.push(pipeline::DedupeCandidate {
+                                    ticket_id: t.id.clone(),
+                                    title: t.title.clone(),
+                                    project: t.project.clone(),
+                                    score: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let verdict = pipeline::dedupe_idea(&candidate, &candidates);
+    match &verdict {
+        pipeline::DedupeVerdict::NearDuplicate { ticket_id: matched_id, score } => {
+            let matched_id = matched_id.clone();
+            let score = *score;
+            if let Some(line) = pipeline::dedupe_log_line(&candidate, &verdict) {
+                if let Some(matched) = tasks::find_by_id(&tasks_list, &matched_id) {
+                    let today = local_date_today();
+                    let matched_path = matched.path.clone();
+                    if let Err(e) = apply_pipeline_patch(&matched_path, &tasks::TaskPatch::default(), &today, &pipelines, Some(&line)) {
+                        eprintln!("warning: failed to append near-duplicate note to '{matched_id}': {e}");
+                    } else {
+                        drop(guard);
+                        note_task_write_and_emit(&app, state.inner(), matched_path, true);
+                        return Ok(PipelineIdeaOutcome::NearDuplicate { ticket_id: matched_id, score });
+                    }
+                }
+            }
+            Ok(PipelineIdeaOutcome::NearDuplicate { ticket_id: matched_id, score })
+        }
+        pipeline::DedupeVerdict::Land => {
+            let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or("pipeline not loaded")?;
+            let new_task = pipeline::compose_idea_ticket(&candidate, pl).map_err(|e| describe_idea_refusal(&e))?;
+            let today = local_date_today();
+            let task = tasks::create_task(tasks::TaskHome::Workspace { workspace_root: &ws_root }, &new_task, &today).map_err(err)?;
+            drop(guard);
+            note_task_write_and_emit(&app, state.inner(), task.path.clone(), true);
+            Ok(PipelineIdeaOutcome::Landed { task })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// ken-pipeline task 2.9: artifacts. Every path below is rooted at
+// `pipeline::artifact_ticket_dir(ws_root, ticket_id)` —
+// `.ken-workspace/artifacts/<ticket-id>/` — with no parameter or branch
+// that could redirect a write into any project member's own tree, which
+// is the "verify no write path can place an artifact inside a member
+// repo" the task asks for: structurally true by construction, not just
+// tested.
+// ---------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactManifestDto {
+    #[serde(flatten)]
+    manifest: pipeline::ArtifactManifest,
+    expired: bool,
+}
+
+#[tauri::command]
+fn pipeline_artifacts(state: State<SharedState>, ticket_id: String) -> CmdResult<Option<ArtifactManifestDto>> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    let path = pipeline::artifact_manifest_path(&ws_root, &ticket_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(err)?;
+    let manifest = pipeline::parse_artifact_manifest(&path, &raw);
+    let expired = pipeline::is_artifact_expired(&manifest, &local_date_today());
+    Ok(Some(ArtifactManifestDto { manifest, expired }))
+}
+
+/// Lazily create `artifacts/<ticket-id>/` and its manifest on first use
+/// (task 2.9: "create ... lazily with its manifest"), or append `filename`
+/// to an already-existing manifest's `files` list (idempotent). Judgment
+/// call, flagged: section 2's task list names `pipeline_artifacts`/
+/// `pipeline_prune_artifacts` explicitly but not a registration command —
+/// without one, nothing would ever create the folder, so this is the one
+/// addition beyond the literal list.
+#[tauri::command]
+fn pipeline_register_artifact(state: State<SharedState>, ticket_id: String, filename: String) -> CmdResult<ArtifactManifestDto> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    let dir = pipeline::artifact_ticket_dir(&ws_root, &ticket_id);
+    let path = pipeline::artifact_manifest_path(&ws_root, &ticket_id);
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let manifest = if path.is_file() {
+        let raw = std::fs::read_to_string(&path).map_err(err)?;
+        let mut m = pipeline::parse_artifact_manifest(&path, &raw);
+        if !m.files.iter().any(|f| f == &filename) {
+            m.files.push(filename.clone());
+            let edits = vec![("files", tasks::seq_lines("files", &m.files))];
+            let next = pipeline::patch_artifact_manifest_text(&raw, &edits);
+            std::fs::write(&path, next).map_err(err)?;
+        }
+        m
+    } else {
+        let today = local_date_today();
+        let m = pipeline::new_artifact_manifest(&ticket_id, &today, vec![filename]);
+        std::fs::write(&path, pipeline::compose_artifact_manifest(&m)).map_err(err)?;
+        m
+    };
+    let expired = pipeline::is_artifact_expired(&manifest, &local_date_today());
+    Ok(ArtifactManifestDto { manifest, expired })
+}
+
+/// The prune action (OPEN-5/D9: "surfaced as a prune action in the tray,
+/// never auto-deleted"). This command is exactly that human-invoked
+/// action — Ken never calls it on a timer.
+#[tauri::command]
+fn pipeline_prune_artifacts(state: State<SharedState>, ticket_id: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    if !ken_pipeline_enabled(&guard.app_settings) {
+        return Err(KEN_PIPELINE_DISABLED_MSG.into());
+    }
+    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    let dir = pipeline::artifact_ticket_dir(&ws_root, &ticket_id);
+    if dir.is_dir() {
+        std::fs::remove_dir_all(&dir).map_err(err)?;
+    }
+    Ok(())
 }
 
 /// The incremental-Map worker: one per open project. Loops draining the
@@ -10790,6 +12452,21 @@ pub fn run() {
             resolve_daily_candidate,
             daily_rollover_candidates,
             resolve_daily_rollover,
+            pipeline_list_defs,
+            pipeline_board,
+            pipeline_runs,
+            pipeline_blockers,
+            pipeline_digest,
+            pipeline_kickoff,
+            pipeline_advance,
+            pipeline_cancel_run,
+            pipeline_block,
+            pipeline_unblock,
+            pipeline_signoff,
+            pipeline_propose_idea,
+            pipeline_artifacts,
+            pipeline_register_artifact,
+            pipeline_prune_artifacts,
             family_create,
             family_join,
             family_list,
@@ -10887,6 +12564,25 @@ mod tests {
 
         assert!(!project.root.join("Meetings").exists());
         assert!(db.get_file(child).unwrap().is_none(), "child row should be dropped with the folder");
+    }
+
+    /// ken-pipeline task 2.6's explicit ask: "Add an assertion/test that
+    /// this path cannot reach `Start`." `apply_unblocks_for` itself never
+    /// calls `admit()` at all in this pass (task 2.12/auto-transitions is
+    /// gated off, so there is no code path from an unblock patch to a run
+    /// yet) — this is the regression guard for when that gate lifts: an
+    /// unblocked ticket re-admitted with `EntryKind::Unblock` must stay a
+    /// `Confirm` even in an `auto`-kickoff lane of an `auto: true`
+    /// pipeline, exactly D5's "even an `auto` lane cannot out-vote it".
+    #[test]
+    fn unblocked_ticket_never_admits_to_start() {
+        let raw = "---\nid: t\nname: T\nauto: true\nlanes:\n  - id: doing\n    name: Doing\n    maps_to: doing\n    agent: worker\n    kickoff: auto\n    on_pass: done\n  - id: done\n    name: Done\n    maps_to: done\n    terminal: true\n---\n";
+        let pl = pipeline::parse_pipeline(Path::new("t.md"), raw);
+        let ticket_raw = "---\nid: '01ARZ3NDEKTSV4RRFFQ69G5FAV'\ntitle: T\nstatus: doing\npipeline: t\nscope:\n  - src/\nverify: cargo test\n---\n";
+        let task = tasks::parse_task(Path::new("ticket.md"), tasks::HomeKind::Workspace, "", ticket_raw);
+        let lane = pipeline::resolve_lane(&pl, "doing").expect("lane resolves");
+        let admission = pipeline::admit(&task, lane, &pl, &[], pipeline::EntryKind::Unblock);
+        assert!(!matches!(admission, pipeline::Admission::Start), "unblock entry reached Start: {admission:?}");
     }
 }
 
