@@ -41,7 +41,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::tasks::{
-    map_list, map_str, split_fm_body, AttentionReason, Task, TaskPatch, TaskStatus,
+    map_list, map_str, scalar_lines, seq_lines, split_fm_body, AttentionReason, NewTask, Task,
+    TaskPatch, TaskStatus,
 };
 
 // ---------------------------------------------------------------------
@@ -1293,6 +1294,231 @@ pub fn running_runs(runs: &[RunRecord]) -> usize {
 }
 
 // ---------------------------------------------------------------------
+// 1.11 Run ledger: pathing, parse/write, ledger scan, derived queue,
+// stale detection (D13)
+// ---------------------------------------------------------------------
+
+const RUNS_SUBDIR: &str = "runs";
+
+/// `.ken-workspace/runs/`, the append-only ledger root (D13).
+pub fn runs_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(crate::workspace::CONFIG_DIR).join(RUNS_SUBDIR)
+}
+
+/// `.ken-workspace/runs/<yyyy-mm>/` — monthly folders mirror ken-tasks'
+/// `archive/YYYY-MM/` convention, keeping the directory listable.
+pub fn run_month_dir(workspace_root: &Path, yyyy_mm: &str) -> PathBuf {
+    runs_dir(workspace_root).join(yyyy_mm)
+}
+
+/// `.ken-workspace/runs/<yyyy-mm>/<ulid>.md`. `yyyy_mm` is caller-supplied
+/// (this module owns no clock, same convention as `tasks::create_task`'s
+/// `today`); see [`run_month`] to derive it from a run's `started` value.
+pub fn run_path(workspace_root: &Path, yyyy_mm: &str, id: &str) -> PathBuf {
+    run_month_dir(workspace_root, yyyy_mm).join(format!("{id}.md"))
+}
+
+/// The `yyyy-mm` folder a run files under, taken from the first 7
+/// characters of its (caller-supplied) `started` timestamp. Falls back to
+/// the input unchanged if it's too short to slice — defensive only; every
+/// real caller passes a validated ISO date/datetime.
+pub fn run_month(started: &str) -> String {
+    started.get(0..7).unwrap_or(started).to_string()
+}
+
+/// Parse a run-record file. Infallible and tolerant, the same posture as
+/// [`parse_pipeline`]/`tasks::parse_task`: a malformed record degrades to
+/// something renderable rather than an error that takes the tray down. An
+/// empty/missing `id` key falls back to the file stem, mirroring
+/// [`parse_pipeline`]'s same fallback for a definition's `id`.
+pub fn parse_run(path: &Path, raw: &str) -> RunRecord {
+    let (fm, body) = split_fm_body(raw);
+    let map = fm
+        .and_then(|f| serde_yaml::from_str::<serde_yaml::Mapping>(f).ok())
+        .unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = {
+        let declared = map_str(&map, "id").trim().to_string();
+        if declared.is_empty() {
+            stem
+        } else {
+            declared
+        }
+    };
+    let outcome_raw = map_str(&map, "outcome").trim().to_string();
+    RunRecord {
+        id,
+        ticket: map_str(&map, "ticket").trim().to_string(),
+        pipeline: map_str(&map, "pipeline").trim().to_string(),
+        lane: map_str(&map, "lane").trim().to_string(),
+        agent: map_str(&map, "agent").trim().to_string(),
+        model: map_str(&map, "model").trim().to_string(),
+        scope: map_list(&map, "scope"),
+        verify: map_str(&map, "verify").trim().to_string(),
+        started: map_str(&map, "started").trim().to_string(),
+        ended: map_str(&map, "ended").trim().to_string(),
+        outcome: RunOutcome::parse(&outcome_raw),
+        outcome_raw,
+        artifacts: map_list(&map, "artifacts"),
+        report: body.trim().to_string(),
+    }
+}
+
+/// Render a fresh run-record file: every [`RunRecord`] field as
+/// frontmatter, in field-declaration order, then the agent's report as the
+/// body. Pure text composition — the caller writes the bytes (module-wide
+/// "no filesystem access" posture); reuses `tasks::scalar_lines`/
+/// `seq_lines` for the same quoting guarantees every other write in this
+/// feature gets.
+pub fn compose_run(record: &RunRecord) -> String {
+    let outcome_str = record
+        .outcome
+        .map(RunOutcome::as_str)
+        .unwrap_or(record.outcome_raw.as_str());
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(scalar_lines("id", &record.id));
+    lines.extend(scalar_lines("ticket", &record.ticket));
+    lines.extend(scalar_lines("pipeline", &record.pipeline));
+    lines.extend(scalar_lines("lane", &record.lane));
+    lines.extend(scalar_lines("agent", &record.agent));
+    lines.extend(scalar_lines("model", &record.model));
+    lines.extend(seq_lines("scope", &record.scope));
+    lines.extend(scalar_lines("verify", &record.verify));
+    lines.extend(scalar_lines("started", &record.started));
+    lines.extend(scalar_lines("ended", &record.ended));
+    lines.extend(scalar_lines("outcome", outcome_str));
+    lines.extend(seq_lines("artifacts", &record.artifacts));
+
+    let mut out = String::from("---\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("---\n\n");
+    let report = record.report.trim();
+    out.push_str(report);
+    if !report.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Rewrite named top-level keys of an existing run record through the S6
+/// patch core (closing a run: `ended`, `outcome`, `artifacts`), the same
+/// shape [`patch_pipeline_text`] gives definitions.
+pub fn patch_run_text(raw: &str, edits: &[(&str, Vec<String>)]) -> String {
+    crate::tasks::patch_text(raw, edits, None)
+}
+
+/// Parse every `(path, raw)` pair already read off disk into a
+/// [`RunRecord`] — 1.11's "ledger scan". The caller does the directory
+/// listing (this module has no filesystem access by design), so this is a
+/// `map` over already-read bytes, not a scanner; it exists so every caller
+/// shares exactly one parse path for the whole ledger, the same shape
+/// `tasks::list_tasks`/`scan_tasks` give the board.
+pub fn scan_runs<'a, I>(files: I) -> Vec<RunRecord>
+where
+    I: IntoIterator<Item = (&'a Path, &'a str)>,
+{
+    files.into_iter().map(|(path, raw)| parse_run(path, raw)).collect()
+}
+
+/// The ledger-derived queue view (D13 / spec: "running, queued, blocked,
+/// and waiting-on-human state SHALL be derived from the ledger and the
+/// tickets"). `waiting_human` is not run-ledger data — no run record
+/// exists yet for work nobody has authorised — so it is derived from the
+/// board via [`admit`] instead, never guessed at from `outcome`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunQueue {
+    pub running: Vec<RunRecord>,
+    pub queued: Vec<RunRecord>,
+    pub blocked: Vec<RunRecord>,
+    /// [`RunOutcome::Running`] records this session has no live memory of
+    /// (D13: "a `running` record with no live run after restart ... SHALL
+    /// NOT be recorded as passed").
+    pub stale: Vec<RunRecord>,
+    /// Ticket ids currently sitting at a confirmation gate.
+    pub waiting_human: Vec<String>,
+}
+
+/// Derive the full queue view from the ledger plus the board.
+///
+/// `known_running_ids` is the set of run ids *this Ken session* has itself
+/// observed as running — never persisted, never read from disk (this
+/// module owns no clock or watcher, and D13 gives the ledger, not an
+/// in-memory registry, as the source of truth). A `running` record whose
+/// id is **not** in that set is one this session has no live memory of.
+/// Concretely: on a fresh workspace-open the caller passes an *empty* set,
+/// so every `running` record already on disk is reported stale by
+/// construction — exactly D13's "no live run after restart", for a runner
+/// that spawns no processes to track in the first place (D14/OPEN-1).
+/// Mid-session, a freshly claimed run's id belongs to the caller's own
+/// running set and is therefore never stale.
+pub fn derive_queue(
+    tasks: &[Task],
+    pipelines: &[Pipeline],
+    runs: &[RunRecord],
+    known_running_ids: &BTreeSet<String>,
+) -> RunQueue {
+    let mut q = RunQueue::default();
+    for r in runs {
+        match r.outcome {
+            Some(RunOutcome::Running) => {
+                if known_running_ids.contains(&r.id) {
+                    q.running.push(r.clone());
+                } else {
+                    q.stale.push(r.clone());
+                }
+            }
+            Some(RunOutcome::Queued) => q.queued.push(r.clone()),
+            Some(RunOutcome::Blocked) => q.blocked.push(r.clone()),
+            // pass/fail/cancelled/unparseable: closed, not part of the
+            // live queue.
+            _ => {}
+        }
+    }
+    q.waiting_human = waiting_on_human(tasks, pipelines, runs)
+        .into_iter()
+        .map(|t| t.id.clone())
+        .collect();
+    q
+}
+
+/// Tickets sitting at a confirmation gate right now, computed by asking
+/// [`admit`] what a human-initiated kickoff would do — so this can never
+/// drift from the one admission function (D5's single-home rule). A
+/// blocked ticket is excluded: it belongs to the `blocked` bucket, not
+/// this one, so stuck work has exactly one home in the derived view too.
+pub fn waiting_on_human<'a>(
+    tasks: &'a [Task],
+    pipelines: &[Pipeline],
+    runs: &[RunRecord],
+) -> Vec<&'a Task> {
+    tasks
+        .iter()
+        .filter(|t| {
+            let Some(pipeline_id) = ticket_pipeline(t) else {
+                return false;
+            };
+            let Some(pipeline) = find_pipeline(pipelines, &pipeline_id) else {
+                return false;
+            };
+            let Some(lane) = resolve_lane(pipeline, &t.status_raw) else {
+                return false;
+            };
+            matches!(
+                admit(t, lane, pipeline, runs, EntryKind::Kickoff),
+                Admission::Confirm { .. }
+            )
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------
 // 1.8 Admission — the single gate every start goes through
 // ---------------------------------------------------------------------
 
@@ -1815,6 +2041,994 @@ fn evaluate_unblocks_inner(
         });
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// 1.12 Sign-off child composition (D11)
+// ---------------------------------------------------------------------
+
+/// The lane a sign-off comment's child ticket lands in (D11/spec: "a new
+/// ticket in the `todo` lane"). Literal, per the spec's exact wording —
+/// not derived from any per-lane flag, because the definition model has
+/// none for "the intake-adjacent lane". See [`SignoffRefusal::NoTodoLane`]
+/// for what happens when a pipeline doesn't declare one.
+const SIGNOFF_CHILD_LANE: &str = "todo";
+
+/// What "accept with comments" produces, as one pure result (D11: "both
+/// things happen ... in the same action"): the child ticket to create, the
+/// parent's `on_pass` advance (composed via [`advance`] so the bounce/cap
+/// machinery is never duplicated), and the line appended to the *parent's*
+/// `## Log` so the parent's history is self-contained. Plain accept is
+/// just `advance(parent, pipeline, AdvanceOutcome::Pass, now)` with no
+/// child — nothing here to compose for it. Reject is `advance(..,
+/// AdvanceOutcome::Fail, ..)`, which already counts as a bounce.
+// `NewTask` (`tasks.rs`) does not derive `PartialEq`, so this struct can't
+// either — tests compare `child`'s fields individually instead of the
+// whole `SignoffChild`.
+#[derive(Debug, Clone)]
+pub struct SignoffChild {
+    pub child: NewTask,
+    pub parent_transition: Transition,
+    pub parent_log: String,
+}
+
+/// Why a comment-spawned child cannot be composed. Every variant leaves
+/// both files untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignoffRefusal {
+    /// The reviewed ticket isn't sitting in a `human: true` lane — nothing
+    /// to sign off on.
+    NotHumanLane(String),
+    /// An empty comment is "accept", not "accept with comments".
+    EmptyComment,
+    /// The lane declares no `on_pass` edge for the parent to advance
+    /// along.
+    NoOnPass(String),
+    /// The pipeline declares no lane literally named `todo` for the child
+    /// to land in (D2: never write around a lane that can't be
+    /// validated).
+    NoTodoLane,
+}
+
+/// Compose the child ticket + parent advance for "accept with comments"
+/// (D11). Pure: returns everything a caller needs to write in one shot, so
+/// the action's two writes (new child file, parent patch) can never
+/// disagree about the parent's target lane.
+///
+/// The child inherits `pipeline`, `project`, and `projects` from the
+/// parent, and carries `parent` + `origin: signoff`. It deliberately does
+/// **not** inherit `scope`/`verify` (D11/D3: "the child is new work and
+/// must earn its own boundary").
+pub fn compose_signoff_child(
+    parent: &Task,
+    pipeline: &Pipeline,
+    comment: &str,
+    now: &str,
+) -> Result<SignoffChild, SignoffRefusal> {
+    let comment = comment.trim();
+    if comment.is_empty() {
+        return Err(SignoffRefusal::EmptyComment);
+    }
+    let Some(lane) = resolve_lane(pipeline, &parent.status_raw) else {
+        return Err(SignoffRefusal::NotHumanLane(parent.status_raw.clone()));
+    };
+    if !lane.human {
+        return Err(SignoffRefusal::NotHumanLane(lane.id.clone()));
+    }
+    if pipeline.lane(SIGNOFF_CHILD_LANE).is_none() {
+        return Err(SignoffRefusal::NoTodoLane);
+    }
+
+    let parent_transition = advance(parent, pipeline, AdvanceOutcome::Pass, now);
+    if matches!(
+        parent_transition,
+        Transition::Refused {
+            reason: TransitionRefusal::NoEdge { .. }
+        }
+    ) {
+        return Err(SignoffRefusal::NoOnPass(lane.id.clone()));
+    }
+
+    let parent_fields = ticket_fields(parent);
+    let child = NewTask {
+        id: None,
+        title: format!("Sign-off comment on {}", parent.title),
+        body: comment.to_string(),
+        fields: TaskPatch {
+            lane: Some(SIGNOFF_CHILD_LANE.to_string()),
+            pipeline: parent_fields.pipeline.clone(),
+            project: Some(parent.project.clone()),
+            projects: if parent_fields.projects.is_empty() {
+                None
+            } else {
+                Some(parent_fields.projects.clone())
+            },
+            parent: Some(parent.id.clone()),
+            origin: Some("signoff".to_string()),
+            ..TaskPatch::default()
+        },
+    };
+    let parent_log = format!("sign-off comment → new ticket \"{}\": {comment}", child.title);
+    Ok(SignoffChild {
+        child,
+        parent_transition,
+        parent_log,
+    })
+}
+
+// ---------------------------------------------------------------------
+// 1.13 Idea proposal + dedupe scoring (D7)
+// ---------------------------------------------------------------------
+
+/// The lane a landed idea occupies (D7/spec: `status: ideas`, an inert
+/// holding column by construction).
+const IDEA_LANE: &str = "ideas";
+/// D7/spec: every generated idea carries this origin.
+const IDEA_ORIGIN: &str = "generated";
+
+/// A proposed idea, before it becomes a ticket. `spawned_by` is required
+/// at construction — [`propose_idea`] is the one place that can produce an
+/// [`IdeaCandidate`], and it refuses to build one without a citation (D7:
+/// "An idea without a citation is refused at creation").
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdeaCandidate {
+    pub title: String,
+    pub body: String,
+    pub spawned_by: String,
+    pub project: String,
+    pub projects: Vec<String>,
+    pub pipeline: String,
+}
+
+/// Why an idea candidate could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdeaRefusal {
+    /// D7: "An idea without a citation is refused at creation."
+    MissingCitation,
+    EmptyTitle,
+    /// The pipeline declares no `ideas` lane, so there's nowhere inert for
+    /// it to land (only raised by [`compose_idea_ticket`]).
+    NoIdeasLane,
+}
+
+/// Build an idea candidate, refusing at construction rather than letting a
+/// missing citation slip through to dedupe or landing (D7).
+pub fn propose_idea(
+    title: &str,
+    body: &str,
+    spawned_by: &str,
+    project: &str,
+    projects: &[String],
+    pipeline: &str,
+) -> Result<IdeaCandidate, IdeaRefusal> {
+    if spawned_by.trim().is_empty() {
+        return Err(IdeaRefusal::MissingCitation);
+    }
+    if title.trim().is_empty() {
+        return Err(IdeaRefusal::EmptyTitle);
+    }
+    Ok(IdeaCandidate {
+        title: title.trim().to_string(),
+        body: body.trim().to_string(),
+        spawned_by: spawned_by.trim().to_string(),
+        project: project.trim().to_string(),
+        projects: projects.to_vec(),
+        pipeline: pipeline.trim().to_string(),
+    })
+}
+
+/// Dedupe scope (D7/D12): the candidate's project plus any project linked
+/// to the idea's project. Pure set membership so callers (2.8) can filter
+/// their search results to this scope before ever calling [`dedupe_idea`]
+/// — this module has no workspace handle, so the caller resolves
+/// `linked` via `WorkspaceConfig::linked_projects` and passes it in.
+pub fn in_dedupe_scope(idea_project: &str, candidate_project: &str, linked: &[&str]) -> bool {
+    eq_ci(idea_project, candidate_project) || linked.iter().any(|l| eq_ci(l, candidate_project))
+}
+
+/// A ticket already on the board, offered to [`dedupe_idea`] as a possible
+/// match. Deliberately narrower than [`Task`]: the same shape serves both
+/// the semantic-search path (2.8's `semantic_search`/`kg_search` results,
+/// mapped down to this) and the FTS fallback (`search_knowledge` results),
+/// so `dedupe_idea` never has to know which produced its input.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DedupeCandidate {
+    pub ticket_id: String,
+    pub title: String,
+    pub project: String,
+    /// `Some` when the caller already has a similarity score (the
+    /// semantic path); `None` when only a title is available (FTS/
+    /// title-match fallback), in which case [`dedupe_idea`] computes one
+    /// itself from [`normalized_title_score`].
+    pub score: Option<f32>,
+}
+
+/// The dedupe verdict (D7).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DedupeVerdict {
+    Land,
+    NearDuplicate { ticket_id: String, score: f32 },
+}
+
+/// Similarity threshold above which a candidate counts as a duplicate.
+/// Applies uniformly to a caller-supplied semantic score and this
+/// module's own normalized-title score, so the two dedupe paths (D7:
+/// "the same function serves the semantic path and the FTS fallback")
+/// agree on what "above threshold" means.
+pub const DEDUPE_THRESHOLD: f32 = 0.82;
+
+/// Crude normalized-title similarity: lowercase, tokenize on non-
+/// alphanumerics, Jaccard overlap. This is the FTS-path fallback D7
+/// requires when `semanticIndex`/`federatedKg` are off — not a
+/// replacement for real embeddings, which the semantic path already
+/// supplies as a `DedupeCandidate::score`.
+fn normalized_title_score(a: &str, b: &str) -> f32 {
+    let tokens = |s: &str| -> BTreeSet<String> {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let ta = tokens(a);
+    let tb = tokens(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let inter = ta.intersection(&tb).count() as f32;
+    let union = ta.union(&tb).count() as f32;
+    inter / union
+}
+
+/// Score every offered candidate and return the verdict (D7). The same
+/// function serves the semantic path (candidates carry a `score` from
+/// `semantic_search`/`kg_search`) and the FTS fallback (candidates carry
+/// `None`, so [`normalized_title_score`] is computed here) — the caller
+/// never branches on which index produced its input. Dedupe scope
+/// ([`in_dedupe_scope`]) is the caller's job to apply *before* calling
+/// this; this module has no workspace handle to enforce it itself.
+pub fn dedupe_idea(idea: &IdeaCandidate, candidates: &[DedupeCandidate]) -> DedupeVerdict {
+    let mut best: Option<(&DedupeCandidate, f32)> = None;
+    for c in candidates {
+        let score = c
+            .score
+            .unwrap_or_else(|| normalized_title_score(&idea.title, &c.title));
+        if score >= DEDUPE_THRESHOLD && best.map(|(_, b)| score > b).unwrap_or(true) {
+            best = Some((c, score));
+        }
+    }
+    match best {
+        Some((c, score)) => DedupeVerdict::NearDuplicate {
+            ticket_id: c.ticket_id.clone(),
+            score,
+        },
+        None => DedupeVerdict::Land,
+    }
+}
+
+/// The `## Log` line appended to the *matched* ticket when an idea is
+/// deduped away instead of landing (D7/spec: "a near-duplicate note SHALL
+/// be appended to the matched ticket's `## Log`"). `None` for
+/// `DedupeVerdict::Land` — a landed idea gets no such note, it gets a
+/// ticket.
+pub fn dedupe_log_line(idea: &IdeaCandidate, verdict: &DedupeVerdict) -> Option<String> {
+    match verdict {
+        DedupeVerdict::NearDuplicate { score, .. } => Some(format!(
+            "near-duplicate idea proposed from {} — \"{}\" ({:.0}% match), not filed",
+            idea.spawned_by,
+            idea.title,
+            score * 100.0
+        )),
+        DedupeVerdict::Land => None,
+    }
+}
+
+/// Compose the ticket-creation payload for an idea that survived dedupe
+/// (`DedupeVerdict::Land`). Requires the pipeline to declare an `ideas`
+/// lane — the same defensive "never write around a lane that can't be
+/// validated" check [`compose_signoff_child`] makes for `todo`. D7: "the
+/// Ideas lane is inert by construction" — landing here can never start a
+/// run because the lane itself has no agent, not because this function
+/// checks admission.
+pub fn compose_idea_ticket(idea: &IdeaCandidate, pipeline: &Pipeline) -> Result<NewTask, IdeaRefusal> {
+    if pipeline.lane(IDEA_LANE).is_none() {
+        return Err(IdeaRefusal::NoIdeasLane);
+    }
+    Ok(NewTask {
+        id: None,
+        title: idea.title.clone(),
+        body: idea.body.clone(),
+        fields: TaskPatch {
+            lane: Some(IDEA_LANE.to_string()),
+            pipeline: Some(idea.pipeline.clone()),
+            project: Some(idea.project.clone()),
+            projects: if idea.projects.is_empty() {
+                None
+            } else {
+                Some(idea.projects.clone())
+            },
+            spawned_by: Some(idea.spawned_by.clone()),
+            origin: Some(IDEA_ORIGIN.to_string()),
+            ..TaskPatch::default()
+        },
+    })
+}
+
+// ---------------------------------------------------------------------
+// 1.14 Artifact manifest model (D9)
+// ---------------------------------------------------------------------
+
+const ARTIFACTS_SUBDIR: &str = "artifacts";
+const ARTIFACT_MANIFEST_FILE: &str = "manifest.md";
+/// OPEN-5, pinned: 30 days, surfaced as a prune action in the tray, never
+/// auto-deleted (D9: "Ken does not delete a human's review material on a
+/// timer").
+pub const DEFAULT_ARTIFACT_TTL_DAYS: i64 = 30;
+
+/// `.ken-workspace/artifacts/`.
+pub fn artifacts_dir(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(crate::workspace::CONFIG_DIR).join(ARTIFACTS_SUBDIR)
+}
+
+/// `.ken-workspace/artifacts/<ticket-id>/` — never inside any member repo
+/// (D9's physical boundary).
+pub fn artifact_ticket_dir(workspace_root: &Path, ticket_id: &str) -> PathBuf {
+    artifacts_dir(workspace_root).join(ticket_id)
+}
+
+/// `.ken-workspace/artifacts/<ticket-id>/manifest.md`.
+pub fn artifact_manifest_path(workspace_root: &Path, ticket_id: &str) -> PathBuf {
+    artifact_ticket_dir(workspace_root, ticket_id).join(ARTIFACT_MANIFEST_FILE)
+}
+
+/// One throwaway-artifact folder's manifest (D9). `durable` has no setter
+/// and no frontmatter reader that could make it anything but `false` —
+/// the same "cannot typecheck the unsafe state" posture as [`Block`]'s
+/// `return_lane`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactManifest {
+    pub ticket: String,
+    pub created: String,
+    pub expires: String,
+    pub files: Vec<String>,
+}
+
+impl ArtifactManifest {
+    /// Always `false` (D9). There is no field to set it any other way.
+    pub fn durable(&self) -> bool {
+        false
+    }
+}
+
+/// Build a fresh manifest, defaulting `expires` to `created` + 30 days
+/// (OPEN-5). Falls back to `created` unchanged if it isn't a parseable
+/// `YYYY-MM-DD` — an unparseable `expires` is a tray entry for a human to
+/// fix, never a panic.
+pub fn new_artifact_manifest(ticket: &str, created: &str, files: Vec<String>) -> ArtifactManifest {
+    ArtifactManifest {
+        ticket: ticket.to_string(),
+        expires: shift_iso_date(created, DEFAULT_ARTIFACT_TTL_DAYS)
+            .unwrap_or_else(|| created.to_string()),
+        created: created.to_string(),
+        files,
+    }
+}
+
+/// Parse a manifest file. Infallible and tolerant, same posture as
+/// [`parse_run`]/[`parse_pipeline`]. `durable` is read-and-discarded — the
+/// type only ever reports `false` ([`ArtifactManifest::durable`]) — so a
+/// hand-edited `durable: true` cannot make an artifact folder look
+/// durable to the rest of Ken.
+pub fn parse_artifact_manifest(path: &Path, raw: &str) -> ArtifactManifest {
+    let (fm, _body) = split_fm_body(raw);
+    let map = fm
+        .and_then(|f| serde_yaml::from_str::<serde_yaml::Mapping>(f).ok())
+        .unwrap_or_default();
+    let ticket = {
+        let declared = map_str(&map, "ticket").trim().to_string();
+        if declared.is_empty() {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            declared
+        }
+    };
+    ArtifactManifest {
+        ticket,
+        created: map_str(&map, "created").trim().to_string(),
+        expires: map_str(&map, "expires").trim().to_string(),
+        files: map_list(&map, "files"),
+    }
+}
+
+/// Render a fresh manifest file. `durable: false` is always the first
+/// line and is never taken from `self` — it isn't a field on
+/// [`ArtifactManifest`] at all (D9).
+pub fn compose_artifact_manifest(manifest: &ArtifactManifest) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(scalar_lines("durable", "false"));
+    lines.extend(scalar_lines("ticket", &manifest.ticket));
+    lines.extend(scalar_lines("created", &manifest.created));
+    lines.extend(scalar_lines("expires", &manifest.expires));
+    lines.extend(seq_lines("files", &manifest.files));
+
+    let mut out = String::from("---\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("---\n\n");
+    out.push_str("Throwaway artifacts for this ticket — not part of the test suite.\n");
+    out
+}
+
+/// Rewrite named top-level keys of an existing manifest (e.g. appending a
+/// file to `files`) through the S6 patch core, same shape as
+/// [`patch_run_text`]/[`patch_pipeline_text`].
+pub fn patch_artifact_manifest_text(raw: &str, edits: &[(&str, Vec<String>)]) -> String {
+    crate::tasks::patch_text(raw, edits, None)
+}
+
+/// Whether `manifest` has passed its `expires` date, as of `today` — a
+/// pure predicate and nothing more (D9: "Expiry is surfaced, never
+/// automatic ... prune is a UI action"; there is deliberately no delete/
+/// prune function anywhere in this module). ISO dates compare correctly
+/// as strings (same trick `tasks::rollover_candidates` uses); an
+/// unparseable `expires` or `today` reads as *not* expired rather than
+/// guessed at — surfaced elsewhere (the tray), never a silent prune
+/// trigger. Exactly `today == expires` is not yet expired: it expires the
+/// day *after*.
+pub fn is_artifact_expired(manifest: &ArtifactManifest, today: &str) -> bool {
+    let expires = manifest.expires.trim();
+    let today = today.trim();
+    if !is_iso_date_like(expires) || !is_iso_date_like(today) {
+        return false;
+    }
+    today > expires
+}
+
+fn is_iso_date_like(s: &str) -> bool {
+    s.len() == 10
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[7] == b'-'
+        && s.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                true
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian `(y, m, d)` date —
+/// Howard Hinnant's public-domain `days_from_civil` algorithm
+/// (https://howardhinnant.github.io/date_algorithms.html). Duplicated
+/// locally rather than shared from `memory.rs` (whose copy is private to
+/// that module and this session's scope is this file only); used only to
+/// compute [`shift_iso_date`]'s default `expires`, never to compare dates
+/// (string comparison suffices for that, see [`is_artifact_expired`]).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The inverse of [`days_from_civil`]: a day count back to `(y, m, d)`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn parse_iso_date_parts(s: &str) -> Option<(i64, i64, i64)> {
+    if !is_iso_date_like(s) {
+        return None;
+    }
+    let mut parts = s.splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// `date` shifted by `days` (may be negative), as `YYYY-MM-DD`. `None` for
+/// an unparseable input.
+pub fn shift_iso_date(date: &str, days: i64) -> Option<String> {
+    let (y, m, d) = parse_iso_date_parts(date)?;
+    let (y2, m2, d2) = civil_from_days(days_from_civil(y, m, d) + days);
+    Some(format!("{y2:04}-{m2:02}-{d2:02}"))
+}
+
+// ---------------------------------------------------------------------
+// 1.15 Digest composition (spec: "produce a grouped daily update")
+// ---------------------------------------------------------------------
+
+/// One entry in the `blocked` digest group — the ticket plus the *root*
+/// blocker(s) of its chain, not the nearest (1.15's subtle part; see
+/// [`root_blockers`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockedDigestEntry {
+    pub ticket_id: String,
+    pub title: String,
+    pub blocked_at: Option<String>,
+    pub root_blockers: Vec<String>,
+    pub block_reason: Option<String>,
+    pub run_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnblockedDigestEntry {
+    pub ticket_id: String,
+    pub title: String,
+    pub return_lane: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AwaitingReviewEntry {
+    pub ticket_id: String,
+    pub title: String,
+    pub updated: String,
+    pub run_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MovedEntry {
+    pub ticket_id: String,
+    pub title: String,
+    pub lane: String,
+    pub run_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdeaEntry {
+    pub ticket_id: String,
+    pub title: String,
+    pub spawned_by: Option<String>,
+}
+
+/// The whole daily update, groups in the spec's exact order: awaiting
+/// review, newly unblocked, blocked (root-first, oldest first), moved
+/// today, new ideas, stale runs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Digest {
+    pub awaiting_review: Vec<AwaitingReviewEntry>,
+    pub newly_unblocked: Vec<UnblockedDigestEntry>,
+    pub blocked: Vec<BlockedDigestEntry>,
+    pub moved_today: Vec<MovedEntry>,
+    pub new_ideas: Vec<IdeaEntry>,
+    pub stale_runs: Vec<RunRecord>,
+}
+
+/// The ticket(s) at the top of a blocked ticket's dependency chain — the
+/// digest's "root blocker of each chain, not the nearest" (1.15). Walks
+/// [`BlockGraph::blockers`] to its leaves (tickets with no `blocked_by` of
+/// their own), de-duplicated, in first-seen order. A `seen` set (the same
+/// discipline [`check_cycle`] uses) means a cycle an existing hand-edited
+/// file already contains still terminates, even though write-time
+/// detection stops any *new* one.
+pub fn root_blockers(graph: &BlockGraph, ticket_id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<String> = graph.blockers(ticket_id).to_vec();
+    while let Some(current) = stack.pop() {
+        if !seen.insert(norm(&current)) {
+            continue;
+        }
+        let next = graph.blockers(&current);
+        if next.is_empty() {
+            if !out.iter().any(|o| eq_ci(o, &current)) {
+                out.push(current);
+            }
+        } else {
+            stack.extend(next.iter().cloned());
+        }
+    }
+    out
+}
+
+/// Compose the digest (1.15). Pure over a caller-supplied board + ledger +
+/// `today` (this module owns no clock). `known_running_ids` is
+/// [`derive_queue`]'s staleness input — see its docs.
+pub fn compose_digest(
+    tasks: &[Task],
+    pipelines: &[Pipeline],
+    runs: &[RunRecord],
+    known_running_ids: &BTreeSet<String>,
+    today: &str,
+) -> Digest {
+    let graph = BlockGraph::from_tasks(tasks);
+    let run_count = |id: &str| runs.iter().filter(|r| eq_ci(&r.ticket, id)).count();
+
+    // awaiting_review: sitting in a human lane, oldest (by `updated`)
+    // first.
+    let mut awaiting: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| {
+            ticket_pipeline(t)
+                .and_then(|pid| find_pipeline(pipelines, &pid).map(|p| (p, t.status_raw.clone())))
+                .and_then(|(p, status_raw)| resolve_lane(p, &status_raw).map(|l| l.human))
+                .unwrap_or(false)
+        })
+        .collect();
+    awaiting.sort_by(|a, b| a.updated.cmp(&b.updated));
+    let awaiting_review = awaiting
+        .into_iter()
+        .map(|t| AwaitingReviewEntry {
+            ticket_id: t.id.clone(),
+            title: t.title.clone(),
+            updated: t.updated.clone(),
+            run_count: run_count(&t.id),
+        })
+        .collect();
+
+    // newly_unblocked: with return lanes.
+    let newly_unblocked = tasks
+        .iter()
+        .filter(|t| matches_block_filter(t, &crate::tasks::BlockedFilter::NewlyUnblocked))
+        .map(|t| UnblockedDigestEntry {
+            ticket_id: t.id.clone(),
+            title: t.title.clone(),
+            return_lane: ticket_fields(t).return_lane.unwrap_or_default(),
+        })
+        .collect();
+
+    // blocked: oldest first by blocked_at, root blocker(s) shown.
+    let mut blocked_tasks: Vec<&Task> = tasks.iter().filter(|t| has_block_evidence(t)).collect();
+    blocked_tasks.sort_by(|a, b| {
+        let ba = ticket_fields(a).blocked_at.unwrap_or_default();
+        let bb = ticket_fields(b).blocked_at.unwrap_or_default();
+        ba.cmp(&bb)
+    });
+    let blocked = blocked_tasks
+        .into_iter()
+        .map(|t| {
+            let f = ticket_fields(t);
+            BlockedDigestEntry {
+                ticket_id: t.id.clone(),
+                title: t.title.clone(),
+                blocked_at: f.blocked_at.clone(),
+                root_blockers: root_blockers(&graph, &t.id),
+                block_reason: f.block_reason.clone(),
+                run_count: run_count(&t.id),
+            }
+        })
+        .collect();
+
+    // moved_today: `updated` is today.
+    let moved_today = tasks
+        .iter()
+        .filter(|t| t.updated == today)
+        .map(|t| MovedEntry {
+            ticket_id: t.id.clone(),
+            title: t.title.clone(),
+            lane: t.lane.clone().unwrap_or_else(|| t.status_raw.clone()),
+            run_count: run_count(&t.id),
+        })
+        .collect();
+
+    // new_ideas: generated today.
+    let new_ideas = tasks
+        .iter()
+        .filter(|t| {
+            let f = ticket_fields(t);
+            f.origin.as_deref() == Some(IDEA_ORIGIN) && t.created == today
+        })
+        .map(|t| IdeaEntry {
+            ticket_id: t.id.clone(),
+            title: t.title.clone(),
+            spawned_by: ticket_fields(t).spawned_by.clone(),
+        })
+        .collect();
+
+    // stale_runs
+    let stale_runs = derive_queue(tasks, pipelines, runs, known_running_ids).stale;
+
+    Digest {
+        awaiting_review,
+        newly_unblocked,
+        blocked,
+        moved_today,
+        new_ideas,
+        stale_runs,
+    }
+}
+
+/// Render the digest to markdown — the one function chat, MCP, and
+/// `journal_append` all call (1.15), so the three surfaces can never drift
+/// text apart. Empty groups are omitted; an entirely empty digest renders
+/// a single "nothing to report" line.
+pub fn render_digest_markdown(digest: &Digest, today: &str) -> String {
+    let mut out = format!("# Pipeline digest — {today}\n\n");
+    let mut any = false;
+
+    if !digest.awaiting_review.is_empty() {
+        any = true;
+        out.push_str("## Awaiting your review\n\n");
+        for e in &digest.awaiting_review {
+            out.push_str(&format!(
+                "- **{}** ({}) — updated {}, {} run(s)\n",
+                e.title, e.ticket_id, e.updated, e.run_count
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !digest.newly_unblocked.is_empty() {
+        any = true;
+        out.push_str("## Unblocked overnight\n\n");
+        for e in &digest.newly_unblocked {
+            out.push_str(&format!(
+                "- **{}** ({}) — returns to `{}`\n",
+                e.title, e.ticket_id, e.return_lane
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !digest.blocked.is_empty() {
+        any = true;
+        out.push_str("## Blocked\n\n");
+        for e in &digest.blocked {
+            let root = if e.root_blockers.is_empty() {
+                String::new()
+            } else {
+                format!(", root blocker(s): {}", e.root_blockers.join(", "))
+            };
+            let reason = e
+                .block_reason
+                .as_deref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- **{}** ({}) — blocked since {}{root}{reason}, {} run(s)\n",
+                e.title,
+                e.ticket_id,
+                e.blocked_at.as_deref().unwrap_or("unknown"),
+                e.run_count
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !digest.moved_today.is_empty() {
+        any = true;
+        out.push_str("## Moved today\n\n");
+        for e in &digest.moved_today {
+            out.push_str(&format!("- **{}** ({}) → `{}`\n", e.title, e.ticket_id, e.lane));
+        }
+        out.push('\n');
+    }
+
+    if !digest.new_ideas.is_empty() {
+        any = true;
+        out.push_str("## New ideas\n\n");
+        for e in &digest.new_ideas {
+            let cite = e
+                .spawned_by
+                .as_deref()
+                .map(|s| format!(" — from {s}"))
+                .unwrap_or_default();
+            out.push_str(&format!("- **{}** ({}){cite}\n", e.title, e.ticket_id));
+        }
+        out.push('\n');
+    }
+
+    if !digest.stale_runs.is_empty() {
+        any = true;
+        out.push_str("## Stale runs\n\n");
+        for r in &digest.stale_runs {
+            out.push_str(&format!("- run `{}` on ticket {} (lane `{}`)\n", r.id, r.ticket, r.lane));
+        }
+        out.push('\n');
+    }
+
+    if !any {
+        out.push_str("Nothing to report.\n");
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// 1.19 Default pipeline scaffold (D1's twelve lanes)
+// ---------------------------------------------------------------------
+
+/// `.ken-workspace/pipelines/default.md`'s content on first enable —
+/// D1's twelve lanes (eleven flow lanes plus `blocked`) verbatim, with the
+/// per-lane brief body a lane's agent is handed at kickoff. Written only
+/// when the file doesn't already exist ([`scaffold_default_pipeline`]) —
+/// a user's edited pipeline is never overwritten.
+pub const DEFAULT_PIPELINE_MD: &str = r#"---
+id: default
+name: Standard delivery pipeline
+auto: false
+concurrency_cap: 1
+bounce_cap: 3
+lanes:
+  - id: ideas
+    name: Ideas backlog
+    maps_to: backlog
+    agent: none
+    kickoff: manual
+    on_pass: backlog
+  - id: backlog
+    name: Backlog
+    maps_to: backlog
+    agent: none
+    kickoff: manual
+    on_pass: todo
+  - id: todo
+    name: To Do
+    maps_to: todo
+    agent: none
+    kickoff: manual
+    on_pass: investigation
+  - id: investigation
+    name: Investigation
+    maps_to: doing
+    agent: investigator
+    model: sonnet
+    kickoff: confirm
+    on_pass: refinement
+  - id: refinement
+    name: Refinement
+    maps_to: doing
+    agent: refiner
+    model: opus
+    kickoff: confirm
+    on_pass: programmer
+  - id: programmer
+    name: Programmer
+    maps_to: doing
+    agent: programmer
+    model: sonnet
+    kickoff: confirm
+    writes_code: true
+    on_pass: tester
+  - id: tester
+    name: Tester
+    maps_to: review
+    agent: tester
+    model: sonnet
+    kickoff: confirm
+    on_pass: architect
+    on_fail: programmer
+  - id: architect
+    name: Architect review
+    maps_to: review
+    agent: architect
+    model: opus
+    kickoff: confirm
+    on_pass: qa
+    on_fail: refinement
+  - id: qa
+    name: QA tester
+    maps_to: review
+    agent: qa
+    model: sonnet
+    kickoff: confirm
+    on_pass: signoff
+    on_fail: programmer
+  - id: signoff
+    name: Sign-off
+    maps_to: review
+    human: true
+    kickoff: manual
+    on_pass: documentation
+    on_fail: refinement
+  - id: documentation
+    name: Documentation
+    maps_to: done
+    agent: documenter
+    model: sonnet
+    kickoff: confirm
+    terminal: true
+    generative: true
+  - id: blocked
+    name: Blocked
+    maps_to: doing
+    agent: none
+    kickoff: manual
+    blocked: true
+---
+
+# Standard delivery pipeline
+
+Eleven flow lanes plus Blocked (D1). Manual kickoff only until `auto` is
+flipped on (D6) — every lane with an agent defaults to `kickoff: confirm`,
+so nothing runs without an explicit accept.
+
+## Ideas / Backlog / To Do
+
+Pure holding columns — no agent, no risk. Groom Ideas into Backlog, and
+Backlog into To Do, by hand.
+
+## Investigation (sonnet)
+
+Read the ticket and its `scope`. Confirm the ask is well-specified before
+anything is designed; report ambiguity rather than guessing.
+
+## Refinement (opus)
+
+Design-heavy: decide the shape of the work. This is the lane most worth a
+stronger model (D8) because it sets the plan every later lane executes.
+
+## Programmer (sonnet, writes_code)
+
+Implement inside `scope` only. Prove the work with the ticket's `verify`
+command and report the result — Ken does not run `verify` itself.
+
+## Tester (sonnet)
+
+Write and run real tests. A fail bounces back to Programmer; three bounces
+(`bounce_cap`) blocks the ticket for a human rather than looping forever
+(D4).
+
+## Architect review (opus)
+
+Risk-bearing: the lane that catches a bad shape before it ships. A fail
+bounces back to Refinement, not Programmer — the shape needs to change,
+not just the code.
+
+## QA tester (sonnet)
+
+Two outputs, two destinations (D9): durable long-term/E2E test plans go
+into the repo inside `scope`; throwaway review material (walkthrough,
+screenshots, a demo recording) goes only under
+`.ken-workspace/artifacts/<ticket-id>/`, never into a member repo, with a
+`manifest.md` recording `durable: false` and an `expires` date. Pick the
+recording recipe from the ticket's `target` (D10): `web` → Playwright,
+`tauri` → `tauri-driver` over WebDriver, `none` → a written walkthrough.
+
+## Sign-off (human)
+
+No agent. Accept moves to Documentation. Accept with comments spawns a
+child ticket in To Do carrying the comment — the parent still advances,
+so a comment never blocks work that's already done (D11). Reject bounces
+to Refinement.
+
+## Documentation (sonnet, terminal, generative)
+
+Update docs, then look at the finished ticket for follow-up ideas. Every
+proposed idea must cite the ticket that produced it (`spawned_by`) and is
+deduped against existing tickets in this project and any linked project
+before landing (D7); a near-duplicate gets a log note on the existing
+ticket instead of a new file.
+
+## Blocked
+
+Never picked up by any lane's agent (D5) — whatever blocked a ticket,
+dependency or retry cap, it resumes at its recorded `return_lane` only
+after a human (or an unblock re-entry, which still waits at a
+confirmation) says so.
+"#;
+
+/// Whether to write [`DEFAULT_PIPELINE_MD`] on first enable. `exists` is
+/// the caller's own `Path::exists()` check (this module does no
+/// filesystem I/O) — the scaffold is written **only if the file does not
+/// already exist** (1.19): a user's edited pipeline is never overwritten.
+pub fn scaffold_default_pipeline(exists: bool) -> Option<&'static str> {
+    if exists {
+        None
+    } else {
+        Some(DEFAULT_PIPELINE_MD)
+    }
 }
 
 #[cfg(test)]
@@ -3079,5 +4293,643 @@ Per-lane briefs live here.
             Path::new("/ws").join(crate::workspace::CONFIG_DIR).join("pipelines")
         );
         assert!(pipeline_path(root, "default").ends_with("default.md"));
+    }
+
+    // -----------------------------------------------------------------
+    // 1.11 Run ledger: pathing, parse/write, ledger scan, derived queue,
+    // stale detection
+    // -----------------------------------------------------------------
+
+    fn run(id: &str, ticket_id: &str, outcome: RunOutcome) -> RunRecord {
+        RunRecord {
+            id: id.to_string(),
+            ticket: ticket_id.to_string(),
+            pipeline: "default".to_string(),
+            lane: "programmer".to_string(),
+            agent: "programmer".to_string(),
+            model: "sonnet".to_string(),
+            scope: vec!["crates/ken-core/**".to_string()],
+            verify: "cargo test -p ken-core".to_string(),
+            started: "2026-08-01T10:00:00Z".to_string(),
+            ended: String::new(),
+            outcome: Some(outcome),
+            outcome_raw: outcome.as_str().to_string(),
+            artifacts: Vec::new(),
+            report: "in progress".to_string(),
+        }
+    }
+
+    #[test]
+    fn run_paths_follow_the_monthly_ledger_convention() {
+        let root = Path::new("/ws");
+        assert_eq!(
+            runs_dir(root),
+            Path::new("/ws").join(crate::workspace::CONFIG_DIR).join("runs")
+        );
+        assert_eq!(run_month_dir(root, "2026-08"), runs_dir(root).join("2026-08"));
+        assert_eq!(
+            run_path(root, "2026-08", &uid('A')),
+            runs_dir(root).join("2026-08").join(format!("{}.md", uid('A')))
+        );
+        assert_eq!(run_month("2026-08-03T10:00:00Z"), "2026-08");
+        assert_eq!(run_month("bad"), "bad");
+    }
+
+    #[test]
+    fn run_record_round_trips_through_compose_and_parse() {
+        let r = run(&uid('R'), &uid('A'), RunOutcome::Pass);
+        let text = compose_run(&r);
+        assert!(text.contains("outcome: pass"));
+        let parsed = parse_run(Path::new("/ws/.ken-workspace/runs/2026-08/x.md"), &text);
+        assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn parse_run_falls_back_to_the_file_stem_when_id_is_absent() {
+        let text = "---\nticket: T1\noutcome: queued\n---\n\nreport body\n";
+        let parsed = parse_run(Path::new("/ws/.ken-workspace/runs/2026-08/RUN123.md"), text);
+        assert_eq!(parsed.id, "RUN123");
+        assert_eq!(parsed.ticket, "T1");
+        assert_eq!(parsed.outcome, Some(RunOutcome::Queued));
+        assert_eq!(parsed.report, "report body");
+    }
+
+    #[test]
+    fn scan_runs_parses_every_file_pair_in_order() {
+        let a = compose_run(&run(&uid('A'), &uid('X'), RunOutcome::Running));
+        let b = compose_run(&run(&uid('B'), &uid('Y'), RunOutcome::Queued));
+        let pa = PathBuf::from("/ws/a.md");
+        let pb = PathBuf::from("/ws/b.md");
+        let files: Vec<(&Path, &str)> = vec![(pa.as_path(), a.as_str()), (pb.as_path(), b.as_str())];
+        let scanned = scan_runs(files);
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].id, uid('A'));
+        assert_eq!(scanned[1].id, uid('B'));
+    }
+
+    #[test]
+    fn stale_detection_is_every_running_record_the_session_has_no_memory_of() {
+        let live = run(&uid('L'), &uid('T'), RunOutcome::Running);
+        let orphaned = run(&uid('O'), &uid('T'), RunOutcome::Running);
+        let queued = run(&uid('Q'), &uid('T'), RunOutcome::Queued);
+        let blocked = run(&uid('K'), &uid('T'), RunOutcome::Blocked);
+        let done = run(&uid('N'), &uid('T'), RunOutcome::Pass);
+        let runs = vec![live.clone(), orphaned.clone(), queued.clone(), blocked.clone(), done];
+
+        // Fresh workspace-open: nothing known ⇒ every `running` record is
+        // stale (D13's "no live run after restart").
+        let empty = BTreeSet::new();
+        let q = derive_queue(&[], &[], &runs, &empty);
+        assert_eq!(q.running.len(), 0);
+        assert_eq!(q.stale.len(), 2);
+        assert!(q.stale.iter().any(|r| r.id == live.id));
+        assert!(q.stale.iter().any(|r| r.id == orphaned.id));
+        assert_eq!(q.queued, vec![queued.clone()]);
+        assert_eq!(q.blocked, vec![blocked.clone()]);
+
+        // Mid-session: the caller's own claim is remembered, so only the
+        // orphan is stale, and the live one is not silently marked passed.
+        let mut known = BTreeSet::new();
+        known.insert(live.id.clone());
+        let q2 = derive_queue(&[], &[], &runs, &known);
+        assert_eq!(q2.running, vec![live]);
+        assert_eq!(q2.stale, vec![orphaned]);
+    }
+
+    #[test]
+    fn waiting_human_is_derived_from_admit_not_guessed() {
+        let p = pipe();
+        let t = ticket(&uid('A'), "tester", ""); // kickoff: confirm
+        let blocked_t = ticket(&uid('B'), "programmer", "blocked_by:\n  - unrelated\n");
+        let board = vec![t.clone(), blocked_t];
+        let q = derive_queue(&board, &[p], &[], &BTreeSet::new());
+        assert_eq!(q.waiting_human, vec![t.id.clone()], "blocked ticket must not appear");
+    }
+
+    // -----------------------------------------------------------------
+    // 1.12 Sign-off child composition
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn accept_with_comments_composes_child_and_parent_advance() {
+        let p = pipe();
+        let parent = ticket(&uid('P'), "signoff", "project: alpha\nprojects:\n  - beta\n");
+        let out = compose_signoff_child(&parent, &p, "please add a migration note", "2026-08-03T00:00:00Z");
+        let Ok(SignoffChild { child, parent_transition, parent_log }) = out else {
+            panic!("expected Ok, got {out:?}");
+        };
+        assert_eq!(child.fields.lane.as_deref(), Some("todo"));
+        assert_eq!(child.fields.pipeline.as_deref(), Some("default"));
+        assert_eq!(child.fields.project.as_deref(), Some("alpha"));
+        assert_eq!(child.fields.projects, Some(vec!["beta".to_string()]));
+        assert_eq!(child.fields.parent.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.fields.origin.as_deref(), Some("signoff"));
+        assert!(child.fields.scope.is_none(), "child must not inherit scope");
+        assert!(child.fields.verify.is_none(), "child must not inherit verify");
+        assert_eq!(child.body, "please add a migration note");
+
+        match parent_transition {
+            Transition::Moved { from, to, backward, .. } => {
+                assert_eq!(from, "signoff");
+                assert_eq!(to, "documentation");
+                assert!(!backward);
+            }
+            other => panic!("expected Moved, got {other:?}"),
+        }
+        assert!(parent_log.contains("please add a migration note"));
+    }
+
+    #[test]
+    fn accept_with_comments_refuses_a_non_human_lane() {
+        let p = pipe();
+        let parent = ticket(&uid('P'), "programmer", "");
+        assert_eq!(
+            compose_signoff_child(&parent, &p, "a comment", "2026-08-03").unwrap_err(),
+            SignoffRefusal::NotHumanLane("programmer".to_string())
+        );
+    }
+
+    #[test]
+    fn accept_with_comments_refuses_an_empty_comment() {
+        let p = pipe();
+        let parent = ticket(&uid('P'), "signoff", "");
+        assert_eq!(
+            compose_signoff_child(&parent, &p, "   ", "2026-08-03").unwrap_err(),
+            SignoffRefusal::EmptyComment
+        );
+    }
+
+    #[test]
+    fn accept_with_comments_refuses_when_the_pipeline_has_no_on_pass_edge() {
+        let md = DEFAULT_MD.replace(
+            "    on_pass: documentation\n    on_fail: refinement\n",
+            "    on_fail: refinement\n",
+        );
+        let p = parse_pipeline(Path::new("/ws/p.md"), &md);
+        assert!(p.lane("signoff").unwrap().on_pass.is_none(), "fixture: on_pass must be gone");
+        let parent = ticket(&uid('P'), "signoff", "");
+        assert_eq!(
+            compose_signoff_child(&parent, &p, "a comment", "2026-08-03").unwrap_err(),
+            SignoffRefusal::NoOnPass("signoff".to_string())
+        );
+    }
+
+    #[test]
+    fn accept_with_comments_refuses_when_no_todo_lane_exists() {
+        let md = r#"---
+id: mini
+lanes:
+  - id: signoff
+    name: Sign-off
+    maps_to: review
+    human: true
+    kickoff: manual
+    on_pass: documentation
+  - id: documentation
+    name: Documentation
+    maps_to: done
+    terminal: true
+---
+"#;
+        let p = parse_pipeline(Path::new("/ws/mini.md"), md);
+        let parent = task_from(&format!(
+            "---\nid: {id}\ntitle: T\nstatus: signoff\npipeline: mini\nscope:\n  - x\nverify: y\n---\n\nBody.\n",
+            id = uid('P')
+        ));
+        assert_eq!(
+            compose_signoff_child(&parent, &p, "a comment", "2026-08-03").unwrap_err(),
+            SignoffRefusal::NoTodoLane
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 1.13 Idea proposal + dedupe scoring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn propose_idea_refuses_without_a_citation() {
+        assert_eq!(
+            propose_idea("A new idea", "body", "", "alpha", &[], "default").unwrap_err(),
+            IdeaRefusal::MissingCitation
+        );
+        assert_eq!(
+            propose_idea("A new idea", "body", "   ", "alpha", &[], "default").unwrap_err(),
+            IdeaRefusal::MissingCitation
+        );
+    }
+
+    #[test]
+    fn propose_idea_refuses_an_empty_title() {
+        assert_eq!(
+            propose_idea("  ", "body", &uid('S'), "alpha", &[], "default").unwrap_err(),
+            IdeaRefusal::EmptyTitle
+        );
+    }
+
+    #[test]
+    fn propose_idea_builds_a_trimmed_candidate() {
+        let idea = propose_idea(
+            " A new idea ",
+            " body ",
+            &uid('S'),
+            "alpha",
+            &["beta".to_string()],
+            "default",
+        )
+        .unwrap();
+        assert_eq!(idea.title, "A new idea");
+        assert_eq!(idea.body, "body");
+        assert_eq!(idea.spawned_by, uid('S'));
+        assert_eq!(idea.projects, vec!["beta".to_string()]);
+    }
+
+    #[test]
+    fn dedupe_scope_is_project_plus_linked_projects() {
+        assert!(in_dedupe_scope("alpha", "alpha", &[]));
+        assert!(in_dedupe_scope("alpha", "beta", &["beta", "gamma"]));
+        assert!(!in_dedupe_scope("alpha", "delta", &["beta", "gamma"]));
+    }
+
+    #[test]
+    fn dedupe_idea_lands_with_no_candidates() {
+        let idea = propose_idea("Ship the thing", "body", &uid('S'), "alpha", &[], "default").unwrap();
+        assert_eq!(dedupe_idea(&idea, &[]), DedupeVerdict::Land);
+    }
+
+    #[test]
+    fn dedupe_idea_trusts_a_caller_supplied_semantic_score() {
+        let idea = propose_idea("Ship the thing", "body", &uid('S'), "alpha", &[], "default").unwrap();
+        let candidates = vec![DedupeCandidate {
+            ticket_id: uid('X'),
+            title: "totally different words".to_string(),
+            project: "alpha".to_string(),
+            score: Some(0.95),
+        }];
+        assert_eq!(
+            dedupe_idea(&idea, &candidates),
+            DedupeVerdict::NearDuplicate { ticket_id: uid('X'), score: 0.95 }
+        );
+    }
+
+    #[test]
+    fn dedupe_idea_falls_back_to_normalized_title_matching() {
+        let idea = propose_idea("Add dark mode toggle", "body", &uid('S'), "alpha", &[], "default").unwrap();
+        let exact = DedupeCandidate {
+            ticket_id: uid('X'),
+            title: "add dark mode toggle".to_string(),
+            project: "alpha".to_string(),
+            score: None,
+        };
+        let unrelated = DedupeCandidate {
+            ticket_id: uid('Y'),
+            title: "fix the login timeout bug".to_string(),
+            project: "alpha".to_string(),
+            score: None,
+        };
+        assert_eq!(dedupe_idea(&idea, &[unrelated.clone()]), DedupeVerdict::Land);
+        assert_eq!(
+            dedupe_idea(&idea, &[unrelated, exact]),
+            DedupeVerdict::NearDuplicate { ticket_id: uid('X'), score: 1.0 }
+        );
+    }
+
+    #[test]
+    fn dedupe_idea_picks_the_highest_scoring_candidate() {
+        let idea = propose_idea("Add dark mode toggle", "body", &uid('S'), "alpha", &[], "default").unwrap();
+        let low = DedupeCandidate {
+            ticket_id: uid('L'),
+            title: "l".into(),
+            project: "alpha".into(),
+            score: Some(0.85),
+        };
+        let high = DedupeCandidate {
+            ticket_id: uid('H'),
+            title: "h".into(),
+            project: "alpha".into(),
+            score: Some(0.99),
+        };
+        assert_eq!(
+            dedupe_idea(&idea, &[low, high]),
+            DedupeVerdict::NearDuplicate { ticket_id: uid('H'), score: 0.99 }
+        );
+    }
+
+    #[test]
+    fn dedupe_log_line_only_fires_on_a_near_duplicate() {
+        let idea = propose_idea("Add dark mode toggle", "body", &uid('S'), "alpha", &[], "default").unwrap();
+        assert_eq!(dedupe_log_line(&idea, &DedupeVerdict::Land), None);
+        let line =
+            dedupe_log_line(&idea, &DedupeVerdict::NearDuplicate { ticket_id: uid('X'), score: 0.9 }).unwrap();
+        assert!(line.contains(idea.spawned_by.as_str()));
+        assert!(line.contains("Add dark mode toggle"));
+        assert!(line.contains("90%"));
+    }
+
+    #[test]
+    fn compose_idea_ticket_lands_in_the_ideas_lane() {
+        let p = pipe();
+        let idea = propose_idea("Add dark mode toggle", "body", &uid('S'), "alpha", &[], "default").unwrap();
+        let nt = compose_idea_ticket(&idea, &p).unwrap();
+        assert_eq!(nt.fields.lane.as_deref(), Some("ideas"));
+        assert_eq!(nt.fields.spawned_by.as_deref(), Some(idea.spawned_by.as_str()));
+        assert_eq!(nt.fields.origin.as_deref(), Some("generated"));
+        assert_eq!(nt.title, "Add dark mode toggle");
+    }
+
+    #[test]
+    fn compose_idea_ticket_refuses_without_an_ideas_lane() {
+        let md = r#"---
+id: mini
+lanes:
+  - id: backlog
+    name: Backlog
+    maps_to: backlog
+---
+"#;
+        let p = parse_pipeline(Path::new("/ws/mini.md"), md);
+        let idea = propose_idea("Add dark mode toggle", "body", &uid('S'), "alpha", &[], "mini").unwrap();
+        assert_eq!(compose_idea_ticket(&idea, &p).unwrap_err(), IdeaRefusal::NoIdeasLane);
+    }
+
+    // -----------------------------------------------------------------
+    // 1.14 Artifact manifest model
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn artifact_paths_stay_outside_any_member_repo() {
+        let root = Path::new("/ws");
+        assert_eq!(
+            artifacts_dir(root),
+            Path::new("/ws").join(crate::workspace::CONFIG_DIR).join("artifacts")
+        );
+        let id = uid('T');
+        assert_eq!(artifact_ticket_dir(root, &id), artifacts_dir(root).join(&id));
+        assert_eq!(
+            artifact_manifest_path(root, &id),
+            artifacts_dir(root).join(&id).join("manifest.md")
+        );
+    }
+
+    #[test]
+    fn shift_iso_date_adds_days_across_month_and_year_boundaries() {
+        assert_eq!(shift_iso_date("2026-08-03", 30).as_deref(), Some("2026-09-02"));
+        assert_eq!(shift_iso_date("2025-12-15", 30).as_deref(), Some("2026-01-14"));
+        assert_eq!(shift_iso_date("2026-08-03", -1).as_deref(), Some("2026-08-02"));
+        assert_eq!(shift_iso_date("not-a-date", 30), None);
+    }
+
+    #[test]
+    fn new_artifact_manifest_defaults_expires_to_thirty_days_out() {
+        let m = new_artifact_manifest(&uid('T'), "2026-08-03", vec!["walkthrough.md".to_string()]);
+        assert_eq!(m.expires, "2026-09-02");
+        assert!(!m.durable());
+    }
+
+    #[test]
+    fn artifact_expiry_is_a_pure_predicate() {
+        let m = ArtifactManifest {
+            ticket: uid('T'),
+            created: "2026-08-01".to_string(),
+            expires: "2026-08-31".to_string(),
+            files: vec![],
+        };
+        assert!(!is_artifact_expired(&m, "2026-08-31"), "exactly on expires: not yet");
+        assert!(is_artifact_expired(&m, "2026-09-01"), "the day after: expired");
+        assert!(!is_artifact_expired(&m, "2026-08-15"), "well before: not expired");
+        assert!(!is_artifact_expired(&m, "not-a-date"), "malformed today: never guess");
+    }
+
+    #[test]
+    fn artifact_manifest_round_trips_and_durable_cannot_be_forged() {
+        let m = new_artifact_manifest(&uid('T'), "2026-08-03", vec!["demo.mp4".to_string()]);
+        let text = compose_artifact_manifest(&m);
+        // `scalar_lines` quotes YAML-ambiguous scalars (D1.5's precedent:
+        // `bounces: '2'`), so the literal `false` renders quoted.
+        assert!(text.starts_with("---\ndurable: 'false'\n"), "{text}");
+        let parsed = parse_artifact_manifest(Path::new("/ws/.ken-workspace/artifacts/x/manifest.md"), &text);
+        assert_eq!(parsed, m);
+
+        // A hand edit claiming `durable: true` still reports `false` —
+        // there is no field to hold anything else (D9).
+        let forged =
+            "---\ndurable: true\nticket: T1\ncreated: 2026-08-03\nexpires: 2026-09-02\nfiles: []\n---\n\nbody\n";
+        let parsed_forged =
+            parse_artifact_manifest(Path::new("/ws/.ken-workspace/artifacts/x/manifest.md"), forged);
+        assert!(!parsed_forged.durable());
+    }
+
+    // -----------------------------------------------------------------
+    // 1.15 Digest composition
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn root_blockers_walks_a_three_deep_chain_to_the_leaf() {
+        let mut g = BlockGraph::new();
+        g.insert("A", &["B".to_string()]);
+        g.insert("B", &["C".to_string()]);
+        g.insert("C", &[]); // leaf: not itself blocked
+        assert_eq!(root_blockers(&g, "A"), vec!["C".to_string()]);
+        assert_ne!(root_blockers(&g, "A"), vec!["B".to_string()], "must not report the nearest blocker");
+    }
+
+    #[test]
+    fn root_blockers_deduplicates_a_diamond() {
+        let mut g = BlockGraph::new();
+        g.insert("A", &["B".to_string(), "C".to_string()]);
+        g.insert("B", &["D".to_string()]);
+        g.insert("C", &["D".to_string()]);
+        g.insert("D", &[]);
+        assert_eq!(root_blockers(&g, "A"), vec!["D".to_string()]);
+    }
+
+    #[test]
+    fn root_blockers_terminates_on_an_already_cyclic_graph() {
+        let mut g = BlockGraph::new();
+        g.insert("A", &["B".to_string()]);
+        g.insert("B", &["A".to_string()]);
+        // No leaf exists; the walk must still terminate rather than loop.
+        assert!(root_blockers(&g, "A").is_empty());
+    }
+
+    #[test]
+    fn digest_groups_in_the_specified_order_with_root_blocker_shown() {
+        let p = pipe();
+        let today = "2026-08-03";
+
+        // awaiting_review: sitting in signoff.
+        let reviewing = ticket(&uid('R'), "signoff", "updated: 2026-08-02\n");
+
+        // newly_unblocked: block evidence cleared, return_lane survives.
+        let unblocked = ticket(&uid('U'), "programmer", "return_lane: programmer\n");
+
+        // blocked: a 3-deep chain — the leaf is the root blocker, not
+        // `mid`'s immediate blocker.
+        let leaf = ticket(&uid('L'), "documentation", "");
+        let mid = ticket(
+            &uid('M'),
+            "blocked",
+            &format!(
+                "return_lane: programmer\nblocked_by:\n  - {}\nblocked_at: '2026-08-02'\n",
+                uid('L')
+            ),
+        );
+        let deep = ticket(
+            &uid('D'),
+            "blocked",
+            &format!(
+                "return_lane: tester\nblocked_by:\n  - {}\nblocked_at: '2026-08-01'\n",
+                uid('M')
+            ),
+        );
+
+        // moved_today, and the source of a generated idea.
+        let moved = ticket(&uid('X'), "tester", "updated: 2026-08-03\n");
+
+        // new_ideas: generated today, citing `moved`.
+        let idea = ticket(
+            &uid('I'),
+            "ideas",
+            &format!("origin: generated\nspawned_by: {}\ncreated: 2026-08-03\n", uid('X')),
+        );
+
+        let board = vec![
+            reviewing.clone(),
+            unblocked.clone(),
+            mid.clone(),
+            deep.clone(),
+            leaf,
+            moved.clone(),
+            idea.clone(),
+        ];
+
+        let stale = run(&uid('S'), &uid('X'), RunOutcome::Running);
+        let runs = vec![stale.clone(), run(&uid('N'), &uid('X'), RunOutcome::Pass)];
+
+        let digest = compose_digest(&board, &[p], &runs, &BTreeSet::new(), today);
+
+        assert_eq!(digest.awaiting_review.len(), 1);
+        assert_eq!(digest.awaiting_review[0].ticket_id, reviewing.id);
+        assert_eq!(digest.awaiting_review[0].run_count, 0);
+
+        assert_eq!(digest.newly_unblocked.len(), 1);
+        assert_eq!(digest.newly_unblocked[0].ticket_id, unblocked.id);
+        assert_eq!(digest.newly_unblocked[0].return_lane, "programmer");
+
+        assert_eq!(digest.blocked.len(), 2);
+        // oldest first by blocked_at
+        assert_eq!(digest.blocked[0].ticket_id, deep.id);
+        assert_eq!(digest.blocked[1].ticket_id, mid.id);
+        // the deep chain shows the ROOT blocker, not the nearest (`mid`'s
+        // own blocker).
+        assert_eq!(digest.blocked[0].root_blockers, vec![uid('L')]);
+        assert_eq!(digest.blocked[1].root_blockers, vec![uid('L')]);
+
+        assert_eq!(digest.moved_today.len(), 1);
+        assert_eq!(digest.moved_today[0].ticket_id, moved.id);
+        assert_eq!(digest.moved_today[0].run_count, 2);
+
+        assert_eq!(digest.new_ideas.len(), 1);
+        assert_eq!(digest.new_ideas[0].ticket_id, idea.id);
+        assert_eq!(digest.new_ideas[0].spawned_by.as_deref(), Some(moved.id.as_str()));
+
+        assert_eq!(digest.stale_runs.len(), 1);
+        assert_eq!(digest.stale_runs[0].id, stale.id);
+    }
+
+    #[test]
+    fn render_digest_markdown_orders_sections_and_handles_empty() {
+        let d = Digest::default();
+        assert_eq!(
+            render_digest_markdown(&d, "2026-08-03"),
+            "# Pipeline digest — 2026-08-03\n\nNothing to report.\n"
+        );
+
+        let mut d = Digest::default();
+        d.awaiting_review.push(AwaitingReviewEntry {
+            ticket_id: "A".into(),
+            title: "Review me".into(),
+            updated: "2026-08-02".into(),
+            run_count: 1,
+        });
+        d.newly_unblocked.push(UnblockedDigestEntry {
+            ticket_id: "B".into(),
+            title: "Freed".into(),
+            return_lane: "programmer".into(),
+        });
+        d.blocked.push(BlockedDigestEntry {
+            ticket_id: "C".into(),
+            title: "Stuck".into(),
+            blocked_at: Some("2026-08-01".into()),
+            root_blockers: vec!["D".into()],
+            block_reason: None,
+            run_count: 0,
+        });
+        d.moved_today.push(MovedEntry {
+            ticket_id: "E".into(),
+            title: "Moved".into(),
+            lane: "tester".into(),
+            run_count: 2,
+        });
+        d.new_ideas.push(IdeaEntry {
+            ticket_id: "F".into(),
+            title: "Idea".into(),
+            spawned_by: Some("E".into()),
+        });
+        d.stale_runs.push(run(&uid('S'), "E", RunOutcome::Running));
+
+        let md = render_digest_markdown(&d, "2026-08-03");
+        let idx = |needle: &str| md.find(needle).unwrap_or_else(|| panic!("missing '{needle}' in {md}"));
+        let review = idx("## Awaiting your review");
+        let unblocked_i = idx("## Unblocked overnight");
+        let blocked_i = idx("## Blocked");
+        let moved_i = idx("## Moved today");
+        let ideas_i = idx("## New ideas");
+        let stale_i = idx("## Stale runs");
+        assert!(review < unblocked_i);
+        assert!(unblocked_i < blocked_i);
+        assert!(blocked_i < moved_i);
+        assert!(moved_i < ideas_i);
+        assert!(ideas_i < stale_i);
+        assert!(md.contains("root blocker(s): D"));
+    }
+
+    // -----------------------------------------------------------------
+    // 1.19 Default pipeline scaffold
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn scaffold_is_written_only_when_the_file_is_absent() {
+        assert_eq!(scaffold_default_pipeline(true), None);
+        assert_eq!(scaffold_default_pipeline(false), Some(DEFAULT_PIPELINE_MD));
+    }
+
+    #[test]
+    fn default_pipeline_scaffold_reproduces_d1s_twelve_lanes() {
+        let p = parse_pipeline(
+            Path::new("/ws/.ken-workspace/pipelines/default.md"),
+            DEFAULT_PIPELINE_MD,
+        );
+        let ids: Vec<&str> = p.lanes.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "ideas",
+                "backlog",
+                "todo",
+                "investigation",
+                "refinement",
+                "programmer",
+                "tester",
+                "architect",
+                "qa",
+                "signoff",
+                "documentation",
+                "blocked",
+            ]
+        );
+        assert!(p.blocked_lane().is_some());
+        assert!(p.human_lane().is_some());
+        assert!(validate_pipeline(&p).is_empty(), "{:?}", validate_pipeline(&p));
+        assert!(!p.auto, "ships auto:false (D6)");
     }
 }

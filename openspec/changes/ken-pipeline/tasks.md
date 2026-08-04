@@ -204,44 +204,96 @@ before starting. Two sequencing rules this file encodes:
         `evaluate_unblocks` returns, re-admitted with
         `EntryKind::Unblock` into an `auto` lane of an `auto: true`
         pipeline, is `Confirm{Unblocked}`.
-- [ ] 1.11 `pipeline.rs`: run-record model + pathing —
-      **(seam left by this session)** `RunRecord` + `RunOutcome` +
-      `running_runs()` already exist in `pipeline.rs` because `admit`
-      takes `&[RunRecord]`; the struct carries the full spec field list
-      so 1.11 can adopt it as-is. Still to do here: `runs_dir` /
-      `runs/YYYY-MM/<ulid>.md` pathing, parse/write, ledger scan, the
-      derived queue view, and stale detection.
-      `RunRecord { id, ticket, pipeline, lane, agent, model, scope,
-      verify, started, ended, outcome, artifacts }` + body report;
-      `runs/YYYY-MM/<ulid>.md`; ledger scan; derived queue view
-      (`running` / `queued` / `blocked` / `waiting_human` / `stale`)
-      — stale = `running` with no live run after restart, never
-      auto-passed (D13)
-- [ ] 1.12 `pipeline.rs`: sign-off child composition (D11) — from
-      (parent ticket, comment) produce the child `NewTask` in the
-      `todo` lane with `parent`, inherited `pipeline`/`project`/
-      `projects`, **no** inherited `scope`/`verify`, plus the parent's
-      `## Log` append and the parent's `on_pass` transition, as one
-      pure result
-- [ ] 1.13 `pipeline.rs`: idea proposal + dedupe scoring (D7) —
-      candidate struct requiring `spawned_by` (refuse without it),
-      normalized-title matching, and a `DedupeVerdict`
-      (`Land | NearDuplicate{ticket_id, score}`) over a caller-
-      supplied candidate list, so the same function serves the
-      semantic path and the FTS fallback. Dedupe scope = project +
-      linked projects
-- [ ] 1.14 `pipeline.rs`: artifact manifest model (D9) —
-      `artifacts/<ticket-id>/manifest.md` with `durable: false`,
-      `ticket`, `created`, `expires`, artifact list; `expires`
-      defaulting to created + 30 days; expiry check is a pure
-      predicate (prune is a UI action, never automatic)
-- [ ] 1.15 `pipeline.rs`: digest composition (spec) — group the
-      board + ledger, **in this order**: `awaiting_review` (oldest
-      first), `newly_unblocked` (with return lanes), `blocked`
-      (oldest first by `blocked_at`, showing the *root* blocker of
-      each chain, not the nearest), `moved_today`, `new_ideas`,
-      `stale_runs`; with per-ticket run counts. Renders to markdown
-      for chat, MCP, and `journal_append`
+- [x] 1.11 `pipeline.rs`: run-record model + pathing —
+      `RunRecord` + `RunOutcome` + `running_runs()` were the prior
+      session's seam; this session added `runs_dir`/`run_month_dir`/
+      `run_path`/`run_month`, `parse_run`/`compose_run`/
+      `patch_run_text`, `scan_runs` (a caller-supplied `(path, raw)`
+      map — this module still does no filesystem I/O of its own), and
+      `derive_queue` (the `running`/`queued`/`blocked`/`waiting_human`/
+      `stale` view) + `RunQueue`.
+      - Judgment call: `waiting_human` is not ledger data (no run
+        record exists for unauthorised work), so it is derived from
+        the board via a new `waiting_on_human()` that calls `admit()`
+        with `EntryKind::Kickoff` — never re-implements the gate.
+      - Judgment call: stale detection's "no live run after restart"
+        needs a liveness signal this module doesn't own (no clock, no
+        process registry, and v1's `mcp` runner means Ken never spawns
+        anything to track — D14). `derive_queue` takes a caller-owned
+        `known_running_ids: &BTreeSet<String>`: a `running` record
+        whose id isn't in it is stale. The caller passes an *empty*
+        set on workspace-open, so every on-disk `running` record is
+        stale by construction right after a restart — exactly D13's
+        rule — and a freshly claimed run stays live mid-session because
+        its id is in the caller's own set. This is the one place in
+        1.11-1.15 where "callers own the clock/watcher" required an
+        explicit extra parameter rather than a pure function of the
+        ledger alone; flagged for 2.2 to review when it wires the real
+        session state.
+- [x] 1.12 `pipeline.rs`: sign-off child composition (D11) —
+      `compose_signoff_child(parent, pipeline, comment, now) ->
+      Result<SignoffChild, SignoffRefusal>`; `SignoffChild` bundles the
+      child `NewTask` (`todo` lane via `TaskPatch.lane`, inherited
+      `pipeline`/`project`/`projects`, `parent`, `origin: signoff`, no
+      `scope`/`verify`), the parent's `on_pass` `Transition` (reuses
+      `advance` — no bounce/cap logic duplicated), and the `## Log`
+      line for the parent. Plain accept/reject need no new function:
+      they're `advance(.., Pass/Fail, ..)` directly.
+      - Judgment call: refuses `NoTodoLane` if the pipeline declares no
+        lane literally named `todo` (the spec's exact wording), the
+        same "never write around a lane that can't be validated"
+        posture as `block()`'s `NoBlockedLane`.
+      - Note: `SignoffChild` cannot derive `PartialEq` because
+        `tasks::NewTask` doesn't — tests compare `child`'s fields
+        individually.
+- [x] 1.13 `pipeline.rs`: idea proposal + dedupe scoring (D7) —
+      `propose_idea(..) -> Result<IdeaCandidate, IdeaRefusal>` refuses
+      `MissingCitation` (empty/blank `spawned_by`) and `EmptyTitle`;
+      `dedupe_idea(&IdeaCandidate, &[DedupeCandidate]) -> DedupeVerdict`
+      (`Land | NearDuplicate{ticket_id, score}`) trusts a caller-
+      supplied semantic score when present and falls back to a
+      Jaccard-over-tokens `normalized_title_score` when not, both
+      compared against one `DEDUPE_THRESHOLD` so the two paths agree on
+      "above threshold"; `in_dedupe_scope(idea_project, candidate_
+      project, linked)` is the pure project+linked-projects scope
+      check (caller resolves `linked` via `WorkspaceConfig::
+      linked_projects` — this module has no workspace handle);
+      `dedupe_log_line` composes the near-duplicate note;
+      `compose_idea_ticket` lands a survivor in the `ideas` lane
+      (refusing `NoIdeasLane` the same way 1.12 refuses `NoTodoLane`).
+- [x] 1.14 `pipeline.rs`: artifact manifest model (D9) —
+      `artifacts_dir`/`artifact_ticket_dir`/`artifact_manifest_path`;
+      `ArtifactManifest { ticket, created, expires, files }` with a
+      `durable()` accessor that is hardcoded `false` — there is no
+      field to set it any other way, so a hand-edited `durable: true`
+      cannot make an artifact folder read as durable
+      (`parse_artifact_manifest` reads-and-discards the key); `new_
+      artifact_manifest` defaults `expires` to `created` + 30 days via
+      a locally-duplicated Howard Hinnant civil-days algorithm (`memory
+      .rs` has the same math but it's private to that module, and this
+      session's scope is `pipeline.rs` only); `is_artifact_expired` is
+      a pure string-compare predicate (`today > expires`; exactly equal
+      is not yet expired) — there is no delete/prune function anywhere
+      in this module, only detection.
+- [x] 1.15 `pipeline.rs`: digest composition (spec) — `compose_digest`
+      groups board + ledger in the specified order via `Digest {
+      awaiting_review, newly_unblocked, blocked, moved_today, new_
+      ideas, stale_runs }`; `root_blockers(&BlockGraph, ticket_id)`
+      walks `BlockGraph::blockers` to its leaves (de-duplicated, cycle-
+      safe via the same `seen`-set discipline `check_cycle` uses) to
+      surface the *root* blocker of a chain rather than the nearest —
+      tested on a 3-deep chain and a diamond; `render_digest_markdown`
+      is the one renderer chat/MCP/`journal_append` all call.
+      - Judgment call: per-ticket run counts are attached to
+        `awaiting_review`, `blocked`, and `moved_today` entries (where
+        "how many runs has this burned" is meaningful) and omitted from
+        `newly_unblocked`/`new_ideas` (no runs exist yet for either).
+        The spec's "with per-ticket run counts" doesn't scope which
+        groups; flagging the choice rather than silently applying it
+        everywhere.
+      - Judgment call: `new_ideas` membership is `origin: generated`
+        tickets with `created == today` (no per-lane "is this the ideas
+        lane" flag exists on `Lane` to key off instead).
 - [x] 1.16 `workspace.rs`: `links: Vec<ProjectLink>` read from the
       manifest's existing `extra` map (`{from, to, relation, note?}`)
       with a helper `linked_projects(name) -> Vec<&str>`; write path
@@ -252,27 +304,50 @@ before starting. Two sequencing rules this file encodes:
 - [x] 1.18 `features.rs`: register `kenPipeline`, `FlagScope::
       Workspace`, `default: false`, plain-language description
       stating it requires `workspace` and `kenTasks`
-- [ ] 1.19 Default pipeline scaffold: `default.md` content constant
+- [x] 1.19 Default pipeline scaffold: `default.md` content constant
       reproducing the twelve lanes of design D1 (eleven flow lanes
       plus `blocked`), written on first enable only if the file does
       not exist
-- [ ] 1.20 Tests — **partially done (1.1–1.10's share is green: 88
-      passing in `pipeline::` + `tasks::`)**. Done: definition
-      round-trip with unknown keys + hand-edited body; two-blocked-lanes
-      and two-human-lanes rejected; lane resolution and `maps_to`
-      projection incl. the pipeline-less ticket asserted byte-identical;
-      unknown lane / pipeline / blocker / return-lane ⇒ tray with the
-      file byte-compared unchanged; the full forward transition table,
-      every bounce edge, and the exact bounce_cap boundary producing a
-      block; the admission cross-product asserting blocked ⇒ Refused
-      ahead of everything incl. an `auto` lane with the master switch
-      on; cycle detection (self, direct, 3-hop, 6-hop, legal diamond
-      allowed, shortcut allowed, already-cyclic graph terminates);
-      `return_lane` capture on block and restore on unblock; unblock
-      evaluation requiring both halves. **Still owed (belongs with
-      1.11–1.15/1.19):** child-ticket composition, dedupe verdicts,
-      run ledger scan + stale detection, digest grouping, artifact
-      expiry, `links` round-trip.
+      - `DEFAULT_PIPELINE_MD` reproduces D1's twelve-lane frontmatter
+        verbatim plus a real per-lane brief body (not a placeholder);
+        `scaffold_default_pipeline(exists: bool) -> Option<&'static
+        str>` returns `None` when `exists` (the caller's own
+        `Path::exists()` check — this module does no I/O), so a user's
+        edited pipeline is never overwritten. Tested: parses to exactly
+        D1's 12 lane ids in order, one blocked lane, one human lane,
+        `validate_pipeline` reports zero issues, `auto: false`.
+- [x] 1.20 Tests — **complete**. 1.1–1.10's share (88 passing in
+      `pipeline::` + `tasks::`, see their own notes) plus this
+      session's 34 new `pipeline::` tests (74 passing there now,
+      122 total across both modules): run-record pathing + `compose_
+      run`/`parse_run` round-trip + file-stem fallback + `scan_runs`;
+      stale detection proving an empty `known_running_ids` at
+      workspace-open marks every `running` record stale while a
+      mid-session id is not, plus `waiting_human` sourced from `admit`
+      excluding a blocked ticket; sign-off child composition (fields,
+      the parent's `Transition::Moved`, the log line) and its three
+      refusals (non-human lane, empty comment, no `on_pass` edge, no
+      `todo` lane); dedupe verdicts incl. missing-citation and
+      empty-title refusal, semantic-score trust, normalized-title
+      fallback (exact match scores 1.0), highest-score-wins across
+      multiple candidates, the scope helper, the log-line composer, and
+      `compose_idea_ticket`'s `NoIdeasLane` refusal; artifact paths,
+      `shift_iso_date` across a month and a year boundary plus a
+      negative shift, the default-expiry-at-30-days composition, the
+      expiry boundary (`today == expires` is *not yet* expired,
+      `today == expires + 1` is), and a manifest round-trip proving a
+      hand-edited `durable: true` still reads back `false`; `root_
+      blockers` on a 3-deep chain (asserting the *root* is reported,
+      not the nearest), a diamond (de-duplicated), and an already-
+      cyclic hand-edited graph (terminates); a full-board digest test
+      asserting group membership, ordering, root-blocker-not-nearest
+      on the 3-deep chain, and per-ticket run counts, plus a markdown
+      render test asserting section order and the empty-digest case;
+      the scaffold's write-only-if-absent rule and its twelve-lane
+      shape. `links` round-trip through an unknown-key manifest is
+      covered by 1.16's own suite in `workspace.rs`
+      (`links_round_trip_through_unknown_keys`), out of this session's
+      touch scope but already green.
       Original list follows:
       definition round-trip with unknown keys + hand-
       edited body; two-blocked-lanes and two-human-lanes rejected;

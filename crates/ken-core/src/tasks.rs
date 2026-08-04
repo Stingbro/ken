@@ -1340,6 +1340,37 @@ pub fn create_task(home: TaskHome, new: &NewTask, today: &str) -> Result<Task> {
     ));
     fm.push_str(&format!("created: {}\n", render_scalar(today)));
     fm.push_str(&format!("updated: {}\n", render_scalar(today)));
+    // ken-pipeline fields. These live in `extra` on a parsed task, but a file
+    // being *created* has no extra to flatten from — so they are written here
+    // or they are lost. Without this, a sign-off child would land with no
+    // `parent` and a generated idea with no `spawned_by` citation, silently
+    // breaking exactly the links those two flows exist to record.
+    // `blocked_by` is deliberately absent: a task cannot be born blocked —
+    // `pipeline::block` captures the return lane from a lane the ticket is
+    // already in, so there is no valid blocked state at creation.
+    for (key, value) in [
+        ("lane", f.lane.as_deref()),
+        ("pipeline", f.pipeline.as_deref()),
+        ("model", f.model.as_deref()),
+        ("agent", f.agent.as_deref()),
+        ("verify", f.verify.as_deref()),
+        ("parent", f.parent.as_deref()),
+        ("spawned_by", f.spawned_by.as_deref()),
+        ("origin", f.origin.as_deref()),
+        ("target", f.target.as_deref()),
+    ] {
+        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+            fm.push_str(&format!("{key}: {}\n", render_scalar(v)));
+        }
+    }
+    for (key, seq) in [("scope", f.scope.as_deref()), ("projects", f.projects.as_deref())] {
+        if let Some(items) = seq.filter(|s| !s.is_empty()) {
+            for line in seq_lines(key, items) {
+                fm.push_str(&line);
+                fm.push('\n');
+            }
+        }
+    }
     fm.push_str("---\n\n");
     fm.push_str(new.body.trim());
     if !new.body.trim().is_empty() {
@@ -2498,6 +2529,63 @@ mod tests {
         assert!(raw.contains("tags: []"));
         assert_eq!(t.project, "ShatteredRealms", "defaulted from the home");
         assert!(t.path.ends_with(".ken/tasks/01J0PROJPROJPROJPROJPROJPR-ship-it.md"));
+    }
+
+    #[test]
+    fn create_writes_pipeline_fields_so_provenance_survives() {
+        // A sign-off child and a generated idea are both born carrying links
+        // (`parent`, `spawned_by`) that only exist at creation time. If
+        // `create_task` drops them the ticket still looks fine — it just
+        // silently loses the connection it was created to record.
+        let dir = tempdir().unwrap();
+        let t = create_task(
+            TaskHome::Workspace {
+                workspace_root: dir.path(),
+            },
+            &NewTask {
+                id: Some("01J0CHILDCHILDCHILDCHILDCH".into()),
+                title: "Address review comment".into(),
+                fields: TaskPatch {
+                    lane: Some("todo".into()),
+                    pipeline: Some("default".into()),
+                    parent: Some("01J0PARENTPARENTPARENTPARE".into()),
+                    spawned_by: Some("01J0SOURCESOURCESOURCESOUR".into()),
+                    origin: Some("generated".into()),
+                    projects: Some(vec!["ShatteredRealms".into(), "ShatteredRealmsTools".into()]),
+                    ..TaskPatch::default()
+                },
+                ..NewTask::default()
+            },
+            "2026-08-03",
+        )
+        .unwrap();
+
+        let raw = read(&t.path);
+        for expected in [
+            "lane:",
+            "pipeline:",
+            "parent:",
+            "spawned_by:",
+            "origin:",
+            "projects:",
+        ] {
+            assert!(raw.contains(expected), "{expected} missing from:\n{raw}");
+        }
+        assert!(raw.contains("ShatteredRealmsTools"), "sequence lost:\n{raw}");
+        // Unset pipeline fields stay absent — no empty keys on a plain task.
+        assert!(!raw.contains("scope:"), "unset key emitted:\n{raw}");
+        assert!(!raw.contains("blocked_by:"), "a task cannot be born blocked");
+
+        // And they survive the round-trip back through the parser.
+        let reparsed = parse_task(&t.path, HomeKind::Workspace, "workspace", &raw);
+        assert_eq!(
+            reparsed.extra().get("parent").and_then(|v| v.as_str()),
+            Some("01J0PARENTPARENTPARENTPARE")
+        );
+        assert_eq!(
+            reparsed.extra().get("spawned_by").and_then(|v| v.as_str()),
+            Some("01J0SOURCESOURCESOURCESOUR")
+        );
     }
 
     #[test]
