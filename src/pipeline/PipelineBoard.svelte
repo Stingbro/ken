@@ -15,9 +15,11 @@
   import ArtifactViewer from "./ArtifactViewer.svelte";
   import RunTray from "./RunTray.svelte";
   import DigestPanel from "./DigestPanel.svelte";
+  import IdeasView from "./IdeasView.svelte";
   import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
   import ListChecks from "@lucide/svelte/icons/list-checks";
   import History from "@lucide/svelte/icons/history";
+  import Lightbulb from "@lucide/svelte/icons/lightbulb";
   import X from "@lucide/svelte/icons/x";
 
   const laneOptions = $derived([...new Set(pipelineStore.pipelines.flatMap((p) => p.lanes.map((l) => l.id)))].sort());
@@ -62,38 +64,40 @@
             <option value={p}>{p}</option>
           {/each}
         </select>
-        <select bind:value={pipelineStore.filters.lane}>
-          <option value="">All lanes</option>
-          {#each laneOptions as l (l)}
-            <option value={l}>{l}</option>
-          {/each}
-        </select>
-        <select bind:value={pipelineStore.filters.model}>
-          <option value="">Any model</option>
-          {#each pipelineStore.models as m (m)}
-            <option value={m}>{m}</option>
-          {/each}
-        </select>
-        <select bind:value={pipelineStore.filters.assignee}>
-          <option value="">Any assignee</option>
-          {#each assigneeOptions as a (a)}
-            <option value={a}>{a}</option>
-          {/each}
-        </select>
-        <select bind:value={pipelineStore.filters.blockMode}>
-          <option value="">Any block state</option>
-          <option value="blocked">Blocked</option>
-          <option value="notBlocked">Not blocked</option>
-          <option value="newlyUnblocked">Newly unblocked</option>
-          <option value="byTicket">Blocked by ticket…</option>
-        </select>
-        {#if pipelineStore.filters.blockMode === "byTicket"}
-          <input class="filter-text" placeholder="Ticket id" bind:value={pipelineStore.filters.blockByTicketId} />
+        {#if !pipelineStore.showIdeas}
+          <select bind:value={pipelineStore.filters.lane}>
+            <option value="">All lanes</option>
+            {#each laneOptions as l (l)}
+              <option value={l}>{l}</option>
+            {/each}
+          </select>
+          <select bind:value={pipelineStore.filters.model}>
+            <option value="">Any model</option>
+            {#each pipelineStore.models as m (m)}
+              <option value={m}>{m}</option>
+            {/each}
+          </select>
+          <select bind:value={pipelineStore.filters.assignee}>
+            <option value="">Any assignee</option>
+            {#each assigneeOptions as a (a)}
+              <option value={a}>{a}</option>
+            {/each}
+          </select>
+          <select bind:value={pipelineStore.filters.blockMode}>
+            <option value="">Any block state</option>
+            <option value="blocked">Blocked</option>
+            <option value="notBlocked">Not blocked</option>
+            <option value="newlyUnblocked">Newly unblocked</option>
+            <option value="byTicket">Blocked by ticket…</option>
+          </select>
+          {#if pipelineStore.filters.blockMode === "byTicket"}
+            <input class="filter-text" placeholder="Ticket id" bind:value={pipelineStore.filters.blockByTicketId} />
+          {/if}
+          <label class="check disabled" title="Requires per-project links (workspace.json `links`, D12) — no command exposes them to the frontend yet; deferred rather than invented.">
+            <input type="checkbox" disabled />
+            Include linked projects
+          </label>
         {/if}
-        <label class="check disabled" title="Requires per-project links (workspace.json `links`, D12) — no command exposes them to the frontend yet; deferred rather than invented.">
-          <input type="checkbox" disabled />
-          Include linked projects
-        </label>
         {#if pipelineStore.filtersActive}
           <button class="clear-filters" onclick={() => pipelineStore.clearFilters()}>
             <X size={12} strokeWidth={2} /> Clear
@@ -101,6 +105,17 @@
         {/if}
 
         <div class="toolbar-right">
+          <button
+            class="btn btn-small ideas-toggle"
+            class:btn-ghost={!pipelineStore.showIdeas}
+            class:btn-primary={pipelineStore.showIdeas}
+            onclick={() => (pipelineStore.showIdeas = !pipelineStore.showIdeas)}
+            title="Short notes proposed by the Documentation lane, landed inert (D16) — review and promote them here"
+          >
+            <Lightbulb size={13} strokeWidth={1.75} />
+            Ideas
+            {#if pipelineStore.ideaCount > 0}<span class="idea-badge">{pipelineStore.ideaCount}</span>{/if}
+          </button>
           <button class="btn btn-small btn-ghost" onclick={() => (pipelineStore.digestOpen = !pipelineStore.digestOpen)}>
             <ListChecks size={13} strokeWidth={1.75} />Digest
           </button>
@@ -129,37 +144,41 @@
         </button>
       {/if}
 
-      <div class="pipelines">
-        {#each pipelineStore.pipelines as pipeline (pipeline.id)}
-          <section class="pipeline-section">
-            <div class="pipeline-head">
-              <h2>{pipeline.name}</h2>
-              <span class="auto-badge" class:on={pipeline.auto}>{pipeline.auto ? "auto-transitions on" : "manual only"}</span>
-              <span class="cap-badge">cap {pipeline.concurrencyCap} · bounce cap {pipeline.bounceCap}</span>
-            </div>
-            <div class="lanes">
-              {#each pipeline.lanes as lane (lane.id)}
-                {@const laneTasks = pipelineStore.tasksForLane(pipeline.id, lane.id)}
-                <div class="lane-col" class:blocked-lane={lane.blocked} class:human-lane={lane.human}>
-                  <div class="lane-head">
-                    <span class="lane-title">{lane.name}</span>
-                    <span class="lane-count">{pipelineStore.laneCountsFor(pipeline.id)[lane.id] ?? laneTasks.length}</span>
+      {#if pipelineStore.showIdeas}
+        <IdeasView />
+      {:else}
+        <div class="pipelines">
+          {#each pipelineStore.pipelines as pipeline (pipeline.id)}
+            <section class="pipeline-section">
+              <div class="pipeline-head">
+                <h2>{pipeline.name}</h2>
+                <span class="auto-badge" class:on={pipeline.auto}>{pipeline.auto ? "auto-transitions on" : "manual only"}</span>
+                <span class="cap-badge">cap {pipeline.concurrencyCap} · bounce cap {pipeline.bounceCap}</span>
+              </div>
+              <div class="lanes">
+                {#each pipeline.lanes as lane (lane.id)}
+                  {@const laneTasks = pipelineStore.tasksForLane(pipeline.id, lane.id)}
+                  <div class="lane-col" class:blocked-lane={lane.blocked} class:human-lane={lane.human}>
+                    <div class="lane-head">
+                      <span class="lane-title">{lane.name}</span>
+                      <span class="lane-count">{pipelineStore.laneCountsFor(pipeline.id)[lane.id] ?? laneTasks.length}</span>
+                    </div>
+                    <div class="lane-body">
+                      {#each laneTasks as task (task.id)}
+                        <PipelineCard {task} {lane} {pipeline} />
+                      {:else}
+                        <p class="lane-empty">Empty</p>
+                      {/each}
+                    </div>
                   </div>
-                  <div class="lane-body">
-                    {#each laneTasks as task (task.id)}
-                      <PipelineCard {task} {lane} {pipeline} />
-                    {:else}
-                      <p class="lane-empty">Empty</p>
-                    {/each}
-                  </div>
-                </div>
-              {/each}
-            </div>
-          </section>
-        {:else}
-          <p class="note">No pipeline definitions loaded yet.</p>
-        {/each}
-      </div>
+                {/each}
+              </div>
+            </section>
+          {:else}
+            <p class="note">No pipeline definitions loaded yet.</p>
+          {/each}
+        </div>
+      {/if}
     </div>
 
     {#if pipelineStore.runTrayOpen}<RunTray />{/if}
@@ -248,6 +267,26 @@
     margin-left: auto;
     display: flex;
     gap: 6px;
+  }
+  .ideas-toggle {
+    gap: 5px;
+  }
+  .idea-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    color: var(--accent-deep);
+  }
+  .ideas-toggle.btn-primary .idea-badge {
+    background: color-mix(in srgb, white 30%, transparent);
+    color: inherit;
   }
   .banner {
     display: flex;

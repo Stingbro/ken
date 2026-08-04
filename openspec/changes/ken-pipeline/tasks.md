@@ -835,6 +835,44 @@ before starting. Two sequencing rules this file encodes:
         unblocked-overnight row's "Start" button calls
         `pipelineStore.openKickoff`, i.e. the same confirmation gate as
         every other start — never a direct `pipeline_kickoff(id, true)`.
+- [x] 4.12 Ideas surface (D16): a dedicated view listing tickets in the
+      idea-landing lane, each showing title/short body/source ticket
+      (`spawnedBy`), with a deliberate Promote action
+      (`pipeline_advance(id, "pass", report)`, the lane's own `on_pass`
+      edge — no new command) and Dismiss, plus an unobtrusive count and
+      a "no ideas" empty state that isn't an error
+      - `IdeasView.svelte`, toggled from a new "Ideas" button in
+        `PipelineBoard.svelte`'s toolbar (badge = live count) — a
+        sub-tab of the existing Pipeline tab, not a new nav-rail screen,
+        matching 4.2's own "extend the Phase 7 Kanban" precedent one
+        level further in. `pipeline.svelte.ts` gained `ideaLaneFor()`,
+        `allIdeas`/`ideaCount`/`ideasForView`, `promoteIdea()`.
+      - **Finding, not the literal ask**: `Lane.generative` is NOT the
+        signal for the idea-landing lane — per ken-core's own doc
+        comment it marks the lane that PRODUCES ideas (Documentation in
+        the shipped default), not the lane ideas land IN. The backend
+        itself has no other structural marker for the landing lane
+        either: `compose_idea_ticket` (crates/ken-core/src/pipeline.rs,
+        read-only this session) hardcodes `const IDEA_LANE: &str =
+        "ideas"`. `ideaLaneFor()` mirrors that same convention (resolve
+        by reserved lane id, `!blocked` as a D5 sanity check) rather
+        than inventing a new signal — documented in full in its own doc
+        comment.
+      - Promote is a two-step, not a one-click button: "Promote…" opens
+        an inline panel naming the exact destination lane (resolved
+        from `lane.onPass`, never hardcoded "backlog") plus an optional
+        report note, with its own "Confirm promote"/"Cancel" pair —
+        same shape as `PipelineCard`'s existing pass/fail panel.
+      - Dismiss wires the existing `taskArchive` command (via
+        `tasksStore.archiveTask`, already used by `TaskCard.svelte` for
+        done-card archiving) rather than inventing a backend path — an
+        idea ticket is an ordinary ticket, so the generic archive-to-
+        `archive/YYYY-MM/` move applies unchanged and the idea leaves
+        the view on the next `board-state` update.
+      - Cards use a lighter visual language than `PipelineCard`
+        (dashed border, no model/agent/bounce chips — an idea has none
+        of those) and clamp the body to 4 lines, matching D16's "a few
+        sentences, not a ticket brief."
 
 ## 5. Verification
 

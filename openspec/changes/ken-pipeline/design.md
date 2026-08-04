@@ -613,6 +613,37 @@ which folder the file is in, so nothing about the model assumes the
 workspace home — including `blocked_by`, which is a ULID precisely so
 it keeps working across homes (D5).
 
+### D16. Ideas are short, optional, and promoted by a human (locked)
+
+User ruling, 2026-08-03. Resolves OPEN-4 and settles what the
+documentation→ideas flywheel actually produces.
+
+1. **An idea is a few sentences, not a ticket brief.** The
+   documentation lane writes a title and a short body — enough to
+   recognise the thought later. It does not write `scope`, `verify`,
+   estimates, or a plan. Those are what *promotion* and the
+   Investigation/Refinement lanes are for. A generated idea that
+   arrives pre-planned is a lie about how much thinking has happened.
+2. **Not every ticket produces ideas.** Proposing is an explicit,
+   optional act by the documentation agent, never an obligation and
+   never a required field on its report. A pipeline run that ends
+   with no ideas is the normal case, not a failure to notice
+   something.
+3. **Ideas auto-land in the `ideas` lane** (inert by construction:
+   `agent: none`, `kickoff: manual`), so nothing runs and the blast
+   radius of a bad idea is one row in a list. Dedupe and the
+   `spawned_by` citation (D7) still gate what lands.
+4. **Promotion is the human editorial act.** A dedicated Ideas
+   surface lists the short ideas with their source ticket, and
+   promoting one advances it `ideas → backlog` — the lane's existing
+   `on_pass` edge, so this needs no new transition machinery. Promote
+   is deliberately *not* a kickoff: it moves an idea into the normal
+   intake column, where it queues like any other work.
+
+The point of the separation: the flywheel should cost almost nothing
+to feed and require deliberate attention to act on. Cheap to capture,
+explicit to commit.
+
 ## Risks / Trade-offs
 
 - **Runaway token spend.** Thirteen lanes × auto-kickoff ×
@@ -729,12 +760,13 @@ behaves byte-identically to today.
   lesson) and **`bounce_cap: 3`** (enough for a genuine
   fix-retest-fix, short enough to catch a loop on the same day).
   Both are per-pipeline data, so changing them is a file edit.
-- **OPEN-4 — Do generated ideas land automatically or via an
-  approval card?** **Recommendation: auto-land into the Ideas lane**,
-  because the Ideas lane is inert by construction (D7) so the blast
-  radius is a row in a list, and an approval card per idea would
-  make the flywheel cost more attention than it saves. Grooming
-  Ideas → Backlog stays a human action either way.
+- ~~**OPEN-4 — Do generated ideas land automatically or via an
+  approval card?**~~ **RESOLVED (user ruling, 2026-08-03): auto-land
+  into the Ideas lane, reviewed on a dedicated Ideas surface.** See
+  D16 — the ruling also settled what an idea *is* (a few sentences,
+  not a ticket brief), that generating them is optional per ticket,
+  and that promotion is the human editorial act that turns one into
+  real work.
 - **OPEN-5 — Artifact retention.** **Recommendation: `expires` =
   created + 30 days, surfaced as a prune action in the tray, never
   auto-deleted** (D9). Ken deleting a human's review material on a

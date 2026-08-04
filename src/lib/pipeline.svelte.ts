@@ -16,6 +16,7 @@
 // of `BoardStateDto.pipelines`).
 import {
   api,
+  type Pipeline,
   type PipelineAdvanceDto,
   type PipelineAdvanceOutcome,
   type PipelineArtifactManifestDto,
@@ -24,6 +25,7 @@ import {
   type PipelineDigestDto,
   type PipelineIdeaOutcome,
   type PipelineKickoffOutcome,
+  type PipelineLane,
   type PipelineRunQueue,
   type PipelineSignoffDecision,
   type PipelineSignoffDto,
@@ -96,6 +98,14 @@ export function matchesBlockFilter(fields: TicketFields, mode: PipelineBlockFilt
   }
 }
 
+/** One idea ticket plus the lane/pipeline it was resolved against — the
+ *  Ideas view's (task 4.12, D16) unit of display. */
+export interface IdeaEntry {
+  task: Task;
+  lane: PipelineLane;
+  pipeline: Pipeline;
+}
+
 class PipelineStore {
   /** Whether the `kenPipeline` flag resolves on (requires `workspace` +
    *  `kenTasks` — enforced server-side, `listFeatures`'s `effective`
@@ -121,6 +131,12 @@ class PipelineStore {
   digestOpen = $state(false);
 
   filters = $state<PipelineFilters>(emptyPipelineFilters());
+
+  /** Ideas sub-tab toggle (task 4.12, D16) — a filtered view WITHIN the
+   *  existing Pipeline tab rather than a new nav-rail screen, same
+   *  precedent as the Main/Daily/Pipeline segmented control `TasksScreen`
+   *  already uses one level up. `false` = the normal lanes board. */
+  showIdeas = $state(false);
 
   /** Kickoff confirmation dialog state (task 4.6) — the only path that can
    *  ever start a lane's agent. `outcome` is the last `pipelineKickoff`
@@ -264,6 +280,74 @@ class PipelineStore {
       if (t.lane?.toLowerCase() !== laneId.toLowerCase()) return false;
       return this.matchesFilters(t, fields);
     });
+  }
+
+  // ── Ideas surface (task 4.12, D16) ──────────────────────────────────────
+
+  /** The lane a generated idea auto-lands in, resolved from the pipeline's
+   *  OWN definition rather than assumed by the view. **Finding**: this
+   *  task's brief asked to check whether `Lane.generative` is a better
+   *  signal than the literal id — it is not. Per ken-core's own doc
+   *  comment ("D7: this lane files new ideas back into the ideas lane"),
+   *  `generative` marks the lane that PRODUCES ideas (the Documentation
+   *  lane in the shipped default pipeline), not the lane ideas land IN.
+   *  The backend has no other structural marker for the landing lane
+   *  either: `compose_idea_ticket` (crates/ken-core/src/pipeline.rs, read-
+   *  only this session) hardcodes `const IDEA_LANE: &str = "ideas"` and
+   *  refuses to build a ticket at all when `pipeline.lane("ideas")` is
+   *  absent. So resolving by id here mirrors the backend's own convention
+   *  — a well-known reserved lane id, the same way `blocked_lane()`/
+   *  `human_lane()` are resolved by a boolean flag instead — rather than
+   *  inventing a new one. `!lane.blocked` is a defensive sanity check
+   *  matching D5 (a pipeline may declare at most one `blocked: true` lane,
+   *  and the ideas lane is never meant to be it). */
+  ideaLaneFor(pipeline: Pipeline): PipelineLane | null {
+    const lane = pipeline.lanes.find((l) => l.id.toLowerCase() === "ideas");
+    return lane && !lane.blocked ? lane : null;
+  }
+
+  /** Every idea ticket across every loaded pipeline, unfiltered — the true
+   *  total the toolbar badge counts (task 4.12: "an unobtrusive count so
+   *  ideas are discoverable without nagging" needs the real number, not
+   *  whatever the board's own filters currently narrow it to). */
+  get allIdeas(): IdeaEntry[] {
+    const out: IdeaEntry[] = [];
+    for (const pipeline of this.pipelines) {
+      const lane = this.ideaLaneFor(pipeline);
+      if (!lane) continue;
+      for (const task of this.pipelineTasks) {
+        const fields = this.fieldsFor(task.id);
+        if (!fields || fields.pipeline?.toLowerCase() !== pipeline.id.toLowerCase()) continue;
+        if (task.lane?.toLowerCase() !== lane.id.toLowerCase()) continue;
+        out.push({ task, lane, pipeline });
+      }
+    }
+    return out;
+  }
+
+  get ideaCount(): number {
+    return this.allIdeas.length;
+  }
+
+  /** The Ideas view's own list: `allIdeas` narrowed by the project filter
+   *  only, newest first. The board toolbar's other filters (lane/model/
+   *  assignee/block state) describe work in progress, which an inert idea
+   *  never has — D7: "nothing an idea does can start a run" — so they're
+   *  not meaningful here and are deliberately not applied. */
+  get ideasForView(): IdeaEntry[] {
+    const project = this.filters.project.trim().toLowerCase();
+    return this.allIdeas
+      .filter((e) => !project || e.task.project.toLowerCase() === project)
+      .sort((a, b) => b.task.created.localeCompare(a.task.created));
+  }
+
+  /** Promote = advance the idea along the lane's own `on_pass` edge (D16:
+   *  "the lane's existing `on_pass` edge, so this needs no new transition
+   *  machinery" — `ideas → backlog` in the shipped default). Thin wrapper
+   *  over `advance()` so the Ideas view's intent reads clearly at the call
+   *  site; it is the ONLY thing that moves an idea off this lane. */
+  async promoteIdea(ticketId: string, report: string): Promise<PipelineAdvanceDto> {
+    return this.advance(ticketId, "pass", report);
   }
 
   // ── Kickoff (task 4.6, D3) ──────────────────────────────────────────────
