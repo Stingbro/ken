@@ -101,6 +101,15 @@ pub fn archive_dir(home_dir: &Path, year_month: &str) -> PathBuf {
 pub enum HomeKind {
     Workspace,
     Project,
+    /// A family board (`<family-clone>/members/<member-id>/board/`) —
+    /// ken-families' third task home (design D2 follow-up: "the board scans
+    /// both [homes] and treats home as invisible plumbing" extended to a
+    /// third). Deliberately a fieldless unit variant like its siblings so
+    /// `Task::home` keeps serializing as a plain lowercase string
+    /// (`"family"`) rather than changing shape on the wire — the extra data
+    /// a family task needs (which board dir, which family's display name)
+    /// lives on `TaskHome::Family` at scan time, not here.
+    Family,
 }
 
 /// A task home to scan. Borrowed like `memory::MemoryScope` so callers
@@ -117,6 +126,20 @@ pub enum TaskHome<'a> {
         project_root: &'a Path,
         project: &'a str,
     },
+    /// A family board (ken-families task 2.4's "third home"). Unlike
+    /// `Project`, whose `tasks_dir()` derives `<project_root>/.ken/tasks`
+    /// from a root, a family board has no such fixed suffix to append — the
+    /// caller already resolved `<clone>/members/<member-id>/board` (see
+    /// `family::board_dir`) before it has enough context (the family clone
+    /// root lives in app data, keyed by a `family_id` this module doesn't
+    /// know about) to hand it to `TaskHome`, so this variant takes the
+    /// board dir directly rather than re-deriving it.
+    Family {
+        board_dir: &'a Path,
+        /// The family's display name — fills the same `default_project`
+        /// role a real project's name would (mirrors `Project::project`).
+        family_name: &'a str,
+    },
 }
 
 impl<'a> TaskHome<'a> {
@@ -124,6 +147,13 @@ impl<'a> TaskHome<'a> {
         match self {
             TaskHome::Workspace { workspace_root } => workspace_tasks_dir(workspace_root),
             TaskHome::Project { project_root, .. } => project_tasks_dir(project_root),
+            // The board dir itself IS the listing dir — a family board has
+            // no `.ken/tasks` (or similar) subfolder to append, files live
+            // directly under `members/<id>/board/` (mirrors `family::
+            // board_dir`'s own doc comment: "archive/YYYY-MM/ goes
+            // underneath it, exactly as tasks::archive_dir computes for the
+            // other two homes").
+            TaskHome::Family { board_dir, .. } => board_dir.to_path_buf(),
         }
     }
 
@@ -131,6 +161,7 @@ impl<'a> TaskHome<'a> {
         match self {
             TaskHome::Workspace { .. } => HomeKind::Workspace,
             TaskHome::Project { .. } => HomeKind::Project,
+            TaskHome::Family { .. } => HomeKind::Family,
         }
     }
 
@@ -140,6 +171,7 @@ impl<'a> TaskHome<'a> {
         match self {
             TaskHome::Workspace { .. } => "",
             TaskHome::Project { project, .. } => project,
+            TaskHome::Family { family_name, .. } => family_name,
         }
     }
 }
@@ -377,6 +409,28 @@ impl Task {
                 crate::project::CONFIG_DIR,
                 self.file_name()
             ),
+            // `home_dir` for a family task is always exactly the board dir
+            // `family::board_dir(clone_root, member_id)` built
+            // (`TaskHome::Family::tasks_dir()` returns it unmodified, and
+            // `parse_task` sets `home_dir` from the file's own parent), i.e.
+            // `<clone-root>/members/<member-id>/board`. So the member id is
+            // recoverable as `home_dir`'s grandparent-relative directory
+            // name — the same "matched by directory, not by any field the
+            // task carries" posture `ken-mcp`'s own `family_origin`/`host_
+            // for` use, just without that caller's live connection list to
+            // cross-check against. `family::board_rel` then composes the
+            // exact same `members/<id>/board` shape ken-mcp's own override
+            // uses, so a family task's address ends up byte-identical
+            // whichever caller renders it.
+            HomeKind::Family => {
+                let member_id = self
+                    .home_dir
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!("{}/{}", crate::family::board_rel(&member_id), self.file_name())
+            }
         }
     }
 
@@ -2793,5 +2847,165 @@ mod tests {
         );
         assert!(grouped.iter().any(|t| t.home == HomeKind::Project));
         assert!(needs_attention(&tasks, &[g]).is_empty());
+    }
+
+    // ---- ken-families follow-up: TaskHome::Family (folds src-tauri's old
+    // `list_family_board_tasks` duplication back into the shared scanner) ----
+
+    #[test]
+    fn family_home_lists_a_board_and_defaults_project() {
+        let dir = tempdir().unwrap();
+        let board_dir = dir.path().join("families/FAM1/members/mem-1/board");
+        let home = TaskHome::Family {
+            board_dir: &board_dir,
+            family_name: "The Smiths",
+        };
+        create_task(
+            home,
+            &NewTask {
+                id: Some("01J0FAM1".into()),
+                title: "Pick up groceries".into(),
+                ..NewTask::default()
+            },
+            "2026-08-03",
+        )
+        .unwrap();
+        let listed = list_tasks(home).unwrap();
+        assert_eq!(listed.len(), 1);
+        let t = &listed[0];
+        assert_eq!(t.home, HomeKind::Family);
+        assert_eq!(t.project, "The Smiths", "defaulted from the family's display name");
+        assert!(
+            t.path.ends_with("families/FAM1/members/mem-1/board/01J0FAM1-pick-up-groceries.md"),
+            "{}",
+            t.path.display()
+        );
+        assert_eq!(
+            t.address_rel_path(),
+            "members/mem-1/board/01J0FAM1-pick-up-groceries.md",
+            "member id is recovered from home_dir, matching family::board_rel's shape"
+        );
+    }
+
+    #[test]
+    fn family_archive_stays_inside_the_family_clone() {
+        let dir = tempdir().unwrap();
+        let board_dir = dir.path().join("families/FAM1/members/mem-1/board");
+        let home = TaskHome::Family {
+            board_dir: &board_dir,
+            family_name: "The Smiths",
+        };
+        let t = create_task(
+            home,
+            &NewTask {
+                id: Some("01J0FAM2".into()),
+                title: "Book the vet".into(),
+                ..NewTask::default()
+            },
+            "2026-08-03",
+        )
+        .unwrap();
+        let moved = archive_task(&t, "2026-08-15").unwrap();
+        assert!(
+            moved.ends_with("families/FAM1/members/mem-1/board/archive/2026-08/01J0FAM2-book-the-vet.md"),
+            "{}",
+            moved.display()
+        );
+        assert!(!t.path.exists());
+    }
+
+    #[test]
+    fn family_home_dedupes_by_id_against_another_home() {
+        let dir = tempdir().unwrap();
+        let wsroot = dir.path().join("ws");
+        let board_dir = dir.path().join("families/FAM1/members/mem-1/board");
+        let w = TaskHome::Workspace {
+            workspace_root: &wsroot,
+        };
+        let f = TaskHome::Family {
+            board_dir: &board_dir,
+            family_name: "The Smiths",
+        };
+        let mk = |home: TaskHome, title: &str| {
+            create_task(
+                home,
+                &NewTask {
+                    id: Some("01J0DUP".into()),
+                    title: title.into(),
+                    ..NewTask::default()
+                },
+                "2026-08-03",
+            )
+            .unwrap()
+        };
+        mk(w, "Workspace version");
+        mk(f, "Family version");
+
+        // Same `id` in two homes collapses to the first-home-wins task
+        // (scan_tasks: "duplicate ids ... collapse to the first occurrence"),
+        // exactly like a workspace/project collision already does.
+        let scanned = scan_tasks(&[w, f]).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].home, HomeKind::Workspace);
+        assert_eq!(scanned[0].title, "Workspace version");
+
+        let scanned2 = scan_tasks(&[f, w]).unwrap();
+        assert_eq!(scanned2.len(), 1);
+        assert_eq!(scanned2[0].home, HomeKind::Family);
+        assert_eq!(scanned2[0].title, "Family version");
+    }
+
+    #[test]
+    fn family_task_matches_filters_like_any_other_home() {
+        let dir = tempdir().unwrap();
+        let board_dir = dir.path().join("families/FAM1/members/mem-1/board");
+        let home = TaskHome::Family {
+            board_dir: &board_dir,
+            family_name: "The Smiths",
+        };
+        create_task(
+            home,
+            &NewTask {
+                id: Some("01J0FAM3".into()),
+                title: "Renew passports".into(),
+                fields: TaskPatch {
+                    status: Some(TaskStatus::Doing),
+                    tags: Some(vec!["admin".into()]),
+                    ..TaskPatch::default()
+                },
+                ..NewTask::default()
+            },
+            "2026-08-03",
+        )
+        .unwrap();
+        let tasks = list_tasks(home).unwrap();
+
+        let hit = filter_tasks(
+            &tasks,
+            &TaskFilter {
+                project: Some("the smiths".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hit.len(), 1, "project filter is case-insensitive, same as any other home");
+
+        let hit = filter_tasks(
+            &tasks,
+            &TaskFilter {
+                status: Some(TaskStatus::Doing),
+                tag: Some("admin".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hit.len(), 1);
+
+        let miss = filter_tasks(
+            &tasks,
+            &TaskFilter {
+                status: Some(TaskStatus::Done),
+                ..Default::default()
+            },
+        );
+        assert!(miss.is_empty());
     }
 }

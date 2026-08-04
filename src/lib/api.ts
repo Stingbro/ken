@@ -906,7 +906,7 @@ export type TaskStatus = "backlog" | "todo" | "doing" | "review" | "done";
 export type TaskKind = "human" | "ai";
 export type BoardKind = "main" | "daily";
 export type GoalStatus = "active" | "done" | "dropped";
-export type TaskHomeKind = "workspace" | "project";
+export type TaskHomeKind = "workspace" | "project" | "family";
 
 /** Mirrors the Rust `AssigneeFilter` enum — no explicit `tag`/`content` on
  *  the Rust side, so serde's default *externally tagged* representation

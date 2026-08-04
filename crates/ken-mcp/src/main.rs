@@ -1310,7 +1310,7 @@ fn scan_family_board(fb: &FamilyBoardHome) -> Result<Vec<tasks::Task>, String> {
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
         let raw = std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        out.push(tasks::parse_task(&path, tasks::HomeKind::Project, &fb.family_name, &raw));
+        out.push(tasks::parse_task(&path, tasks::HomeKind::Family, &fb.family_name, &raw));
     }
     Ok(out)
 }
@@ -1481,6 +1481,7 @@ fn task_create_tool(server: &Server, args: &Value) -> Result<String, String> {
         match task.home {
             tasks::HomeKind::Workspace => "workspace",
             tasks::HomeKind::Project => "project",
+            tasks::HomeKind::Family => "family",
         },
         task.address(&host)
     ))

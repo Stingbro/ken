@@ -2,6 +2,7 @@
 //! watcher batches, exclusion changes, and full reindex — one code path.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -74,6 +75,58 @@ pub fn is_office_lock_name(name: &str) -> bool {
     name.starts_with("~$")
 }
 
+/// Ken-owned directories directly under `.ken/` that stay indexable and
+/// watchable despite the rest of `.ken/` being hidden — ken-memory's
+/// project-scope memories (`.ken/memory/`) and ken-tasks' per-repo task home
+/// (`.ken/tasks/`). `.ken/project.json`, `.ken/index-profile.json`, and any
+/// other current or future `.ken/` metadata deliberately stay off this list.
+/// A feature that wants the same treatment adds its subdir name here, not a
+/// one-off literal elsewhere.
+const KEN_ALLOWLISTED_SUBDIRS: &[&str] = &["memory", "tasks"];
+
+/// Is `rel` (project-root-relative, forward-slash separated, no leading
+/// slash) a Ken-owned indexable subpath living under the otherwise fully
+/// hidden `.ken/` directory? True only for `.ken/memory/**` and
+/// `.ken/tasks/**`; `.ken` itself is not "under" `.ken`, so it returns
+/// `false` too — scan.rs's walker and watch.rs's `relevant_path` each still
+/// need to let the bare `.ken` directory be entered/observed one level deep
+/// to reach these allowlisted subpaths, which is their job, not this
+/// predicate's. Shared by both so a file one indexes is always a file the
+/// other watches, and vice versa.
+pub fn is_ken_allowlisted_path(rel: &str) -> bool {
+    let Some(sub) = rel
+        .strip_prefix(crate::project::CONFIG_DIR)
+        .and_then(|s| s.strip_prefix('/'))
+    else {
+        return false;
+    };
+    KEN_ALLOWLISTED_SUBDIRS
+        .iter()
+        .any(|dir| sub == *dir || sub.starts_with(&format!("{dir}/")))
+}
+
+/// Walk one allowlisted Ken-owned subdirectory (`.ken/memory` or
+/// `.ken/tasks`) like an ordinary project folder: office-lock and junk-dir
+/// filtering still applies, and a nested dot-directory (e.g. a hypothetical
+/// `.ken/tasks/.trash/`) still stays hidden — the allowlist covers
+/// `memory/**` and `tasks/**`, not "every path anywhere under `.ken`". A
+/// missing directory (most projects have no memories/tasks yet) yields no
+/// entries rather than an error.
+fn ken_owned_subwalk(dir: &std::path::Path) -> impl Iterator<Item = PathBuf> {
+    ignore::WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !is_office_lock_name(&name) && !(e.path().is_dir() && is_junk_dir_name(&name))
+        })
+        .build()
+        .flatten()
+        .map(|e| e.into_path())
+}
+
 /// File status values stored in the index.
 pub const STATUS_INDEXED: &str = "indexed";
 pub const STATUS_METADATA_ONLY: &str = "metadata_only";
@@ -131,13 +184,21 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         .git_exclude(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            name != ".ken"
+            name != crate::project::CONFIG_DIR
                 && !is_office_lock_name(&name)
                 && !(e.path().is_dir() && is_junk_dir_name(&name))
         })
-        .build();
-    for entry in walker.flatten() {
-        let path = entry.path();
+        .build()
+        .flatten()
+        .map(|e| e.into_path());
+    // `.ken/` is hidden wholesale above (D2 hard-ignore); walk its
+    // allowlisted subpaths (`.ken/memory/`, `.ken/tasks/`) separately so
+    // ken-memory and ken-tasks documents reach the index like any other file
+    // — see `is_ken_allowlisted_path` for exactly what qualifies.
+    let allowlisted = KEN_ALLOWLISTED_SUBDIRS.iter().flat_map(|sub| {
+        ken_owned_subwalk(&project.root.join(crate::project::CONFIG_DIR).join(sub))
+    });
+    for path in walker.chain(allowlisted) {
         if !path.is_file() {
             continue;
         }
@@ -317,8 +378,14 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     }
 }
 
+/// Hidden for single-path reindex purposes. Mirrors the walker's rule — any
+/// dot-prefixed component hides the path — with the same `.ken/` allowlist
+/// carve-out, so a memory or task file created through the UI (which reaches
+/// the index via `refresh_path`, not the walker) is indexed exactly like one
+/// found by a full scan. Without this the two entry points disagree, and the
+/// disagreement is silent: the file simply never appears in search.
 fn is_hidden_rel(rel: &str) -> bool {
-    rel.split('/').any(|part| part.starts_with('.'))
+    rel.split('/').any(|part| part.starts_with('.')) && !is_ken_allowlisted_path(rel)
 }
 
 /// Full rebuild: drop everything and rescan.
@@ -649,6 +716,81 @@ mod tests {
     }
 
     #[test]
+    fn ken_memory_and_tasks_are_indexed_but_other_dot_ken_paths_are_not() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".ken/memory")).unwrap();
+        fs::create_dir_all(dir.path().join(".ken/tasks/archive/2026-07")).unwrap();
+        fs::write(dir.path().join(".ken/memory/foo.md"), "a project memory").unwrap();
+        fs::write(dir.path().join(".ken/tasks/bar.md"), "a task").unwrap();
+        fs::write(
+            dir.path().join(".ken/tasks/archive/2026-07/old.md"),
+            "an archived task",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".ken/index-profile.json"), "{}").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        // Allowlisted: walked and indexed, including a nested archive folder.
+        assert!(db.get_file(".ken/memory/foo.md").unwrap().is_some());
+        assert!(db.get_file(".ken/tasks/bar.md").unwrap().is_some());
+        assert!(db.get_file(".ken/tasks/archive/2026-07/old.md").unwrap().is_some());
+
+        // Everything else under `.ken/` stays excluded, same as today.
+        assert!(db.get_file(".ken/project.json").unwrap().is_none());
+        assert!(db.get_file(".ken/index-profile.json").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn other_dot_directories_still_excluded_alongside_ken_allowlist() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".ken/memory")).unwrap();
+        fs::write(dir.path().join(".ken/memory/foo.md"), "a project memory").unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        fs::create_dir_all(dir.path().join(".vscode")).unwrap();
+        fs::write(dir.path().join(".vscode/settings.json"), "{}").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        assert!(db.get_file(".ken/memory/foo.md").unwrap().is_some());
+        assert!(db.get_file(".git/HEAD").unwrap().is_none());
+        assert!(db.get_file(".vscode/settings.json").unwrap().is_none());
+        drop(dir);
+    }
+
+    #[test]
+    fn is_ken_allowlisted_path_matches_the_allowlist() {
+        // `.ken/memory/**` and `.ken/tasks/**` qualify; `.ken` itself, other
+        // `.ken/` metadata, and non-`.ken` paths never do — this predicate
+        // only answers "is this specifically a Ken-owned carve-out", nothing
+        // broader. `scan::scan` and `watch::relevant_path` both delegate to
+        // it for that one narrow question; see
+        // `watch::tests::scan_and_watch_agree_on_ken_paths` for the fuller
+        // walked-vs-watched agreement check.
+        let cases: &[(&str, bool)] = &[
+            (".ken/memory/foo.md", true),
+            (".ken/memory/sub/bar.md", true),
+            (".ken/tasks/bar.md", true),
+            (".ken/tasks/archive/2026-07/old.md", true),
+            (".ken", false),
+            (".ken/project.json", false),
+            (".ken/index-profile.json", false),
+            (".git/HEAD", false),
+            (".vscode/settings.json", false),
+            ("notes/meeting.md", false),
+        ];
+        for (rel, want_ken_allowlisted) in cases {
+            assert_eq!(
+                is_ken_allowlisted_path(rel),
+                *want_ken_allowlisted,
+                "is_ken_allowlisted_path({rel:?})"
+            );
+        }
+    }
+
+    #[test]
     fn office_lock_files_not_indexed() {
         let (dir, project) = temp_project();
         // Word/Excel drop these beside an open document.
@@ -681,6 +823,36 @@ mod tests {
         fs::remove_file(dir.path().join("notes/hot.md")).unwrap();
         assert!(refresh_path(&project, &mut db, "notes/hot.md").unwrap());
         assert!(db.search("hot new note", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn refresh_path_indexes_ken_allowlisted_files_but_not_metadata() {
+        // The third entry point into the index: files created through the UI
+        // reach it via `refresh_path`, not the walker. It must apply the same
+        // `.ken/` allowlist, or a memory written in-app is silently unsearchable
+        // while an identical file found by a full scan is not.
+        let (dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        let memory_dir = dir.path().join(".ken/memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("ways-of-working.md"), "prefers small diffs\n").unwrap();
+        assert!(refresh_path(&project, &mut db, ".ken/memory/ways-of-working.md").unwrap());
+        assert!(!db.search("prefers small diffs", 5).unwrap().is_empty());
+
+        // Ken's own metadata stays out, exactly as before.
+        fs::write(dir.path().join(".ken/index-profile.json"), "{\"kind\":\"code\"}\n").unwrap();
+        assert!(!refresh_path(&project, &mut db, ".ken/index-profile.json").unwrap());
+        assert!(db.get_file(".ken/index-profile.json").unwrap().is_none());
+
+        // And no other dot-directory becomes reachable.
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("COMMIT_EDITMSG"), "unique gitmessage token\n").unwrap();
+        assert!(!refresh_path(&project, &mut db, ".git/COMMIT_EDITMSG").unwrap());
+        assert!(db.search("unique gitmessage token", 5).unwrap().is_empty());
+        drop(dir);
     }
 
     #[test]

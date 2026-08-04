@@ -7932,8 +7932,11 @@ struct BoardStateDto {
 /// is synthesized purely into `AppState::members` at activation time, never
 /// written to `workspace.json`), so it never needs excluding here.
 /// `base_dir`/`app_settings` (task 2.4) let this reach every family board
-/// attached to `ws` in addition to the workspace/project homes — see the
-/// loop below for why that can't be expressed as one more `tasks::TaskHome`.
+/// attached to `ws` in addition to the workspace/project homes, via
+/// `tasks::TaskHome::Family` (ken-tasks debt follow-up: `tasks.rs` now has a
+/// `Family` variant, so this is one `scan_tasks` call over every home
+/// instead of a separate hand-rolled scan + manual dedupe loop for the
+/// family boards).
 fn task_homes_scan(
     ws: &ken_core::workspace::Workspace,
     base_dir: &Path,
@@ -7947,21 +7950,13 @@ fn task_homes_scan(
             _ => None,
         })
         .collect();
-    let mut homes: Vec<tasks::TaskHome> = vec![tasks::TaskHome::Workspace { workspace_root: &ws.root }];
-    for (root, name) in &member_infos {
-        homes.push(tasks::TaskHome::Project { project_root: root, project: name });
-    }
-    let mut tasks_list = tasks::scan_tasks(&homes).map_err(err)?;
     // ken-families task 2.4 (spec MODIFIED "Hybrid homes with one aggregated
     // board"): family boards attached to THIS workspace are a third home.
-    // `tasks::TaskHome` has no variant that reaches `<clone>/members/<me>/
-    // board/` — its `Project` arm always resolves to `<project_root>/.ken/
-    // tasks`, and `tasks.rs` is outside this task's touch-boundary to add a
-    // variant — so each attached board is scanned directly via
-    // `list_family_board_tasks`, which calls the SAME `tasks::parse_task`
-    // `tasks::list_tasks` itself uses (only the tiny non-recursive
-    // directory-listing glue is duplicated, not the frontmatter parser).
-    // Dedup by id like `tasks::scan_tasks` does, first-home-wins.
+    // Resolved up front into owned `(board_dir, family_name)` pairs — same
+    // "collect first, borrow after" shape `member_infos` already uses —
+    // because `tasks::TaskHome::Family` borrows both fields and they need to
+    // outlive the `homes` vec built below.
+    let mut family_infos: Vec<(PathBuf, String)> = Vec::new();
     if ken_families_enabled(app_settings) {
         for conn in family_connections(app_settings)
             .into_iter()
@@ -7969,13 +7964,21 @@ fn task_homes_scan(
         {
             let clone_root = family_clone_root(base_dir, conn.family_id);
             let board_dir = family::board_dir(&clone_root, &conn.member_id);
-            for task in list_family_board_tasks(&board_dir, &conn.name) {
-                if !tasks_list.iter().any(|t| t.id == task.id) {
-                    tasks_list.push(task);
-                }
-            }
+            family_infos.push((board_dir, conn.name));
         }
     }
+    let mut homes: Vec<tasks::TaskHome> = vec![tasks::TaskHome::Workspace { workspace_root: &ws.root }];
+    for (root, name) in &member_infos {
+        homes.push(tasks::TaskHome::Project { project_root: root, project: name });
+    }
+    for (board_dir, family_name) in &family_infos {
+        homes.push(tasks::TaskHome::Family { board_dir, family_name });
+    }
+    // `scan_tasks` dedupes by id, first-home-wins, across every home in one
+    // pass — workspace, then project members, then family boards, the same
+    // order (and therefore the same collision winner) the old manual loop
+    // preserved.
+    let tasks_list = tasks::scan_tasks(&homes).map_err(err)?;
     let goals = tasks::list_goals(&ws.root).map_err(err)?;
     Ok((tasks_list, goals))
 }
@@ -8024,6 +8027,27 @@ fn owning_member_id(ws: &ken_core::workspace::Workspace, home_dir: &Path) -> Opt
         }
         _ => None,
     })
+}
+
+/// `owning_member_id`'s counterpart for `HomeKind::Family` tasks — the
+/// family id that owns a family-board task's home dir, used by
+/// `task_complete` (task 2.4) to pick the `ken://` host for the journal
+/// summary line, mirroring ken-mcp's own `host_for` (D6: "the family id for
+/// a family board task"). Matched by directory like `owning_member_id`, only
+/// among connections attached to THIS workspace — the same set
+/// `task_homes_scan` scans, so a task that came from `task_homes_scan` is
+/// always found here.
+fn owning_family_id(
+    ws: &ken_core::workspace::Workspace,
+    base_dir: &Path,
+    app_settings: &ken_core::settings::AppSettings,
+    home_dir: &Path,
+) -> Option<uuid::Uuid> {
+    family_connections(app_settings)
+        .into_iter()
+        .filter(|c| c.attached_workspace_id == Some(ws.config.id))
+        .find(|c| family::board_dir(&family_clone_root(base_dir, c.family_id), &c.member_id) == home_dir)
+        .map(|c| c.family_id)
 }
 
 /// Cheap non-cryptographic content hash (std `DefaultHasher`/SipHash — no
@@ -8324,6 +8348,9 @@ fn task_complete(app: AppHandle, state: State<SharedState>, id: String, report: 
         let host = match task.home {
             tasks::HomeKind::Workspace => memory::WORKSPACE_ADDRESS_ID.to_string(),
             tasks::HomeKind::Project => owning_member_id(&ws.ws, &task.home_dir)
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| memory::WORKSPACE_ADDRESS_ID.to_string()),
+            tasks::HomeKind::Family => owning_family_id(&ws.ws, &guard.base_dir, &guard.app_settings, &task.home_dir)
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| memory::WORKSPACE_ADDRESS_ID.to_string()),
         };
@@ -9760,34 +9787,6 @@ fn list_inbox_items(dir: &Path) -> Vec<(PathBuf, family::InboxItem)> {
         .collect()
 }
 
-/// Non-recursive `.md` scan of one family board directory (task 2.4), sorted
-/// by filename — the exact listing shape `tasks::list_tasks` uses for its
-/// own `TaskHome::Project` arm, duplicated here only because a family board
-/// isn't reachable through any `TaskHome` variant (see `task_homes_scan`'s
-/// doc comment). The frontmatter parser itself is NOT duplicated —
-/// `tasks::parse_task` (the same function `list_tasks` calls) does that, so
-/// a family board task parses byte-for-byte like a per-repo one.
-/// `HomeKind::Project` is reused rather than inventing a `HomeKind::Family`
-/// (also outside this task's touch-boundary); `project_label` (the family's
-/// display name) fills the same `default_project` role a real project's
-/// name would.
-fn list_family_board_tasks(dir: &Path, project_label: &str) -> Vec<tasks::Task> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
-        .collect();
-    paths.sort();
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let raw = std::fs::read_to_string(&path).ok()?;
-            Some(tasks::parse_task(&path, tasks::HomeKind::Project, project_label, &raw))
-        })
-        .collect()
-}
-
 /// `created`/`updated` timestamps for inbox items (D4: "iso datetime"),
 /// unlike tasks' plain `YYYY-MM-DD` `local_date_today` — the first place in
 /// this codebase that needs a full timestamp rather than a date.
@@ -10519,7 +10518,12 @@ fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: Stri
     emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
 
     let board_path = clone_root.join(&accepted.board_rel_path);
-    let task = tasks::parse_task(&board_path, tasks::HomeKind::Project, &conn.name, &accepted.board_content);
+    // `HomeKind::Family`, not `Project` — this file lives at `<clone>/
+    // members/<id>/board/…`, exactly the shape `task_homes_scan` now tags
+    // `Family` when it scans the same board a moment later; using `Project`
+    // here would make this command's own return value briefly disagree with
+    // what `task_list`/`board-state` report for the identical file.
+    let task = tasks::parse_task(&board_path, tasks::HomeKind::Family, &conn.name, &accepted.board_content);
     emit_board_state(&app, state.inner());
     Ok(task)
 }
