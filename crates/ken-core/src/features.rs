@@ -102,6 +102,15 @@ pub const FLAGS: &[FlagDef] = &[
                       each member's board visible to the team. Uses the \
                       system git CLI; no accounts, no server.",
     },
+    FlagDef {
+        name: "kenPipeline",
+        scope: FlagScope::Workspace,
+        default: false,
+        description: "A configurable multi-lane pipeline board layered over \
+                      the task board: custom lanes, agent kickoff per lane, \
+                      run records, blockers, and a digest of what needs \
+                      attention. Requires the workspace and kenTasks flags.",
+    },
 ];
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
@@ -163,7 +172,7 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 8);
+        assert_eq!(FLAGS.len(), 9);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
         let profiler = flag("profiler").expect("profiler flag registered");
@@ -184,6 +193,9 @@ mod tests {
         let ken_families = flag("kenFamilies").expect("kenFamilies flag registered");
         assert_eq!(ken_families.scope, FlagScope::Global);
         assert!(!ken_families.default);
+        let ken_pipeline = flag("kenPipeline").expect("kenPipeline flag registered");
+        assert_eq!(ken_pipeline.scope, FlagScope::Workspace);
+        assert!(!ken_pipeline.default);
     }
 
     #[test]

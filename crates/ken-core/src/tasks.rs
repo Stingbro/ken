@@ -362,6 +362,16 @@ pub struct Task {
     /// Exactly what the file said, so the tray can show it and so nothing
     /// silently normalizes it.
     pub status_raw: String,
+    /// The resolved pipeline lane id (ken-pipeline D2), or `None` for a
+    /// ticket with no `pipeline:` key — the classic path.
+    ///
+    /// [`parse_task`] always leaves this `None`, because a lane can only be
+    /// resolved against a loaded pipeline definition. `pipeline::
+    /// resolve_task_lane` (and its board-wide sibling) is the *single* home
+    /// of the board-scoped vocabulary check; it fills this in and rewrites
+    /// [`Task::status`] from the matched lane's `maps_to`. Nothing else
+    /// parses a lane.
+    pub lane: Option<String>,
     pub kind: TaskKind,
     pub kind_raw: String,
     pub assignee: String,
@@ -509,7 +519,19 @@ fn first_line(body: &str) -> String {
         .unwrap_or_default()
 }
 
-fn map_str(m: &serde_yaml::Mapping, key: &str) -> String {
+/// `(frontmatter, body)` for sibling modules that parse the same file
+/// shape through this module's splitter (pipeline definitions in
+/// `pipeline.rs`). Deliberately narrower than [`split_raw`]: read-side
+/// callers never need the delimiter lines, and only [`patch_text`] may
+/// reassemble a file.
+pub(crate) fn split_fm_body(raw: &str) -> (Option<&str>, &str) {
+    match split_raw(raw) {
+        Some(s) => (Some(s.fm), s.body),
+        None => (None, raw),
+    }
+}
+
+pub(crate) fn map_str(m: &serde_yaml::Mapping, key: &str) -> String {
     match m.get(serde_yaml::Value::String(key.to_string())) {
         Some(serde_yaml::Value::String(s)) => s.clone(),
         Some(serde_yaml::Value::Number(n)) => n.to_string(),
@@ -518,7 +540,7 @@ fn map_str(m: &serde_yaml::Mapping, key: &str) -> String {
     }
 }
 
-fn map_list(m: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+pub(crate) fn map_list(m: &serde_yaml::Mapping, key: &str) -> Vec<String> {
     match m.get(serde_yaml::Value::String(key.to_string())) {
         Some(serde_yaml::Value::Sequence(items)) => items
             .iter()
@@ -625,6 +647,10 @@ pub fn parse_task(path: &Path, home: HomeKind, default_project: &str, raw: &str)
         title,
         status,
         status_raw: fm.status.trim().to_string(),
+        // Classic path only. Lane resolution needs the pipeline
+        // definitions, which this function has no access to on purpose —
+        // see `pipeline::resolve_task_lane`.
+        lane: None,
         kind: kind_parsed.unwrap_or(TaskKind::Human),
         kind_raw: fm.kind.trim().to_string(),
         assignee: fm.assignee.trim().to_string(),
@@ -982,11 +1008,48 @@ pub struct TaskPatch {
     pub due: Option<String>,
     pub goal: Option<String>,
     pub board: Option<BoardKind>,
+
+    // -- ken-pipeline (tasks.md 1.5): the *writable* ticket keys. All ride
+    // the existing `extra` flatten on the read side, so today's Ken
+    // round-trips them untouched, and all are rendered through
+    // `scalar_lines`/`seq_lines` like every other key.
+    //
+    // Read-only-by-design and therefore absent here: nothing. `pipeline`
+    // is writable so a ticket can be opted in; `bounces`/`return_lane`/
+    // `blocked_at` are writable only because `pipeline::advance` and
+    // `pipeline::block` compose them — no UI or tool should set them
+    // directly.
+    /// The lane id to write into the `status` key (D2: one `status` key).
+    /// Mutually exclusive with [`TaskPatch::status`]; see [`TaskPatch::
+    /// edits`].
+    pub lane: Option<String>,
+    pub pipeline: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub scope: Option<Vec<String>>,
+    pub verify: Option<String>,
+    pub bounces: Option<u32>,
+    pub return_lane: Option<String>,
+    pub blocked_by: Option<Vec<String>>,
+    pub block_reason: Option<String>,
+    pub blocked_at: Option<String>,
+    pub parent: Option<String>,
+    pub spawned_by: Option<String>,
+    pub origin: Option<String>,
+    pub projects: Option<Vec<String>>,
+    pub target: Option<String>,
 }
 
 impl TaskPatch {
     pub fn is_empty(&self) -> bool {
         *self == TaskPatch::default()
+    }
+
+    /// True when this patch resolves the `status` key one way or the other
+    /// — the escape hatch [`apply_patch`] allows for a ticket whose
+    /// on-disk status it doesn't understand.
+    pub fn sets_status(&self) -> bool {
+        self.status.is_some() || self.lane.is_some()
     }
 
     /// Rendered edit lines in canonical key order. `updated` is appended by
@@ -997,7 +1060,12 @@ impl TaskPatch {
         if let Some(v) = &self.title {
             out.push(("title", scalar_lines("title", v)));
         }
-        if let Some(v) = self.status {
+        // One physical `status` key (D2), two vocabularies. `lane` wins
+        // when both are set, because the board-scoped vocabulary is the
+        // more specific statement of intent; setting both is a caller bug.
+        if let Some(v) = &self.lane {
+            out.push(("status", scalar_lines("status", v)));
+        } else if let Some(v) = self.status {
             out.push(("status", scalar_lines("status", v.as_str())));
         }
         if let Some(v) = self.kind {
@@ -1021,6 +1089,53 @@ impl TaskPatch {
         if let Some(v) = self.board {
             out.push(("board", scalar_lines("board", v.as_str())));
         }
+        // ken-pipeline keys, appended after the classic ones so a file
+        // that doesn't have them yet grows them in a stable order.
+        if let Some(v) = &self.pipeline {
+            out.push(("pipeline", scalar_lines("pipeline", v)));
+        }
+        if let Some(v) = &self.model {
+            out.push(("model", scalar_lines("model", v)));
+        }
+        if let Some(v) = &self.agent {
+            out.push(("agent", scalar_lines("agent", v)));
+        }
+        if let Some(v) = &self.scope {
+            out.push(("scope", seq_lines("scope", v)));
+        }
+        if let Some(v) = &self.verify {
+            out.push(("verify", scalar_lines("verify", v)));
+        }
+        if let Some(v) = self.bounces {
+            out.push(("bounces", scalar_lines("bounces", &v.to_string())));
+        }
+        if let Some(v) = &self.return_lane {
+            out.push(("return_lane", scalar_lines("return_lane", v)));
+        }
+        if let Some(v) = &self.blocked_by {
+            out.push(("blocked_by", seq_lines("blocked_by", v)));
+        }
+        if let Some(v) = &self.block_reason {
+            out.push(("block_reason", scalar_lines("block_reason", v)));
+        }
+        if let Some(v) = &self.blocked_at {
+            out.push(("blocked_at", scalar_lines("blocked_at", v)));
+        }
+        if let Some(v) = &self.parent {
+            out.push(("parent", scalar_lines("parent", v)));
+        }
+        if let Some(v) = &self.spawned_by {
+            out.push(("spawned_by", scalar_lines("spawned_by", v)));
+        }
+        if let Some(v) = &self.origin {
+            out.push(("origin", scalar_lines("origin", v)));
+        }
+        if let Some(v) = &self.projects {
+            out.push(("projects", seq_lines("projects", v)));
+        }
+        if let Some(v) = &self.target {
+            out.push(("target", scalar_lines("target", v)));
+        }
         out
     }
 }
@@ -1034,12 +1149,37 @@ impl TaskPatch {
 /// rewritten" means for a needs-attention task: Ken never edits around a
 /// hand edit it doesn't understand, but an explicit fix is always allowed.
 pub fn apply_patch(path: &Path, patch: &TaskPatch, updated: &str) -> Result<()> {
+    apply_patch_with_pipelines(path, patch, updated, &[])
+}
+
+/// [`apply_patch`] with the loaded pipeline definitions, so a pipeline
+/// ticket's lane id is recognised as a valid `status` (D2) and an
+/// *unknown* lane earns the same refusal an invalid classic status does
+/// (tasks.md 1.4).
+///
+/// Note the asymmetry this creates on purpose: called with no definitions
+/// (which is what [`apply_patch`] does, and therefore what every
+/// pre-ken-pipeline caller does), a ticket sitting in a pipeline lane
+/// looks exactly like a ticket with an unrecognized status and is refused.
+/// That is the conservative direction — a caller that doesn't know about
+/// pipelines has no business editing around a lane it can't validate.
+pub fn apply_patch_with_pipelines(
+    path: &Path,
+    patch: &TaskPatch,
+    updated: &str,
+    pipelines: &[crate::pipeline::Pipeline],
+) -> Result<()> {
     let raw = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-    let current = parse_task(path, HomeKind::Workspace, "", &raw);
-    if current.has_invalid_status() && patch.status.is_none() {
+    let mut current = parse_task(path, HomeKind::Workspace, "", &raw);
+    crate::pipeline::resolve_task_lane(&mut current, pipelines);
+    if current.has_invalid_status() && !patch.sets_status() {
+        let what = match crate::pipeline::ticket_pipeline(&current) {
+            Some(p) => format!("status '{}' in pipeline '{p}'", current.status_raw),
+            None => format!("status '{}'", current.status_raw),
+        };
         return Err(Error::Other(format!(
-            "task '{}' has an unrecognized status '{}' — resolve it before patching other keys",
-            current.id, current.status_raw
+            "task '{}' has an unrecognized {what} — resolve it before patching other keys",
+            current.id
         )));
     }
     let mut edits = patch.edits();
@@ -1304,6 +1444,40 @@ pub struct TaskFilter {
     /// filter" over `board: daily`, so it belongs in the same struct rather
     /// than a parallel one.
     pub board: Option<BoardKind>,
+    /// ken-pipeline D2: the resolved lane id. Only ever matches a ticket
+    /// that has been through `pipeline::resolve_task_lane` — a pipeline-less
+    /// ticket has no lane and therefore matches no lane filter, exactly as
+    /// an out-of-vocabulary `status` matches no status filter.
+    pub lane: Option<String>,
+    /// ken-pipeline D2: the ticket's `pipeline:` frontmatter key.
+    pub pipeline: Option<String>,
+    /// ken-pipeline D5: "what is stuck and why" as a filter.
+    pub blocked: Option<BlockedFilter>,
+}
+
+/// Block-state filter (ken-pipeline D5 / tasks.md 1.3).
+///
+/// Deliberately evaluated from the ticket's own frontmatter alone — no
+/// pipeline definition, no board — so [`matches`] stays pure over one
+/// [`Task`]. The consequence, stated plainly: "blocked" here means *the
+/// ticket carries block evidence* (`blocked_by` and/or `block_reason`),
+/// not "the ticket's status is the blocked lane's id". Those agree for
+/// every ticket that went through `pipeline::block`, and the disagreement
+/// cases (a hand edit that sets `status: blocked` with no reason and no
+/// dependency) are tray entries by construction, not board rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockedFilter {
+    /// Match regardless of block state — a no-op, present so a tool
+    /// argument can say "don't care" explicitly.
+    Any,
+    Blocked,
+    NotBlocked,
+    /// Blocked by a specific ticket id (case-insensitive).
+    By(String),
+    /// Was blocked, no longer is, and has not yet been moved back to its
+    /// `return_lane` — the digest's "unblocked overnight" group.
+    NewlyUnblocked,
 }
 
 fn eq_ci(a: &str, b: &str) -> bool {
@@ -1360,6 +1534,23 @@ pub fn matches(task: &Task, filter: &TaskFilter) -> bool {
             return false;
         }
     }
+    if let Some(l) = &filter.lane {
+        match &task.lane {
+            Some(task_lane) if eq_ci(task_lane, l) => {}
+            _ => return false,
+        }
+    }
+    if let Some(p) = &filter.pipeline {
+        match crate::pipeline::ticket_pipeline(task) {
+            Some(task_pipeline) if eq_ci(&task_pipeline, p) => {}
+            _ => return false,
+        }
+    }
+    if let Some(b) = &filter.blocked {
+        if !crate::pipeline::matches_block_filter(task, b) {
+            return false;
+        }
+    }
     true
 }
 
@@ -1385,6 +1576,18 @@ pub enum AttentionReason {
     InvalidBoard(String),
     /// `goal` references an id with no goal file (D7).
     UnknownGoal(String),
+    /// ken-pipeline D2: `pipeline:` names a definition that isn't loaded.
+    UnknownPipeline(String),
+    /// ken-pipeline D2: the ticket's pipeline has no lane matching its
+    /// `status`. Carries the raw status, like [`AttentionReason::
+    /// InvalidStatus`] does for the classic path.
+    UnknownLane(String),
+    /// ken-pipeline D5: a `blocked_by` id matching no ticket on the board.
+    UnknownBlocker(String),
+    /// ken-pipeline D5: the ticket is blocked but its `return_lane` is
+    /// missing, or names a lane the pipeline doesn't define (the
+    /// lane-rename orphan case). Empty string means "missing".
+    UnknownReturnLane(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1398,13 +1601,39 @@ pub struct NeedsAttention {
 
 /// Everything the tray shows. Pure over an already-scanned board, so the
 /// caller can recompute it on every watcher event for free.
+///
+/// This is the classic, pipeline-unaware entry point and it keeps its
+/// exact pre-ken-pipeline behaviour, so every existing caller is
+/// unchanged. A board that has pipeline definitions loaded calls
+/// [`needs_attention_with_pipelines`] instead.
 pub fn needs_attention(tasks: &[Task], goals: &[Goal]) -> Vec<NeedsAttention> {
+    needs_attention_with_pipelines(tasks, goals, &[])
+}
+
+/// [`needs_attention`] plus the board-scoped lane checks (ken-pipeline
+/// D2/D5): unknown pipeline, unknown lane, unknown blocker, and a missing
+/// or orphaned `return_lane`.
+///
+/// Every one of these is *surfaced*, never repaired — the same rule
+/// [`apply_patch`] already enforces for an out-of-vocabulary status.
+pub fn needs_attention_with_pipelines(
+    tasks: &[Task],
+    goals: &[Goal],
+    pipelines: &[crate::pipeline::Pipeline],
+) -> Vec<NeedsAttention> {
     let mut out = Vec::new();
     for task in tasks {
         let mut reasons = Vec::new();
-        if task.status.is_none() {
+        let pipeline_reasons = crate::pipeline::attention_reasons(task, tasks, pipelines);
+        // A pipeline ticket's `status` holds a lane id, so the classic
+        // five-value check is meaningless for it: `UnknownLane` /
+        // `UnknownPipeline` replace `InvalidStatus` rather than doubling
+        // up on it.
+        let pipeline_owned_status = crate::pipeline::ticket_pipeline(task).is_some();
+        if task.status.is_none() && !pipeline_owned_status {
             reasons.push(AttentionReason::InvalidStatus(task.status_raw.clone()));
         }
+        reasons.extend(pipeline_reasons);
         if !task.kind_raw.is_empty() && TaskKind::parse(&task.kind_raw).is_none() {
             reasons.push(AttentionReason::InvalidKind(task.kind_raw.clone()));
         }

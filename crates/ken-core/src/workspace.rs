@@ -46,6 +46,71 @@ pub struct WorkspaceConfig {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// One entry of `workspace.json`'s `links` array (design D12,
+/// `ken-pipeline`): an explicit cross-project link, e.g. a tool repo linked
+/// to the project it supports. Not a typed `WorkspaceConfig` field — see
+/// [`WorkspaceConfig::links`] for why — this struct exists only to give
+/// callers a parsed shape for the entries already living in `extra`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectLink {
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl WorkspaceConfig {
+    /// Parsed `links` array (design D12). Deliberately **not** a typed
+    /// `WorkspaceConfig` field: the manifest already round-trips unknown
+    /// keys through `extra` (see `unknown_fields_survive_roundtrip`), and a
+    /// typed field would only be needed if something here wrote `links`
+    /// itself — nothing in this phase does, links are hand-authored or
+    /// written by a future lane. Reading them out of `extra` on demand keeps
+    /// that round-trip guarantee exactly as-is. Entries that don't parse as
+    /// `{from, to, relation, note?}` are skipped rather than failing the
+    /// whole read (same tolerant-load philosophy as the rest of this
+    /// module).
+    pub fn links(&self) -> Vec<ProjectLink> {
+        self.extra
+            .get("links")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Project names linked to `name`, in either direction. `links` entries
+    /// are stored directional (`from` -> `to`, carrying a `relation` that
+    /// reads naturally one way, e.g. "ShatteredRealmsTools tools_for
+    /// ShatteredRealms"), but every consumer named in design D12 — idea
+    /// dedupe scope, the board's "include linked projects" filter, and
+    /// cross-project `blocked_by` suggestions — cares about connectivity,
+    /// not which side is `from`. So a link recorded as `{from: A, to: B}`
+    /// makes each project visible from the other's scope; callers that need
+    /// the raw direction/relation should use [`WorkspaceConfig::links`]
+    /// instead.
+    pub fn linked_projects(&self, name: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let Some(arr) = self.extra.get("links").and_then(|v| v.as_array()) else {
+            return out;
+        };
+        for entry in arr {
+            let from = entry.get("from").and_then(|v| v.as_str());
+            let to = entry.get("to").and_then(|v| v.as_str());
+            match (from, to) {
+                (Some(f), Some(t)) if f == name => out.push(t),
+                (Some(f), Some(t)) if t == name => out.push(f),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 /// Per-member resolution result within an opened [`Workspace`].
 #[derive(Debug, Clone)]
 pub enum MemberStatus {
@@ -335,6 +400,73 @@ mod tests {
         reopened.save().unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("ingestRunner"), "extra field lost: {raw}");
+    }
+
+    #[test]
+    fn links_round_trip_through_unknown_keys() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alpha")).unwrap();
+        Workspace::create(dir.path(), "WS", &["alpha".into()]).unwrap();
+
+        // Simulate a newer/other-tool write that adds `links` alongside an
+        // unrelated unknown key, same as `unknown_fields_survive_roundtrip`.
+        let path = config_path(dir.path());
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        v["links"] = serde_json::json!([
+            { "from": "ShatteredRealms", "to": "ShatteredRealmsTools", "relation": "tools_for" },
+            { "from": "ShatteredRealms", "to": "Docs", "relation": "documents", "note": "wiki" },
+        ]);
+        v["ingestRunner"] = "hidden-tui".into();
+        fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+        let reopened = Workspace::open(dir.path()).unwrap();
+        let links = reopened.config.links();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].from, "ShatteredRealms");
+        assert_eq!(links[0].to, "ShatteredRealmsTools");
+        assert_eq!(links[0].relation, "tools_for");
+        assert_eq!(links[0].note, None);
+        assert_eq!(links[1].note.as_deref(), Some("wiki"));
+
+        // Write path preserves both the unrelated unknown key and `links`
+        // itself (a manifest saved by this build must not drop either).
+        reopened.save().unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("ingestRunner"), "extra field lost: {raw}");
+        assert!(raw.contains("ShatteredRealmsTools"), "links lost: {raw}");
+    }
+
+    #[test]
+    fn linked_projects_resolves_both_directions() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alpha")).unwrap();
+        let mut ws = Workspace::create(dir.path(), "WS", &["alpha".into()]).unwrap();
+        ws.config.extra.insert(
+            "links".into(),
+            serde_json::json!([
+                { "from": "ShatteredRealms", "to": "ShatteredRealmsTools", "relation": "tools_for" },
+            ]),
+        );
+
+        assert_eq!(
+            ws.config.linked_projects("ShatteredRealms"),
+            vec!["ShatteredRealmsTools"]
+        );
+        assert_eq!(
+            ws.config.linked_projects("ShatteredRealmsTools"),
+            vec!["ShatteredRealms"]
+        );
+        assert!(ws.config.linked_projects("Unrelated").is_empty());
+    }
+
+    #[test]
+    fn links_absent_when_no_links_key() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alpha")).unwrap();
+        let ws = Workspace::create(dir.path(), "WS", &["alpha".into()]).unwrap();
+        assert!(ws.config.links().is_empty());
+        assert!(ws.config.linked_projects("alpha").is_empty());
     }
 
     #[test]

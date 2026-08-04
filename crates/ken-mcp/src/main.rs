@@ -1184,12 +1184,12 @@ struct FamilyBoardHome {
     /// This device's own member id in the family, if known — the only
     /// identity a write to this home may lane-check as `member_id`.
     my_member_id: Option<String>,
-}
-
-impl FamilyBoardHome {
-    fn board_dir(&self) -> PathBuf {
-        family::board_dir(&self.clone_root, &self.member_id)
-    }
+    /// `family::board_dir(&clone_root, &member_id)`, resolved once at
+    /// construction (`resolve_task_homes`) rather than recomputed per call —
+    /// `tasks::TaskHome::Family` borrows this field, so it needs to outlive
+    /// the borrow the same way `member_infos`/`family_infos` do in
+    /// src-tauri's `task_homes_scan` ("collect first, borrow after").
+    board_dir: PathBuf,
 }
 
 /// Owned scan-home data for one call: the open workspace's tasks home,
@@ -1202,13 +1202,14 @@ impl FamilyBoardHome {
 /// folder yet simply contribute no tasks (`list_tasks`'s "missing folder
 /// reads as no tasks").
 ///
-/// Family boards can't be represented as a `tasks::TaskHome` — that type's
-/// `tasks_dir()` always derives `.ken-workspace/tasks/` or
-/// `<project>/.ken/tasks/`, and a family board lives at
-/// `members/<id>/board/`, a shape `tasks.rs` (owned by another session this
-/// phase) has no variant for. `family_boards` is therefore scanned
-/// separately, in `scan_all`, using the same lower-level `tasks::parse_task`
-/// the two built-in homes use under the hood.
+/// Family boards ARE now representable as a `tasks::TaskHome` —
+/// `TaskHome::Family { board_dir, family_name }` (ken-tasks debt follow-up).
+/// `family_boards` still owns the resolved `(clone_root, member_id, …)` data
+/// (a `TaskHome::Family` only borrows `board_dir`/`family_name`, and this
+/// struct needs to keep the rest — `family_id`, `my_member_id` — around for
+/// `host_for`/`family_authorize_write`), but scanning itself is now a single
+/// `tasks::scan_tasks` call over every home, workspace/project/family alike
+/// (mirrors src-tauri's `task_homes_scan`).
 struct TaskHomes {
     workspace_root: PathBuf,
     projects: Vec<RegistryEntry>,
@@ -1221,23 +1222,18 @@ impl TaskHomes {
         for p in &self.projects {
             out.push(tasks::TaskHome::Project { project_root: &p.path, project: &p.name });
         }
+        for fb in &self.family_boards {
+            out.push(tasks::TaskHome::Family { board_dir: &fb.board_dir, family_name: &fb.family_name });
+        }
         out
     }
 
-    /// Every task across every home: the two built-in homes via
-    /// `tasks::scan_tasks`, plus each family board directly (task 3.4).
-    /// Duplicate ids collapse to the first occurrence, extending
-    /// `scan_tasks`'s own precedence rule across the combined set.
+    /// Every task across every home in one `tasks::scan_tasks` pass —
+    /// workspace, then registered projects, then family boards, the same
+    /// order (and therefore the same dedupe-by-id winner) `homes()` builds
+    /// them in.
     fn scan_all(&self) -> Result<Vec<tasks::Task>, String> {
-        let mut out = tasks::scan_tasks(&self.homes()).map_err(|e| e.to_string())?;
-        for fb in &self.family_boards {
-            for t in scan_family_board(fb)? {
-                if !out.iter().any(|x| x.id == t.id) {
-                    out.push(t);
-                }
-            }
-        }
-        Ok(out)
+        tasks::scan_tasks(&self.homes()).map_err(|e| e.to_string())
     }
 
     /// Which family board a task found via `scan_all` came from, if any —
@@ -1245,15 +1241,17 @@ impl TaskHomes {
     /// own parent, so it is exact regardless of which `HomeKind` the task
     /// was tagged with).
     fn family_origin(&self, task: &tasks::Task) -> Option<&FamilyBoardHome> {
-        self.family_boards.iter().find(|fb| fb.board_dir() == task.home_dir)
+        self.family_boards.iter().find(|fb| fb.board_dir == task.home_dir)
     }
 
     /// The `ken://` host for a task found via `scan_all`: the workspace
     /// pseudo-host for workspace-home tasks, the owning project's registry
     /// id for a per-repo task, or the family id (D6: `ken://<family-id>/…`)
     /// for a family board task — `tasks::Task::address` takes this as an
-    /// argument because `tasks.rs` has no `Project`/family handle of its own
-    /// (mirrors `journal_summary_line`'s doc comment on the same point).
+    /// argument because `tasks.rs` has no `Project`/family *connection*
+    /// handle of its own (it only knows paths, not which family a board
+    /// belongs to) — mirrors `journal_summary_line`'s doc comment on the
+    /// same point.
     fn host_for(&self, task: &tasks::Task) -> String {
         if let Some(fb) = self.family_origin(task) {
             return fb.family_id.to_string();
@@ -1272,47 +1270,16 @@ impl TaskHomes {
         task.project.clone()
     }
 
-    /// The repo/project-relative tail of a task's `ken://` address.
-    /// `Task::address_rel_path` can't express a family board's
-    /// `members/<id>/board/<file>` shape (it hardcodes the `.ken/tasks/`
-    /// layout project-home tasks use), so family-origin tasks compute their
-    /// own via `family::board_rel`.
-    fn address_rel_path(&self, task: &tasks::Task) -> String {
-        match self.family_origin(task) {
-            Some(fb) => format!("{}/{}", family::board_rel(&fb.member_id), task.file_name()),
-            None => task.address_rel_path(),
-        }
-    }
-
+    /// `ken://` address for a task found via `scan_all`. `Task::address`
+    /// (via `Task::address_rel_path`) now derives a family task's
+    /// `members/<id>/board/<file>` tail natively — `HomeKind::Family`'s
+    /// member id is recovered structurally from `home_dir`'s parent, which
+    /// is always exactly `family::board_dir(clone_root, member_id)` because
+    /// that's the literal path `TaskHome::Family { board_dir, .. }` above was
+    /// built from — so this no longer needs its own override.
     fn address_for(&self, task: &tasks::Task) -> String {
-        format!("ken://{}/{}", self.host_for(task), self.address_rel_path(task))
+        task.address(&self.host_for(task))
     }
-}
-
-/// Parse every `.md` file directly in a family board (task 3.4) — the same
-/// shape as `tasks::list_tasks`'s body (not recursive; a missing folder
-/// reads as no tasks), reimplemented here because `tasks::list_tasks`
-/// requires a `tasks::TaskHome`, which a board dir can't be represented as
-/// (see `TaskHomes`'s doc comment). `tasks::parse_task` is the same public
-/// primitive `list_tasks` calls internally, so parsing itself doesn't drift.
-fn scan_family_board(fb: &FamilyBoardHome) -> Result<Vec<tasks::Task>, String> {
-    let dir = fb.board_dir();
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| format!("could not read {}: {e}", dir.display()))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
-        .collect();
-    paths.sort();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let raw = std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
-        out.push(tasks::parse_task(&path, tasks::HomeKind::Family, &fb.family_name, &raw));
-    }
-    Ok(out)
 }
 
 fn resolve_task_homes(server: &Server) -> Result<TaskHomes, String> {
@@ -1326,16 +1293,18 @@ fn resolve_task_homes(server: &Server) -> Result<TaskHomes, String> {
                 continue; // "needs a newer Ken": no sync, ingest, or write (spec)
             }
             for member in &conn.manifest.members {
-                let fb = FamilyBoardHome {
+                let board_dir = family::board_dir(&conn.clone_root, &member.id);
+                if !board_dir.is_dir() {
+                    continue;
+                }
+                family_boards.push(FamilyBoardHome {
                     family_id: conn.manifest.id,
                     family_name: conn.manifest.name.clone(),
                     clone_root: conn.clone_root.clone(),
                     member_id: member.id.clone(),
                     my_member_id: conn.my_member_id.clone(),
-                };
-                if fb.board_dir().is_dir() {
-                    family_boards.push(fb);
-                }
+                    board_dir,
+                });
             }
         }
     }
@@ -1380,6 +1349,10 @@ fn parse_task_patch(value: &Value) -> Result<tasks::TaskPatch, String> {
         due: get_str("due"),
         goal: get_str("goal"),
         board,
+        // The pipeline fields (lane, blocked_by, scope, …) are not part of
+        // this tool's schema: an external agent claims and completes work,
+        // it does not move tickets between lanes or block them.
+        ..Default::default()
     })
 }
 
@@ -1420,6 +1393,9 @@ fn parse_task_filter(value: &Value) -> Result<tasks::TaskFilter, String> {
         kind,
         goal: get_str("goal"),
         board,
+        // Lane/pipeline/blocked filtering is added by ken-pipeline's own
+        // tools (section 3 of that change), not retrofitted onto task_list.
+        ..Default::default()
     })
 }
 
@@ -1626,10 +1602,12 @@ project's task home, or any attached family board"
     );
 
     if ken_memory_enabled(&AppSettings::load(&server.base_dir)) {
-        // `journal_line_for_address` rather than `tasks::journal_summary_line`
-        // here (see its doc comment): the latter calls `Task::address`
-        // internally, which can't express a family board's path shape.
-        let line = journal_line_for_address(task, &address, &report);
+        // `tasks::journal_summary_line` directly now — it calls
+        // `Task::address` internally, which (via `Task::address_rel_path`)
+        // now natively expresses a family board's `members/<id>/board/`
+        // path, so there's no longer a need for a local override that takes
+        // a precomputed address instead.
+        let line = tasks::journal_summary_line(task, &homes.host_for(task), &report);
         let project_opt = if task.project.trim().is_empty() { None } else { Some(task.project.as_str()) };
         match memory::append_journal(&homes.workspace_root, &line, project_opt, &[], &today, &time_hhmm) {
             Ok(_) => msg.push_str(" Journal summary recorded."),
@@ -1638,27 +1616,6 @@ project's task home, or any attached family board"
     }
     msg.push_str(&sync_note);
     Ok(msg)
-}
-
-/// Same composition as `tasks::journal_summary_line`, but taking a
-/// precomputed `ken://` address rather than calling `Task::address`
-/// internally — that method hardcodes the `.ken/tasks/` shape project-home
-/// tasks use and cannot express a family board's `members/<id>/board/`
-/// path, so every `task_complete_tool` call (family-origin or not) builds
-/// its address via `TaskHomes::address_for` first and hands it in here.
-fn journal_line_for_address(task: &tasks::Task, address: &str, report: &str) -> String {
-    let excerpt = report.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    let excerpt: String = if excerpt.chars().count() > 160 {
-        let cut: String = excerpt.chars().take(160).collect();
-        format!("{}…", cut.trim_end())
-    } else {
-        excerpt.to_string()
-    };
-    if excerpt.is_empty() {
-        format!("Completed task \"{}\" ({address})", task.title)
-    } else {
-        format!("Completed task \"{}\" — {excerpt} ({address})", task.title)
-    }
 }
 
 fn source_label(source: Source) -> &'static str {

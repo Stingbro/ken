@@ -59,6 +59,23 @@ pub struct ProjectConfig {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+impl ProjectConfig {
+    /// Short display symbol (1-3 characters or an emoji), rendered
+    /// top-left on every board card carrying this project (design D12,
+    /// `ken-pipeline`). Lives in `extra`, not a typed field — per OPEN-2,
+    /// this keeps `project.json` round-tripping through older Ken
+    /// untouched; there is no schema change to make.
+    pub fn symbol(&self) -> Option<&str> {
+        self.extra.get("symbol").and_then(|v| v.as_str())
+    }
+
+    /// Optional display colour paired with `symbol`. Same `extra`-only
+    /// treatment as `symbol` — see OPEN-2.
+    pub fn color(&self) -> Option<&str> {
+        self.extra.get("color").and_then(|v| v.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Project {
     pub root: PathBuf,
@@ -253,6 +270,42 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("ingestRunner"), "extra field lost: {raw}");
         assert!(raw.contains("futureFlag"), "features map lost: {raw}");
+        drop(p);
+    }
+
+    #[test]
+    fn symbol_and_color_read_from_extra_when_present() {
+        let dir = tempdir().unwrap();
+        let mut p = Project::create(dir.path(), "X").unwrap();
+        p.config.extra.insert("symbol".into(), "SR".into());
+        p.config.extra.insert("color".into(), "#5566ee".into());
+        assert_eq!(p.config.symbol(), Some("SR"));
+        assert_eq!(p.config.color(), Some("#5566ee"));
+    }
+
+    #[test]
+    fn symbol_and_color_absent_when_not_set() {
+        let dir = tempdir().unwrap();
+        let p = Project::create(dir.path(), "X").unwrap();
+        assert_eq!(p.config.symbol(), None);
+        assert_eq!(p.config.color(), None);
+    }
+
+    #[test]
+    fn symbol_survives_roundtrip_via_extra() {
+        let dir = tempdir().unwrap();
+        let path = config_path(dir.path());
+        let p = Project::create(dir.path(), "X").unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        v["symbol"] = "SR".into();
+        fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+        let reopened = Project::open(dir.path()).unwrap();
+        assert_eq!(reopened.config.symbol(), Some("SR"));
+        reopened.save().unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"symbol\""), "symbol lost: {raw}");
         drop(p);
     }
 

@@ -27,6 +27,7 @@ pub mod local_llm;
 pub mod memory;
 pub mod model;
 pub mod ocr;
+pub mod pipeline;
 pub mod profiler;
 pub mod project;
 pub mod record;
