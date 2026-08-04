@@ -27,10 +27,30 @@ import {
 import { app } from "./app.svelte";
 import { families } from "./families.svelte";
 
-export type TaskView = "board" | "daily";
+// ken-pipeline task 4.2: a third view, "pipeline" — added here (rather than
+// a new top-level nav-rail screen) because the pipeline board extends the
+// Phase 7 Kanban (precedent this change follows) and is gated by its own
+// `kenPipeline` flag exactly the way Main/Daily are gated by `kenTasks` —
+// same tab strip, same "flag off ⇒ renders exactly as today" contract.
+export type TaskView = "board" | "daily" | "pipeline";
 export type DailyPlanPhase = "idle" | "planning" | "ready" | "error";
 
-const EMPTY_BOARD: BoardStateDto = { tasks: [], goals: [], needsAttention: [], progress: {} };
+// ken-pipeline task 4.1: `BoardStateDto` gained four fields (pipelines,
+// pipelineFields, pipelineLaneCounts, blocked) — always present, empty when
+// `kenPipeline` is off or the board has no pipeline tickets (src-tauri's own
+// "byte-identical computation, not byte-identical payload" note on
+// `board_state_dto`). `pipeline.svelte.ts` reads this same store's `board`
+// rather than keeping a second live copy.
+const EMPTY_BOARD: BoardStateDto = {
+  tasks: [],
+  goals: [],
+  needsAttention: [],
+  progress: {},
+  pipelines: [],
+  pipelineFields: {},
+  pipelineLaneCounts: {},
+  blocked: [],
+};
 
 export interface TaskFilters {
   project: string;
@@ -45,10 +65,15 @@ export interface TaskFilters {
    *  via `families.familyForTask` since no `Task` field names its family
    *  directly (see that function's doc comment). */
   family: string;
+  /** ken-pipeline task 4.5 (OPEN-7): hide pipeline tickets from the classic
+   *  Main/Daily Kanban. Pipeline tickets project onto the classic board by
+   *  design (D2/`maps_to`) — this is purely a "keep the classic board
+   *  clean" viewing preference, never a data change. */
+  hidePipeline: boolean;
 }
 
 function emptyFilters(): TaskFilters {
-  return { project: "", tag: "", assignee: "", kind: "", goal: "", family: "" };
+  return { project: "", tag: "", assignee: "", kind: "", goal: "", family: "", hidePipeline: false };
 }
 
 class TasksStore {
@@ -158,6 +183,7 @@ class TasksStore {
     if (f.kind && task.kind !== f.kind) return false;
     if (f.goal && (task.goal ?? "").toLowerCase() !== f.goal.toLowerCase()) return false;
     if (f.family && families.familyForTask(task)?.connection.familyId !== f.family) return false;
+    if (f.hidePipeline && task.lane !== null) return false;
     return true;
   }
 
@@ -167,7 +193,7 @@ class TasksStore {
 
   get filtersActive(): boolean {
     const f = this.filters;
-    return !!(f.project || f.tag || f.assignee || f.kind || f.goal || f.family);
+    return !!(f.project || f.tag || f.assignee || f.kind || f.goal || f.family || f.hidePipeline);
   }
 
   /** Filtered tasks for one board (`"main"` | `"daily"`), still unsorted by

@@ -7,7 +7,8 @@
 //! unscoped, the project tools take a required `project` argument matched
 //! against Ken's registry.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +21,7 @@ use ken_core::family::{self, FamilyManifest, InboxKind, InboxTaskPayload, Lane, 
 use ken_core::family_sync::{self, ConnectionState, GitTransport, PendingWrite, SyncEngine, SystemGit};
 use ken_core::features;
 use ken_core::memory;
+use ken_core::pipeline;
 use ken_core::profiler::{self, ProjectProfile};
 use ken_core::project::Project;
 use ken_core::registry::{self, Registry, RegistryEntry};
@@ -37,10 +39,24 @@ const KNOWN_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-
 /// Cap on `read_document` output.
 const MAX_DOCUMENT_BYTES: usize = 200 * 1024;
 
+#[derive(Default)]
 struct Server {
     base_dir: PathBuf,
     /// Root the server is locked to (`--project <path>`), if any.
     scoped: Option<PathBuf>,
+    /// ken-pipeline (task 3.3): run ids **this server process** has itself
+    /// flipped to `running` via `pipeline_claim`, mirroring src-tauri's
+    /// `WorkspaceState::pipeline_known_running` (task 2.2) for a process
+    /// that has no watcher of its own. Used only as `derive_queue`'s/
+    /// `compose_digest`'s `known_running_ids` staleness input (D13): a
+    /// `running` record this process didn't itself observe is reported
+    /// stale, exactly the "no live run after restart" rule read literally
+    /// for an MCP server that may be a fresh process per client connection.
+    /// Interior mutability because every tool function takes `&Server`
+    /// (unlike Tauri's `State<SharedState>`, ken-mcp's dispatch never
+    /// hands out `&mut Server` to individual tools) — never persisted to
+    /// disk, so this is purely an in-session hint, not a second ledger.
+    known_running: RefCell<BTreeSet<String>>,
 }
 
 fn main() {
@@ -73,7 +89,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut server = Server { base_dir, scoped };
+    let mut server = Server { base_dir, scoped, ..Default::default() };
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -131,6 +147,8 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
                 | "kg_search" | "semantic_search" | "route_query"
                 | "memory_write" | "journal_append"
                 | "task_create" | "task_list" | "task_update" | "task_complete"
+                | "pipeline_list" | "pipeline_get" | "pipeline_claim" | "pipeline_advance"
+                | "pipeline_block" | "pipeline_runs" | "pipeline_digest"
                 | "family_list" | "family_inbox" | "family_send" => {
                     let outcome = call_tool(server, name, &args);
                     rpc_result(&id, tool_content(outcome))
@@ -498,6 +516,201 @@ next sync.",
         }));
     }
 
+    // ken-pipeline (task 3.1-3.8): seven tools over the pipeline board —
+    // list/get/claim/advance/block/runs/digest — gated on `kenPipeline` the
+    // same way the kenTasks block above gates its four (spec.md "Flag-
+    // scoped activation": "register no pipeline tools on either surface").
+    // `ken_pipeline_enabled` already AND-s in `ken_tasks_enabled`, which
+    // itself AND-s in `workspace_enabled`, so this one check transitively
+    // requires all three flags.
+    //
+    // Pipeline tickets live in the workspace tasks home only in v1 (D15) —
+    // these tools scan `.ken-workspace/tasks/` and `.ken-workspace/runs/`,
+    // never a project's or family's own task home, unlike the classic
+    // `task_*` tools above.
+    if ken_pipeline_enabled(&AppSettings::load(&server.base_dir)) {
+        let blocked_filter_schema = json!({
+            "type": "string",
+            "enum": ["any", "blocked", "notBlocked", "newlyUnblocked"],
+            "description": "\"blocked\": carries blocked_by and/or a block_reason (this is \"what is stuck and why\"). \"newlyUnblocked\": every blocker cleared but the ticket hasn't been moved back to its return lane yet — check this after finishing a ticket to see what freed up. \"notBlocked\"/\"any\" are the complement / no-op."
+        });
+        tools.push(json!({
+            "name": "pipeline_list",
+            "description": "THE CLAIM PROTOCOL, STEP 1 — discover work: page \
+through Ken's pipeline board (the ticket backlog can be large; this is the \
+only way an agent reads it — never all at once). Returns compact rows only \
+(id, title, lane, project symbol, model, assignee, block summary, updated) \
+— never a ticket's body, scope, or verify command; call pipeline_get with \
+an id for those. Default page size is 20, hard maximum 100; when more rows \
+match, the reply's last line is `cursor: <token>` — pass that back as \
+`cursor` to continue, and an empty/absent cursor on the reply means you've \
+reached the end. `filter.blocked: \"blocked\"` is the one call that answers \
+\"what is stuck and why\" — each row in that view names the ticket's \
+blockers, its reason, its return lane, and how long it has been blocked. \
+Note this tool does NOT tell you which tickets are ready for an agent to \
+claim right now — a ticket only becomes claimable once a human has \
+approved a run for it in the Ken app (kickoff), which files a `queued` run \
+record. Call pipeline_runs({\"state\": \"queued\"}) to see those, or \
+pipeline_digest for the daily-update view — then pipeline_claim(id, agent) \
+on the ticket named by a queued run's `ticket` field.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "properties": {
+                            "lane": { "type": "string", "description": "A lane id from the ticket's pipeline definition (e.g. \"tester\", \"blocked\")." },
+                            "pipeline": { "type": "string", "description": "A pipeline definition id (e.g. \"default\")." },
+                            "project": { "type": "string" },
+                            "model": { "type": "string", "description": "The ticket's own model override, or the lane's default model when the ticket has none." },
+                            "assignee": { "type": "string" },
+                            "blocked": blocked_filter_schema,
+                            "blockedBy": { "type": "string", "description": "A ticket id — return only tickets whose blocked_by lists it (a dependency search, e.g. \"what does finishing ticket X unblock\")." }
+                        }
+                    },
+                    "limit": { "type": "integer", "description": "Max rows to return (default 20, hard max 100)." },
+                    "cursor": { "type": "string", "description": "Opaque continuation token from a previous pipeline_list reply's `cursor:` line. Do not construct one by hand." }
+                }
+            }
+        }));
+        tools.push(json!({
+            "name": "pipeline_get",
+            "description": "The one pipeline tool that returns a full \
+ticket: its body, `scope` (the path globs that are the agent's file \
+boundary — D3: do not write outside them), `verify` (the command that \
+proves the lane's work; Ken never runs it, the claiming agent does and \
+reports the result via pipeline_advance), `bounces`, its blockers and \
+return lane, and a tail of its `## Log`. Call this right after \
+pipeline_claim, before doing any work, to read `scope`/`verify` for the \
+ticket you just claimed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "The ticket's id, from pipeline_list or pipeline_runs." } },
+                "required": ["id"]
+            }
+        }));
+        tools.push(json!({
+            "name": "pipeline_claim",
+            "description": "THE CLAIM PROTOCOL, STEP 2 — claim a ticket a \
+human has already approved a run for (see pipeline_list's description for \
+how to find one: pipeline_runs({\"state\": \"queued\"}) or \
+pipeline_digest). This call is not optional ceremony: it re-runs Ken's own \
+admission check server-side and, on success, writes a `running` run record \
+— that record IS what makes your work visible to Ken and to its stale-run \
+detector. An agent that edits files without calling pipeline_claim first is \
+invisible to Ken; its work will not be found, and the ticket will look \
+untouched. Refused when the ticket is blocked (no exceptions — an agent \
+cannot claim around a blocked ticket, ever), when the workspace's \
+concurrency cap is already full (the run stays queued; retry later), or \
+when the ticket still needs a human confirmation Ken hasn't gotten yet. On \
+success the reply names the ticket's `scope` and `verify` — call \
+pipeline_get for the full brief before writing anything. When you finish, \
+you MUST call pipeline_advance with the outcome; a claimed ticket with no \
+pipeline_advance call is a run Ken will eventually report as stale.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The ticket's id, from pipeline_list or pipeline_runs." },
+                    "agent": { "type": "string", "description": "Your agent identity — recorded on the run so a human can see who is doing the work." },
+                    "model": { "type": "string", "description": "Which model is doing the work. Defaults to the ticket's own model override, then the lane's default model." }
+                },
+                "required": ["id", "agent"]
+            }
+        }));
+        tools.push(json!({
+            "name": "pipeline_advance",
+            "description": "THE CLAIM PROTOCOL, STEP 3 — report back after \
+doing the work inside a claimed ticket's `scope` and running its `verify` \
+command yourself (Ken never runs `verify`; it only records what you \
+report). `outcome: \"pass\"` moves the ticket to its lane's `on_pass` \
+target; `outcome: \"fail\"` moves it to `on_fail` and counts as a bounce — \
+enough consecutive bounces trip the pipeline's retry cap, which blocks the \
+ticket for a human rather than looping forever. `report` is appended to \
+the ticket's ## Log and becomes the closed run's report. This closes \
+whichever run you opened with pipeline_claim (`running` → `pass`/`fail`, \
+or `blocked` if the retry cap tripped) — it is the other half of the claim \
+protocol; a claim with no matching advance call leaves your run stuck at \
+`running` until Ken reports it stale.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The ticket's id you claimed with pipeline_claim." },
+                    "outcome": { "type": "string", "enum": ["pass", "fail"] },
+                    "report": { "type": "string", "description": "What you did / found — appended to the ticket's ## Log and recorded as the run's report." },
+                    "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Optional: filenames written under .ken-workspace/artifacts/<ticket-id>/ for this run (D9 throwaway review material — never a member repo)." }
+                },
+                "required": ["id", "outcome", "report"]
+            }
+        }));
+        tools.push(json!({
+            "name": "pipeline_block",
+            "description": "Set or clear a ticket's block. `blockedBy` \
+takes ticket ids (ULIDs) ONLY, never file paths — a dependency must survive \
+the blocking ticket being renamed or moved, which a path cannot. Setting a \
+block removes the ticket from every agent's claimable queue immediately \
+(pipeline_claim on a blocked ticket always fails, with no exception for an \
+`auto` lane) and records `return_lane` — the lane the ticket will resume \
+in once unblocked — automatically; you cannot set `return_lane` yourself. \
+A dependency that would close a cycle (directly, or through a longer \
+chain) is refused before anything is written, with the full cycle path in \
+the error. To clear a block, pass `clear`: `{\"deps\": true}` and/or \
+`{\"reason\": true}` clear independently — a ticket blocked by both a \
+dependency and a stated reason stays blocked until both are cleared. \
+Clearing never restarts an agent by itself: the ticket returns to its \
+lane awaiting a human confirmation, exactly like a fresh kickoff.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The ticket's id." },
+                    "blockedBy": { "type": "array", "items": { "type": "string" }, "description": "Ticket ids (ULIDs) to add as dependencies. Never file paths." },
+                    "reason": { "type": "string", "description": "Free-text reason to set (or replace) — everything not captured by a ticket dependency." },
+                    "clear": {
+                        "type": "object",
+                        "description": "Present only to unblock. Independent flags: a dependency-blocked ticket keeps its bounce history when cleared; a retry-cap block resets its bounce counter.",
+                        "properties": {
+                            "deps": { "type": "boolean", "description": "Clear every blocked_by dependency." },
+                            "reason": { "type": "boolean", "description": "Clear the free-text block_reason." }
+                        }
+                    }
+                },
+                "required": ["id"]
+            }
+        }));
+        tools.push(json!({
+            "name": "pipeline_runs",
+            "description": "The watch surface over Ken's run ledger — the \
+append-only history pipeline_claim/pipeline_advance write to. Returns \
+`running` (currently claimed and being worked), `queued` (approved by a \
+human, waiting to be claimed — this is your claimable-work list), \
+`blocked` (runs closed because the ticket's retry cap tripped), \
+`waitingHuman` (tickets sitting at a confirmation gate — nobody has \
+approved a run yet, so there is nothing to claim), and `stale` (a `running` \
+record this Ken session has no live memory of — e.g. Ken restarted mid-run \
+— never treated as passed). Pass `state` to see only one group.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "enum": ["running", "queued", "blocked", "waitingHuman", "stale", "all"], "description": "Default \"all\"." }
+                }
+            }
+        }));
+        tools.push(json!({
+            "name": "pipeline_digest",
+            "description": "The daily update, grouped in a fixed order: \
+tickets awaiting human review first, then tickets newly unblocked \
+overnight (each with its return lane — the ticket is waiting at a \
+confirmation, nothing started by itself), then blocked tickets oldest \
+first (each with its root blocker, reason, and how long it's been stuck), \
+then tickets that moved today, new ideas filed by the documentation lane, \
+and stale runs. When Ken's memory feature is on, calling this also \
+appends the digest to today's workspace journal.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "day": { "type": "string", "description": "YYYY-MM-DD; defaults to today. Changes what counts as \"today\" for the moved/new-ideas groups — the board itself is always current." } }
+            }
+        }));
+    }
+
     // ken-families (tasks 3.1-3.4): three new tools, gated on `kenFamilies`
     // the same way the blocks above gate theirs — absent from the list
     // entirely when the flag is off. `task_list`/`task_update`/
@@ -585,6 +798,13 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "task_list" => task_list_tool(server, args),
         "task_update" => task_update_tool(server, args),
         "task_complete" => task_complete_tool(server, args),
+        "pipeline_list" => pipeline_list_tool(server, args),
+        "pipeline_get" => pipeline_get_tool(server, args),
+        "pipeline_claim" => pipeline_claim_tool(server, args),
+        "pipeline_advance" => pipeline_advance_tool(server, args),
+        "pipeline_block" => pipeline_block_tool(server, args),
+        "pipeline_runs" => pipeline_runs_tool(server, args),
+        "pipeline_digest" => pipeline_digest_tool(server, args),
         "family_list" => family_list_tool(server),
         "family_inbox" => family_inbox_tool(server, args),
         "family_send" => family_send_tool(server, args),
@@ -1618,6 +1838,940 @@ project's task home, or any attached family board"
     Ok(msg)
 }
 
+// --- ken-pipeline tools (task 3.1-3.9) ---
+//
+// The seven tools below are **the runner** for design D14's v1 `mcp` pull
+// model: Ken itself never spawns a process; an external agent discovers
+// claimable work (pipeline_list / pipeline_runs / pipeline_digest), claims
+// it (pipeline_claim — re-runs `pipeline::admit` server-side, which is the
+// ONLY function allowed to decide whether a run may start; this layer
+// never re-derives the blocked-refusal or cap logic), does the work inside
+// the ticket's `scope`, and reports back (pipeline_advance — routes
+// through `pipeline::advance`, which owns bounce accounting and the
+// retry-cap-to-block escalation). `pipeline_block` is the third write
+// path, routed through `pipeline::block`/`unblock` so cycle detection and
+// `return_lane` capture cannot be bypassed (D5).
+//
+// D15: pipeline tickets live in the workspace tasks home only in v1, so —
+// unlike the classic `task_*` tools' `TaskHomes` above — every tool here
+// scans exactly one home: `.ken-workspace/tasks/`, plus
+// `.ken-workspace/pipelines/` and `.ken-workspace/runs/`. Every call
+// re-checks `ken_pipeline_enabled` (`require_pipeline_flag`) — defense in
+// depth, since an MCP client can invoke any tool name whether or not
+// `tools/list` advertised it.
+
+/// `.ken-workspace/pipelines/*.md`, parsed. Reproduction of src-tauri's
+/// own `pipelines_scan` (`lib.rs`) — duplicated rather than exported from
+/// ken-core because `crates/**` is read-only for this session (task
+/// brief); kept byte-identical in behaviour (sorted paths, tolerant parse,
+/// missing directory reads as no pipelines).
+fn pipelines_scan(ws_root: &Path) -> Vec<pipeline::Pipeline> {
+    let dir = pipeline::pipelines_dir(ws_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok().map(|raw| pipeline::parse_pipeline(&p, &raw)))
+        .collect()
+}
+
+/// Every run record under `.ken-workspace/runs/YYYY-MM/*.md`, with its
+/// path (needed to close a specific run — `RunRecord` carries no path,
+/// only `id`). Mirrors src-tauri's `run_ledger_scan_with_paths`.
+fn run_ledger_scan_with_paths(ws_root: &Path) -> Vec<(PathBuf, pipeline::RunRecord)> {
+    let mut out = Vec::new();
+    let runs_dir = pipeline::runs_dir(ws_root);
+    let Ok(months) = std::fs::read_dir(&runs_dir) else { return out };
+    for month in months.flatten() {
+        let month_path = month.path();
+        if !month_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&month_path) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "md") {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    out.push((path.clone(), pipeline::parse_run(&path, &raw)));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_ledger_scan(ws_root: &Path) -> Vec<pipeline::RunRecord> {
+    run_ledger_scan_with_paths(ws_root).into_iter().map(|(_, r)| r).collect()
+}
+
+/// The most recently started still-open (`queued`/`running`) run for a
+/// ticket. Mirrors src-tauri's `find_open_run`.
+fn find_open_run<'a>(runs: &'a [(PathBuf, pipeline::RunRecord)], ticket_id: &str) -> Option<&'a (PathBuf, pipeline::RunRecord)> {
+    runs.iter()
+        .filter(|(_, r)| {
+            r.ticket.eq_ignore_ascii_case(ticket_id)
+                && matches!(r.outcome, Some(pipeline::RunOutcome::Queued) | Some(pipeline::RunOutcome::Running))
+        })
+        .max_by(|a, b| a.1.started.cmp(&b.1.started))
+}
+
+/// Load the workspace's pipeline board (D15: workspace tasks home only) —
+/// every pipeline definition, plus every workspace-home task with
+/// `Task::lane` resolved against them (`pipeline::resolve_board`).
+fn load_pipeline_board(server: &Server) -> Result<(PathBuf, Vec<tasks::Task>, Vec<pipeline::Pipeline>), String> {
+    let ws_root = resolve_workspace_root(server)?;
+    let pipelines = pipelines_scan(&ws_root);
+    let home = tasks::TaskHome::Workspace { workspace_root: &ws_root };
+    let mut tasks_list = tasks::scan_tasks(&[home]).map_err(|e| e.to_string())?;
+    pipeline::resolve_board(&mut tasks_list, &pipelines);
+    Ok((ws_root, tasks_list, pipelines))
+}
+
+/// A ticket by id that resolved to a real pipeline lane
+/// (`Task::lane.is_some()`, set only by `pipeline::resolve_board` when
+/// both the ticket's `pipeline:` id and its `status` lane resolve).
+/// Mirrors src-tauri's `find_pipeline_ticket`: a classic (non-pipeline)
+/// ticket, or a pipeline ticket sitting in an unresolvable lane/pipeline,
+/// is refused here rather than partially handled — that belongs to Ken's
+/// needs-attention tray, not an agent run.
+fn find_pipeline_ticket<'a>(tasks_list: &'a [tasks::Task], id: &str) -> Result<&'a tasks::Task, String> {
+    let t = tasks::find_by_id(tasks_list, id)
+        .ok_or_else(|| format!("no pipeline ticket with id '{id}' in the workspace tasks home"))?;
+    if t.lane.is_none() {
+        return Err(format!(
+            "ticket '{id}' is not a pipeline ticket, or its lane/pipeline could not be resolved — call pipeline_get or check Ken's needs-attention tray"
+        ));
+    }
+    Ok(t)
+}
+
+/// `(today, now)` — `today` (`YYYY-MM-DD`) is the `updated` convention
+/// every ken-tasks patch uses; `now` (`YYYY-MM-DDTHH:MM:SSZ`) is the full
+/// timestamp convention `started`/`ended`/`blocked_at` use. Both derived
+/// from the one UTC clock read `today_and_time_utc` already owns (module
+/// doc: "no date/time crate is a ken-core dependency"), so this session
+/// adds no new time source, just the two renderings ken-pipeline's own
+/// fields need.
+fn today_and_iso_now_utc() -> (String, String) {
+    let (today, time_hhmm) = today_and_time_utc();
+    let now = format!("{today}T{time_hhmm}:00Z");
+    (today, now)
+}
+
+/// Reproduction of `tasks::TaskPatch`'s private `edits()` method. Needed
+/// because closing a transition/block in one guarded write requires a
+/// frontmatter patch AND a `## Log` body append together (`tasks::
+/// apply_edits`'s whole point), and `ken_core::tasks::apply_patch_with_
+/// pipelines` hard-codes `append_body: None`. Field list, key order, and
+/// the `lane`/`status` mutual-exclusivity rule are read off `tasks.rs`
+/// directly and reuse the same `pub` `scalar_lines`/`seq_lines` renderers,
+/// so the rendered bytes are byte-identical to what the private method
+/// would produce — a reproduction of public rendering rules, not a second
+/// patch core (mirrors src-tauri's own `pipeline_patch_edits`, forced by
+/// the same `crates/**` read-only constraint).
+fn pipeline_patch_edits(patch: &tasks::TaskPatch) -> Vec<(&'static str, Vec<String>)> {
+    let mut out: Vec<(&'static str, Vec<String>)> = Vec::new();
+    if let Some(v) = &patch.title {
+        out.push(("title", tasks::scalar_lines("title", v)));
+    }
+    if let Some(v) = &patch.lane {
+        out.push(("status", tasks::scalar_lines("status", v)));
+    } else if let Some(v) = patch.status {
+        out.push(("status", tasks::scalar_lines("status", v.as_str())));
+    }
+    if let Some(v) = patch.kind {
+        out.push(("kind", tasks::scalar_lines("kind", v.as_str())));
+    }
+    if let Some(v) = &patch.assignee {
+        out.push(("assignee", tasks::scalar_lines("assignee", v)));
+    }
+    if let Some(v) = &patch.project {
+        out.push(("project", tasks::scalar_lines("project", v)));
+    }
+    if let Some(v) = &patch.tags {
+        out.push(("tags", tasks::seq_lines("tags", v)));
+    }
+    if let Some(v) = &patch.due {
+        out.push(("due", tasks::scalar_lines("due", v)));
+    }
+    if let Some(v) = &patch.goal {
+        out.push(("goal", tasks::scalar_lines("goal", v)));
+    }
+    if let Some(v) = patch.board {
+        out.push(("board", tasks::scalar_lines("board", v.as_str())));
+    }
+    if let Some(v) = &patch.pipeline {
+        out.push(("pipeline", tasks::scalar_lines("pipeline", v)));
+    }
+    if let Some(v) = &patch.model {
+        out.push(("model", tasks::scalar_lines("model", v)));
+    }
+    if let Some(v) = &patch.agent {
+        out.push(("agent", tasks::scalar_lines("agent", v)));
+    }
+    if let Some(v) = &patch.scope {
+        out.push(("scope", tasks::seq_lines("scope", v)));
+    }
+    if let Some(v) = &patch.verify {
+        out.push(("verify", tasks::scalar_lines("verify", v)));
+    }
+    if let Some(v) = patch.bounces {
+        out.push(("bounces", tasks::scalar_lines("bounces", &v.to_string())));
+    }
+    if let Some(v) = &patch.return_lane {
+        out.push(("return_lane", tasks::scalar_lines("return_lane", v)));
+    }
+    if let Some(v) = &patch.blocked_by {
+        out.push(("blocked_by", tasks::seq_lines("blocked_by", v)));
+    }
+    if let Some(v) = &patch.block_reason {
+        out.push(("block_reason", tasks::scalar_lines("block_reason", v)));
+    }
+    if let Some(v) = &patch.blocked_at {
+        out.push(("blocked_at", tasks::scalar_lines("blocked_at", v)));
+    }
+    if let Some(v) = &patch.parent {
+        out.push(("parent", tasks::scalar_lines("parent", v)));
+    }
+    if let Some(v) = &patch.spawned_by {
+        out.push(("spawned_by", tasks::scalar_lines("spawned_by", v)));
+    }
+    if let Some(v) = &patch.origin {
+        out.push(("origin", tasks::scalar_lines("origin", v)));
+    }
+    if let Some(v) = &patch.projects {
+        out.push(("projects", tasks::seq_lines("projects", v)));
+    }
+    if let Some(v) = &patch.target {
+        out.push(("target", tasks::scalar_lines("target", v)));
+    }
+    out
+}
+
+/// The `## Log` body addition a transition/block/unblock composes: a
+/// heading only if the body doesn't already have one, then `line`
+/// verbatim. Mirrors src-tauri's `compose_pipeline_log_addition`.
+fn compose_pipeline_log_addition(body: &str, line: &str) -> String {
+    let has_heading = body.lines().any(|l| l.trim_end().eq_ignore_ascii_case(tasks::LOG_HEADING));
+    let mut out = String::new();
+    if !has_heading {
+        out.push_str(tasks::LOG_HEADING);
+        out.push_str("\n\n");
+    }
+    out.push_str(line.trim());
+    out.push('\n');
+    out
+}
+
+/// Apply a `TaskPatch` (as composed by `pipeline::advance`/`block`/
+/// `unblock`) plus an optional `## Log` addition, in one guarded write.
+/// Mirrors src-tauri's `apply_pipeline_patch`: refuses to touch a ticket
+/// whose on-disk lane/status this pipeline set can't resolve, unless the
+/// patch itself resolves it (`patch.sets_status()`) — "never write around
+/// a lane it can't validate" (D2).
+fn apply_pipeline_patch(
+    path: &Path,
+    patch: &tasks::TaskPatch,
+    updated: &str,
+    pipelines: &[pipeline::Pipeline],
+    log_addition: Option<&str>,
+) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut current = tasks::parse_task(path, tasks::HomeKind::Workspace, "", &raw);
+    pipeline::resolve_task_lane(&mut current, pipelines);
+    if current.has_invalid_status() && !patch.sets_status() {
+        return Err(format!(
+            "ticket '{}' has an unrecognized lane — resolve it before patching other keys",
+            current.id
+        ));
+    }
+    let mut edits = pipeline_patch_edits(patch);
+    edits.push(("updated", tasks::scalar_lines("updated", updated)));
+    match log_addition {
+        Some(line) => {
+            let f = |body: &str| compose_pipeline_log_addition(body, line);
+            tasks::apply_edits(path, &edits, Some(&f)).map_err(|e| e.to_string())
+        }
+        None => tasks::apply_edits(path, &edits, None).map_err(|e| e.to_string()),
+    }
+}
+
+/// Close a run record: `ended`/`outcome`/(optionally) `artifacts` as
+/// frontmatter edits, the agent's `report` as the body (the run's body
+/// starts empty at claim time, so this is the report becoming the whole
+/// body). Mirrors src-tauri's `close_run_record`.
+fn close_run_record(path: &Path, outcome: pipeline::RunOutcome, report: &str, artifacts: &[String]) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let (_, now) = today_and_iso_now_utc();
+    let mut edits: Vec<(&str, Vec<String>)> = vec![
+        ("ended", tasks::scalar_lines("ended", &now)),
+        ("outcome", tasks::scalar_lines("outcome", outcome.as_str())),
+    ];
+    if !artifacts.is_empty() {
+        edits.push(("artifacts", tasks::seq_lines("artifacts", artifacts)));
+    }
+    let next = tasks::patch_text(&raw, &edits, Some(report));
+    std::fs::write(path, next).map_err(|e| e.to_string())
+}
+
+/// A fresh run record for a ticket a claim is about to start or queue.
+fn new_run_record(
+    ticket: &tasks::Task,
+    pl: &pipeline::Pipeline,
+    lane: &pipeline::Lane,
+    fields: &pipeline::TicketFields,
+    agent: &str,
+    model_arg: Option<&str>,
+    outcome: pipeline::RunOutcome,
+    now: &str,
+) -> pipeline::RunRecord {
+    let model = model_arg
+        .map(str::to_string)
+        .or_else(|| fields.model.clone())
+        .or_else(|| lane.model.clone())
+        .unwrap_or_default();
+    pipeline::RunRecord {
+        id: tasks::new_ulid(),
+        ticket: ticket.id.clone(),
+        pipeline: pl.id.clone(),
+        lane: lane.id.clone(),
+        agent: agent.to_string(),
+        model,
+        scope: fields.scope.clone(),
+        verify: fields.verify.clone().unwrap_or_default(),
+        started: now.to_string(),
+        ended: String::new(),
+        outcome: Some(outcome),
+        outcome_raw: outcome.as_str().to_string(),
+        artifacts: Vec::new(),
+        report: String::new(),
+    }
+}
+
+fn write_new_run(ws_root: &Path, record: &pipeline::RunRecord) -> Result<(), String> {
+    let month = pipeline::run_month(&record.started);
+    let dir = pipeline::run_month_dir(ws_root, &month);
+    let path = pipeline::run_path(ws_root, &month, &record.id);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(&path, pipeline::compose_run(record)).map_err(|e| e.to_string())
+}
+
+// -- Readable error strings for the ken-core refusal/issue enums that do
+// NOT derive `Serialize`-to-text on their own (only their "successful
+// outcome" siblings matter to a caller that just wants JSON — a text tool
+// reply needs prose). Converting rather than deriving `Display`:
+// `crates/**` is read-only this session. Mirrors src-tauri's own
+// `describe_*` functions (`lib.rs`), independently reproduced here for the
+// same reason `pipeline_patch_edits` is. --
+
+fn describe_confirm_reason(r: &pipeline::ConfirmReason) -> String {
+    match r {
+        pipeline::ConfirmReason::LaneGate => {
+            "this lane requires a human confirmation (kickoff: confirm) in the Ken app before any run may start".to_string()
+        }
+        pipeline::ConfirmReason::ManualKickoff => {
+            "this lane is kickoff: manual — it never starts a run by itself; a human must kick it off in the Ken app first".to_string()
+        }
+        pipeline::ConfirmReason::MissingBoundary { scope, verify } => {
+            let mut missing = Vec::new();
+            if *scope {
+                missing.push("scope");
+            }
+            if *verify {
+                missing.push("verify");
+            }
+            format!(
+                "the ticket is missing {} — a ticket lacking either can never auto-run; add it, or a human must confirm the run in the Ken app",
+                missing.join(" and ")
+            )
+        }
+        pipeline::ConfirmReason::Unblocked => {
+            "the ticket just returned from being blocked — an unblock always re-enters through a confirmation, never straight into a run".to_string()
+        }
+        pipeline::ConfirmReason::AutoDisabled => {
+            "this lane is kickoff: auto but the pipeline's auto master switch is off".to_string()
+        }
+    }
+}
+
+fn describe_refusal_reason(r: &pipeline::RefusalReason) -> String {
+    match r {
+        pipeline::RefusalReason::Blocked { return_lane, blocked_by, block_reason } => {
+            let mut parts = vec!["the ticket is blocked".to_string()];
+            if let Some(rl) = return_lane {
+                parts.push(format!("returns to '{rl}'"));
+            }
+            if !blocked_by.is_empty() {
+                parts.push(format!("blocked by {}", blocked_by.join(", ")));
+            }
+            if let Some(reason) = block_reason {
+                parts.push(reason.clone());
+            }
+            parts.join(" — ")
+        }
+        pipeline::RefusalReason::HumanLane { lane: l } => format!("lane '{l}' is a human sign-off lane — no agent, no kickoff"),
+        pipeline::RefusalReason::NoAgent { lane: l } => format!("lane '{l}' has no agent — it is a holding column"),
+        pipeline::RefusalReason::ManualLane { lane: l } => {
+            format!("lane '{l}' is kickoff: manual and was reached by something other than a human asking")
+        }
+    }
+}
+
+fn describe_transition_refusal(r: &pipeline::TransitionRefusal) -> String {
+    match r {
+        pipeline::TransitionRefusal::UnknownLane { status: s } => format!("ticket's status '{s}' names no lane"),
+        pipeline::TransitionRefusal::NoEdge { lane, outcome } => {
+            format!("lane '{lane}' declares no {} edge", outcome.as_str())
+        }
+        pipeline::TransitionRefusal::UnknownTarget { lane, target } => {
+            format!("lane '{lane}' points to unknown lane '{target}'")
+        }
+        pipeline::TransitionRefusal::NoBlockedLane => {
+            "this pipeline declares no blocked lane to escalate the retry-cap breach into".to_string()
+        }
+    }
+}
+
+fn describe_block_refusal(r: &pipeline::BlockRefusal) -> String {
+    match r {
+        pipeline::BlockRefusal::NoBlockedLane => "this pipeline declares no blocked lane".to_string(),
+        pipeline::BlockRefusal::UnknownLane { status: s } => format!("ticket's current status '{s}' names no lane"),
+        pipeline::BlockRefusal::MissingReturnLane => {
+            "ticket is already blocked but its return lane is missing or orphaned — resolve it in Ken's needs-attention tray first".to_string()
+        }
+        pipeline::BlockRefusal::Empty => "neither a dependency nor a reason was given".to_string(),
+        pipeline::BlockRefusal::PathBlocker(s) => {
+            format!("'{s}' looks like a path, not a ticket id — blockedBy must hold ticket ids (ULIDs), never paths")
+        }
+        pipeline::BlockRefusal::MalformedBlocker(s) => format!("'{s}' is not a valid ticket id (ULID)"),
+        pipeline::BlockRefusal::SelfBlock(s) => format!("a ticket cannot block itself ('{s}')"),
+        pipeline::BlockRefusal::Cycle(c) => format!("blocking on this would close a dependency cycle: {}", c.render()),
+    }
+}
+
+fn describe_unblock_refusal(r: &pipeline::UnblockRefusal) -> String {
+    match r {
+        pipeline::UnblockRefusal::NotBlocked => "ticket is not blocked".to_string(),
+        pipeline::UnblockRefusal::MissingReturnLane => {
+            "ticket's return lane is missing or names a lane the pipeline no longer declares".to_string()
+        }
+        pipeline::UnblockRefusal::Empty => "neither clear.deps nor clear.reason was set".to_string(),
+    }
+}
+
+/// A project's display symbol (D12/OPEN-2, `ProjectConfig::symbol`), by
+/// project name — best-effort: an unregistered or unreadable project name
+/// simply contributes no symbol rather than failing the whole call (a
+/// pipeline ticket's `project` string is free text, not a foreign key).
+fn project_symbol(server: &Server, project_name: &str) -> Option<String> {
+    if project_name.trim().is_empty() {
+        return None;
+    }
+    let registry = Registry::load(&server.base_dir).ok()?;
+    let entry = registry.projects.iter().find(|p| p.name.eq_ignore_ascii_case(project_name))?;
+    let project = Project::open(&entry.path).ok()?;
+    project.config.symbol().map(str::to_string)
+}
+
+/// The `## Log` section of a ticket's body, tail-truncated to `max_chars`
+/// on a UTF-8 boundary (`pipeline_get`'s "log tail"). Empty when the body
+/// has no `## Log` heading yet.
+fn log_tail(body: &str, max_chars: usize) -> String {
+    let lower = body.to_ascii_lowercase();
+    let Some(pos) = lower.find(&tasks::LOG_HEADING.to_ascii_lowercase()) else {
+        return String::new();
+    };
+    let section = &body[pos..];
+    if section.len() <= max_chars {
+        return section.to_string();
+    }
+    let start = floor_char_boundary_at(section.as_bytes(), section.len() - max_chars);
+    format!("... (truncated)\n{}", &section[start..])
+}
+
+/// `pipeline_list` (task 3.1): the pipeline board's read side, paged.
+/// Compact rows only — id, title, lane, project symbol, model, assignee,
+/// block summary, updated — **never a ticket's body**; `pipeline_get`
+/// returns that. Default page size 20, hard max 100, opaque cursor (the
+/// last row's id — paging asks for everything strictly after it, so a
+/// board mutated between pages can only ever skip or repeat a boundary
+/// row, never loop).
+fn pipeline_list_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_list")?;
+    let (_ws_root, tasks_list, pipelines) = load_pipeline_board(server)?;
+
+    let filter_obj = args.get("filter");
+    let get_str = |key: &str| -> Option<String> {
+        filter_obj
+            .and_then(|o| o.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut filter = tasks::TaskFilter::default();
+    filter.lane = get_str("lane");
+    filter.pipeline = get_str("pipeline");
+    filter.project = get_str("project");
+    filter.assignee = get_str("assignee").map(|a| tasks::AssigneeFilter::parse(&a));
+    let model_filter = get_str("model");
+    if let Some(id) = get_str("blockedBy") {
+        filter.blocked = Some(tasks::BlockedFilter::By(id));
+    } else if let Some(b) = get_str("blocked") {
+        filter.blocked = Some(match b.as_str() {
+            "any" => tasks::BlockedFilter::Any,
+            "blocked" => tasks::BlockedFilter::Blocked,
+            "notBlocked" => tasks::BlockedFilter::NotBlocked,
+            "newlyUnblocked" => tasks::BlockedFilter::NewlyUnblocked,
+            other => {
+                return Err(format!(
+                    "invalid \"blocked\" {other:?} in filter — use any, blocked, notBlocked, or newlyUnblocked"
+                ))
+            }
+        });
+    }
+
+    let mut hits: Vec<&tasks::Task> = tasks::filter_tasks(&tasks_list, &filter)
+        .into_iter()
+        .filter(|t| t.lane.is_some())
+        .collect();
+    if let Some(m) = &model_filter {
+        hits.retain(|t| {
+            let f = pipeline::ticket_fields(t);
+            let lane_default = f
+                .pipeline
+                .as_deref()
+                .and_then(|pid| pipeline::find_pipeline(&pipelines, pid))
+                .and_then(|p| pipeline::resolve_lane(p, &t.status_raw))
+                .and_then(|l| l.model.clone());
+            f.model.clone().or(lane_default).is_some_and(|em| em.eq_ignore_ascii_case(m))
+        });
+    }
+    // Deterministic paging order: id ascending — ULIDs are time-sortable,
+    // so this also reads as roughly creation order.
+    hits.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let hard_max = 100usize;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|l| (l as usize).clamp(1, hard_max))
+        .unwrap_or(20);
+    let cursor = args.get("cursor").and_then(Value::as_str);
+    let start = match cursor {
+        None => 0,
+        Some(c) => hits.iter().position(|t| t.id == c).map(|i| i + 1).unwrap_or(0),
+    };
+    let page: Vec<&tasks::Task> = hits.iter().skip(start).take(limit).copied().collect();
+
+    if page.is_empty() {
+        return Ok("No tickets match that filter.".to_string());
+    }
+    let mut out = format!(
+        "{} ticket{} match (showing {}):\n",
+        hits.len(),
+        if hits.len() == 1 { "" } else { "s" },
+        page.len()
+    );
+    for t in &page {
+        let f = pipeline::ticket_fields(t);
+        let symbol = project_symbol(server, &t.project);
+        let block_summary = if !f.blocked_by.is_empty() || f.block_reason.is_some() {
+            let mut parts = Vec::new();
+            if !f.blocked_by.is_empty() {
+                parts.push(format!("by {}", f.blocked_by.join(",")));
+            }
+            if let Some(r) = &f.block_reason {
+                parts.push(r.clone());
+            }
+            format!(" BLOCKED({})", parts.join("; "))
+        } else if f.return_lane.is_some() {
+            " newly-unblocked".to_string()
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "\n{} — \"{}\" [lane={}{}] model={} assignee={} updated={}{}",
+            t.id,
+            t.title,
+            t.lane.as_deref().unwrap_or("?"),
+            symbol.map(|s| format!(" {s}")).unwrap_or_default(),
+            f.model.as_deref().unwrap_or("-"),
+            if t.assignee.is_empty() { "none" } else { &t.assignee },
+            t.updated,
+            block_summary,
+        ));
+    }
+    if start + page.len() < hits.len() {
+        out.push_str(&format!("\n\ncursor: {}", page.last().unwrap().id));
+    }
+    Ok(out)
+}
+
+/// `pipeline_get` (task 3.2): the one tool returning a full ticket.
+fn pipeline_get_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_get")?;
+    let id = require_str(args, "id")?;
+    let (_ws_root, tasks_list, _pipelines) = load_pipeline_board(server)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &id)?;
+    let f = pipeline::ticket_fields(ticket);
+    let graph = pipeline::BlockGraph::from_tasks(&tasks_list);
+    let root = pipeline::root_blockers(&graph, &ticket.id);
+
+    let mut out = format!(
+        "{} — \"{}\"\nlane={} pipeline={} model={} agent={} bounces={} updated={}\nscope=[{}]\nverify={}\n",
+        ticket.id,
+        ticket.title,
+        ticket.lane.as_deref().unwrap_or("?"),
+        f.pipeline.as_deref().unwrap_or("-"),
+        f.model.as_deref().unwrap_or("-"),
+        f.agent.as_deref().unwrap_or("-"),
+        f.bounces,
+        ticket.updated,
+        f.scope.join(", "),
+        f.verify.as_deref().unwrap_or("(none — cannot auto-run under any lane setting)"),
+    );
+    if !f.blocked_by.is_empty() || f.block_reason.is_some() {
+        out.push_str(&format!(
+            "BLOCKED — blocked_by=[{}] reason={} return_lane={} root_blockers=[{}]\n",
+            f.blocked_by.join(", "),
+            f.block_reason.as_deref().unwrap_or("-"),
+            f.return_lane.as_deref().unwrap_or("-"),
+            root.join(", "),
+        ));
+    }
+    out.push_str("\n--- body ---\n");
+    out.push_str(&ticket.body);
+    let tail = log_tail(&ticket.body, 2000);
+    if !tail.is_empty() {
+        out.push_str("\n\n--- log tail ---\n");
+        out.push_str(&tail);
+    }
+    Ok(out)
+}
+
+/// `pipeline_claim` (task 3.3): re-runs `pipeline::admit` server-side with
+/// `EntryKind::Claim` — the single admission function (D5) — and only on
+/// `Admission::Start` does this write a `running` run record. Reuses an
+/// already-`queued` run (filed by a human's kickoff in the Ken app) when
+/// one exists, flipping it to `running`; otherwise files a fresh one, so
+/// the claim protocol works whether or not a UI kickoff preceded it.
+/// Refuses (writing nothing) when the ticket is blocked or the lane is
+/// structurally unrunnable, and refuses — leaving/filing a `queued` record
+/// — when `admit` reports the concurrency cap is full or the ticket still
+/// needs a human confirmation an MCP agent cannot supply on its own.
+fn pipeline_claim_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_claim")?;
+    let id = require_str(args, "id")?;
+    let agent = require_str(args, "agent")?;
+    let model_arg = opt_str(args, "model");
+
+    let (ws_root, tasks_list, pipelines) = load_pipeline_board(server)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &id)?;
+    let fields = pipeline::ticket_fields(ticket);
+    let pipeline_id = fields.pipeline.clone().ok_or_else(|| format!("ticket '{id}' has no pipeline key"))?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or_else(|| format!("pipeline '{pipeline_id}' is not loaded"))?;
+    let lane = pipeline::resolve_lane(pl, &ticket.status_raw)
+        .ok_or_else(|| format!("ticket '{id}' status '{}' names no lane in pipeline '{pipeline_id}'", ticket.status_raw))?;
+
+    let runs_with_paths = run_ledger_scan_with_paths(&ws_root);
+    // Judgment call beyond `admit`'s own cross-product (which counts
+    // running records workspace-wide against the cap, not per-ticket): a
+    // ticket already `running` cannot be claimed a second time, whatever
+    // the cap says. `admit` has no opinion on this (it has no per-ticket
+    // "already claimed" concept), so it is checked here, before `admit`
+    // runs at all, and — like every other refusal path — writes nothing.
+    if let Some((_, existing)) = runs_with_paths
+        .iter()
+        .find(|(_, r)| r.ticket.eq_ignore_ascii_case(&id) && r.outcome == Some(pipeline::RunOutcome::Running))
+    {
+        return Err(format!(
+            "ticket '{id}' is already claimed and running (agent '{}', run '{}') — call pipeline_advance to close it before claiming again",
+            existing.agent, existing.id
+        ));
+    }
+
+    let runs: Vec<pipeline::RunRecord> = runs_with_paths.iter().map(|(_, r)| r.clone()).collect();
+    let admission = pipeline::admit(ticket, lane, pl, &runs, pipeline::EntryKind::Claim);
+    match admission {
+        pipeline::Admission::Refused { reason } => Err(format!("claim refused: {}", describe_refusal_reason(&reason))),
+        pipeline::Admission::Confirm { reason } => Err(format!(
+            "claim refused: {} — an MCP agent cannot accept a confirmation on the ticket's behalf; ask a human to approve it in the Ken app, then retry the claim",
+            describe_confirm_reason(&reason)
+        )),
+        pipeline::Admission::Queued { running, cap } => {
+            let (_, now) = today_and_iso_now_utc();
+            let run_id = match find_open_run(&runs_with_paths, &id) {
+                Some((_, existing)) => existing.id.clone(),
+                None => {
+                    let record = new_run_record(ticket, pl, lane, &fields, &agent, model_arg.as_deref(), pipeline::RunOutcome::Queued, &now);
+                    write_new_run(&ws_root, &record)?;
+                    record.id
+                }
+            };
+            Err(format!(
+                "claim refused: the concurrency cap is full ({running}/{cap} running) — ticket '{id}' stays queued as run '{run_id}'; retry later or call pipeline_runs to watch it"
+            ))
+        }
+        pipeline::Admission::Start => {
+            let (_, now) = today_and_iso_now_utc();
+            let model = model_arg
+                .clone()
+                .or_else(|| fields.model.clone())
+                .or_else(|| lane.model.clone())
+                .unwrap_or_default();
+            let record = match find_open_run(&runs_with_paths, &id) {
+                Some((path, existing)) if existing.outcome == Some(pipeline::RunOutcome::Queued) => {
+                    let edits: Vec<(&str, Vec<String>)> = vec![
+                        ("agent", tasks::scalar_lines("agent", &agent)),
+                        ("model", tasks::scalar_lines("model", &model)),
+                        ("started", tasks::scalar_lines("started", &now)),
+                        ("outcome", tasks::scalar_lines("outcome", pipeline::RunOutcome::Running.as_str())),
+                    ];
+                    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+                    let next = tasks::patch_text(&raw, &edits, None);
+                    std::fs::write(path, next).map_err(|e| e.to_string())?;
+                    pipeline::RunRecord {
+                        agent: agent.clone(),
+                        model,
+                        started: now,
+                        outcome: Some(pipeline::RunOutcome::Running),
+                        outcome_raw: pipeline::RunOutcome::Running.as_str().to_string(),
+                        ..existing.clone()
+                    }
+                }
+                _ => {
+                    let record = new_run_record(ticket, pl, lane, &fields, &agent, model_arg.as_deref(), pipeline::RunOutcome::Running, &now);
+                    write_new_run(&ws_root, &record)?;
+                    record
+                }
+            };
+            server.known_running.borrow_mut().insert(record.id.clone());
+            Ok(format!(
+                "Claimed ticket '{}' (\"{}\") in lane '{}' — run '{}' now running (agent '{}', model '{}'). scope=[{}] verify={}. Call pipeline_get(\"{}\") for the full brief before writing anything, then pipeline_advance(\"{}\", \"pass\"|\"fail\", report) when done — an unreported claim eventually shows up as a stale run.",
+                ticket.id,
+                ticket.title,
+                lane.id,
+                record.id,
+                record.agent,
+                record.model,
+                record.scope.join(", "),
+                if record.verify.is_empty() { "(none)".to_string() } else { record.verify.clone() },
+                ticket.id,
+                ticket.id,
+            ))
+        }
+    }
+}
+
+/// `pipeline_advance` (task 3.4): resolve the target lane via `pipeline::
+/// advance` (bounce accounting and the retry-cap-to-block escalation both
+/// live there, never re-derived here), apply the resulting patch + `##
+/// Log` line in one guarded write, and close whichever run is currently
+/// open for this ticket (best-effort — a ticket advanced with no matching
+/// open run on the ledger still advances, D13: "derived, not owned").
+fn pipeline_advance_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_advance")?;
+    let id = require_str(args, "id")?;
+    let outcome_str = require_str(args, "outcome")?;
+    let outcome = pipeline::AdvanceOutcome::parse(&outcome_str)
+        .ok_or_else(|| format!("invalid \"outcome\" {outcome_str:?} — use pass or fail"))?;
+    let report = require_str(args, "report")?;
+    let artifacts: Vec<String> = args
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let (ws_root, tasks_list, pipelines) = load_pipeline_board(server)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &id)?;
+    let path = ticket.path.clone();
+    let pipeline_id = pipeline::ticket_fields(ticket).pipeline.clone().ok_or_else(|| format!("ticket '{id}' has no pipeline key"))?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or_else(|| format!("pipeline '{pipeline_id}' is not loaded"))?;
+
+    let (today, now) = today_and_iso_now_utc();
+    let transition = pipeline::advance(ticket, pl, outcome, &now);
+    let (patch, log) = match &transition {
+        pipeline::Transition::Moved { patch, log, .. } => (patch, log.clone()),
+        pipeline::Transition::Blocked { patch, log, .. } => (patch, log.clone()),
+        pipeline::Transition::Refused { reason } => {
+            return Err(format!("advance refused: {}", describe_transition_refusal(reason)))
+        }
+    };
+    apply_pipeline_patch(&path, patch, &today, &pipelines, Some(&log))?;
+
+    let runs_with_paths = run_ledger_scan_with_paths(&ws_root);
+    let mut closed_note = String::new();
+    if let Some((run_path, open_run)) = find_open_run(&runs_with_paths, &id) {
+        let run_outcome = match &transition {
+            pipeline::Transition::Blocked { .. } => pipeline::RunOutcome::Blocked,
+            _ => match outcome {
+                pipeline::AdvanceOutcome::Pass => pipeline::RunOutcome::Pass,
+                pipeline::AdvanceOutcome::Fail => pipeline::RunOutcome::Fail,
+            },
+        };
+        match close_run_record(run_path, run_outcome, &report, &artifacts) {
+            Ok(()) => closed_note = format!(" Run '{}' closed as {}.", open_run.id, run_outcome.as_str()),
+            Err(e) => closed_note = format!(" (warning: could not close run '{}': {e})", open_run.id),
+        }
+        server.known_running.borrow_mut().remove(&open_run.id);
+    }
+
+    Ok(match &transition {
+        pipeline::Transition::Moved { from, to, backward, bounces, .. } => format!(
+            "Ticket '{id}' advanced {from} → {to}{}.{closed_note}",
+            if *backward { format!(" (bounce {bounces})") } else { String::new() }
+        ),
+        pipeline::Transition::Blocked { from, would_have_entered, block, .. } => format!(
+            "Ticket '{id}' bounced past the retry cap at '{from}' (was heading to '{would_have_entered}') — now blocked, returns to '{}': {}.{closed_note}",
+            block.return_lane(),
+            block.reason().unwrap_or("")
+        ),
+        pipeline::Transition::Refused { .. } => unreachable!("handled above"),
+    })
+}
+
+/// `pipeline_block` (task 3.5): set or clear a block, routed through
+/// `pipeline::block`/`unblock` so cycle detection and `return_lane`
+/// capture cannot be bypassed. `clear` (present) means unblock;
+/// `blockedBy`/`reason` (absent `clear`) means block — the two are
+/// mutually exclusive by which arguments are given, not by a separate
+/// mode flag.
+fn pipeline_block_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_block")?;
+    let id = require_str(args, "id")?;
+    let (_ws_root, tasks_list, pipelines) = load_pipeline_board(server)?;
+    let ticket = find_pipeline_ticket(&tasks_list, &id)?;
+    let path = ticket.path.clone();
+    let pipeline_id = pipeline::ticket_fields(ticket).pipeline.clone().ok_or_else(|| format!("ticket '{id}' has no pipeline key"))?;
+    let pl = pipeline::find_pipeline(&pipelines, &pipeline_id).ok_or_else(|| format!("pipeline '{pipeline_id}' is not loaded"))?;
+    let (today, now) = today_and_iso_now_utc();
+
+    if let Some(c) = args.get("clear") {
+        let clear_deps = c.get("deps").and_then(Value::as_bool).unwrap_or(false);
+        let clear_reason = c.get("reason").and_then(Value::as_bool).unwrap_or(false);
+        let request = pipeline::UnblockRequest { clear_deps, clear_reason };
+        return match pipeline::unblock(ticket, pl, &request) {
+            pipeline::UnblockOutcome::Released { return_lane, patch, log, .. } => {
+                apply_pipeline_patch(&path, &patch, &today, &pipelines, Some(&log))?;
+                Ok(format!(
+                    "Ticket '{id}' unblocked — returns to '{return_lane}' awaiting a confirmation there (unblocking never starts a run by itself)."
+                ))
+            }
+            pipeline::UnblockOutcome::StillBlocked { remaining_deps, remaining_reason, patch } => {
+                apply_pipeline_patch(&path, &patch, &today, &pipelines, None)?;
+                Ok(format!(
+                    "Ticket '{id}' partially cleared — still blocked: remaining deps=[{}] reason={}",
+                    remaining_deps.join(", "),
+                    remaining_reason.as_deref().unwrap_or("-")
+                ))
+            }
+            pipeline::UnblockOutcome::Refused { reason } => Err(format!("unblock refused: {}", describe_unblock_refusal(&reason))),
+        };
+    }
+
+    let blocked_by: Vec<String> = args
+        .get("blockedBy")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let reason = opt_str(args, "reason");
+    if blocked_by.is_empty() && reason.is_none() {
+        return Err("pipeline_block needs \"blockedBy\", \"reason\", or \"clear\" — nothing to do".to_string());
+    }
+    let graph = pipeline::BlockGraph::from_tasks(&tasks_list);
+    let request = pipeline::BlockRequest { blocked_by, reason, now };
+    match pipeline::block(ticket, pl, &graph, &request) {
+        pipeline::BlockOutcome::Blocked { block, patch, log } => {
+            apply_pipeline_patch(&path, &patch, &today, &pipelines, Some(&log))?;
+            Ok(format!(
+                "Ticket '{id}' blocked — returns to '{}'. blocked_by=[{}] reason={}. It is now refused by pipeline_claim on every lane, including an auto lane with the pipeline's master switch on.",
+                block.return_lane(),
+                block.blocked_by().join(", "),
+                block.reason().unwrap_or("-")
+            ))
+        }
+        pipeline::BlockOutcome::Refused { reason } => Err(format!("block refused: {}", describe_block_refusal(&reason))),
+    }
+}
+
+/// `pipeline_runs` (task 3.6): the watch surface over `pipeline::
+/// derive_queue` — running/queued/blocked/waitingHuman/stale, entirely
+/// derived from the ledger plus the board (D13), never a second state
+/// store. `known_running` is this server process's own claims this
+/// session (see `Server::known_running`'s doc comment) — a `running`
+/// record this process has no live memory of (e.g. claimed by another
+/// agent, or before this process started) reports as `stale`.
+fn pipeline_runs_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_runs")?;
+    let (ws_root, tasks_list, pipelines) = load_pipeline_board(server)?;
+    let runs = run_ledger_scan(&ws_root);
+    let known = server.known_running.borrow().clone();
+    let queue = pipeline::derive_queue(&tasks_list, &pipelines, &runs, &known);
+    let state = args.get("state").and_then(Value::as_str).unwrap_or("all");
+
+    let fmt_run = |r: &pipeline::RunRecord| {
+        format!(
+            "  {} — ticket={} lane={} agent={} model={} started={}\n",
+            r.id, r.ticket, r.lane, r.agent, r.model, r.started
+        )
+    };
+    let mut out = String::new();
+    if state == "all" || state == "running" {
+        out.push_str(&format!("running ({}):\n", queue.running.len()));
+        queue.running.iter().for_each(|r| out.push_str(&fmt_run(r)));
+    }
+    if state == "all" || state == "queued" {
+        out.push_str(&format!("queued ({}):\n", queue.queued.len()));
+        queue.queued.iter().for_each(|r| out.push_str(&fmt_run(r)));
+    }
+    if state == "all" || state == "blocked" {
+        out.push_str(&format!("blocked ({}):\n", queue.blocked.len()));
+        queue.blocked.iter().for_each(|r| out.push_str(&fmt_run(r)));
+    }
+    if state == "all" || state == "waitingHuman" {
+        out.push_str(&format!("waitingHuman ({}):\n", queue.waiting_human.len()));
+        queue.waiting_human.iter().for_each(|id| out.push_str(&format!("  {id}\n")));
+    }
+    if state == "all" || state == "stale" {
+        out.push_str(&format!("stale ({}):\n", queue.stale.len()));
+        queue.stale.iter().for_each(|r| out.push_str(&fmt_run(r)));
+    }
+    Ok(out)
+}
+
+/// `pipeline_digest` (task 3.7): the daily update, via `pipeline::
+/// compose_digest` + `render_digest_markdown` — "the one renderer
+/// chat/MCP/journal_append all call" (pipeline.rs doc comment), so this
+/// tool's output can never drift from the desktop app's own digest text.
+/// Journals through `memory::append_journal` when `kenMemory` is on
+/// (task 2.10's sibling behaviour for this surface); skipped cleanly,
+/// with no attempt and no note, when it is off.
+fn pipeline_digest_tool(server: &Server, args: &Value) -> Result<String, String> {
+    require_pipeline_flag(server, "pipeline_digest")?;
+    let (ws_root, tasks_list, pipelines) = load_pipeline_board(server)?;
+    let runs = run_ledger_scan(&ws_root);
+    let known = server.known_running.borrow().clone();
+    let (today_default, _) = today_and_time_utc();
+    let today = args.get("day").and_then(Value::as_str).map(str::to_string).unwrap_or(today_default);
+    let digest = pipeline::compose_digest(&tasks_list, &pipelines, &runs, &known, &today);
+    let mut out = pipeline::render_digest_markdown(&digest, &today);
+
+    if ken_memory_enabled(&AppSettings::load(&server.base_dir)) {
+        let (d, t) = today_and_time_utc();
+        match memory::append_journal(&ws_root, &out, None, &["pipeline-digest".to_string()], &d, &t) {
+            Ok(_) => out.push_str("\n\n(journaled)"),
+            Err(e) => out.push_str(&format!("\n\n(warning: could not write journal: {e})")),
+        }
+    }
+    Ok(out)
+}
+
 fn source_label(source: Source) -> &'static str {
     match source {
         Source::Keyword => "keyword",
@@ -1698,6 +2852,33 @@ fn ken_memory_enabled(app_settings: &AppSettings) -> bool {
 /// this correct regardless of which change lands first.
 fn ken_tasks_enabled(app_settings: &AppSettings) -> bool {
     workspace_enabled(app_settings) && global_flag(app_settings, "kenTasks")
+}
+
+/// `kenPipeline` (ken-pipeline task 3.1-3.8), mirroring src-tauri's own
+/// `ken_pipeline_enabled` (`lib.rs`) exactly: AND-ed with `ken_tasks_
+/// enabled`, which itself AND-s in `workspace_enabled` — the registry
+/// description states "Requires the workspace and kenTasks flags", and this
+/// transitively requires both without re-checking `workspace_enabled` a
+/// second time. Gates all seven pipeline tools' presence in `tools/list`
+/// (spec "Flag-scoped activation": "register no pipeline tools on either
+/// surface"); every pipeline tool function below re-checks this itself too
+/// (defense-in-depth, same posture as every other flag-gated tool in this
+/// file — an MCP client can call any tool name whether or not `tools/list`
+/// advertised it).
+fn ken_pipeline_enabled(app_settings: &AppSettings) -> bool {
+    ken_tasks_enabled(app_settings) && global_flag(app_settings, "kenPipeline")
+}
+
+/// Defense-in-depth flag re-check every pipeline tool function opens with
+/// (same posture as every other flag-gated tool's inline `if !x_enabled
+/// {...}` check — factored into one helper here only because seven tools
+/// share the identical wording).
+fn require_pipeline_flag(server: &Server, tool: &str) -> Result<(), String> {
+    if ken_pipeline_enabled(&AppSettings::load(&server.base_dir)) {
+        Ok(())
+    } else {
+        Err(format!("{tool} requires the kenPipeline feature flag, which is off."))
+    }
 }
 
 /// `kenFamilies` (tasks 3.1-3.4). Deliberately **not** gated behind
@@ -2418,6 +3599,7 @@ mod tests {
             server: Server {
                 base_dir: base.path().to_path_buf(),
                 scoped: scoped.then(|| root_path.clone()),
+                ..Default::default()
             },
             root: root_path,
             _base: base,
@@ -2666,6 +3848,7 @@ mod tests {
         let server = Server {
             base_dir: base.path().to_path_buf(),
             scoped: None,
+            ..Default::default()
         };
         (base, root_a, root_b, server)
     }
@@ -2805,7 +3988,7 @@ mod tests {
         settings.features.insert("kenMemory".into(), true.into());
         settings.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         (base, ws_parent, proj_root, server)
     }
 
@@ -2938,7 +4121,7 @@ mod tests {
         settings.features.insert("workspace".into(), true.into());
         settings.features.insert("kenMemory".into(), true.into());
         settings.save(base.path()).unwrap();
-        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
 
         let (text, is_err) = tool(&mut server, "journal_append", json!({"text": "hi"}));
         assert!(is_err, "{text}");
@@ -2981,7 +4164,7 @@ mod tests {
         }
         settings.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         (base, ws_parent, proj_root, server)
     }
 
@@ -3288,7 +4471,7 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.features.insert("kenFamilies".into(), true.into());
         settings.save(base.path()).unwrap();
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         (base, server)
     }
 
@@ -3370,7 +4553,7 @@ mod tests {
         }
         settings.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         Some((base, remote_dir, ws_parent, server, family_id, clone_root))
     }
 
@@ -3536,5 +4719,463 @@ project: ''\ntags: []\nboard: main\ncreated: '2026-08-01'\nupdated: '2026-08-01'
         let owner_raw = std::fs::read_to_string(&owner_path).unwrap();
         assert!(owner_raw.contains("status: doing"), "{owner_raw}");
         assert!(owner_raw.contains("title: \"Owner's task\"") || owner_raw.contains("title: Owner's task"), "{owner_raw}");
+    }
+
+    // --- ken-pipeline (task 3.9) ---
+
+    /// A small pipeline definition covering everything section 3's tests
+    /// need: a plain holding lane (`todo`), two confirm-gated agent lanes
+    /// with a bounce edge between them (`doing` <-> `review`), an `auto`
+    /// lane under a pipeline whose master switch is on (`autolane`), a
+    /// terminal lane (`done`), and the one `blocked: true` lane every
+    /// pipeline needs. Lane ids `todo`/`doing`/`review`/`done` deliberately
+    /// match `TaskStatus`'s own keywords so `tasks::create_task`'s typed
+    /// `fields.status` can seed a ticket directly into one of them; `bounce_
+    /// cap: 2` keeps the retry-cap test's setup short.
+    // A raw string, not a `\n`-joined literal: Rust's backslash-newline
+    // line-continuation strips the *leading whitespace* of the following
+    // line too, which silently flattens YAML's indentation-sensitive
+    // `lanes:` list into something `serde_yaml` can't parse as a sequence
+    // of mappings (found the hard way — an earlier `"...\n\` version of
+    // this constant parsed to a pipeline with zero lanes).
+    const TEST_PIPELINE_MD: &str = r#"---
+id: default
+name: Test pipeline
+auto: true
+concurrency_cap: 1
+bounce_cap: 2
+lanes:
+  - id: todo
+    name: To Do
+    maps_to: todo
+    agent: none
+    kickoff: manual
+    on_pass: doing
+  - id: doing
+    name: Doing
+    maps_to: doing
+    agent: programmer
+    model: sonnet
+    kickoff: confirm
+    on_pass: review
+    on_fail: doing
+  - id: review
+    name: Review
+    maps_to: review
+    agent: tester
+    model: sonnet
+    kickoff: confirm
+    on_pass: done
+    on_fail: doing
+  - id: autolane
+    name: Auto lane
+    maps_to: doing
+    agent: programmer
+    model: sonnet
+    kickoff: auto
+    on_pass: done
+  - id: done
+    name: Done
+    maps_to: done
+    agent: none
+    kickoff: manual
+    terminal: true
+  - id: blocked
+    name: Blocked
+    maps_to: doing
+    agent: none
+    kickoff: manual
+    blocked: true
+---
+Test pipeline body.
+"#;
+
+    /// `workspace`+`kenTasks`+`kenPipeline` on (plus `kenMemory` when
+    /// asked), one registered workspace, `TEST_PIPELINE_MD` written to
+    /// `.ken-workspace/pipelines/default.md`. Mirrors `task_fixture` above.
+    fn pipeline_fixture(ken_memory: bool) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, Server) {
+        let base = tempfile::tempdir().unwrap();
+        let ws_parent = tempfile::tempdir().unwrap();
+        let workspace = ken_core::workspace::Workspace::create(ws_parent.path(), "WS", &[]).unwrap();
+        let ws_root = workspace.root.clone();
+
+        let mut registry = Registry::default();
+        registry.add_workspace(&workspace, None, 0);
+        registry.last_workspace = Some(workspace.config.id);
+        registry.save(base.path()).unwrap();
+
+        let mut settings = AppSettings::default();
+        settings.features.insert("workspace".into(), true.into());
+        settings.features.insert("kenTasks".into(), true.into());
+        settings.features.insert("kenPipeline".into(), true.into());
+        if ken_memory {
+            settings.features.insert("kenMemory".into(), true.into());
+        }
+        settings.save(base.path()).unwrap();
+
+        let pdir = pipeline::pipelines_dir(&ws_root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("default.md"), TEST_PIPELINE_MD).unwrap();
+
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
+        (base, ws_parent, ws_root, server)
+    }
+
+    /// Hand-write a pipeline ticket directly (bypassing `tasks::create_task`
+    /// — needed for tests that seed an arbitrary lane id, `blocked_by`, or a
+    /// large number of tickets fast). `id` must be exactly 26 chars for
+    /// anything exercising `blocked_by` (`pipeline::is_ulid_like`).
+    fn write_pipeline_ticket(ws_root: &Path, id: &str, title: &str, lane: &str, extra: &[(&str, &str)]) -> PathBuf {
+        let dir = tasks::workspace_tasks_dir(ws_root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}-{}.md", tasks::slugify(title)));
+        let mut fm = format!(
+            "---\nid: {id}\ntitle: \"{title}\"\nstatus: {lane}\nkind: ai\nassignee: ''\nproject: TestProj\nboard: main\ncreated: 2026-01-01\nupdated: 2026-01-01\npipeline: default\n"
+        );
+        for (k, v) in extra {
+            fm.push_str(&format!("{k}: {v}\n"));
+        }
+        fm.push_str("---\n\nBody text.\n");
+        std::fs::write(&path, &fm).unwrap();
+        path
+    }
+
+    /// A 26-char, all-digit (therefore Crockford-valid) test ticket id —
+    /// digits are always in the Crockford alphabet, so this never collides
+    /// with `pipeline::is_ulid_like`'s path/malformed checks.
+    fn test_id(n: u32) -> String {
+        format!("{n:026}")
+    }
+
+    #[test]
+    fn pipeline_tools_absent_and_erroring_when_flag_off() {
+        // kenTasks on, kenPipeline left at its registered default (off).
+        let (_base, _ws, _proj, mut server) = task_fixture(false);
+        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let names: Vec<_> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for n in [
+            "pipeline_list",
+            "pipeline_get",
+            "pipeline_claim",
+            "pipeline_advance",
+            "pipeline_block",
+            "pipeline_runs",
+            "pipeline_digest",
+        ] {
+            assert!(!names.contains(&n.to_string()), "{names:?} must not list {n} when kenPipeline is off");
+        }
+        // task_* tools stay listed — kenPipeline off must not regress
+        // kenTasks (byte-identical tool list otherwise).
+        assert!(names.contains(&"task_create".to_string()));
+
+        // Defense-in-depth: dispatch still recognizes the tool names and
+        // explains the flag rather than erroring opaquely.
+        for name in [
+            "pipeline_list",
+            "pipeline_get",
+            "pipeline_claim",
+            "pipeline_advance",
+            "pipeline_block",
+            "pipeline_runs",
+            "pipeline_digest",
+        ] {
+            let (text, is_err) = tool(&mut server, name, json!({}));
+            assert!(is_err, "{name}: {text}");
+            assert!(text.contains("kenPipeline"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn pipeline_tools_appear_with_valid_schemas_when_flag_on() {
+        let (_base, _ws, _root, mut server) = pipeline_fixture(false);
+        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let tools = reply["result"]["tools"].as_array().unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for n in [
+            "pipeline_list",
+            "pipeline_get",
+            "pipeline_claim",
+            "pipeline_advance",
+            "pipeline_block",
+            "pipeline_runs",
+            "pipeline_digest",
+        ] {
+            assert!(names.contains(&n), "{names:?}");
+        }
+        for t in tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
+            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
+        }
+        let get = tools.iter().find(|t| t["name"] == "pipeline_get").unwrap();
+        assert_eq!(get["inputSchema"]["required"], json!(["id"]));
+        let claim = tools.iter().find(|t| t["name"] == "pipeline_claim").unwrap();
+        assert_eq!(claim["inputSchema"]["required"], json!(["id", "agent"]));
+        let advance = tools.iter().find(|t| t["name"] == "pipeline_advance").unwrap();
+        assert_eq!(advance["inputSchema"]["required"], json!(["id", "outcome", "report"]));
+        assert_eq!(advance["inputSchema"]["properties"]["outcome"]["enum"], json!(["pass", "fail"]));
+        let block = tools.iter().find(|t| t["name"] == "pipeline_block").unwrap();
+        assert_eq!(block["inputSchema"]["required"], json!(["id"]));
+    }
+
+    #[test]
+    fn pipeline_claim_refused_when_blocked_even_in_auto_lane() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(false);
+        // `autolane` has kickoff: auto and the pipeline's master switch is
+        // on — the strongest case D5 asks for: blocked beats an auto lane.
+        write_pipeline_ticket(
+            &ws_root,
+            &test_id(1),
+            "Blocked in an auto lane",
+            "autolane",
+            &[("scope", "['src/**']"), ("verify", "'cargo test'"), ("block_reason", "'waiting on vendor'")],
+        );
+        let (text, is_err) = tool(&mut server, "pipeline_claim", json!({"id": test_id(1), "agent": "agent-a"}));
+        assert!(is_err, "{text}");
+        assert!(text.to_lowercase().contains("blocked"), "{text}");
+
+        // No run record was created at all.
+        let runs = run_ledger_scan(&ws_root);
+        assert!(runs.is_empty(), "a refused claim must create no run record: {runs:?}");
+    }
+
+    #[test]
+    fn pipeline_claim_refused_when_over_cap() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(false);
+        // Occupy the single concurrency slot with a running run for a
+        // ticket that isn't the one under test.
+        let occupied = pipeline::RunRecord {
+            id: "01OCCUPIEDRUNRUNRUNRUNRUN".to_string(),
+            ticket: "some-other-ticket".to_string(),
+            pipeline: "default".to_string(),
+            lane: "doing".to_string(),
+            agent: "someone-else".to_string(),
+            model: "sonnet".to_string(),
+            scope: vec!["src/**".to_string()],
+            verify: "cargo test".to_string(),
+            started: "2026-01-01T00:00:00Z".to_string(),
+            ended: String::new(),
+            outcome: Some(pipeline::RunOutcome::Running),
+            outcome_raw: "running".to_string(),
+            artifacts: Vec::new(),
+            report: String::new(),
+        };
+        let month_dir = pipeline::run_month_dir(&ws_root, "2026-01");
+        std::fs::create_dir_all(&month_dir).unwrap();
+        std::fs::write(pipeline::run_path(&ws_root, "2026-01", &occupied.id), pipeline::compose_run(&occupied)).unwrap();
+
+        write_pipeline_ticket(
+            &ws_root,
+            &test_id(2),
+            "Wants the one slot",
+            "doing",
+            &[("scope", "['src/**']"), ("verify", "'cargo test'")],
+        );
+        let (text, is_err) = tool(&mut server, "pipeline_claim", json!({"id": test_id(2), "agent": "agent-b"}));
+        assert!(is_err, "{text}");
+        assert!(text.to_lowercase().contains("cap"), "{text}");
+        // The claim attempt records the ticket as queued rather than
+        // silently doing nothing — "the run stays queued" (spec scenario).
+        let runs = run_ledger_scan(&ws_root);
+        assert!(
+            runs.iter().any(|r| r.ticket == test_id(2) && r.outcome == Some(pipeline::RunOutcome::Queued)),
+            "{runs:?}"
+        );
+        assert!(
+            !runs.iter().any(|r| r.ticket == test_id(2) && r.outcome == Some(pipeline::RunOutcome::Running)),
+            "an over-cap claim must never write a running record: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_claim_writes_running_then_advance_closes_with_exact_frontmatter_diff() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(false);
+        let path = write_pipeline_ticket(
+            &ws_root,
+            &test_id(3),
+            "Do the work",
+            "doing",
+            &[("scope", "['src/**']"), ("verify", "'cargo test'"), ("hand_added_key", "'preserve me'")],
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let (claim_text, claim_err) = tool(&mut server, "pipeline_claim", json!({"id": test_id(3), "agent": "agent-c", "model": "opus"}));
+        assert!(!claim_err, "{claim_text}");
+        assert!(claim_text.contains(&test_id(3)), "{claim_text}");
+
+        let runs = run_ledger_scan(&ws_root);
+        let running: Vec<_> = runs.iter().filter(|r| r.ticket == test_id(3)).collect();
+        assert_eq!(running.len(), 1, "{runs:?}");
+        assert_eq!(running[0].outcome, Some(pipeline::RunOutcome::Running));
+        assert_eq!(running[0].agent, "agent-c");
+        assert_eq!(running[0].model, "opus");
+
+        // Claiming again while already running is refused, not duplicated.
+        let (text2, is_err2) = tool(&mut server, "pipeline_claim", json!({"id": test_id(3), "agent": "agent-d"}));
+        assert!(is_err2, "{text2}");
+        assert!(text2.to_lowercase().contains("already"), "{text2}");
+
+        // Ticket file itself is untouched by the claim (claim only writes
+        // the run ledger) — the intended-keys-only assertion is about
+        // pipeline_advance below.
+        let after_claim = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after_claim, "pipeline_claim must not touch the ticket file");
+
+        // Now report pass — advances doing -> review, closes the run.
+        let (advance_text, advance_err) =
+            tool(&mut server, "pipeline_advance", json!({"id": test_id(3), "outcome": "pass", "report": "Implemented and verified."}));
+        assert!(!advance_err, "{advance_text}");
+        assert!(advance_text.contains("review"), "{advance_text}");
+
+        let after_advance = std::fs::read_to_string(&path).unwrap();
+        assert!(after_advance.contains("status: review"), "{after_advance}");
+        assert!(after_advance.contains("hand_added_key"), "unrelated hand-added key must survive: {after_advance}");
+        assert!(after_advance.contains("Do the work"), "{after_advance}");
+        // Only status/updated/## Log changed — bounces is untouched
+        // because this was a forward move, and scope/verify/hand_added_key
+        // are byte-identical to before.
+        assert!(after_advance.contains("scope:"), "{after_advance}");
+        assert!(after_advance.contains("verify:"), "{after_advance}");
+        assert!(after_advance.contains("## Log"), "{after_advance}");
+        // The transition line lands on the ticket's ## Log; the agent's
+        // full report is the closed run's body, not the ticket's — asserted
+        // via `closed[0].report` below.
+        assert!(after_advance.contains("doing → review (pass)"), "{after_advance}");
+
+        let runs_after = run_ledger_scan(&ws_root);
+        let closed: Vec<_> = runs_after.iter().filter(|r| r.ticket == test_id(3)).collect();
+        assert_eq!(closed.len(), 1, "{runs_after:?}");
+        assert_eq!(closed[0].outcome, Some(pipeline::RunOutcome::Pass));
+        assert!(closed[0].report.contains("Implemented and verified."), "{:?}", closed[0].report);
+    }
+
+    #[test]
+    fn pipeline_block_refuses_cycle_and_leaves_both_files_unchanged() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(false);
+        let a = test_id(10);
+        let b = test_id(11);
+        let path_a = write_pipeline_ticket(&ws_root, &a, "Ticket A", "doing", &[]);
+        let path_b = write_pipeline_ticket(&ws_root, &b, "Ticket B", "doing", &[]);
+
+        // A is blocked by B.
+        let (block_text, block_err) = tool(&mut server, "pipeline_block", json!({"id": a, "blockedBy": [b.clone()]}));
+        assert!(!block_err, "{block_text}");
+
+        let before_a = std::fs::read_to_string(&path_a).unwrap();
+        let before_b = std::fs::read_to_string(&path_b).unwrap();
+
+        // Now try to block B by A — closes the cycle, must be refused with
+        // neither file touched.
+        let (cycle_text, cycle_err) = tool(&mut server, "pipeline_block", json!({"id": b, "blockedBy": [a.clone()]}));
+        assert!(cycle_err, "{cycle_text}");
+        assert!(cycle_text.to_lowercase().contains("cycle"), "{cycle_text}");
+
+        let after_a = std::fs::read_to_string(&path_a).unwrap();
+        let after_b = std::fs::read_to_string(&path_b).unwrap();
+        assert_eq!(before_a, after_a, "ticket A must be unchanged by a refused block");
+        assert_eq!(before_b, after_b, "ticket B must be unchanged by a refused block");
+
+        // A blocked ticket is refused by pipeline_claim, with no exception.
+        let (claim_text, claim_err) = tool(&mut server, "pipeline_claim", json!({"id": a, "agent": "agent-e"}));
+        assert!(claim_err, "{claim_text}");
+        assert!(claim_text.to_lowercase().contains("blocked"), "{claim_text}");
+    }
+
+    #[test]
+    fn pipeline_get_never_shown_in_list_and_list_never_leaks_a_body() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(false);
+        write_pipeline_ticket(
+            &ws_root,
+            &test_id(20),
+            "Has a distinctive body",
+            "doing",
+            &[("scope", "['src/**']"), ("verify", "'cargo test'")],
+        );
+        // Overwrite the body with a distinctive marker `pipeline_list`
+        // must never leak.
+        let path = tasks::workspace_tasks_dir(&ws_root).join(format!("{}-has-a-distinctive-body.md", test_id(20)));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw = raw.replace("Body text.", "SECRET-BODY-MARKER-not-for-pipeline-list");
+        std::fs::write(&path, raw).unwrap();
+
+        let (list_text, list_err) = tool(&mut server, "pipeline_list", json!({}));
+        assert!(!list_err, "{list_text}");
+        assert!(!list_text.contains("SECRET-BODY-MARKER"), "{list_text}");
+        assert!(list_text.contains(&test_id(20)), "{list_text}");
+
+        let (get_text, get_err) = tool(&mut server, "pipeline_get", json!({"id": test_id(20)}));
+        assert!(!get_err, "{get_text}");
+        assert!(get_text.contains("SECRET-BODY-MARKER"), "{get_text}");
+    }
+
+    #[test]
+    fn pipeline_list_pages_a_1000_ticket_lane_exactly_once_never_exceeding_hard_max() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(false);
+        for n in 0..1000u32 {
+            write_pipeline_ticket(&ws_root, &test_id(n), &format!("Ticket {n}"), "todo", &[]);
+        }
+
+        // No limit given: default page (<=20), well under the hard max.
+        let (first_text, first_err) = tool(&mut server, "pipeline_list", json!({}));
+        assert!(!first_err, "{first_text}");
+        assert!(first_text.contains("1000 tickets match"), "{first_text}");
+        assert!(first_text.contains("cursor:"), "{first_text}");
+
+        // A `limit` above the hard max is clamped, never exceeded.
+        let (big_text, big_err) = tool(&mut server, "pipeline_list", json!({"limit": 100000}));
+        assert!(!big_err, "{big_text}");
+        let row_count = big_text.lines().filter(|l| l.starts_with(&test_id(0)[0..2])).count();
+        assert!(row_count <= 100, "hard max exceeded: {row_count} rows");
+
+        // Page through with limit=100 until the cursor disappears,
+        // collecting every id — must cover exactly 1000, no dupes.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut args = json!({"limit": 100});
+            if let Some(c) = &cursor {
+                args["cursor"] = json!(c);
+            }
+            let (text, is_err) = tool(&mut server, "pipeline_list", args);
+            assert!(!is_err, "{text}");
+            for line in text.lines() {
+                if line.len() >= 26 && line.as_bytes()[0].is_ascii_digit() && line.contains(" — ") {
+                    let id = &line[0..26];
+                    assert!(seen.insert(id.to_string()), "ticket {id} seen twice while paging");
+                }
+            }
+            cursor = text
+                .lines()
+                .find_map(|l| l.strip_prefix("cursor: "))
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 1000, "paging must cover every ticket exactly once");
+    }
+
+    #[test]
+    fn pipeline_digest_journals_when_ken_memory_is_on_and_skips_cleanly_when_off() {
+        let (_base, _ws, ws_root, mut server) = pipeline_fixture(true);
+        write_pipeline_ticket(&ws_root, &test_id(30), "For the digest", "todo", &[]);
+        let (text, is_err) = tool(&mut server, "pipeline_digest", json!({}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("Pipeline digest"), "{text}");
+        assert!(text.contains("journaled"), "{text}");
+        let journal_dir = ws_root.join(".ken-workspace").join("journal");
+        assert!(journal_dir.is_dir(), "kenMemory on must write a journal entry");
+
+        let (_base2, _ws2, ws_root2, mut server2) = pipeline_fixture(false);
+        write_pipeline_ticket(&ws_root2, &test_id(31), "For the digest, no memory", "todo", &[]);
+        let (text2, is_err2) = tool(&mut server2, "pipeline_digest", json!({}));
+        assert!(!is_err2, "{text2}");
+        assert!(!text2.contains("journaled"), "{text2}");
+        let journal_dir2 = ws_root2.join(".ken-workspace").join("journal");
+        assert!(!journal_dir2.is_dir(), "kenMemory off must write no journal file: {text2}");
     }
 }

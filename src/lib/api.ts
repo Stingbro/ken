@@ -954,6 +954,9 @@ export interface Task {
   title: string;
   status: TaskStatus | null;
   statusRaw: string;
+  /** ken-pipeline D2: the resolved lane id, or `null` for a ticket with no
+   *  `pipeline:` key (the classic path is untouched). */
+  lane: string | null;
   kind: TaskKind;
   kindRaw: string;
   assignee: string;
@@ -977,7 +980,15 @@ export type AttentionReason =
   | { reason: "invalidStatus"; value: string }
   | { reason: "invalidKind"; value: string }
   | { reason: "invalidBoard"; value: string }
-  | { reason: "unknownGoal"; value: string };
+  | { reason: "unknownGoal"; value: string }
+  // ken-pipeline task 1.4/4.9: `pipeline:` names a definition that isn't
+  // loaded; the ticket's `status` matches no lane in its pipeline; a
+  // `blocked_by` id matching no ticket; the ticket is in the blocked lane
+  // but its `return_lane` is missing/orphaned (empty string = missing).
+  | { reason: "unknownPipeline"; value: string }
+  | { reason: "unknownLane"; value: string }
+  | { reason: "unknownBlocker"; value: string }
+  | { reason: "unknownReturnLane"; value: string };
 
 /** Mirrors `ken_core::tasks::NeedsAttention`. */
 export interface NeedsAttention {
@@ -1012,13 +1023,332 @@ export interface Progress {
   total: number;
 }
 
-/** Mirrors the Rust `BoardStateDto` — `board_get`'s return shape and the
- *  `board-state` event payload. `progress` is keyed by goal id. */
+// ---- ken-pipeline (ken-pipeline change, task 4.1) ----
+//
+// Mirrors `crates/ken-core/src/pipeline.rs` (camelCase throughout — every
+// type there derives `#[serde(rename_all = "camelCase")]`) plus the
+// `src-tauri/src/lib.rs` command DTOs built on top of it. `pipeline_board`/
+// `board_get`/`board-state` all return the SAME `BoardStateDto` shape (the
+// pipeline fields are simply empty when `kenPipeline` is off or a board has
+// no pipeline tickets), so `tasksStore`'s existing `board-state` stream is
+// the live source for `pipelines`/`pipelineFields`/`pipelineLaneCounts`/
+// `blocked` too — `pipeline.svelte.ts` reads `tasksStore.board` rather than
+// keeping a second copy in sync.
+
+export type PipelineKickoff = "manual" | "confirm" | "auto";
+export type PipelineRunner = "mcp" | "command";
+export type PipelineTarget = "web" | "tauri" | "none";
+
+/** Mirrors the Rust `Lane` struct. */
+export interface PipelineLane {
+  id: string;
+  name: string;
+  mapsTo: TaskStatus;
+  mapsToRaw: string;
+  agent: string | null;
+  model: string | null;
+  kickoff: PipelineKickoff;
+  kickoffRaw: string;
+  onPass: string | null;
+  onFail: string | null;
+  writesCode: boolean;
+  human: boolean;
+  terminal: boolean;
+  generative: boolean;
+  blocked: boolean;
+  runner: PipelineRunner;
+}
+
+/** Mirrors the Rust `Pipeline` struct — one loaded definition file. Lane
+ *  order (`lanes`) IS column order (D1); the frontend never re-sorts it. */
+export interface Pipeline {
+  id: string;
+  name: string;
+  auto: boolean;
+  concurrencyCap: number;
+  bounceCap: number;
+  lanes: PipelineLane[];
+  body: string;
+  path: string;
+}
+
+/** Mirrors the Rust `PipelineIssue` enum (`tag = "issue"`) —
+ *  `validate_pipeline`'s findings, surfaced by `pipeline_list_defs`. */
+export type PipelineIssue =
+  | { issue: "noLanes" }
+  | { issue: "laneMissingId"; index: number }
+  | { issue: "duplicateLaneId"; id: string }
+  | { issue: "multipleBlockedLanes"; first: string; second: string }
+  | { issue: "multipleHumanLanes"; first: string; second: string }
+  | { issue: "invalidMapsTo"; lane: string; value: string }
+  | { issue: "invalidKickoff"; lane: string; value: string }
+  | { issue: "unknownTransition"; lane: string; edge: string; target: string };
+
+/** Mirrors `PipelineDefDto` (`#[serde(flatten)] def: Pipeline` + `issues`) —
+ *  `pipeline_list_defs`'s return shape. */
+export interface PipelineDefDto extends Pipeline {
+  issues: PipelineIssue[];
+}
+
+/** Mirrors the Rust `TicketFields` struct — the ken-pipeline half of a
+ *  ticket's frontmatter, keyed by ticket id in `BoardStateDto.pipelineFields`
+ *  (only pipeline tickets — `task.lane != null` — get an entry; `Task`
+ *  itself carries no `scope`/`verify`/`model`/etc., only `lane`). */
+export interface TicketFields {
+  pipeline: string | null;
+  model: string | null;
+  agent: string | null;
+  scope: string[];
+  verify: string | null;
+  bounces: number;
+  returnLane: string | null;
+  blockedBy: string[];
+  blockReason: string | null;
+  blockedAt: string | null;
+  parent: string | null;
+  spawnedBy: string | null;
+  origin: string | null;
+  projects: string[];
+  target: PipelineTarget;
+  targetRaw: string;
+}
+
+/** Mirrors `BlockedSummaryDto` — one row of `BoardStateDto.blocked`.
+ *  `rootBlockers` is `pipeline::root_blockers` — the root of the dependency
+ *  chain, not the nearest link (D5's "the subtle part"). */
+export interface BlockedSummaryDto {
+  ticketId: string;
+  title: string;
+  project: string;
+  returnLane: string | null;
+  blockedBy: string[];
+  blockReason: string | null;
+  blockedAt: string | null;
+  rootBlockers: string[];
+}
+
+export type PipelineRunOutcome = "queued" | "running" | "pass" | "fail" | "blocked" | "cancelled";
+
+/** Mirrors the Rust `RunRecord` — one append-only ledger entry
+ *  (`.ken-workspace/runs/YYYY-MM/<ulid>.md`, D13). */
+export interface PipelineRunRecord {
+  id: string;
+  ticket: string;
+  pipeline: string;
+  lane: string;
+  agent: string;
+  model: string;
+  scope: string[];
+  verify: string;
+  started: string;
+  ended: string;
+  outcome: PipelineRunOutcome | null;
+  outcomeRaw: string;
+  artifacts: string[];
+  report: string;
+}
+
+/** Mirrors `RunQueue` — the `pipeline_runs` command's return shape and the
+ *  `pipeline-runs` event payload. `waitingHuman` is ticket ids sitting at a
+ *  confirmation gate (derived from `admit`, not ledger data). */
+export interface PipelineRunQueue {
+  running: PipelineRunRecord[];
+  queued: PipelineRunRecord[];
+  blocked: PipelineRunRecord[];
+  stale: PipelineRunRecord[];
+  waitingHuman: string[];
+}
+
+/** Mirrors `PipelineBlockersDto` — `pipeline_blockers`'s return shape.
+ *  `direct` is the ticket's own `blocked_by`; `chain` is every id between
+ *  the ticket and its root blocker(s), root first. */
+export interface PipelineBlockersDto {
+  ticketId: string;
+  direct: string[];
+  chain: string[];
+}
+
+export interface DigestAwaitingReviewDto {
+  ticketId: string;
+  title: string;
+  updated: string;
+  runCount: number;
+}
+export interface DigestUnblockedDto {
+  ticketId: string;
+  title: string;
+  returnLane: string;
+}
+export interface DigestBlockedDto {
+  ticketId: string;
+  title: string;
+  blockedAt: string | null;
+  rootBlockers: string[];
+  blockReason: string | null;
+  runCount: number;
+}
+export interface DigestMovedDto {
+  ticketId: string;
+  title: string;
+  lane: string;
+  runCount: number;
+}
+export interface DigestIdeaDto {
+  ticketId: string;
+  title: string;
+  spawnedBy: string | null;
+}
+
+/** Mirrors `PipelineDigestDto` — `pipeline_digest`'s return shape. Group
+ *  order matches the spec: awaiting review, then newly unblocked, then
+ *  blocked (oldest-first), then moved-today, new ideas, stale runs.
+ *  `markdown` is `render_digest_markdown`'s output — the one renderer
+ *  chat/MCP/`journal_append` all use, included so the frontend never
+ *  re-derives its own markdown from the structured groups. */
+export interface PipelineDigestDto {
+  awaitingReview: DigestAwaitingReviewDto[];
+  newlyUnblocked: DigestUnblockedDto[];
+  blocked: DigestBlockedDto[];
+  movedToday: DigestMovedDto[];
+  newIdeas: DigestIdeaDto[];
+  staleRuns: PipelineRunRecord[];
+  markdown: string;
+}
+
+/** Mirrors `ConfirmReason` (`tag = "reason"`) — why `pipeline_kickoff`
+ *  returned `needsConfirm` rather than starting immediately. */
+export type PipelineConfirmReason =
+  | { reason: "laneGate" }
+  | { reason: "manualKickoff" }
+  | { reason: "missingBoundary"; scope: boolean; verify: boolean }
+  | { reason: "unblocked" }
+  | { reason: "autoDisabled" };
+
+/** Mirrors `RefusalReason` (`tag = "reason"`) — why work was refused
+ *  outright. NOTE: `humanLane`/`noAgent`/`manualLane` are Rust newtype
+ *  variants (`HumanLane(String)`) under a *bare* `tag = "reason"` (no
+ *  `content`) — serde's internally-tagged representation only supports
+ *  struct-shaped variant content, so these three may fail to serialize at
+ *  all (a live IPC error, not a typed payload) rather than arriving as the
+ *  shape below. Flagged as an observation for the ken-core owner, not fixed
+ *  here (crates/** is out of this session's touch scope) — every call site
+ *  in this build treats a `pipelineKickoff` rejection as an opaque string
+ *  (`String(err)`), so this is not a hard blocker for the UI. */
+export type PipelineRefusalReason =
+  | { reason: "blocked"; returnLane: string | null; blockedBy: string[]; blockReason: string | null }
+  | { reason: "humanLane"; lane: string }
+  | { reason: "noAgent"; lane: string }
+  | { reason: "manualLane"; lane: string };
+
+/** Mirrors `PipelineKickoffOutcome` (`tag = "kind"`) — `pipeline_kickoff`'s
+ *  verdict. `needsConfirm` is the confirmation gate's own payload (D3: "a
+ *  dialog showing lane, agent, model, scope, and verify command"); calling
+ *  `pipelineKickoff(id, true)` again after the human accepts proceeds. */
+export type PipelineKickoffOutcome =
+  | { kind: "queued"; runId: string; ready: boolean; running: number; cap: number }
+  | {
+      kind: "needsConfirm";
+      reason: PipelineConfirmReason;
+      lane: string;
+      agent: string | null;
+      model: string | null;
+      scope: string[];
+      verify: string | null;
+    }
+  | { kind: "refused"; reason: PipelineRefusalReason };
+
+export type PipelineAdvanceOutcome = "pass" | "fail";
+
+/** Mirrors the Rust `TransitionRefusal` enum (`tag = "refusal"`).
+ *  `unknownLane` is a `String` newtype variant under a bare `tag =
+ *  "refusal"` — the same internally-tagged-newtype serialization risk
+ *  flagged on `PipelineRefusalReason` above; shaped defensively. */
+export type PipelineTransitionRefusal =
+  | ({ refusal: "unknownLane" } & Record<string, unknown>)
+  | { refusal: "noEdge"; lane: string; outcome: PipelineAdvanceOutcome }
+  | { refusal: "unknownTarget"; lane: string; target: string }
+  | { refusal: "noBlockedLane" };
+
+/** Mirrors the Rust `Transition` enum (`tag = "kind"`) — `pipeline_advance`'s
+ *  resolved move. `blocked` is D4's retry-cap escalation (there is no
+ *  separate "halted" state) — `wouldHaveEntered` is the lane it was
+ *  bouncing to, which becomes `return_lane`. `patch` (the raw `TaskPatch`
+ *  written) is present on the wire but untyped here — the UI reads `task`
+ *  from `PipelineAdvanceDto` for the post-transition ticket instead of
+ *  re-deriving anything from the patch. */
+export type PipelineTransition =
+  | { kind: "moved"; from: string; to: string; backward: boolean; bounces: number; patch: unknown; log: string }
+  | {
+      kind: "blocked";
+      from: string;
+      wouldHaveEntered: string;
+      block: { returnLane: string; blockedBy: string[]; reason: string | null; blockedAt: string };
+      patch: unknown;
+      log: string;
+    }
+  | { kind: "refused"; reason: PipelineTransitionRefusal };
+
+/** Mirrors `PipelineAdvanceDto` — `pipeline_advance`'s return shape. */
+export interface PipelineAdvanceDto {
+  task: Task;
+  transition: PipelineTransition;
+}
+
+/** Mirrors the Rust `BlockRequest` (every field optional/defaulted;
+ *  `now` is always server-stamped — see `pipeline_block`'s doc comment —
+ *  so the frontend never sends it). */
+export interface PipelineBlockRequest {
+  blockedBy?: string[];
+  reason?: string;
+}
+
+/** Mirrors the Rust `UnblockRequest` — clearing dependencies and the reason
+ *  are independent (D5: clearing one must not unblock a ticket the other
+ *  still applies to). */
+export interface PipelineUnblockRequest {
+  clearDeps?: boolean;
+  clearReason?: boolean;
+}
+
+export type PipelineSignoffDecision = "accept" | "acceptWithComments" | "reject";
+
+/** Mirrors `PipelineSignoffDto` — `child` is `Some` only for
+ *  `acceptWithComments`. */
+export interface PipelineSignoffDto {
+  parent: Task;
+  child: Task | null;
+}
+
+/** Mirrors `PipelineIdeaOutcome` (`tag = "kind"`) — `pipeline_propose_idea`'s
+ *  verdict. */
+export type PipelineIdeaOutcome = { kind: "landed"; task: Task } | { kind: "nearDuplicate"; ticketId: string; score: number };
+
+/** Mirrors `ArtifactManifestDto` (`#[serde(flatten)] manifest:
+ *  ArtifactManifest` + `expired`) — `pipeline_artifacts`'s return shape.
+ *  `durable` is always `false` server-side (D9: "there is no field to set
+ *  it any other way"). */
+export interface PipelineArtifactManifestDto {
+  ticket: string;
+  created: string;
+  expires: string;
+  files: string[];
+  expired: boolean;
+}
+
+/** Mirrors the Rust `BoardStateDto` — `board_get`/`pipeline_board`'s return
+ *  shape and the `board-state` event payload. `progress` is keyed by goal
+ *  id. The four `pipeline*`/`blocked` fields are always present (never
+ *  `undefined`) but empty when `kenPipeline` is off or the board has no
+ *  pipeline tickets — a `kenTasks`-only build simply never reads them. */
 export interface BoardStateDto {
   tasks: Task[];
   goals: Goal[];
   needsAttention: NeedsAttention[];
   progress: Record<string, Progress>;
+  pipelines: Pipeline[];
+  pipelineFields: Record<string, TicketFields>;
+  pipelineLaneCounts: Record<string, Record<string, number>>;
+  blocked: BlockedSummaryDto[];
 }
 
 /** Mirrors the Rust `Rollover` enum (`#[serde(rename_all = "camelCase")]`)
@@ -1757,4 +2087,81 @@ export const api = {
    *  `board-state` — a family connection has no single owning project. */
   onFamilySync: (fn: (ev: FamilySyncEvent) => void): Promise<UnlistenFn> =>
     listen<FamilySyncEvent>("family-sync", (e) => fn(e.payload)),
+
+  // ---- ken-pipeline (ken-pipeline change, task 4.1) ----
+  /** Every loaded pipeline definition plus its `validate_pipeline` findings
+   *  — the natural place to discover a bad definition file. */
+  pipelineListDefs: () => invoke<PipelineDefDto[]>("pipeline_list_defs"),
+  /** Lane-ordered board state on demand — same `BoardStateDto` shape
+   *  `board_get`/`board-state` give, gated specifically on `kenPipeline`
+   *  (not just `kenTasks`). Most UI reads should prefer `tasksStore.board`
+   *  (already live via `board-state`) over calling this directly. */
+  pipelineBoard: () => invoke<BoardStateDto>("pipeline_board"),
+  /** The run ledger's derived queue view on demand; live updates arrive via
+   *  `onPipelineRuns`. */
+  pipelineRuns: () => invoke<PipelineRunQueue>("pipeline_runs"),
+  /** The resolved blocker chain for one ticket, root first. */
+  pipelineBlockers: (ticketId: string) => invoke<PipelineBlockersDto>("pipeline_blockers", { ticketId }),
+  /** The daily update — grouped, markdown-rendered, and (when `kenMemory`
+   *  is on) journaled server-side on every call. `day` defaults to today. */
+  pipelineDigest: (day?: string) => invoke<PipelineDigestDto>("pipeline_digest", { day }),
+  /** The confirmation gate (D3). First call (or `confirmed: false`) with a
+   *  `Confirm` verdict returns `needsConfirm` and writes nothing; call again
+   *  with `confirmed: true` once the human accepts to actually queue the
+   *  run. `Start`/`Queued`/an already-accepted `Confirm` all write a run
+   *  record with `outcome: queued` (D14: Ken never itself distinguishes
+   *  "start" from "queue" — `ready` says whether the cap is free). */
+  pipelineKickoff: (ticketId: string, confirmed: boolean) =>
+    invoke<PipelineKickoffOutcome>("pipeline_kickoff", { ticketId, confirmed }),
+  /** Resolve `on_pass`/`on_fail`, apply bounce accounting (a cap breach
+   *  blocks the ticket instead — D4), append `report` to the ticket's
+   *  `## Log`, and close whichever run is currently open for the ticket.
+   *  `artifacts` names which QA-lane outputs landed under
+   *  `.ken-workspace/artifacts/<ticket-id>/` for this run (D9). */
+  pipelineAdvance: (ticketId: string, outcome: PipelineAdvanceOutcome, report: string, artifacts?: string[]) =>
+    invoke<PipelineAdvanceDto>("pipeline_advance", { ticketId, outcome, report, artifacts }),
+  /** Cancel a still-open (`queued`/`running`) run; refused once the run is
+   *  already closed (the ledger is append-only history). */
+  pipelineCancelRun: (runId: string) => invoke<void>("pipeline_cancel_run", { runId }),
+  /** Block a ticket — routes through `pipeline::block` server-side, so
+   *  cycle detection and `return_lane` capture (captured from the ticket's
+   *  CURRENT lane, never caller-supplied) cannot be bypassed. A cycle
+   *  refusal rejects with the offending path in the error message. */
+  pipelineBlock: (ticketId: string, request: PipelineBlockRequest) =>
+    invoke<Task>("pipeline_block", { ticketId, request }),
+  /** Clear a block's dependencies and/or reason independently (D5) — both
+   *  hold coexist, so clearing one alone may leave the ticket
+   *  `stillBlocked`; the returned `Task` reflects whichever happened. */
+  pipelineUnblock: (ticketId: string, request: PipelineUnblockRequest) =>
+    invoke<Task>("pipeline_unblock", { ticketId, request }),
+  /** The human sign-off lane's own review action (D11) — accept / accept
+   *  with comments (spawns a `todo`-lane child with `parent` set, in the
+   *  same action the parent advances) / reject (the lane's `on_fail` edge,
+   *  counted as a bounce). */
+  pipelineSignoff: (ticketId: string, decision: PipelineSignoffDecision, comment?: string) =>
+    invoke<PipelineSignoffDto>("pipeline_signoff", { ticketId, decision, comment }),
+  /** Propose a documentation-lane idea citing `ticketId` (D7's required
+   *  `spawned_by`); deduped against in-scope tickets before landing — a
+   *  match above threshold appends a log note instead of creating a
+   *  ticket. */
+  pipelineProposeIdea: (ticketId: string, title: string, body: string) =>
+    invoke<PipelineIdeaOutcome>("pipeline_propose_idea", { ticketId, title, body }),
+  /** One ticket's artifact manifest (D9), or `null` if the folder doesn't
+   *  exist yet. */
+  pipelineArtifacts: (ticketId: string) => invoke<PipelineArtifactManifestDto | null>("pipeline_artifacts", { ticketId }),
+  /** Lazily create `artifacts/<ticket-id>/` + its manifest on first use, or
+   *  append `filename` to an existing manifest (idempotent). Every path
+   *  this writes is rooted under `.ken-workspace/artifacts/<ticket-id>/` —
+   *  structurally unable to land inside a member repo (D9). */
+  pipelineRegisterArtifact: (ticketId: string, filename: string) =>
+    invoke<PipelineArtifactManifestDto>("pipeline_register_artifact", { ticketId, filename }),
+  /** The human-invoked prune action (OPEN-5/D9) — Ken never calls this on a
+   *  timer; expired artifact folders are only ever surfaced, never
+   *  auto-deleted. */
+  pipelinePruneArtifacts: (ticketId: string) => invoke<void>("pipeline_prune_artifacts", { ticketId }),
+  /** `pipeline-runs`: the run queue, re-emitted alongside `board-state`
+   *  from the same recompute (task 2.2) so the two events never drift out
+   *  of sync with each other. */
+  onPipelineRuns: (fn: (queue: PipelineRunQueue) => void): Promise<UnlistenFn> =>
+    listen<PipelineRunQueue>("pipeline-runs", (e) => fn(e.payload)),
 };

@@ -592,7 +592,7 @@ before starting. Two sequencing rules this file encodes:
 
 ## 3. ken-mcp
 
-- [ ] 3.1 `pipeline_list(filter, limit?, cursor?)` — filter by lane,
+- [x] 3.1 `pipeline_list(filter, limit?, cursor?)` — filter by lane,
       pipeline, project, model, assignee, and block state
       (`blocked`, `blocked_by: <id>`, `newly_unblocked`); compact
       rows only (id, title, lane, symbol, model, assignee, block
@@ -600,77 +600,241 @@ before starting. Two sequencing rules this file encodes:
       100, opaque cursor. The tool description states plainly that
       the backlog is large, that this tool is the only way to read
       it, and that `blocked` answers "what is stuck and why"
-- [ ] 3.2 `pipeline_get(id)` — the one tool returning a full ticket
+      - Scans the workspace tasks home only (D15: pipeline tickets live
+        there in v1) via a new `load_pipeline_board` helper —
+        `tasks::scan_tasks` + `pipeline::resolve_board`, filtered to
+        `Task::lane.is_some()`. Reuses `tasks::TaskFilter`/`filter_tasks`
+        for lane/pipeline/project/assignee/blocked; `model` isn't a
+        `TaskFilter` field so it's a post-filter over `ticket_fields`
+        (ticket's own `model`, falling back to the lane's default).
+      - Cursor is the last-returned row's ticket id (opaque to the
+        caller; described in the schema as "do not construct by hand"),
+        paging strictly-after it over an id-sorted list — see 3.9's
+        1000-ticket test.
+- [x] 3.2 `pipeline_get(id)` — the one tool returning a full ticket
       (body, scope, verify, bounces, blockers, return lane, log tail)
-- [ ] 3.3 `pipeline_claim(id, agent, model?)` — re-runs `admit()`
+      - `root_blockers`/`BlockGraph::from_tasks` supply the resolved
+        blocker chain; a `log_tail` helper finds the `## Log` heading and
+        UTF-8-safely tail-truncates it (reuses the file's own
+        `floor_char_boundary_at`).
+- [x] 3.3 `pipeline_claim(id, agent, model?)` — re-runs `admit()`
       server-side; **refuses blocked tickets** and over-cap claims;
       creates/updates the run record to `running`
-- [ ] 3.4 `pipeline_advance(id, outcome, report)` — `pass|fail`;
+      - See the final report's "claim protocol" section for the full
+        judgment call: claim reuses an already-`queued` run (filed by a
+        human kickoff in the Ken app) when one exists, flipping it to
+        `running`, but also works standalone — creating a fresh `running`
+        record straight from `Admission::Start` — since ken-mcp has no
+        `pipeline_kickoff` tool of its own. `Admission::Confirm` (the
+        ticket needs a human, or is missing scope/verify) is refused with
+        no write, since an MCP agent cannot accept a confirmation on the
+        ticket's behalf. An additional guard beyond `admit`'s own
+        cross-product: a ticket already `running` refuses a second claim
+        outright (case not covered by `admit`, which only counts running
+        records against the workspace-wide cap, not per-ticket).
+- [x] 3.4 `pipeline_advance(id, outcome, report)` — `pass|fail`;
       resolves the target lane from the definition, applies bounce
       accounting (a cap breach blocks the ticket), appends the
       report, closes the run record
-- [ ] 3.5 `pipeline_block(id, {blocked_by?, reason?, clear?})` — set
+      - `artifacts?: string[]` added beyond the literal signature (D9 —
+        same addition src-tauri's 2.4 made and flagged for the same
+        reason: without it `RunRecord.artifacts` could never be set by
+        an MCP-reported run).
+      - The frontmatter patch + `## Log` transition line land in one
+        guarded write; the full `report` becomes the *closed run's* body,
+        not a second copy on the ticket (asserted in 3.9's diff test).
+- [x] 3.5 `pipeline_block(id, {blocked_by?, reason?, clear?})` — set
       or clear a block; enforces cycle detection and records
       `return_lane`; the tool description states that `blocked_by`
       takes ticket ids, never paths, and that blocking removes the
       ticket from every claimable queue
-- [ ] 3.6 `pipeline_runs(filter)` — the watch surface: running,
+      - `clear` is `{deps?: bool, reason?: bool}`; its presence selects
+        the unblock path (`pipeline::unblock`) over the block path
+        (`pipeline::block`) — mutually exclusive by which arguments are
+        given, no separate mode flag.
+- [x] 3.6 `pipeline_runs(filter)` — the watch surface: running,
       queued, blocked, waiting-on-human, stale
-- [ ] 3.7 `pipeline_digest(day?)` — the daily update:
+      - `filter` is `{state?: "running"|"queued"|"blocked"|"waitingHuman"|"stale"|"all"}`
+        over `pipeline::derive_queue`. `known_running_ids` (D13's
+        staleness input) is a new `Server.known_running: RefCell<BTreeSet<String>>`
+        field — this server *process's* own claims this session, mirroring
+        src-tauri's `WorkspaceState::pipeline_known_running` for a runner
+        with no watcher of its own; a `running` record this process never
+        itself claimed reports as `stale`. See the final report for the
+        full reasoning.
+- [x] 3.7 `pipeline_digest(day?)` — the daily update:
       awaiting-review, then newly-unblocked, then blocked oldest-first
-- [ ] 3.8 All seven absent when `kenPipeline` is off (mirror the
+      - Calls `pipeline::compose_digest` + `render_digest_markdown`
+        directly (the shared renderer chat/MCP/journal all use) and, when
+        `kenMemory` is on, journals it via `memory::append_journal` — same
+        every-call-journals posture src-tauri's 2.10 flagged (no dedupe
+        rule stated anywhere), carried over here for the same reason.
+- [x] 3.8 All seven absent when `kenPipeline` is off (mirror the
       existing `task_*` flag-off test)
-- [ ] 3.9 Tests: schema round-trips; `pipeline_list` never returns a
+      - `ken_pipeline_enabled` mirrors src-tauri's exactly: AND-ed with
+        `ken_tasks_enabled` (which AND-s `workspace_enabled`), so one
+        check transitively requires all three. Every tool function also
+        opens with `require_pipeline_flag` — defense-in-depth, same
+        posture as every other flag-gated tool in this file.
+- [x] 3.9 Tests: schema round-trips; `pipeline_list` never returns a
       body and never exceeds the hard max; cursor paging covers a
       1000-ticket lane exactly once; **claim refused when blocked**,
       including when the lane is `auto`; claim refused when over cap;
       `pipeline_block` refuses a cycle and leaves both files
       unchanged; advance applies exactly the intended frontmatter keys
+      - 8 new tests, all passing (see final report for the verbatim
+        `cargo test -p ken-mcp` result: 39 + 2 = 41 passed, 0 failed).
+        Covers: flag-off absence + dispatch-still-explains for all seven;
+        flag-on schema shapes (`required` arrays, `outcome` enum); claim
+        refused when blocked in an `auto` lane under an `auto: true`
+        pipeline, with zero run records created; claim refused over cap,
+        leaving/filing the run as `queued` (never `running`); claim
+        writes `running`, a second claim on the same ticket is refused,
+        and `pipeline_advance` closes it with an exact frontmatter diff
+        (status/updated/## Log changed; a hand-added unknown key and
+        scope/verify survive byte-for-byte); `pipeline_get` is the only
+        tool that leaks a ticket's body, `pipeline_list` never does;
+        `pipeline_block` on a 2-cycle is refused with neither ticket file
+        touched, and the would-be-blocker still can't be claimed once
+        blocked; `pipeline_digest` journals when `kenMemory` is on and
+        writes no journal file when it's off; 1000-ticket cursor paging
+        covers every id exactly once with no duplicate and a `limit`
+        far above the hard max still yields ≤100 rows.
 
 ## 4. Frontend
 
-- [ ] 4.1 `api.ts`: pipeline/lane/run/block/digest types, command
+- [x] 4.1 `api.ts`: pipeline/lane/run/block/digest types, command
       wrappers, `pipeline-runs` listener alongside `board-state`
-- [ ] 4.2 Pipeline board view (workspace mode, flag on): horizontally
+      - `board_get`/`pipeline_board`/`board-state` share one `BoardStateDto`
+        shape, so `pipeline.svelte.ts` reads `tasksStore.board` for
+        `pipelines`/`pipelineFields`/`pipelineLaneCounts`/`blocked` instead
+        of polling a second copy; `pipeline_list_defs` (for `issues`,
+        `pipeline_runs`/`pipeline-runs`, and every write command got their
+        own wrapper. `Task` gained `lane`; `AttentionReason` gained the four
+        pipeline variants — `tasks.svelte.ts`'s `EMPTY_BOARD` updated to match.
+      - Flagged, not fixed (crates/** read-only this session): `RefusalReason`'s
+        `HumanLane(String)`/`NoAgent(String)`/`ManualLane(String)` and
+        `TransitionRefusal::UnknownLane(String)` are newtype variants under a
+        *bare* `#[serde(tag = "...")]` (no `content`) — serde's internally-
+        tagged representation only supports struct-shaped variant content, so
+        these may fail to serialize via `serde_json` at all (a live IPC error)
+        rather than reach the frontend as typed JSON. Every call site already
+        treats a kickoff/advance rejection as an opaque string, so this isn't
+        a UI blocker, but worth a look from the ken-core owner.
+- [x] 4.2 Pipeline board view (workspace mode, flag on): horizontally
       scrolling lanes in definition order; card shows **project
       symbol top-left**, lane colour, model badge, agent badge,
       bounce badge when > 0, `+n` for multi-project tickets
-- [ ] 4.3 Blocked rendering (D5): a real **Blocked column**, plus a
+      - `PipelineBoard.svelte` + `PipelineCard.svelte`, mounted as a third
+        "Pipeline" tab inside `TasksScreen.svelte` (alongside Main/Daily)
+        rather than a new nav-rail screen — it extends the Phase 7 Kanban,
+        same flag-gated-tab precedent `kenTasks` already uses.
+      - **Deferred, not invented**: no Tauri command exposes the real
+        per-project `symbol`/`color` (ken-core task 1.17's
+        `ProjectConfig.extra` fields) or `workspace.json` `links` (task
+        1.16) to the frontend — `ProjectInfo`/`WorkspaceOverview` carry
+        neither. `projectSymbol()` in `pipeline.svelte.ts` derives a
+        placeholder from the project name's initials so "readable at a
+        glance" has something to render; swap it once a command exists.
+      - No free drag-drop between pipeline lanes (judgment call): every
+        forward move is an explicit button through `pipeline_kickoff`
+        (agent lanes, gated) or `pipeline_advance` (holding lanes, ungated
+        since there's no agent to mis-fire) — D3's whole point is that a
+        mis-drag must never start a code-writing agent, and a free drag
+        target makes that too easy to get wrong.
+- [x] 4.3 Blocked rendering (D5): a real **Blocked column**, plus a
       card badge reading "blocked · returns to `<return_lane>`" and
       a blocker chip per `blocked_by` entry (click ⇒ open the
       blocking ticket, cross-project included) and the block reason.
       Ghost placeholders in the return lane are OPEN-9 — **ship
       column + badge first, add the ghost only if the board stops
       reading correctly without it**
-- [ ] 4.4 Block/unblock dialog: set dependencies (ticket picker
+      - `PipelineCard.svelte`'s `.block-panel`; blocker chips resolve
+        against `tasksStore.board.tasks` (already cross-project/cross-home
+        via `task_homes_scan`) and open through the existing
+        `tasksStore.openFile` honest-disabled-reason path. Ghost
+        placeholders NOT built, per OPEN-9's own recommendation.
+- [x] 4.4 Block/unblock dialog: set dependencies (ticket picker
       searching across projects, returns ids) and/or a free-text
       reason, both optional but at least one required; cycle refusal
       renders the offending path readably; unblock offers clearing
       dependencies and reason independently
-- [ ] 4.5 Filters: per-project chips, "include linked projects"
+      - `BlockDialog.svelte`. Cycle-refusal text is the backend's own
+        `describe_block_refusal` string (already includes the path) —
+        displayed verbatim, not re-parsed. `blockedBy` is additive
+        (matches `pipeline::block`'s merge-with-existing semantics); there
+        is no per-blocker removal (only `clearDeps` clears the whole set),
+        matching the backend's own `UnblockRequest` shape.
+- [x] 4.5 Filters: per-project chips, "include linked projects"
       toggle, lane, model, assignee, and a block filter
       (blocked / not blocked / blocked-by-ticket / newly unblocked);
       plus a classic-board toggle to hide pipeline tickets (OPEN-7)
-- [ ] 4.6 Kickoff confirmation dialog showing lane, agent, model,
+      - `PipelineBoard.svelte`'s toolbar + `pipeline.svelte.ts`'s
+        `PipelineFilters`/`matchesBlockFilter` (a client-side mirror of
+        `pipeline::matches_block_filter`). "Include linked projects" is an
+        **honestly disabled** checkbox with a tooltip explaining the same
+        missing-command gap as 4.2's project symbol — no invented backend
+        path. The classic-board toggle lives on `tasksStore.filters.hidePipeline`
+        (Main/Daily tabs), checked in `TasksScreen.svelte`.
+- [x] 4.6 Kickoff confirmation dialog showing lane, agent, model,
       **scope globs and verify command** — the intent diff, not a
       generic "are you sure"; disabled with an explanation when scope
       or verify is missing, or when the ticket is blocked
-- [ ] 4.7 Run tray: running / queued / waiting-on-human / stale, with
+      - `KickoffDialog.svelte`. Judgment call: a *blocked* ticket hard-
+        disables Start (matches `admit()`'s hard `Refused{Blocked}`), but a
+        missing-scope/verify ticket does NOT hard-disable the dialog's
+        Confirm button — `admit()` only ever *downgrades* that case to
+        `confirm` (D3), it never refuses outright, so a human can still
+        deliberately run an unbounded ticket. Instead the dialog requires an
+        explicit "I understand this run has no defined boundary" checkbox
+        before Confirm enables — same spirit as "disabled with an
+        explanation", without contradicting the backend's actual admission
+        rule. Flagged here in case the literal reading was intended instead.
+- [x] 4.7 Run tray: running / queued / waiting-on-human / stale, with
       cancel; cap indicator when runs are queued behind the cap
-- [ ] 4.8 Sign-off dialog: Accept / Accept with comments (comment box
+      - `RunTray.svelte`, toggled from the board toolbar; per-pipeline
+        "N/cap running" chips; cancel wraps `pipeline_cancel_run` (works on
+        stale rows too — they're still `outcome: running` on disk).
+- [x] 4.8 Sign-off dialog: Accept / Accept with comments (comment box
       → child ticket, shown in the confirmation) / Reject
-- [ ] 4.9 Needs-attention tray additions: unknown lane, unknown
+      - `SignoffDialog.svelte`, three distinct buttons (Accept disabled by
+        nothing; Accept-with-comments requires non-empty text; Reject is
+        its own button, not a mode toggle). `pipelineStore.signoff()`
+        deliberately does NOT auto-close the dialog — the component shows
+        the created child ticket's title/id before the human dismisses it,
+        satisfying "shown in the confirmation" literally.
+- [x] 4.9 Needs-attention tray additions: unknown lane, unknown
       pipeline, unknown blocker, missing return lane, blocked-and-
       ageing, missing boundary, expired artifacts (with prune), stale
       runs
-- [ ] 4.10 Artifact viewer for `artifacts/<ticket-id>/` with a visible
+      - `NeedsAttentionTray.svelte` extended: the four `AttentionReason`
+        variants slot into the existing `describe()` switch (same tray, same
+        "never rewritten, fix by hand" contract); ageing-blocked/missing-
+        boundary/stale-runs are derived client-side from `board-state`/
+        `pipeline_runs` (no such `AttentionReason` variants exist). Expired
+        artifacts is **best-effort, flagged as a scaling gap**: no bulk
+        "list every manifest" command exists, so it probes
+        `pipeline_artifacts` once per pipeline ticket currently on the
+        board — fine for realistic board sizes, not for 5.9's 1000-ticket
+        scale.
+- [x] 4.10 Artifact viewer for `artifacts/<ticket-id>/` with a visible
       `throwaway — not part of the test suite` marker and the expiry
       date
-- [ ] 4.11 Digest surface: a daily panel rendering
+      - `ArtifactViewer.svelte`; prune wraps `pipeline_prune_artifacts`
+        (human-invoked only, never on a timer, per OPEN-5/D9). Added a
+        small "record a filename" input beyond the literal ask — without
+        some UI writer, the viewer would only ever show manifests an agent
+        created via MCP, which doesn't exist in this session's scope
+        (section 3 is a parallel session's).
+- [x] 4.11 Digest surface: a daily panel rendering
       `pipeline_digest`, awaiting-review first, then a prominent
       "unblocked overnight" group with a per-ticket start action
       (which still opens the confirmation dialog, never starts
       directly)
+      - `DigestPanel.svelte`, group order matches the spec exactly; the
+        unblocked-overnight row's "Start" button calls
+        `pipelineStore.openKickoff`, i.e. the same confirmation gate as
+        every other start — never a direct `pipeline_kickoff(id, true)`.
 
 ## 5. Verification
 

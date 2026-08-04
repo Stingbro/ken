@@ -9451,7 +9451,7 @@ fn close_run_record(path: &Path, outcome: pipeline::RunOutcome, report: &str, ar
 fn describe_block_refusal(r: &pipeline::BlockRefusal) -> String {
     match r {
         pipeline::BlockRefusal::NoBlockedLane => "this pipeline declares no blocked lane".to_string(),
-        pipeline::BlockRefusal::UnknownLane(s) => format!("ticket's current status '{s}' names no lane"),
+        pipeline::BlockRefusal::UnknownLane { status: s } => format!("ticket's current status '{s}' names no lane"),
         pipeline::BlockRefusal::MissingReturnLane => {
             "ticket is already blocked but its return lane is missing or orphaned — resolve it in the needs-attention tray first".to_string()
         }
@@ -9477,7 +9477,7 @@ fn describe_unblock_refusal(r: &pipeline::UnblockRefusal) -> String {
 
 fn describe_transition_refusal(r: &pipeline::TransitionRefusal) -> String {
     match r {
-        pipeline::TransitionRefusal::UnknownLane(s) => format!("ticket's status '{s}' names no lane"),
+        pipeline::TransitionRefusal::UnknownLane { status: s } => format!("ticket's status '{s}' names no lane"),
         pipeline::TransitionRefusal::NoEdge { lane, outcome } => {
             format!("lane '{lane}' declares no {} edge", outcome.as_str())
         }

@@ -928,8 +928,9 @@ pub enum BlockRefusal {
     /// nowhere to put stuck work.
     NoBlockedLane,
     /// The ticket's `status` names no lane, so there is no current lane to
-    /// capture as the return lane.
-    UnknownLane(String),
+    /// capture as the return lane. Struct variant for the serde reason
+    /// documented on `RefusalReason`.
+    UnknownLane { status: String },
     /// Extending a block on a ticket already in the blocked lane whose
     /// `return_lane` is missing or orphaned. It is a tray entry, and it is
     /// not this function's job to invent one.
@@ -999,7 +1000,7 @@ pub fn block(
         return refuse(BlockRefusal::NoBlockedLane);
     };
     let Some(current) = resolve_lane(pipeline, &ticket.status_raw) else {
-        return refuse(BlockRefusal::UnknownLane(ticket.status_raw.clone()));
+        return refuse(BlockRefusal::UnknownLane { status: ticket.status_raw.clone() });
     };
 
     let existing = ticket_fields(ticket);
@@ -1566,12 +1567,21 @@ pub enum RefusalReason {
         blocked_by: Vec<String>,
         block_reason: Option<String>,
     },
+    // Every payload-carrying variant below is a STRUCT variant, not a
+    // newtype. This enum is internally tagged (`tag = "reason"`, no
+    // `content`), and serde cannot serialize `Variant(String)` in that
+    // representation: it fails at RUNTIME with "cannot serialize tagged
+    // newtype variant". The compiler says nothing, and only refusal paths
+    // reach it — so the failure would land exactly when the UI needed to
+    // explain why work was refused. Same rule applies to `TransitionRefusal`
+    // and `BlockRefusal`; `every_refusal_variant_actually_serializes` guards
+    // all three.
     /// A `human: true` lane has no agent and no kickoff (D11).
-    HumanLane(String),
+    HumanLane { lane: String },
     /// A holding column — `agent: none`. Nothing to run.
-    NoAgent(String),
+    NoAgent { lane: String },
     /// A `manual` lane reached by something other than a human asking.
-    ManualLane(String),
+    ManualLane { lane: String },
 }
 
 /// [`admit`]'s verdict.
@@ -1680,12 +1690,12 @@ pub fn admit(
     // (2) Structurally unrunnable lanes.
     if lane.human {
         return Admission::Refused {
-            reason: RefusalReason::HumanLane(lane.id.clone()),
+            reason: RefusalReason::HumanLane { lane: lane.id.clone() },
         };
     }
     if lane.agent.is_none() {
         return Admission::Refused {
-            reason: RefusalReason::NoAgent(lane.id.clone()),
+            reason: RefusalReason::NoAgent { lane: lane.id.clone() },
         };
     }
 
@@ -1723,7 +1733,7 @@ pub fn admit(
             EntryKind::Claim => boundary,
             EntryKind::AutoTransition | EntryKind::Unblock => {
                 return Admission::Refused {
-                    reason: RefusalReason::ManualLane(lane.id.clone()),
+                    reason: RefusalReason::ManualLane { lane: lane.id.clone() },
                 }
             }
         },
@@ -1786,8 +1796,9 @@ impl AdvanceOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "refusal")]
 pub enum TransitionRefusal {
-    /// The ticket's `status` names no lane in this pipeline.
-    UnknownLane(String),
+    /// The ticket's `status` names no lane in this pipeline. Struct variant
+    /// for the serde reason documented on `RefusalReason`.
+    UnknownLane { status: String },
     /// The lane declares no edge for this outcome (a terminal lane on
     /// `pass`, or any lane with no `on_fail`).
     NoEdge { lane: String, outcome: AdvanceOutcome },
@@ -1846,7 +1857,7 @@ pub fn advance(
     let refuse = |reason| Transition::Refused { reason };
 
     let Some(from) = resolve_lane(pipeline, &ticket.status_raw) else {
-        return refuse(TransitionRefusal::UnknownLane(ticket.status_raw.clone()));
+        return refuse(TransitionRefusal::UnknownLane { status: ticket.status_raw.clone() });
     };
     let target_id = match outcome {
         AdvanceOutcome::Pass => from.on_pass.clone(),
@@ -3957,6 +3968,53 @@ Per-lane briefs live here.
     }
 
     #[test]
+    fn every_refusal_variant_actually_serializes() {
+        // Regression guard for a bug that shipped silently: these three enums
+        // are internally tagged, and serde cannot serialize a newtype variant
+        // in that representation — it fails at RUNTIME, not compile time, and
+        // only on refusal paths. So the UI would break exactly when it needed
+        // to say why work was refused. Every payload-carrying variant must be
+        // a struct variant; this test is what keeps that true.
+        let cases: Vec<(&str, serde_json::Result<String>)> = vec![
+            (
+                "RefusalReason::Blocked",
+                serde_json::to_string(&RefusalReason::Blocked {
+                    return_lane: Some("programmer".into()),
+                    blocked_by: vec![uid('B')],
+                    block_reason: None,
+                }),
+            ),
+            (
+                "RefusalReason::HumanLane",
+                serde_json::to_string(&RefusalReason::HumanLane { lane: "signoff".into() }),
+            ),
+            (
+                "RefusalReason::NoAgent",
+                serde_json::to_string(&RefusalReason::NoAgent { lane: "todo".into() }),
+            ),
+            (
+                "RefusalReason::ManualLane",
+                serde_json::to_string(&RefusalReason::ManualLane { lane: "a".into() }),
+            ),
+            (
+                "TransitionRefusal::UnknownLane",
+                serde_json::to_string(&TransitionRefusal::UnknownLane { status: "bogus".into() }),
+            ),
+            (
+                "BlockRefusal::UnknownLane",
+                serde_json::to_string(&BlockRefusal::UnknownLane { status: "bogus".into() }),
+            ),
+        ];
+        for (name, result) in cases {
+            let json = result.unwrap_or_else(|e| panic!("{name} failed to serialize: {e}"));
+            assert!(
+                json.starts_with('{') && json.contains("\":"),
+                "{name} serialized to a non-object: {json}"
+            );
+        }
+    }
+
+    #[test]
     fn admission_gate_table_for_unblocked_tickets() {
         let plain = pipe();
         let auto = auto_pipe();
@@ -3965,11 +4023,11 @@ Per-lane briefs live here.
         // Holding columns and the human lane refuse outright.
         assert_eq!(
             admit(&t, plain.lane("todo").unwrap(), &plain, &[], EntryKind::Kickoff),
-            Admission::Refused { reason: RefusalReason::NoAgent("todo".into()) }
+            Admission::Refused { reason: RefusalReason::NoAgent { lane: "todo".into() } }
         );
         assert_eq!(
             admit(&t, plain.lane("signoff").unwrap(), &plain, &[], EntryKind::Kickoff),
-            Admission::Refused { reason: RefusalReason::HumanLane("signoff".into()) }
+            Admission::Refused { reason: RefusalReason::HumanLane { lane: "signoff".into() } }
         );
         // A manual lane reached by automation, rather than by a human.
         let manual_agent = parse_pipeline(
@@ -3983,7 +4041,7 @@ Per-lane briefs live here.
         ));
         assert_eq!(
             admit(&mt, m_lane, &manual_agent, &[], EntryKind::AutoTransition),
-            Admission::Refused { reason: RefusalReason::ManualLane("a".into()) }
+            Admission::Refused { reason: RefusalReason::ManualLane { lane: "a".into() } }
         );
         assert_eq!(
             admit(&mt, m_lane, &manual_agent, &[], EntryKind::Kickoff),
@@ -4119,7 +4177,7 @@ Per-lane briefs live here.
         // An unresolvable current lane refuses rather than guessing.
         assert_eq!(
             advance(&ticket(&uid('A'), "programmerr", ""), &p, AdvanceOutcome::Pass, now),
-            Transition::Refused { reason: TransitionRefusal::UnknownLane("programmerr".into()) }
+            Transition::Refused { reason: TransitionRefusal::UnknownLane { status: "programmerr".into() } }
         );
     }
 

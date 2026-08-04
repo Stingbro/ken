@@ -5,6 +5,7 @@
   // rollover, and archiving done cards.
   import { onMount } from "svelte";
   import { tasksStore } from "../lib/tasks.svelte";
+  import { pipelineStore } from "../lib/pipeline.svelte";
   import { families } from "../lib/families.svelte";
   import { app } from "../lib/app.svelte";
   import type { Task, TaskStatus } from "../lib/api";
@@ -13,6 +14,7 @@
   import NeedsAttentionTray from "../tasks/NeedsAttentionTray.svelte";
   import DailyPlanCards from "../tasks/DailyPlanCards.svelte";
   import RolloverPrompt from "../tasks/RolloverPrompt.svelte";
+  import PipelineBoard from "../pipeline/PipelineBoard.svelte";
   import Plus from "@lucide/svelte/icons/plus";
   import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
   import Target from "@lucide/svelte/icons/target";
@@ -21,6 +23,11 @@
   onMount(() => {
     void tasksStore.init();
     void families.init();
+    // ken-pipeline task 4: cheap even if the user never opens the Pipeline
+    // tab — resolves the `kenPipeline` flag and nothing else. The tab
+    // itself only renders once `pipelineStore.enabled` (task 4's "flag off
+    // ⇒ the Phase 7 board renders exactly as today").
+    void pipelineStore.init();
   });
 
   // ken-families task 4.3: per-family filter chip. Only families attached
@@ -197,14 +204,21 @@
             <button class:on={tasksStore.view === "daily"} onclick={() => (tasksStore.view = "daily")}>
               Daily
             </button>
+            {#if pipelineStore.enabled}
+              <button class:on={tasksStore.view === "pipeline"} onclick={() => (tasksStore.view = "pipeline")}>
+                Pipeline
+              </button>
+            {/if}
           </div>
-          <label class="check">
-            <input type="checkbox" bind:checked={tasksStore.groupByGoal} />
-            Group by goal
-          </label>
-          <button class="btn btn-small btn-ghost" onclick={() => tasksStore.openGoalDialog(null)}>
-            <Target size={13} strokeWidth={1.75} /> New goal
-          </button>
+          {#if tasksStore.view !== "pipeline"}
+            <label class="check">
+              <input type="checkbox" bind:checked={tasksStore.groupByGoal} />
+              Group by goal
+            </label>
+            <button class="btn btn-small btn-ghost" onclick={() => tasksStore.openGoalDialog(null)}>
+              <Target size={13} strokeWidth={1.75} /> New goal
+            </button>
+          {/if}
           <button
             class="btn btn-small attention-toggle"
             class:has-items={tasksStore.board.needsAttention.length > 0}
@@ -215,40 +229,48 @@
           </button>
         </div>
 
-        <div class="filters">
-          <select bind:value={tasksStore.filters.project}>
-            <option value="">All projects</option>
-            {#each tasksStore.projects as p (p)}
-              <option value={p}>{p}</option>
-            {/each}
-          </select>
-          <input class="filter-text" placeholder="Tag" bind:value={tasksStore.filters.tag} />
-          <input class="filter-text" placeholder="Assignee" bind:value={tasksStore.filters.assignee} />
-          <select bind:value={tasksStore.filters.kind}>
-            <option value="">Any kind</option>
-            <option value="human">Human</option>
-            <option value="ai">AI</option>
-          </select>
-          <select bind:value={tasksStore.filters.goal}>
-            <option value="">Any goal</option>
-            {#each tasksStore.board.goals as g (g.id)}
-              <option value={g.id}>{g.title}</option>
-            {/each}
-          </select>
-          {#if familyOptions.length > 0}
-            <select bind:value={tasksStore.filters.family}>
-              <option value="">All families</option>
-              {#each familyOptions as dto (dto.connection.familyId)}
-                <option value={dto.connection.familyId}>{dto.connection.name}</option>
+        {#if tasksStore.view !== "pipeline"}
+          <div class="filters">
+            <select bind:value={tasksStore.filters.project}>
+              <option value="">All projects</option>
+              {#each tasksStore.projects as p (p)}
+                <option value={p}>{p}</option>
               {/each}
             </select>
-          {/if}
-          {#if tasksStore.filtersActive}
-            <button class="clear-filters" onclick={() => tasksStore.clearFilters()}>
-              <X size={12} strokeWidth={2} /> Clear
-            </button>
-          {/if}
-        </div>
+            <input class="filter-text" placeholder="Tag" bind:value={tasksStore.filters.tag} />
+            <input class="filter-text" placeholder="Assignee" bind:value={tasksStore.filters.assignee} />
+            <select bind:value={tasksStore.filters.kind}>
+              <option value="">Any kind</option>
+              <option value="human">Human</option>
+              <option value="ai">AI</option>
+            </select>
+            <select bind:value={tasksStore.filters.goal}>
+              <option value="">Any goal</option>
+              {#each tasksStore.board.goals as g (g.id)}
+                <option value={g.id}>{g.title}</option>
+              {/each}
+            </select>
+            {#if familyOptions.length > 0}
+              <select bind:value={tasksStore.filters.family}>
+                <option value="">All families</option>
+                {#each familyOptions as dto (dto.connection.familyId)}
+                  <option value={dto.connection.familyId}>{dto.connection.name}</option>
+                {/each}
+              </select>
+            {/if}
+            {#if pipelineStore.enabled}
+              <label class="check" title="Pipeline tickets still project onto this column by design (D2) — this only hides them from view.">
+                <input type="checkbox" bind:checked={tasksStore.filters.hidePipeline} />
+                Hide pipeline tickets
+              </label>
+            {/if}
+            {#if tasksStore.filtersActive}
+              <button class="clear-filters" onclick={() => tasksStore.clearFilters()}>
+                <X size={12} strokeWidth={2} /> Clear
+              </button>
+            {/if}
+          </div>
+        {/if}
 
         {#if dragError}
           <div class="drag-error">
@@ -258,37 +280,41 @@
         {/if}
       </div>
 
-      <div class="content">
-        {#if tasksStore.view === "daily"}
-          <DailyPlanCards />
-          <RolloverPrompt />
-        {/if}
+      {#if tasksStore.view === "pipeline"}
+        <PipelineBoard />
+      {:else}
+        <div class="content">
+          {#if tasksStore.view === "daily"}
+            <DailyPlanCards />
+            <RolloverPrompt />
+          {/if}
 
-        {#if tasksStore.loading && tasksStore.board.tasks.length === 0}
-          <p class="note">Loading the board…</p>
-        {:else if tasksStore.loadError}
-          <p class="note warn">Couldn't load the board: {tasksStore.loadError}</p>
-        {:else if tasksStore.groupByGoal}
-          {#each goalBuckets(tasksStore.tasksForBoard(board())) as bucket (bucket.id ?? "none")}
-            {@const bucketTasks = tasksStore
-              .tasksForBoard(board())
-              .filter((t) => (bucket.id === null ? !t.goal : t.goal === bucket.id))}
-            <div class="goal-group">
-              <div class="goal-group-head">
-                <Target size={13} strokeWidth={1.75} />
-                <span class="goal-group-title">{bucket.title}</span>
-                {#if bucket.id !== null}
-                  {@const progress = tasksStore.progressFor(bucket.id)}
-                  <span class="goal-progress">{progress.done}/{progress.total}</span>
-                {/if}
+          {#if tasksStore.loading && tasksStore.board.tasks.length === 0}
+            <p class="note">Loading the board…</p>
+          {:else if tasksStore.loadError}
+            <p class="note warn">Couldn't load the board: {tasksStore.loadError}</p>
+          {:else if tasksStore.groupByGoal}
+            {#each goalBuckets(tasksStore.tasksForBoard(board())) as bucket (bucket.id ?? "none")}
+              {@const bucketTasks = tasksStore
+                .tasksForBoard(board())
+                .filter((t) => (bucket.id === null ? !t.goal : t.goal === bucket.id))}
+              <div class="goal-group">
+                <div class="goal-group-head">
+                  <Target size={13} strokeWidth={1.75} />
+                  <span class="goal-group-title">{bucket.title}</span>
+                  {#if bucket.id !== null}
+                    {@const progress = tasksStore.progressFor(bucket.id)}
+                    <span class="goal-progress">{progress.done}/{progress.total}</span>
+                  {/if}
+                </div>
+                {@render kanban(bucketTasks)}
               </div>
-              {@render kanban(bucketTasks)}
-            </div>
-          {/each}
-        {:else}
-          {@render kanban(tasksStore.tasksForBoard(board()))}
-        {/if}
-      </div>
+            {/each}
+          {:else}
+            {@render kanban(tasksStore.tasksForBoard(board()))}
+          {/if}
+        </div>
+      {/if}
     </div>
 
     {#if tasksStore.attentionOpen}
