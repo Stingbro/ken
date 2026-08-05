@@ -474,8 +474,14 @@
   .wrap {
     height: 100vh;
     display: flex;
+    /* A too-tall panel (Features expanded, long candidate list) must stay
+       reachable: `align-items: center` alone clips it at BOTH ends with no
+       scroll. `safe center` degrades to `flex-start` once it would overflow;
+       the plain `center` above it is the fallback for engines without it. */
     align-items: center;
+    align-items: safe center;
     justify-content: center;
+    overflow-y: auto;
     /* Gentle lined paper: faint rules every 28px on the paper ground. */
     background:
       repeating-linear-gradient(
@@ -489,6 +495,9 @@
   }
   .panel {
     width: 460px;
+    max-width: 100%;
+    /* Never let the centering flexbox compress the panel — it scrolls instead. */
+    flex: none;
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -671,6 +680,9 @@
     flex-direction: column;
     gap: 10px;
     padding: 2px 2px 0;
+    /* Same treatment as `.ws-candidates`: nine flags overflow the panel. */
+    max-height: 260px;
+    overflow-y: auto;
   }
   .radio {
     display: flex;
@@ -681,6 +693,9 @@
   }
   .radio input {
     accent-color: var(--accent);
+    /* The checkbox is a flex item too — without this it shrinks to a sliver
+       when the label text is long. */
+    flex: none;
   }
   .feature-row {
     align-items: flex-start;
@@ -689,6 +704,12 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+    /* `min-width: auto` (the flex default) refuses to shrink below the
+       content width, so a long candidate note pushes the row past the
+       panel instead of wrapping. These two make it wrap in place. */
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .feature-name {
     font-weight: 600;
