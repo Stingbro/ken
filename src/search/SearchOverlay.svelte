@@ -31,11 +31,20 @@
   // `run()`'s project-scope branch is untouched, so that path (and its
   // `hybridSearch` call) stays byte-identical to before this change.
   type Scope = "project" | "all";
-  // ken-home-workspace: in a workspace the default is all-projects — a
-  // workspace-wide question is the common case, and defaulting to the
-  // focused member is what made Home feel single-project. Single-project
-  // mode never renders the toggle, so its default is unchanged.
-  let scope = $state<Scope>(app.workspace ? "all" : "project");
+  // ONE scope, shared with Home's picker (`scope.svelte.ts`). This used to
+  // be local state, which meant the overlay and Home could disagree — set
+  // "All projects" on Home and the overlay still showed "This project",
+  // because nothing connected them.
+  //
+  // The legacy single-project path is used only when the scope is the
+  // FOCUSED project; a pin on any other project (or a group) goes through
+  // routing, which can reach it whether or not it is resident.
+  const scope = $derived<Scope>(
+    sharedScope.enabled &&
+      !(sharedScope.kind === "project" && sharedScope.value === app.focused)
+      ? "all"
+      : "project",
+  );
   let kgRoutingEnabled = $state(false);
   /** Narrow the all-projects scope to one member (ken-home-workspace
    *  3.3). `null` = every member. Routed search pins the plan to this id
@@ -274,9 +283,13 @@
 
   function setScope(next: Scope) {
     if (scope === next) return;
-    scope = next;
-    // Pinning only means anything within the all-projects scope.
-    if (next === "project") pinnedMember = null;
+    // Writes through to the shared store, so Home reflects it too.
+    if (next === "project") {
+      pinnedMember = null;
+      sharedScope.set("project", app.focused ?? null);
+    } else {
+      sharedScope.set("all", null);
+    }
     void run();
   }
 

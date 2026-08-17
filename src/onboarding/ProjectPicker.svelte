@@ -425,13 +425,28 @@
         {/if}
       </div>
     {:else}
-      <div class="choose-row">
-        <button class="btn btn-primary big" onclick={chooseFolder}>Choose a folder…</button>
+      <!-- Two genuinely different outcomes, so they read as a choice
+           rather than an action plus an afterthought. The old pair —
+           a primary "Choose a folder…" above a ghost "Open a workspace…"
+           — pushed people into single-project mode by emphasis, and
+           "Open a workspace" sounded like opening an existing one rather
+           than building one from a folder of repos. -->
+      <div class="choose-row" class:stacked={app.workspaceFlagEnabled}>
         {#if app.workspaceFlagEnabled}
-          <button class="btn btn-ghost big" onclick={chooseWorkspaceFolder}>
-            Open a workspace…
+          <button class="choice" onclick={chooseWorkspaceFolder}>
+            <span class="choice-title">Several projects</span>
+            <span class="choice-note">
+              Pick the folder that CONTAINS your repos. Ken tracks each one
+              separately and you can search across all of them.
+            </span>
           </button>
         {/if}
+        <button class="choice" class:solo={!app.workspaceFlagEnabled} onclick={chooseFolder}>
+          <span class="choice-title">One project</span>
+          <span class="choice-note">
+            Pick a single folder — one repo, or one set of notes.
+          </span>
+        </button>
       </div>
     {/if}
 
@@ -530,16 +545,48 @@
     line-height: 1.7;
     color: var(--ink-secondary);
   }
-  .big {
-    height: 40px;
-    font-size: 14px;
-    align-self: flex-start;
-    margin-top: 6px;
-  }
   .choose-row {
     display: flex;
     gap: 10px;
     align-items: center;
+  }
+  /* Two real options: stacked cards, equal weight, so neither wins by
+     emphasis. */
+  .choose-row.stacked {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .choice {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    text-align: left;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    box-shadow: var(--shadow-control);
+    font: inherit;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .choice:hover {
+    border-color: var(--accent);
+  }
+  .choice:focus-visible {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
+    outline: none;
+  }
+  .choice-title {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .choice-note {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ink-tertiary);
   }
   .ws-candidates {
     display: flex;

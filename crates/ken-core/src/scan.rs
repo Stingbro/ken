@@ -177,11 +177,35 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
 
     // What's on disk (rel_path -> size, mtime, cloud placeholder?, tier)
     let mut on_disk: HashMap<String, (i64, i64, bool, crate::kenignore::Tier)> = HashMap::new();
+    // A git repo's own `.gitignore` is the best statement anyone has of
+    // "this is generated, not authored" — build output, caches, server
+    // world data. Honouring it in a repo is why a Gradle project indexes
+    // its `src/` and not its 1.7GB `build/`, without the user writing a
+    // `.kenignore` that restates what git already knows.
+    //
+    // Gated on the project actually BEING a repo, because the original
+    // reasoning still holds everywhere else: a notes folder is not a code
+    // repo, and a stray `.gitignore` inherited from a parent directory
+    // must not silently hide someone's documents. `parents(false)` keeps
+    // this to the project's own rules for the same reason — a workspace
+    // parent's `.gitignore` has no authority over a member's contents.
+    //
+    // LIMITATION, verified by test rather than assumed: `.kenignore` is
+    // applied to paths this walk YIELDS, so in a repo a `!` line cannot
+    // pull back something `.gitignore` already excluded — the walker
+    // never hands it over to be reclassified. To index a gitignored path
+    // deliberately, un-ignore it in `.gitignore` (a `!` line there), or
+    // move it out from under the pattern. `.kenignore` remains able to
+    // exclude further, and to demote to search-only, which is what it is
+    // overwhelmingly used for.
+    let is_repo = project.root.join(".git").exists();
     let walker = ignore::WalkBuilder::new(&project.root)
         .hidden(true) // skip dotfiles: .git, .ken, .DS_Store…
-        .git_ignore(false) // knowledge folders aren't code repos
+        .git_ignore(is_repo)
+        .git_exclude(is_repo)
+        .parents(false)
+        .require_git(true)
         .git_global(false)
-        .git_exclude(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             name != crate::project::CONFIG_DIR
@@ -712,6 +736,75 @@ mod tests {
         scan(&project, &mut db).unwrap();
         assert!(db.get_file(".DS_Store").unwrap().is_none());
         assert!(db.get_file(".ken/project.json").unwrap().is_none());
+        drop(dir);
+    }
+
+    /// In a git repo, `.gitignore` is honoured — otherwise a Gradle
+    /// project's 1.7GB `build/` and a server's `run/universe` world data
+    /// land in the index.
+    #[test]
+    fn gitignore_is_honoured_inside_a_repo() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "build/\nrun/\n").unwrap();
+        fs::create_dir_all(dir.path().join("build")).unwrap();
+        fs::create_dir_all(dir.path().join("run/universe")).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("build/out.txt"), "generated artifact").unwrap();
+        fs::write(dir.path().join("run/universe/region.txt"), "world data").unwrap();
+        fs::write(dir.path().join("src/main.txt"), "authored source").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        assert!(db.get_file("src/main.txt").unwrap().is_some(), "source must index");
+        assert!(db.get_file("build/out.txt").unwrap().is_none(), "build output must not");
+        assert!(
+            db.get_file("run/universe/region.txt").unwrap().is_none(),
+            "world data must not"
+        );
+        drop(dir);
+    }
+
+    /// …and NOT outside one. A notes folder that happens to carry a
+    /// `.gitignore` (copied in, inherited) must not have its documents
+    /// silently hidden.
+    #[test]
+    fn gitignore_is_ignored_outside_a_repo() {
+        let (dir, project) = temp_project();
+        fs::write(dir.path().join(".gitignore"), "notes/\n").unwrap();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/plan.md"), "a real document").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(
+            db.get_file("notes/plan.md").unwrap().is_some(),
+            "no .git means .gitignore has no authority here"
+        );
+        drop(dir);
+    }
+
+    /// Pins the limitation documented at the walker: `.kenignore` filters
+    /// what the walk YIELDS, so in a repo a `!` line cannot resurrect a
+    /// path `.gitignore` already excluded. Asserted so the behavior can't
+    /// drift silently in either direction — if someone later makes `!`
+    /// win, this test should fail and be updated deliberately.
+    #[test]
+    fn kenignore_bang_cannot_resurrect_a_gitignored_path() {
+        let (dir, project) = temp_project();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+        fs::write(dir.path().join(".kenignore"), "!dist/\n").unwrap();
+        fs::create_dir_all(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/notes.md"), "wanted, but gitignored").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(
+            db.get_file("dist/notes.md").unwrap().is_none(),
+            "the walker never yields it, so kenignore never sees it"
+        );
         drop(dir);
     }
 
