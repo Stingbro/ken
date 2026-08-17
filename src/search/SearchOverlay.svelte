@@ -9,6 +9,7 @@
     type RoutedSearchStateEvent,
   } from "../lib/api";
   import { app, forFocused } from "../lib/app.svelte";
+  import { scope as sharedScope } from "../lib/scope.svelte";
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
@@ -30,8 +31,16 @@
   // `run()`'s project-scope branch is untouched, so that path (and its
   // `hybridSearch` call) stays byte-identical to before this change.
   type Scope = "project" | "all";
-  let scope = $state<Scope>("project");
+  // ken-home-workspace: in a workspace the default is all-projects — a
+  // workspace-wide question is the common case, and defaulting to the
+  // focused member is what made Home feel single-project. Single-project
+  // mode never renders the toggle, so its default is unchanged.
+  let scope = $state<Scope>(app.workspace ? "all" : "project");
   let kgRoutingEnabled = $state(false);
+  /** Narrow the all-projects scope to one member (ken-home-workspace
+   *  3.3). `null` = every member. Routed search pins the plan to this id
+   *  and skips the KG entirely — same result shape either way. */
+  let pinnedMember = $state<string | null>(null);
 
   /** One results row, normalized from whichever endpoint answered the query
    *  (`hybrid_search`, `search_all_projects`, or `route_search`) so the
@@ -204,7 +213,12 @@
     if (scope === "all" && app.workspace) {
       routedProgress = null;
       if (kgRoutingEnabled) {
-        const res = await api.routeSearch(q, 30).catch(() => null);
+        // The shared scope store wins when it is narrowing (a group, or a
+        // project chosen on Home); `pinnedMember` is the overlay's own
+        // in-place narrowing for a single query.
+        const res = await api
+          .routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName)
+          .catch(() => null);
         if (q !== query.trim() || !res) return; // stale or failed
         routedPlan = res.plan;
         coverageNotes = res.memberStatus
@@ -261,6 +275,14 @@
   function setScope(next: Scope) {
     if (scope === next) return;
     scope = next;
+    // Pinning only means anything within the all-projects scope.
+    if (next === "project") pinnedMember = null;
+    void run();
+  }
+
+  function setPinnedMember(id: string | null) {
+    if (pinnedMember === id) return;
+    pinnedMember = id;
     void run();
   }
 
@@ -328,6 +350,23 @@
       <button class="scope-btn" class:active={scope === "all"} onclick={() => setScope("all")}>
         All projects
       </button>
+      {#if scope === "all" && kgRoutingEnabled}
+        <!-- Narrowing within all-projects: pins routing to one member,
+             including one that is dormant. -->
+        <select
+          class="member-pin"
+          value={pinnedMember ?? ""}
+          onchange={(e) => setPinnedMember(e.currentTarget.value || null)}
+          title="Narrow to one project"
+        >
+          <option value="">Everywhere</option>
+          <!-- Dormant members are pinnable: routing opens their index by
+               id without activating them. Only unresolvable ones are out. -->
+          {#each app.workspace.members.filter((m) => m.projectId && (m.status === "active" || m.status === "dormant")) as m (m.projectId)}
+            <option value={m.projectId}>{m.name}</option>
+          {/each}
+        </select>
+      {/if}
     </div>
   {/if}
 
@@ -510,6 +549,17 @@
     font-size: 11.5px;
     font-weight: 600;
     color: var(--ink-secondary);
+  }
+  .member-pin {
+    margin-left: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control, 6px);
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--ink-secondary);
+    max-width: 160px;
   }
   .scope-btn.active {
     background: var(--accent);

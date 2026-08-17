@@ -11,6 +11,7 @@ import {
   type TranscriptEntry,
 } from "./chatEcho";
 import { app, forFocused } from "./app.svelte";
+import { scope } from "./scope.svelte";
 
 class ChatsStore {
   open = $state(false);
@@ -112,7 +113,7 @@ class ChatsStore {
     const openFiles = app.fileTabs.map((t) => t.path);
     const focusedFile = app.openFile;
     try {
-      await api.sendChatMessage(chatId, text, openFiles, focusedFile);
+      await api.sendChatMessage(chatId, text, openFiles, focusedFile, scope.chatScope);
     } catch (e) {
       // The send failed: pull the pending echo and show why, so the message
       // doesn't sit there looking sent.

@@ -601,6 +601,13 @@ class AppStore {
    *  from `workspace-state`'s `open`/`focus` events and `member-status`
    *  events (workspace task 4.3: "screens reload their stores on the focus
    *  workspace-state event"). */
+  /** Public re-read of the workspace roster, for callers that changed
+   *  membership themselves (adding a project) and can't wait for the
+   *  `workspace-state` event that normally drives this. */
+  async refreshWorkspace() {
+    await this.refreshWorkspaceOverview();
+  }
+
   private async refreshWorkspaceOverview() {
     const overview = await api.workspaceOverview().catch(() => null);
     if (!overview) return;

@@ -302,6 +302,10 @@ export interface SyncStatus {
 export type ChatStatus = "working" | "needs_input" | "done" | "error";
 
 export interface ChatRow {
+  /** Projects this chat asks about, bound on its first message (schema
+   *  v13). null = this project only; "all" = every member; otherwise a
+   *  group name. Widens reading, not writing. */
+  scope?: string | null;
   id: string;
   title: string;
   kind: "user" | "ingest" | "research";
@@ -889,6 +893,69 @@ export interface RouteSearchResult {
   plan: RoutePlan;
   results: RoutedHit[];
   memberStatus: RouteMemberStatusEntry[];
+}
+
+/** Mirrors `CandidateDto` — a sibling folder not yet in the workspace.
+ *  `existing` means it already has `.ken/project.json` and will be
+ *  adopted rather than created fresh. */
+export interface WorkspaceCandidate {
+  name: string;
+  existing: boolean;
+  fileCount: number;
+  markers: string[];
+}
+
+/** Mirrors `ProjectGroupDto` — a named set of members that belong
+ *  together despite being separate repos. `members` are parent-relative
+ *  folder names; `projectIds` are the resolvable ones a scoped search
+ *  actually targets (shorter than `members` when one can't resolve). */
+export interface ProjectGroup {
+  name: string;
+  members: string[];
+  projectIds: string[];
+}
+
+/** One member's stored digest for the day, parsed. Mirrors
+ *  `MemberDigestDto`. */
+export interface MemberDigest {
+  projectId: string;
+  name: string;
+  body: string;
+  sources: string[];
+}
+
+/** A member with no digest stored for the day — named rather than
+ *  dropped, so Home never silently omits a project. */
+export interface MemberAwaitingDigest {
+  projectId: string;
+  name: string;
+}
+
+/** Mirrors `WorkspaceDigestDto`. `board` is null when `kenPipeline` is
+ *  off. `hasContent` is false when nothing has been written and the board
+ *  is empty — `awaiting` alone is something to explain, not to render. */
+export interface WorkspaceDigest {
+  date: string;
+  members: MemberDigest[];
+  awaiting: MemberAwaitingDigest[];
+  hasContent: boolean;
+  board: PipelineDigestDto | null;
+}
+
+/** Mirrors `MemberOverviewDto`. `status` is `ok` | `missing` | `invalid`;
+ *  `missing`/`invalid` members carry no project id or counts, and are
+ *  surfaced nowhere else in the app. */
+export interface MemberOverview {
+  folder: string;
+  status: "ok" | "missing" | "invalid";
+  detail: string | null;
+  projectId: string | null;
+  name: string | null;
+  resident: boolean;
+  indexReady: boolean;
+  fileCount: number;
+  failedFiles: number;
+  unread: number;
 }
 
 /** Mirrors the Rust `RoutedSearchStateEvent` internally-tagged enum
@@ -1561,8 +1628,45 @@ export const api = {
    *  targets, merge with cross-member RRF, and return cited `ken://`/
    *  `kg://` addresses. Requires `kgRouting`. Progress rides
    *  `routed-search-state`. */
-  routeSearch: (query: string, limit = 30) =>
-    invoke<RouteSearchResult>("route_search", { query, limit }),
+  routeSearch: (
+    query: string,
+    limit = 30,
+    scope?: string | null,
+    group?: string | null,
+  ) =>
+    invoke<RouteSearchResult>("route_search", {
+      query,
+      limit,
+      scope: scope ?? null,
+      group: group ?? null,
+    }),
+  /** Named groups of members, stored in the workspace manifest. */
+  workspaceGroups: () => invoke<ProjectGroup[]>("workspace_groups"),
+  workspaceSetGroup: (name: string, members: string[]) =>
+    invoke<ProjectGroup[]>("workspace_set_group", { name, members }),
+  workspaceRemoveGroup: (name: string) =>
+    invoke<ProjectGroup[]>("workspace_remove_group", { name }),
+  /** Sibling folders under the workspace root that aren't members yet. */
+  workspaceCandidates: () => invoke<WorkspaceCandidate[]>("workspace_candidates"),
+  /** Join an existing sibling folder to the open workspace. It lands
+   *  dormant and opens on first focus. */
+  workspaceAddMember: (folder: string) =>
+    invoke<MemberOverview[]>("workspace_add_member", { folder }),
+  /** Folders dismissed as "not a project" (world data, vendored source). */
+  workspaceIgnored: () => invoke<string[]>("workspace_ignored"),
+  workspaceIgnoreCandidate: (folder: string) =>
+    invoke<string[]>("workspace_ignore_candidate", { folder }),
+  workspaceUnignoreCandidate: (folder: string) =>
+    invoke<string[]>("workspace_unignore_candidate", { folder }),
+  /** Every manifest member's already-stored digest for the day plus the
+   *  pipeline board summary. Composes only — never generates, schedules,
+   *  or refreshes a member's digest. Requires `workspace`. */
+  workspaceDigest: (day?: string) =>
+    invoke<WorkspaceDigest>("workspace_digest", { day: day ?? null }),
+  /** Per-member state for Home's members strip, covering EVERY manifest
+   *  member including unresolvable ones. Requires `workspace`. */
+  workspaceMembersOverview: () =>
+    invoke<MemberOverview[]>("workspace_members_overview"),
   readFile: (relPath: string) => invoke<string>("read_file", { relPath }),
   readFileBytes: (relPath: string) =>
     invoke<ArrayBuffer>("read_file_bytes", { relPath }),
@@ -1794,13 +1898,23 @@ export const api = {
   chatTranscript: (chatId: string) =>
     invoke<ChatMessage[]>("chat_transcript", { chatId }),
   createChat: () => invoke<ChatRow>("create_chat"),
+  /** `scope`: null = this project only; `"all"` = every workspace member;
+   *  anything else = a group name. Widens what the session may READ —
+   *  edits stay pinned to the focused project. */
   sendChatMessage: (
     chatId: string,
     text: string,
     openFiles: string[],
     focusedFile: string | null,
+    scope?: string | null,
   ) =>
-    invoke<void>("send_chat_message", { chatId, text, openFiles, focusedFile }),
+    invoke<void>("send_chat_message", {
+      chatId,
+      text,
+      openFiles,
+      focusedFile,
+      scope: scope ?? null,
+    }),
   renameChat: (chatId: string, title: string) =>
     invoke<void>("rename_chat", { chatId, title }),
   setChatPinned: (chatId: string, pinned: boolean) =>

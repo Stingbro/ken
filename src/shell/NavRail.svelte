@@ -4,7 +4,6 @@
   import { review } from "../lib/review.svelte";
   import { tasksStore } from "../lib/tasks.svelte";
   import { families } from "../lib/families.svelte";
-  import WorkspaceSwitcher from "./WorkspaceSwitcher.svelte";
   import FamilyTray from "../family/FamilyTray.svelte";
   import LayoutGrid from "@lucide/svelte/icons/layout-grid";
   import Files from "@lucide/svelte/icons/files";
@@ -15,10 +14,8 @@
   import Clock from "@lucide/svelte/icons/clock";
   import Mic from "@lucide/svelte/icons/mic";
   import Settings from "@lucide/svelte/icons/settings";
-  import Boxes from "@lucide/svelte/icons/boxes";
   import Bell from "@lucide/svelte/icons/bell";
 
-  let switcherOpen = $state(false);
   let familyTrayOpen = $state(false);
 
   // Resolve the `kenTasks` flag as soon as (and only once) a workspace is
@@ -47,19 +44,14 @@
 </script>
 
 <nav>
-  {#if app.workspace}
-    <button
-      class="ws-trigger"
-      class:active={switcherOpen}
-      onclick={() => (switcherOpen = !switcherOpen)}
-      title="{app.workspace.name} — switch project (Ctrl+P)"
-    >
-      <span class="icon"><Boxes size={16} strokeWidth={1.75} /></span>Projects
-    </button>
-    {#if switcherOpen}
-      <WorkspaceSwitcher close={() => (switcherOpen = false)} />
-    {/if}
-  {/if}
+  <!-- The project switcher deliberately does NOT live here any more
+       (ken-home-workspace 3.6). A global "Projects" control framed the
+       whole app as being "in" one project, which is what made Home read
+       as project-specific. Selection now sits in `ProjectScopeBar`, above
+       the screens that actually describe one project; Home and Settings
+       describe the whole setup and show no selector at all. Ctrl+P still
+       cycles members. `WorkspaceSwitcher.svelte` is kept (it also owns
+       forget/rename) but is no longer mounted from the rail. -->
   {#each items as item (item.key)}
     {@const Icon = item.icon}
     <button
@@ -191,11 +183,5 @@
   }
   .settings {
     margin-top: auto;
-  }
-  .ws-trigger {
-    margin-bottom: 8px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border);
-    border-radius: 10px 10px 0 0;
   }
 </style>

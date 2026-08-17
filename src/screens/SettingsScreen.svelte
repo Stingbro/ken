@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { app, forFocused } from "../lib/app.svelte";
+  import ProjectGroups from "./ProjectGroups.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { memory } from "../lib/memory.svelte";
   import { families } from "../lib/families.svelte";
@@ -757,6 +758,15 @@
             </div>
           </div>
         {/each}
+      </section>
+    {/if}
+
+    {#if app.workspace}
+      <section class="group">
+        <div class="group-head">Projects</div>
+        <div class="card">
+          <ProjectGroups />
+        </div>
       </section>
     {/if}
 
