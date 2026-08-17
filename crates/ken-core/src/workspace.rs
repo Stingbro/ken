@@ -40,10 +40,29 @@ pub struct WorkspaceConfig {
     /// Parent-relative folder names (design D1: relative so the manifest
     /// survives the parent being moved or synced to a teammate).
     pub members: Vec<String>,
+    /// Named sets of members that belong together conceptually even though
+    /// they are separate repos (e.g. a game and its tools).
+    ///
+    /// Unlike [`WorkspaceConfig::links`] — which is read out of `extra` on
+    /// demand precisely because nothing in-tree writes it — groups ARE
+    /// written by Ken (the user manages them in Settings), so they get a
+    /// typed field. `skip_serializing_if` keeps a manifest that has no
+    /// groups byte-identical to one written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ProjectGroup>,
     /// Fields written by newer versions or other capabilities survive a
     /// round-trip through this one (same idiom as `ProjectConfig::extra`).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One named group of members. `members` holds parent-relative folder
+/// names — the same vocabulary as [`WorkspaceConfig::members`] — so a
+/// group survives the parent folder moving, exactly like membership does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectGroup {
+    pub name: String,
+    pub members: Vec<String>,
 }
 
 /// One entry of `workspace.json`'s `links` array (design D12,
@@ -61,6 +80,98 @@ pub struct ProjectLink {
 }
 
 impl WorkspaceConfig {
+    /// The group named `name`, matched case-insensitively (users type
+    /// group names; "Shattered Realms" and "shattered realms" are the
+    /// same group).
+    pub fn group(&self, name: &str) -> Option<&ProjectGroup> {
+        self.groups
+            .iter()
+            .find(|g| g.name.trim().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// A group's members, filtered to folder names that are ACTUALLY
+    /// members of this workspace and de-duplicated, preserving the
+    /// group's own ordering.
+    ///
+    /// A group can name a member that was later removed from the
+    /// workspace; resolving it here rather than validating on write means
+    /// a hand-edited manifest, or a member removed behind Ken's back,
+    /// degrades to a smaller group instead of a broken one.
+    pub fn group_members(&self, name: &str) -> Vec<String> {
+        let Some(group) = self.group(name) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for candidate in &group.members {
+            let is_member = self.members.iter().any(|m| m == candidate);
+            let already = out.iter().any(|o| o == candidate);
+            if is_member && !already {
+                out.push(candidate.clone());
+            }
+        }
+        out
+    }
+
+    /// Every group `member` (a parent-relative folder name) belongs to.
+    /// A member may be in more than one group — nothing here enforces a
+    /// partition, because "tools" could reasonably sit in both a product
+    /// group and a tooling group.
+    pub fn groups_for_member(&self, member: &str) -> Vec<&str> {
+        self.groups
+            .iter()
+            .filter(|g| g.members.iter().any(|m| m == member))
+            .map(|g| g.name.as_str())
+            .collect()
+    }
+
+    /// Create or replace a group. Returns an error for a blank name or an
+    /// empty member list — a group with nothing in it is a scope that can
+    /// never match anything, which reads as a bug at the point of use.
+    /// Members not in the workspace are dropped here rather than stored.
+    pub fn set_group(&mut self, name: &str, members: &[String]) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Other("group name cannot be empty".into()));
+        }
+        let mut kept: Vec<String> = Vec::new();
+        for candidate in members {
+            if self.members.iter().any(|m| m == candidate)
+                && !kept.iter().any(|k| k == candidate)
+            {
+                kept.push(candidate.clone());
+            }
+        }
+        if kept.is_empty() {
+            return Err(Error::Other(format!(
+                "group \"{name}\" would contain no workspace members"
+            )));
+        }
+        match self
+            .groups
+            .iter_mut()
+            .find(|g| g.name.trim().eq_ignore_ascii_case(name))
+        {
+            Some(existing) => {
+                existing.name = name.to_string();
+                existing.members = kept;
+            }
+            None => self.groups.push(ProjectGroup {
+                name: name.to_string(),
+                members: kept,
+            }),
+        }
+        Ok(())
+    }
+
+    /// Remove a group. Returns whether one was actually removed, so a
+    /// caller can tell "deleted" from "already gone" without a prior read.
+    pub fn remove_group(&mut self, name: &str) -> bool {
+        let before = self.groups.len();
+        self.groups
+            .retain(|g| !g.name.trim().eq_ignore_ascii_case(name.trim()));
+        self.groups.len() != before
+    }
+
     /// Parsed `links` array (design D12). Deliberately **not** a typed
     /// `WorkspaceConfig` field: the manifest already round-trips unknown
     /// keys through `extra` (see `unknown_fields_survive_roundtrip`), and a
@@ -179,6 +290,7 @@ impl Workspace {
             name,
             id: Uuid::new_v4(),
             members: member_names.to_vec(),
+            groups: Vec::new(),
             extra: serde_json::Map::new(),
         };
         let workspace = Workspace {
@@ -285,6 +397,92 @@ pub struct Candidate {
 /// profiler use) are never candidates. One level deep only: neither this
 /// listing nor a candidate's `file_count`/`markers` recurse into
 /// subfolders (D5).
+/// The workspace-root `.kenignore` — `<parent>/.kenignore`.
+///
+/// Same file name, same syntax, same matcher as a project's own
+/// `.kenignore`; the only difference is what it governs. A project's file
+/// covers paths inside that project; this one covers the parent folder,
+/// so it is what excludes SIBLING folders (world data, vendored source
+/// drops) from ever being offered as projects. Exactly the relationship a
+/// repo-root `.gitignore` has to the tree beneath it.
+///
+/// Distinct from `.ken-workspace/.kenignore`, which Ken regenerates for
+/// the memory pseudo-member and warns against hand-editing. This one is
+/// yours.
+pub fn ignore_path(parent: &Path) -> PathBuf {
+    parent.join(".kenignore")
+}
+
+/// Parsed rules from the workspace-root `.kenignore`. Missing file reads
+/// as no rules — same tolerance as `Project::kenignore_rules`.
+pub fn ignore_rules(parent: &Path) -> Vec<crate::kenignore::Rule> {
+    fs::read_to_string(ignore_path(parent))
+        .map(|text| crate::kenignore::parse(&text))
+        .unwrap_or_default()
+}
+
+/// Whether a sibling folder is excluded by the workspace-root
+/// `.kenignore`. Only the `Ignore` tier hides a folder outright: a
+/// `~search-only` rule is about how much of a file's content gets
+/// indexed, which has no meaning for "is this a project".
+pub fn is_ignored_folder(rules: &[crate::kenignore::Rule], name: &str) -> bool {
+    crate::kenignore::classify(name, true, &[rules]) == crate::kenignore::Tier::Ignore
+}
+
+/// Append a folder rule to the workspace-root `.kenignore`, creating the
+/// file with a short header if absent. Idempotent — a folder already
+/// excluded by ANY existing rule (a glob, not just its own literal line)
+/// is left alone rather than adding a redundant duplicate.
+pub fn ignore_folder(parent: &Path, folder: &str) -> Result<bool> {
+    let folder = folder.trim().trim_end_matches('/');
+    if folder.is_empty() || folder.contains('/') || folder.contains('\\') {
+        return Err(Error::Other(
+            "only a folder directly inside the workspace can be ignored".into(),
+        ));
+    }
+    if is_ignored_folder(&ignore_rules(parent), folder) {
+        return Ok(false);
+    }
+    let path = ignore_path(parent);
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    if text.is_empty() {
+        text.push_str(
+            "# Ken ignores these, using .gitignore syntax.\n\
+             # `~pattern` indexes a path for search only; `!pattern` forces it back in.\n",
+        );
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("{folder}/\n"));
+    fs::write(&path, text).map_err(|e| Error::io(&path, e))?;
+    Ok(true)
+}
+
+/// Remove the plain `folder/` line this module writes. Returns false when
+/// no such literal line exists — a folder excluded by a hand-written glob
+/// (`sr-universe-*/`) is deliberately NOT rewritten here, because editing
+/// someone's glob to carve out one folder is a guess about intent.
+pub fn unignore_folder(parent: &Path, folder: &str) -> Result<bool> {
+    let folder = folder.trim().trim_end_matches('/');
+    let path = ignore_path(parent);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let target = format!("{folder}/");
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| line.trim() != target && line.trim() != folder)
+        .collect();
+    if kept.len() == text.lines().count() {
+        return Ok(false);
+    }
+    let mut out = kept.join("\n");
+    out.push('\n');
+    fs::write(&path, out).map_err(|e| Error::io(&path, e))?;
+    Ok(true)
+}
+
 pub fn discover_candidates(parent: &Path) -> Result<Vec<Candidate>> {
     let entries = fs::read_dir(parent).map_err(|e| Error::io(parent, e))?;
     let mut dirs: Vec<PathBuf> = entries
@@ -294,12 +492,17 @@ pub fn discover_candidates(parent: &Path) -> Result<Vec<Candidate>> {
         .collect();
     dirs.sort();
 
+    let rules = ignore_rules(parent);
     let mut out = Vec::with_capacity(dirs.len());
     for dir in dirs {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if name.starts_with('.') || crate::scan::is_junk_dir_name(name) {
+            continue;
+        }
+        // The workspace-root `.kenignore` decides what is even a candidate.
+        if is_ignored_folder(&rules, name) {
             continue;
         }
         out.push(scan_candidate(&dir, name)?);
@@ -377,6 +580,173 @@ mod tests {
                 m.name
             );
         }
+    }
+
+    /// A workspace with no groups must serialize exactly as it did before
+    /// the field existed — otherwise every existing manifest churns on the
+    /// next save.
+    #[test]
+    fn no_groups_writes_no_groups_key() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alpha")).unwrap();
+        let ws = Workspace::create(dir.path(), "WS", &["alpha".into()]).unwrap();
+        ws.save().unwrap();
+        let raw = fs::read_to_string(config_path(dir.path())).unwrap();
+        assert!(!raw.contains("groups"), "empty groups must not be written: {raw}");
+    }
+
+    #[test]
+    fn groups_round_trip_and_resolve() {
+        let dir = tempdir().unwrap();
+        for m in ["realms", "realms-tools", "unrelated"] {
+            fs::create_dir_all(dir.path().join(m)).unwrap();
+        }
+        let mut ws = Workspace::create(
+            dir.path(),
+            "WS",
+            &["realms".into(), "realms-tools".into(), "unrelated".into()],
+        )
+        .unwrap();
+
+        ws.config
+            .set_group("Shattered Realms", &["realms".into(), "realms-tools".into()])
+            .unwrap();
+        ws.save().unwrap();
+
+        let reopened = Workspace::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.config.group_members("Shattered Realms"),
+            ["realms", "realms-tools"]
+        );
+        // Group names are typed by humans — matching is case-insensitive.
+        assert_eq!(
+            reopened.config.group_members("shattered realms").len(),
+            2,
+            "group lookup must not be case-sensitive"
+        );
+        assert_eq!(
+            reopened.config.groups_for_member("realms-tools"),
+            ["Shattered Realms"]
+        );
+        assert!(reopened.config.groups_for_member("unrelated").is_empty());
+    }
+
+    /// A group naming a folder that is no longer a workspace member
+    /// degrades to the members that remain, rather than resolving to a
+    /// broken target list.
+    #[test]
+    fn group_drops_members_that_left_the_workspace() {
+        let dir = tempdir().unwrap();
+        for m in ["realms", "realms-tools"] {
+            fs::create_dir_all(dir.path().join(m)).unwrap();
+        }
+        let mut ws =
+            Workspace::create(dir.path(), "WS", &["realms".into(), "realms-tools".into()]).unwrap();
+        ws.config
+            .set_group("SR", &["realms".into(), "realms-tools".into()])
+            .unwrap();
+
+        // Someone removes a member from the workspace but not from the group.
+        ws.config.members.retain(|m| m != "realms-tools");
+        assert_eq!(ws.config.group_members("SR"), ["realms"]);
+    }
+
+    #[test]
+    fn set_group_rejects_empty_name_and_empty_membership() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("alpha")).unwrap();
+        let mut ws = Workspace::create(dir.path(), "WS", &["alpha".into()]).unwrap();
+
+        assert!(ws.config.set_group("  ", &["alpha".into()]).is_err());
+        assert!(
+            ws.config.set_group("Ghosts", &["not-a-member".into()]).is_err(),
+            "a group of non-members can never match anything"
+        );
+        assert!(ws.config.groups.is_empty());
+    }
+
+    #[test]
+    fn set_group_replaces_and_dedupes() {
+        let dir = tempdir().unwrap();
+        for m in ["a", "b"] {
+            fs::create_dir_all(dir.path().join(m)).unwrap();
+        }
+        let mut ws = Workspace::create(dir.path(), "WS", &["a".into(), "b".into()]).unwrap();
+
+        ws.config.set_group("G", &["a".into(), "a".into()]).unwrap();
+        assert_eq!(ws.config.groups.len(), 1);
+        assert_eq!(ws.config.group_members("G"), ["a"], "duplicates collapse");
+
+        // Same name, different case → replaces rather than adding a second.
+        ws.config.set_group("g", &["a".into(), "b".into()]).unwrap();
+        assert_eq!(ws.config.groups.len(), 1);
+        assert_eq!(ws.config.group_members("G"), ["a", "b"]);
+
+        assert!(ws.config.remove_group("G"));
+        assert!(!ws.config.remove_group("G"), "second remove is a no-op");
+    }
+
+    #[test]
+    fn workspace_kenignore_hides_candidates() {
+        let dir = tempdir().unwrap();
+        for m in ["ken", "worlds", "shared-source"] {
+            fs::create_dir_all(dir.path().join(m)).unwrap();
+        }
+
+        let before = discover_candidates(dir.path()).unwrap();
+        assert_eq!(before.len(), 3);
+
+        assert!(ignore_folder(dir.path(), "worlds").unwrap());
+        assert!(!ignore_folder(dir.path(), "worlds").unwrap(), "idempotent");
+
+        let after = discover_candidates(dir.path()).unwrap();
+        let names: Vec<&str> = after.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["ken", "shared-source"]);
+
+        assert!(unignore_folder(dir.path(), "worlds").unwrap());
+        assert_eq!(discover_candidates(dir.path()).unwrap().len(), 3);
+        assert!(!unignore_folder(dir.path(), "worlds").unwrap(), "no-op twice");
+    }
+
+    /// The whole point of using `.kenignore` rather than a list: a
+    /// hand-written glob works, exactly like `.gitignore`.
+    #[test]
+    fn hand_written_globs_work_like_gitignore() {
+        let dir = tempdir().unwrap();
+        for m in ["ken", "sr-universe-current", "sr-universe-2026-08-09"] {
+            fs::create_dir_all(dir.path().join(m)).unwrap();
+        }
+        fs::write(ignore_path(dir.path()), "sr-universe-*/\n").unwrap();
+
+        let names: Vec<String> = discover_candidates(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["ken"], "a glob must hide every match");
+
+        // And a glob is left alone rather than rewritten to carve one out.
+        assert!(
+            !unignore_folder(dir.path(), "sr-universe-current").unwrap(),
+            "un-ignoring must not edit someone's glob"
+        );
+    }
+
+    /// A search-only rule says how much of a file to index; it has no
+    /// meaning for "is this folder a project", so it must not hide one.
+    #[test]
+    fn search_only_rule_does_not_hide_a_candidate() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("notes")).unwrap();
+        fs::write(ignore_path(dir.path()), "~notes/\n").unwrap();
+        assert_eq!(discover_candidates(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignore_folder_rejects_paths() {
+        let dir = tempdir().unwrap();
+        assert!(ignore_folder(dir.path(), "a/b").is_err());
+        assert!(ignore_folder(dir.path(), "  ").is_err());
     }
 
     #[test]

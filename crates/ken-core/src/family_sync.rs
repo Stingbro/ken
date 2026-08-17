@@ -425,7 +425,7 @@ impl SyncEngine {
 static GIT_PROBE: OnceLock<std::result::Result<String, String>> = OnceLock::new();
 
 fn probe_git() -> std::result::Result<String, String> {
-    match Command::new("git").arg("--version").output() {
+    match crate::proc::quiet(&mut Command::new("git")).arg("--version").output() {
         Ok(out) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         }
@@ -595,6 +595,7 @@ impl SystemGit {
 
     fn run(&self, args: &[&str]) -> Result<GitOut> {
         let mut cmd = Command::new("git");
+        crate::proc::quiet(&mut cmd);
         if let Some(id) = &self.identity {
             cmd.args(["-c", &format!("user.name={}", id.name)]);
             cmd.args(["-c", &format!("user.email={}", id.email)]);

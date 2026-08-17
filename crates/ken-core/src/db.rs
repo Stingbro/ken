@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Install the statically-linked sqlite-vec (`vec0`) extension into SQLite's
 /// process-global auto-extension list exactly once. sqlite-vec is compiled into
@@ -500,6 +500,22 @@ impl Db {
             self.conn.execute_batch(
                 r#"
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text);
+                "#,
+            )?;
+        }
+        if version < 13 {
+            // ken-home-workspace: a chat remembers the scope it was opened
+            // with, so "all projects" survives a restart and switching the
+            // Home picker later cannot silently re-scope an existing
+            // conversation.
+            //
+            // NULL means "this project only" — the pre-feature behavior and
+            // the value every existing row gets, so upgrading changes no
+            // chat's meaning. `"all"` is every workspace member; any other
+            // value names a group.
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE chats ADD COLUMN scope TEXT;
                 "#,
             )?;
         }
@@ -1600,11 +1616,11 @@ impl Db {
 
     pub fn upsert_chat(&mut self, chat: &ChatRow) -> Result<()> {
         self.conn.execute(
-            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived, model)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            r#"INSERT INTO chats (id, title, kind, pinned, status, created_at, last_active_at, archived, model, scope)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                ON CONFLICT(id) DO UPDATE SET
                  title = ?2, kind = ?3, pinned = ?4, status = ?5,
-                 last_active_at = ?7, archived = ?8, model = ?9"#,
+                 last_active_at = ?7, archived = ?8, model = ?9, scope = ?10"#,
             params![
                 chat.id,
                 chat.title,
@@ -1614,7 +1630,8 @@ impl Db {
                 chat.created_at,
                 chat.last_active_at,
                 chat.archived as i64,
-                chat.model
+                chat.model,
+                chat.scope
             ],
         )?;
         Ok(())
@@ -1631,11 +1648,12 @@ impl Db {
             last_active_at: r.get(6)?,
             archived: r.get::<_, i64>(7)? != 0,
             model: r.get(8)?,
+            scope: r.get(9)?,
         })
     }
 
     const CHAT_COLS: &'static str =
-        "id, title, kind, pinned, status, created_at, last_active_at, archived, model";
+        "id, title, kind, pinned, status, created_at, last_active_at, archived, model, scope";
 
     pub fn get_chat(&self, id: &str) -> Result<Option<ChatRow>> {
         let sql = format!("SELECT {} FROM chats WHERE id = ?1", Self::CHAT_COLS);
@@ -1664,6 +1682,7 @@ impl Db {
         let sql = match field {
             ChatField::Title => "UPDATE chats SET title = ?2 WHERE id = ?1",
             ChatField::Status => "UPDATE chats SET status = ?2 WHERE id = ?1",
+            ChatField::Scope => "UPDATE chats SET scope = ?2 WHERE id = ?1",
         };
         self.conn.execute(sql, params![id, value])?;
         Ok(())
@@ -2446,6 +2465,7 @@ impl Db {
 pub enum ChatField {
     Title,
     Status,
+    Scope,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2470,6 +2490,12 @@ pub struct ChatRow {
     /// Chosen model as a stable tier alias (`haiku`/`sonnet`/`opus`/`fable`),
     /// or None for the CLI's own default. Applied when a session is spawned.
     pub model: Option<String>,
+    /// The projects this chat asks about, bound when it was created
+    /// (schema v13). `None` = this project only, which is what every chat
+    /// created before this column existed means. `Some("all")` = every
+    /// workspace member; any other value names a group. Widens what the
+    /// session may READ; writes stay pinned to the focused project.
+    pub scope: Option<String>,
 }
 
 /// One day's digest. `content` is the raw model output — a paragraph
@@ -4270,6 +4296,51 @@ mod tests {
         assert_eq!(paths(&via_reader), paths(&via_writer));
     }
 
+    /// A chat created before schema v13 must read back as `scope: None`
+    /// (this project only), i.e. the upgrade changes no existing chat's
+    /// meaning — and a v13 chat must round-trip its scope.
+    #[test]
+    fn chat_scope_defaults_to_none_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let mut db = Db::open(dir.path(), id).unwrap();
+
+        // Simulate a pre-v13 row by writing one with no scope set.
+        let legacy = ChatRow {
+            id: "c-legacy".into(),
+            title: "Old chat".into(),
+            kind: "user".into(),
+            pinned: false,
+            status: "done".into(),
+            created_at: 1,
+            last_active_at: 1,
+            archived: false,
+            model: None,
+            scope: None,
+        };
+        db.upsert_chat(&legacy).unwrap();
+        assert_eq!(db.get_chat("c-legacy").unwrap().unwrap().scope, None);
+
+        let scoped = ChatRow {
+            id: "c-all".into(),
+            scope: Some("all".into()),
+            ..legacy.clone()
+        };
+        db.upsert_chat(&scoped).unwrap();
+        assert_eq!(
+            db.get_chat("c-all").unwrap().unwrap().scope.as_deref(),
+            Some("all")
+        );
+
+        // And it is settable after the fact (re-scoping an existing chat).
+        db.set_chat_field("c-legacy", ChatField::Scope, "Shattered Realms")
+            .unwrap();
+        assert_eq!(
+            db.get_chat("c-legacy").unwrap().unwrap().scope.as_deref(),
+            Some("Shattered Realms")
+        );
+    }
+
     #[test]
     fn schema_version_recorded() {
         let db = Db::open_in_memory().unwrap();
@@ -4293,6 +4364,7 @@ mod tests {
             last_active_at: 100,
             archived: false,
             model: None,
+            scope: None,
         };
         db.upsert_chat(&chat).unwrap();
         db.upsert_chat(&ChatRow { id: "sess-2".into(), title: "Second".into(), last_active_at: 200, created_at: 200, ..chat.clone() }).unwrap();
@@ -4333,6 +4405,7 @@ mod tests {
             last_active_at: 100,
             archived: false,
             model: None,
+            scope: None,
         })
         .unwrap();
         db.append_chat_message(chat_id, "user", "hello there", 100).unwrap();
@@ -4353,6 +4426,7 @@ mod tests {
             last_active_at: 1,
             archived: false,
             model: None,
+            scope: None,
         };
         db.upsert_chat(&chat).unwrap();
         // A fresh chat carries no model → CLI default.

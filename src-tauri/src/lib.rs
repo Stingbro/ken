@@ -35,7 +35,7 @@ use ken_core::pty_registry;
 use ken_core::routing;
 use ken_core::scan::{self, ScanStats};
 use ken_core::search as hybrid_search_mod;
-use ken_core::sync::{self, SyncConfig, SyncEngine, SyncNotice};
+use ken_core::sync::{self, SyncEngine, SyncNotice};
 use ken_core::record::{self, CaptureSource, LinearResampler, RecorderState, Source};
 use ken_core::transcript;
 use ken_core::user_state::{self, UserState};
@@ -851,6 +851,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                         last_active_at: now,
                         archived: false,
                         model: None,
+                        // Ingest/automation sessions are inherently one
+                        // project's own run — never cross-project.
+                        scope: None,
                     });
                     let _ = db.upsert_chat(&ChatRow {
                         status: status.into(),
@@ -958,7 +961,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         SyncEngine::start(
             project.root.clone(),
             watch_db_path.clone(),
-            SyncConfig::default(),
+            // Per-project timers from the `sync` block, not the bare
+            // defaults — see `sync::sync_config_for`.
+            sync::sync_config_for(&project),
             move |notice| match notice {
                 SyncNotice::State { state, detail } => {
                     emit_member(&sync_app, project_id, "sync-state", SyncStateEvent {
@@ -2446,7 +2451,8 @@ async fn search_all_projects(
                 })
                 .collect()
         };
-        let dto = route_search(app, state, query, Some(limit)).await?;
+        // No scope: this caller is the all-projects search by definition.
+        let dto = route_search(app, state, query, Some(limit), None, None).await?;
         return Ok(adapt_route_search_to_all_projects(dto, manifest_extras));
     }
 
@@ -7496,8 +7502,16 @@ enum RoutedSearchStateEvent {
 struct RouteMemberSnapshot {
     project_id: uuid::Uuid,
     name: String,
-    search_db: Arc<Mutex<Db>>,
-    embedder_slot: Arc<Mutex<Option<Box<dyn Embedder + Send>>>>,
+    /// The member's live handle when it is **resident**; `None` when it is a
+    /// manifest member whose runtime is dormant (ken-home-workspace 2.1).
+    /// A dormant member is still searchable — its index lives at
+    /// `<base>/index/<project-id>.db` and opens by id — so this being
+    /// `None` means "open one for the query", not "skip it". Residency
+    /// governs runtimes (watcher, engine, extraction worker), not whether
+    /// the database can be read.
+    search_db: Option<Arc<Mutex<Db>>>,
+    /// Only resident members carry a loaded embedder.
+    embedder_slot: Option<Arc<Mutex<Option<Box<dyn Embedder + Send>>>>>,
 }
 
 /// Route a query across every open workspace member and return the merged,
@@ -7509,11 +7523,21 @@ struct RouteMemberSnapshot {
 /// `searching m/n` → `done`) as an app-global event — see
 /// `RoutedSearchStateEvent`'s doc for why not `emit_member`.
 ///
-/// Deviation (see final report): "members" = every project currently open
-/// in `AppState::members`, the same stand-in `start_workspace_kg_build`/
-/// `workspace_kg_overview` already use — no `workspace.rs` manifest exists
-/// yet to enumerate a workspace's members independent of what's open this
-/// session.
+/// Targets come from the **workspace manifest** (`Workspace::members`,
+/// `MemberStatus::Ok` only), not from whatever happens to be open this
+/// session (ken-home-workspace 2.1 — this replaces kg-routing's original
+/// `AppState::members` stand-in, which existed only because `workspace.rs`
+/// hadn't shipped yet). A resident member is searched through its live
+/// handle; a dormant one has a short-lived `Db::open(base, project_id)`
+/// opened for the query and dropped after, which does not activate it,
+/// start any watcher, or evict a resident. `Missing`/`Invalid` members are
+/// never targets — they surface in the members overview instead. With no
+/// workspace open (single-project mode) this falls back to `AppState::
+/// members` exactly as before.
+///
+/// `scope` pins the search to one member: planning short-circuits to that
+/// single target without consulting the KG, and the result shape is
+/// identical to an unpinned search so the UI renders one thing.
 ///
 /// The query is embedded exactly once (design: "the query is embedded once
 /// and reused across all member KNN searches") via the focused member's
@@ -7535,33 +7559,93 @@ async fn route_search(
     state: State<'_, SharedState>,
     query: String,
     limit: Option<usize>,
+    scope: Option<uuid::Uuid>,
+    group: Option<String>,
 ) -> CmdResult<RouteSearchDto> {
     let limit = limit.unwrap_or(30);
 
+    let group_targets: Option<Vec<uuid::Uuid>>;
     let (base_dir, kg_enabled, embedder_slot, snapshots) = {
         let guard = state.lock().unwrap();
         if !kg_routing_enabled(&guard.app_settings) {
             return Err("kgRouting flag is off".into());
         }
-        let snapshots: Vec<RouteMemberSnapshot> = guard
-            .members
-            .values()
-            .map(|m| RouteMemberSnapshot {
-                project_id: m.project.config.id,
-                name: m.project.config.name.clone(),
-                search_db: m.search_db.clone(),
-                embedder_slot: m.semantic_embedder.clone(),
-            })
-            .collect();
+        // Manifest members when a workspace is open, so a member that has
+        // never been focused this session is still searchable; the open
+        // projects otherwise (single-project mode).
+        let snapshots: Vec<RouteMemberSnapshot> = match guard.workspace.as_ref() {
+            Some(ws) => ws
+                .ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some(p),
+                    _ => None,
+                })
+                .map(|p| {
+                    let resident = guard.members.get(&p.config.id);
+                    RouteMemberSnapshot {
+                        project_id: p.config.id,
+                        name: p.config.name.clone(),
+                        search_db: resident.map(|m| m.search_db.clone()),
+                        embedder_slot: resident.map(|m| m.semantic_embedder.clone()),
+                    }
+                })
+                .collect(),
+            None => guard
+                .members
+                .values()
+                .map(|m| RouteMemberSnapshot {
+                    project_id: m.project.config.id,
+                    name: m.project.config.name.clone(),
+                    search_db: Some(m.search_db.clone()),
+                    embedder_slot: Some(m.semantic_embedder.clone()),
+                })
+                .collect(),
+        };
         if snapshots.is_empty() {
             return Err("no project open".into());
         }
+        if let Some(id) = scope {
+            if !snapshots.iter().any(|s| s.project_id == id) {
+                return Err("that project is not a member of this workspace".into());
+            }
+        }
+        // A group scope resolves to its members' ids, which become the
+        // plan's targets directly — `RoutePlan.targets` is already a list,
+        // so a group needs no special search path.
+        group_targets = match (&group, guard.workspace.as_ref()) {
+            (Some(name), Some(ws)) => {
+                let ids: Vec<uuid::Uuid> = ws
+                    .ws
+                    .config
+                    .group_members(name)
+                    .iter()
+                    .filter_map(|folder| {
+                        ws.ws.members.iter().find(|m| &m.name == folder).and_then(|m| {
+                            match &m.status {
+                                ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id),
+                                _ => None,
+                            }
+                        })
+                    })
+                    .collect();
+                if ids.is_empty() {
+                    return Err(format!("group \"{name}\" has no resolvable members"));
+                }
+                Some(ids)
+            }
+            (Some(_), None) => return Err("no workspace open".into()),
+            (None, _) => None,
+        };
+        // Every member's slot loads the same embedding model, so any
+        // resident one is representative — but with every member dormant
+        // there is none, and the search runs FTS-only rather than failing.
         let embedder_slot = guard
             .focused
             .and_then(|id| snapshots.iter().find(|s| s.project_id == id))
-            .or_else(|| snapshots.first())
-            .map(|s| s.embedder_slot.clone())
-            .expect("snapshots checked non-empty above");
+            .and_then(|s| s.embedder_slot.clone())
+            .or_else(|| snapshots.iter().find_map(|s| s.embedder_slot.clone()));
         (
             guard.base_dir.clone(),
             federated_kg_enabled(&guard.app_settings),
@@ -7575,42 +7659,82 @@ async fn route_search(
     // Plan + embed on the blocking pool: `plan_route`'s KG read and
     // `embed_query` can both touch disk / the local model.
     let query_for_plan = query.clone();
-    let plan_snapshots: Vec<(uuid::Uuid, String, Arc<Mutex<Db>>)> = snapshots
+    let plan_snapshots: Vec<(uuid::Uuid, String, Option<Arc<Mutex<Db>>>)> = snapshots
         .iter()
         .map(|s| (s.project_id, s.name.clone(), s.search_db.clone()))
         .collect();
-    let (plan, members, query_vec) = tauri::async_runtime::spawn_blocking(move || {
-        let members: Vec<routing::MemberInfo> = plan_snapshots
-            .iter()
-            .map(|(project_id, name, db)| {
-                let db = db.lock().unwrap();
-                let last_activity = db
-                    .runs_with_status("fresh")
-                    .ok()
-                    .and_then(|rows| rows.iter().filter_map(|r| r.finished_at).max())
-                    .unwrap_or(0);
-                routing::MemberInfo {
-                    project_id: *project_id,
-                    name: name.clone(),
-                    index_ready: db.vec_available(),
-                    last_activity,
+    let plan_base = base_dir.clone();
+    let (plan, members, query_vec, dormant_dbs) = tauri::async_runtime::spawn_blocking(move || {
+        // Dormant members are opened ONCE here and reused by the fan-out
+        // below. Opening again per search would double the per-member cost
+        // the D5 latency budget is measured against.
+        let mut dormant: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> =
+            std::collections::HashMap::new();
+        let mut members: Vec<routing::MemberInfo> = Vec::with_capacity(plan_snapshots.len());
+        for (project_id, name, live) in &plan_snapshots {
+            let handle: Option<Arc<Mutex<Db>>> = match live {
+                Some(db) => Some(db.clone()),
+                None => match Db::open(&plan_base, *project_id) {
+                    Ok(db) => {
+                        let arc = Arc::new(Mutex::new(db));
+                        dormant.insert(*project_id, arc.clone());
+                        Some(arc)
+                    }
+                    // An index that won't open is simply not ready: the
+                    // Broadcast tier filters it out at plan time, and a
+                    // KG-guided pick still reports `Unavailable` below
+                    // rather than failing the whole search.
+                    Err(_) => None,
+                },
+            };
+            let (index_ready, last_activity) = match &handle {
+                Some(db) => {
+                    let db = db.lock().unwrap();
+                    let last = db
+                        .runs_with_status("fresh")
+                        .ok()
+                        .and_then(|rows| rows.iter().filter_map(|r| r.finished_at).max())
+                        .unwrap_or(0);
+                    (db.vec_available(), last)
                 }
-            })
-            .collect();
+                None => (false, 0),
+            };
+            members.push(routing::MemberInfo {
+                project_id: *project_id,
+                name: name.clone(),
+                index_ready,
+                last_activity,
+            });
+        }
 
-        let kg = if kg_enabled {
-            ken_core::workspace_kg_db::WorkspaceKgDb::open(&base_dir).ok()
-        } else {
-            None
+        // A pinned scope never consults the KG (design D3) — there is
+        // nothing to plan when the targets are already named. A group is
+        // the same case with more than one target.
+        let plan = match (scope, group_targets) {
+            (Some(id), _) => routing::RoutePlan {
+                targets: vec![id],
+                reason: routing::RouteReason::Named,
+            },
+            (None, Some(ids)) => routing::RoutePlan {
+                targets: ids,
+                reason: routing::RouteReason::Named,
+            },
+            (None, None) => {
+                let kg = if kg_enabled {
+                    ken_core::workspace_kg_db::WorkspaceKgDb::open(&plan_base).ok()
+                } else {
+                    None
+                };
+                routing::plan_route(&query_for_plan, &members, kg.as_ref())
+            }
         };
-        let plan = routing::plan_route(&query_for_plan, &members, kg.as_ref());
 
-        let query_vec = {
-            let mut guard = embedder_slot.lock().unwrap();
+        let query_vec = embedder_slot.as_ref().and_then(|slot| {
+            let mut guard = slot.lock().unwrap();
             guard.as_deref_mut().and_then(|e| e.embed_query(&query_for_plan).ok())
-        };
+        });
 
-        (plan, members, query_vec)
+        (plan, members, query_vec, dormant)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -7625,8 +7749,14 @@ async fn route_search(
         members.iter().map(|m| (m.project_id, m.index_ready)).collect();
     let name_by_id: std::collections::HashMap<uuid::Uuid, String> =
         members.iter().map(|m| (m.project_id, m.name.clone())).collect();
-    let db_by_id: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> =
-        snapshots.into_iter().map(|s| (s.project_id, s.search_db)).collect();
+    // Resident handles plus the dormant ones opened during planning. A
+    // member absent from this map (its index wouldn't open) falls through
+    // to the `Unavailable` arm below.
+    let mut db_by_id: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = snapshots
+        .into_iter()
+        .filter_map(|s| s.search_db.map(|db| (s.project_id, db)))
+        .collect();
+    db_by_id.extend(dormant_dbs);
 
     // Concurrent fan-out (design D5: "per-member searches run concurrently"):
     // every target's search is its own `spawn_blocking` task, started before
@@ -9875,6 +10005,526 @@ fn pipeline_digest(state: State<SharedState>, day: Option<String>) -> CmdResult<
 }
 
 // ---------------------------------------------------------------------
+// ken-home-workspace tasks 2.4/2.5: the workspace digest and the members
+// overview — the two reads Home needs to describe a whole workspace
+// instead of whichever member happens to be focused.
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberDigestDto {
+    project_id: uuid::Uuid,
+    name: String,
+    body: String,
+    sources: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberAwaitingDto {
+    project_id: uuid::Uuid,
+    name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDigestDto {
+    date: String,
+    members: Vec<MemberDigestDto>,
+    /// Members with no digest stored for `date` — named, never dropped.
+    awaiting: Vec<MemberAwaitingDto>,
+    has_content: bool,
+    /// `None` when `kenPipeline` is off.
+    board: Option<PipelineDigestDto>,
+}
+
+/// The workspace digest: every member's ALREADY-STORED digest for the day
+/// plus the pipeline board summary (ken-home-workspace 2.4).
+///
+/// Composes and never generates (design D4). It does not call
+/// `maybe_generate_digest`, touch the in-flight guard, consult the 07:00
+/// gate, or write a `digests` row — a member with nothing stored for the
+/// day comes back in `awaiting`. Generation stays owned entirely by the
+/// per-project scheduler, which already holds all of that state.
+///
+/// Dormant members are read the same way `route_search` searches them:
+/// their index opens by project id without activating anything.
+#[tauri::command]
+fn workspace_digest(state: State<SharedState>, day: Option<String>) -> CmdResult<WorkspaceDigestDto> {
+    let today = day.unwrap_or_else(local_date_today);
+
+    let (base_dir, members, board) = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+
+        // Board first, while the workspace borrow is live.
+        let board = if ken_pipeline_enabled(&guard.app_settings) {
+            let (tasks_list, _goals, pipelines) =
+                scan_board_with_pipelines(&ws.ws, &guard.base_dir, &guard.app_settings)?;
+            let runs = run_ledger_scan(&ws.ws.root);
+            let known_running = ws.pipeline_known_running.lock().unwrap().clone();
+            Some(pipeline::compose_digest(
+                &tasks_list,
+                &pipelines,
+                &runs,
+                &known_running,
+                &today,
+            ))
+        } else {
+            None
+        };
+
+        let members: Vec<(uuid::Uuid, String, Option<Arc<Mutex<Db>>>)> = ws
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some(p),
+                _ => None,
+            })
+            .map(|p| {
+                (
+                    p.config.id,
+                    p.config.name.clone(),
+                    guard.members.get(&p.config.id).map(|m| m.search_db.clone()),
+                )
+            })
+            .collect();
+
+        (guard.base_dir.clone(), members, board)
+    };
+
+    // Reads happen off the lock — a dormant member's open is real I/O.
+    let inputs: Vec<ken_core::workspace_digest::MemberDigestInput> = members
+        .into_iter()
+        .map(|(project_id, name, live)| {
+            let content = match live {
+                Some(db) => db.lock().unwrap().get_digest(&today).ok().flatten(),
+                None => Db::open(&base_dir, project_id)
+                    .ok()
+                    .and_then(|db| db.get_digest(&today).ok().flatten()),
+            }
+            .map(|row| row.content);
+            ken_core::workspace_digest::MemberDigestInput {
+                project_id,
+                name,
+                content,
+            }
+        })
+        .collect();
+
+    let board_digest = board.clone().unwrap_or_else(|| pipeline::Digest {
+        awaiting_review: Vec::new(),
+        newly_unblocked: Vec::new(),
+        blocked: Vec::new(),
+        moved_today: Vec::new(),
+        new_ideas: Vec::new(),
+        stale_runs: Vec::new(),
+    });
+    let composed =
+        ken_core::workspace_digest::compose_workspace_digest(&today, &inputs, board_digest);
+
+    Ok(WorkspaceDigestDto {
+        date: composed.date.clone(),
+        members: composed
+            .members
+            .iter()
+            .map(|m| MemberDigestDto {
+                project_id: m.project_id,
+                name: m.name.clone(),
+                body: m.body.clone(),
+                sources: m.sources.clone(),
+            })
+            .collect(),
+        awaiting: composed
+            .awaiting
+            .iter()
+            .map(|m| MemberAwaitingDto {
+                project_id: m.project_id,
+                name: m.name.clone(),
+            })
+            .collect(),
+        has_content: composed.has_content(),
+        board: board.as_ref().map(|b| digest_to_dto(b, &today)),
+    })
+}
+
+/// Sibling folders under the workspace root that are NOT yet members —
+/// the "add this repo too" list. Mirrors `discover_candidates`' filtering
+/// (no dot-folders, no junk dirs) minus everything already joined.
+#[tauri::command]
+fn workspace_candidates(state: State<SharedState>) -> CmdResult<Vec<CandidateDto>> {
+    let guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err(WORKSPACE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let existing: Vec<String> = ws.ws.config.members.clone();
+    let root = ws.ws.root.clone();
+    drop(guard);
+
+    // `discover_candidates` already applies the workspace-root
+    // `.kenignore`, so nothing extra is filtered here.
+    let found = ken_core::workspace::discover_candidates(&root).map_err(err)?;
+    Ok(found
+        .into_iter()
+        .filter(|c| !existing.iter().any(|m| m == &c.name))
+        .map(|c| CandidateDto {
+            name: c.name,
+            existing: c.existing,
+            file_count: c.file_count,
+            markers: c.markers,
+        })
+        .collect())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateDto {
+    name: String,
+    /// Already has `.ken/project.json` — it will be adopted, not created.
+    existing: bool,
+    file_count: usize,
+    markers: Vec<String>,
+}
+
+/// Folder names currently excluded by the workspace-root `.kenignore`,
+/// for the UI's "not projects" list. Derived by testing each sibling
+/// folder against the rules rather than by parsing lines back out, so a
+/// hand-written glob (`sr-universe-*/`) reports every folder it hides.
+#[tauri::command]
+fn workspace_ignored(state: State<SharedState>) -> CmdResult<Vec<String>> {
+    let guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err(WORKSPACE_DISABLED_MSG.into());
+    }
+    let root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
+    drop(guard);
+
+    let rules = ken_core::workspace::ignore_rules(&root);
+    if rules.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = std::fs::read_dir(&root)
+        .map_err(err)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|name| !name.starts_with('.'))
+        .filter(|name| ken_core::workspace::is_ignored_folder(&rules, name))
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Exclude a sibling folder by appending a rule to the workspace-root
+/// `.kenignore` — the same file, syntax, and matcher a project's own
+/// `.kenignore` uses, just governing the parent folder. Hand-editing it
+/// works exactly as well as this command.
+#[tauri::command]
+fn workspace_ignore_candidate(state: State<SharedState>, folder: String) -> CmdResult<Vec<String>> {
+    let root = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
+    };
+    ken_core::workspace::ignore_folder(&root, &folder).map_err(err)?;
+    workspace_ignored(state)
+}
+
+#[tauri::command]
+fn workspace_unignore_candidate(state: State<SharedState>, folder: String) -> CmdResult<Vec<String>> {
+    let root = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
+    };
+    // False here means the folder is hidden by a hand-written glob rather
+    // than a line we wrote — say so instead of silently doing nothing.
+    if !ken_core::workspace::unignore_folder(&root, &folder).map_err(err)? {
+        return Err(format!(
+            "\"{folder}\" is excluded by a pattern in .kenignore — edit that file to change it"
+        ));
+    }
+    workspace_ignored(state)
+}
+
+/// Join an existing sibling folder to the open workspace.
+///
+/// Until now the only way to add a member was the creation picker, which
+/// means closing the workspace — so a repo cloned after setup could not be
+/// added at all. `Project::create` adopts an existing `.ken/project.json`
+/// rather than clobbering it, so re-adding a folder Ken already knows is
+/// safe.
+///
+/// The new member is registered but deliberately NOT activated: it lands
+/// dormant and opens on first focus, exactly like a member past the
+/// resident cap. Joining a repo should not evict a resident one.
+#[tauri::command]
+fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<Vec<MemberOverviewDto>> {
+    let folder = folder.trim().to_string();
+    if folder.is_empty() || folder.contains('/') || folder.contains('\\') {
+        return Err("choose a folder directly inside the workspace".into());
+    }
+    let mut guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err(WORKSPACE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
+    if ws.ws.config.members.iter().any(|m| m == &folder) {
+        return Err(format!("\"{folder}\" is already in this workspace"));
+    }
+    let member_root = ws.ws.root.join(&folder);
+    if !member_root.is_dir() {
+        return Err(format!("no folder named \"{folder}\" in this workspace"));
+    }
+    let project = ken_core::project::Project::create(&member_root, &folder).map_err(err)?;
+    ws.ws.config.members.push(folder.clone());
+    ws.ws.members.push(ken_core::workspace::Member {
+        name: folder,
+        status: ken_core::workspace::MemberStatus::Ok(project),
+    });
+    ws.ws.save().map_err(err)?;
+    drop(guard);
+    workspace_members_overview(state)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectGroupDto {
+    name: String,
+    /// Parent-relative folder names, filtered to current members.
+    members: Vec<String>,
+    /// Resolved project ids for the members that are currently resolvable —
+    /// what a scoped search actually targets.
+    project_ids: Vec<uuid::Uuid>,
+}
+
+/// Named groups of members (e.g. a game and its tools). Stored in the
+/// workspace manifest so the grouping travels with the folder.
+#[tauri::command]
+fn workspace_groups(state: State<SharedState>) -> CmdResult<Vec<ProjectGroupDto>> {
+    let guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err(WORKSPACE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    Ok(group_dtos(&ws.ws))
+}
+
+/// Resolve every group against the live manifest. Kept separate so the
+/// create/delete commands can return the fresh list without re-locking.
+fn group_dtos(ws: &ken_core::workspace::Workspace) -> Vec<ProjectGroupDto> {
+    ws.config
+        .groups
+        .iter()
+        .map(|g| {
+            let members = ws.config.group_members(&g.name);
+            let project_ids = members
+                .iter()
+                .filter_map(|folder| {
+                    ws.members.iter().find(|m| &m.name == folder).and_then(|m| {
+                        match &m.status {
+                            ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id),
+                            _ => None,
+                        }
+                    })
+                })
+                .collect();
+            ProjectGroupDto {
+                name: g.name.clone(),
+                members,
+                project_ids,
+            }
+        })
+        .collect()
+}
+
+/// Create or replace a group, then persist the manifest.
+#[tauri::command]
+fn workspace_set_group(
+    state: State<SharedState>,
+    name: String,
+    members: Vec<String>,
+) -> CmdResult<Vec<ProjectGroupDto>> {
+    let mut guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err(WORKSPACE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
+    ws.ws.config.set_group(&name, &members).map_err(err)?;
+    ws.ws.save().map_err(err)?;
+    Ok(group_dtos(&ws.ws))
+}
+
+#[tauri::command]
+fn workspace_remove_group(state: State<SharedState>, name: String) -> CmdResult<Vec<ProjectGroupDto>> {
+    let mut guard = state.lock().unwrap();
+    if !workspace_enabled(&guard.app_settings) {
+        return Err(WORKSPACE_DISABLED_MSG.into());
+    }
+    let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
+    if ws.ws.config.remove_group(&name) {
+        ws.ws.save().map_err(err)?;
+    }
+    Ok(group_dtos(&ws.ws))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberOverviewDto {
+    /// Parent-relative folder name, exactly as the manifest stores it.
+    folder: String,
+    /// `ok` | `missing` | `invalid`.
+    status: String,
+    /// Parse error, for `invalid` members only.
+    detail: Option<String>,
+    project_id: Option<uuid::Uuid>,
+    name: Option<String>,
+    /// Whether this member has a live runtime this session.
+    resident: bool,
+    /// Semantic index built and searchable.
+    index_ready: bool,
+    file_count: usize,
+    failed_files: usize,
+    unread: usize,
+}
+
+/// Per-member state for Home's members strip (ken-home-workspace 2.5).
+///
+/// This is the per-member read path `loadFocusedMemberState` documents as
+/// missing — it deliberately covers EVERY manifest member, including
+/// `Missing` and `Invalid` ones. `Workspace::open` does not fail on those,
+/// so without this surface they are invisible everywhere in the app.
+///
+/// Read-only in the strict sense: a member whose user-state has never been
+/// baselined reports `unread: 0` rather than its whole tree, and no
+/// baseline is written — computing an overview must not mark a project's
+/// files as seen.
+#[tauri::command]
+fn workspace_members_overview(state: State<SharedState>) -> CmdResult<Vec<MemberOverviewDto>> {
+    enum Entry {
+        Ok {
+            folder: String,
+            project_id: uuid::Uuid,
+            name: String,
+            live: Option<Arc<Mutex<Db>>>,
+        },
+        Missing(String),
+        Invalid(String, String),
+    }
+
+    let (base_dir, entries) = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let entries: Vec<Entry> = ws
+            .ws
+            .members
+            .iter()
+            .map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Entry::Ok {
+                    folder: m.name.clone(),
+                    project_id: p.config.id,
+                    name: p.config.name.clone(),
+                    live: guard.members.get(&p.config.id).map(|r| r.search_db.clone()),
+                },
+                ken_core::workspace::MemberStatus::Missing => Entry::Missing(m.name.clone()),
+                ken_core::workspace::MemberStatus::Invalid(e) => {
+                    Entry::Invalid(m.name.clone(), e.clone())
+                }
+            })
+            .collect();
+        (guard.base_dir.clone(), entries)
+    };
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| match entry {
+            Entry::Missing(folder) => MemberOverviewDto {
+                folder,
+                status: "missing".into(),
+                detail: None,
+                project_id: None,
+                name: None,
+                resident: false,
+                index_ready: false,
+                file_count: 0,
+                failed_files: 0,
+                unread: 0,
+            },
+            Entry::Invalid(folder, detail) => MemberOverviewDto {
+                folder,
+                status: "invalid".into(),
+                detail: Some(detail),
+                project_id: None,
+                name: None,
+                resident: false,
+                index_ready: false,
+                file_count: 0,
+                failed_files: 0,
+                unread: 0,
+            },
+            Entry::Ok {
+                folder,
+                project_id,
+                name,
+                live,
+            } => {
+                let resident = live.is_some();
+                let opened = match live {
+                    Some(db) => Some(db),
+                    None => Db::open(&base_dir, project_id)
+                        .ok()
+                        .map(|db| Arc::new(Mutex::new(db))),
+                };
+                let (index_ready, files) = match &opened {
+                    Some(db) => {
+                        let db = db.lock().unwrap();
+                        (db.vec_available(), db.list_files().unwrap_or_default())
+                    }
+                    None => (false, Vec::new()),
+                };
+                let failed_files = files.iter().filter(|f| f.status == "failed").count();
+                let unread = {
+                    let mut us = UserState::load(&base_dir, project_id);
+                    let index = index_versions(&files);
+                    // `baseline` returning true means this project has never
+                    // been baselined — reporting its entire tree as unread
+                    // would be nonsense. Nothing is saved either way.
+                    if us.baseline(&index) {
+                        0
+                    } else {
+                        us.unread(&index).len()
+                    }
+                };
+                MemberOverviewDto {
+                    folder,
+                    status: "ok".into(),
+                    detail: None,
+                    project_id: Some(project_id),
+                    name: Some(name),
+                    resident,
+                    index_ready,
+                    file_count: files.len(),
+                    failed_files,
+                    unread,
+                }
+            }
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------
 // ken-pipeline task 2.4: kickoff / advance / cancel-run. Manual kickoff
 // only in this pass (D6) — no transition fires without a user action;
 // `pipeline_kickoff`'s own admission check is the only thing that can
@@ -10739,12 +11389,31 @@ fn create_chat(app: AppHandle, state: State<SharedState>) -> CmdResult<ChatRow> 
         last_active_at: now,
         archived: false,
         model: None,
+        // Bound on the first message from the scope the UI is showing —
+        // see `send_chat_message`. Creating a chat is not yet a commitment
+        // to a scope, so an abandoned empty chat never records one.
+        scope: None,
     };
     active.chat_db.lock().unwrap().upsert_chat(&row).map_err(err)?;
     emit_member(&app, active.project.config.id, "chat-updated", row.clone());
     Ok(row)
 }
 
+/// Send a chat message.
+///
+/// `scope` widens what the Claude Code session may READ: `None`/absent is
+/// this project only (unchanged behavior), `"all"` is every resolvable
+/// workspace member, and any other value names a group. Writes stay
+/// pinned to the focused project either way — see
+/// `chat::build_scope_preamble` for why the asymmetry, and note that the
+/// session's cwd is unchanged, so the focused project remains the natural
+/// write target rather than merely the instructed one.
+///
+/// Scope is bound to the CHAT (schema v13's `chats.scope`), not to the
+/// send: the row's value wins, and the `scope` argument only seeds a chat
+/// that has none yet (its first message). Changing the Home picker later
+/// therefore cannot silently re-scope a conversation that is already
+/// under way, and an "all projects" chat is still one after a restart.
 #[tauri::command]
 fn send_chat_message(
     app: AppHandle,
@@ -10753,6 +11422,7 @@ fn send_chat_message(
     text: String,
     open_files: Option<Vec<String>>,
     focused_file: Option<String>,
+    scope: Option<String>,
 ) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -10785,6 +11455,13 @@ fn send_chat_message(
             content: text.clone(),
             created_at: now,
         });
+        // Bind scope on the first message, so a chat opened while Home said
+        // "all projects" stays an all-projects chat for its whole life.
+        if row.scope.is_none() {
+            if let Some(s) = scope.as_deref().filter(|s| !s.trim().is_empty()) {
+                let _ = db.set_chat_field(&chat_id, ChatField::Scope, s);
+            }
+        }
         if row.title == "New chat" {
             let title: String = text.chars().take(40).collect();
             let _ = db.set_chat_field(&chat_id, ChatField::Title, title.trim());
@@ -10805,7 +11482,44 @@ fn send_chat_message(
             guard.workspace.as_ref().map(|w| w.ws.root.clone()),
         )
     });
+
+    // Cross-project scope: collect the sibling roots this session may read,
+    // under the same lock, and trust them after dropping it (trusting
+    // touches `~/.claude.json`, so it is IO and must not span the lock).
+    let focused_id = active.project.config.id;
+    let focused_name = active.project.config.name.clone();
+    let focused_root = active.project.root.display().to_string();
+    // The chat's own stored scope wins; the argument seeds a chat that has
+    // none yet, so scope is fixed by the first message and stable after.
+    let scope = row.scope.clone().or(scope);
+    let scope_siblings: Vec<(String, String)> = match (scope.as_deref(), guard.workspace.as_ref()) {
+        (None, _) | (_, None) => Vec::new(),
+        (Some(kind), Some(ws)) => {
+            // "all" spans every resolvable member; anything else names a
+            // group, whose folder list filters the same set.
+            let allowed: Option<Vec<String>> = (kind != "all").then(|| ws.ws.config.group_members(kind));
+            ws.ws
+                .members
+                .iter()
+                .filter(|m| allowed.as_ref().is_none_or(|list| list.contains(&m.name)))
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) if p.config.id != focused_id => {
+                        Some((p.config.name.clone(), p.root.display().to_string()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    };
+    let group_label = scope.as_deref().filter(|s| *s != "all").map(str::to_string);
     drop(guard);
+
+    // Claude Code shows a blocking trust dialog the first time it touches an
+    // unseen folder; pre-trusting the siblings we just told it to read keeps
+    // a cross-project question from wedging on that prompt.
+    for (_, root) in &scope_siblings {
+        chat::ensure_folder_trusted(std::path::Path::new(root));
+    }
 
     // Design D4: workspace-scope memories + the focused project's own,
     // ordered/budgeted by `memory::build_injection`. Composed here rather
@@ -10830,6 +11544,17 @@ fn send_chat_message(
     let mut prompt = text.clone();
     if let Some(preamble) = file_preamble {
         prompt = format!("{preamble}\n\n{prompt}");
+    }
+    // Scope goes ABOVE the open-files hint: which projects are in play
+    // frames everything below it, and the files hint is explicitly the
+    // weakest signal in the prompt.
+    if let Some(scope_preamble) = chat::build_scope_preamble(
+        &focused_name,
+        &focused_root,
+        &scope_siblings,
+        group_label.as_deref(),
+    ) {
+        prompt = format!("{scope_preamble}\n\n{prompt}");
     }
     if let Some(mems) = memories_block {
         prompt = format!("{mems}\n\n{prompt}");
@@ -11076,6 +11801,8 @@ fn start_research(
         last_active_at: now,
         archived: false,
         model: None,
+        // Research runs in one project's own tree.
+        scope: None,
     };
     {
         let mut db = active.chat_db.lock().unwrap();
@@ -11367,6 +12094,7 @@ fn family_clone_root(base_dir: &Path, family_id: uuid::Uuid) -> PathBuf {
 /// the message the user needs to read in full, not a summary.
 fn family_git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     let mut cmd = std::process::Command::new("git");
+    ken_core::proc::quiet(&mut cmd);
     if let Some(d) = dir {
         cmd.current_dir(d);
     }
@@ -12457,6 +13185,16 @@ pub fn run() {
             pipeline_runs,
             pipeline_blockers,
             pipeline_digest,
+            workspace_digest,
+            workspace_members_overview,
+            workspace_groups,
+            workspace_set_group,
+            workspace_remove_group,
+            workspace_candidates,
+            workspace_add_member,
+            workspace_ignored,
+            workspace_ignore_candidate,
+            workspace_unignore_candidate,
             pipeline_kickoff,
             pipeline_advance,
             pipeline_cancel_run,

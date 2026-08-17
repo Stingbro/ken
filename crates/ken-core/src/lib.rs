@@ -28,6 +28,7 @@ pub mod memory;
 pub mod model;
 pub mod ocr;
 pub mod pipeline;
+pub mod proc;
 pub mod profiler;
 pub mod project;
 pub mod record;
@@ -47,6 +48,7 @@ pub mod transcript;
 pub mod user_state;
 pub mod watch;
 pub mod workspace;
+pub mod workspace_digest;
 pub mod workspace_kg_db;
 
 pub use error::{Error, Result};
