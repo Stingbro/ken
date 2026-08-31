@@ -15,8 +15,6 @@
     openContextMenu,
     type MenuEntry,
   } from "../lib/ui/ContextMenu.svelte";
-  import ContextMenu from "../lib/ui/ContextMenu.svelte";
-  import ConfirmMenu from "../lib/ui/ConfirmMenu.svelte";
   import { canDrop, drag } from "./dnd.svelte";
   import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
@@ -224,9 +222,6 @@
     {/if}
   </div>
 </div>
-
-<ContextMenu />
-<ConfirmMenu />
 
 <style>
   .tree {

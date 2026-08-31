@@ -17,7 +17,7 @@
   import Telescope from "@lucide/svelte/icons/telescope";
   import Terminal from "@lucide/svelte/icons/terminal";
   import X from "@lucide/svelte/icons/x";
-  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import ResearchModal from "../research/ResearchModal.svelte";
   import ChatResizer from "./ChatResizer.svelte";
   import { app } from "../lib/app.svelte";
@@ -359,8 +359,6 @@
 {#if researchOpen}
   <ResearchModal close={() => (researchOpen = false)} />
 {/if}
-
-<ContextMenu />
 
 <style>
   /* Width comes in inline (persisted + clamped to the window); flex-basis auto

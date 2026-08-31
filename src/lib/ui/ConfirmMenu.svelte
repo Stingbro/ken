@@ -11,12 +11,10 @@
     y: number;
   }
 
+  // Shared open state for the app's single <ConfirmMenu/>, mounted once at the
+  // root in App.svelte — see the note in ContextMenu.svelte for why it must not
+  // be mounted per-screen.
   let current = $state<OpenState | null>(null);
-  // Mirror ContextMenu's most-recently-mounted owner guard so several screens
-  // can each mount <ConfirmMenu/> without double-drawing.
-  let seq = 0;
-  let owner = $state(0);
-  const mounted = new Set<number>();
 
   /** Open a small Paper & Ink confirm popover at viewport coords. */
   export function openConfirm(x: number, y: number, opts: ConfirmOptions) {
@@ -29,22 +27,10 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
-
-  const myId = ++seq;
-  onMount(() => {
-    mounted.add(myId);
-    owner = myId;
-  });
-  onDestroy(() => {
-    mounted.delete(myId);
-    if (owner === myId) owner = mounted.size ? Math.max(...mounted) : 0;
-  });
-
   let menuEl = $state<HTMLDivElement | null>(null);
   let pos = $state({ x: 0, y: 0 });
 
-  const visible = $derived(current !== null && owner === myId);
+  const visible = $derived(current !== null);
 
   // Position on open, clamped to the viewport once measured.
   $effect(() => {

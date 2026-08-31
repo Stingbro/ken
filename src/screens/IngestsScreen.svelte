@@ -13,8 +13,8 @@
   import Pencil from "@lucide/svelte/icons/pencil";
   import Play from "@lucide/svelte/icons/play";
   import Trash2 from "@lucide/svelte/icons/trash-2";
-  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
   type FormPreset = {
     name: string;
@@ -433,9 +433,6 @@
     close={() => (galleryOpen = false)}
   />
 {/if}
-
-<ContextMenu />
-<ConfirmMenu />
 
 <style>
   .wrap {

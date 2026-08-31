@@ -6,8 +6,8 @@
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Pencil from "@lucide/svelte/icons/pencil";
   import Trash2 from "@lucide/svelte/icons/trash-2";
-  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
   let { close }: { close: () => void } = $props();
   let error = $state<string | null>(null);
@@ -182,9 +182,6 @@
     <div class="error">{error}</div>
   {/if}
 </div>
-
-<ContextMenu />
-<ConfirmMenu />
 
 <style>
   .scrim {

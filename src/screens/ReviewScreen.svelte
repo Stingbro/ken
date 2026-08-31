@@ -14,7 +14,7 @@
   import { timeAgo } from "../lib/format";
   import type { InboxItem } from "../lib/api";
   import ConflictDetail from "../review/ConflictDetail.svelte";
-  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import Check from "@lucide/svelte/icons/check";
   import BellOff from "@lucide/svelte/icons/bell-off";
 
@@ -198,8 +198,6 @@
     {/if}
   </div>
 </div>
-
-<ContextMenu />
 
 <style>
   .screen {
