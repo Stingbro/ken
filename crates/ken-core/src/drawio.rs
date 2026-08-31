@@ -85,7 +85,16 @@ fn collect_attr_labels(
     }
 }
 
-/// base64 → raw deflate → percent-decode. None when any stage fails.
+/// Ceiling on a single page's *decompressed* XML. `MAX_EXTRACT_BYTES` gates the
+/// file on disk, which deflate's ~1000:1 ratio makes meaningless here: a few
+/// hundred kilobytes of `.drawio` can expand to gigabytes and take the scanner
+/// down with it. Real pages are kilobytes; 32 MiB is orders of magnitude more
+/// XML than any hand-drawn diagram carries, and a payload that exceeds it is
+/// treated like any other undecodable one.
+const MAX_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// base64 → raw deflate → percent-decode. None when any stage fails, including
+/// a payload that inflates past `MAX_PAYLOAD_BYTES`.
 fn decode_payload(payload: &str) -> Option<String> {
     use base64::Engine;
     use std::io::Read;
@@ -93,10 +102,17 @@ fn decode_payload(payload: &str) -> Option<String> {
         return None;
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
-    let mut xml = String::new();
+    // Read one byte past the cap so hitting it is distinguishable from a
+    // payload that merely ends there.
+    let mut inflated = Vec::new();
     flate2::read::DeflateDecoder::new(bytes.as_slice())
-        .read_to_string(&mut xml)
+        .take(MAX_PAYLOAD_BYTES + 1)
+        .read_to_end(&mut inflated)
         .ok()?;
+    if inflated.len() as u64 > MAX_PAYLOAD_BYTES {
+        return None;
+    }
+    let xml = String::from_utf8_lossy(&inflated);
     Some(percent_decode(&xml))
 }
 
@@ -221,6 +237,24 @@ mod tests {
         let text = extract_labels(&xml);
         assert!(text.contains("L7"), "got: {text:?}");
         assert!(!text.contains("Deepest"), "got: {text:?}");
+    }
+
+    #[test]
+    fn oversized_payload_is_refused_not_inflated() {
+        // A deflate bomb: highly redundant XML that compresses to a handful of
+        // kilobytes but inflates past the cap. It must degrade like any other
+        // undecodable payload — the page name survives, its content doesn't.
+        let mut body = String::from(r#"<mxGraphModel><root>"#);
+        let cell = r#"<mxCell id="2" value="Bomb" vertex="1"/>"#;
+        while body.len() as u64 <= MAX_PAYLOAD_BYTES {
+            body.push_str(cell);
+        }
+        body.push_str("</root></mxGraphModel>");
+        let packed = pack(&body);
+        assert!(packed.len() < 1024 * 1024, "fixture should be small: {}", packed.len());
+        let raw = format!(r#"<mxfile><diagram name="Boom">{packed}</diagram></mxfile>"#);
+        let text = extract_labels(&raw);
+        assert_eq!(text, "Boom", "got: {text:?}");
     }
 
     #[test]
