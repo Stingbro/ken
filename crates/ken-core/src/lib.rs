@@ -9,6 +9,7 @@ pub mod chat;
 pub mod cloud;
 pub mod db;
 pub mod digest;
+pub mod drawio;
 pub mod engine;
 pub mod error;
 pub mod extract;

@@ -232,6 +232,11 @@ fn index_one(
         Ok(out) if kind == FileKind::Video && out.text.trim().is_empty() => {
             (STATUS_METADATA_ONLY, None, out.text)
         }
+        // A drawio file whose labels couldn't be decoded is searchable by name
+        // only — metadata-only, not an empty-content "indexed" row.
+        Ok(out) if kind == FileKind::Drawio && out.text.trim().is_empty() => {
+            (STATUS_METADATA_ONLY, None, out.text)
+        }
         Ok(out) if kind.has_content() => (STATUS_INDEXED, None, out.text),
         Ok(out) => (STATUS_METADATA_ONLY, None, out.text),
         Err(e) => (STATUS_FAILED, Some(e.to_string()), String::new()),
