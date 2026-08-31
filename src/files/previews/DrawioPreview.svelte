@@ -1,19 +1,10 @@
-<script lang="ts">
-  // Renders a .drawio file with diagrams.net's own standalone viewer, vendored
-  // into the bundle (never fetched). The viewer reads a div's data-mxgraph
-  // config and replaces it with an interactive canvas: page tabs for
-  // multi-page files, zoom, layers. It also decompresses draw.io's
-  // base64+deflate page payloads itself, so the raw file text is handed over
-  // untouched.
-  import { api } from "../../lib/api";
-  import PreviewLoading from "./PreviewLoading.svelte";
+<script module lang="ts">
+  // The viewer is a 4 MB classic script that defines window.GraphViewer once per
+  // webview. Injection state therefore belongs to the module, not to a component
+  // instance: two .drawio files opened in quick succession must share one
+  // in-flight promise rather than each appending their own <script> and
+  // re-evaluating the bundle mid-load.
   import viewerUrl from "./vendor/drawio-viewer.min.js?url";
-
-  let { relPath }: { relPath: string } = $props();
-
-  let xml = $state<string | null>(null);
-  let error = $state<string | null>(null);
-  let host = $state<HTMLDivElement | null>(null);
 
   type Viewer = { createViewerForElement(el: HTMLElement): void };
   const win = window as unknown as {
@@ -23,9 +14,8 @@
     Editor?: { MathJaxRender?: (el: HTMLElement) => void };
   };
 
-  // The viewer script defines window.GraphViewer once per webview; subsequent
-  // previews reuse it. A single module-level promise keeps double-injection out.
   let loader: Promise<void> | null = null;
+
   function loadViewer(): Promise<void> {
     if (win.GraphViewer) return Promise.resolve();
     if (!loader) {
@@ -40,9 +30,17 @@
       loader = new Promise((resolve, reject) => {
         const s = document.createElement("script");
         s.src = viewerUrl;
+        // A failure must not poison the rest of the session: drop the promise
+        // and the dead tag so the next .drawio preview injects afresh. Only
+        // success is cached.
+        const fail = (message: string) => {
+          loader = null;
+          s.remove();
+          reject(new Error(message));
+        };
         s.onload = () => {
           if (!win.GraphViewer) {
-            reject(new Error("viewer loaded without defining GraphViewer"));
+            fail("viewer loaded without defining GraphViewer");
             return;
           }
           // Skipping the MathJax bootstrap also skips its definition of this
@@ -51,12 +49,29 @@
           if (win.Editor) win.Editor.MathJaxRender ??= () => {};
           resolve();
         };
-        s.onerror = () => reject(new Error("viewer failed to load"));
+        s.onerror = () => fail("viewer failed to load");
         document.head.appendChild(s);
       });
     }
     return loader;
   }
+</script>
+
+<script lang="ts">
+  // Renders a .drawio file with diagrams.net's own standalone viewer, vendored
+  // into the bundle (never fetched). The viewer reads a div's data-mxgraph
+  // config and replaces it with an interactive canvas: page tabs for
+  // multi-page files, zoom, layers. It also decompresses draw.io's
+  // base64+deflate page payloads itself, so the raw file text is handed over
+  // untouched.
+  import { api } from "../../lib/api";
+  import PreviewLoading from "./PreviewLoading.svelte";
+
+  let { relPath }: { relPath: string } = $props();
+
+  let xml = $state<string | null>(null);
+  let error = $state<string | null>(null);
+  let host = $state<HTMLDivElement | null>(null);
 
   let generation = 0;
   $effect(() => {
