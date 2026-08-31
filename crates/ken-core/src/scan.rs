@@ -54,7 +54,7 @@ pub fn pdf_text_is_sparse(text: &str) -> bool {
 /// SVG (and any other vector image) can't be rasterized by ImageIO, so the OCR
 /// bridge errors on it — never enqueue it. The only vector kind among the image
 /// extensions is `.svg`.
-fn is_vector_image(rel: &str) -> bool {
+pub fn is_vector_image(rel: &str) -> bool {
     rel.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("svg"))
 }
 

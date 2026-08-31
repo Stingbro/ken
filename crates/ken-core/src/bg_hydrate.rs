@@ -1,10 +1,11 @@
 //! Background hydration policy: which cloud-only files the low-priority
 //! worker downloads-and-indexes on its own, and whether the feature is on.
 //!
-//! The user wants cloud-offline *documents* to be searchable without having
-//! to open each one. This module holds the pure decision — "is this row worth
-//! pulling down in the background?" — so the selection rule is unit-tested
-//! without a real `SF_DATALESS` file (which can't be fabricated in a test).
+//! The user wants cloud-offline *documents and OCR-able images* to be
+//! searchable without having to open each one. This module holds the pure
+//! decision — "is this row worth pulling down in the background?" — so the
+//! selection rule is unit-tested without a real `SF_DATALESS` file (which
+//! can't be fabricated in a test).
 //! The worker that acts on it (throttling, backoff, off-lock I/O) lives in the
 //! app layer, alongside the transcript and knowledge workers it must not fight.
 
@@ -39,9 +40,10 @@ pub fn background_index_enabled(project: &Project) -> bool {
 /// Should the background worker download-and-index this indexed row?
 ///
 /// Deliberately narrow. Only `cloud_only` rows have bytes still in the cloud;
-/// only text-bearing, non-video kinds under the size cap are worth the
-/// bandwidth (videos and huge media are left to the on-open path); and an
-/// excluded path is never touched even if a stale row lingers in the index.
+/// only text-bearing, non-video kinds under the size cap — plus raster images
+/// the OCR pass can read — are worth the bandwidth (videos and huge media are
+/// left to the on-open path); and an excluded path is never touched even if a
+/// stale row lingers in the index.
 pub fn wants_background_index(row: &FileRow, excluded: bool) -> bool {
     if row.status != scan::STATUS_CLOUD_ONLY {
         return false;
@@ -50,7 +52,18 @@ pub fn wants_background_index(row: &FileRow, excluded: bool) -> bool {
         return false;
     }
     let kind = FileKind::from_path(Path::new(&row.rel_path));
-    if kind == FileKind::Video || !kind.has_content() {
+    if kind == FileKind::Video {
+        return false;
+    }
+    // Raster images carry no extractable text (has_content() is false) but the
+    // OCR pipeline makes their pixels searchable — worth pulling down under the
+    // same limits OCR itself enforces (no SVG, ≤ MAX_OCR_IMAGE_BYTES).
+    if kind == FileKind::Image {
+        return !scan::is_vector_image(&row.rel_path)
+            && row.size >= 0
+            && row.size <= scan::MAX_OCR_IMAGE_BYTES;
+    }
+    if !kind.has_content() {
         return false;
     }
     // A negative or oversized placeholder is skipped: nothing sane to download.
@@ -144,16 +157,40 @@ mod tests {
         ));
     }
 
-    /// Images and opaque binaries carry no extractable text, so pulling their
-    /// bytes down would cost bandwidth for nothing.
+    /// Opaque binaries carry no extractable text and no pixels worth reading,
+    /// so pulling their bytes down would cost bandwidth for nothing.
     #[test]
     fn skips_kinds_without_text_content() {
         assert!(!wants_background_index(
-            &row("photos/team.jpg", scan::STATUS_CLOUD_ONLY, 4096),
+            &row("archive.zip", scan::STATUS_CLOUD_ONLY, 4096),
+            false,
+        ));
+    }
+
+    /// A cloud-only raster image is worth pulling down: once local, the rescan
+    /// re-indexes it and the OCR queue makes its pixels searchable.
+    #[test]
+    fn selects_a_cloud_only_image_for_ocr() {
+        assert!(wants_background_index(
+            &row("decks/arch-diagram.png", scan::STATUS_CLOUD_ONLY, 4096),
+            false,
+        ));
+        assert!(wants_background_index(
+            &row("photos/whiteboard.JPG", scan::STATUS_CLOUD_ONLY, 4096),
+            false,
+        ));
+    }
+
+    /// Images the OCR pipeline itself would reject are not worth the bandwidth:
+    /// vector SVGs (Vision can't rasterize them) and files over the OCR size cap.
+    #[test]
+    fn rejects_images_ocr_would_skip() {
+        assert!(!wants_background_index(
+            &row("logos/brand.svg", scan::STATUS_CLOUD_ONLY, 512),
             false,
         ));
         assert!(!wants_background_index(
-            &row("archive.zip", scan::STATUS_CLOUD_ONLY, 4096),
+            &row("scans/huge.png", scan::STATUS_CLOUD_ONLY, scan::MAX_OCR_IMAGE_BYTES + 1),
             false,
         ));
     }
