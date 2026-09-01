@@ -16,11 +16,21 @@ use quick_xml::Reader;
 /// recursion below is capped instead of left to blow the stack.
 const MAX_PAYLOAD_DEPTH: u8 = 4;
 
+/// Ceiling on the label text one file may yield in total. The per-payload cap
+/// below bounds each page, but a file can hold hundreds of pages — a crafted
+/// one whose payloads are almost entirely `value="…"` attributes would multiply
+/// that cap by its page count and exhaust memory. Whatever fits under the
+/// budget is kept; the rest is dropped, like every other degradation here.
+const MAX_TOTAL_LABEL_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn extract_labels(raw: &str) -> String {
-    labels_at(raw, 0)
+    let mut budget = MAX_TOTAL_LABEL_BYTES;
+    labels_at(raw, 0, &mut budget)
 }
 
-fn labels_at(raw: &str, depth: u8) -> String {
+/// `budget` is the label text still allowed across the whole file, shared by
+/// every page and every nested payload.
+fn labels_at(raw: &str, depth: u8, budget: &mut usize) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut reader = Reader::from_str(raw);
     reader.config_mut().trim_text(true);
@@ -30,6 +40,9 @@ fn labels_at(raw: &str, depth: u8) -> String {
     let decoder = reader.decoder();
     let mut in_diagram = false;
     loop {
+        if *budget == 0 {
+            break; // budget spent: keep what we have, stop reading
+        }
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 if e.name().local_name().as_ref() == b"diagram" {
@@ -37,9 +50,9 @@ fn labels_at(raw: &str, depth: u8) -> String {
                     // payload as its child text node.
                     in_diagram = true;
                 }
-                collect_attr_labels(&e, decoder, &mut out);
+                collect_attr_labels(&e, decoder, &mut out, budget);
             }
-            Ok(Event::Empty(e)) => collect_attr_labels(&e, decoder, &mut out),
+            Ok(Event::Empty(e)) => collect_attr_labels(&e, decoder, &mut out, budget),
             Ok(Event::End(e)) if e.name().local_name().as_ref() == b"diagram" => {
                 in_diagram = false;
             }
@@ -48,7 +61,9 @@ fn labels_at(raw: &str, depth: u8) -> String {
                 if let Ok(txt) = t.decode() {
                     if let Some(inner) = decode_payload(txt.trim()) {
                         // Recurse over the decoded mxGraphModel XML.
-                        let nested = labels_at(&inner, depth + 1);
+                        // The nested text is already charged to the shared
+                        // budget as it is gathered.
+                        let nested = labels_at(&inner, depth + 1, budget);
                         if !nested.is_empty() {
                             out.push(nested);
                         }
@@ -69,6 +84,7 @@ fn collect_attr_labels(
     e: &quick_xml::events::BytesStart,
     decoder: quick_xml::encoding::Decoder,
     out: &mut Vec<String>,
+    budget: &mut usize,
 ) {
     let name = e.name();
     let is_diagram = name.local_name().as_ref() == b"diagram";
@@ -79,7 +95,7 @@ fn collect_attr_labels(
             || key.as_ref() == b"label"
         {
             if let Ok(v) = attr.decode_and_unescape_value(decoder) {
-                push_clean(out, &v);
+                push_clean(out, &v, budget);
             }
         }
     }
@@ -140,8 +156,10 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Strip HTML tags and decode the handful of entities draw.io emits in rich
-/// labels, then push the cleaned text if anything is left.
-fn push_clean(out: &mut Vec<String>, value: &str) {
+/// labels, then push the cleaned text if anything is left and the shared
+/// `budget` still covers it. A label that would overrun the budget is dropped
+/// and the budget zeroed, which stops the walk.
+fn push_clean(out: &mut Vec<String>, value: &str, budget: &mut usize) {
     let mut text = String::with_capacity(value.len());
     let mut in_tag = false;
     for c in value.chars() {
@@ -163,9 +181,15 @@ fn push_clean(out: &mut Vec<String>, value: &str) {
         .replace("&quot;", "\"")
         .replace("&#39;", "'");
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if !text.is_empty() {
-        out.push(text);
+    if text.is_empty() {
+        return;
     }
+    if text.len() > *budget {
+        *budget = 0;
+        return;
+    }
+    *budget -= text.len();
+    out.push(text);
 }
 
 #[cfg(test)]
@@ -255,6 +279,31 @@ mod tests {
         let raw = format!(r#"<mxfile><diagram name="Boom">{packed}</diagram></mxfile>"#);
         let text = extract_labels(&raw);
         assert_eq!(text, "Boom", "got: {text:?}");
+    }
+
+    #[test]
+    fn total_label_output_is_budgeted() {
+        // The per-payload cap bounds one page; a file with many bomb pages
+        // would still multiply it. Ten 4 MiB pages exceed the total budget:
+        // extraction keeps roughly a budget's worth and stops.
+        const PAGE_LABEL_BYTES: usize = 4 * 1024 * 1024;
+        let value = "a".repeat(PAGE_LABEL_BYTES / 4);
+        let cells: String = std::iter::repeat_n(&value, 4)
+            .map(|v| format!(r#"<mxCell id="2" value="{v}" vertex="1"/>"#))
+            .collect();
+        let packed = pack(&format!("<mxGraphModel><root>{cells}</root></mxGraphModel>"));
+        let pages: String = (0..MAX_TOTAL_LABEL_BYTES / PAGE_LABEL_BYTES + 2)
+            .map(|i| format!(r#"<diagram name="P{i}">{packed}</diagram>"#))
+            .collect();
+        let text = extract_labels(&format!("<mxfile>{pages}</mxfile>"));
+        // The join's newlines are the only slack over the budget.
+        assert!(
+            text.len() <= MAX_TOTAL_LABEL_BYTES + 1024,
+            "unbounded: {} bytes",
+            text.len()
+        );
+        // What fit under the budget is still indexed.
+        assert!(text.len() > MAX_TOTAL_LABEL_BYTES / 2, "too little: {} bytes", text.len());
     }
 
     #[test]
