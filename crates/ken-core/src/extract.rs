@@ -31,6 +31,8 @@ pub enum FileKind {
     /// A Windows `.url` internet shortcut — an INI-ish stub whose only real
     /// content is the link it points at.
     Url,
+    /// A diagrams.net drawing; its searchable content is its text labels.
+    Drawio,
     Binary,
 }
 
@@ -48,6 +50,7 @@ impl FileKind {
             FileKind::Image => "image",
             FileKind::Video => "video",
             FileKind::Url => "url",
+            FileKind::Drawio => "drawio",
             FileKind::Binary => "binary",
         }
     }
@@ -78,6 +81,7 @@ impl FileKind {
             | "svg" => FileKind::Image,
             "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => FileKind::Video,
             "url" => FileKind::Url,
+            "drawio" => FileKind::Drawio,
             _ => FileKind::Binary,
         }
     }
@@ -125,6 +129,7 @@ pub fn extract(path: &Path) -> Result<Extracted> {
         FileKind::Ipynb => extract_ipynb(path),
         FileKind::Image => extract_image(path),
         FileKind::Url => extract_url(path),
+        FileKind::Drawio => extract_drawio(path),
         // Handled above, before the size cap.
         FileKind::Video => Ok(Extracted::default()),
         FileKind::Binary => Ok(Extracted::default()),
@@ -145,6 +150,16 @@ fn extract_url(path: &Path) -> Result<Extracted> {
     let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
     Ok(Extracted {
         text: parse_internet_shortcut(&String::from_utf8_lossy(&bytes)).unwrap_or_default(),
+        title: None,
+    })
+}
+
+/// A drawio file's searchable content is its diagram labels. Undecodable
+/// content yields empty text (→ metadata_only in the scanner), never an error.
+fn extract_drawio(path: &Path) -> Result<Extracted> {
+    let bytes = fs::read(path).map_err(|e| Error::io(path, e))?;
+    Ok(Extracted {
+        text: crate::drawio::extract_labels(&String::from_utf8_lossy(&bytes)),
         title: None,
     })
 }
@@ -419,6 +434,25 @@ mod tests {
         let out = extract(&path).unwrap();
         // Only the link — the INI scaffolding isn't worth indexing.
         assert_eq!(out.text, "https://langdonsoft.example/quotes");
+    }
+
+    #[test]
+    fn drawio_classifies_and_extracts_labels() {
+        assert_eq!(FileKind::from_path(Path::new("d/arch.drawio")), FileKind::Drawio);
+        assert_eq!(FileKind::Drawio.as_str(), "drawio");
+        assert!(FileKind::Drawio.has_content());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arch.drawio");
+        std::fs::write(
+            &path,
+            r#"<mxfile><diagram name="P1"><mxGraphModel><root>
+            <mxCell id="2" value="Data Lake" vertex="1"/>
+        </root></mxGraphModel></diagram></mxfile>"#,
+        )
+        .unwrap();
+        let out = extract(&path).unwrap();
+        assert!(out.text.contains("Data Lake"));
     }
 
     #[test]

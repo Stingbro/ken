@@ -54,7 +54,7 @@ pub fn pdf_text_is_sparse(text: &str) -> bool {
 /// SVG (and any other vector image) can't be rasterized by ImageIO, so the OCR
 /// bridge errors on it — never enqueue it. The only vector kind among the image
 /// extensions is `.svg`.
-fn is_vector_image(rel: &str) -> bool {
+pub fn is_vector_image(rel: &str) -> bool {
     rel.rsplit('.').next().is_some_and(|e| e.eq_ignore_ascii_case("svg"))
 }
 
@@ -72,6 +72,15 @@ pub fn is_junk_dir_name(name: &str) -> bool {
 /// index or trigger rescans.
 pub fn is_office_lock_name(name: &str) -> bool {
     name.starts_with("~$")
+}
+
+/// Timestamped backup files (`report.xlsx.bak`, `report.xlsx.bak-2026-07-16T…Z`)
+/// written by external tools beside live documents. Pure noise in a knowledge
+/// index — and in a cloud folder they pile up as cloud-only rows that inflate
+/// the offline count — so they are ignored everywhere, like Office lock files.
+pub fn is_backup_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".bak") || lower.contains(".bak-")
 }
 
 /// File status values stored in the index.
@@ -126,6 +135,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
             let name = e.file_name().to_string_lossy();
             name != ".ken"
                 && !is_office_lock_name(&name)
+                && !is_backup_name(&name)
                 && !(e.path().is_dir() && is_junk_dir_name(&name))
         })
         .build();
@@ -222,6 +232,11 @@ fn index_one(
         Ok(out) if kind == FileKind::Video && out.text.trim().is_empty() => {
             (STATUS_METADATA_ONLY, None, out.text)
         }
+        // A drawio file whose labels couldn't be decoded is searchable by name
+        // only — metadata-only, not an empty-content "indexed" row.
+        Ok(out) if kind == FileKind::Drawio && out.text.trim().is_empty() => {
+            (STATUS_METADATA_ONLY, None, out.text)
+        }
         Ok(out) if kind.has_content() => (STATUS_INDEXED, None, out.text),
         Ok(out) => (STATUS_METADATA_ONLY, None, out.text),
         Err(e) => (STATUS_FAILED, Some(e.to_string()), String::new()),
@@ -263,7 +278,7 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     let abs = project.root.join(rel);
     let excluded = project.is_excluded(rel)
         || is_hidden_rel(rel)
-        || rel.rsplit('/').next().is_some_and(is_office_lock_name);
+        || rel.rsplit('/').next().is_some_and(|n| is_office_lock_name(n) || is_backup_name(n));
     if !excluded && abs.is_file() {
         let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
         let mtime = meta
@@ -636,6 +651,30 @@ mod tests {
         assert!(!refresh_path(&project, &mut db, "notes/~$meeting.docx").unwrap());
         assert!(db.get_file("notes/~$meeting.docx").unwrap().is_none());
         drop(dir);
+    }
+
+    #[test]
+    fn backup_names_are_junk() {
+        // Timestamped backups written by external tools next to live documents.
+        assert!(is_backup_name("ATT Op Model Dev V2.xlsx.bak-2026-07-16T11-55-35-773Z"));
+        assert!(is_backup_name("notes.md.bak"));
+        assert!(is_backup_name("NOTES.MD.BAK")); // case-insensitive
+        // Words that merely contain "bak" are not backups.
+        assert!(!is_backup_name("bakery-roadmap.md"));
+        assert!(!is_backup_name("a.baker"));
+        assert!(!is_backup_name("bak")); // no dot — not a suffix segment
+    }
+
+    #[test]
+    fn scan_skips_backup_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::create(dir.path(), "Fixture").unwrap();
+        std::fs::write(dir.path().join("live.md"), "# keep me").unwrap();
+        std::fs::write(dir.path().join("live.md.bak-2026-07-16T11-55-35-773Z"), "old").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        let rels: Vec<String> = db.list_files().unwrap().into_iter().map(|f| f.rel_path).collect();
+        assert_eq!(rels, vec!["live.md"]);
     }
 
     #[test]

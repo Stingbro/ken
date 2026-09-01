@@ -2995,6 +2995,33 @@ mod tests {
         assert!(hits[0].snippet.contains("<mark>"));
     }
 
+    /// A cloud placeholder is indexed with empty text but must remain findable by
+    /// name: `upsert_file` writes name tokens into FTS even for contentless rows,
+    /// and the query-time rel_path LIKE pass catches mid-word fragments. This
+    /// pins the guarantee scan.rs relies on ("Name-searchable; content arrives
+    /// when the user opens the file").
+    #[test]
+    fn cloud_only_rows_are_name_searchable() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file(
+            "meetings/Standup Recording 06.15.mp4",
+            "video",
+            999,
+            0,
+            crate::scan::STATUS_CLOUD_ONLY,
+            None,
+            "",
+        )
+        .unwrap();
+        // Whole-token match via the FTS name column.
+        let hits = db.search("standup", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].status, crate::scan::STATUS_CLOUD_ONLY);
+        // Mid-word fragment via the filename substring pass.
+        let hits = db.search("cording", 10).unwrap();
+        assert_eq!(hits.len(), 1, "filename LIKE pass must catch mid-word fragments");
+    }
+
     #[test]
     fn search_prefix_as_you_type() {
         let db = seeded();
