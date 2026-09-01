@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from "svelte";
   import { Crepe } from "@milkdown/crepe";
-  import { editorViewCtx } from "@milkdown/kit/core";
+  import { editorViewCtx, remarkStringifyOptionsCtx } from "@milkdown/kit/core";
   // Namespace import: Svelte reserves the `$` prefix, so `$prose` can only be
   // reached as a property.
   import * as milkdown from "@milkdown/kit/utils";
@@ -149,6 +149,13 @@
       });
     });
     crepe.editor.use(findPlugin);
+    // House style is `- ` bullets; remark-stringify would otherwise write `*`.
+    crepe.editor.config((ctx) => {
+      ctx.update(remarkStringifyOptionsCtx, (opts) => ({
+        ...opts,
+        bullet: "-" as const,
+      }));
+    });
     await crepe.create();
     crepe.editor.action((ctx) => {
       view = ctx.get(editorViewCtx);
