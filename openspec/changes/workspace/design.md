@@ -18,6 +18,10 @@ frontend problem.
 - Non-Goals: nested workspaces; members outside the parent folder;
   cross-project *semantic* search (kg-routing); any cross-project
   derived data (federated-kg); per-member window/tab UI.
+  *(Amended by `workspace-group-folders`: a member may now sit one level
+  down inside a group folder — `SR/ShatteredRealms` — which is still not
+  a nested workspace; the workspace stays flat, only member paths gained
+  one segment. See that change's D6.)*
 
 ## Decisions
 

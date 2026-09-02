@@ -8,6 +8,7 @@
   // nav-rail trigger, the same pattern `ProjectSwitcher.svelte` uses for the
   // title-bar project menu.
   import { app, type MemberInfo } from "../lib/app.svelte";
+  import { memberLeaf } from "../lib/api";
 
   let { close }: { close: () => void } = $props();
 
@@ -66,7 +67,7 @@
       title={statusTitle(m)}
     >
       <span class="dot {m.status}"></span>
-      <span class="name">{m.name}</span>
+      <span class="name">{memberLeaf(m.name)}</span>
       {#if m.status !== "active"}
         <span class="status-label">{statusLabel(m.status)}</span>
       {/if}

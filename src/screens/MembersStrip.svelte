@@ -8,7 +8,7 @@
   // mode this change exists to fix.
   import { app } from "../lib/app.svelte";
   import { workspaceHome } from "../lib/workspaceHome.svelte";
-  import type { MemberOverview } from "../lib/api";
+  import { memberLeaf, type MemberOverview } from "../lib/api";
 
   let expanded = $state(false);
 
@@ -62,7 +62,7 @@
           class:amber={m.status === "ok" && (!m.indexReady || m.failedFiles > 0)}
           class:dormant={m.status === "ok" && !m.resident}
         ></span>
-        <span class="mname">{m.name ?? m.folder}</span>
+        <span class="mname">{m.name ?? memberLeaf(m.folder)}</span>
         <span class="mnote">{note(m)}</span>
       </button>
     {/each}

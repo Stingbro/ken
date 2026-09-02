@@ -3,6 +3,8 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     api,
+    memberGroup,
+    memberLeaf,
     type Candidate,
     type FeatureInfo,
     type ProjectProfile,
@@ -350,7 +352,9 @@
                 <label class="radio feature-row">
                   <input type="checkbox" bind:checked={wsIncluded[c.name]} />
                   <span class="feature-text">
-                    <span class="feature-name ws-name">{c.name}</span>
+                    <span class="feature-name ws-name">
+                      {memberLeaf(c.name)}{#if memberGroup(c.name)}<span class="ws-group"> in {memberGroup(c.name)}/</span>{/if}
+                    </span>
                     <span class="note">
                       {c.existing ? "Existing Ken project" : "New"} · {c.fileCount}
                       {c.fileCount === 1 ? "file" : "files"}{#if c.markers.length > 0} · {c.markers.join(", ")}{/if}
@@ -597,6 +601,10 @@
   }
   .feature-name.ws-name {
     text-transform: none;
+  }
+  .ws-group {
+    font-weight: 400;
+    color: var(--ink-tertiary);
   }
   .confirm {
     background: var(--surface);

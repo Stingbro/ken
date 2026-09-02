@@ -6,7 +6,7 @@
 // own. Deliberately NOT the same thing as `app.project` (the focused
 // member, i.e. "which project am I working in") — you can be editing one
 // project while asking a question about all of them.
-import { api, type ProjectGroup } from "./api";
+import { api, memberLeaf, type ProjectGroup } from "./api";
 import { app } from "./app.svelte";
 
 export type ScopeKind = "all" | "group" | "project";
@@ -48,7 +48,7 @@ class ScopeStore {
     if (this.kind === "all") return "All projects";
     if (this.kind === "group") return this.value ?? "Group";
     const member = app.workspace?.members.find((m) => m.projectId === this.value);
-    return member?.name ?? "One project";
+    return member ? memberLeaf(member.name) : "One project";
   }
 
   async init() {

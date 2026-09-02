@@ -44,14 +44,12 @@
 </script>
 
 <nav>
-  <!-- The project switcher deliberately does NOT live here any more
-       (ken-home-workspace 3.6). A global "Projects" control framed the
-       whole app as being "in" one project, which is what made Home read
-       as project-specific. Selection now sits in `ProjectScopeBar`, above
-       the screens that actually describe one project; Home and Settings
-       describe the whole setup and show no selector at all. Ctrl+P still
-       cycles members. `WorkspaceSwitcher.svelte` is kept (it also owns
-       forget/rename) but is no longer mounted from the rail. -->
+  <!-- No project switcher here. It lives in the title bar
+       (`ProjectSwitcher.svelte`), which is where people reach for it and
+       which also owns rename/forget, open-a-folder, and the "All
+       projects" merged Files tree. A second selector in the rail framed
+       the whole app as being IN one project, which is what made Home read
+       as project-specific. Ctrl+P still cycles members. -->
   {#each items as item (item.key)}
     {@const Icon = item.icon}
     <button

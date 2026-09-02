@@ -2677,6 +2677,106 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
     Ok(TreeData { files, folders })
 }
 
+/// The whole workspace as ONE tree: every resolvable member's files and
+/// folders, each path prefixed with the member's folder name so the top
+/// level of the tree is the projects themselves.
+///
+/// Deliberately the same `TreeData` shape as [`get_tree`], so `FileTree`
+/// renders it with no changes — a prefixed path is just a path with one
+/// more leading segment. The prefix is also what makes a selection
+/// resolvable: `app.openTab` splits it back off, focuses that member, and
+/// opens the remainder (see its comment), which is why the prefix is the
+/// MANIFEST folder name rather than the display name — folder names are
+/// unique within a parent, display names need not be.
+///
+/// Dormant members are read the same way `route_search` reads them: their
+/// index opens by project id without activating anything.
+#[tauri::command]
+fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
+    let (base_dir, members) = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let members: Vec<(String, ken_core::project::Project, Option<Arc<Mutex<Db>>>)> = ws
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some((
+                    m.name.clone(),
+                    p.clone(),
+                    guard.members.get(&p.config.id).map(|r| r.search_db.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+        (guard.base_dir.clone(), members)
+    };
+
+    let mut files: Vec<FileRowDto> = Vec::new();
+    let mut folders: Vec<FolderInfo> = Vec::new();
+
+    for (folder_name, project, live) in members {
+        // Each member is a folder in the merged tree — and a nested member
+        // ("SR/ShatteredRealms") needs its group folder ("SR") emitted
+        // too, or the tree has a node whose parent doesn't exist. Emitted
+        // per member and de-duplicated by the sort+dedup below, so two SR
+        // members yield one SR node.
+        if let Some(group) = ken_core::workspace::member_group(&folder_name) {
+            folders.push(FolderInfo {
+                excluded: false,
+                rel_path: group.to_string(),
+            });
+        }
+        folders.push(FolderInfo {
+            excluded: false,
+            rel_path: folder_name.clone(),
+        });
+
+        let rows = match live {
+            Some(db) => db.lock().unwrap().list_files().unwrap_or_default(),
+            None => Db::open(&base_dir, project.config.id)
+                .ok()
+                .and_then(|db| db.list_files().ok())
+                .unwrap_or_default(),
+        };
+        for mut row in rows {
+            row.rel_path = format!("{folder_name}/{}", row.rel_path);
+            files.push(FileRowDto::new(row, &project));
+        }
+
+        // Folders from disk, same as `get_tree`, so an excluded or empty
+        // one still appears under its project.
+        let walker = ignore::WalkBuilder::new(&project.root)
+            .hidden(true)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                name != ".ken" && !(e.path().is_dir() && ken_core::scan::is_junk_dir_name(&name))
+            })
+            .build();
+        for entry in walker.flatten() {
+            if entry.path().is_dir() && entry.path() != project.root {
+                if let Ok(rel) = entry.path().strip_prefix(&project.root) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    folders.push(FolderInfo {
+                        excluded: project.is_excluded(&rel),
+                        rel_path: format!("{folder_name}/{rel}"),
+                    });
+                }
+            }
+        }
+    }
+
+    folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    folders.dedup_by(|a, b| a.rel_path == b.rel_path);
+    Ok(TreeData { files, folders })
+}
+
 #[tauri::command]
 async fn search(
     state: State<'_, SharedState>,
@@ -7619,7 +7719,7 @@ async fn route_search(
                 let ids: Vec<uuid::Uuid> = ws
                     .ws
                     .config
-                    .group_members(name)
+                    .effective_group_members(name)
                     .iter()
                     .filter_map(|folder| {
                         ws.ws.members.iter().find(|m| &m.name == folder).and_then(|m| {
@@ -10171,7 +10271,14 @@ fn workspace_candidates(state: State<SharedState>) -> CmdResult<Vec<CandidateDto
     let found = ken_core::workspace::discover_candidates(&root).map_err(err)?;
     Ok(found
         .into_iter()
-        .filter(|c| !existing.iter().any(|m| m == &c.name))
+        // Not already a member, and not a group folder that CONTAINS
+        // members — adding "SR" itself while "SR/ShatteredRealms" is a
+        // member would nest one project's tree inside another's.
+        .filter(|c| {
+            !existing
+                .iter()
+                .any(|m| m == &c.name || m.starts_with(&format!("{}/", c.name)))
+        })
         .map(|c| CandidateDto {
             name: c.name,
             existing: c.existing,
@@ -10208,14 +10315,46 @@ fn workspace_ignored(state: State<SharedState>) -> CmdResult<Vec<String>> {
     if rules.is_empty() {
         return Ok(Vec::new());
     }
-    let mut out: Vec<String> = std::fs::read_dir(&root)
-        .map_err(err)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .filter(|name| !name.starts_with('.'))
-        .filter(|name| ken_core::workspace::is_ignored_folder(&rules, name))
-        .collect();
+    // Two levels, matching membership's D6 shape: a rule can hide a direct
+    // child ("worlds/") or something inside a group folder
+    // ("SR/scratch/"). Rows are parent-relative paths; an ignored
+    // top-level folder reports alone — descending into it would list every
+    // child as redundantly ignored via parent matching.
+    let mut out: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&root).map_err(err)?.filter_map(|e| e.ok()) {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if ken_core::workspace::is_ignored_folder(&rules, &name) {
+            out.push(name);
+            continue;
+        }
+        for child in std::fs::read_dir(entry.path())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+        {
+            if !child.path().is_dir() {
+                continue;
+            }
+            let Some(child_name) = child.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if child_name.starts_with('.') {
+                continue;
+            }
+            let rel = format!("{name}/{child_name}");
+            if ken_core::workspace::is_ignored_folder(&rules, &rel) {
+                out.push(rel);
+            }
+        }
+    }
     out.sort();
     Ok(out)
 }
@@ -10269,10 +10408,11 @@ fn workspace_unignore_candidate(state: State<SharedState>, folder: String) -> Cm
 /// resident cap. Joining a repo should not evict a resident one.
 #[tauri::command]
 fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<Vec<MemberOverviewDto>> {
-    let folder = folder.trim().to_string();
-    if folder.is_empty() || folder.contains('/') || folder.contains('\\') {
-        return Err("choose a folder directly inside the workspace".into());
-    }
+    // D6: a member is a folder in the workspace or one inside a single
+    // group folder — `validate_member_name` normalizes to forward slashes
+    // and rejects traversal (`..`, absolutes), so the join below can't
+    // escape the workspace root.
+    let folder = ken_core::workspace::validate_member_name(&folder).map_err(err)?;
     let mut guard = state.lock().unwrap();
     if !workspace_enabled(&guard.app_settings) {
         return Err(WORKSPACE_DISABLED_MSG.into());
@@ -10285,7 +10425,11 @@ fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<
     if !member_root.is_dir() {
         return Err(format!("no folder named \"{folder}\" in this workspace"));
     }
-    let project = ken_core::project::Project::create(&member_root, &folder).map_err(err)?;
+    let project = ken_core::project::Project::create(
+        &member_root,
+        ken_core::workspace::member_leaf(&folder),
+    )
+    .map_err(err)?;
     ws.ws.config.members.push(folder.clone());
     ws.ws.members.push(ken_core::workspace::Member {
         name: folder,
@@ -10322,11 +10466,16 @@ fn workspace_groups(state: State<SharedState>) -> CmdResult<Vec<ProjectGroupDto>
 /// Resolve every group against the live manifest. Kept separate so the
 /// create/delete commands can return the fresh list without re-locking.
 fn group_dtos(ws: &ken_core::workspace::Workspace) -> Vec<ProjectGroupDto> {
+    // The effective view: groups derived from group FOLDERS (D6 — a
+    // nested member's leading segment) first, then manifest groups from
+    // Settings. One list, so every surface (Home's scope picker, routed
+    // search, chat scope) sees the same groups without knowing which kind
+    // each one is.
     ws.config
-        .groups
+        .effective_groups()
         .iter()
         .map(|g| {
-            let members = ws.config.group_members(&g.name);
+            let members = ws.config.effective_group_members(&g.name);
             let project_ids = members
                 .iter()
                 .filter_map(|folder| {
@@ -11496,8 +11645,17 @@ fn send_chat_message(
         (None, _) | (_, None) => Vec::new(),
         (Some(kind), Some(ws)) => {
             // "all" spans every resolvable member; anything else names a
-            // group, whose folder list filters the same set.
-            let allowed: Option<Vec<String>> = (kind != "all").then(|| ws.ws.config.group_members(kind));
+            // group (manifest or group-folder), whose member list filters
+            // the same set.
+            let allowed: Option<Vec<String>> =
+                (kind != "all").then(|| ws.ws.config.effective_group_members(kind));
+            // A named scope that resolves to nothing is an error, not a
+            // quiet fallback: silently sending the chat with single-project
+            // scope while the UI says "asking about <group>" hands the
+            // model the wrong world without telling anyone.
+            if allowed.as_ref().is_some_and(|list| list.is_empty()) {
+                return Err(format!("scope \"{kind}\" matches no workspace members"));
+            }
             ws.ws
                 .members
                 .iter()
@@ -13055,6 +13213,7 @@ pub fn run() {
             current_project,
             set_folder_selection,
             get_tree,
+            get_tree_all,
             search,
             hybrid_search,
             set_project_feature,

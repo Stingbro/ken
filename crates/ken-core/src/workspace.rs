@@ -37,8 +37,12 @@ pub fn config_path(parent: &Path) -> PathBuf {
 pub struct WorkspaceConfig {
     pub name: String,
     pub id: Uuid,
-    /// Parent-relative folder names (design D1: relative so the manifest
-    /// survives the parent being moved or synced to a teammate).
+    /// Parent-relative paths, one or two segments (design D1: relative so
+    /// the manifest survives the parent being moved or synced to a
+    /// teammate; D6: a two-segment member like `SR/ShatteredRealms` lives
+    /// inside a *group folder*, and the leading segment IS its group).
+    /// Always forward slashes, even on Windows — [`validate_member_name`]
+    /// normalizes.
     pub members: Vec<String>,
     /// Named sets of members that belong together conceptually even though
     /// they are separate repos (e.g. a game and its tools).
@@ -63,6 +67,56 @@ pub struct WorkspaceConfig {
 pub struct ProjectGroup {
     pub name: String,
     pub members: Vec<String>,
+}
+
+/// The member's own folder name — the last path segment. This is the
+/// display name; the full string stays the manifest key.
+pub fn member_leaf(member: &str) -> &str {
+    member.rsplit('/').next().unwrap_or(member)
+}
+
+/// The group folder a nested member lives in (`SR/ShatteredRealms` → `SR`),
+/// or `None` for a direct child of the workspace root.
+pub fn member_group(member: &str) -> Option<&str> {
+    member.rsplit_once('/').map(|(group, _)| group)
+}
+
+/// Validate and normalize a member name to its canonical manifest form:
+/// forward slashes, no surrounding separators, at most TWO segments (a
+/// member either sits directly in the workspace root or one level down
+/// inside a group folder — never deeper), and no segment that is empty,
+/// dot-prefixed, or a `..` traversal. Returns the normalized string.
+///
+/// This is the only gate between user input and `parent.join(name)`, so
+/// it is deliberately strict: everything it lets through joins to a path
+/// that stays inside the workspace.
+pub fn validate_member_name(name: &str) -> Result<String> {
+    let name = name.trim().replace('\\', "/");
+    let name = name.trim_matches('/');
+    if name.is_empty() {
+        return Err(Error::Other("member name cannot be empty".into()));
+    }
+    // A Windows drive ("C:") or UNC remnant is absolute intent, not a name.
+    if name.contains(':') {
+        return Err(Error::Other(format!(
+            "member name {name:?} must be a relative path inside the workspace"
+        )));
+    }
+    let segments: Vec<&str> = name.split('/').collect();
+    if segments.len() > 2 {
+        return Err(Error::Other(format!(
+            "member name {name:?} nests too deep — a member is either a \
+             folder in the workspace or inside ONE group folder"
+        )));
+    }
+    for segment in &segments {
+        if segment.is_empty() || *segment == ".." || segment.starts_with('.') {
+            return Err(Error::Other(format!(
+                "member name {name:?} contains an invalid path segment"
+            )));
+        }
+    }
+    Ok(name.to_string())
 }
 
 /// One entry of `workspace.json`'s `links` array (design D12,
@@ -124,6 +178,69 @@ impl WorkspaceConfig {
             .collect()
     }
 
+    /// Groups implied by the directory layout: every group folder (the
+    /// leading segment of a nested member) becomes a group holding the
+    /// members inside it. `SR/ShatteredRealms` + `SR/sr-docs` yields group
+    /// "SR" with those two members — no Settings bookkeeping involved.
+    /// Member entries hold the FULL manifest strings, the same vocabulary
+    /// as `groups`, so both kinds resolve identically downstream.
+    pub fn derived_groups(&self) -> Vec<ProjectGroup> {
+        let mut out: Vec<ProjectGroup> = Vec::new();
+        for member in &self.members {
+            let Some(folder) = member_group(member) else {
+                continue;
+            };
+            match out
+                .iter_mut()
+                .find(|g| g.name.eq_ignore_ascii_case(folder))
+            {
+                Some(group) => group.members.push(member.clone()),
+                None => out.push(ProjectGroup {
+                    name: folder.to_string(),
+                    members: vec![member.clone()],
+                }),
+            }
+        }
+        out
+    }
+
+    /// Directory-derived groups first, then manifest groups whose names
+    /// don't collide (case-insensitive) with a derived one. The folder is
+    /// the stronger claim: it's visible in the filesystem, and `set_group`
+    /// refuses to create the collision in the first place — this filter
+    /// only matters for a hand-edited manifest.
+    pub fn effective_groups(&self) -> Vec<ProjectGroup> {
+        let mut out = self.derived_groups();
+        for group in &self.groups {
+            if !out.iter().any(|d| d.name.eq_ignore_ascii_case(&group.name)) {
+                out.push(group.clone());
+            }
+        }
+        out
+    }
+
+    /// [`Self::group_members`] over the effective view: resolves a derived
+    /// (folder) group or a manifest group by one name, with the same
+    /// members-only filtering and de-duplication.
+    pub fn effective_group_members(&self, name: &str) -> Vec<String> {
+        let name = name.trim();
+        let Some(group) = self
+            .effective_groups()
+            .into_iter()
+            .find(|g| g.name.trim().eq_ignore_ascii_case(name))
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for candidate in &group.members {
+            let is_member = self.members.iter().any(|m| m == candidate);
+            if is_member && !out.iter().any(|o| o == candidate) {
+                out.push(candidate.clone());
+            }
+        }
+        out
+    }
+
     /// Create or replace a group. Returns an error for a blank name or an
     /// empty member list — a group with nothing in it is a scope that can
     /// never match anything, which reads as a bug at the point of use.
@@ -132,6 +249,19 @@ impl WorkspaceConfig {
         let name = name.trim();
         if name.is_empty() {
             return Err(Error::Other("group name cannot be empty".into()));
+        }
+        // A group folder already owns this name (D6). Refusing here beats
+        // storing a manifest group that `effective_groups` would shadow
+        // forever — the user would see their edit silently not exist.
+        if self
+            .derived_groups()
+            .iter()
+            .any(|g| g.name.trim().eq_ignore_ascii_case(name))
+        {
+            return Err(Error::Other(format!(
+                "\"{name}\" is already a group folder in the workspace — \
+                 its members are the folders inside it"
+            )));
         }
         let mut kept: Vec<String> = Vec::new();
         for candidate in members {
@@ -277,10 +407,17 @@ impl Workspace {
             return Workspace::open(parent);
         }
         let name = project::normalize_name(name)?;
+        let member_names: Vec<String> = member_names
+            .iter()
+            .map(|n| validate_member_name(n))
+            .collect::<Result<_>>()?;
         let mut members = Vec::with_capacity(member_names.len());
-        for member_name in member_names {
+        for member_name in &member_names {
             let member_root = parent.join(member_name);
-            let project = Project::create(&member_root, member_name)?;
+            // The leaf is the display name; the full relative path stays
+            // the manifest key. A project inside a group folder is still
+            // just "ShatteredRealms", not "SR/ShatteredRealms".
+            let project = Project::create(&member_root, member_leaf(member_name))?;
             members.push(Member {
                 name: member_name.clone(),
                 status: MemberStatus::Ok(project),
@@ -289,7 +426,7 @@ impl Workspace {
         let config = WorkspaceConfig {
             name,
             id: Uuid::new_v4(),
-            members: member_names.to_vec(),
+            members: member_names.clone(),
             groups: Vec::new(),
             extra: serde_json::Map::new(),
         };
@@ -343,7 +480,7 @@ impl Workspace {
                 status: MemberStatus::Missing,
             };
         }
-        match Project::create(&member_root, name) {
+        match Project::create(&member_root, member_leaf(name)) {
             Ok(project) => Member {
                 name: name.to_string(),
                 status: MemberStatus::Ok(project),
@@ -375,8 +512,9 @@ impl Workspace {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
-    /// The folder's own name — becomes the manifest's relative member name
-    /// if selected.
+    /// Parent-relative path — becomes the manifest's member name if
+    /// selected. One segment for a direct child; `Group/Child` for a repo
+    /// living inside a group folder (D6).
     pub name: String,
     /// Already has `.ken/project.json` — pre-checked in the selection UI.
     pub existing: bool,
@@ -435,11 +573,16 @@ pub fn is_ignored_folder(rules: &[crate::kenignore::Rule], name: &str) -> bool {
 /// is left alone rather than adding a redundant duplicate.
 pub fn ignore_folder(parent: &Path, folder: &str) -> Result<bool> {
     let folder = folder.trim().trim_end_matches('/');
-    if folder.is_empty() || folder.contains('/') || folder.contains('\\') {
-        return Err(Error::Other(
-            "only a folder directly inside the workspace can be ignored".into(),
-        ));
-    }
+    // Same shape rule as membership (D6): a bare folder or one inside a
+    // single group folder. `validate_member_name` also rejects `..`/drive
+    // prefixes, which matters more here — this string is written to disk.
+    let folder = &validate_member_name(folder).map_err(|_| {
+        Error::Other(
+            "only a folder in the workspace (or inside one of its group \
+             folders) can be ignored"
+                .into(),
+        )
+    })?;
     if is_ignored_folder(&ignore_rules(parent), folder) {
         return Ok(false);
     }
@@ -505,7 +648,53 @@ pub fn discover_candidates(parent: &Path) -> Result<Vec<Candidate>> {
         if is_ignored_folder(&rules, name) {
             continue;
         }
-        out.push(scan_candidate(&dir, name)?);
+        let candidate = scan_candidate(&dir, name)?;
+        // D6: a folder that is not repo-ish itself but holds repos is a
+        // GROUP folder — offer what's inside it (as `Group/Child` member
+        // names) rather than the container. Still bounded: one extra
+        // level, only when the evidence says "this wraps projects", so a
+        // plain folder of loose notes keeps its old depth-1 candidacy.
+        if !candidate.existing && candidate.markers.is_empty() {
+            let children = group_folder_children(&dir, name, &rules)?;
+            if children.iter().any(|c| c.existing || !c.markers.is_empty()) {
+                out.extend(children);
+                continue;
+            }
+        }
+        out.push(candidate);
+    }
+    Ok(out)
+}
+
+/// The immediate subfolders of a prospective group folder, as `Group/Child`
+/// candidates — same hidden/junk/`.kenignore` filters as the top level, with
+/// the ignore check running against the nested relative path so an `SR/`
+/// rule hides everything inside `SR` via parent matching.
+fn group_folder_children(
+    dir: &Path,
+    folder: &str,
+    rules: &[crate::kenignore::Rule],
+) -> Result<Vec<Candidate>> {
+    let entries = fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
+    let mut child_dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    child_dirs.sort();
+    let mut out = Vec::new();
+    for child in child_dirs {
+        let Some(child_name) = child.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if child_name.starts_with('.') || crate::scan::is_junk_dir_name(child_name) {
+            continue;
+        }
+        let rel = format!("{folder}/{child_name}");
+        if is_ignored_folder(rules, &rel) {
+            continue;
+        }
+        out.push(scan_candidate(&child, &rel)?);
     }
     Ok(out)
 }
@@ -742,10 +931,15 @@ mod tests {
         assert_eq!(discover_candidates(dir.path()).unwrap().len(), 1);
     }
 
+    /// D6 relaxed the old flat-only rule: ONE level of nesting (a folder
+    /// inside a group folder) is now a valid ignore target, the same shape
+    /// membership allows. Deeper paths and traversal stay rejected.
     #[test]
     fn ignore_folder_rejects_paths() {
         let dir = tempdir().unwrap();
-        assert!(ignore_folder(dir.path(), "a/b").is_err());
+        assert!(ignore_folder(dir.path(), "a/b").is_ok());
+        assert!(ignore_folder(dir.path(), "a/b/c").is_err());
+        assert!(ignore_folder(dir.path(), "../escape").is_err());
         assert!(ignore_folder(dir.path(), "  ").is_err());
     }
 
@@ -924,5 +1118,128 @@ mod tests {
         assert!(!repo.existing);
         assert!(repo.markers.contains(&"Cargo.toml".to_string()));
         assert_eq!(repo.file_count, 2);
+    }
+
+    #[test]
+    fn member_names_validate_to_at_most_two_clean_segments() {
+        assert_eq!(validate_member_name("ken").unwrap(), "ken");
+        assert_eq!(
+            validate_member_name("SR/ShatteredRealms").unwrap(),
+            "SR/ShatteredRealms"
+        );
+        // Windows separators and stray slashes normalize instead of failing.
+        assert_eq!(
+            validate_member_name("SR\\ShatteredRealms").unwrap(),
+            "SR/ShatteredRealms"
+        );
+        assert_eq!(validate_member_name("/ken/").unwrap(), "ken");
+        for bad in ["", "a/b/c", "../escape", "SR/..", "SR/.git", ".hidden", "C:/x"] {
+            assert!(validate_member_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn group_folders_derive_groups_and_shadow_manifest_names() {
+        let mut config = WorkspaceConfig {
+            name: "ws".into(),
+            id: Uuid::new_v4(),
+            members: vec![
+                "ken".into(),
+                "SR/ShatteredRealms".into(),
+                "SR/sr-docs".into(),
+            ],
+            groups: Vec::new(),
+            extra: serde_json::Map::new(),
+        };
+        let derived = config.derived_groups();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].name, "SR");
+        assert_eq!(
+            derived[0].members,
+            vec!["SR/ShatteredRealms".to_string(), "SR/sr-docs".to_string()]
+        );
+        assert_eq!(
+            config.effective_group_members("sr"),
+            vec!["SR/ShatteredRealms".to_string(), "SR/sr-docs".to_string()]
+        );
+        // The folder owns the name — a manifest group can't squat on it...
+        assert!(config.set_group("SR", &["ken".into()]).is_err());
+        // ...but a manifest group under a fresh name coexists and resolves
+        // through the same effective view.
+        config
+            .set_group("Everything", &["ken".into(), "SR/sr-docs".into()])
+            .unwrap();
+        assert_eq!(config.effective_groups().len(), 2);
+        assert_eq!(
+            config.effective_group_members("everything"),
+            vec!["ken".to_string(), "SR/sr-docs".to_string()]
+        );
+    }
+
+    #[test]
+    fn create_gives_nested_members_leaf_display_names() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("SR/Realms")).unwrap();
+        fs::create_dir_all(dir.path().join("ken")).unwrap();
+        let ws = Workspace::create(
+            dir.path(),
+            "ws",
+            &["SR/Realms".to_string(), "ken".to_string()],
+        )
+        .unwrap();
+        let MemberStatus::Ok(project) = &ws.members[0].status else {
+            panic!("nested member did not resolve");
+        };
+        assert_eq!(project.config.name, "Realms");
+        assert_eq!(ws.members[0].name, "SR/Realms");
+        // Re-open resolves the same shape from the saved manifest.
+        let reopened = Workspace::open(dir.path()).unwrap();
+        let MemberStatus::Ok(project) = &reopened.members[0].status else {
+            panic!("nested member did not re-resolve");
+        };
+        assert_eq!(project.config.name, "Realms");
+    }
+
+    #[test]
+    fn discovery_surfaces_group_folder_children_not_the_container() {
+        let dir = tempdir().unwrap();
+        // SR wraps two repos (one marked by .git, one by Cargo.toml) plus a
+        // junk dir that must not surface.
+        fs::create_dir_all(dir.path().join("SR/Realms/.git")).unwrap();
+        fs::create_dir_all(dir.path().join("SR/tools")).unwrap();
+        fs::write(dir.path().join("SR/tools/Cargo.toml"), "[package]\n").unwrap();
+        fs::create_dir_all(dir.path().join("SR/node_modules")).unwrap();
+        // A plain folder of loose subfolders stays a depth-1 candidate.
+        fs::create_dir_all(dir.path().join("notes/drafts")).unwrap();
+        let names: Vec<String> = discover_candidates(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.contains(&"SR/Realms".to_string()));
+        assert!(names.contains(&"SR/tools".to_string()));
+        assert!(names.contains(&"notes".to_string()));
+        assert!(!names.contains(&"SR".to_string()));
+        assert!(!names.contains(&"SR/node_modules".to_string()));
+    }
+
+    #[test]
+    fn ignoring_the_group_folder_hides_its_members_from_discovery() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("SR/Realms/.git")).unwrap();
+        fs::write(dir.path().join(".kenignore"), "SR/\n").unwrap();
+        let names: Vec<String> = discover_candidates(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.is_empty(), "SR/ rule should hide the whole group: {names:?}");
+        // And a nested entry can itself be ignored/unignored.
+        let dir2 = tempdir().unwrap();
+        fs::create_dir_all(dir2.path().join("SR/scratch")).unwrap();
+        assert!(ignore_folder(dir2.path(), "SR/scratch").unwrap());
+        assert!(is_ignored_folder(&ignore_rules(dir2.path()), "SR/scratch"));
+        assert!(unignore_folder(dir2.path(), "SR/scratch").unwrap());
+        assert!(!is_ignored_folder(&ignore_rules(dir2.path()), "SR/scratch"));
     }
 }

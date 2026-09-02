@@ -776,11 +776,28 @@ export type WorkspaceMemberStatus = "active" | "dormant" | "missing" | "invalid"
  *  resolvable `ProjectHandle`); `reason` carries the parse error only for
  *  `invalid`. */
 export interface WorkspaceMember {
+  /** The manifest key: parent-relative path, so a member inside a group
+   *  folder reads `SR/ShatteredRealms`. Identity everywhere — display
+   *  through {@link memberLeaf}. */
   name: string;
   projectId: string | null;
   status: WorkspaceMemberStatus;
   reason: string | null;
   fileCount: number | null;
+}
+
+/** A member's display name: the last segment of its manifest key.
+ *  `SR/ShatteredRealms` → `ShatteredRealms`; a flat member is unchanged. */
+export function memberLeaf(name: string): string {
+  const slash = name.lastIndexOf("/");
+  return slash === -1 ? name : name.slice(slash + 1);
+}
+
+/** The group folder a nested member lives in (`SR/ShatteredRealms` →
+ *  `SR`), or null for a direct child of the workspace root. */
+export function memberGroup(name: string): string | null {
+  const slash = name.lastIndexOf("/");
+  return slash === -1 ? null : name.slice(0, slash);
 }
 
 /** Mirrors `WorkspaceOverviewDto` — the open workspace's manifest header
@@ -1616,6 +1633,10 @@ export const api = {
   setFolderSelection: (excluded: string[]) =>
     invoke<ProjectInfo>("set_folder_selection", { excluded }),
   getTree: () => invoke<TreeData>("get_tree"),
+  /** The whole workspace as one tree: every member's files and folders,
+   *  each path prefixed with the member's folder name. Same shape as
+   *  getTree, so FileTree renders it unchanged. */
+  getTreeAll: () => invoke<TreeData>("get_tree_all"),
   search: (query: string, limit = 30) =>
     invoke<SearchHit[]>("search", { query, limit }),
   /** Keyword FTS merged with semantic (when the `semanticIndex` feature is

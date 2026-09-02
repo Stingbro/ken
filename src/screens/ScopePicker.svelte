@@ -6,6 +6,7 @@
   // Map are showing. That separation is deliberate — you often want to ask
   // about one repo while working in another.
   import { app } from "../lib/app.svelte";
+  import { memberLeaf } from "../lib/api";
   import { scope } from "../lib/scope.svelte";
 
   const members = $derived(
@@ -51,7 +52,7 @@
       {/if}
       <optgroup label="Projects">
         {#each members as m (m.projectId)}
-          <option value={`p:${m.projectId}`}>{m.name}</option>
+          <option value={`p:${m.projectId}`}>{memberLeaf(m.name)}</option>
         {/each}
       </optgroup>
     </select>

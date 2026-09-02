@@ -6,7 +6,7 @@
   // That is the right home because a group is a fact about the projects
   // ("these two repos are one product"), not a personal preference.
   import { onMount } from "svelte";
-  import { api, type WorkspaceCandidate } from "../lib/api";
+  import { api, memberGroup, memberLeaf, type ProjectGroup, type WorkspaceCandidate } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
   import { workspaceHome } from "../lib/workspaceHome.svelte";
@@ -71,6 +71,13 @@
     ),
   );
 
+  // A group that exists because of the directory layout (its name is the
+  // group FOLDER its members live in) is managed by moving folders, not
+  // here — Edit/Delete on it would be refused by the backend anyway.
+  function isDerived(g: ProjectGroup): boolean {
+    return g.members.some((m) => memberGroup(m)?.toLowerCase() === g.name.toLowerCase());
+  }
+
   function startNew() {
     creating = true;
     name = "";
@@ -121,7 +128,9 @@
       </p>
       {#each candidates as c (c.name)}
         <div class="row">
-          <span class="gname">{c.name}</span>
+          <span class="gname">
+            {memberLeaf(c.name)}{#if memberGroup(c.name)}<span class="derived"> in {memberGroup(c.name)}/</span>{/if}
+          </span>
           <span class="gmembers">
             {c.existing ? "Known to Ken" : "New"} · {c.fileCount}
             {c.fileCount === 1 ? "file" : "files"}{#if c.markers.length > 0} · {c.markers.join(", ")}{/if}
@@ -174,11 +183,17 @@
     {#each scope.groups as g (g.name)}
       <div class="row">
         <span class="gname">{g.name}</span>
-        <span class="gmembers">{g.members.join(", ") || "no resolvable projects"}</span>
-        <button class="link" onclick={() => edit(g.name)}>Edit</button>
-        <button class="link danger" onclick={() => void scope.deleteGroup(g.name)}>
-          Delete
-        </button>
+        <span class="gmembers">{g.members.map(memberLeaf).join(", ") || "no resolvable projects"}</span>
+        {#if isDerived(g)}
+          <span class="gmembers derived" title="This group is the {g.name}/ folder — move projects in or out of it to change the group">
+            from folder
+          </span>
+        {:else}
+          <button class="link" onclick={() => edit(g.name)}>Edit</button>
+          <button class="link danger" onclick={() => void scope.deleteGroup(g.name)}>
+            Delete
+          </button>
+        {/if}
       </div>
     {/each}
 
@@ -189,7 +204,7 @@
           {#each members as m (m.name)}
             <label class="pick">
               <input type="checkbox" bind:checked={picked[m.name]} />
-              <span>{m.name}</span>
+              <span>{memberLeaf(m.name)}</span>
             </label>
           {/each}
         </div>
@@ -239,6 +254,12 @@
   .gname.dim {
     font-weight: 500;
     color: var(--ink-tertiary);
+  }
+  .derived {
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--ink-tertiary);
+    flex: none;
   }
   .gmembers {
     flex: 1;
