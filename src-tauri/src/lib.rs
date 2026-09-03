@@ -13128,6 +13128,18 @@ fn family_push_back(app: AppHandle, state: State<SharedState>, family_id: String
     Ok(())
 }
 
+/// Bring the main window back from the tray: unhide it, restore it if the
+/// user minimized it, and focus it. Shared by the tray's left click and its
+/// "Open Ken" item so both do exactly the same thing.
+fn reveal_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
@@ -13176,12 +13188,59 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let shared_state = app_handle.state::<SharedState>().inner().clone();
             reconcile_family_pollers(&app_handle, &shared_state);
+
+            // Closing the window hides Ken to the tray rather than quitting
+            // it (see `on_window_event` below). The file watchers that keep
+            // each resident member's index current live in this process, so
+            // quitting means nothing is indexed until Ken is opened again —
+            // which is exactly the "it waits for you to open it" problem.
+            // The tray is therefore the way back to the window, and its
+            // "Quit Ken" item the only real exit.
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+                let show = MenuItem::with_id(app, "ken-show", "Open Ken", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "ken-quit", "Quit Ken", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show, &quit])?;
+
+                let mut tray = TrayIconBuilder::with_id("ken-tray")
+                    .tooltip("Ken — watching your workspaces")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "ken-show" => reveal_main_window(app),
+                        "ken-quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            reveal_main_window(tray.app_handle());
+                        }
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                tray.build(app)?;
+            }
             Ok(())
         })
-        // Focus = "the user is back" — the moment to fetch teammates'
-        // work and to check whether today's digest is due.
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Focused(true) = event {
+        .on_window_event(|window, event| match event {
+            // The close button hides Ken instead of quitting, so the
+            // watchers keep indexing while the window is away. Quit lives
+            // in the tray menu.
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            // Focus = "the user is back" — the moment to fetch teammates'
+            // work and to check whether today's digest is due.
+            tauri::WindowEvent::Focused(true) => {
                 use tauri::Manager;
                 let state = window.state::<SharedState>();
                 let sync = {
@@ -13193,6 +13252,7 @@ pub fn run() {
                 }
                 let _ = maybe_generate_digest(window.app_handle(), state.inner(), false);
             }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
