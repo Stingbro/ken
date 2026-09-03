@@ -41,16 +41,21 @@ workspaces SHALL NOT become targets.
   the search does not fail
 
 ### Requirement: Scope control over the search
-Search scope SHALL be a two-level address: a workspace tier and, within
-it, a member tier. The workspace tier SHALL default to the focused
-workspace, SHALL accept a single named open workspace, and SHALL accept
-all open workspaces. The member tier SHALL default to every member in
-scope and SHALL accept a single named member. Pinning a member SHALL
-search exactly that member without consulting any knowledge graph, and
-SHALL produce the same result shape as an unpinned search. Requesting all
-workspaces together with a pinned member SHALL be rejected as a usage
-error, since a member identifies its workspace already. When only one
-workspace is open, the workspace tier SHALL NOT be shown.
+Search scope SHALL be a three-level address: a workspace tier, a group
+tier within it, and a member tier within that. The workspace tier SHALL
+default to the focused workspace, SHALL accept a single named open
+workspace, and SHALL accept all open workspaces. The group tier SHALL
+default to every group in scope and SHALL accept a single named group.
+The member tier SHALL default to every member in scope and SHALL accept a
+single named member. Every tier SHALL offer the widening choice as an
+explicit entry alongside its individual entries, rather than expressing it
+only as the absence of a selection. Pinning a member SHALL search exactly
+that member without consulting any knowledge graph, and SHALL produce the
+same result shape as an unpinned search. The narrowest pin SHALL win: a
+pinned member over a pinned group, a pinned group over a pinned
+workspace. Requesting all workspaces together with a pinned member SHALL
+be rejected as a usage error, since a member identifies its workspace
+already. A tier SHALL NOT be shown when it would offer only one choice.
 
 #### Scenario: Default scope is the focused workspace
 - **WHEN** the user searches without changing the scope
@@ -73,7 +78,20 @@ workspace is open, the workspace tier SHALL NOT be shown.
 
 #### Scenario: The workspace tier hides when it is meaningless
 - **WHEN** exactly one workspace is open
-- **THEN** the scope control shows only the member tier
+- **THEN** the scope control shows only the group and member tiers
+
+#### Scenario: A pinned group narrows to its folder
+- **WHEN** the user pins the scope to a group and searches
+- **THEN** only that group's members are searched
+
+#### Scenario: The narrowest pin wins
+- **WHEN** a member is pinned within an already pinned group
+- **THEN** only that member is searched
+
+#### Scenario: Every tier can be widened back out
+- **WHEN** the user opens a tier that currently has something pinned
+- **THEN** an explicit entry covering everything in that tier is offered
+  alongside the individual entries, and choosing it removes the pin
 
 ### Requirement: Every result names its project
 Each merged result SHALL carry the member name it came from and its
@@ -114,6 +132,34 @@ non-graph planning behavior rather than failing the search.
 - **WHEN** one in-scope workspace has no usable knowledge graph
 - **THEN** that workspace still contributes targets by its non-graph
   planning and the search completes
+
+### Requirement: Members are presented grouped by default
+Wherever members are offered for selection, they SHALL be presented
+grouped by their derived parent folder by default, with no configuration
+having been made. A group SHALL be selectable as a whole and SHALL expand
+to the members within it. A flat, ungrouped listing SHALL be available
+only as a per-workspace configured exception, SHALL persist with the
+workspace rather than the session, and SHALL NOT be the default for any
+workspace whose member names imply groups. A workspace whose members
+imply no groups SHALL be listed flat, with no grouping control shown.
+
+#### Scenario: A folder of related repos arrives grouped
+- **WHEN** a workspace contains members sharing a parent folder and no
+  grouping has been configured
+- **THEN** they are shown under that folder as one selectable group
+
+#### Scenario: A group is selectable without expanding it
+- **WHEN** the user selects a group rather than a member within it
+- **THEN** every member of that group is in scope
+
+#### Scenario: Flat is a configured choice, not the default
+- **WHEN** a workspace is configured to list its members ungrouped
+- **THEN** the members are listed individually, and the setting still
+  applies after a restart
+
+#### Scenario: No implied groups, no grouping shown
+- **WHEN** no member name implies a parent folder
+- **THEN** the list is flat and no grouping control appears
 
 ### Requirement: Workspace-level status is reported
 The per-member status list SHALL identify the workspace each member

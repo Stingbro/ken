@@ -85,13 +85,23 @@ shape".
   which is focused, one click to focus another. Hidden entirely when only
   one workspace is open.
 - [ ] 4.3 Search scope control becomes three tiers — workspace, group,
-  member (design D9). Workspace tier: focused (default), a named
-  workspace, or all open. Group tier: populated from
-  `workspace_groups`, which already returns derived folder groups with no
-  configuration. Member tier as today. Narrowest pin wins. Each tier is
+  member (design D9), with **members grouped by default** rather than
+  flattened. Workspace tier: focused (default), a named workspace, or all
+  open. Group tier: populated from `workspace_groups`, which already
+  returns derived folder groups with no configuration. Member tier as
+  today, but nested under its group. Narrowest pin wins. Each tier is
   hidden when it would offer only one choice, so a single workspace with
-  no groups degrades to today's member picker.
-- [ ] 4.3a **Ship the group tier first.** It needs no backend work —
+  no derived groups degrades to today's member picker.
+- [ ] 4.3a **Every tier carries an explicit "all" entry**, listed beside
+  the individual ones rather than expressed as the absence of a selection.
+  Today there is no visible way to widen back out once a member is pinned,
+  which is the option missing from the current picker.
+- [ ] 4.3b **Ungrouping is configuration, not the default.** A
+  per-workspace setting flattens the list for someone who wants the
+  `Shattered-Realms*` folders listed apart; absent that setting,
+  `derived_groups()` decides the shape. Persist it with the workspace, not
+  the session.
+- [ ] 4.3c **Ship the grouped picker first.** It needs no backend work —
   `route_search` already accepts `group`, and `derived_groups()` already
   yields `Hytale` and `Personal` for the Code workspace. This is the
   shortest path to the stated goal (a folder of related repos answering

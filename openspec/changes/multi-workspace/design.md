@@ -149,10 +149,25 @@ question crosses, while staying separate projects. That already exists in
 
 Grepping the frontend for group usage finds only families and regex
 captures. So the whole cluster feature is backend-complete and has no
-control anywhere in the UI. **The scope picker in task 4.3 must therefore
-offer three tiers, not two: workspace, then group, then member** — and the
-group tier is the one with the shortest path to being useful, because
-nothing below the UI needs writing.
+control anywhere in the UI. The scope picker in task 4.3 therefore offers
+three tiers, not two: workspace, then group, then member — and the group
+tier is the one with the shortest path to being useful, because nothing
+below the UI needs writing.
+
+**Grouping is the default presentation, not an added tier.** The flat
+member list in today's picker is not a neutral starting point that groups
+get layered on top of; it is a flattening of structure `derived_groups()`
+has already worked out and then discarded at the render. So the
+correction is to draw the tree Ken already knows about. A flat list is the
+exception, and belongs in per-workspace configuration for someone who
+genuinely wants the four `Shattered-Realms*` folders listed apart. A
+workspace whose member names imply no groups renders flat regardless,
+with no grouping control shown for it.
+
+**Every tier needs an explicit "all".** Today "everything" is expressed as
+the absence of a selection, which is undiscoverable and leaves no way back
+out once something is pinned. Each tier offers the widening choice as an
+entry beside the individual ones.
 
 Scope resolution order stays narrowest-wins: a pinned member beats a
 pinned group, which beats a pinned workspace.
