@@ -4,6 +4,23 @@ Task 1 is the bug fix and is worth landing on its own: it is one tick
 calling one function that is already written and tested. Everything after
 it makes the result visible and bounded.
 
+## 0. The Advanced language model breaks JSON extraction
+
+- [ ] 0.1 `generate_json` fails on `Qwen3-8B` because it is the hybrid
+  reasoning model and emits `<think>` before the answer, while the
+  Recommended `Qwen3-4B-Instruct-2507` answers directly. Measured on a real
+  corpus: **47 errors to 1 success**, all `no JSON object found in the
+  model output` or `trailing characters at line 1 column 5`.
+- [ ] 0.2 Fix by stripping a leading reasoning block before parsing —
+  cheap, and it makes every future thinking model work — and/or curate a
+  non-thinking build for the Advanced tier.
+- [ ] 0.3 Until then the Advanced Language entry is a trap: it is offered
+  as "smarter answers, needs more memory" and silently fails the contract
+  extraction depends on. Say so in the catalogue blurb if the fix lands
+  later than the warning can.
+- [ ] 0.4 Tests: a model output wrapped in a reasoning block parses; the
+  existing plain-JSON path is unchanged.
+
 ## 1. src-tauri — call the decision function that exists
 
 - [ ] 1.1 Add a slow tick (30s) that, for each resident member, builds an
@@ -21,6 +38,19 @@ it makes the result visible and bounded.
   initial scan finishes — the tracker starts `scanning: true` and a build
   may not run against a half-walked folder. If nothing clears it today,
   that is a second half of this same bug.
+- [ ] 1.6 **`extraction_worker` exits for every member but one.** Its loop
+  resolves the active project with `guard.members.values().next()` and
+  `return`s unless that member's id equals its own `project_id`. With one
+  open project that is always true; with a workspace of ten it is true for
+  whichever member `HashMap` iteration happens to yield, so the other nine
+  workers exit on their first tick and their extraction queues never move.
+  With no workspace open at all, `values().next()` is `None` and every
+  worker exits. Look up the worker's OWN project by id instead of taking
+  the first member — the same single-project assumption `AppState.workspace`
+  carries, one layer down.
+- [ ] 1.7 Tests: with N resident members, N extraction workers each process
+  their own queue; a worker whose project closes exits; a worker whose
+  project is merely not-first does not.
 - [ ] 1.5 Tests: a never-built member with a settled scan builds once; a
   second tick inside `MIN_AUTO_INTERVAL` does not; a member with no Claude
   CLI never builds; a burst of changes produces exactly one build.

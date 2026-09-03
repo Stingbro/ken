@@ -27,6 +27,28 @@ been sleeping in a two-second loop since the day the workspace opened,
 and `extractions` has never been processed for any member. The knowledge
 model is composed from those extractions, so it has nothing to compose.
 
+**Cause zero: the Advanced language model cannot do the job it is offered for.**
+The catalogue's Language tiers are `Qwen3-4B-Instruct-2507` (Recommended)
+and `Qwen3-8B` (Advanced). The 4B is the **Instruct** variant and answers
+directly; plain `Qwen3-8B` is the hybrid reasoning model and emits
+`<think>` before answering. `generate_json` cannot parse that, so choosing
+Advanced produces `no JSON object found in the model output` on nearly
+every file — measured at 47 errors to 1 success before the model was
+switched back. A model offered as "smarter answers" must not be one that
+breaks the JSON contract every extraction depends on: either strip the
+reasoning block before parsing, or select a non-thinking build for the
+Advanced tier.
+
+**Cause one-and-a-half: the worker exits for every member but one.**
+`extraction_worker`'s loop resolves the active project with
+`guard.members.values().next()` and returns unless that member's id equals
+its own. With a single open project that is always true. With a workspace
+of ten members it is true for whichever member `HashMap` iteration happens
+to yield first, so the other nine workers exit on their first tick — and
+with no workspace open, `values().next()` is `None` and all ten exit. The
+same single-project assumption `AppState.workspace` carries, one layer
+down.
+
 **Cause two: one missing call.**
 
 `knowledge_model::should_auto_build` is a complete, pure, unit-tested
