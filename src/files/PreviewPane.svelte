@@ -15,8 +15,24 @@
   import { isPreviewTooLarge } from "./previews/sizeGate";
   import { isHtmlPath } from "./previews/html";
 
-  let { relPath, kind, meta }: { relPath: string; kind: string; meta: FileRow } =
-    $props();
+  let {
+    relPath,
+    kind,
+    meta,
+    onfillable,
+    onchange,
+    onsaved,
+    onerror,
+  }: {
+    relPath: string;
+    kind: string;
+    meta: FileRow;
+    // Only a PDF uses these: a fillable form turns the preview into an editor.
+    onfillable?: () => void;
+    onchange?: () => void;
+    onsaved?: (mtime: number) => void;
+    onerror?: (message: string) => void;
+  } = $props();
 
   // Some formats are routed by extension because the backend kind is coarse
   // (e.g. .ipynb indexes as "binary", .html/.htm as "code", videos as "binary")
@@ -44,7 +60,7 @@
 {:else if isHtmlPath(relPath)}
   <HtmlPreview {relPath} />
 {:else if kind === "pdf"}
-  <PdfPreview {relPath} />
+  <PdfPreview {relPath} {onfillable} {onchange} {onsaved} {onerror} />
 {:else if kind === "docx"}
   <DocxPreview {relPath} />
 {:else if kind === "xlsx"}

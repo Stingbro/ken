@@ -522,6 +522,9 @@ export const api = {
   hydrateFile: (relPath: string) => invoke<void>("hydrate_file", { relPath }),
   saveFile: (relPath: string, content: string) =>
     invoke<number>("save_file", { relPath, content }),
+  /** Overwrite a file with raw bytes (PDF form fills). Returns the new mtime like saveFile. */
+  saveFileBytes: (relPath: string, bytes: Uint8Array) =>
+    invoke<number>("save_file_bytes", { relPath, bytes: Array.from(bytes) }),
   fileMeta: (relPath: string) => invoke<FileRow | null>("file_meta", { relPath }),
   extractedText: (relPath: string) =>
     invoke<string>("extracted_text", { relPath }),

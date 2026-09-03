@@ -976,19 +976,14 @@ async fn hydrate_file(
     Ok(())
 }
 
-#[tauri::command]
-fn save_file(
-    app: AppHandle,
-    state: State<SharedState>,
-    rel_path: String,
-    content: String,
-) -> CmdResult<i64> {
-    let mut guard = state.lock().unwrap();
+/// Post-write bookkeeping shared by `save_file` and `save_file_bytes`: reindex
+/// the file, mark the version as seen, notify the frontend, return the mtime.
+/// Assumes the bytes are already on disk at `rel_path`.
+fn finish_save(app: &AppHandle, guard: &mut AppState, rel_path: &str) -> CmdResult<i64> {
     let active = guard.active.as_mut().ok_or("no project open")?;
-    let abs = active.project.resolve(&rel_path).map_err(err)?;
-    std::fs::write(&abs, &content).map_err(err)?;
+    let abs = active.project.resolve(rel_path).map_err(err)?;
     // Index immediately — no need to wait for the watcher debounce.
-    scan::refresh_path(&active.project, &mut active.db, &rel_path).map_err(err)?;
+    scan::refresh_path(&active.project, &mut active.db, rel_path).map_err(err)?;
     let mtime = abs
         .metadata()
         .and_then(|m| m.modified())
@@ -1003,19 +998,50 @@ fn save_file(
     // `guard.base_dir` (its mutable borrow through `active` must end first).
     let seen_version = active
         .db
-        .get_file(&rel_path)
+        .get_file(rel_path)
         .map_err(err)?
         .map(|r| (r.size, r.mtime));
     let project_id = active.project.config.id;
     if let Some(version) = seen_version {
         let base = guard.base_dir.clone();
         let mut us = UserState::load(&base, project_id);
-        if us.mark_seen(&rel_path, version) {
+        if us.mark_seen(rel_path, version) {
             let _ = us.save(&base, project_id);
         }
     }
-    let _ = app.emit("file-saved", &rel_path);
+    let _ = app.emit("file-saved", rel_path);
     Ok(mtime)
+}
+
+#[tauri::command]
+fn save_file(
+    app: AppHandle,
+    state: State<SharedState>,
+    rel_path: String,
+    content: String,
+) -> CmdResult<i64> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    std::fs::write(&abs, &content).map_err(err)?;
+    finish_save(&app, &mut guard, &rel_path)
+}
+
+/// Overwrite a file with raw bytes. Used by the PDF form filler: `bytes` is the
+/// WHOLE file, not a patch — the caller hands over a fully re-serialized
+/// document. Otherwise identical to `save_file`.
+#[tauri::command]
+fn save_file_bytes(
+    app: AppHandle,
+    state: State<SharedState>,
+    rel_path: String,
+    bytes: Vec<u8>,
+) -> CmdResult<i64> {
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    std::fs::write(&abs, &bytes).map_err(err)?;
+    finish_save(&app, &mut guard, &rel_path)
 }
 
 #[tauri::command]
@@ -5160,6 +5186,7 @@ pub fn run() {
             is_cloud_only,
             hydrate_file,
             save_file,
+            save_file_bytes,
             file_meta,
             extracted_text,
             get_ocr_regions,
