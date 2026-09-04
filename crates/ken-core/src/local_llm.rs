@@ -25,13 +25,23 @@ pub enum Priority {
 
 /// How many tokens a generation may emit, chosen per job by priority. Quick
 /// answers (Interactive) are a short, streamed summary, so 256 tokens covers a
-/// full answer while keeping the tail latency low. Background Map extraction
-/// only ever emits a small, bounded JSON delta (≤ 40 entities / 60 relations /
-/// 20 events per file — see `knowledge_model`), so its budget is ample and
-/// keeps the per-file decode work — the dominant cost of indexing a large
-/// project — bounded.
+/// full answer while keeping the tail latency low.
+///
+/// Background Map extraction emits a JSON delta of up to 40 entities / 60
+/// relations / 20 events per file (see `knowledge_model`). The budget here was
+/// 512 and described as "ample"; it was not. Forty entities alone, each with a
+/// name, kind and description, is on the order of a thousand tokens, so the
+/// generation was severed mid-array and `parse_json_lenient` then threw the
+/// whole file away. Measured on a real project: 354 errors to 77 successes,
+/// dominated by `EOF while parsing a list`, with every failure costing a full
+/// GPU generation and then being retried twice more by the DB attempt cap.
+///
+/// 2048 leaves 6136 of the 8192-token context for the prompt (see
+/// `max_prompt_tokens`) and costs nothing on short outputs, which stop at EOG
+/// long before the cap. The cap only ever binds on the outputs that were
+/// previously being destroyed.
 pub(crate) const INTERACTIVE_MAX_TOKENS: usize = 256;
-pub(crate) const BACKGROUND_MAX_TOKENS: usize = 512;
+pub(crate) const BACKGROUND_MAX_TOKENS: usize = 2048;
 
 /// The generation length cap for a job at this priority. Scoping the cap here
 /// (rather than on the engine) keeps the quick-answer budget untouched while the
@@ -139,14 +149,107 @@ impl Utf8Streamer {
 /// `}` or `]`. Good enough for the greedy, schema-hinted generations Map
 /// extraction and any JSON caller produce.
 pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
-    let start = text.find(['{', '[']);
-    let end = text.rfind(['}', ']']);
-    let slice = match (start, end) {
-        (Some(s), Some(e)) if e >= s => &text[s..=e],
-        _ => return Err(Error::Other("no JSON object found in the model output".into())),
+    let Some(start) = text.find(['{', '[']) else {
+        return Err(Error::Other("no JSON object found in the model output".into()));
     };
-    serde_json::from_str(slice)
-        .map_err(|e| Error::Other(format!("model output wasn't valid JSON: {e}")))
+    // The strict attempt stays scoped to the outermost bracket pair, so a model
+    // that appends a sentence of commentary after valid JSON still parses.
+    if let Some(end) = text.rfind(['}', ']']) {
+        if end >= start {
+            if let Ok(v) = serde_json::from_str(&text[start..=end]) {
+                return Ok(v);
+            }
+        }
+    }
+    // Nothing parsed cleanly. If the text is merely INCOMPLETE — the usual
+    // shape of a generation that hit its token cap — recover the part the model
+    // did finish rather than discarding the whole thing. Repair runs on the
+    // full tail, not the bracket-bounded slice, because a severed generation
+    // frequently has no closing bracket to find.
+    if let Some(repaired) = repair_truncated_json(&text[start..]) {
+        if let Ok(v) = serde_json::from_str(&repaired) {
+            return Ok(v);
+        }
+    }
+    let detail = match text.rfind(['}', ']']) {
+        Some(end) if end >= start => serde_json::from_str::<serde_json::Value>(&text[start..=end])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unparseable".into()),
+        _ => "output ended before the JSON was closed".into(),
+    };
+    Err(Error::Other(format!("model output wasn't valid JSON: {detail}")))
+}
+
+/// Best-effort recovery of JSON that was cut off mid-value.
+///
+/// A generation that hits its token cap stops wherever it happens to be —
+/// inside a string, between an object's key and value, halfway through an
+/// array. What it produced up to that point is usually most of a useful answer,
+/// and discarding all of it turns a partial result into a total loss. That is
+/// what was happening to Map extraction: the cap severed the JSON and every
+/// affected file was recorded as an error and retried twice more.
+///
+/// Deliberately conservative. It only ever DROPS a trailing incomplete value
+/// and appends the closers for containers that were still open, so the result
+/// is always a prefix of what the model actually said. It never invents a key,
+/// a value, or a delimiter. Returns `None` when nothing was left open, which
+/// means the text is malformed rather than truncated and the caller's original
+/// parse error is the honest thing to report.
+fn repair_truncated_json(slice: &str) -> Option<String> {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_str = false;
+    let mut esc = false;
+    // Where we could cut and still have a complete value, plus the containers
+    // open at that point. The stack is snapshotted because later pops make the
+    // final stack say nothing about the state back here.
+    let mut safe: Option<(usize, Vec<char>)> = None;
+
+    for (i, ch) in slice.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+                // Just past a complete container: everything to here parses.
+                safe = Some((i + ch.len_utf8(), stack.clone()));
+            }
+            // A comma proves the value before it finished. Cut BEFORE it, so a
+            // dangling separator never survives into the repaired text.
+            ',' => safe = Some((i, stack.clone())),
+            _ => {}
+        }
+    }
+
+    // Balanced: this is not a truncation, so there is nothing here to fix.
+    if stack.is_empty() {
+        return None;
+    }
+
+    let (cut, open) = match safe {
+        Some(found) => found,
+        // Cut off before any value completed, e.g. `[{"name": "half`. The only
+        // honest repair is an empty container of the outermost kind.
+        None => {
+            let (i, c) = slice.char_indices().next()?;
+            (i + c.len_utf8(), stack[..1].to_vec())
+        }
+    };
+
+    let mut out = slice[..cut].to_string();
+    out.extend(open.iter().rev());
+    Some(out)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -876,7 +979,7 @@ mod tests {
         // low; background Map extraction keeps its own bounded budget. Guards the
         // two constants against accidental change.
         assert_eq!(max_tokens_for(Priority::Interactive), 256);
-        assert_eq!(max_tokens_for(Priority::Background), 512);
+        assert_eq!(max_tokens_for(Priority::Background), 2048);
     }
 
     #[test]
@@ -952,6 +1055,69 @@ mod tests {
     #[test]
     fn json_errors_when_there_is_no_object() {
         assert!(parse_json_lenient("no json here at all").is_err());
+    }
+
+    // --- truncation recovery -------------------------------------------
+    // These are the real shapes seen in the extraction queue when the
+    // background budget severed the generation: 354 errors to 77 successes,
+    // dominated by "EOF while parsing a list".
+
+    #[test]
+    fn json_recovers_a_list_severed_between_elements() {
+        // The token cap landed after a complete element and a comma.
+        let text = r#"{"entities":[{"name":"Emberwulf","kind":"mob"},"#;
+        let v = parse_json_lenient(text).expect("truncated list should recover");
+        assert_eq!(v["entities"][0]["name"], "Emberwulf");
+        assert_eq!(v["entities"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_recovers_a_list_severed_inside_a_string() {
+        // The nastier case: cut off mid-value, so the trailing object is
+        // unusable and must be dropped rather than guessed at.
+        let text = r#"{"entities":[{"name":"Emberwulf","kind":"mob"},{"name":"Chest of Wh"#;
+        let v = parse_json_lenient(text).expect("mid-string truncation should recover");
+        let list = v["entities"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "the half-written entity is dropped, not invented");
+        assert_eq!(list[0]["name"], "Emberwulf");
+    }
+
+    #[test]
+    fn json_recovers_when_nothing_completed() {
+        // Severed before even the first value closed. An empty container of the
+        // right kind is the only honest reading.
+        let v = parse_json_lenient(r#"[{"name":"half"#).expect("should degrade to empty");
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn json_repair_never_invents_a_value() {
+        // A repaired document must be a PREFIX of what the model said, plus
+        // closers. Anything else would put words in the model's mouth and end
+        // up in the knowledge graph as fact.
+        let text = r#"{"a":[1,2,3],"b":{"c":"partial"#;
+        let repaired = repair_truncated_json(text).expect("should repair");
+        let body: String = repaired.chars().filter(|c| !matches!(c, '}' | ']')).collect();
+        let orig: String = text.chars().filter(|c| !matches!(c, '}' | ']')).collect();
+        assert!(orig.starts_with(&body), "repair added non-closing content");
+        let v: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(v["a"][2], 3);
+    }
+
+    #[test]
+    fn json_repair_declines_balanced_but_broken_text() {
+        // Balanced brackets mean this is malformed, not truncated. Repair must
+        // stand aside so the caller reports the real parse error instead of
+        // silently returning something plausible.
+        assert!(repair_truncated_json(r#"{"a": }"#).is_none());
+    }
+
+    #[test]
+    fn json_still_prefers_a_clean_parse_over_repair() {
+        // Trailing commentary after valid JSON must keep parsing strictly —
+        // the repair path must not change what already worked.
+        let v = parse_json_lenient(r#"{"a":[1,2]} and that is my answer"#).unwrap();
+        assert_eq!(v["a"][1], 2);
     }
 
     #[test]
