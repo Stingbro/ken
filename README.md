@@ -67,6 +67,16 @@ Other targets: `make build` (release bundle), `make test` (Rust +
 frontend tests), `make check` (svelte-check), `make clean`. Run `make` on
 its own to list them.
 
+### Releasing
+
+Releases are driven by a version bump on `main`: bump `package.json`, add the
+user-facing entry to `WHATS_NEW.md` (what the in-app "What's new" dialog
+shows), run `scripts/sync-version.sh` and `scripts/check-whats-new.sh`, then
+push — CI tags `v<version>`, regenerates `CHANGELOG.md`, and builds and
+publishes the installers. Run the `/release` skill
+(`.claude/skills/release/SKILL.md`) to do all of it; the release gate refuses
+to ship a version that `WHATS_NEW.md` doesn't document.
+
 ### Video transcripts (optional)
 
 Ken plays MP4/MOV/WebM/MKV/AVI videos and shows a transcript beside them.
