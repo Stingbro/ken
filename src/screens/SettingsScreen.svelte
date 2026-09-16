@@ -5,6 +5,7 @@
   import { theme, type ThemeMode } from "../lib/theme.svelte";
   import { api, type McpInfo, type SyncStatus, type ModelStatus } from "../lib/api";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
+  import { whatsNew } from "../whats-new/whatsNew.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
@@ -540,6 +541,19 @@
     </div>
     </section>
 
+    <section class="group">
+      <div class="group-head">About</div>
+
+    <div class="card">
+      <div class="row">
+        <span class="about-version">Ken v{whatsNew.version}</span>
+        <button class="whats-new" onclick={() => whatsNew.show()}>
+          What's new in this version
+        </button>
+      </div>
+    </div>
+    </section>
+
   </div>
 </div>
 
@@ -797,6 +811,24 @@
   }
   .mcp-chip-btn:hover {
     border-color: var(--border-strong);
+  }
+  .about-version {
+    font-size: 13px;
+    color: var(--ink-secondary);
+  }
+  .whats-new {
+    margin-left: auto;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .whats-new:hover {
+    text-decoration: underline;
   }
   .mcp-chip-action {
     display: inline-flex;

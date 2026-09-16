@@ -13,6 +13,9 @@
   import TimelineScreen from "../screens/TimelineScreen.svelte";
   import RecordScreen from "../screens/RecordScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
+  import WhatsNewDialog from "../whats-new/WhatsNewDialog.svelte";
+  import { whatsNew } from "../whats-new/whatsNew.svelte";
+  import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
 
   // Screens the user has actually opened this session (home is always live).
@@ -20,6 +23,10 @@
   $effect(() => {
     if (app.screen !== "home") visited.add(app.screen);
   });
+
+  // The shell only renders with a project open, so the release notes never
+  // interrupt onboarding.
+  onMount(() => whatsNew.init());
 
   function onKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -71,6 +78,7 @@
   {#if app.searchOpen}
     <SearchOverlay />
   {/if}
+  <WhatsNewDialog />
 </div>
 
 <style>

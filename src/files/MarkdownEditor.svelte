@@ -2,14 +2,30 @@
   import { onDestroy, onMount, tick } from "svelte";
   import { Crepe } from "@milkdown/crepe";
   import { editorViewCtx, remarkStringifyOptionsCtx } from "@milkdown/kit/core";
+  import type { Ctx } from "@milkdown/kit/ctx";
   // Namespace import: Svelte reserves the `$` prefix, so `$prose` can only be
   // reached as a property.
   import * as milkdown from "@milkdown/kit/utils";
-  import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
+  import { Plugin, PluginKey, TextSelection } from "@milkdown/kit/prose/state";
   import type { Node as ProseNode } from "@milkdown/kit/prose/model";
   import { Decoration, DecorationSet, type EditorView } from "@milkdown/kit/prose/view";
   import "@milkdown/crepe/theme/common/style.css";
   import "@milkdown/crepe/theme/frame.css";
+  import {
+    blockquoteSchema,
+    paragraphSchema,
+  } from "@milkdown/kit/preset/commonmark";
+  import {
+    addGithubAlertMenuGroup,
+    githubAlertPlugins,
+  } from "./markdown/githubAlert";
+  import "./markdown/githubAlert.css";
+  import { disableHeadingDowngrade, headingBackspace } from "./markdown/headingBackspace";
+  import {
+    mermaidPreviewToggleText,
+    renderMermaidPreview,
+  } from "./markdown/mermaid";
+  import { slashShortcutInputRule } from "./markdown/slashShortcuts";
   import { CURRENT_CLASS, MARK_CLASS } from "../lib/find-dom";
   import { MATCH_CAP, findTextMatches } from "../lib/find";
   import { find, type FindAdapter } from "../lib/find.svelte";
@@ -133,6 +149,30 @@
     return () => find.unregister(adapter);
   });
 
+  /**
+   * Replace the current block with `blockquote(paragraph)` and put the cursor
+   * inside it. Crepe's stock Quote item clears the block and then *wraps* it,
+   * which silently does nothing whenever `findWrapping` cannot fit a blockquote
+   * around the current block range; replacing works from any textblock.
+   */
+  function insertQuote(ctx: Ctx) {
+    const editorView = ctx.get(editorViewCtx);
+    const { state } = editorView;
+    // Svelte reserves the `$` prefix, so the resolved position cannot be
+    // destructured as `$from` here.
+    const pos = state.selection.$from;
+    const depth = pos.depth;
+    const blockquote = blockquoteSchema.type(ctx);
+    const paragraph = paragraphSchema.type(ctx);
+    const node = blockquote.createAndFill(null, paragraph.create());
+    if (!node) return;
+    const start = pos.before(depth);
+    const tr = state.tr.replaceWith(start, pos.after(depth), node);
+    tr.setSelection(TextSelection.near(tr.doc.resolve(start + 2)));
+    editorView.dispatch(tr.scrollIntoView());
+    editorView.focus();
+  }
+
   onMount(async () => {
     crepe = new Crepe({
       root: host,
@@ -142,6 +182,24 @@
       features: {
         [Crepe.Feature.Latex]: false,
       },
+      featureConfigs: {
+        [Crepe.Feature.CodeMirror]: {
+          renderPreview: renderMermaidPreview,
+          // Only has an effect where a preview exists, i.e. mermaid fences.
+          previewOnlyByDefault: true,
+          previewToggleText: mermaidPreviewToggleText,
+        },
+        [Crepe.Feature.BlockEdit]: {
+          buildMenu: (builder) => {
+            const quote = builder
+              .build()
+              .find((group) => group.key === "text")
+              ?.items.find((item) => item.key === "quote");
+            if (quote) quote.onRun = insertQuote;
+            addGithubAlertMenuGroup(builder);
+          },
+        },
+      },
     });
     crepe.on((listener) => {
       listener.markdownUpdated((_ctx, markdown, prev) => {
@@ -149,6 +207,10 @@
       });
     });
     crepe.editor.use(findPlugin);
+    crepe.editor.use(githubAlertPlugins);
+    crepe.editor.use(headingBackspace);
+    crepe.editor.use(slashShortcutInputRule);
+    crepe.editor.config(disableHeadingDowngrade);
     // House style is `- ` bullets; remark-stringify would otherwise write `*`.
     crepe.editor.config((ctx) => {
       ctx.update(remarkStringifyOptionsCtx, (opts) => ({
@@ -227,6 +289,100 @@
     /* A touch more breathing room after headings. */
     margin-bottom: 0.55em;
   }
+
+  /* --- Mermaid ------------------------------------------------------------ */
+  /* In diagram mode (preview only: the CodeMirror host is hidden) the toolbar
+     is a distraction, so it only fades in while the block is hovered or has
+     focus. In code mode it stays put, as it always has. */
+  .measure
+    :global(.milkdown .milkdown-code-block:has(.codemirror-host.hidden) .tools) {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .measure
+    :global(
+      .milkdown .milkdown-code-block:has(.codemirror-host.hidden):hover .tools
+    ),
+  .measure
+    :global(
+      .milkdown
+        .milkdown-code-block:has(.codemirror-host.hidden):focus-within
+        .tools
+    ) {
+    opacity: 1;
+  }
+  .measure :global(.milkdown .mermaid-preview) {
+    display: flex;
+    justify-content: center;
+  }
+  .measure :global(.milkdown .mermaid-preview svg) {
+    max-width: 100%;
+    height: auto;
+    background: transparent;
+  }
+  /* Mermaid sizes its label boxes itself and renders the text in a
+     foreignObject; the editor's generous paragraph line-height would overflow
+     those boxes and clip descenders. */
+  .measure :global(.milkdown .mermaid-preview foreignObject p),
+  .measure :global(.milkdown .mermaid-preview foreignObject div),
+  .measure :global(.milkdown .mermaid-preview foreignObject span) {
+    margin: 0;
+    line-height: inherit;
+  }
+  .measure :global(.milkdown .mermaid-error) {
+    padding: 8px 12px;
+    border-left: 3px solid var(--danger);
+    color: var(--danger);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+
+  /* --- Tables ------------------------------------------------------------- */
+  /* Crepe draws the row/column handles in `--crepe-color-outline`, which maps
+     to Ken's hairline `--border-strong` and left them all but invisible against
+     the paper. Give the pills a readable glyph and an edge so they read as
+     controls; everything else in the table block is Crepe's. */
+  .measure :global(.milkdown .milkdown-table-block .cell-handle),
+  .measure :global(.milkdown .milkdown-table-block .line-handle .add-button) {
+    color: var(--ink-tertiary);
+    border: 1px solid var(--border-strong);
+  }
+  .measure :global(.milkdown .milkdown-table-block .cell-handle svg),
+  .measure
+    :global(.milkdown .milkdown-table-block .line-handle .add-button svg) {
+    fill: var(--ink-tertiary);
+  }
+  .measure :global(.milkdown .milkdown-table-block .cell-handle:hover),
+  .measure
+    :global(.milkdown .milkdown-table-block .line-handle .add-button:hover) {
+    border-color: var(--ink-tertiary);
+  }
+  /* The align/delete popup floats over body text, so it needs a real edge. */
+  .measure :global(.milkdown .milkdown-table-block .cell-handle .button-group) {
+    border: 1px solid var(--border);
+  }
+  .measure
+    :global(.milkdown .milkdown-table-block .cell-handle .button-group svg) {
+    fill: var(--ink-secondary);
+  }
+
+  /* --- GitHub-flavored markdown ------------------------------------------ */
+  .measure :global(.milkdown .ProseMirror del) {
+    color: var(--ink-secondary);
+  }
+  /* A ticked task reads as done. */
+  .measure :global(.milkdown .list-item:has(> .label-wrapper .label.checked)) {
+    color: var(--ink-secondary);
+  }
+  /* Footnote definitions read as an aside, not as body copy. */
+  .measure :global(.milkdown dl[data-type="footnote_definition"]) {
+    border-top: 1px solid var(--border);
+    margin-top: 24px;
+    padding-top: 12px;
+    font-size: 13px;
+    color: var(--ink-secondary);
+  }
+
   /* Slightly smaller than Crepe's defaults, keeping the scale gentle. */
   .measure :global(.milkdown h1) {
     font-size: 1.7em;
