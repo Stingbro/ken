@@ -3,6 +3,9 @@ name = "ken-mcp"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ken-core = { path = "../ken-core" }
 serde.workspace = true

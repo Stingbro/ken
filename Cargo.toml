@@ -6,6 +6,19 @@ members = ["crates/ken-core", "crates/ken-mcp", "src-tauri"]
 version = "0.1.2"
 edition = "2021"
 
+# whisper-rs-sys and llama-cpp-sys-2 each bundle their own ggml (currently
+# ggml 0.9.5 vs 0.13.1) and every ken binary links both, resolving the shared
+# ggml symbols pick-first (see the backend comment in crates/ken-core/Cargo.toml
+# and .cargo/config.toml). Apple's ld64 reports each of those ~300 duplicates
+# as a warning, which rustc's `linker_messages` lint (1.98+) re-emits on every
+# link of ken-app, ken-mcp and the ken-core test binaries. The duplication is
+# deliberate, so silence the lint for the crates that opt in below; linker
+# *errors* still fail the build. Remove this once whisper-rs-sys can consume an
+# external ggml (llama-cpp-sys-2 already has `system-ggml`) or the two models
+# no longer share a process.
+[workspace.lints.rust]
+linker_messages = "allow"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

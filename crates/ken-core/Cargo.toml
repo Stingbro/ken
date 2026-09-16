@@ -3,6 +3,9 @@ name = "ken-core"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -50,8 +53,10 @@ local-llm = ["dep:llama-cpp-2"]
 #
 # The GPU backend feature is target-specific, and it is load-bearing that BOTH
 # crates enable the SAME backend on each platform: whisper-rs and llama-cpp-2
-# each bundle a ggml, and the linker resolves the shared ggml symbols from
-# whisper's copy. A mismatch silently strips the GPU backend from llama.cpp
+# each bundle a ggml (whisper-rs-sys 0.15 ships ggml 0.9.5, llama-cpp-sys-2
+# 0.1.151 ships 0.13.1), and the linker resolves the shared ggml symbols from
+# whisper's copy; the resulting duplicate-symbol linker warnings are silenced
+# via [workspace.lints] in the root Cargo.toml. A mismatch silently strips the GPU backend from llama.cpp
 # (all layers land on CPU despite n_gpu_layers).
 #   macOS   -> metal
 #   Windows -> vulkan (needs the Vulkan SDK's glslc at build time; at runtime
