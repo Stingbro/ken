@@ -149,7 +149,7 @@ impl CaptureSource for MicSource {
 // ---------------------------------------------------------------------------
 // ScreenCaptureKit — compile-probe (Task 13)
 //
-// Confirmed screencapturekit 8.0.0 API surface (verified against the crate
+// Confirmed screencapturekit 9.0.1 API surface (verified against the crate
 // source), for the system-audio backend below:
 //   - screencapturekit::shareable_content::SCShareableContent::get()
 //         -> Result<SCShareableContent, SCError>
@@ -170,10 +170,10 @@ impl CaptureSource for MicSource {
 //   - SCStreamOutputType::{Screen, Audio, Microphone}
 //   - CMSampleBufferExt::audio_buffer_list(&self) -> Option<AudioBufferList>
 //   - AudioBufferList::{num_buffers(), get(i) -> Option<&AudioBuffer>}
-//   - AudioBuffer::{data() -> &[u8], number_channels: u32}   (32-bit float PCM)
+//   - AudioBuffer::{data() -> &[u8], number_channels() -> u32}  (32-bit float PCM)
 // ---------------------------------------------------------------------------
 
-/// Compile-probe: confirm the pinned ScreenCaptureKit v8 API by listing
+/// Compile-probe: confirm the pinned ScreenCaptureKit v9 API by listing
 /// shareable displays synchronously. Its only purpose is to lock the exact
 /// module paths / method names before the capture backend below (the crate's
 /// API churns across majors). Kept as a hand-run sanity check.
@@ -334,7 +334,7 @@ fn extract_audio_f32(sample: &CMSampleBuffer) -> Result<(Vec<f32>, u16)> {
         if samples.is_empty() {
             return Err(Error::Other("audio buffer had no samples".into()));
         }
-        let ch = (buf.number_channels as u16).max(1);
+        let ch = (buf.number_channels() as u16).max(1);
         return Ok((samples, ch));
     }
 
