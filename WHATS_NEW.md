@@ -27,7 +27,7 @@
 - **Backspace clears a heading**: pressing Backspace at the start of any heading turns it straight into a paragraph instead of stepping down one level at a time.
 - **Slash shortcuts**: type `/h1 ` (or `/quote`, `/code`, `/todo`, `/note`, …) in an empty block to apply that block type immediately.
 - **Quote from the add menu**: the block "+" menu now inserts a quote reliably.
-- **Table editing**: hover a table to add or remove rows and columns, set column alignment, and drag to reorder; the handles are now visible on paper.
+- **Table editing**: hover a table to add or remove rows and columns, set column alignment, and drag to reorder; the handles are now visible on paper. Wide tables grow past the text column and scroll sideways only when they outgrow the pane.
 
 ### Releases
 

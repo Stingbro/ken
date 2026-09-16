@@ -238,6 +238,10 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* Makes the pane a query container so a table can size itself against the
+       pane rather than the 720px text column (`100cqw` below). The pane's own
+       width comes from the flex parent, so inline-size containment is safe. */
+    container-type: inline-size;
   }
   .measure {
     max-width: 720px;
@@ -338,6 +342,33 @@
   }
 
   /* --- Tables ------------------------------------------------------------- */
+  /* Tables are the one block that may break out of the text column: a wide
+     table is unreadable squeezed into 720px. The block sizes to its content,
+     never narrower than the text column, and may grow into the pane's gutters
+     up to the same `clamp()` margin `.measure` uses. Past that the table
+     scrolls inside `.table-wrapper`, so the pane never scrolls sideways.
+     `left`/`translateX` (rather than auto margins) keeps it centred on the
+     text column even when it is wider than its containing block. */
+  .measure :global(.milkdown .milkdown-table-block) {
+    width: max-content;
+    min-width: 100%;
+    max-width: calc(100cqw - 2 * clamp(20px, 5cqw, 48px));
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  .measure :global(.milkdown .milkdown-table-block .table-wrapper) {
+    overflow-x: auto;
+  }
+  /* ProseMirror's stylesheet pins tables to `width: 100%; table-layout: fixed`,
+     which divides the text column evenly however long the headings are. Ken has
+     no column resizing, so content-driven widths are safe here. */
+  .measure :global(.milkdown .milkdown-table-block table.children) {
+    width: max-content;
+    min-width: 100%;
+    table-layout: auto;
+  }
+
   /* Crepe draws the row/column handles in `--crepe-color-outline`, which maps
      to Ken's hairline `--border-strong` and left them all but invisible against
      the paper. Give the pills a readable glyph and an edge so they read as
