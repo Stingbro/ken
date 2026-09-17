@@ -486,6 +486,154 @@ impl Db {
         Ok(())
     }
 
+    /// Rewrite every row keyed by `rel_path` from one path prefix to another —
+    /// the index-side half of a file/folder move. Returns how many `files` rows
+    /// moved.
+    ///
+    /// This is the cheap alternative to "forget the subtree and rescan": a move
+    /// changes no file's bytes, mtime or size, so re-extracting (or worse,
+    /// clearing the whole index) would throw away extractions, OCR and
+    /// transcripts to achieve a pure string rename. Everything happens in one
+    /// transaction so a crash can't leave half the subtree at each path.
+    ///
+    /// Matching mirrors [`Self::remove_folder`]: the exact path (so a single
+    /// file rename works too) plus `from/…` descendants, with `LIKE … ESCAPE`
+    /// so a folder called `50%_plans` or `a_b` can't act as a wildcard. The
+    /// trailing slash is what keeps a string-sibling like `docs2/` out of a
+    /// `docs` move.
+    ///
+    /// Tables covered: `files`, `extractions`, `ocr_regions`, `ocr_pending`,
+    /// `events.source`, `entities.sources` (a JSON array) and the file-valued
+    /// `review_items.source_ref` kinds. `contents` is keyed by `file_id`, not by
+    /// path, so its rows need no move — only the FTS `name` tokens of a row
+    /// whose *basename* changed are rebuilt, and the `contents` update trigger
+    /// carries that into the `search` index (which stores no path of its own:
+    /// it is an external-content table over `contents`, joined back to `files`
+    /// by rowid at query time).
+    pub fn rename_prefix(&mut self, from_rel: &str, to_rel: &str) -> Result<usize> {
+        let from = from_rel.trim_matches('/').to_string();
+        let to = to_rel.trim_matches('/').to_string();
+        if from.is_empty() || to.is_empty() || from == to {
+            return Ok(0);
+        }
+        // `LIKE 'from/%'`, with the prefix escaped so `%`/`_`/`\` in a real
+        // folder name stay literal. `substr` is 1-based, so cutting at
+        // `from.len() + 1` keeps everything after the old prefix.
+        let like = format!("{}/%", like_escape(&from));
+        let cut = from.chars().count() as i64 + 1;
+        let tx = self.conn.transaction()?;
+
+        // Which rows are moving, and where to. Needed up front because the
+        // basename-dependent FTS `name` and the JSON `entities.sources` can't be
+        // rewritten by a single UPDATE.
+        let pairs: Vec<(i64, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, rel_path FROM files
+                 WHERE rel_path = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
+            )?;
+            let rows = stmt.query_map(params![from, like], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.map(|r| {
+                r.map(|(id, old)| {
+                    let new = format!("{to}{}", &old[from.len()..]);
+                    (id, old, new)
+                })
+            })
+            .collect::<std::result::Result<_, _>>()?
+        };
+        if pairs.is_empty() {
+            tx.commit()?;
+            return Ok(0);
+        }
+
+        // A move refuses an existing destination on disk, but the index can
+        // still hold a stale row there (a path deleted outside the app, say).
+        // Clear the destination first so the UNIQUE/PK constraints can't trip.
+        for (table, col) in [
+            ("files", "rel_path"),
+            ("extractions", "rel_path"),
+            ("ocr_regions", "rel_path"),
+            ("ocr_pending", "rel_path"),
+        ] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE {col} = ?1 OR {col} LIKE ?2 ESCAPE '\\'"
+                ),
+                params![to, format!("{}/%", like_escape(&to))],
+            )?;
+        }
+
+        // The bulk of the work: one prefix rewrite per path-keyed table.
+        for (table, col) in [
+            ("files", "rel_path"),
+            ("extractions", "rel_path"),
+            ("ocr_regions", "rel_path"),
+            ("ocr_pending", "rel_path"),
+            ("events", "source"),
+        ] {
+            tx.execute(
+                &format!(
+                    "UPDATE {table} SET {col} = ?1 || substr({col}, ?2)
+                     WHERE {col} = ?3 OR {col} LIKE ?4 ESCAPE '\\'"
+                ),
+                params![to, cut, from, like],
+            )?;
+        }
+        // Inbox items whose `source_ref` is a file path (the slug-valued kinds
+        // must not be touched) — see `user_state::inbox_item_file_ref`.
+        tx.execute(
+            "UPDATE review_items SET source_ref = ?1 || substr(source_ref, ?2)
+             WHERE kind IN ('failed-file', 'conflict', 'conflict-copy', 'stored')
+               AND (source_ref = ?3 OR source_ref LIKE ?4 ESCAPE '\\')",
+            params![to, cut, from, like],
+        )?;
+
+        // FTS name tokens: only rows whose basename actually changed (a folder
+        // move leaves every child's filename alone, so this is usually a no-op).
+        for (id, old, new) in &pairs {
+            let (old_name, new_name) = (name_tokens(old), name_tokens(new));
+            if old_name != new_name {
+                tx.execute(
+                    "UPDATE contents SET name = ?2 WHERE file_id = ?1",
+                    params![id, new_name],
+                )?;
+            }
+        }
+
+        // `entities.sources` is a JSON array of rel_paths, so it needs a
+        // decode/rewrite/encode rather than SQL string surgery.
+        let renames: std::collections::HashMap<&str, &str> =
+            pairs.iter().map(|(_, o, n)| (o.as_str(), n.as_str())).collect();
+        let ent_rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare("SELECT id, sources FROM entities")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (id, json) in ent_rows {
+            let mut sources: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+            let mut touched = false;
+            for src in sources.iter_mut() {
+                if let Some(new) = renames.get(src.as_str()) {
+                    *src = (*new).to_string();
+                    touched = true;
+                }
+            }
+            if touched {
+                tx.execute(
+                    "UPDATE entities SET sources = ?2 WHERE id = ?1",
+                    params![id, serde_json::to_string(&sources).unwrap()],
+                )?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(pairs.len())
+    }
+
     pub fn get_file(&self, rel_path: &str) -> Result<Option<FileRow>> {
         let row = self
             .conn
@@ -3329,6 +3477,85 @@ mod tests {
         db.remove_folder("notes").unwrap();
         assert!(db.get_file("notes/meeting-jul-8.md").unwrap().is_none());
         assert!(db.get_file("knowledge/People.md").unwrap().is_some());
+    }
+
+    /// Renaming a folder rewrites every keyed row to the new prefix in place:
+    /// no content is dropped, FTS keeps finding the same text at the new path,
+    /// and a sibling folder that merely *starts with* the same characters
+    /// (`docs2/` vs `docs/`) is left completely alone.
+    #[test]
+    fn rename_prefix_rewrites_subtree_and_leaves_string_siblings_alone() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("docs/a.md", "md", 10, 1, "indexed", None, "alpha widget").unwrap();
+        db.upsert_file("docs/deep/b.md", "md", 20, 2, "indexed", None, "beta widget").unwrap();
+        db.upsert_file("docs2/c.md", "md", 30, 3, "indexed", None, "gamma widget").unwrap();
+        db.enqueue_extraction_if_changed("docs/a.md", "h1").unwrap();
+        db.enqueue_extraction_if_changed("docs2/c.md", "h3").unwrap();
+        db.enqueue_ocr_if_changed("docs/deep/b.md", "h2").unwrap();
+        db.mark_ocr_done(
+            "docs/deep/b.md", "h2",
+            &[OcrRegionRow { page: 0, text: "beta scan".into(), bbox: [0.0, 0.0, 1.0, 0.1] }],
+        )
+        .unwrap();
+
+        let moved = db.rename_prefix("docs", "Archive/docs").unwrap();
+        assert_eq!(moved, 2, "only the two rows under docs/ move");
+
+        // Rows live at the new paths, with content and status intact.
+        assert!(db.get_file("docs/a.md").unwrap().is_none());
+        assert!(db.get_file("docs/deep/b.md").unwrap().is_none());
+        let a = db.get_file("Archive/docs/a.md").unwrap().expect("a moved");
+        assert_eq!(a.status, "indexed");
+        assert_eq!(a.size, 10);
+        assert_eq!(db.get_text("Archive/docs/a.md").unwrap().as_deref(), Some("alpha widget"));
+        // b.md's content carries its merged OCR text too — all of it survives.
+        assert_eq!(
+            db.get_text("Archive/docs/deep/b.md").unwrap().as_deref(),
+            Some("beta widget\nbeta scan")
+        );
+
+        // The string-sibling folder is untouched.
+        assert!(db.get_file("docs2/c.md").unwrap().is_some());
+        assert_eq!(db.file_count().unwrap(), 3, "nothing was dropped");
+
+        // Search still finds the same content, now reported at the new path.
+        let hits = db.search("widget", 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.rel_path.as_str()).collect();
+        assert!(paths.contains(&"Archive/docs/a.md"), "got {paths:?}");
+        assert!(paths.contains(&"Archive/docs/deep/b.md"), "got {paths:?}");
+        assert!(paths.contains(&"docs2/c.md"), "got {paths:?}");
+        assert!(!paths.iter().any(|p| p.starts_with("docs/")), "got {paths:?}");
+        assert!(!db.search("alpha", 10).unwrap().is_empty(), "content still searchable");
+
+        // Side tables follow the rename; the sibling's queue row does not move.
+        assert!(db.get_ocr_regions("Archive/docs/deep/b.md").unwrap().len() == 1);
+        assert!(db.get_ocr_regions("docs/deep/b.md").unwrap().is_empty());
+        let pending: Vec<String> = db
+            .conn
+            .prepare("SELECT rel_path FROM extractions ORDER BY rel_path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(pending, vec!["Archive/docs/a.md".to_string(), "docs2/c.md".to_string()]);
+    }
+
+    /// A single file rename goes through the same call: the row moves AND its
+    /// FTS `name` tokens are rebuilt from the new basename.
+    #[test]
+    fn rename_prefix_renames_a_single_file_and_its_name_tokens() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("notes/kickoff.md", "md", 10, 1, "indexed", None, "body text").unwrap();
+
+        assert_eq!(db.rename_prefix("notes/kickoff.md", "notes/launch-plan.md").unwrap(), 1);
+        assert!(db.get_file("notes/kickoff.md").unwrap().is_none());
+        assert!(db.get_file("notes/launch-plan.md").unwrap().is_some());
+
+        let hits = db.search("launch", 10).unwrap();
+        assert_eq!(hits.len(), 1, "findable by the new name");
+        assert_eq!(hits[0].rel_path, "notes/launch-plan.md");
+        assert!(db.search("kickoff", 10).unwrap().is_empty(), "old name is gone");
     }
 
     #[test]
