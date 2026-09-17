@@ -1934,17 +1934,67 @@ fn deindex_removed(project: &Project, db: &mut Db, rel: &str, is_dir: bool) -> k
     Ok(())
 }
 
+/// Move one path to the OS trash. The single place the app talks to the OS
+/// trash, so every caller gets the same delete method and the same phrasing.
+///
+/// On macOS the `trash` crate defaults to `DeleteMethod::Finder`, which drives
+/// Finder over `osascript`. That has two problems here: it blocks on Finder
+/// (seconds, and forever if Finder is busy or not running), and Finder REFUSES
+/// to trash a folder holding undownloaded iCloud placeholders — it insists the
+/// item "needs to be downloaded" first. `DeleteMethod::NsFileManager` calls
+/// `-[NSFileManager trashItemAtURL:…]` instead: no Finder dependency, no
+/// AppleScript round trip, and dataless items move as-is without being
+/// hydrated first (which is the whole point — you shouldn't have to download a
+/// 50 GB folder to throw it away). The trade-off is that Finder's "Put Back"
+/// may not be offered for these items on some macOS versions; the files are
+/// still in the Trash and can be dragged out.
+///
+/// Every other platform keeps the crate's default behaviour.
+fn trash_path(abs: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::new();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(abs).map_err(trash_err)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(abs).map_err(trash_err)
+    }
+}
+
+/// Readable phrasing for a failed trash. The crate's `Error::Unknown` carries
+/// the raw OS text (an `NSError` debug string on macOS), which is noise in a
+/// toast, so name the action and keep the cause on the end for support.
+fn trash_err(e: trash::Error) -> String {
+    match e {
+        trash::Error::CouldNotAccess { target } => {
+            format!("Couldn't move \u{201c}{target}\u{201d} to the trash — it may have already been removed.")
+        }
+        other => format!("Couldn't move that to the trash. {other}"),
+    }
+}
+
 /// Move a file OR folder to the OS trash (recoverable — it lands in Finder's
 /// Trash / the Recycle Bin, not an unlink). The path is validated to stay inside
 /// the project root (`resolve` rejects `..`/absolute escapes). After the trash
 /// succeeds the index is reconciled via `deindex_removed` and the tree refreshes.
+///
+/// The trash call itself runs on a blocking thread with no lock held: even the
+/// fast path touches the filesystem for every item in a folder tree, and on a
+/// cloud-backed folder that is far from instant. Doing it inline froze the
+/// whole UI (every other IPC command queues behind it) for as long as the OS
+/// took. The state lock is taken twice — briefly, to read the path, and again
+/// after the await to reconcile the index — because a `State` borrow can't be
+/// held across an await point in a Tauri command.
 #[tauri::command]
-fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
-    let abs = {
-        let guard = state.lock().unwrap();
-        let active = guard.active.as_ref().ok_or("no project open")?;
-        active.project.resolve(&rel_path).map_err(err)?
-    };
+async fn delete_file(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    rel_path: String,
+) -> CmdResult<()> {
+    let abs = resolve_path(&state, &rel_path)?;
 
     let is_dir = abs.is_dir();
     if !abs.is_file() && !is_dir {
@@ -1952,7 +2002,7 @@ fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> C
     }
 
     // Recoverable delete: hand the path to the OS trash rather than unlinking it.
-    trash::delete(&abs).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || trash_path(&abs)).await.map_err(err)??;
 
     let mut guard = state.lock().unwrap();
     let active = guard.active.as_mut().ok_or("no project open")?;
@@ -5354,7 +5404,7 @@ mod tests {
         assert!(db.get_file(rel).unwrap().is_some(), "file should be indexed");
 
         // Same two steps delete_file runs, minus the Tauri State plumbing.
-        trash::delete(&abs).unwrap();
+        trash_path(&abs).unwrap();
         deindex_removed(&project, &mut db, rel, false).unwrap();
 
         assert!(!abs.exists(), "file should be gone from disk (in the trash)");
@@ -5374,7 +5424,7 @@ mod tests {
         scan::refresh_path(&project, &mut db, child).unwrap();
         assert!(db.get_file(child).unwrap().is_some());
 
-        trash::delete(project.root.join("Meetings")).unwrap();
+        trash_path(&project.root.join("Meetings")).unwrap();
         deindex_removed(&project, &mut db, "Meetings", true).unwrap();
 
         assert!(!project.root.join("Meetings").exists());
