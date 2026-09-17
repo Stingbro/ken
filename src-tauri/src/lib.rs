@@ -1826,12 +1826,30 @@ fn finish_recording(
 #[cfg(unix)]
 const EXDEV: i32 = 18;
 
+/// Reconcile the index after a folder (or file) has moved on disk: rewrite every
+/// row keyed by the old path prefix to the new one. A move changes no file's
+/// bytes, size or mtime, so there is nothing to re-read — `Db::rename_prefix`
+/// does the whole job in one SQL transaction (milliseconds, no file I/O),
+/// preserving extracted content, OCR regions and queue state instead of
+/// re-deriving them. Factored out of `move_file` so it's unit-testable without
+/// Tauri.
+fn reindex_moved(db: &mut Db, from_rel: &str, to_rel: &str) -> ken_core::Result<()> {
+    db.rename_prefix(from_rel, to_rel)?;
+    Ok(())
+}
+
 /// Move a file OR folder within the project. Both paths are validated to stay
 /// inside the project root (`resolve` rejects `..`/absolute escapes); overwriting
-/// an existing destination is refused. Folder moves (same-parent rename or a
-/// full move) rename the directory, then reconcile child index rows through the
-/// standard rescan — the same reconciliation the watcher does, but synchronous
-/// so the caller's tree refresh already sees it.
+/// an existing destination is refused.
+///
+/// A folder move (same-parent rename or a full move) renames the directory and
+/// then reconciles the index with `reindex_moved` — a prefix rewrite of the
+/// already-indexed rows. This used to be `remove_folder` + `scan::reindex`,
+/// which is a full `db.clear()` + re-walk + re-extract of the ENTIRE project:
+/// it froze the whole app (heavy work on the IPC thread while holding the global
+/// state mutex) and discarded every extraction, OCR result and transcript in the
+/// project just to rename a directory. The rewrite is pure SQL, so it is safe to
+/// keep synchronous; `index-updated` still fires so the UI refreshes.
 #[tauri::command]
 fn move_file(
     app: AppHandle,
@@ -1887,14 +1905,13 @@ fn move_file(
     let mut guard = state.lock().unwrap();
     let active = guard.active.as_mut().ok_or("no project open")?;
     if from_is_dir {
-        // Drop the old subtree's rows, then rescan so every child re-indexes at
-        // its new path (unchanged files elsewhere are skipped by the scanner).
-        active.db.remove_folder(&from_rel).map_err(err)?;
-        let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
-        let videos = stats.videos_needing_transcript.clone();
+        // Pure index bookkeeping: every child row moves to the new prefix with
+        // its content and queue state intact. No rescan, no re-extraction.
+        reindex_moved(&mut active.db, &from_rel, &to_rel).map_err(err)?;
         drop(guard);
-        enqueue_transcriptions(&app, state.inner(), &videos);
-        let _ = app.emit("index-updated", stats);
+        // Nothing was re-read, so there are no fresh stats and no new
+        // transcription work — just tell the UI the index moved.
+        let _ = app.emit("index-updated", ScanStats::default());
     } else {
         scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
         scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
@@ -5362,6 +5379,57 @@ mod tests {
 
         assert!(!project.root.join("Meetings").exists());
         assert!(db.get_file(child).unwrap().is_none(), "child row should be dropped with the folder");
+    }
+
+    /// Moving a folder must reconcile the index in place: rows appear at the new
+    /// paths with their content intact, nothing is left behind at the old paths,
+    /// and search still finds the text. The old implementation cleared the whole
+    /// DB and rescanned the project, which froze the app and threw away every
+    /// extraction/OCR/transcript in the project just to rename a directory.
+    #[test]
+    fn move_file_reindexes_a_folder_subtree_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::create(dir.path(), "Fixture").unwrap();
+        let mut db = Db::open(&dir.path().join("idx"), project.config.id).unwrap();
+
+        std::fs::create_dir_all(project.root.join("Meetings/Q3")).unwrap();
+        std::fs::write(project.root.join("Meetings/kickoff.md"), "Kickoff notes zebra.").unwrap();
+        std::fs::write(project.root.join("Meetings/Q3/review.md"), "Review notes zebra.").unwrap();
+        // A sibling folder sharing the name as a string prefix must not move.
+        std::fs::create_dir_all(project.root.join("Meetings-old")).unwrap();
+        std::fs::write(project.root.join("Meetings-old/stale.md"), "Stale zebra.").unwrap();
+        for rel in ["Meetings/kickoff.md", "Meetings/Q3/review.md", "Meetings-old/stale.md"] {
+            scan::refresh_path(&project, &mut db, rel).unwrap();
+        }
+        let before = db.file_count().unwrap();
+
+        // Same two steps move_file runs for a folder, minus the Tauri plumbing.
+        std::fs::create_dir_all(project.root.join("Archive")).unwrap();
+        std::fs::rename(project.root.join("Meetings"), project.root.join("Archive/Meetings"))
+            .unwrap();
+        reindex_moved(&mut db, "Meetings", "Archive/Meetings").unwrap();
+
+        assert_eq!(db.file_count().unwrap(), before, "no rows dropped or re-created");
+        assert!(db.get_file("Meetings/kickoff.md").unwrap().is_none());
+        assert!(db.get_file("Meetings/Q3/review.md").unwrap().is_none());
+        let moved = db.get_file("Archive/Meetings/kickoff.md").unwrap().expect("moved row");
+        assert_eq!(moved.status, "indexed");
+        assert_eq!(
+            db.get_text("Archive/Meetings/kickoff.md").unwrap().as_deref(),
+            Some("Kickoff notes zebra.")
+        );
+        assert!(db.get_file("Archive/Meetings/Q3/review.md").unwrap().is_some());
+        assert!(db.get_file("Meetings-old/stale.md").unwrap().is_some(), "sibling untouched");
+
+        let paths: Vec<String> = db
+            .search("zebra", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.rel_path)
+            .collect();
+        assert!(paths.contains(&"Archive/Meetings/kickoff.md".to_string()), "got {paths:?}");
+        assert!(paths.contains(&"Archive/Meetings/Q3/review.md".to_string()), "got {paths:?}");
+        assert!(paths.contains(&"Meetings-old/stale.md".to_string()), "got {paths:?}");
     }
 }
 
