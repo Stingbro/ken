@@ -27,7 +27,18 @@
 - **Backspace clears a heading**: pressing Backspace at the start of any heading turns it straight into a paragraph instead of stepping down one level at a time.
 - **Slash shortcuts**: type `/h1 ` (or `/quote`, `/code`, `/todo`, `/note`, …) in an empty block to apply that block type immediately.
 - **Quote from the add menu**: the block "+" menu now inserts a quote reliably.
-- **Table editing**: hover a table to add or remove rows and columns, set column alignment, and drag to reorder; the handles are now visible on paper. Wide tables grow past the text column and scroll sideways only when they outgrow the pane.
+- **Table editing**: hover a table to add or remove rows and columns, set column alignment, and drag to reorder; the handles are now visible on paper.
+- **Table menu**: right-click any cell to insert or delete rows and columns, set column alignment, switch the table to full width, or delete the table.
+- **Table width**: tables now size to their content and sit in the text column; hover a table and use the button above its top-right corner (or the right-click menu) to let it spread across the pane. The choice is saved in the file in a way other Markdown tools ignore. Table lines are also clearer and tables have more room around them.
+- **Headings**: every heading level is larger, with a clearer step between levels.
+- **Heading links**: hover a heading and click the link icon to copy `[Heading](#slug)` to the clipboard.
+- **In-document links**: clicking a `#heading` link scrolls to that heading instead of doing nothing.
+- **Diagram and image viewer**: click a Mermaid diagram or an image to open it full-pane, then zoom with the wheel, pinch or `+`/`-` and drag to pan. Esc closes it.
+
+### Files
+
+- **Folder moves**: Moving a folder no longer freezes the app or rebuilds the whole index.
+- **Trash**: Moving a folder to the Trash works when it holds iCloud files that are not downloaded, and no longer freezes the app.
 
 ### Releases
 
