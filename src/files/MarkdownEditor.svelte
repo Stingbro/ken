@@ -30,6 +30,7 @@
   import { headingLinkPlugin } from "./markdown/headingLink";
   import { tableContextMenu } from "./markdown/tableMenu";
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
+  import { tableLayoutPlugin } from "./markdown/tableLayout";
   import ImageLightbox from "./markdown/ImageLightbox.svelte";
   import { lightbox } from "./markdown/lightbox.svelte";
   import { CURRENT_CLASS, MARK_CLASS } from "../lib/find-dom";
@@ -273,6 +274,7 @@
     // After the GFM preset: the table schema extension replaces the preset's
     // own `table` node, so it has to be registered last.
     crepe.editor.use(tableFullWidthPlugins);
+    crepe.editor.use(tableLayoutPlugin);
     crepe.editor.use(tableContextMenu);
     crepe.editor.config(disableHeadingDowngrade);
     // House style is `- ` bullets; remark-stringify would otherwise write `*`.
@@ -439,7 +441,13 @@
   /* ProseMirror's stylesheet pins tables to `width: 100%; table-layout: fixed`,
      which divides the column evenly however long the headings are. `auto` plus
      a `max-width` lets the browser size columns to their content and then
-     squeeze them back inside the cap. */
+     squeeze them back inside the cap.
+
+     That auto layout is only the starting point a table is painted with:
+     markdown/tableLayout.ts then measures each column's content and writes
+     exact widths to a `<colgroup>`, switching the table to
+     `table-layout: fixed` inline so they are honoured to the pixel. See that
+     file for why the browser's own auto layout cannot be left to do it. */
   .measure :global(.milkdown .milkdown-table-block table.children) {
     width: auto;
     min-width: 0;
@@ -456,8 +464,8 @@
   /* Crepe's cell borders are the outline colour at 20% opacity, which all but
      disappears on paper. Ken draws the full hairline instead, with a heavier
      rule under the header row. Long cells wrap; `anywhere` is what lets a
-     single unbroken token (a URL, an id) give way rather than force the table
-     wider than its cap. */
+     single unbroken token (a URL, an id) give way rather than spill out of a
+     column that tableLayout.ts has had to make narrower than it. */
   .measure :global(.milkdown .milkdown-table-block th),
   .measure :global(.milkdown .milkdown-table-block td) {
     border: 1px solid var(--border-strong);

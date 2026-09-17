@@ -30,6 +30,7 @@
 - **Table editing**: hover a table to add or remove rows and columns, set column alignment, and drag to reorder; the handles are now visible on paper.
 - **Table menu**: right-click any cell to insert or delete rows and columns, set column alignment, switch the table to full width, or delete the table.
 - **Table width**: tables now size to their content and sit in the text column; hover a table and use the button above its top-right corner (or the right-click menu) to let it spread across the pane. The choice is saved in the file in a way other Markdown tools ignore. Table lines are also clearer and tables have more room around them.
+- **Table columns**: each column is now sized to how much content it holds. Short columns — dates, counts, names, statuses — get the room to render whole, and wide description columns give up the difference, so nothing wraps that did not have to. Tables still never scroll sideways.
 - **Headings**: every heading level is larger, with a clearer step between levels.
 - **Heading links**: hover a heading and click the link icon to copy `[Heading](#slug)` to the clipboard.
 - **In-document links**: clicking a `#heading` link scrolls to that heading instead of doing nothing.
