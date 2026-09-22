@@ -18,6 +18,14 @@
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
 
+  // Map and Timeline are paused (see `KNOWLEDGE_EXTRACTION_ENABLED` in
+  // src-tauri/src/lib.rs), so they have no nav entry. Anything that still
+  // points at them — a restored screen, an older link — lands on Home rather
+  // than on a pane the user can't navigate away from.
+  $effect(() => {
+    if (app.screen === "map" || app.screen === "timeline") app.screen = "home";
+  });
+
   // Screens the user has actually opened this session (home is always live).
   const visited = new SvelteSet<string>();
   $effect(() => {

@@ -500,13 +500,17 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
     // per generation, merging each delta into the Map/Timeline model and
     // emitting a throttled `knowledge-updated` after each merged file. When the
     // local model isn't ready it idles quietly (the Map shows a plain notice).
-    let worker_app = app.clone();
-    let worker_state = state.clone();
-    let worker_id = project.config.id;
-    let worker_stop = stop.clone();
-    std::thread::spawn(move || {
-        extraction_worker(worker_app, worker_state, worker_id, worker_stop);
-    });
+    // Paused behind `KNOWLEDGE_EXTRACTION_ENABLED` (see its doc comment): the
+    // `stop` plumbing above stays wired either way, so nothing else changes.
+    if KNOWLEDGE_EXTRACTION_ENABLED {
+        let worker_app = app.clone();
+        let worker_state = state.clone();
+        let worker_id = project.config.id;
+        let worker_stop = stop.clone();
+        std::thread::spawn(move || {
+            extraction_worker(worker_app, worker_state, worker_id, worker_stop);
+        });
+    }
 
     // One background OCR worker per open project: drains `ocr_pending`, runs
     // Vision on images/scanned PDFs, and merges the recognized text into the
@@ -537,6 +541,20 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project) -> CmdResult
 
     Ok(info)
 }
+
+/// Master switch for the per-project knowledge extraction worker — the
+/// background pass that runs the local LLM over every indexed file and feeds
+/// the Map and Timeline screens.
+///
+/// Off for now: that worker drives llama.cpp on the GPU once per file, so an
+/// otherwise idle Ken keeps the GPU busy and the fans spinning while it chews
+/// through a project.
+///
+/// Re-enabling is a one-line flip: queue rows stay `pending` in the DB when
+/// the worker never starts, so setting this back to `true` resumes exactly
+/// where it left off. Also re-add the `map` and `timeline` entries to
+/// `src/shell/NavRail.svelte` (the screens themselves were left in place).
+const KNOWLEDGE_EXTRACTION_ENABLED: bool = false;
 
 /// How often the background hydration worker wakes to look for cloud-only
 /// documents to pull down. Long on purpose: this is opportunistic work that

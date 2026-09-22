@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { columnWidths } from "./tableLayout";
+import { columnWidths, tablesNeedingLayout } from "./tableLayout";
+import type { TableMark } from "./tableLayout";
 
 const total = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 
@@ -75,5 +76,49 @@ describe("columnWidths", () => {
   it("handles degenerate input", () => {
     expect(columnWidths([], 720, false)).toEqual([]);
     expect(total(columnWidths([0, 0], 100, false))).toBeLessThanOrEqual(100);
+  });
+});
+
+describe("tablesNeedingLayout", () => {
+  // Stand-ins for ProseMirror nodes: only their identity matters.
+  const a = { table: "a" };
+  const b = { table: "b" };
+  const mark = (node: unknown, width = 720): TableMark => ({ node, width });
+
+  it("leaves a table alone when neither its node nor its container moved", () => {
+    const current = [mark(a), mark(b)];
+    expect(tablesNeedingLayout(current, [mark(a), mark(b)], false)).toEqual([]);
+  });
+
+  it("picks out only the table whose node was replaced", () => {
+    // What an edit inside the second table looks like: ProseMirror rebuilds
+    // that node and hands back the very same object for the first.
+    const edited = { table: "b'" };
+    const current = [mark(a), mark(edited)];
+    expect(tablesNeedingLayout(current, [mark(a), mark(b)], false)).toEqual([
+      1,
+    ]);
+  });
+
+  it("re-measures a table whose container changed width", () => {
+    const current = [mark(a, 640), mark(b)];
+    expect(tablesNeedingLayout(current, [mark(a), mark(b)], false)).toEqual([
+      0,
+    ]);
+  });
+
+  it("re-measures a table that has never been laid out", () => {
+    expect(
+      tablesNeedingLayout([mark(a), mark(b)], [undefined, mark(b)], false),
+    ).toEqual([0]);
+  });
+
+  it("takes every table when the pass is forced", () => {
+    const current = [mark(a), mark(b)];
+    expect(tablesNeedingLayout(current, current, true)).toEqual([0, 1]);
+  });
+
+  it("has nothing to do in a document without tables", () => {
+    expect(tablesNeedingLayout([], [], true)).toEqual([]);
   });
 });

@@ -30,6 +30,7 @@
   import { headingLinkPlugin } from "./markdown/headingLink";
   import { tableContextMenu } from "./markdown/tableMenu";
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
+  import { addTocMenuItem, tocPlugins } from "./markdown/toc";
   import { tableLayoutPlugin } from "./markdown/tableLayout";
   import ImageLightbox from "./markdown/ImageLightbox.svelte";
   import { lightbox } from "./markdown/lightbox.svelte";
@@ -255,6 +256,7 @@
               .find((group) => group.key === "text")
               ?.items.find((item) => item.key === "quote");
             if (quote) quote.onRun = insertQuote;
+            addTocMenuItem(builder);
             addGithubAlertMenuGroup(builder);
           },
         },
@@ -274,6 +276,9 @@
     // After the GFM preset: the table schema extension replaces the preset's
     // own `table` node, so it has to be registered last.
     crepe.editor.use(tableFullWidthPlugins);
+    // Same reason: the bullet-list schema extension replaces the commonmark
+    // preset's own `bullet_list` node.
+    crepe.editor.use(tocPlugins);
     crepe.editor.use(tableLayoutPlugin);
     crepe.editor.use(tableContextMenu);
     crepe.editor.config(disableHeadingDowngrade);
@@ -552,6 +557,23 @@
   .measure :global(.milkdown .list-item:has(> .label-wrapper .label.checked)) {
     color: var(--ink-secondary);
   }
+  /* Crepe draws bullet dots and ordinals in its outline colour, which reads as
+     chrome; a list marker belongs to the text it marks, so it follows the item's
+     own ink. Task checkboxes are controls and keep Crepe's colour. */
+  .measure :global(.milkdown .milkdown-list-item-block li .label-wrapper) {
+    color: inherit;
+  }
+  .measure
+    :global(
+      .milkdown
+        .milkdown-list-item-block
+        li
+        .label-wrapper
+        .label:not(.checked):not(.unchecked)
+        svg
+    ) {
+    fill: currentcolor;
+  }
   /* Footnote definitions read as an aside, not as body copy. */
   .measure :global(.milkdown dl[data-type="footnote_definition"]) {
     border-top: 1px solid var(--border);
@@ -623,6 +645,76 @@
   .measure :global(.milkdown h6) {
     position: relative;
   }
+  /* Table of contents (markdown/toc.ts). On disk it is a plain nested bullet
+     list of anchor links; here it reads as a section of the document itself:
+     a heading that matches the document's own H1, then an indented index of
+     links flush with the text column. Nothing about the document changes —
+     the caption is a `::before`, not a node. */
+  .measure :global(.milkdown ul.ken-toc) {
+    margin: 1.5em 0;
+    padding: 0;
+    list-style: none;
+    font-family: var(--font-sans);
+    user-select: none;
+  }
+  /* Styled as `.milkdown h1` is, so it reads as the document's own heading. */
+  .measure :global(.milkdown ul.ken-toc::before) {
+    content: "Table of Contents";
+    display: block;
+    font-family: var(--font-serif);
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    font-size: 2.25em;
+    line-height: 1.18;
+    margin-bottom: 0.55em;
+    color: var(--ink);
+  }
+  .measure :global(.milkdown ul.ken-toc ul) {
+    margin: 0;
+    padding-left: 1.75em;
+    list-style: none;
+  }
+  /* Crepe's list-item node view gives every item a paragraph's worth of air
+     and a bullet in a fixed-width gutter; a table of contents wants to read as
+     a compact index of plain links instead, starting at the text column's own
+     left edge. */
+  .measure :global(.milkdown ul.ken-toc li.list-item) {
+    margin: 0;
+    gap: 0;
+  }
+  .measure :global(.milkdown ul.ken-toc .label-wrapper) {
+    width: 0;
+    height: auto;
+  }
+  .measure :global(.milkdown ul.ken-toc .milkdown-icon.label) {
+    display: none;
+  }
+  .measure :global(.milkdown ul.ken-toc li p) {
+    margin: 0;
+    padding: 0.35em 0;
+    line-height: 1.6;
+  }
+  /* An entry for an `h1` carries the weight its heading does. The decoration
+     covers the item's nested list too, so those links take it back. */
+  .measure :global(.milkdown ul.ken-toc .ken-toc-h1 a) {
+    font-weight: 600;
+  }
+  .measure :global(.milkdown ul.ken-toc .ken-toc-h1 ul a) {
+    font-weight: 400;
+  }
+  /* The entries sit a touch below body size; the caption keeps the document's
+     own scale, so `2.25em` above resolves against it and matches a real H1. */
+  .measure :global(.milkdown ul.ken-toc a) {
+    font-size: 0.95em;
+    color: var(--ink);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .measure :global(.milkdown ul.ken-toc a:hover) {
+    color: var(--accent-deep);
+    text-decoration: underline;
+  }
+
   .measure :global(.milkdown .ken-heading-link) {
     position: absolute;
     left: calc(-1 * clamp(28px, (100cqw - 100%) / 2 - 4px, 110px));

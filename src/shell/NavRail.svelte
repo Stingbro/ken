@@ -6,8 +6,6 @@
   import Files from "@lucide/svelte/icons/files";
   import SquareCheck from "@lucide/svelte/icons/square-check";
   import Layers from "@lucide/svelte/icons/layers";
-  import Network from "@lucide/svelte/icons/network";
-  import Clock from "@lucide/svelte/icons/clock";
   import Mic from "@lucide/svelte/icons/mic";
   import Settings from "@lucide/svelte/icons/settings";
 
@@ -16,8 +14,9 @@
     { key: "files", icon: Files, label: "Files" },
     { key: "review", icon: SquareCheck, label: "Review" },
     { key: "ingests", icon: Layers, label: "Ingests" },
-    { key: "map", icon: Network, label: "Map" },
-    { key: "timeline", icon: Clock, label: "Timeline" },
+    // Map and Timeline are paused: the background extraction that fed them is
+    // off behind `KNOWLEDGE_EXTRACTION_ENABLED` in src-tauri/src/lib.rs. Put
+    // their entries back here when that flag goes back to `true`.
     { key: "record", icon: Mic, label: "Record" },
   ];
 </script>

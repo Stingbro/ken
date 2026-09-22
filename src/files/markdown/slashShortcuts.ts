@@ -14,9 +14,15 @@ import {
 } from "@milkdown/kit/preset/commonmark";
 import { InputRule } from "@milkdown/kit/prose/inputrules";
 import type { NodeType } from "@milkdown/kit/prose/model";
-import { TextSelection, type Transaction } from "@milkdown/kit/prose/state";
+import {
+  Selection,
+  TextSelection,
+  type Transaction,
+} from "@milkdown/kit/prose/state";
 import { findWrapping } from "@milkdown/kit/prose/transform";
 import * as milkdown from "@milkdown/kit/utils";
+import { collectHeadings } from "./anchors";
+import { buildTocList } from "./toc";
 
 export type AlertKind = "note" | "tip" | "important" | "warning" | "caution";
 
@@ -28,11 +34,12 @@ export type SlashShortcut =
   | { type: "bulletList" }
   | { type: "orderedList" }
   | { type: "taskList" }
+  | { type: "toc" }
   | { type: "alert"; kind: AlertKind };
 
 /** The whole block text must be exactly the shortcut plus its trailing space. */
 export const SLASH_SHORTCUT_RE =
-  /^\/(h[1-6]|quote|code|divider|bullet|number|todo|note|tip|important|warning|caution)\s$/i;
+  /^\/(h[1-6]|quote|code|divider|bullet|number|todo|toc|note|tip|important|warning|caution)\s$/i;
 
 const ALERT_KINDS: readonly string[] = [
   "note",
@@ -70,6 +77,8 @@ export function parseSlashShortcut(text: string): SlashShortcut | null {
       return { type: "orderedList" };
     case "todo":
       return { type: "taskList" };
+    case "toc":
+      return { type: "toc" };
     default:
       return null;
   }
@@ -155,6 +164,23 @@ export const slashShortcutInputRule = milkdown.$inputRule(
         case "taskList": {
           if (!wrapBlock(tr, pos, listItemSchema.type(ctx), { checked: false }))
             return null;
+          break;
+        }
+        case "toc": {
+          // Without the TOC plugin registered the `bullet_list` node has no
+          // `toc` attribute, and the shortcut would produce a plain list: do
+          // nothing instead and leave the typed text alone.
+          const bulletList = bulletListSchema.type(ctx);
+          if (!bulletList.spec.attrs?.toc) return null;
+          const $pos = tr.doc.resolve(pos);
+          const from = $pos.before();
+          const list = buildTocList(state.schema, collectHeadings(tr.doc));
+          tr.replaceWith(from, $pos.after(), list);
+          const after = Math.min(
+            from + list.nodeSize,
+            tr.doc.content.size,
+          );
+          tr.setSelection(Selection.near(tr.doc.resolve(after), 1));
           break;
         }
         case "alert": {

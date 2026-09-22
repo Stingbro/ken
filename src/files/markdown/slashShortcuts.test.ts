@@ -18,6 +18,7 @@ describe("parseSlashShortcut", () => {
     expect(parseSlashShortcut("/bullet ")).toEqual({ type: "bulletList" });
     expect(parseSlashShortcut("/number ")).toEqual({ type: "orderedList" });
     expect(parseSlashShortcut("/todo ")).toEqual({ type: "taskList" });
+    expect(parseSlashShortcut("/toc ")).toEqual({ type: "toc" });
   });
 
   it("parses the five alert kinds", () => {
@@ -44,6 +45,7 @@ describe("parseSlashShortcut", () => {
 
   it("rejects unknown keywords", () => {
     expect(parseSlashShortcut("/h7 ")).toBeNull();
+    expect(parseSlashShortcut("/tocs ")).toBeNull();
     expect(parseSlashShortcut("/heading ")).toBeNull();
     expect(parseSlashShortcut("/ ")).toBeNull();
     expect(parseSlashShortcut("")).toBeNull();

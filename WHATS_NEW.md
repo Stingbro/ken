@@ -33,6 +33,8 @@
 - **Table columns**: each column is now sized to how much content it holds. Short columns — dates, counts, names, statuses — get the room to render whole, and wide description columns give up the difference, so nothing wraps that did not have to. Tables still never scroll sideways.
 - **Headings**: every heading level is larger, with a clearer step between levels.
 - **Heading links**: hover a heading and click the link icon to copy `[Heading](#slug)` to the clipboard.
+- **Table of contents**: type `/toc ` in an empty block (or pick "Table of contents" from the block "+" menu) to drop in a table of contents. It lists every heading below it, nested by level, and rewrites itself as you add, rename or reorder headings. On disk it is an ordinary list of links, so other Markdown tools show it too.
+- **List markers**: bullets and numbers now match the colour of their text.
 - **In-document links**: clicking a `#heading` link scrolls to that heading instead of doing nothing.
 - **Diagram and image viewer**: click a Mermaid diagram or an image to open it full-pane, then zoom with the wheel, pinch or `+`/`-` and drag to pan. Esc closes it.
 
@@ -44,3 +46,7 @@
 ### Releases
 
 - **What's new dialog**: this dialog, shown once after each update, with the highlights of everything you got. Reopen it any time from Settings.
+
+### Performance
+
+- **Map and Timeline**: paused for now — the background analysis that fed them kept the GPU busy and fans spinning even while Ken was idle.

@@ -22,9 +22,13 @@
  *
  * Widths are DOM-only: the `<colgroup>` sits outside ProseMirror's content
  * DOM and is never serialized, so the markdown round trip is untouched. They
- * are recomputed on every document change and whenever the editor is resized.
+ * are recomputed whenever a table's content changes and whenever the editor is
+ * resized — but only for the tables that changed, because measuring forces the
+ * browser to lay the document out again. See `TableMark` and
+ * `layoutTableBlocks` for how little of that work a keystroke has to pay for.
  */
 import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
+import type { EditorView } from "@milkdown/kit/prose/view";
 import { $prose } from "@milkdown/kit/utils";
 
 /** Our colgroup, so it is never confused with anything Crepe adds. */
@@ -228,52 +232,6 @@ const horizontalPadding = (el: HTMLElement) => {
   return parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
 };
 
-/**
- * Each column's max-content width, plus the width the columns have to fit
- * into. The table is laid out at `max-content` to read the former;
- * everything is restored before returning, and because the whole function
- * runs inside one task the intermediate layout is never painted.
- */
-function measure(
-  parts: TableParts,
-): { max: number[]; cap: number } | undefined {
-  const { block, wrapper, table, headerRow } = parts;
-  const full = block.getAttribute("data-full-width") === "true";
-
-  table.querySelector(`:scope > colgroup.${COLGROUP_CLASS}`)?.remove();
-
-  // A default-width block is `width: fit-content`, so it is only as wide as
-  // the table it holds and cannot report the space available: widen it to its
-  // containing block first. A full-width block already has an explicit width.
-  const blockWidth = block.style.width;
-  if (!full) block.style.width = "100%";
-  const tableStyle = table.getAttribute("style") ?? "";
-
-  const available = wrapper.clientWidth - horizontalPadding(wrapper);
-
-  table.style.tableLayout = "auto";
-  table.style.minWidth = "0";
-  table.style.maxWidth = "none";
-  table.style.width = "max-content";
-  const max = Array.from(
-    headerRow.cells,
-    (c) => c.getBoundingClientRect().width,
-  );
-  // A table is a shade wider than its columns — its own border, and the
-  // border spacing between them under `border-collapse: separate`. Charging
-  // that to the budget is what keeps the table from ending up a pixel over
-  // its cap, which would count as an overflow.
-  const chrome = Math.max(0, table.getBoundingClientRect().width - sum(max));
-
-  if (tableStyle) table.setAttribute("style", tableStyle);
-  else table.removeAttribute("style");
-  block.style.width = blockWidth;
-
-  const cap = available - chrome;
-  if (!(cap > 0) || max.length === 0) return undefined;
-  return { max, cap };
-}
-
 /** Write the computed widths, unless they are already what the table has. */
 function apply(parts: TableParts, widths: number[], total: number): void {
   const { table } = parts;
@@ -306,23 +264,178 @@ function apply(parts: TableParts, widths: number[], total: number): void {
   if (table.style.maxWidth !== "none") table.style.maxWidth = "none";
 }
 
+/**
+ * What a table was last laid out from: the ProseMirror node it was rendered
+ * from, and the width of the block that contains it.
+ *
+ * The node is compared by *identity*, not by value. ProseMirror's nodes are
+ * persistent: a transaction rebuilds only the nodes on the path it touched, so
+ * every table the edit did not reach comes back as the very same object. That
+ * makes "did this table change?" a pointer comparison — exact, and cheaper
+ * than any serialized signature, which would cost more to compute than the
+ * layout it saves.
+ *
+ * The width is the *containing block's* `clientWidth` rather than the table's
+ * own, because sizing a table changes its own width: recording that would
+ * report every table as dirty on the pass after it was laid out. The
+ * container's width is untouched by our writes and is exactly what a pane
+ * resize changes.
+ */
+export interface TableMark {
+  node: unknown;
+  width: number;
+}
+
+/**
+ * The indices of the tables that have to be measured again: those whose mark
+ * differs from the one recorded when they were last laid out (`previous` is
+ * indexed alongside `current`, and holds `undefined` for a table that has
+ * never been laid out). `force` selects them all — what a resize, a web font
+ * landing or the first mount needs, since those change what a measurement
+ * returns without touching the document.
+ *
+ * Exported for unit tests.
+ */
+export function tablesNeedingLayout(
+  current: readonly TableMark[],
+  previous: readonly (TableMark | undefined)[],
+  force: boolean,
+): number[] {
+  const dirty: number[] = [];
+  for (let i = 0; i < current.length; i++) {
+    const was = previous[i];
+    const now = current[i]!;
+    if (force || !was || was.node !== now.node || was.width !== now.width) {
+      dirty.push(i);
+    }
+  }
+  return dirty;
+}
+
+/**
+ * Measure and size `blocks`, in phases: every write of a phase happens before
+ * any read of the next one, so a pass costs three forced layouts however many
+ * tables it covers. Doing it a table at a time instead — widen, read, restore,
+ * widen the next — makes the browser re-lay-out the whole document once per
+ * table, which is what put a 30-table document at tens of milliseconds a
+ * keystroke.
+ *
+ * Nothing intermediate is ever painted: the whole function runs in one task.
+ *
+ * Returns the blocks it actually sized.
+ */
+function layoutTableBlocks(blocks: readonly Element[]): HTMLElement[] {
+  const all: TableParts[] = [];
+  for (const block of blocks) {
+    const parts = partsOf(block);
+    if (parts) all.push(parts);
+  }
+  if (all.length === 0) return [];
+
+  // Write: drop our own colgroup, and widen a fit-content block to its
+  // containing block — it is only as wide as the table it holds and so cannot
+  // otherwise report the space available. A full-width block has an explicit
+  // width already.
+  const saved = all.map(({ block, table }) => {
+    table.querySelector(`:scope > colgroup.${COLGROUP_CLASS}`)?.remove();
+    const full = block.getAttribute("data-full-width") === "true";
+    const blockWidth = block.style.width;
+    if (!full) block.style.width = "100%";
+    return { full, blockWidth, tableStyle: table.getAttribute("style") ?? "" };
+  });
+
+  // Read: the width the columns have to fit into.
+  const available = all.map(
+    ({ wrapper }) => wrapper.clientWidth - horizontalPadding(wrapper),
+  );
+
+  // Write: lay every table out at its natural width.
+  for (const { table } of all) {
+    table.style.tableLayout = "auto";
+    table.style.minWidth = "0";
+    table.style.maxWidth = "none";
+    table.style.width = "max-content";
+  }
+
+  // Read: each column's max-content width. A table is a shade wider than its
+  // columns — its own border, and the border spacing between them under
+  // `border-collapse: separate`. Charging that to the budget is what keeps the
+  // table from ending up a pixel over its cap, which would count as overflow.
+  const measured = all.map(({ table, headerRow }) => {
+    const max = Array.from(
+      headerRow.cells,
+      (c) => c.getBoundingClientRect().width,
+    );
+    const chrome = Math.max(0, table.getBoundingClientRect().width - sum(max));
+    return { max, chrome };
+  });
+
+  // Write: restore what the measurement disturbed, then size. Neither step
+  // reads back from layout, so they share a phase.
+  const done: HTMLElement[] = [];
+  all.forEach((parts, i) => {
+    const { full, blockWidth, tableStyle } = saved[i]!;
+    if (tableStyle) parts.table.setAttribute("style", tableStyle);
+    else parts.table.removeAttribute("style");
+    parts.block.style.width = blockWidth;
+
+    const { max, chrome } = measured[i]!;
+    const cap = available[i]! - chrome;
+    if (!(cap > 0) || max.length === 0) return;
+    const widths = columnWidths(max, cap, full);
+    apply(parts, widths, Math.min(sum(widths), cap));
+    done.push(parts.block);
+  });
+  return done;
+}
+
 /** Measure and size every table under `root`. */
 export function layoutTables(root: ParentNode): void {
-  for (const block of root.querySelectorAll(".milkdown-table-block")) {
-    const parts = partsOf(block);
-    if (!parts) continue;
-    const m = measure(parts);
-    if (!m) continue;
-    const stretch = parts.block.getAttribute("data-full-width") === "true";
-    const widths = columnWidths(m.max, m.cap, stretch);
-    apply(parts, widths, Math.min(sum(widths), m.cap));
-  }
+  layoutTableBlocks(Array.from(root.querySelectorAll(".milkdown-table-block")));
+}
+
+/** The `.milkdown-table-block` a table node at `pos` is rendered into. */
+function blockOfNode(view: EditorView, pos: number): HTMLElement | undefined {
+  const dom = view.nodeDOM(pos);
+  if (!(dom instanceof HTMLElement)) return undefined;
+  if (dom.classList.contains("milkdown-table-block")) return dom;
+  return (
+    dom.closest<HTMLElement>(".milkdown-table-block") ??
+    dom.querySelector<HTMLElement>(".milkdown-table-block") ??
+    undefined
+  );
+}
+
+/** Every table in the document, paired with the element it is rendered into. */
+function tableBlocks(
+  view: EditorView,
+): { block: HTMLElement; node: unknown }[] {
+  const out: { block: HTMLElement; node: unknown }[] = [];
+  view.state.doc.descendants((node, pos) => {
+    if (node.type.name === "table") {
+      const block = blockOfNode(view, pos);
+      if (block) out.push({ block, node });
+      // A table block cannot hold another one, and its cells are most of the
+      // document's nodes: not descending is most of what makes this walk free.
+      return false;
+    }
+    // Nothing inside a paragraph or a heading is a table either.
+    return !node.isTextblock;
+  });
+  return out;
 }
 
 /**
  * Keep every table's columns sized to its content. One pass per animation
- * frame at most: document changes, node-view mounts and pane resizes all
- * funnel into the same scheduled run.
+ * frame at most: document changes, font loads and pane resizes all funnel into
+ * the same scheduled run.
+ *
+ * A pass only re-measures the tables that need it. Measuring is layout work,
+ * and a caret moving through a long document must not pay for it: a
+ * selection-only update is ignored outright, and a document change re-measures
+ * only the tables the edit actually reached (see `TableMark`). A resize, a web
+ * font landing and the first mount change every measurement, so those force a
+ * full pass.
  */
 export const tableLayoutPlugin = $prose(
   () =>
@@ -333,11 +446,42 @@ export const tableLayoutPlugin = $prose(
         // Our own writes change a block's width, which the ResizeObserver
         // would see as a resize: ignore observations we caused ourselves.
         let running = false;
+        // Set when the next pass has to re-measure everything, not just the
+        // tables the document changed.
+        let force = true;
+        /** What each table was last laid out from; see `TableMark`. */
+        const marks = new WeakMap<HTMLElement, TableMark>();
+
         const run = () => {
           frame = 0;
+          const all = force;
+          force = false;
+
+          const tables = tableBlocks(view);
+          // Reads only, and ahead of every write below, so they cost one
+          // layout between them however many tables there are.
+          const current: TableMark[] = tables.map(({ block, node }) => ({
+            node,
+            width: block.parentElement?.clientWidth ?? 0,
+          }));
+          const dirty = tablesNeedingLayout(
+            current,
+            tables.map(({ block }) => marks.get(block)),
+            all,
+          );
+          if (dirty.length === 0) return;
+
           running = true;
           try {
-            layoutTables(view.dom);
+            const done = new Set(
+              layoutTableBlocks(dirty.map((i) => tables[i]!.block)),
+            );
+            // Only a table that was really sized counts as up to date; one
+            // that could not be (a pane with no width yet) is tried again.
+            for (const i of dirty) {
+              const { block } = tables[i]!;
+              if (done.has(block)) marks.set(block, current[i]!);
+            }
           } finally {
             // A microtask is too early: the observer fires after layout.
             requestAnimationFrame(() => {
@@ -345,18 +489,32 @@ export const tableLayoutPlugin = $prose(
             });
           }
         };
-        const schedule = () => {
+
+        const schedule = (everything = false) => {
+          if (everything) force = true;
           if (frame === 0) frame = requestAnimationFrame(run);
         };
-        const observer = new ResizeObserver(() => {
-          if (!running) schedule();
+
+        // Only a change of *width* invalidates a measurement. Height changes
+        // constantly while typing — and are mostly our own doing — so taking
+        // them for resizes would force a full pass on every keystroke.
+        let width = -1;
+        const observer = new ResizeObserver((entries) => {
+          const now = entries[0]?.contentRect.width ?? view.dom.clientWidth;
+          if (now === width) return;
+          width = now;
+          if (!running) schedule(true);
         });
         observer.observe(view.dom);
         // Web fonts land after the first layout and change every measurement.
-        document.fonts?.ready.then(schedule).catch(() => {});
-        schedule();
+        document.fonts?.ready.then(() => schedule(true)).catch(() => {});
+        schedule(true);
         return {
-          update: schedule,
+          update: (_view, prevState) => {
+            // A caret moving is not a reason to touch the DOM at all.
+            if (view.state.doc.eq(prevState.doc)) return;
+            schedule();
+          },
           destroy: () => {
             observer.disconnect();
             if (frame !== 0) cancelAnimationFrame(frame);
