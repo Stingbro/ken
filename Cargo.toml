@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ken-core", "crates/ken-mcp", "src-tauri"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 
 # whisper-rs-sys and llama-cpp-sys-2 each bundle their own ggml (currently

@@ -17,7 +17,7 @@
 
 # What's New
 
-## 0.1.3 — 2026-09-16
+## 0.2.0 — 2026-09-22
 
 ### Editor
 
@@ -40,12 +40,25 @@
 
 ### Files
 
+- **PDF forms**: fill in the fields of a PDF form right in the preview pane and save the filled copy.
+- **Diagrams.net files**: `.drawio` diagrams open in a preview with page tabs, zoom and layers, and their text labels are indexed for search.
+- **Web shortcuts**: `.url` internet shortcuts get their own preview and icon, can be created from the file tree, and open their link or reveal the file in Finder.
+- **Folder tools**: mark a whole folder as viewed in one action, and optionally have the tree follow whichever file is open.
+- **Tab strip**: right-click a tab to close tabs to the right or close all, reveal the file, or copy its path; hover a shortened tab name to see it in full.
+- **Cloud images**: images that live only in the cloud are fetched in the background so their text can be recognized and searched.
+- **Backup files**: `.bak` files are skipped, the same way Office lock files are.
+- **Right-click menus**: context menus no longer vanish after you switch between screens.
 - **Folder moves**: Moving a folder no longer freezes the app or rebuilds the whole index.
 - **Trash**: Moving a folder to the Trash works when it holds iCloud files that are not downloaded, and no longer freezes the app.
+
+### Chat
+
+- **Questions from the assistant**: when the assistant needs to ask you something, a question card appears in the conversation and answering it resumes the turn.
 
 ### Releases
 
 - **What's new dialog**: this dialog, shown once after each update, with the highlights of everything you got. Reopen it any time from Settings.
+- **Install without admin rights**: the Windows installer installs per user, and the macOS install script falls back to `~/Applications` when `/Applications` is not writable.
 
 ### Performance
 

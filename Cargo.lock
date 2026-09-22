@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "ken-app"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "ken-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "ken-mcp"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ken-core",
  "serde",
