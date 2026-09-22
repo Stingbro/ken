@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+### Bug Fixes
+
+- Rebuild latest.json from signed assets before publishing
+
+### Chores
+
+- Bump version to 0.2.1
 ## 0.2.0
 
 ### Bug Fixes
@@ -20,6 +29,7 @@
 
 ### Chores
 
+- V0.2.0 [skip ci]
 - Bump version to 0.2.0
 
 ### Documentation
