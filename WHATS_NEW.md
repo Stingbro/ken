@@ -17,6 +17,12 @@
 
 # What's New
 
+## 0.2.1 — 2026-09-22
+
+### Updates
+
+- **Apple Silicon Macs**: the 0.2.0 release left Apple Silicon out of the update feed, so those Macs were never offered it. Every release now publishes a complete feed, checked before it goes live.
+
 ## 0.2.0 — 2026-09-22
 
 ### Editor
