@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.2.0
+
+### Bug Fixes
+
+- Trash via NSFileManager off the IPC thread
+- Moving a folder no longer clears and rescans the whole index
+- Bump screencapturekit 8.0.0 -> 9.0.1 to end duplicate CoreMediaBridge symbols
+- Serialize markdown bullets as dashes in the editor
+- Budget total .drawio label output across pages
+- Share one drawio viewer load per webview, and retry after failure
+- Cap decompressed .drawio payload size
+- Mount ContextMenu/ConfirmMenu once globally so menus survive tab switches
+- Drop the need for administrator privileges
+
+### Build
+
+- Silence ld64 duplicate-ggml warnings via a workspace linker_messages allow
+
+### Chores
+
+- Bump version to 0.2.0
+
+### Documentation
+
+- Spec for editor GFM polish, What's New dialog, and release skill
+- Implementation plan for cloud-files follow-ups
+- Spec for .bak ignore, cloud-image OCR, drawio preview, name-search test
+
+### Features
+
+- Live table of contents; pause Map/Timeline extraction
+- Size table columns in proportion to their content
+- Table menu and width toggle, larger headings, heading links, in-document anchors, image/diagram lightbox
+- Let wide tables expand past the text column
+- Mermaid, GitHub alerts, slash shortcuts, table handles; add What's New dialog and /release skill
+- Fill and save PDF AcroForm fields in the preview pane
+- Preview .drawio diagrams with the vendored diagrams.net viewer
+- Index .drawio diagrams by their text labels
+- Background-hydrate cloud-only images so OCR can index them
+- Ignore .bak backup files like Office lock files
+- Add folder read-tracking, follow-open, and tab strip UX
+- Support .url internet shortcuts with preview and reveal
+- Support AskUserQuestion with inline question cards
+
+### Testing
+
+- Pin name-search over cloud-only (contentless) rows
 ## 0.1.2
 
 ### Bug Fixes
@@ -9,6 +56,7 @@
 
 ### Chores
 
+- V0.1.2 [skip ci]
 - Bump version to 0.1.2
 ## 0.1.1
 
