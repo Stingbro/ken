@@ -54,6 +54,15 @@ pub const FLAGS: &[FlagDef] = &[
                       chunking, exclusions, and knowledge extraction.",
     },
     FlagDef {
+        name: "backgroundExtraction",
+        scope: FlagScope::Global,
+        default: true,
+        description: "Read new files with the local model in the background \
+                      so the Map and Timeline fill in on their own. On by \
+                      default. Turn it off to leave the GPU alone — queued \
+                      files stay queued and resume when it goes back on.",
+    },
+    FlagDef {
         name: "federatedKg",
         scope: FlagScope::Workspace,
         default: false,
@@ -172,9 +181,15 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 9);
+        assert_eq!(FLAGS.len(), 10);
         assert!(flag("semanticIndex").is_some());
         assert!(flag("workspace").is_some());
+        // The only flag in the registry that defaults ON: background
+        // extraction is the behaviour Ken shipped with, and the switch exists
+        // to stop it rather than to start it.
+        let bg_extraction = flag("backgroundExtraction").expect("backgroundExtraction registered");
+        assert_eq!(bg_extraction.scope, FlagScope::Global);
+        assert!(bg_extraction.default);
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);

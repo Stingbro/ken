@@ -1,6 +1,6 @@
 ﻿use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -1004,7 +1004,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                 // rebuilt only once the changes stop coming.
                 watch_knowledge.changed();
             }
-            enqueue_transcriptions(&emit_app, &watch_state, &stats.videos_needing_transcript);
+            enqueue_transcriptions(&emit_app, &watch_state, project_id, &stats.videos_needing_transcript);
             emit_member(&emit_app, project_id, "index-updated", stats.clone());
         },
     )
@@ -1156,7 +1156,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                         scan_sync.changed(stats.changed_paths.clone());
                         scan_knowledge.changed();
                     }
-                    enqueue_transcriptions(&scan_app, &scan_state, &stats.videos_needing_transcript);
+                    enqueue_transcriptions(&scan_app, &scan_state, project_id, &stats.videos_needing_transcript);
                     emit_member(&scan_app, project_id, "index-updated", stats);
                 }
                 Err(e) => {
@@ -1256,12 +1256,13 @@ fn background_hydrate_worker(
         // being open means this tick is stale (the drop guard will stop us).
         let (base, project, engine, sync, auto_knowledge) = {
             let guard = state.lock().unwrap();
-            let Some(active) = guard.members.values().next() else {
-                continue;
+            // Own project by id — see `extraction_worker`. The old
+            // `values().next()` plus id-mismatch check meant that with several
+            // members open, every hydrate worker but one returned on its first
+            // tick and their projects' cloud-only files were never pulled down.
+            let Some(active) = guard.members.get(&project_id) else {
+                return; // project closed — this worker is done
             };
-            if active.project.config.id != project_id {
-                return;
-            }
             if !ken_core::bg_hydrate::background_index_enabled(&active.project) {
                 continue; // feature off → idle, but keep the thread alive
             }
@@ -2618,7 +2619,10 @@ fn last_project_id(state: State<SharedState>) -> CmdResult<Option<String>> {
 #[tauri::command]
 fn current_project(state: State<SharedState>) -> CmdResult<Option<ProjectInfo>> {
     let guard = state.lock().unwrap();
-    Ok(guard.members.values().next().map(|a| ProjectInfo::of(&a.project)))
+    // `member(.., None)` resolves through `focused`. Taking an arbitrary
+    // `members.values().next()` here reported a random open project as the
+    // current one once a workspace held more than one member.
+    Ok(member(&guard, None).ok().map(|a| ProjectInfo::of(&a.project)))
 }
 
 #[tauri::command]
@@ -2635,7 +2639,7 @@ fn set_folder_selection(
     let project_id = active.project.config.id;
     let videos = stats.videos_needing_transcript.clone();
     drop(guard);
-    enqueue_transcriptions(&app, state.inner(), &videos);
+    enqueue_transcriptions(&app, state.inner(), project_id, &videos);
     emit_member(&app, project_id, "index-updated", stats);
     Ok(info)
 }
@@ -2947,7 +2951,12 @@ fn set_project_feature(
     // e.g. a future re-open) in sync with what was just persisted.
     {
         let mut guard = state.lock().unwrap();
-        if let Some(active) = guard.members.values_mut().next() {
+        // Write back to the member this project actually IS. The read above
+        // resolves through `focused`, but the write used to land on an
+        // arbitrary `values_mut().next()` — so in a workspace, flipping a flag
+        // on the focused project could overwrite a *different* member's
+        // in-memory project with the focused one's root, name and id.
+        if let Some(active) = guard.members.get_mut(&project.config.id) {
             active.project = project.clone();
         }
     }
@@ -3441,6 +3450,7 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
                         enqueue_transcriptions(
                             &bg_app,
                             &bg_state,
+                            project_id,
                             &stats.videos_needing_transcript,
                         );
                         emit_member(&bg_app, project_id, "index-updated", stats);
@@ -4230,7 +4240,10 @@ fn finish_recording(
     use chrono::{Datelike, Local, Timelike};
     // Best-effort: the project may have switched by the time transcription
     // starts, so `transcript-progress` below just falls back to unscoped.
-    let transcribe_project_id = state.lock().unwrap().members.values().next().map(|a| a.project.config.id);
+    let transcribe_project_id = {
+        let guard = state.lock().unwrap();
+        member(&guard, None).ok().map(|a| a.project.config.id)
+    };
     let now = Local::now();
     let (y, mo, d, h, mi) = (now.year(), now.month(), now.day(), now.hour(), now.minute());
     let recordings = root.join("Recordings");
@@ -4365,16 +4378,23 @@ fn finish_recording(
     let sys_rel = sys_moved.map(|(_, rel)| rel);
 
     // Index the new files so they're searchable + automation-eligible.
+    // The recording belongs to the project the user is looking at, so resolve
+    // through `focused` rather than taking an arbitrary member. The old code
+    // also read the id and the runtime in two separate `values().next()`
+    // calls, which is only coincidentally the same member.
     let project_id = {
         let mut guard = state.lock().unwrap();
-        let id = guard.members.values().next().map(|a| a.project.config.id);
-        if let Some(active) = guard.members.values_mut().next() {
-            let _ = scan::refresh_path(&active.project, &mut active.db, &md_rel);
-            for rel in [mic_rel, sys_rel].into_iter().flatten() {
-                let _ = scan::refresh_path(&active.project, &mut active.db, &rel);
+        match member_mut(&mut guard, None) {
+            Ok(active) => {
+                let id = active.project.config.id;
+                let _ = scan::refresh_path(&active.project, &mut active.db, &md_rel);
+                for rel in [mic_rel, sys_rel].into_iter().flatten() {
+                    let _ = scan::refresh_path(&active.project, &mut active.db, &rel);
+                }
+                Some(id)
             }
+            Err(_) => None,
         }
-        id
     };
     match project_id {
         Some(id) => emit_member(&app, id, "index-updated", ScanStats::default()),
@@ -4475,7 +4495,7 @@ fn move_file(
         let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
         let videos = stats.videos_needing_transcript.clone();
         drop(guard);
-        enqueue_transcriptions(&app, state.inner(), &videos);
+        enqueue_transcriptions(&app, state.inner(), project_id, &videos);
         emit_member(&app, project_id, "index-updated", stats);
     } else {
         scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
@@ -5116,24 +5136,35 @@ struct TranscriptionJob {
 /// completely quiet when ffmpeg or the model is missing — exactly like the
 /// knowledge auto-build going silent without the Claude CLI. Nobody asked for
 /// this work, so a missing prerequisite is a no-op, never an error.
-fn enqueue_transcriptions(app: &AppHandle, state: &SharedState, rels: &[String]) {
+/// `project_id` is the project the videos were found in. It used to be
+/// resolved as `members.values().next()` — an arbitrary open member — so in a
+/// workspace a video indexed under one project could be queued against a
+/// different project's root, DB and opt-in setting. Every caller already knew
+/// the right id; now it passes it.
+fn enqueue_transcriptions(
+    app: &AppHandle,
+    state: &SharedState,
+    project_id: uuid::Uuid,
+    rels: &[String],
+) {
     if rels.is_empty() {
         return;
     }
-    let (root, base, project_id, jobs) = {
+    let (root, base, jobs) = {
         let guard = state.lock().unwrap();
-        let Some(active) = guard.members.values().next() else {
+        let Some(active) = guard.members.get(&project_id) else {
             return;
         };
         // Auto-transcription during indexing is opt-in (off by default). The
         // manual `generate_transcript` command bypasses this and always runs.
+        // Read it from THIS project: it is a per-project setting, and the old
+        // arbitrary-member lookup could consult a different project's answer.
         if !transcript::transcribe_on_index_enabled(&active.project) {
             return;
         }
         (
             active.project.root.clone(),
             guard.base_dir.clone(),
-            active.project.config.id,
             active.transcripts.clone(),
         )
     };
@@ -5185,10 +5216,12 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
             Ok(_) => {
                 // Re-index the video so the fresh transcript is searchable.
                 let mut guard = job.state.lock().unwrap();
-                if let Some(active) = guard.members.values_mut().next() {
-                    if active.project.config.id == job.project_id {
-                        let _ = scan::refresh_path(&active.project, &mut active.db, &job.rel_path);
-                    }
+                // The job carries the project it belongs to, so ask for it.
+                // Taking an arbitrary member and then checking the id matched
+                // meant that in a workspace the re-index silently never ran,
+                // and a finished transcript stayed unsearchable.
+                if let Some(active) = guard.members.get_mut(&job.project_id) {
+                    let _ = scan::refresh_path(&active.project, &mut active.db, &job.rel_path);
                 }
                 drop(guard);
                 emit_member(&app, job.project_id, "index-updated", ScanStats::default());
@@ -6445,7 +6478,9 @@ fn local_hour() -> u32 {
 /// fallback without calling Claude.
 fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let Some(active) = guard.members.values_mut().next() else {
+    // The digest is for the project the user is in, so resolve through
+    // `focused` rather than whichever member the map happened to yield.
+    let Ok(active) = member_mut(&mut guard, None) else {
         return Ok(());
     };
     let today = local_date_today();
@@ -11267,6 +11302,55 @@ fn pipeline_prune_artifacts(state: State<SharedState>, ticket_id: String) -> Cmd
 /// steps aside between files while a quick answer is in flight. When the local
 /// model isn't ready — no model installed, a load error — the worker idles
 /// quietly (polling with a sleep), never erroring rows and never spinning CPU.
+/// Minimum gap between two background extraction generations, counted ACROSS
+/// EVERY OPEN PROJECT rather than per worker.
+///
+/// It has to be global, and that is the whole point. Local inference is a
+/// single worker thread behind a shared two-priority queue (`local_llm`), so
+/// N extraction workers never run N generations at once — they queue on the
+/// one engine. A per-worker `sleep` therefore does not bound GPU duty cycle at
+/// all: with ten projects open, ten independent gaps overlap and the queue is
+/// never empty, which is exactly the state measured on 2026-09-03 when an
+/// unpaced backlog held the A4000 at 94% / 114 W / 75 °C indefinitely. One
+/// shared "not before" instant bounds the aggregate rate no matter how many
+/// projects are open.
+///
+/// Two seconds against a background generation of roughly the same order
+/// leaves the card idle about half the time. Raise it to be gentler; the
+/// `backgroundExtraction` flag turns the work off outright.
+const EXTRACT_PACING: Duration = Duration::from_secs(2);
+
+/// The shared "not before" instant every extraction worker paces against.
+fn extraction_gate() -> &'static Mutex<Instant> {
+    static GATE: OnceLock<Mutex<Instant>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(Instant::now()))
+}
+
+/// Block until the shared extraction slot opens. `false` means the worker was
+/// asked to stop while waiting and should exit rather than generate.
+fn wait_for_extraction_slot(stop: &Arc<AtomicBool>) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now = Instant::now();
+        let until = *extraction_gate().lock().unwrap();
+        if until <= now {
+            return true;
+        }
+        // Sleep in short chunks so closing a project or quitting the app is
+        // still responsive while a long pace is being served.
+        std::thread::sleep((until - now).min(Duration::from_millis(250)));
+    }
+}
+
+/// Close the shared slot for `EXTRACT_PACING`. Called only after a generation
+/// actually happened: an idle worker finding an empty queue must not consume
+/// the pace, or nine idle projects would starve the one with work to do.
+fn stamp_extraction_slot() {
+    *extraction_gate().lock().unwrap() = Instant::now() + EXTRACT_PACING;
+}
+
 fn extraction_worker(
     app: AppHandle,
     state: SharedState,
@@ -11310,17 +11394,39 @@ fn extraction_worker(
         }
         // Resolve base + project root/profiler-flag under the lock, then drop
         // it before the (slow) generation so IPC stays responsive.
-        let (base, profiler_enabled, project_root) = {
+        // Look up THIS worker's own project by id.
+        //
+        // This used to read `members.values().next()` — an arbitrary entry of
+        // a HashMap — and `return` unless that entry happened to be this
+        // worker's project. With more than one member open it killed every
+        // worker but the lucky one, and HashMap order is arbitrary (randomized
+        // per process), so which project survived was chance rather than
+        // design. Measured 2026-09-08: nine of ten projects had never
+        // extracted a single file, 25,859 rows stuck at `pending`, while the
+        // tenth held 77 done / 355 error. A worker that knows its own id must
+        // ask for its own id.
+        let (base, profiler_enabled, project_root, extraction_on) = {
             let guard = state.lock().unwrap();
-            match guard.members.values().next() {
-                Some(active) if active.project.config.id == project_id => (
-                    guard.base_dir.clone(),
-                    ken_core::features::effective_flag(&guard.app_settings, &active.project, "profiler"),
-                    active.project.root.clone(),
+            let Some(active) = guard.members.get(&project_id) else {
+                return; // project closed — this worker is done
+            };
+            (
+                guard.base_dir.clone(),
+                ken_core::features::effective_flag(&guard.app_settings, &active.project, "profiler"),
+                active.project.root.clone(),
+                ken_core::features::effective_flag(
+                    &guard.app_settings,
+                    &active.project,
+                    "backgroundExtraction",
                 ),
-                _ => return, // project closed or switched — this worker is done
-            }
+            )
         };
+        // Switched off: idle but stay alive, so turning it back on resumes
+        // without having to reopen the project.
+        if !extraction_on {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
         if db.is_none() {
             match Db::open(&base, project_id) {
                 Ok(d) => db = Some(d),
@@ -11354,8 +11460,14 @@ fn extraction_worker(
         } else {
             String::new()
         };
+        // Take the shared pace before spending a generation on the one engine.
+        if !wait_for_extraction_slot(&stop) {
+            return;
+        }
         match knowledge_model::process_next_pending_with_addendum(db, &today, at, &generate, &addendum) {
             Ok(Some(_)) => {
+                // A generation actually ran: close the slot behind us.
+                stamp_extraction_slot();
                 pending_emit = true;
                 // Throttle: coalesce a burst into at most one event / 750ms.
                 if last_emit.elapsed() >= Duration::from_millis(750) {
@@ -11383,7 +11495,12 @@ fn extraction_worker(
             Err(_) => {
                 // A generation failed (already recorded on the row, which is now
                 // `error` and won't be re-popped). Continue the loop past it —
-                // a brief backoff so a bad model state doesn't spin.
+                // a brief backoff so a bad model state doesn't spin. A failed
+                // generation still burned GPU, so it takes the shared pace too:
+                // the per-worker sleep below only bounds ONE worker, and a
+                // whole workspace erroring in lockstep is exactly the burst
+                // the global gate exists to stop.
+                stamp_extraction_slot();
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
@@ -11411,14 +11528,15 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
     while !stop.load(Ordering::SeqCst) {
         // Resolve base + root under the lock, then drop it before the (slow)
         // Vision pass so IPC stays responsive.
+        // Own project by id, not an arbitrary map entry — same defect, and the
+        // same fix, as `extraction_worker` above: picking `values().next()`
+        // and bailing unless it matched meant only one project's OCR ever ran.
         let (base, root) = {
             let guard = state.lock().unwrap();
-            match guard.members.values().next() {
-                Some(active) if active.project.config.id == project_id => {
-                    (guard.base_dir.clone(), active.project.root.clone())
-                }
-                _ => return, // project closed or switched — this worker is done
-            }
+            let Some(active) = guard.members.get(&project_id) else {
+                return; // project closed — this worker is done
+            };
+            (guard.base_dir.clone(), active.project.root.clone())
         };
         if db.is_none() {
             match Db::open(&base, project_id) {
@@ -13243,11 +13361,14 @@ pub fn run() {
             tauri::WindowEvent::Focused(true) => {
                 use tauri::Manager;
                 let state = window.state::<SharedState>();
-                let sync = {
+                // Every open member, not an arbitrary one: "the user is back"
+                // is true for the whole workspace, and pulling only whichever
+                // member the map happened to yield left the others stale.
+                let syncs: Vec<_> = {
                     let guard = state.lock().unwrap();
-                    guard.members.values().next().map(|a| a.sync.clone())
+                    guard.members.values().map(|a| a.sync.clone()).collect()
                 };
-                if let Some(sync) = sync {
+                for sync in syncs {
                     sync.pull_now();
                 }
                 let _ = maybe_generate_digest(window.app_handle(), state.inner(), false);
