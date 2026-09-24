@@ -538,6 +538,17 @@ impl Db {
                     "ALTER TABLE files ADD COLUMN tier INTEGER NOT NULL DEFAULT 0;",
                 )?;
             }
+            // And a hash of the file's bytes, so a rescan that sees only a
+            // new modified time (a sync client touching the file) can tell
+            // the content did not change without parsing it again. NULL
+            // until the file is next read.
+            let has_hash: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'byte_hash'")?
+                .exists([])?;
+            if !has_hash {
+                self.conn.execute_batch("ALTER TABLE files ADD COLUMN byte_hash TEXT;")?;
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -1899,6 +1910,28 @@ impl Db {
             params![MAX_EXTRACTION_ATTEMPTS],
             |r| r.get(0),
         )?)
+    }
+
+    /// The stored hash of a file's bytes, if it has one.
+    pub fn file_byte_hash(&self, rel_path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT byte_hash FROM files WHERE rel_path = ?1",
+                params![rel_path],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record a file's byte hash, and its modified time when only that moved.
+    pub fn set_file_byte_hash(&mut self, rel_path: &str, hash: &str, mtime: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET byte_hash = ?2, mtime = ?3 WHERE rel_path = ?1",
+            params![rel_path, hash, mtime],
+        )?;
+        Ok(())
     }
 
     /// Indexed files at the full tier: the ones read for entities.

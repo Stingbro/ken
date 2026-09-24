@@ -68,7 +68,12 @@ PC (dev), not measured anywhere.
   (Ken transcribes video). The scan skips linked checkouts (a folder
   whose `.git` is a file: worktrees, submodules) but still walks nested
   clones; workspace discovery never offers a linked worktree as a member.
-  ken-core on this PC: 770 pass, 53 fail (all pre-existing, Windows).
+- **Step 7, hash not time.** Schema v14 also adds `files.byte_hash`
+  (xxh64 of the bytes, files up to 64 MB). A rescan or watcher event
+  that sees the same size but a new modified time hashes the bytes; on a
+  match it records the new time and skips the parse and the search
+  write. Cloud placeholders are never hashed (reading one downloads it).
+  ken-core on this PC: 771 pass, 53 fail (all pre-existing, Windows).
 
 ## The steps, in order
 

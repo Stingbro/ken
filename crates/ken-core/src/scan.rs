@@ -77,6 +77,41 @@ pub fn is_linked_checkout(dir: &Path) -> bool {
     dir.join(".git").is_file()
 }
 
+/// Files above this are not byte-hashed: reading a large video in full on
+/// every touch would cost more than the parse it saves. They fall back to
+/// size and modified time.
+const MAX_BYTE_HASH_BYTES: i64 = 64 * 1024 * 1024;
+
+/// A hash of the file's bytes, or None when it is too big or unreadable.
+fn byte_hash(abs: &Path, size: i64) -> Option<String> {
+    if size > MAX_BYTE_HASH_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(abs).ok()?;
+    Some(format!("{:016x}", twox_hash::XxHash64::oneshot(0x4B454E_4259_5445, &bytes)))
+}
+
+/// A file whose size is unchanged and whose bytes hash as last time only had
+/// its modified time moved (a sync client, a checkout, a copy). Record the
+/// new time and skip the parse and the search-index write. Never called for
+/// a cloud placeholder, whose bytes are not local.
+fn only_mtime_moved(db: &mut Db, rel: &str, abs: &Path, size: i64, mtime: i64) -> Result<bool> {
+    let Some(row) = db.get_file(rel)? else {
+        return Ok(false);
+    };
+    if row.size != size || !(row.status == STATUS_INDEXED || row.status == STATUS_METADATA_ONLY) {
+        return Ok(false);
+    }
+    let (Some(stored), Some(now)) = (db.file_byte_hash(rel)?, byte_hash(abs, size)) else {
+        return Ok(false);
+    };
+    if stored != now {
+        return Ok(false);
+    }
+    db.set_file_byte_hash(rel, &now, mtime)?;
+    Ok(true)
+}
+
 /// Whether `rel` sits under a linked checkout below the project root.
 fn inside_linked_checkout(root: &Path, rel: &str) -> bool {
     let mut dir = root.to_path_buf();
@@ -301,6 +336,15 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
                 stats.unchanged += 1;
                 continue;
             }
+            Some((s, _, status, error))
+                if s == size
+                    && !*dataless
+                    && !needs_retry(status, error.as_deref(), *dataless)
+                    && only_mtime_moved(db, rel, &project.root.join(rel), *size, *mtime)? =>
+            {
+                stats.unchanged += 1;
+                continue;
+            }
             Some(_) => stats.updated += 1,
             None => stats.added += 1,
         }
@@ -358,6 +402,11 @@ fn index_one(
         Err(e) => (STATUS_FAILED, Some(e.to_string()), String::new()),
     };
     db.upsert_file(rel, kind.as_str(), size, mtime, status, error.as_deref(), &text)?;
+    if status != STATUS_FAILED {
+        if let Some(hash) = byte_hash(&abs, size) {
+            db.set_file_byte_hash(rel, &hash, mtime)?;
+        }
+    }
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
     // churn without a content change never re-runs extraction. kenignore D3/
@@ -421,6 +470,10 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let dataless = cloud::is_dataless(&meta);
+        if !dataless && only_mtime_moved(db, rel, &abs, meta.len() as i64, mtime)? {
+            db.set_file_tiers(&[(rel.to_string(), tier)])?;
+            return Ok(false);
+        }
         index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
         db.set_file_tiers(&[(rel.to_string(), tier)])?;
         Ok(true)
@@ -977,6 +1030,33 @@ mod tests {
         assert!(!refresh_path(&project, &mut db, "wt-u7/docs/plan.md").unwrap());
         assert!(db.get_file("wt-u7/docs/plan.md").unwrap().is_none());
         assert!(!refresh_path(&project, &mut db, "config/credentials.json").unwrap());
+    }
+
+    /// A new modified time on the same bytes (a sync client touching the
+    /// file) is not a change: no re-parse, no update counted, and the stored
+    /// time moves on. A real edit of the same size still re-indexes.
+    #[test]
+    fn a_touched_file_with_the_same_bytes_is_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        fs::write(&path, "# Plan\nalpha\n").unwrap();
+        let project = Project::create(dir.path(), "Touch").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        let before = db.get_file("plan.md").unwrap().unwrap().mtime;
+
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        let stats = scan(&project, &mut db).unwrap();
+        assert_eq!((stats.updated, stats.unchanged), (0, 1), "{stats:?}");
+        let after = db.get_file("plan.md").unwrap().unwrap().mtime;
+        assert!(after > before, "the stored time follows the file");
+        assert!(!refresh_path(&project, &mut db, "plan.md").unwrap(), "a watcher touch is a no-op");
+
+        fs::write(&path, "# Plan\nbravo\n").unwrap(); // same size, new bytes
+        let stats = scan(&project, &mut db).unwrap();
+        assert_eq!(stats.updated, 1, "{stats:?}");
+        assert!(db.get_file("plan.md").unwrap().is_some());
     }
 
     #[test]
