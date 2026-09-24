@@ -625,7 +625,11 @@
         <div class="group-head">Features</div>
         {#each features as flag (flag.name)}
           <div class="card">
-            <div class="card-title">{flag.name}</div>
+            <div class="card-title">{flag.label}</div>
+            <p class="note">
+              {flag.description}
+              <span class="flag-meta">{flag.applies} · <span class="mono">{flag.name}</span></span>
+            </p>
             <div class="row">
               <label class="radio">
                 <input
@@ -1259,6 +1263,12 @@
     font-size: 12.5px;
     color: var(--ink-tertiary);
     line-height: 1.6;
+  }
+  /* Where a feature applies, and its code name for anyone editing JSON. */
+  .flag-meta {
+    display: block;
+    font-size: 11.5px;
+    opacity: 0.85;
   }
   .folders {
     display: flex;

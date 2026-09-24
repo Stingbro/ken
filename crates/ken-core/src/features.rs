@@ -28,11 +28,19 @@ pub struct FlagDef {
     pub default: bool,
     /// Plain language, shown in the UI.
     pub description: &'static str,
+    /// The flag's plain name in Settings (`semanticIndex` is "Search by
+    /// meaning"); the code name stays the key.
+    pub label: &'static str,
+    /// Where it applies, in the reader's words: this repo, this machine,
+    /// the team, or mine.
+    pub applies: &'static str,
 }
 
 pub const FLAGS: &[FlagDef] = &[
     FlagDef {
         name: "semanticIndex",
+        label: "Search by meaning",
+        applies: "this repo",
         scope: FlagScope::Project,
         default: false,
         description: "Meaning-based search using a local embedding model. \
@@ -40,6 +48,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "workspace",
+        label: "Several repos together",
+        applies: "this machine",
         scope: FlagScope::Global,
         default: false,
         description: "Open a parent folder's sibling projects together, \
@@ -47,6 +57,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "profiler",
+        label: "Repo profile",
+        applies: "this repo",
         scope: FlagScope::Project,
         default: false,
         description: "Analyze each project's shape (deterministic scan, \
@@ -55,6 +67,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "backgroundExtraction",
+        label: "Background reading",
+        applies: "this machine",
         scope: FlagScope::Global,
         default: true,
         description: "Read new files with the local model in the background \
@@ -64,6 +78,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "federatedKg",
+        label: "Team knowledge graph",
+        applies: "the team",
         scope: FlagScope::Workspace,
         default: false,
         description: "Build a workspace-wide knowledge graph that federates \
@@ -73,6 +89,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "kgRouting",
+        label: "Search across the team",
+        applies: "the team",
         scope: FlagScope::Workspace,
         default: false,
         description: "Route search across workspace members: aim directly \
@@ -83,6 +101,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "kenMemory",
+        label: "Ken memory",
+        applies: "mine",
         scope: FlagScope::Workspace,
         default: false,
         description: "Ken's own working memory: long-term memory files, a \
@@ -93,6 +113,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "kenTasks",
+        label: "Task board",
+        applies: "the team",
         scope: FlagScope::Workspace,
         default: false,
         description: "A shared task board (Kanban + a daily view) backed by \
@@ -103,6 +125,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "kenFamilies",
+        label: "Team inbox",
+        applies: "the team",
         scope: FlagScope::Global,
         default: false,
         description: "Team collaboration over a shared git repo: clone, \
@@ -113,6 +137,8 @@ pub const FLAGS: &[FlagDef] = &[
     },
     FlagDef {
         name: "kenPipeline",
+        label: "Pipeline board",
+        applies: "the team",
         scope: FlagScope::Workspace,
         default: false,
         description: "A configurable multi-lane pipeline board layered over \

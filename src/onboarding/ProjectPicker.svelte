@@ -325,7 +325,7 @@
                   <label class="radio feature-row">
                     <input type="checkbox" bind:checked={featureChoices[flag.name]} />
                     <span class="feature-text">
-                      <span class="feature-name">{flag.name}</span>
+                      <span class="feature-name" title={flag.name}>{flag.label}</span>
                       <span class="note">{flag.description}</span>
                     </span>
                   </label>
@@ -411,7 +411,7 @@
                     <label class="radio feature-row">
                       <input type="checkbox" bind:checked={wsFeatureChoices[flag.name]} />
                       <span class="feature-text">
-                        <span class="feature-name">{flag.name}</span>
+                        <span class="feature-name" title={flag.name}>{flag.label}</span>
                         <span class="note">{flag.description}</span>
                       </span>
                     </label>

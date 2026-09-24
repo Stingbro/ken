@@ -3100,6 +3100,9 @@ struct FeatureInfo {
     /// `global` | `project` | `workspace`.
     scope: String,
     description: String,
+    /// The plain name shown in Settings, and where the flag applies.
+    label: String,
+    applies: String,
     /// The global-layer value: `settings.json` if set, else the registry default.
     global: bool,
     /// The project's own override — `Some` only when a project-scoped flag is
@@ -3210,6 +3213,8 @@ fn list_features(
                 name: def.name.to_string(),
                 scope: scope_str(def.scope).to_string(),
                 description: def.description.to_string(),
+                label: def.label.to_string(),
+                applies: def.applies.to_string(),
                 global,
                 project_override,
                 effective,
@@ -4938,7 +4943,9 @@ struct McpInfo {
 }
 
 /// Where is the `ken-mcp` binary? Installer layout first (sibling of the
-/// app executable, then `~/.local/bin`), then PATH, then a dev build.
+/// app executable; `%LOCALAPPDATA%\Programs\ken-mcp`, where `install.ps1`
+/// puts it on Windows; `~/.local/bin` from `install.sh`), then PATH, then a
+/// dev build.
 fn find_ken_mcp() -> Option<PathBuf> {
     let name = format!("ken-mcp{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
@@ -4948,15 +4955,27 @@ fn find_ken_mcp() -> Option<PathBuf> {
             }
         }
     }
+    if cfg!(windows) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let installed = PathBuf::from(local).join("Programs").join("ken-mcp").join(&name);
+            if installed.is_file() {
+                return Some(installed);
+            }
+        }
+    }
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let local = PathBuf::from(home).join(".local/bin").join(&name);
         if local.is_file() {
             return Some(local);
         }
     }
-    if let Ok(out) = std::process::Command::new("which").arg("ken-mcp").output() {
+    // PATH: `where` on Windows (there is no `which`), `which` elsewhere.
+    let finder = if cfg!(windows) { "where" } else { "which" };
+    let mut cmd = std::process::Command::new(finder);
+    if let Ok(out) = ken_core::proc::quiet(&mut cmd).arg("ken-mcp").output() {
         if out.status.success() {
-            let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
+            let path = PathBuf::from(first);
             if path.is_file() {
                 return Some(path);
             }

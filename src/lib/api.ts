@@ -839,6 +839,10 @@ export interface FeatureInfo {
   name: string;
   scope: "global" | "project" | "workspace";
   description: string;
+  /** Plain name for Settings ("Search by meaning"). */
+  label: string;
+  /** Where it applies: this repo, this machine, the team, mine. */
+  applies: string;
   global: boolean;
   projectOverride: boolean | null;
   effective: boolean;
