@@ -113,6 +113,8 @@ export interface RegistryEntryStatus {
   /** Absent until someone says what the repo is. */
   kind?: RepoKind[];
   team?: string;
+  /** Set only when a person chose other than what the kind implies. */
+  index?: IndexState;
 }
 
 export interface FileRow {
@@ -1728,6 +1730,8 @@ export const api = {
   /** A page's links both ways: pages it reaches, pages that reach it. */
   pageLinks: (path: string) =>
     invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),
+  setProjectIndex: (id: string, index: IndexState | null) =>
+    invoke<RegistryEntryStatus[]>("set_project_index", { id, index }),
   setProjectKind: (id: string, kind: RepoKind[], team: string | null) =>
     invoke<RegistryEntryStatus[]>("set_project_kind", { id, kind, team }),
   createProject: (path: string, name: string) =>

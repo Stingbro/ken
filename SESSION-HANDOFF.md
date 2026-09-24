@@ -167,8 +167,11 @@ PC (dev), not measured anywhere.
   (opens the workspace), `setup_rescan`; `SetupFlow.svelte` (4 steps) is
   the first choice on the start screen, beside the old wizard. Gaps:
   confirm still creates `.ken/project.json` in each member, code repos
-  included (dropping it touches every Project::open); no Add a repo
-  dialog or Scan again button in the UI yet; not tried in the app.
+  included (dropping it touches every Project::open); not tried in the
+  app. Settings > Projects > Repos (`WorkspaceRepos.svelte`) now edits each
+  member's kind, team and index state (`set_project_index`; `off` ignores
+  the whole repo) and has Scan again: Add a new folder with its proposed
+  row, Skip a new worktree (adds its ignore line), note a gone repo.
   ken-core on this PC: 803 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 482/482.
 - **Step 15, teams and settings.** Each feature flag has a plain `label`

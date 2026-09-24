@@ -2646,6 +2646,24 @@ fn set_project_kind(
     Ok(registry.statuses())
 }
 
+/// Set how deep Ken reads a repo (off / search / entities), or clear the
+/// choice so it follows the kind. The next scan re-tiers its files.
+#[tauri::command]
+fn set_project_index(
+    state: State<SharedState>,
+    id: String,
+    index: Option<ken_core::registry::IndexState>,
+) -> CmdResult<Vec<RegistryEntryStatus>> {
+    let guard = state.lock().unwrap();
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
+    let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
+    if !registry.set_index(uuid, index) {
+        return Err(format!("no project with id {id}"));
+    }
+    registry.save(&guard.base_dir).map_err(err)?;
+    Ok(registry.statuses())
+}
+
 #[tauri::command]
 fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
@@ -13911,6 +13929,7 @@ pub fn run() {
             sync_status,
             set_sync_auto,
             set_project_kind,
+            set_project_index,
             index_health,
             page_links,
             drift_status,

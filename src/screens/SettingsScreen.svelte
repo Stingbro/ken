@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { app, forFocused } from "../lib/app.svelte";
   import ProjectGroups from "./ProjectGroups.svelte";
+  import WorkspaceRepos from "./WorkspaceRepos.svelte";
   import { ingests } from "../lib/ingests.svelte";
   import { memory } from "../lib/memory.svelte";
   import { families } from "../lib/families.svelte";
@@ -768,6 +769,10 @@
     {#if app.workspace}
       <section class="group">
         <div class="group-head">Projects</div>
+        <div class="card">
+          <div class="card-title">Repos</div>
+          <WorkspaceRepos />
+        </div>
         <div class="card">
           <ProjectGroups />
         </div>
