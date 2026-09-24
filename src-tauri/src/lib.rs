@@ -2279,14 +2279,10 @@ fn focus_project(app: AppHandle, state: State<SharedState>, id: String) -> CmdRe
 /// Set-up, step one to three: scan a code folder and propose a row per repo
 /// (kind, team, index state, evidence) and the ignore entries. Reads only.
 #[tauri::command]
-async fn setup_propose(state: State<'_, SharedState>, parent: String) -> CmdResult<ken_core::setup::Proposal> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-    }
-    // `git worktree list` per repo: off the UI thread.
+async fn setup_propose(parent: String) -> CmdResult<ken_core::setup::Proposal> {
+    // Not flag-gated: set-up is how a fresh install opts into several repos
+    // (Confirm turns the workspace flag on). `git worktree list` per repo:
+    // off the UI thread.
     tauri::async_runtime::spawn_blocking(move || ken_core::setup::propose(Path::new(&parent)).map_err(err))
         .await
         .map_err(|e| e.to_string())?
@@ -2304,10 +2300,16 @@ fn setup_confirm(
     rows: Vec<ken_core::setup::RepoRow>,
     ignores: Vec<ken_core::setup::IgnoreRow>,
 ) -> CmdResult<WorkspaceOverviewDto> {
+    // Confirming set-up is the opt-in to several repos together: switch the
+    // workspace flag on (a fresh install has no settings.json to hold it,
+    // so it could never be turned on before a workspace existed).
     let base = {
-        let guard = state.lock().unwrap();
+        let mut guard = state.lock().unwrap();
         if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
+            let mut settings = guard.app_settings.clone();
+            settings.features.insert("workspace".into(), serde_json::Value::Bool(true));
+            settings.save(&guard.base_dir).map_err(err)?;
+            guard.app_settings = settings;
         }
         guard.base_dir.clone()
     };

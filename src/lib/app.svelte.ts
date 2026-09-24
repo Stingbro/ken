@@ -609,6 +609,8 @@ class AppStore {
   /** Set-up's Confirm: write what the person chose and open the workspace. */
   async confirmSetup(parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) {
     const overview = await api.setupConfirm(parent, name, rows, ignores);
+    // Confirm switched the workspace feature on if it was off.
+    this.workspaceFlagEnabled = true;
     this.workspace = overview;
     await this.loadFocusedMemberState(overview);
   }

@@ -441,16 +441,18 @@
            — pushed people into single-project mode by emphasis, and
            "Open a workspace" sounded like opening an existing one rather
            than building one from a folder of repos. -->
-      <div class="choose-row" class:stacked={app.workspaceFlagEnabled}>
+      <div class="choose-row stacked">
+        <!-- Set-up is offered on a fresh install too: confirming it turns the
+             workspace feature on, so it is the way in, not behind the flag. -->
+        <button class="choice" onclick={() => (setupOpen = true)}>
+          <span class="choice-title">Set up Ken for your code</span>
+          <span class="choice-note">
+            Point Ken at the folder your repos live in. It proposes teams, what
+            each repo is and how deep to read it; nothing is written until you
+            confirm.
+          </span>
+        </button>
         {#if app.workspaceFlagEnabled}
-          <button class="choice" onclick={() => (setupOpen = true)}>
-            <span class="choice-title">Set up Ken for your code</span>
-            <span class="choice-note">
-              Point Ken at the folder your repos live in. It proposes teams, what
-              each repo is and how deep to read it; nothing is written until you
-              confirm.
-            </span>
-          </button>
           <button class="choice" onclick={chooseWorkspaceFolder}>
             <span class="choice-title">Several projects</span>
             <span class="choice-note">
@@ -459,7 +461,7 @@
             </span>
           </button>
         {/if}
-        <button class="choice" class:solo={!app.workspaceFlagEnabled} onclick={chooseFolder}>
+        <button class="choice" onclick={chooseFolder}>
           <span class="choice-title">One project</span>
           <span class="choice-note">
             Pick a single folder — one repo, or one set of notes.
