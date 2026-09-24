@@ -897,6 +897,10 @@ export interface RoutedHit {
   memberName: string;
   /** `ken://<project-id>/<rel-path>`. */
   address: string;
+  /** The line the hit's chunk starts on, when known. */
+  line: number | null;
+  /** How to cite it: `repo:path:line`, `repo@sha:…`, led by `[[Note]]` in a wiki. */
+  locator: string;
   kgBreadcrumbs: string[];
 }
 

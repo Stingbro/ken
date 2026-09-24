@@ -117,6 +117,10 @@ pub struct Chunk {
     pub token_est: usize,
     /// xxHash64 of `text`, hex-encoded. Used for incremental diffing.
     pub content_hash: String,
+    /// 1-based line in the file where this chunk's own content starts (not
+    /// the overlap carried from the chunk before), so a hit can be cited as
+    /// `repo:path:line`.
+    pub line: usize,
 }
 
 /// Hard cap on chunks per file. Guards against pathological inputs
@@ -143,10 +147,10 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
 
     pieces
         .into_iter()
-        .filter(|p| !p.trim().is_empty())
+        .filter(|(_, p)| !p.trim().is_empty())
         .take(CHUNK_CAP)
         .enumerate()
-        .map(|(seq, text)| {
+        .map(|(seq, (line, text))| {
             let token_est = (text.len() / 4).max(1);
             let content_hash = hash_text(&text);
             Chunk {
@@ -154,6 +158,7 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
                 text,
                 token_est,
                 content_hash,
+                line,
             }
         })
         .collect()
@@ -166,35 +171,40 @@ fn hash_text(text: &str) -> String {
 
 /// Split text into paragraph/heading blocks: blank lines separate
 /// paragraphs; any line starting with `#` (markdown ATX heading) is always
-/// its own block, regardless of surrounding blank lines.
-fn split_prose_blocks(text: &str) -> Vec<String> {
+/// its own block, regardless of surrounding blank lines. Each block carries
+/// the 1-based line it starts on.
+fn split_prose_blocks(text: &str) -> Vec<(usize, String)> {
     let mut blocks = Vec::new();
     let mut current = String::new();
+    let mut start = 0usize;
 
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
+        let n = i + 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if !current.trim().is_empty() {
-                blocks.push(current.trim().to_string());
+                blocks.push((start, current.trim().to_string()));
             }
             current.clear();
             continue;
         }
         if trimmed.starts_with('#') {
             if !current.trim().is_empty() {
-                blocks.push(current.trim().to_string());
+                blocks.push((start, current.trim().to_string()));
             }
             current.clear();
-            blocks.push(trimmed.to_string());
+            blocks.push((n, trimmed.to_string()));
             continue;
         }
-        if !current.is_empty() {
+        if current.is_empty() {
+            start = n;
+        } else {
             current.push('\n');
         }
         current.push_str(line);
     }
     if !current.trim().is_empty() {
-        blocks.push(current.trim().to_string());
+        blocks.push((start, current.trim().to_string()));
     }
     blocks
 }
@@ -212,15 +222,19 @@ fn tail(s: &str, n: usize) -> String {
     s[start..].to_string()
 }
 
-fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<String> {
+/// Chunks as (first line of the chunk's own content, text).
+fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
     let target_chars = (profile.target_tokens * 4).max(1);
     let overlap_chars = ((target_chars as f32) * profile.overlap_pct).round() as usize;
 
     let blocks = split_prose_blocks(text);
-    let mut chunks: Vec<String> = Vec::new();
+    let mut chunks: Vec<(usize, String)> = Vec::new();
     let mut current = String::new();
+    // The line of the first block added since the last boundary; the
+    // overlap tail carried into a chunk does not move it.
+    let mut line: Option<usize> = None;
 
-    for block in blocks {
+    for (block_line, block) in blocks {
         let is_heading = block.starts_with('#');
         let would_exceed = !current.is_empty() && current.len() + block.len() + 2 > target_chars;
         // Headings always start a fresh chunk (no merging a new section into
@@ -228,7 +242,8 @@ fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<String> {
         let force_boundary = is_heading && !current.is_empty();
 
         if would_exceed || force_boundary {
-            chunks.push(current.clone());
+            chunks.push((line.unwrap_or(block_line), current.clone()));
+            line = None;
             current = if overlap_chars > 0 && !force_boundary {
                 tail(&current, overlap_chars)
             } else {
@@ -240,30 +255,35 @@ fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<String> {
             current.push_str("\n\n");
         }
         current.push_str(&block);
+        line.get_or_insert(block_line);
     }
     if !current.trim().is_empty() {
-        chunks.push(current);
+        chunks.push((line.unwrap_or(1), current));
     }
     chunks
 }
 
-fn chunk_code(text: &str, profile: &IndexProfile) -> Vec<String> {
+/// Chunks as (first line, text).
+fn chunk_code(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
     let target_chars = (profile.target_tokens * 4).max(1);
-    let mut chunks: Vec<String> = Vec::new();
+    let mut chunks: Vec<(usize, String)> = Vec::new();
     let mut current = String::new();
+    let mut start = 1usize;
 
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         if !current.is_empty() && current.len() + line.len() + 1 > target_chars {
-            chunks.push(current.clone());
+            chunks.push((start, current.clone()));
             current.clear();
         }
-        if !current.is_empty() {
+        if current.is_empty() {
+            start = i + 1;
+        } else {
             current.push('\n');
         }
         current.push_str(line);
     }
     if !current.trim().is_empty() {
-        chunks.push(current);
+        chunks.push((start, current));
     }
     chunks
 }
@@ -386,6 +406,35 @@ mod tests {
             last_line_of_first, first_line_of_second,
             "code mode must not repeat lines across chunk boundaries"
         );
+    }
+
+    /// Each chunk knows the line its own content starts on: the heading's
+    /// line for a section, the first new paragraph after an overlap tail,
+    /// and the first line of a code block.
+    #[test]
+    fn chunks_carry_the_line_their_content_starts_on() {
+        let text = "Intro.\n\n\n# Section Two\n\nBody of two.\n";
+        let profile = IndexProfile { mode: ChunkMode::Prose, target_tokens: 350, overlap_pct: 0.15 };
+        let chunks = chunk_file("doc.md", text, &profile);
+        assert_eq!(chunks[0].line, 1);
+        assert_eq!(chunks[1].line, 4, "the heading's line");
+
+        let mut prose = String::new();
+        for i in 0..30 {
+            prose.push_str(&format!("Paragraph {i} with filler content to pad it.\n\n"));
+        }
+        let profile = IndexProfile { mode: ChunkMode::Prose, target_tokens: 50, overlap_pct: 0.2 };
+        for c in chunk_file("doc.md", &prose, &profile) {
+            // The chunk's first new paragraph is the one on its line.
+            let own = prose.lines().nth(c.line - 1).unwrap();
+            assert!(c.text.contains(own), "line {} = {own:?} not in {:?}", c.line, c.text);
+        }
+
+        let code: String = (0..200).map(|i| format!("let x{i} = {i}; // padding line\n")).collect();
+        let profile = IndexProfile { mode: ChunkMode::Code, target_tokens: 50, overlap_pct: 0.0 };
+        for c in chunk_file("main.rs", &code, &profile) {
+            assert_eq!(code.lines().nth(c.line - 1).unwrap(), c.text.lines().next().unwrap());
+        }
     }
 
     #[test]

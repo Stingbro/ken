@@ -89,6 +89,7 @@
 //!   compose `member name + these ids` however it likes.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use uuid::Uuid;
 
@@ -268,6 +269,55 @@ fn contains_normalized(haystack: &str, needle: &str) -> bool {
     padded_haystack.contains(&padded_needle)
 }
 
+/// How a hit is cited so a reader can go straight to it: `repo:path:line`,
+/// with `repo@sha` when the repo is git, and led by `[[Note Name]]` for a
+/// page in a team or wiki repo. `line` is None for a chunk stored before
+/// lines were recorded, which drops the `:line`.
+pub fn locator(repo: &str, rel_path: &str, line: Option<i64>, sha: Option<&str>, wiki_page: bool) -> String {
+    let path = rel_path.replace('\\', "/");
+    let repo = match sha {
+        Some(sha) => format!("{repo}@{sha}"),
+        None => repo.to_string(),
+    };
+    let mut out = match line {
+        Some(n) => format!("{repo}:{path}:{n}"),
+        None => format!("{repo}:{path}"),
+    };
+    if wiki_page {
+        let is_page = path.ends_with(".md") || path.ends_with(".markdown");
+        if let Some(stem) = std::path::Path::new(&path).file_stem().and_then(|s| s.to_str()).filter(|_| is_page) {
+            out = format!("[[{stem}]] · {out}");
+        }
+    }
+    out
+}
+
+/// The short commit a git repo's working tree is on, read from `.git` files
+/// rather than by running git, so a search never waits on a process. None
+/// for a repo that is not git, a detached worktree (`.git` is a file), or an
+/// unborn branch.
+pub fn head_sha(root: &Path) -> Option<String> {
+    let git = root.join(".git");
+    if !git.is_dir() {
+        return None;
+    }
+    let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
+    let head = head.trim();
+    let full = match head.strip_prefix("ref: ") {
+        None => head.to_string(),
+        Some(r) => match std::fs::read_to_string(git.join(r)) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => {
+                let packed = std::fs::read_to_string(git.join("packed-refs")).ok()?;
+                packed
+                    .lines()
+                    .find_map(|l| l.strip_suffix(r).map(|sha| sha.trim().to_string()))?
+            }
+        },
+    };
+    (full.len() >= 7 && full.chars().all(|c| c.is_ascii_hexdigit())).then(|| full[..7].to_string())
+}
+
 /// `ken://<project-id>/<rel-path>` (fixed scheme, `features/multi-project/
 /// README.md` "Cross-feature contracts": "Rel-paths are always forward-slash
 /// normalized, on Windows too").
@@ -300,7 +350,11 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
             .collect(),
         _ => Vec::new(),
     };
-    Ok(search::merge_and_rerank(&fts_hits, &vec_hits, query))
+    let mut hits = search::merge_and_rerank(&fts_hits, &vec_hits, query);
+    for hit in &mut hits {
+        hit.line = db.chunk_line(hit.chunk_id)?;
+    }
+    Ok(hits)
 }
 
 /// A handle `execute_plan` needs to search one planned target: identity plus
@@ -344,6 +398,10 @@ pub struct RoutedHit {
     pub member_name: String,
     /// `ken://<project-id>/<rel-path>`.
     pub address: String,
+    /// The line the hit's chunk starts on, when known.
+    pub line: Option<i64>,
+    /// The human citation, see [`locator`].
+    pub locator: String,
     /// `kg://<entity-id>` per entity that selected this hit's plan (empty
     /// unless the plan's reason was `KgEntities` — see the module doc's
     /// "KG breadcrumbs are plan-level, not per-hit").
@@ -458,6 +516,15 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
         if mh.status != MemberStatus::Searched {
             continue;
         }
+        // Once per member: its commit, and whether its pages are notes. A
+        // member missing from the registry is cited as plain repo:path:line.
+        let (sha, wiki) = match crate::registry::entry_of(mh.project_id) {
+            Some((root, kind)) => (
+                head_sha(&root),
+                kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)),
+            ),
+            None => (None, false),
+        };
         let order = target_order.get(&mh.project_id).copied().unwrap_or(usize::MAX);
         for (i, hit) in mh.hits.iter().enumerate() {
             let rank = i + 1;
@@ -475,6 +542,8 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     project_id: mh.project_id,
                     member_name: mh.member_name.clone(),
                     address,
+                    line: hit.line,
+                    locator: locator(&mh.member_name, &hit.path, hit.line, sha.as_deref(), wiki),
                     kg_breadcrumbs: breadcrumbs.clone(),
                 },
             ));
@@ -524,6 +593,7 @@ mod tests {
             chunk_id,
             snippet: format!("snippet for {path}"),
             source: Source::Keyword,
+            line: None,
         }
     }
 
@@ -777,6 +847,40 @@ mod tests {
     }
 
     // --- citation address integrity (task 1.4) ---
+
+    #[test]
+    fn a_hit_is_cited_by_repo_path_line_and_by_note_name_in_a_wiki() {
+        assert_eq!(locator("ken", "src/scan.rs", Some(42), None, false), "ken:src/scan.rs:42");
+        assert_eq!(locator("ken", "src\\scan.rs", Some(42), Some("f00218c"), false), "ken@f00218c:src/scan.rs:42");
+        assert_eq!(locator("ken", "README.md", None, None, false), "ken:README.md", "no line: no suffix");
+        assert_eq!(
+            locator("sr-docs", "Engine/Combat Loop.md", Some(7), Some("abc1234"), true),
+            "[[Combat Loop]] · sr-docs@abc1234:Engine/Combat Loop.md:7"
+        );
+        assert_eq!(
+            locator("sr-docs", "tools/gen.py", Some(3), None, true),
+            "sr-docs:tools/gen.py:3",
+            "code in a wiki repo is not a note"
+        );
+    }
+
+    #[test]
+    fn head_sha_reads_a_branch_a_packed_ref_and_a_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        assert_eq!(head_sha(dir.path()), None, "no HEAD yet");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("refs/heads/main"), "f00218c9b1e2d3a4f5061728394a5b6c7d8e9f01\n").unwrap();
+        assert_eq!(head_sha(dir.path()).as_deref(), Some("f00218c"));
+        std::fs::remove_file(git.join("refs/heads/main")).unwrap();
+        std::fs::write(git.join("packed-refs"), "# pack-refs\n1e132cf00000000000000000000000000000000a refs/heads/main\n").unwrap();
+        assert_eq!(head_sha(dir.path()).as_deref(), Some("1e132cf"));
+        std::fs::write(git.join("HEAD"), "0f87d6f11111111111111111111111111111111b\n").unwrap();
+        assert_eq!(head_sha(dir.path()).as_deref(), Some("0f87d6f"));
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(head_sha(plain.path()), None, "not a git repo");
+    }
 
     #[test]
     fn every_hit_carries_a_resolvable_ken_address() {

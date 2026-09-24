@@ -66,6 +66,10 @@ pub struct HybridHit {
     pub chunk_id: i64,
     pub snippet: String,
     pub source: Source,
+    /// The line the winning chunk starts on, filled by the caller that has
+    /// the database (`routing::search_member`); None before that, or for a
+    /// chunk stored before lines were recorded.
+    pub line: Option<i64>,
 }
 
 /// Merge FTS and KNN chunk hits per B4 "FTS-priority fill": FTS hits fill
@@ -98,6 +102,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             chunk_id: hit.chunk_id,
             snippet: hit.text.clone(),
             source,
+            line: None,
         });
     }
 
@@ -113,6 +118,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             chunk_id: hit.chunk_id,
             snippet: hit.text.clone(),
             source: Source::Semantic,
+            line: None,
         });
     }
 
@@ -375,6 +381,7 @@ mod tests {
             chunk_id,
             snippet: snippet.to_string(),
             source,
+            line: None,
         }
     }
 

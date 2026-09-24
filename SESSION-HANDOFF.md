@@ -73,7 +73,15 @@ PC (dev), not measured anywhere.
   that sees the same size but a new modified time hashes the bytes; on a
   match it records the new time and skips the parse and the search
   write. Cloud placeholders are never hashed (reading one downloads it).
-  ken-core on this PC: 771 pass, 53 fail (all pre-existing, Windows).
+- **Step 8, locators.** Chunks record the 1-based line their own content
+  starts on (`chunks.line`, schema v14; kept current when lines are added
+  above an unchanged chunk). Routed hits carry `line` and `locator`:
+  `repo:path:line`, `repo@sha:path:line` for a git repo (sha read from
+  `.git/HEAD`/`packed-refs`, no process), led by `[[Note]]` for a page in a
+  team or wiki repo. The MCP search output leads with the locator; the
+  app DTO and `RoutedHit` TS type carry both. Old chunks have no line
+  until the file is re-chunked.
+  ken-core on this PC: 775 pass, 53 fail (all pre-existing, Windows).
 
 ## The steps, in order
 

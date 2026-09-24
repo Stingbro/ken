@@ -129,6 +129,13 @@ fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The registered folder and kinds of project `id`, from the default
+/// registry.
+pub fn entry_of(id: Uuid) -> Option<(PathBuf, Vec<RepoKind>)> {
+    let reg = default_base_dir().and_then(|base| Registry::load(&base)).ok()?;
+    reg.projects.into_iter().find(|e| e.id == id).map(|e| (e.path, e.kind))
+}
+
 /// [`Registry::kind_of`] against the registry in the default app-data
 /// directory. Empty when it cannot be read.
 pub fn kind_of(root: &Path) -> Vec<RepoKind> {

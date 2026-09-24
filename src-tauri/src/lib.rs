@@ -7567,6 +7567,10 @@ struct RoutedHitDto {
     member_name: String,
     /// `ken://<project-id>/<rel-path>`.
     address: String,
+    /// The line the hit's chunk starts on, when known.
+    line: Option<i64>,
+    /// `repo:path:line`, `repo@sha:…`, led by `[[Note]]` in a wiki repo.
+    locator: String,
     /// `kg://<entity-id>` per entity that selected this hit's plan; empty
     /// unless the plan's reason was `KgEntities` (routing.rs module doc: "KG
     /// breadcrumbs are plan-level, not per-hit").
@@ -7588,6 +7592,8 @@ impl From<routing::RoutedHit> for RoutedHitDto {
             project_id: h.project_id.to_string(),
             member_name: h.member_name,
             address: h.address,
+            line: h.line,
+            locator: h.locator,
             kg_breadcrumbs: h.kg_breadcrumbs,
         }
     }

@@ -549,6 +549,15 @@ impl Db {
             if !has_hash {
                 self.conn.execute_batch("ALTER TABLE files ADD COLUMN byte_hash TEXT;")?;
             }
+            // And the 1-based line each chunk starts on, for `repo:path:line`
+            // citations. NULL until the file is next chunked.
+            let has_line: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('chunks') WHERE name = 'line'")?
+                .exists([])?;
+            if !has_line {
+                self.conn.execute_batch("ALTER TABLE chunks ADD COLUMN line INTEGER;")?;
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -677,13 +686,19 @@ impl Db {
         for chunk in chunks {
             let seq = chunk.seq as i64;
             let unchanged = matches!(existing.get(&seq), Some((_, hash)) if hash == &chunk.content_hash);
-            if !unchanged {
+            if unchanged {
+                // Same text, but lines added above it move where it starts.
                 tx.execute(
-                    r#"INSERT INTO chunks (path, seq, text, token_est, content_hash, tier)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "UPDATE chunks SET line = ?3 WHERE path = ?1 AND seq = ?2",
+                    params![path, seq, chunk.line as i64],
+                )?;
+            } else {
+                tx.execute(
+                    r#"INSERT INTO chunks (path, seq, text, token_est, content_hash, tier, line)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                        ON CONFLICT(path, seq) DO UPDATE SET
-                         text = ?3, token_est = ?4, content_hash = ?5, tier = ?6"#,
-                    params![path, seq, chunk.text, chunk.token_est as i64, chunk.content_hash, tier],
+                         text = ?3, token_est = ?4, content_hash = ?5, tier = ?6, line = ?7"#,
+                    params![path, seq, chunk.text, chunk.token_est as i64, chunk.content_hash, tier, chunk.line as i64],
                 )?;
                 let id: i64 = tx.query_row(
                     "SELECT id FROM chunks WHERE path = ?1 AND seq = ?2",
@@ -1912,6 +1927,18 @@ impl Db {
         )?)
     }
 
+    /// The line a chunk starts on, when it has been chunked since lines were
+    /// recorded.
+    pub fn chunk_line(&self, chunk_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT line FROM chunks WHERE id = ?1", params![chunk_id], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     /// The stored hash of a file's bytes, if it has one.
     pub fn file_byte_hash(&self, rel_path: &str) -> Result<Option<String>> {
         Ok(self
@@ -3129,7 +3156,28 @@ mod tests {
             text: text.to_string(),
             token_est: text.split_whitespace().count(),
             content_hash: hash.to_string(),
+            line: seq * 10 + 1,
         }
+    }
+
+    #[test]
+    fn a_chunk_keeps_its_line_and_it_moves_when_text_is_added_above() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_chunks("a.md", &[chunk(0, "one", "h0"), chunk(1, "two", "h1")], crate::kenignore::Tier::Full)
+            .unwrap();
+        let id: i64 = db
+            .conn
+            .query_row("SELECT id FROM chunks WHERE path='a.md' AND seq=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(db.chunk_line(id).unwrap(), Some(11));
+        let mut moved = chunk(1, "two", "h1");
+        moved.line = 40;
+        let changed = db
+            .upsert_chunks("a.md", &[chunk(0, "one", "h0"), moved], crate::kenignore::Tier::Full)
+            .unwrap();
+        assert!(changed.is_empty(), "same text: nothing to re-embed");
+        assert_eq!(db.chunk_line(id).unwrap(), Some(40));
+        assert_eq!(db.chunk_line(9999).unwrap(), None);
     }
 
     #[test]

@@ -1283,11 +1283,12 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
         return out;
     }
     for (i, hit) in report.results.iter().enumerate() {
+        // The locator is what to cite; the ken:// address is what to open.
         out.push_str(&format!(
-            "\n{}. {} [{}, {}] — {}",
+            "\n{}. {} ({}) [{}] — {}",
             i + 1,
+            hit.locator,
             hit.address,
-            hit.member_name,
             source_label(hit.source),
             hit.snippet
         ));
