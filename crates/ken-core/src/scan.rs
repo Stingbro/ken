@@ -368,7 +368,40 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
     db.set_file_tiers(&tiers)?;
 
+    if let Some(result) = control_query(db)? {
+        db.set_index_control(&result)?;
+    }
+
     Ok(stats)
+}
+
+/// Pages tried, in order, as the known page a control query must rank first.
+const CONTROL_PAGES: &[&str] = &["START-HERE.md", "Current/Index.md", "README.md", "readme.md"];
+
+/// Search the first control page present by its title and check it comes
+/// back first (docs-system: "Every rebuild runs one control query that must
+/// rank one known page first"). None when the project has none of them.
+pub fn control_query(db: &Db) -> Result<Option<crate::db::ControlResult>> {
+    let Some(page) = CONTROL_PAGES
+        .iter()
+        .find(|p| matches!(db.get_file(p), Ok(Some(f)) if f.status == STATUS_INDEXED))
+    else {
+        return Ok(None);
+    };
+    let stem = page.rsplit('/').next().unwrap_or(page).trim_end_matches(".md");
+    let query = db
+        .page_meta(page)?
+        .and_then(|m| m.title)
+        .unwrap_or_else(|| stem.replace(['-', '_'], " "));
+    let top = db.search(&query, 5)?.into_iter().next().map(|h| h.rel_path);
+    let ok = top.as_deref() == Some(*page);
+    Ok(Some(crate::db::ControlResult {
+        page: page.to_string(),
+        query,
+        top: (!ok).then_some(top).flatten(),
+        ok,
+        at: std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+    }))
 }
 
 /// Index a single file (already known to exist and be included). Returns the
@@ -1085,6 +1118,34 @@ mod tests {
         fs::write(&page, "# Rules, no frontmatter now, and longer\n").unwrap();
         scan(&project, &mut db).unwrap();
         assert_eq!(db.page_meta("Rules.md").unwrap(), None);
+    }
+
+    #[test]
+    fn each_scan_runs_the_control_query_and_health_counts_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("START-HERE.md"), "---\ntitle: Start here\n---\n# Start here\nRead this first.\n").unwrap();
+        fs::write(dir.path().join("notes.md"), "Notes that mention start once.\n").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join(".kenignore"), "~src/\n").unwrap();
+        let project = Project::create(dir.path(), "Health").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        let h = db.index_health().unwrap();
+        let control = h.control.clone().unwrap();
+        assert!(control.ok, "{control:?}");
+        assert_eq!((control.page.as_str(), control.query.as_str()), ("START-HERE.md", "Start here"));
+        assert_eq!(h.pending, 2, "both pages queued");
+        assert_eq!(h.skipped, 1, "src/ is searchable only");
+        assert_eq!((h.failed, h.retrying), (0, 0));
+
+        let empty = tempfile::tempdir().unwrap();
+        fs::write(empty.path().join("a.md"), "x\n").unwrap();
+        let p2 = Project::create(empty.path(), "None").unwrap();
+        let mut db2 = Db::open_in_memory().unwrap();
+        scan(&p2, &mut db2).unwrap();
+        assert_eq!(db2.index_health().unwrap().control, None, "no control page, no control");
     }
 
     #[test]

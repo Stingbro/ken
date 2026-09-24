@@ -94,7 +94,17 @@ PC (dev), not measured anywhere.
   see ...", "generated", "evidence from <date>" or "verified <date>".
   Not yet: serving a retired page's replacement in its place (the hit
   names it), and the app UI showing these (the data is on the DTO).
-  ken-core on this PC: 785 pass, 53 fail (all pre-existing, Windows).
+- **Step 6, index health.** `Db::index_health`: read of extractable,
+  pending, retrying, failed (3 attempts), skipped (search-only files), and
+  the last control query. Every scan ends with `scan::control_query`: the
+  first of START-HERE.md, Current/Index.md, README.md searched by its
+  title must rank first; the result is kept in `meta.index_control`. A
+  failed file that changes starts its three attempts over. App command
+  `index_health`; Home's footer shows a graph row and one warning line
+  (no on-device model, or the control check missed). The Timeline now
+  shows the model notice too.
+  ken-core on this PC: 786 pass, 53 fail (all pre-existing, Windows);
+  frontend 479/479.
 
 ## The steps, in order
 

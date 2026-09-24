@@ -92,6 +92,11 @@
     {#if knowledge.error}
       <div class="error">Last refresh didn't finish — {knowledge.error}</div>
     {/if}
+    {#if knowledge.llmPaused && !knowledge.empty}
+      <!-- Dated events come from reading each file; without the model the
+           timeline stops growing and would otherwise say nothing. -->
+      <p class="note">{knowledge.llmNotice}</p>
+    {/if}
 
     {#if knowledge.empty}
       <div class="empty-card">

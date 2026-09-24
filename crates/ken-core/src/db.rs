@@ -118,6 +118,40 @@ pub struct SearchHit {
     pub rank: f64,
 }
 
+/// Extraction health for one project (see [`Db::index_health`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexHealth {
+    /// Read for entities, of `extractable`.
+    pub analyzed: i64,
+    pub extractable: i64,
+    /// Queued, not read yet.
+    pub pending: i64,
+    /// Errored, with attempts left.
+    pub retrying: i64,
+    /// Errored three times: will not be tried again until the file changes.
+    pub failed: i64,
+    /// Searchable only (a code or reference repo, a `~` line): never read
+    /// for entities, on purpose.
+    pub skipped: i64,
+    /// The last rebuild's control query, if one has run.
+    pub control: Option<ControlResult>,
+}
+
+/// One control query: a known page searched by its title, which must come
+/// back first. When it does not, the index answers but cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlResult {
+    pub page: String,
+    pub query: String,
+    /// What ranked first instead, when it was not `page`.
+    pub top: Option<String>,
+    pub ok: bool,
+    /// Unix seconds.
+    pub at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRow {
@@ -1834,14 +1868,52 @@ impl Db {
         if already_done {
             return Ok(false);
         }
+        // A changed file starts its retries over: the three attempts belong to
+        // the content that failed, not the path. The same content re-queued
+        // keeps its count.
         self.conn.execute(
             "INSERT INTO extractions (rel_path, content_hash, status)
              VALUES (?1, ?2, 'pending')
              ON CONFLICT(rel_path) DO UPDATE SET
+               attempts = CASE WHEN extractions.content_hash = ?2 THEN extractions.attempts ELSE 0 END,
                content_hash = ?2, status = 'pending', error = NULL",
             params![rel_path, content_hash],
         )?;
         Ok(true)
+    }
+
+    /// The index as an instrument (docs-system: "the tool shows index health:
+    /// pending, failed and skipped extractions"). An index that has stopped
+    /// extracting still answers searches, with thin results and no error;
+    /// these numbers are how anyone can tell.
+    pub fn index_health(&self) -> Result<IndexHealth> {
+        let count = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
+        let (analyzed, extractable) = self.extraction_coverage()?;
+        Ok(IndexHealth {
+            analyzed,
+            extractable,
+            pending: count("SELECT COUNT(*) FROM extractions WHERE status = 'pending'")?,
+            retrying: self.conn.query_row(
+                "SELECT COUNT(*) FROM extractions WHERE status = 'error' AND attempts < ?1",
+                params![MAX_EXTRACTION_ATTEMPTS],
+                |r| r.get(0),
+            )?,
+            failed: self.extraction_failed_count()?,
+            skipped: count(
+                "SELECT COUNT(*) FROM files f
+                  WHERE f.status = 'indexed' AND f.tier <> 0
+                    AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)",
+            )?,
+            control: self
+                .meta_get("index_control")?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+        })
+    }
+
+    /// Record the last control query's result (see `scan::control_query`).
+    pub fn set_index_control(&self, result: &ControlResult) -> Result<()> {
+        let json = serde_json::to_string(result).map_err(|e| crate::Error::Other(e.to_string()))?;
+        self.meta_set("index_control", &json)
     }
 
     /// The oldest `pending` file (insertion order via implicit rowid) and the
@@ -3939,6 +4011,17 @@ mod tests {
         assert_eq!(db.next_pending_extraction().unwrap(), None);
         assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
         assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
+        assert_eq!(db.index_health().unwrap().failed, 1);
+
+        // An edit gives the new content the full three tries, not one.
+        db.enqueue_extraction_if_changed("b.md", "hb-edited").unwrap();
+        let attempts: i64 = db
+            .conn
+            .query_row("SELECT attempts FROM extractions WHERE rel_path = 'b.md'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0);
+        let h = db.index_health().unwrap();
+        assert_eq!((h.failed, h.pending), (0, 1));
     }
 
     #[test]

@@ -10,6 +10,26 @@ export interface ProjectInfo {
   ingestRunner: "hidden-tui" | "headless";
 }
 
+/** Mirrors `IndexHealthDto`: the index as an instrument. */
+export interface IndexHealth {
+  analyzed: number;
+  extractable: number;
+  pending: number;
+  retrying: number;
+  /** Failed three times; not tried again until the file changes. */
+  failed: number;
+  /** Searchable only, on purpose (a code or reference repo, a `~` line). */
+  skipped: number;
+  control: {
+    page: string;
+    query: string;
+    top: string | null;
+    ok: boolean;
+    at: number;
+  } | null;
+  llmStatus: "ready" | "notInstalled" | "error";
+}
+
 /** What a repo is for; decides sync and how deep Ken reads it. */
 export type RepoKind = "team" | "wiki" | "code" | "reference";
 
@@ -1609,6 +1629,7 @@ export interface FamilyInboxItem {
 
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
+  indexHealth: () => invoke<IndexHealth>("index_health"),
   setProjectKind: (id: string, kind: RepoKind[], team: string | null) =>
     invoke<RegistryEntryStatus[]>("set_project_kind", { id, kind, team }),
   createProject: (path: string, name: string) =>

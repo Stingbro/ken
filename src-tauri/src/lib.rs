@@ -6937,6 +6937,31 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexHealthDto {
+    #[serde(flatten)]
+    health: ken_core::db::IndexHealth,
+    /// `ready` | `notInstalled` | `error`: without a local model nothing is
+    /// read for entities, and the screen must say which piece is missing.
+    llm_status: String,
+}
+
+/// Index health for the focused project: pending, failed and skipped
+/// extractions, and the last control query.
+#[tauri::command]
+fn index_health(state: State<SharedState>) -> CmdResult<IndexHealthDto> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    let health = active.db.index_health().map_err(err)?;
+    let llm_status = match ken_core::local_llm::llm_status() {
+        ken_core::local_llm::LlmStatus::Ready => "ready",
+        ken_core::local_llm::LlmStatus::NotInstalled => "notInstalled",
+        ken_core::local_llm::LlmStatus::Error(_) => "error",
+    };
+    Ok(IndexHealthDto { health, llm_status: llm_status.into() })
+}
+
 /// Rebuild the knowledge model now, by hand. Progress arrives as
 /// `knowledge-model-state` events: building → ready | error {detail}.
 /// Unlike the automatic build this ignores every threshold — "rebuild it
@@ -13501,6 +13526,7 @@ pub fn run() {
             sync_status,
             set_sync_auto,
             set_project_kind,
+            index_health,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

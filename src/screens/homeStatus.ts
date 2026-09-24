@@ -1,6 +1,6 @@
 // Pure helpers behind the home footer's stats and sync indicator. Kept out of
 // the .svelte file so the counting and copy can be unit-tested without a DOM.
-import type { FileRow, SyncStateName } from "../lib/api";
+import type { FileRow, IndexHealth, SyncStateName } from "../lib/api";
 
 export interface FileStats {
   total: number;
@@ -122,4 +122,49 @@ export function syncPresentation(
       // say that plainly and let the cloud tile own the word "sync".
       return { tone: "muted", label: "Local project" };
   }
+}
+
+/** One figure in the index-health row. `warn` marks what needs a look. */
+export interface HealthFigure {
+  count: number;
+  label: string;
+  warn: boolean;
+}
+
+/**
+ * The knowledge graph's side of the index, as Home shows it: what is read,
+ * what waits, what failed and what is skipped on purpose. An index that has
+ * stopped extracting still answers searches, just thinly, so these numbers
+ * are the only way anyone notices. Zero figures other than "read" are left
+ * out so a healthy project shows one tile.
+ */
+export function healthFigures(h: IndexHealth): HealthFigure[] {
+  const out: HealthFigure[] = [
+    { count: h.analyzed, label: `of ${h.extractable} read for the graph`, warn: false },
+  ];
+  if (h.pending + h.retrying > 0) {
+    out.push({ count: h.pending + h.retrying, label: "waiting to be read", warn: false });
+  }
+  if (h.failed > 0) out.push({ count: h.failed, label: "failed", warn: true });
+  if (h.skipped > 0) out.push({ count: h.skipped, label: "searchable only", warn: false });
+  return out;
+}
+
+/**
+ * The one sentence Home owes the reader when the index cannot be trusted:
+ * no local model (so nothing is read for entities, while search still
+ * works), or the control query missed its page. Null when all is well.
+ */
+export function healthWarning(h: IndexHealth): string | null {
+  if (h.llmStatus === "notInstalled") {
+    return "No on-device model is chosen, so nothing is read for the graph. Search still works. Choose the on-device model in Settings.";
+  }
+  if (h.llmStatus === "error") {
+    return "The on-device model hit a snag, so nothing is read for the graph. Search still works. Open Settings to check the model.";
+  }
+  if (h.control && !h.control.ok) {
+    const top = h.control.top ? `; ${h.control.top} came first` : "";
+    return `The index check missed: searching “${h.control.query}” did not bring ${h.control.page} first${top}. Results may be incomplete; rebuild the index.`;
+  }
+  return null;
 }

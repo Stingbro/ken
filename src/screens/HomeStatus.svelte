@@ -3,14 +3,36 @@
   // numbers are derived live from `app.files`; the counting/copy lives in
   // ./homeStatus so it can be unit-tested.
   import { app } from "../lib/app.svelte";
+  import { api, type IndexHealth } from "../lib/api";
   import { timeAgo } from "../lib/format";
-  import { cloudPresentation, fileStats, syncPresentation } from "./homeStatus";
+  import {
+    cloudPresentation,
+    fileStats,
+    healthFigures,
+    healthWarning,
+    syncPresentation,
+  } from "./homeStatus";
 
   const stats = $derived(fileStats(app.files));
   const cloud = $derived(
     cloudPresentation(stats.cloudEligible, stats.cloudSkipped, app.backgroundIndex),
   );
   const sync = $derived(syncPresentation(app.syncState, app.syncDetail));
+
+  // Re-read after every scan and whenever the file list changes, which is
+  // when the extraction queue moves.
+  let health = $state<IndexHealth | null>(null);
+  $effect(() => {
+    void app.lastScanAt;
+    void app.files.length;
+    void app.project?.id;
+    api.indexHealth().then(
+      (h) => (health = h),
+      () => (health = null),
+    );
+  });
+  const figures = $derived(health ? healthFigures(health) : []);
+  const warning = $derived(health ? healthWarning(health) : null);
 </script>
 
 <div class="footer">
@@ -42,6 +64,20 @@
         </div>
       {/if}
     </div>
+
+    {#if figures.length > 0}
+      <div class="stats graph" aria-label="Knowledge graph">
+        {#each figures as fig}
+          <div class="tile" class:warn={fig.warn}>
+            <span class="num">{fig.count}</span>
+            <span class="lbl">{fig.label}</span>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    {#if warning}
+      <p class="health-warning" role="status">{warning}</p>
+    {/if}
 
     <div class="sync">
       <span class="dot {sync.tone}" title={sync.label}></span>
@@ -93,6 +129,21 @@
   .lbl {
     font-size: 11.5px;
     color: var(--ink-tertiary);
+  }
+  .stats.graph {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .tile.warn .num,
+  .tile.warn .lbl {
+    color: var(--needs-input);
+  }
+  .health-warning {
+    margin: 12px 0 0;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--needs-input);
   }
   /* Cloud files being pulled down read as live work, not a static backlog. */
   .tile.indexing .num {

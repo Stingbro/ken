@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { cloudPresentation, fileStats, syncPresentation } from "./homeStatus";
+import type { IndexHealth } from "../lib/api";
+import { cloudPresentation, fileStats, healthFigures, healthWarning, syncPresentation } from "./homeStatus";
 
 const f = (
   status: "indexed" | "metadata_only" | "failed" | "cloud_only",
@@ -127,5 +128,45 @@ describe("cloudPresentation", () => {
     expect(waiting.count).toBe(5);
     expect(waiting.active).toBe(false);
     expect(waiting.label.toLowerCase()).toContain("waiting");
+  });
+});
+
+describe("index health", () => {
+  const base: IndexHealth = {
+    analyzed: 40,
+    extractable: 50,
+    pending: 0,
+    retrying: 0,
+    failed: 0,
+    skipped: 0,
+    control: { page: "START-HERE.md", query: "Start here", top: null, ok: true, at: 1 },
+    llmStatus: "ready",
+  };
+
+  it("shows only what was read when nothing waits, fails or is skipped", () => {
+    expect(healthFigures(base)).toEqual([{ count: 40, label: "of 50 read for the graph", warn: false }]);
+    expect(healthWarning(base)).toBeNull();
+  });
+
+  it("counts waiting, failed and skipped, and marks failures", () => {
+    const figs = healthFigures({ ...base, pending: 3, retrying: 2, failed: 1, skipped: 900 });
+    expect(figs.map((f) => [f.count, f.label, f.warn])).toEqual([
+      [40, "of 50 read for the graph", false],
+      [5, "waiting to be read", false],
+      [1, "failed", true],
+      [900, "searchable only", false],
+    ]);
+  });
+
+  it("says which piece is missing without a model, before anything else", () => {
+    const h = { ...base, llmStatus: "notInstalled" as const, control: { ...base.control!, ok: false } };
+    expect(healthWarning(h)).toMatch(/No on-device model/);
+  });
+
+  it("names the control page and what came first when the check misses", () => {
+    const h = { ...base, control: { ...base.control!, ok: false, top: "notes.md" } };
+    expect(healthWarning(h)).toBe(
+      "The index check missed: searching “Start here” did not bring START-HERE.md first; notes.md came first. Results may be incomplete; rebuild the index.",
+    );
   });
 });
