@@ -1711,6 +1711,10 @@ export interface FamilyInboxItem {
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   indexHealth: () => invoke<IndexHealth>("index_health"),
+  /** Draft the first wiki pages into workspace member `wiki` from every
+   *  member and an optional folder of documents. Background; a Review card
+   *  lists the result. Never touches a page a person wrote. */
+  draftWiki: (wiki: string, extra: string | null) => invoke<void>("draft_wiki", { wiki, extra }),
   /** What waits in the library inbox (Research/Ingestion/Raw/). */
   ingestStatus: () => invoke<IngestStatus>("ingest_status"),
   /** Read what waits in Raw/ now; false when a pass is already running. */

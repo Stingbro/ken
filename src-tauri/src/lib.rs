@@ -7104,6 +7104,49 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
     true
 }
 
+/// Draft the first wiki pages (item 4b) into the workspace member `wiki`,
+/// from every workspace member plus an optional folder of documents. Runs
+/// in the background through the Claude CLI; the result is one Review card.
+/// Never touches a page a person wrote.
+#[tauri::command]
+fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
+    let (base, wiki_root, wiki_id, repos) = {
+        let guard = state.lock().unwrap();
+        let ws = guard.workspace.as_ref().ok_or("open the workspace first")?;
+        let mut repos: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut target: Option<(std::path::PathBuf, uuid::Uuid)> = None;
+        for m in &ws.ws.members {
+            if let ken_core::workspace::MemberStatus::Ok(p) = &m.status {
+                repos.push((ken_core::workspace::member_leaf(&m.name).to_string(), p.root.clone()));
+                if m.name == wiki {
+                    target = Some((p.root.clone(), p.config.id));
+                }
+            }
+        }
+        let (root, id) = target.ok_or_else(|| format!("{wiki} is not a member of this workspace"))?;
+        (guard.base_dir.clone(), root, id, repos)
+    };
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    };
+    std::thread::spawn(move || {
+        let sources = ken_core::wikidraft::gather(&repos, extra.as_deref().map(Path::new));
+        let Ok(mut db) = Db::open(&base, wiki_id) else { return };
+        let generate = |prompt: &str| -> ken_core::Result<String> {
+            match ken_core::assistant::oneshot(&binary, &wiki_root, prompt, Duration::from_secs(600), &CancelToken::new())? {
+                ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+                ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
+                ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
+                ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
+            }
+        };
+        if let Err(e) = ken_core::wikidraft::draft(&wiki_root, &mut db, &sources, &local_date_today(), engine::now_epoch(), generate) {
+            eprintln!("warning: first-wiki draft failed: {e}");
+        }
+    });
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IngestStatusDto {
@@ -13878,6 +13921,7 @@ pub fn run() {
             ingest_status,
             ingest_now,
             ingest_undo,
+            draft_wiki,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

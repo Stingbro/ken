@@ -27,6 +27,21 @@
 
   const summary = $derived(indexSummary(rows));
 
+  // Item 4b: offered, never forced. Draft the first Current and architecture
+  // pages into a wiki repo from what the scan found, for a person to read.
+  let draftWiki = $state(false);
+  let draftInto = $state("");
+  let draftExtra = $state<string | null>(null);
+  const wikiRows = $derived(rows.filter((r) => r.include && r.kind.includes("wiki")));
+  $effect(() => {
+    if (!wikiRows.some((r) => r.member === draftInto)) draftInto = wikiRows[0]?.member ?? "";
+  });
+
+  async function chooseExtra() {
+    const folder = await openDialog({ directory: true, title: "A folder of documents to read too (a Confluence export, say)" });
+    if (typeof folder === "string") draftExtra = folder;
+  }
+
   async function chooseFolder() {
     error = null;
     const folder = await openDialog({ directory: true, title: "Where is your code?" });
@@ -56,6 +71,7 @@
     error = null;
     try {
       await app.confirmSetup(proposal.folder, name.trim() || "Code", rows, ignores);
+      if (draftWiki && draftInto) await api.draftWiki(draftInto, draftExtra);
       onclose();
     } catch (e) {
       error = String(e);
@@ -196,6 +212,28 @@
     <label class="name">
       Workspace name <input bind:value={name} />
     </label>
+    {#if wikiRows.length > 0}
+      <div class="draft">
+        <label>
+          <input type="checkbox" bind:checked={draftWiki} />
+          Draft the first wiki pages from these repos
+        </label>
+        {#if draftWiki}
+          <p class="note">
+            Claude reads the READMEs, docs, layout and who commits where, and drafts Current/Project,
+            Team, Who-Does-What and the architecture page into
+            <select bind:value={draftInto} aria-label="Wiki to draft into">
+              {#each wikiRows as w (w.member)}<option value={w.member}>{w.member}</option>{/each}
+            </select>.
+            Each page is marked draft and names its sources; a page someone already wrote is left
+            alone. A card on Review lists what was drafted.
+          </p>
+          <button class="btn btn-ghost" onclick={chooseExtra}>
+            {draftExtra ? `Also reading ${draftExtra.split(/[\/]/).pop()}` : "Also read a folder of documents…"}
+          </button>
+        {/if}
+      </div>
+    {/if}
     <div class="actions">
       <button class="btn btn-primary" disabled={busy || summary.entities + summary.search === 0} onclick={confirm}>
         {busy ? "Setting up…" : "Confirm and start reading"}
@@ -360,6 +398,15 @@
     display: flex;
     gap: 8px;
     align-items: center;
+    font-size: 13px;
+  }
+  .draft {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
     font-size: 13px;
   }
   .error {

@@ -199,7 +199,19 @@ PC (dev), not measured anywhere.
   writing what a note calls for (Current pages rewritten in place,
   rulings, tickets), recordings landing in Raw as their transcript,
   staging for memory/automation/chat writes to wiki pages.
-  ken-core on this PC: 806 pass, 53 fail (all pre-existing, Windows);
+- **Item 4b, the first wiki from an analysis.** New `wikidraft` module:
+  `gather` reads each workspace repo's READMEs/CLAUDE.md/START-HERE/AGENTS,
+  up to 10 top-level docs, its two-level layout, CODEOWNERS and `git
+  shortlog` authors, plus any extra folder (a Confluence export), labelled
+  `repo:path`, capped at 120k chars. `draft` fills Current/Project, Team,
+  Who-Does-What and Conventions/ARCHITECTURE only when missing or still an
+  untouched template (`{{` left), using that template; forces `status:
+  draft`, drops any `verified:`, cites sources inline and in frontmatter;
+  one Review card (kind `wiki-draft`) lists drafted, kept and failed
+  pages. Command `draft_wiki(wiki, extra)`; offered as a checkbox on the
+  set-up Index step (wiki repo select, optional documents folder).
+  Business docs beyond Current/Project wait for 2b.
+  ken-core on this PC: 810 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 482/482.
 
 ## The steps, in order
