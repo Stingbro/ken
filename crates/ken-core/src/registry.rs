@@ -12,12 +12,40 @@ use crate::project::Project;
 use crate::workspace::Workspace;
 use crate::{Error, Result};
 
+/// What a repo is for, which decides what Ken does there: sync, and how
+/// deep to read. Team and wiki repos hold people, rulings and dates, so they
+/// sync and are read for entities; code and reference repos are only made
+/// searchable, and Ken never commits into them. A repo can be more than one
+/// kind (a wiki that also carries code).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoKind {
+    Team,
+    Wiki,
+    Code,
+    Reference,
+}
+
+impl RepoKind {
+    /// Kinds whose repos Ken keeps in step with the team by default.
+    pub fn syncs(self) -> bool {
+        matches!(self, RepoKind::Team | RepoKind::Wiki)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryEntry {
     pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
+    /// Empty means not yet said. Kept here, in local app data, rather than
+    /// in the repo, so a code repo gets no file from Ken.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kind: Vec<RepoKind>,
+    /// The team this repo belongs to, by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 /// A recently opened workspace (recent-projects' sibling list — see
@@ -89,6 +117,19 @@ fn registry_path(base: &Path) -> PathBuf {
     base.join("projects.json")
 }
 
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// [`Registry::kind_of`] against the registry in the default app-data
+/// directory. Empty when it cannot be read.
+pub fn kind_of(root: &Path) -> Vec<RepoKind> {
+    default_base_dir()
+        .and_then(|base| Registry::load(&base))
+        .map(|reg| reg.kind_of(root))
+        .unwrap_or_default()
+}
+
 impl Registry {
     pub fn load(base: &Path) -> Result<Registry> {
         let path = registry_path(base);
@@ -109,16 +150,49 @@ impl Registry {
 
     /// Register (or re-register) a project. Same id updates path/name in
     /// place — e.g. a moved folder or a teammate's clone with the shared id.
+    /// Kind and team are what a person said about the repo, so a re-add
+    /// keeps them.
     pub fn add(&mut self, project: &Project) {
-        let entry = RegistryEntry {
-            id: project.config.id,
-            name: project.config.name.clone(),
-            path: project.root.clone(),
-        };
-        match self.projects.iter_mut().find(|e| e.id == entry.id) {
-            Some(existing) => *existing = entry,
-            None => self.projects.push(entry),
+        match self.projects.iter_mut().find(|e| e.id == project.config.id) {
+            Some(existing) => {
+                existing.name = project.config.name.clone();
+                existing.path = project.root.clone();
+            }
+            None => self.projects.push(RegistryEntry {
+                id: project.config.id,
+                name: project.config.name.clone(),
+                path: project.root.clone(),
+                kind: Vec::new(),
+                team: None,
+            }),
         }
+    }
+
+    /// Set a project's kind and team. Returns false for an unknown id.
+    pub fn set_kind(&mut self, id: Uuid, kind: Vec<RepoKind>, team: Option<String>) -> bool {
+        let Some(entry) = self.projects.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        entry.kind.clear();
+        for k in kind {
+            if !entry.kind.contains(&k) {
+                entry.kind.push(k);
+            }
+        }
+        entry.team = team.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        true
+    }
+
+    /// The kinds registered for the repo at `root`, empty when it is not
+    /// registered or no kind has been said. Paths compare canonicalized, so
+    /// a trailing slash or a different drive-letter case still matches.
+    pub fn kind_of(&self, root: &Path) -> Vec<RepoKind> {
+        let want = canonical(root);
+        self.projects
+            .iter()
+            .find(|e| canonical(&e.path) == want)
+            .map(|e| e.kind.clone())
+            .unwrap_or_default()
     }
 
     pub fn remove(&mut self, id: Uuid) {
@@ -248,6 +322,54 @@ mod tests {
 
         let reloaded = Registry::load(app.path()).unwrap();
         assert_eq!(reloaded.last_workspace, Some(id));
+    }
+
+    #[test]
+    fn kind_and_team_survive_a_re_add_and_a_reload() {
+        let app = tempdir().unwrap();
+        let proj_dir = tempdir().unwrap();
+        let project = Project::create(proj_dir.path(), "Atlas").unwrap();
+        let mut reg = Registry::default();
+        reg.add(&project);
+        assert!(reg.set_kind(
+            project.config.id,
+            vec![RepoKind::Wiki, RepoKind::Code, RepoKind::Wiki],
+            Some("  Atlas team ".into()),
+        ));
+        assert_eq!(reg.projects[0].kind, vec![RepoKind::Wiki, RepoKind::Code], "duplicates dropped, order kept");
+        assert_eq!(reg.projects[0].team.as_deref(), Some("Atlas team"));
+
+        reg.add(&project); // reopening re-registers
+        reg.save(app.path()).unwrap();
+        let loaded = Registry::load(app.path()).unwrap();
+        assert_eq!(loaded.projects[0].kind, vec![RepoKind::Wiki, RepoKind::Code]);
+        assert_eq!(loaded.projects[0].team.as_deref(), Some("Atlas team"));
+        assert!(!reg.set_kind(Uuid::new_v4(), vec![RepoKind::Code], None), "unknown id");
+    }
+
+    #[test]
+    fn kind_of_matches_the_folder_however_it_is_spelled() {
+        let proj_dir = tempdir().unwrap();
+        let project = Project::create(proj_dir.path(), "Atlas").unwrap();
+        let mut reg = Registry::default();
+        reg.add(&project);
+        reg.set_kind(project.config.id, vec![RepoKind::Team], None);
+        let dotted = proj_dir.path().join(".");
+        assert_eq!(reg.kind_of(&dotted), vec![RepoKind::Team]);
+        let other = tempdir().unwrap();
+        assert!(reg.kind_of(other.path()).is_empty(), "unregistered folder has no kind");
+    }
+
+    #[test]
+    fn a_registry_without_kinds_still_loads() {
+        let app = tempdir().unwrap();
+        let old_json = r#"{"projects":[{"id":"6f1c2c1e-9a55-4c55-9d7a-1d2a3b4c5d6e","name":"Old","path":"/old"}]}"#;
+        fs::write(registry_path(app.path()), old_json).unwrap();
+        let loaded = Registry::load(app.path()).unwrap();
+        assert!(loaded.projects[0].kind.is_empty());
+        assert_eq!(loaded.projects[0].team, None);
+        let raw = serde_json::to_string(&loaded).unwrap();
+        assert!(!raw.contains("kind") && !raw.contains("team"), "unset fields are not written");
     }
 
     #[test]

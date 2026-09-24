@@ -2555,6 +2555,34 @@ async fn search_all_projects(
     Ok(SearchAllProjectsDto { results, member_status: roster })
 }
 
+/// Say what a repo is for: its kinds and team. Kept in the local registry,
+/// never in the repo. Sync follows the kind unless `project.json` sets it,
+/// and the dot is refreshed at once for an open member.
+#[tauri::command]
+fn set_project_kind(
+    app: AppHandle,
+    state: State<SharedState>,
+    id: String,
+    kind: Vec<ken_core::registry::RepoKind>,
+    team: Option<String>,
+) -> CmdResult<Vec<RegistryEntryStatus>> {
+    let guard = state.lock().unwrap();
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
+    let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
+    if !registry.set_kind(uuid, kind, team) {
+        return Err(format!("no project with id {id}"));
+    }
+    registry.save(&guard.base_dir).map_err(err)?;
+    if let Some(member) = guard.members.get(&uuid) {
+        let status = sync_status_of(&member.project);
+        emit_member(&app, uuid, "sync-state", SyncStateEvent {
+            state: if status.active { "synced" } else { "off" }.into(),
+            detail: None,
+        });
+    }
+    Ok(registry.statuses())
+}
+
 #[tauri::command]
 fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
@@ -6145,7 +6173,7 @@ fn sync_status_of(project: &Project) -> SyncStatus {
     } else {
         (None, None)
     };
-    let auto = sync::sync_auto(project);
+    let auto = sync::sync_auto(project, &ken_core::registry::kind_of(&project.root));
     SyncStatus {
         mode: if is_git { "git" } else { "drive" }.into(),
         auto,
@@ -13456,6 +13484,7 @@ pub fn run() {
             mark_all_seen,
             sync_status,
             set_sync_auto,
+            set_project_kind,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

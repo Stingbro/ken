@@ -21,6 +21,7 @@ use serde_json::json;
 use crate::db::Db;
 use crate::engine::now_epoch;
 use crate::project::Project;
+use crate::registry::{self, RepoKind};
 use crate::{Error, Result};
 
 pub const COMMIT_MESSAGE: &str = "Ken: update knowledge";
@@ -93,16 +94,18 @@ pub fn remote_and_branch(root: &Path) -> (Option<String>, Option<String>) {
     (remote, branch)
 }
 
-/// Project-level sync toggle: `project.json` extra `"sync": {"auto": bool}`.
-/// Defaults to on.
-pub fn sync_auto(project: &Project) -> bool {
+/// Project-level sync toggle: `project.json` extra `"sync": {"auto": bool}`
+/// when a person has set it; otherwise on only for a team or wiki repo.
+/// Off by default because sync runs `git add -A`, commits and pushes: in a
+/// code repo that would publish whatever sits in the working tree.
+pub fn sync_auto(project: &Project, kind: &[RepoKind]) -> bool {
     project
         .config
         .extra
         .get("sync")
         .and_then(|v| v.get("auto"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+        .unwrap_or_else(|| kind.iter().any(|k| k.syncs()))
 }
 
 /// Default gap between the first change of a burst and the auto-commit that
@@ -149,7 +152,10 @@ pub fn sync_active(root: &Path) -> bool {
     if !is_git_repo(root) {
         return false;
     }
-    let auto = Project::open(root).map(|p| sync_auto(&p)).unwrap_or(true);
+    // No project.json means Ken has not been set up here: never sync.
+    let auto = Project::open(root)
+        .map(|p| sync_auto(&p, &registry::kind_of(root)))
+        .unwrap_or(false);
     auto && remote_and_branch(root).0.is_some()
 }
 
@@ -940,6 +946,14 @@ mod tests {
         git(repo, &["config", "user.name", "Ken Test"]);
     }
 
+    /// A Ken project at `repo` with sync switched on by hand, as the engine
+    /// tests need: with no kind registered, sync is off.
+    fn sync_on(repo: &Path) {
+        let mut p = Project::create(repo, "B").unwrap();
+        p.config.extra.insert("sync".into(), json!({"auto": true}));
+        p.save().unwrap();
+    }
+
     /// A bare origin with two clones, seeded with notes.md on main.
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1119,11 +1133,28 @@ mod tests {
     fn sync_auto_reads_project_extra() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = Project::create(dir.path(), "X").unwrap();
-        assert!(sync_auto(&p), "defaults on");
         p.config
             .extra
             .insert("sync".into(), json!({"auto": false}));
-        assert!(!sync_auto(&p));
+        assert!(!sync_auto(&p, &[RepoKind::Wiki]), "an explicit off beats the kind");
+        p.config
+            .extra
+            .insert("sync".into(), json!({"auto": true}));
+        assert!(sync_auto(&p, &[RepoKind::Code]), "an explicit on beats the kind");
+    }
+
+    /// Unset, sync follows the kind: a code repo, or one nobody has
+    /// described yet, is never committed into.
+    #[test]
+    fn sync_auto_defaults_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Project::create(dir.path(), "X").unwrap();
+        assert!(!sync_auto(&p, &[]), "no kind: off");
+        assert!(!sync_auto(&p, &[RepoKind::Code]));
+        assert!(!sync_auto(&p, &[RepoKind::Reference]));
+        assert!(sync_auto(&p, &[RepoKind::Team]));
+        assert!(sync_auto(&p, &[RepoKind::Wiki]));
+        assert!(sync_auto(&p, &[RepoKind::Wiki, RepoKind::Code]), "a wiki that holds code syncs");
     }
 
     /// The `sync` block drives the engine's timers, and an absent block
@@ -1217,7 +1248,7 @@ mod tests {
     #[test]
     fn engine_pushes_local_changes() {
         let (_d, bare, _a, b) = fixture();
-        Project::create(&b, "B").unwrap();
+        sync_on(&b);
         let app = tempfile::tempdir().unwrap();
         let db_path = app.path().join("sync.db");
         drop(Db::open_at(&db_path).unwrap());
@@ -1273,7 +1304,7 @@ mod tests {
         fs::create_dir_all(a.join("knowledge")).unwrap();
         commit_push(&a, "knowledge/People.md", "base\n");
         git(&b, &["pull", "--no-rebase", "--no-edit"]);
-        Project::create(&b, "B").unwrap();
+        sync_on(&b);
 
         // Divergence: teammate pushes, we edit locally (uncommitted).
         commit_push(&a, "knowledge/People.md", "teammate version\n");

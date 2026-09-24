@@ -10,11 +10,17 @@ export interface ProjectInfo {
   ingestRunner: "hidden-tui" | "headless";
 }
 
+/** What a repo is for; decides sync and how deep Ken reads it. */
+export type RepoKind = "team" | "wiki" | "code" | "reference";
+
 export interface RegistryEntryStatus {
   id: string;
   name: string;
   path: string;
   available: boolean;
+  /** Absent until someone says what the repo is. */
+  kind?: RepoKind[];
+  team?: string;
 }
 
 export interface FileRow {
@@ -1582,6 +1588,8 @@ export interface FamilyInboxItem {
 
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
+  setProjectKind: (id: string, kind: RepoKind[], team: string | null) =>
+    invoke<RegistryEntryStatus[]>("set_project_kind", { id, kind, team }),
   createProject: (path: string, name: string) =>
     invoke<ProjectInfo>("create_project", { path, name }),
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),

@@ -20,18 +20,36 @@ still applies from that one is under "Carried over" at the end.
 - The earlier Ken handoff with items 5 and 6 was never committed; it
   lived on the other PC. This file is now the only copy.
 
-## Before the first commit on this branch
+## Measure `f00218c` on the other PC
 
-Build `f00218c` (the member fix and the one global pace for background
-extraction), install it, and measure it on one small project:
+`f00218c` fixes workers that stopped for every workspace member but
+one, and adds one 2s pace for background extraction. Only a workspace
+with several members and a real queue shows either, so the measurement
+belongs on the other PC, against the Shattered-Realms index:
 
 ```sql
 SELECT status, COUNT(*) FROM extractions GROUP BY status;
 ```
 
-against `%APPDATA%\ken\index\<id>.db`. Every step below adds to the
-extraction queue, and the queue is what went wrong in September.
-Status: not built, not measured.
+on `%APPDATA%\ken\index\<id>.db`. The before figures (from `d8ed403`):
+354 errors, 77 done, 1205 queued. Look for errors staying low, the queue
+draining at the pace, and every member moving. Status: built on this
+PC (dev), not measured anywhere.
+
+## Done on this branch
+
+- **Steps 1 and 2, kind and sync (first part of 2).** `RepoKind`
+  (team, wiki, code, reference) and `team` on each registry entry, in
+  local app data, never in the repo; kept across a re-add. `sync_auto`
+  now honours an explicit `sync.auto` in `project.json`, and otherwise
+  is on only for team and wiki kinds; a folder with no `project.json`
+  never syncs. App command `set_project_kind`; `api.setProjectKind`.
+  No set-up screen yet (step 4).
+  - **On the other PC after pulling this:** every existing project has
+    no kind, so sync goes off. For sr-docs and any other wiki or team
+    repo, either set its kind or switch Sync on in Settings (which
+    writes `sync.auto: true`).
+  - Still to do for step 2: the index state per repo from its kind.
 
 ## The steps, in order
 
