@@ -1,108 +1,166 @@
-# Session handoff — workspace group folders (SR move pending)
+# Session handoff — Ken at Level 2 (`knowledge-layer`)
 
-Last updated: 2026-09-01. Branch: `ken-workspace-home`. Read this top to
-bottom before doing anything; the one hard rule is in the next section.
+Last updated: 2026-09-24. Branch: `knowledge-layer`, cut from
+`ken-workspace-home` at `f00218c`. Read this top to bottom before doing
+anything. It replaces the 2026-09-01 handoff (SR group folders); what
+still applies from that one is under "Carried over" at the end.
 
-## THE HOLD (do not skip)
+## Where the plan lives
 
-The physical move of the three SR repos into `Hytale Code\SR\` is
-**blocked until the user explicitly says go**. Their words: *"Ill say
-when, as we do not want to break the claude sessions either we have
-going."* At last check there were live Claude Code sessions in those
-repos AND a running Hytale dev server:
+- **The analysis:** "Ken at Level Two",
+  https://claude.ai/artifact/9b8HKcjTBRaJoreywfFcEG (private, owned by
+  the other account; rulings go on it as comments). It checks 45
+  Knowledge rulings from Ways of Working against this code: 5 has,
+  17 partial, 23 missing, each with file and line at `f00218c`.
+- **The method:** https://github.com/Stingbro/Ways-of-Working, `main`
+  at `b824813` on 2026-09-24. The white box is
+  `design/wright/wright-whitebox.html`; the Ken/Wright split note is
+  in `BUILD-ORDER.md`, Repo strategy. Both are private to the
+  `Stingbro` GitHub account.
+- The earlier Ken handoff with items 5 and 6 was never committed; it
+  lived on the other PC. This file is now the only copy.
 
-- `gradlew runServer` launched from
-  `ShatteredRealms\.claude\worktrees\youthful-archimedes-5b0857`
-  (java `com.hypixel.hytale.Main`, ~4 GB heap) plus two Gradle daemons.
+## Before the first commit on this branch
 
-Do not stop that server, do not move the repos, do not rename
-`~/.claude/projects` dirs until the user gives the word.
+Build `f00218c` (the member fix and the one global pace for background
+extraction), install it, and measure it on one small project:
 
-## What is DONE and verified
+```sql
+SELECT status, COUNT(*) FROM extractions GROUP BY status;
+```
 
-Nested workspace members (`SR/ShatteredRealms` style, one nesting level)
-are implemented end to end and gated green:
+against `%APPDATA%\ken\index\<id>.db`. Every step below adds to the
+extraction queue, and the queue is what went wrong in September.
+Status: not built, not measured.
 
-- **Core** (`crates/ken-core/src/workspace.rs`): `member_leaf` /
-  `member_group` / `validate_member_name`; `derived_groups` /
-  `effective_groups` / `effective_group_members`; `set_group` rejects
-  derived names; discovery surfaces group-folder children and hides the
-  container; nested `ignore_folder`. 23/23 `workspace::` tests pass.
-- **Tauri** (`src-tauri/src/lib.rs`): add-member validation + leaf
-  display names, candidate prefix filtering, two-level ignored walk,
-  group ancestor nodes in `get_tree_all`, effective-group view for
-  groups/search/chat, chat errors on an empty named scope.
-- **Frontend**: `memberLeaf`/`memberGroup` in `src/lib/api.ts`; `openTab`
-  longest-prefix member match in `src/lib/app.svelte.ts`; leaf labels in
-  WorkspaceSwitcher, MembersStrip, ScopePicker, scope store,
-  ProjectGroups (derived groups shown read-only, "from folder"),
-  creation wizard. svelte-check: 0 errors / 18 pre-existing warnings.
-- **Spec**: `openspec/changes/workspace-group-folders/` (proposal,
-  design D6–D9, tasks). Tasks 5.1/5.2 checked; 5.3 (live verification)
-  waits on the move.
-- **Runtime**: release exe rebuilt with all of this and Ken relaunched
-  from it. The running app understands `SR/...` manifest members; the
-  current flat layout keeps working unchanged until the move.
+## The steps, in order
 
-## The go-sequence (execute only after the user says go)
+What protects the index first, then what a hit carries, then the
+inbox, then drift. Paths are relative to the repo root.
 
-Scripts live in `openspec/changes/workspace-group-folders/migration/`.
-Both `.mjs` scripts are idempotent — safe to re-run. Run them with Node,
-never re-implement in PowerShell (codepage/BOM corruption — see
-project memory).
+1. **Sync off for code.** `sync_auto` in `crates/ken-core/src/sync.rs`
+   defaults to `true`: any git repo with a remote gets `git add -A`,
+   a commit "Ken: update knowledge", pull and push (see `0f89f8d`,
+   `921f432`). Default off; on only for kind team or wiki.
+2. **Kinds and index state per repo.** Registry entries gain `kind`
+   (team, wiki, code, reference, or a list) and `team`
+   (`registry.rs:17-21`). The index state (off / search / entities) is
+   one line Ken writes at the top of the repo's `.kenignore`, so the
+   existing tiers do the work. Kind sets the default: entities for
+   team and wiki, search for code and reference.
+   - **2b. Business docs vs dev docs (new, from the other PC).** The
+     library holds two kinds of page for two audiences. Business docs
+     are for people who never read code and go further than a
+     Confluence page: what the product does, what was decided and
+     why, what changed per release. Dev docs are conventions,
+     architecture, how-tos and code references. To decide, in an
+     analysis first: how they are told apart (repo kind, wiki section
+     or tag), who writes and who reads each, and how Ingest and the
+     drift check treat each.
+3. **Built-in patterns.** Fill the empty built-in list
+   (`kenignore.rs:210`): worktrees from `git worktree list`, secrets
+   (hard-ignored, no `!` brings them back), archives, media. Re-tier
+   an indexed file when the ignore file changes (kenignore spec task
+   1.6). The Deep rebuild honours the tier
+   (`knowledge_model.rs:496-501`).
+4. **Set-up: Folder, Team, Repos, Index.** Confirm writes the
+   registry, the workspace manifest and the ignore lines; Ken reads
+   only after. Nothing is written into a code repo. Scan again
+   reports what moved, never overwrites.
+   - **4b. First-time wiki from an analysis (new, from the other PC).**
+     Today "Start a new team" writes the wiki from empty templates.
+     Add an option, offered and never forced: Claude reads the repos,
+     READMEs, existing docs, any Confluence export or dropped-in
+     documents and the code layout, then drafts the Current pages
+     (project, team, who does what), the architecture and convention
+     pages and the first business docs (2b) for a person to review.
+     Each drafted page names the source it came from.
+5. **Extraction scope.** Entities from team and wiki repos only; code
+   is chunked and embedded, never sent to the extraction queue
+   (`scan.rs:338`, `knowledge_model.rs:416-450`).
+6. **Index health.** Home shows pending, failed and skipped; the
+   no-model row on Home, Map and Timeline (frame 8c). Each rebuild
+   ends with one control query that must rank a known page first.
+   Attempts reset when a failed file changes.
+7. **Hash, not time.** The rescan re-reads only when the content hash
+   changes (`scan.rs:273-283`).
+8. **Locators.** Chunks store their first line; hits and MCP citations
+   come back as `repo:path:line`, `[[Note Name]]` for wiki pages, and
+   `repo@sha` for git repos.
+9. **Frontmatter.** Read `title`, `aliases`, `verified`, `sources`,
+   retired and generated banners from wiki pages. Hits carry the
+   verified date; Ways-of-Working and Platform rank first; Research
+   hits are dated; a retired page is served under its replacement.
+10. **Page links.** The third index: name links by stem or alias,
+    path links by path, code stripped first, counted apart.
+    Duplicate and missing names land on Review, grouped by section.
+11. **Aliases in the query**, from the vocabulary page and the
+    decisions log, in the app and the MCP.
+12. **Ingest and Recipes.** The rail item splits into two tabs. Ingest
+    watches `Research/Ingestion/Raw/`, writes one dated note per source
+    to `Ingested/`. Recordings land in Raw. Review gets a card per
+    source with Open, Undo and Seen. Every agent write to a wiki page
+    goes through staging, first run included.
+13. **Drift.** Weekly sweep over wiki pages: Docs check against git,
+    Decision check per decisions-log entry, the 30-day age rule, two
+    controls and a minimum count, a run record. Findings on Review;
+    Research in its own bucket.
+14. **The graph per team**, built from the manifest's team repos, its
+    file in the workspace folder (`lib.rs:7112-7164`,
+    `federation.rs:865`, `workspace_kg_db.rs:40`).
+15. **Teams and Settings.** Send from the app into a team's `shared/`;
+    Settings uses the plain names and scopes from frame 10e; the
+    connector finds `ken-mcp` where `install.ps1` puts it on Windows
+    (`%LOCALAPPDATA%\Programs\ken-mcp`).
 
-1. User winds down (or authorizes stopping): the Hytale server, the
-   Gradle daemons, and every Claude Code session inside the three repos.
-2. Stop Ken.
-3. `mkdir "C:\Users\Owner\Documents\Hytale Code\SR"` and `Move-Item`
-   the three repos into it: `ShatteredRealms`, `ShatterdRealmsTools`
-   (spelling is correct — historical typo), `sr-docs`.
-4. `node migration/sr-move-state.mjs` — manifest members gain `SR/`,
-   `~/.claude/projects` dirs renamed to the new path keys (agent
-   history follows), `.claude.json` trust entries added (backup written
-   first), Obsidian vault paths, `asset-index.json`, worktree
-   `config.worktree` hooksPath fixes.
-5. `node migration/sr-move-docs.mjs` — inserts `SR` into absolute
-   old-location paths and deepens `../hytale-shared-source`-style
-   relative refs across sr-docs, the Tools repo's
-   tickets/findings/docs, and ShatteredRealms/docs (~55 files).
-6. `git worktree repair <worktree paths>` in **both** code repos (the
-   `.git/worktrees/*/gitdir` backlinks are absolute).
-7. Hand-edit CLAUDE.mds:
-   - NEW `SR\CLAUDE.md`: shared cross-repo facts — the three-layer
-     search rule, a repo table, "docs live in sr-docs — search there
-     first". (CLAUDE.md discovery walks UP from cwd, so this loads for
-     all three repos automatically.)
-   - `ShatteredRealms\CLAUDE.md` (~line 9) and
-     `ShatterdRealmsTools\CLAUDE.md` (~line 6): sibling-path tables.
-   - `sr-docs\CLAUDE.md` + `START-HERE.md`: the
-     `..\hytale-shared-source` notes become `..\..\`.
-8. Relaunch Ken; verify per tasks.md 5.3: SR group in Home's picker,
-   merged tree shows `SR/…`, chat scoped to "SR" reaches both code
-   repos, display names are leaves everywhere.
-9. Known cosmetic leftover: the Cursor project-cache slug in
-   `sr-docs/_meta/build_inventory.py:12` regenerates itself when the
-   user next opens the repo in Cursor — leave it.
+Out of this branch: the upstream merge from smo-key/ken (17 commits,
+7 conflicting files including `src-tauri/src/lib.rs`, its own ticket
+after step 1; no `upstream` remote is set in this clone), and the
+multi-workspace spec (0 of 35 tasks).
 
-## Build/test recipe (mandatory on this machine)
+## Method pages that change once Ken is at Level 2
 
-Plain `cargo test` fails (Vulkan/Ninja env). Use
-`migration/test-workspace.bat` — vcvars64 + VULKAN_SDK + Ninja +
-LIBCLANG_PATH + `CARGO_TARGET_DIR=D:\kt`, **release profile** (the
-debug-profile CMake caches under `D:\kt\debug\build` are poisoned by an
-old `C:\kt` path and need a separate cleanup — task chip exists).
-Never write JSON/config files via PowerShell `Set-Content`: PS 5.1
-UTF-8 means BOM, and `AppSettings::load` silently rejects BOM'd JSON
-(this exact bug ate an afternoon). Use the Write/Edit tools or Node.
+In Ways-of-Working, listed in the report's "Method pages that change"
+section: `docs/index.html`, `docs/manual/index.html`,
+`docs/the-tool.html`, `docs/tool/index.html`, `docs/wright.html`,
+`docs/wright-onboarding.html`, `docs/manual/docs-system.html`,
+`docs/manual/drift.html`, `docs/ways-of-working.html`, `README.md`,
+`BUILD-ORDER.md`, `templates/wiki/Research/Ingestion/Index.md`, and
+white box frames 8, 9, 10e, 11 and sections 16 and 17. Items 2b and 4b
+will need their own lines there once decided.
 
-## Other open threads (not started / not approved)
+## Machines
 
-- **sr-docs optimization pass** (proposed, awaiting approval): status/
-  supersession frontmatter on the ~464 `Work/` tickets, a recurring
-  lint job, a `log.md`, `verified:` dates on `Engine/` notes — per the
-  two LLM-wiki gists the user shared.
-- Sync interval configurability (~1 hr push debounce) — designed, not
-  built.
-- Onboarding chicken-and-egg: the workspace card is gated on a flag
-  that lives in settings.json, which a fresh install doesn't have.
-  Offered a fix; not approved.
+- **Other PC** (`C:\Users\chris\Code\ken`, and earlier
+  `C:\Users\Owner\Documents\Hytale Code\ken`): has the full build
+  environment and an installed Ken with real indexes. The measurement
+  above belongs there.
+- **This PC** (`C:\Code\ken`, `C:\Code\Ways-of-Working`, checked
+  2026-09-24): Rust 1.97.1, Node 20.20, VS 2022 Build Tools with C++,
+  CMake and Ninja. Missing the Vulkan SDK and LLVM (`libclang`), so
+  the app does not build yet. No D: drive, so `CARGO_TARGET_DIR=D:\kt`
+  in `migration/test-workspace.bat` needs changing here. Ken has never
+  run here (`%APPDATA%\ken` absent). GitHub: `Stingbro` owns both
+  repos; `StingBros` is a second login on this PC with no access to
+  Ways-of-Working.
+
+## Carried over from the 2026-09-01 handoff
+
+- **The SR move hold still stands on the other PC:** do not move the
+  three SR repos into `Hytale Code\SR\` or rename `~/.claude/projects`
+  dirs until the user says go. The go-sequence and scripts are in
+  `openspec/changes/workspace-group-folders/migration/`; see git
+  history of this file (`606fe3e`) for the full sequence. Task 5.3
+  (live verification) waits on it.
+- **Build recipe:** plain `cargo test` fails (Vulkan/Ninja env). Use
+  `openspec/changes/workspace-group-folders/migration/test-workspace.bat`
+  (vcvars64 + VULKAN_SDK + Ninja + LIBCLANG_PATH, release profile),
+  adjusting its paths per machine.
+- **Never write JSON or config with PowerShell `Set-Content`:** PS 5.1
+  writes a BOM and `AppSettings::load` silently rejects BOM'd JSON.
+  Use the Write/Edit tools or Node.
+- Open, not approved: the sr-docs optimization pass (frontmatter on
+  `Work/` tickets, lint job, `log.md`, `verified:` dates; overlaps
+  steps 9 and 13), configurable sync interval, and the onboarding
+  flag chicken-and-egg (the workspace card is gated on a flag a fresh
+  install's settings.json lacks; overlaps step 4).
