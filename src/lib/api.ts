@@ -1802,8 +1802,10 @@ export const api = {
   /** Keyword FTS merged with semantic (when the `semanticIndex` feature is
    *  on for the project); transparently degrades to FTS-only results when
    *  it's off, so callers can always route through this instead of `search`. */
-  hybridSearch: (query: string, limit = 30) =>
-    invoke<HybridHit[]>("hybrid_search", { query, limit }),
+  /** `audience` "business" keeps only pages written for readers who never
+   *  see code (Current, Design, Work, or `audience: business`). */
+  hybridSearch: (query: string, limit = 30, audience: "business" | "dev" | null = null) =>
+    invoke<HybridHit[]>("hybrid_search", { query, limit, audience }),
   /** Route `query` across every open workspace member (kg-routing task 4.1):
    *  plan (Named/KG-guided/Broadcast), fan out hybrid search over the
    *  targets, merge with cross-member RRF, and return cited `ken://`/

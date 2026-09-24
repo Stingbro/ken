@@ -238,6 +238,16 @@ PC (dev), not measured anywhere.
   each indexed file (default profile); the rebuild embeds every chunk
   with no vector (`Db::chunks_missing_vectors`), not only changed ones;
   `remove_file` deletes a file's chunks (a removed file kept answering).
+- **Item 2b, business docs vs dev docs: by section (decided 2026-09-24).**
+  `pagemeta::audience_of`: frontmatter `audience:` wins; else Current,
+  Design, Work are business; Conventions, Platform, Reference are dev;
+  Ways-of-Working is method; Research has none. Stored in
+  `page_meta.audience`; hits carry `page.audience`. `hybrid_search` takes
+  `audience` and the search box has a For business readers toggle
+  (project scope). Drift checks business pages by the age rule only
+  (`DriftRun.business_pages`, said in the report). The first-wiki draft
+  adds `Work/Releases.md` from CHANGELOG/RELEASES and git tags. Not yet:
+  the audience filter in all-projects search and the MCP.
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
   ken-core on this PC: 812 pass, 53 fail (all pre-existing, Windows);

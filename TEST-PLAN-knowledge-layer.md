@@ -103,6 +103,9 @@ keyword index over sections.
   "region"): `Platform/Save.md` still comes back.
 - [ ] Delete a page in Files, then search a word only it had: it no longer
   comes back.
+- [ ] (2b) Search **region** again and press **For business readers**: only
+  `Design/Why-regions.md` (a business page) is left; `Platform/Save.md` (dev)
+  is gone. Press it again to see both.
 - [ ] (MCP, optional) Through `ken-mcp`, search **region**: the line starts
   with a locator like `[[Save]] · Realms-Docs:Platform/Save.md:1`. The app's
   result list does not show the locator yet.
@@ -146,6 +149,9 @@ keyword index over sections.
     verified date), and the decision `D-001`;
   - **Combat.md is not listed** (its code change was a comment): it is counted
     as cleared;
+  - **Design/Why-regions.md is not listed**, though it cites the same changed
+    code as Save.md: it is a business page, and the report says business
+    pages are checked by age only (2b);
   - **Not verified in 30 days**: `Platform/Legacy.md`, and the template pages
     (never verified);
   - that no controls are declared.
@@ -193,4 +199,5 @@ keyword index over sections.
 - Ingest does not yet write rulings, tickets or Current pages from a note by
   itself; the Current recipe does the last, through staging.
 - Chat edits to wiki pages do not go through staging.
-- 2b, business docs vs dev docs, is undecided and not built.
+- 2b is built by section; the all-projects search and the MCP do not filter
+  by audience yet (the project search box does).

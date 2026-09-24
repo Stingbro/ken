@@ -620,10 +620,20 @@ impl Db {
                     updated     TEXT,
                     sources     TEXT NOT NULL DEFAULT '[]',
                     replaced_by TEXT NOT NULL DEFAULT '[]',
-                    generated   INTEGER NOT NULL DEFAULT 0
+                    generated   INTEGER NOT NULL DEFAULT 0,
+                    audience    TEXT
                 );
                 "#,
             )?;
+            // `audience` (item 2b) came after the table did; a DB made by an
+            // earlier build of this branch gets it here.
+            let has_audience: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('page_meta') WHERE name = 'audience'")?
+                .exists([])?;
+            if !has_audience {
+                self.conn.execute_batch("ALTER TABLE page_meta ADD COLUMN audience TEXT;")?;
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -2061,11 +2071,11 @@ impl Db {
         };
         let json = |v: &Vec<String>| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
         self.conn.execute(
-            r#"INSERT INTO page_meta (rel_path, title, aliases, status, verified, updated, sources, replaced_by, generated)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            r#"INSERT INTO page_meta (rel_path, title, aliases, status, verified, updated, sources, replaced_by, generated, audience)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                ON CONFLICT(rel_path) DO UPDATE SET
                  title = ?2, aliases = ?3, status = ?4, verified = ?5, updated = ?6,
-                 sources = ?7, replaced_by = ?8, generated = ?9"#,
+                 sources = ?7, replaced_by = ?8, generated = ?9, audience = ?10"#,
             params![
                 rel_path,
                 m.title,
@@ -2075,7 +2085,8 @@ impl Db {
                 m.updated,
                 json(&m.sources),
                 json(&m.replaced_by),
-                m.generated as i64
+                m.generated as i64,
+                m.audience
             ],
         )?;
         Ok(())
@@ -2256,7 +2267,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT title, aliases, status, verified, updated, sources, replaced_by, generated
+                "SELECT title, aliases, status, verified, updated, sources, replaced_by, generated, audience
                    FROM page_meta WHERE rel_path = ?1",
                 params![rel_path],
                 |r| {
@@ -2269,6 +2280,7 @@ impl Db {
                         sources: list(r.get(5)?),
                         replaced_by: list(r.get(6)?),
                         generated: r.get::<_, i64>(7)? != 0,
+                        audience: r.get(8)?,
                     })
                 },
             )

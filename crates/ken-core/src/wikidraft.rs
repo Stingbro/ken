@@ -1,8 +1,9 @@
 //! The first wiki, drafted from an analysis at set-up (knowledge-layer item
 //! 4b). Offered, never forced: Claude reads the repos (READMEs, briefs, top
 //! docs, layout, markers, who commits), and any folder of documents a person
-//! adds (a Confluence export, say), and drafts the Current pages and the
-//! architecture page for a person to review.
+//! adds (a Confluence export, say), and drafts the Current pages, the
+//! architecture page and a first business doc, the release notes, for a
+//! person to review.
 //!
 //! Three rules keep it honest:
 //! - A page a person wrote is never touched. A page is drafted only when it
@@ -48,6 +49,10 @@ pub const PAGES: &[(&str, &str)] = &[
     (
         "Conventions/ARCHITECTURE.md",
         "the system's layers: what lives where, what may call what, the entry points, with a mermaid diagram",
+    ),
+    (
+        "Work/Releases.md",
+        "a business doc (item 2b): what changed in each release, newest first, in words for someone who never reads code, from changelogs and release tags",
     ),
 ];
 
@@ -96,6 +101,18 @@ fn layout(root: &Path) -> String {
     out
 }
 
+fn git_tags(root: &Path) -> Option<String> {
+    let mut cmd = Command::new("git");
+    let out = crate::proc::quiet(&mut cmd)
+        .args(["tag", "-n3", "--sort=-creatordate"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let top: Vec<&str> = text.lines().take(40).collect();
+    (out.status.success() && !top.is_empty()).then(|| top.join("\n"))
+}
+
 fn git_authors(root: &Path) -> Option<String> {
     let mut cmd = Command::new("git");
     let out = crate::proc::quiet(&mut cmd).args(["shortlog", "-sne", "--all", "--no-merges"]).current_dir(root).output().ok()?;
@@ -116,7 +133,7 @@ pub fn gather(repos: &[(String, PathBuf)], extra: Option<&Path>) -> Vec<Source> 
         }
     };
     for (name, root) in repos {
-        for f in ["README.md", "readme.md", "README", "CLAUDE.md", "START-HERE.md", "AGENTS.md"] {
+        for f in ["README.md", "readme.md", "README", "CLAUDE.md", "START-HERE.md", "AGENTS.md", "CHANGELOG.md", "RELEASES.md"] {
             if let Some(t) = read_text(&root.join(f)) {
                 push(format!("{name}:{f}"), t, &mut out);
             }
@@ -145,6 +162,9 @@ pub fn gather(repos: &[(String, PathBuf)], extra: Option<&Path>) -> Vec<Source> 
         }
         if let Some(a) = git_authors(root) {
             push(format!("{name}:(git authors, commits · name)"), a, &mut out);
+        }
+        if let Some(t) = git_tags(root) {
+            push(format!("{name}:(release tags, newest first)"), t, &mut out);
         }
     }
     if let Some(dir) = extra {
@@ -350,7 +370,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report.kept, vec!["Current/Team.md"]);
-        assert_eq!(report.drafted, vec!["Current/Project.md", "Current/Who-Does-What.md", "Conventions/ARCHITECTURE.md"]);
+        assert_eq!(
+            report.drafted,
+            vec!["Current/Project.md", "Current/Who-Does-What.md", "Conventions/ARCHITECTURE.md", "Work/Releases.md"]
+        );
         assert!(prompts[0].contains("{{one paragraph}}"), "the template page's own text is the template");
         assert!(prompts.iter().all(|p| p.contains("=== game:README.md ===")));
         assert_eq!(fs::read_to_string(wiki.path().join("Current/Team.md")).unwrap(), "---\ntitle: Team\n---\nAna leads; Ben reviews.\n");

@@ -29,6 +29,9 @@ pub struct PageMeta {
     pub replaced_by: Vec<String>,
     /// Built by a generator (a `generated` key, or `status: generated`).
     pub generated: bool,
+    /// `audience: business` or `audience: dev`, when the page says; else
+    /// its section decides (see [`audience_of`]).
+    pub audience: Option<String>,
 }
 
 impl PageMeta {
@@ -104,6 +107,7 @@ pub fn parse(text: &str) -> Option<PageMeta> {
             "generated" | "generated_by" | "generator" => {
                 meta.generated = !matches!(v.to_ascii_lowercase().as_str(), "false" | "no");
             }
+            "audience" => meta.audience = Some(v.to_ascii_lowercase()),
             "aliases" | "sources" | "replaced_by" | "superseded_by" => push_list(&mut meta, &key, v),
             _ => {}
         }
@@ -236,6 +240,47 @@ pub fn section_of(rel_path: &str) -> Option<Section> {
     })
 }
 
+/// Who a page is written for (item 2b). Business pages are for people who
+/// never read code: what the product does, what was decided and why, what
+/// changed in each release. Dev pages are conventions, architecture,
+/// how-tos and code references. The method's own pages are neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Audience {
+    Business,
+    Dev,
+    Method,
+}
+
+impl Audience {
+    pub fn name(self) -> &'static str {
+        match self {
+            Audience::Business => "business",
+            Audience::Dev => "dev",
+            Audience::Method => "method",
+        }
+    }
+}
+
+/// A page's audience: its frontmatter `audience:` when it says, else its
+/// section. Current, Design and Work are business; Conventions, Platform and
+/// Reference are dev; Ways-of-Working is the method. Research is evidence
+/// for everyone and has none, nor does a page outside the sections.
+pub fn audience_of(section: Option<Section>, meta: Option<&PageMeta>) -> Option<Audience> {
+    match meta.and_then(|m| m.audience.as_deref()) {
+        Some("business") => return Some(Audience::Business),
+        Some("dev") | Some("developer") | Some("code") => return Some(Audience::Dev),
+        Some("method") => return Some(Audience::Method),
+        _ => {}
+    }
+    match section? {
+        Section::Current | Section::Design | Section::Work => Some(Audience::Business),
+        Section::Conventions | Section::Platform | Section::Reference => Some(Audience::Dev),
+        Section::WaysOfWorking => Some(Audience::Method),
+        Section::Research => None,
+    }
+}
+
 /// Search bands, best first: binding and verified, then the rest, then
 /// evidence and pages that are not current (Research, retired, generated).
 pub fn band(section: Option<Section>, meta: Option<&PageMeta>) -> u8 {
@@ -265,6 +310,8 @@ pub struct HitPage {
     pub replaced_by: Vec<String>,
     /// [`band`]: 0 binding, 1 the rest, 2 evidence or not current.
     pub band: u8,
+    /// Who it is written for ([`audience_of`]).
+    pub audience: Option<&'static str>,
 }
 
 /// The page facts for a hit on `rel_path`, or None when it is not a
@@ -276,6 +323,7 @@ pub fn hit_page(rel_path: &str, meta: Option<PageMeta>) -> Option<HitPage> {
     }
     let section = section_of(rel_path);
     let band = band(section, meta.as_ref());
+    let audience = audience_of(section, meta.as_ref()).map(Audience::name);
     let meta = meta.unwrap_or_default();
     let dated = (section == Some(Section::Research))
         .then(|| meta.updated.clone().or_else(|| meta.verified.clone()).or_else(|| date_in_name(rel_path)))
@@ -289,6 +337,7 @@ pub fn hit_page(rel_path: &str, meta: Option<PageMeta>) -> Option<HitPage> {
         dated,
         replaced_by: meta.replaced_by,
         band,
+        audience,
     })
 }
 
@@ -364,6 +413,21 @@ mod tests {
         assert_eq!(old.replaced_by, vec!["[[Rules]]"]);
         assert_eq!(old.dated, None, "only Research is stamped");
         assert_eq!(hit_page("src/main.rs", None), None);
+    }
+
+    #[test]
+    fn the_section_decides_the_audience_unless_the_page_says() {
+        assert_eq!(audience_of(section_of("Current/Project.md"), None), Some(Audience::Business));
+        assert_eq!(audience_of(section_of("Work/Releases.md"), None), Some(Audience::Business));
+        assert_eq!(audience_of(section_of("Conventions/ARCHITECTURE.md"), None), Some(Audience::Dev));
+        assert_eq!(audience_of(section_of("Ways-of-Working/Rules.md"), None), Some(Audience::Method));
+        assert_eq!(audience_of(section_of("Research/spike.md"), None), None);
+        let says = parse("---
+audience: Business
+---
+").unwrap();
+        assert_eq!(audience_of(section_of("Platform/Pricing.md"), Some(&says)), Some(Audience::Business));
+        assert_eq!(hit_page("Design/Why.md", None).unwrap().audience, Some("business"));
     }
 
     #[test]

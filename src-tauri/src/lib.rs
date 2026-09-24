@@ -2955,6 +2955,7 @@ async fn hybrid_search(
     state: State<'_, SharedState>,
     query: String,
     limit: Option<usize>,
+    audience: Option<String>,
 ) -> CmdResult<Vec<HybridSearchHitDto>> {
     let limit = limit.unwrap_or(30);
     let (search_db, semantic_on, embedder_slot) = {
@@ -2984,7 +2985,11 @@ async fn hybrid_search(
         // The one shared composition (keyword + semantic, vocabulary
         // alternatives, lines, page facts and bands), same as workspace
         // search and the MCP.
-        let merged = ken_core::routing::search_member(&db, &query, query_vec.as_deref(), limit).map_err(err)?;
+        let mut merged = ken_core::routing::search_member(&db, &query, query_vec.as_deref(), limit).map_err(err)?;
+        // Item 2b: keep only pages written for this audience.
+        if let Some(want) = audience.as_deref().filter(|a| !a.is_empty()) {
+            merged.retain(|h| h.page.as_ref().and_then(|p| p.audience) == Some(want));
+        }
         let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
         let tiers = db.chunk_tiers(&chunk_ids).map_err(err)?;
 

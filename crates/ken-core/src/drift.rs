@@ -28,7 +28,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
-use crate::pagemeta::{Section, section_of};
+use crate::pagemeta::{audience_of, section_of, Audience, Section};
 use crate::project::Project;
 use crate::Result;
 
@@ -104,6 +104,10 @@ pub struct DriftRun {
     /// Code citations measured, and cross-references counted apart.
     pub code_citations: usize,
     pub cross_references: usize,
+    /// Business pages (item 2b): checked by the age rule only, since code
+    /// churn under a page for readers who never see code is noise to them.
+    #[serde(default)]
+    pub business_pages: usize,
     pub mismatches: Vec<Mismatch>,
     /// Pages raised by the age rule: (page, verified date or none).
     pub aged: Vec<(String, Option<String>)>,
@@ -140,6 +144,12 @@ impl DriftRun {
             "{} pages and {} rulings examined; {} code citations measured, {} cross-references counted apart.\n",
             self.pages_examined, self.rulings_examined, self.code_citations, self.cross_references
         ));
+        if self.business_pages > 0 {
+            s.push_str(&format!(
+                "{} business pages are checked by age only: their readers never see the code they cite.\n",
+                self.business_pages
+            ));
+        }
         if self.uncontrolled {
             s.push_str("No controls are declared (`drift.controlMoved` and `drift.controlClean` in project.json), so a clean result proves less.\n");
         }
@@ -435,7 +445,12 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             continue; // evidence, or rebuilt from its generator: not a claim to re-verify
         }
         run.pages_examined += 1;
-        let research = section_of(&page) == Some(Section::Research);
+        let section = section_of(&page);
+        let research = section == Some(Section::Research);
+        let business = audience_of(section, Some(&meta)) == Some(Audience::Business);
+        if business {
+            run.business_pages += 1;
+        }
         let date = meta.verified.clone().or_else(|| meta.updated.clone());
         if !research {
             let old = meta.verified.as_deref().and_then(|v| days_between(v, now)).is_none_or(|d| d > AGE_DAYS);
@@ -443,7 +458,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
                 run.aged.push((page.clone(), meta.verified.clone()));
             }
         }
-        if let Some(since) = date {
+        if let (Some(since), false) = (date, business) {
             for src in &meta.sources {
                 measure_one(&page, src, &since, research, &mut run);
             }
@@ -602,6 +617,9 @@ mod tests {
         fs::create_dir_all(wiki.join("Research")).unwrap();
         let page = |sources: &str, verified: &str| format!("---\nverified: {verified}\nsources:\n{sources}---\n# P\n");
         fs::write(wiki.join("Platform/Save.md"), page("  - game:src/save.rs:2\n", "2026-09-05")).unwrap();
+        // A business page citing the same changed code: age rule only.
+        fs::create_dir_all(wiki.join("Current")).unwrap();
+        fs::write(wiki.join("Current/Project.md"), page("  - game:src/save.rs:2\n", "2026-09-05")).unwrap();
         fs::write(wiki.join("Platform/Combat.md"), page("  - game:src/combat.rs\n  - \"[[Save]]\"\n", "2026-09-05")).unwrap();
         fs::write(wiki.join("Platform/Old.md"), page("  - game:src/gone.rs\n  - game:src/save.rs:99\n", "2026-08-01")).unwrap();
         fs::write(wiki.join("Research/Spike.md"), page("  - game:src/save.rs\n", "2026-09-05")).unwrap();
@@ -626,6 +644,8 @@ mod tests {
         assert!(run.mismatches.iter().any(|m| m.subject == "Research/Spike.md" && m.research));
         assert_eq!(run.aged, vec![("Platform/Old.md".to_string(), Some("2026-08-01".to_string()))]);
         assert_eq!(run.cross_references, 1);
+        assert_eq!(sev("Current/Project.md"), Vec::<Severity>::new(), "a business page's code is not measured");
+        assert_eq!(run.business_pages, 1);
         assert_eq!(run.void_reason, None, "controls held: {:?}", run.void_reason);
         assert!(!run.uncontrolled);
         assert_eq!(run.exit_code, 1, "a live Finding");

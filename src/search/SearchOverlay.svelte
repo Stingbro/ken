@@ -273,13 +273,17 @@
     // toggle existed.
     routedPlan = null;
     coverageNotes = [];
-    const found = await api.hybridSearch(q, 30);
+    const found = await api.hybridSearch(q, 30, businessOnly ? "business" : null);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
     results = fromHybrid(found);
     searched = true;
     selected = 0;
   }
+
+  // Item 2b: pages for readers who never see code (Current, Design, Work,
+  // or a page that says `audience: business`). Project scope only.
+  let businessOnly = $state(false);
 
   function setScope(next: Scope) {
     if (scope === next) return;
@@ -380,6 +384,22 @@
           {/each}
         </select>
       {/if}
+    </div>
+  {/if}
+  {#if !app.workspace || scope === "project"}
+    <div class="scope-row">
+      <button
+        class="scope-btn"
+        class:active={businessOnly}
+        aria-pressed={businessOnly}
+        title="Only pages written for people who never read code: Current, Design, Work"
+        onclick={() => {
+          businessOnly = !businessOnly;
+          void run();
+        }}
+      >
+        For business readers
+      </button>
     </div>
   {/if}
 

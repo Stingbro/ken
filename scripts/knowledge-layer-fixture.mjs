@@ -105,6 +105,13 @@ write(
   join(docs, "Platform/Legacy.md"),
   "---\ntitle: Legacy\nverified: 2026-08-01\nsources:\n  - Realms-Game:src/old.rs\n  - Realms-Game:src/save.rs:99\n---\n# Legacy\n",
 );
+// A business page (Design is for readers who never see code): it cites the
+// same changed code as Save.md, but drift checks it by age only.
+write(
+  join(docs, "Design/Why-regions.md"),
+  "---\ntitle: Why regions\nverified: 2026-09-18\nsources:\n  - Realms-Game:src/save.rs:2\n---\n" +
+    "# Why regions\n\nWe save each region on its own so a crash loses one region, not the world.\n",
+);
 write(
   join(docs, "Research/Ingestion/Raw/2026-09-20 standup.txt"),
   "Standup, 20 September.\nAna: \"we ship on Friday, not Monday\".\nBen: \"I will fix the save bug today\".\nAna decided: the region format stays.\n",
