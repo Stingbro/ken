@@ -74,6 +74,10 @@ export interface HybridHit {
   snippet: string;
   source: string;
   tier: number | null;
+  /** The line the chunk starts on, when known. */
+  line: number | null;
+  /** Present for a Markdown page. */
+  page: HitPage | null;
 }
 
 /** Mirrors the Rust `SemanticIndexStateEvent` internally-tagged enum

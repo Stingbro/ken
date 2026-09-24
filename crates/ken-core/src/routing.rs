@@ -336,7 +336,17 @@ fn ken_address(project_id: Uuid, rel_path: &str) -> String {
 /// call (no embedder, or `db.vec_available()` is false); the FTS-only path
 /// degrades exactly like the Tauri command's.
 pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usize) -> Result<Vec<HybridHit>> {
-    let fts_hits = db.search_chunks_fts(query, limit)?;
+    let mut fts_hits = db.search_chunks_fts(query, limit)?;
+    // The team's other words for what was asked (Vocabulary page, decisions
+    // aliases, page aliases): each alternative phrasing runs as its own
+    // keyword search, its new chunks after the original's.
+    for alt in crate::vocab::Vocabulary::from_db(db)?.alternatives(query) {
+        for hit in db.search_chunks_fts(&alt, limit)? {
+            if !fts_hits.iter().any(|h| h.chunk_id == hit.chunk_id) {
+                fts_hits.push(hit);
+            }
+        }
+    }
     let vec_hits = match query_vec {
         Some(qv) if db.vec_available() => db
             .semantic_search(qv, limit)?
@@ -985,6 +995,33 @@ mod tests {
     /// `search_member`/`execute_plan` to do an actual search rather than
     /// working from fixture `HybridHit`s directly (`merge_routed`'s tests
     /// don't need this — it's pure).
+    /// A search in the team's word finds a page written in the platform's
+    /// word, through the Vocabulary page; the hit carries its line and page.
+    #[test]
+    fn search_member_finds_a_page_through_the_vocabulary() {
+        use crate::project::Project;
+        use crate::runner::CancelToken;
+        use crate::{engine, scan};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Vocabulary.md"),
+            "# Vocabulary\n\n| our word | the platform's word | where it lives |\n|---|---|---|\n| shard | region | Engine/World.md |\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("Platform")).unwrap();
+        std::fs::write(dir.path().join("Platform/World.md"), "# World\n\nEach region loads from disk.\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        let mut embedder = FakeEmbedder::new();
+        engine::rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap();
+
+        let hits = search_member(&db, "shard loads", None, 10).unwrap();
+        let world = hits.iter().find(|h| h.path == "Platform/World.md").expect("found via region");
+        assert_eq!(world.line, Some(1), "one chunk, from its heading");
+        assert_eq!(world.page.as_ref().and_then(|p| p.section), Some("Platform"));
+    }
+
     fn fixture_db_with_chunk(rel_path: &str, text: &str) -> Db {
         use crate::project::Project;
         use crate::runner::CancelToken;

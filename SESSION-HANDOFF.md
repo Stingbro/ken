@@ -103,8 +103,17 @@ PC (dev), not measured anywhere.
   `index_health`; Home's footer shows a graph row and one warning line
   (no on-device model, or the control check missed). The Timeline now
   shows the model notice too.
-  ken-core on this PC: 786 pass, 53 fail (all pre-existing, Windows);
-  frontend 479/479.
+- **Step 11, aliases in the query.** New `vocab` module builds groups of
+  equivalent phrases from the Vocabulary page word tables (our word <->
+  the platform's word; Method Words skipped), each decisions-log entry's
+  topic plus its `aliases:` line (the fenced format example skipped), and
+  every page's frontmatter title plus aliases. Keyword search is AND, so a
+  matched phrase yields up to 3 alternative queries (phrase swapped, whole
+  words only); `search_member` runs them after the original and appends new
+  chunks. The app's single-project `hybrid_search` now calls
+  `search_member` too, so it gains lines, page facts, bands and aliases.
+  ken-core on this PC: 791 pass, 53 fail (all pre-existing, Windows);
+  ken-mcp 39/39; frontend 479/479.
 
 ## The steps, in order
 

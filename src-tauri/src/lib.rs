@@ -2855,6 +2855,10 @@ struct HybridSearchHitDto {
     /// row's tier couldn't be looked up (shouldn't normally happen for a hit
     /// that came from the chunks tables themselves).
     tier: Option<i64>,
+    /// The line the chunk starts on, when known.
+    line: Option<i64>,
+    /// For a Markdown page: section, freshness, retired or generated.
+    page: Option<ken_core::pagemeta::HitPage>,
 }
 
 /// Chunk-level hybrid (keyword + semantic) search (semantic-index task 2.2).
@@ -2892,34 +2896,18 @@ async fn hybrid_search(
     tauri::async_runtime::spawn_blocking(move || {
         let db = search_db.lock().unwrap();
 
-        let fts_hits = db.search_chunks_fts(&query, limit).map_err(err)?;
-
-        let vec_hits = if semantic_on && db.vec_available() {
-            let query_vec = {
-                let mut guard = embedder_slot.lock().unwrap();
-                guard
-                    .as_deref_mut()
-                    .and_then(|embedder| embedder.embed_query(&query).ok())
-            };
-            match query_vec {
-                Some(qv) => db
-                    .semantic_search(&qv, limit)
-                    .map_err(err)?
-                    .into_iter()
-                    .map(|(chunk_id, path, text, distance)| hybrid_search_mod::VecHit {
-                        chunk_id,
-                        path,
-                        text,
-                        distance,
-                    })
-                    .collect(),
-                None => Vec::new(),
-            }
+        let query_vec = if semantic_on && db.vec_available() {
+            let mut guard = embedder_slot.lock().unwrap();
+            guard
+                .as_deref_mut()
+                .and_then(|embedder| embedder.embed_query(&query).ok())
         } else {
-            Vec::new()
+            None
         };
-
-        let merged = hybrid_search_mod::merge_and_rerank(&fts_hits, &vec_hits, &query);
+        // The one shared composition (keyword + semantic, vocabulary
+        // alternatives, lines, page facts and bands), same as workspace
+        // search and the MCP.
+        let merged = ken_core::routing::search_member(&db, &query, query_vec.as_deref(), limit).map_err(err)?;
         let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
         let tiers = db.chunk_tiers(&chunk_ids).map_err(err)?;
 
@@ -2938,6 +2926,8 @@ async fn hybrid_search(
                     snippet: h.snippet,
                     source,
                     tier,
+                    line: h.line,
+                    page: h.page,
                 }
             })
             .collect())

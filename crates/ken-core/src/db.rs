@@ -2073,6 +2073,36 @@ impl Db {
         Ok(n)
     }
 
+    /// Indexed files whose file name is one of `names` (case-insensitive),
+    /// wherever they sit.
+    pub fn paths_named(&self, names: &[&str]) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rel_path FROM files
+              WHERE status = 'indexed' AND (lower(rel_path) = ?1 OR lower(rel_path) LIKE '%/' || ?1)
+              ORDER BY rel_path",
+        )?;
+        let mut out = Vec::new();
+        for name in names {
+            let rows = stmt
+                .query_map(params![name.to_lowercase()], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
+    /// Every page's frontmatter title and aliases (pages that have aliases).
+    pub fn page_aliases(&self) -> Result<Vec<(Option<String>, Vec<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT title, aliases FROM page_meta WHERE aliases <> '[]'")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let aliases: String = r.get(1)?;
+                Ok((r.get::<_, Option<String>>(0)?, serde_json::from_str(&aliases).unwrap_or_default()))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// What a page's frontmatter said when it was last indexed.
     pub fn page_meta(&self, rel_path: &str) -> Result<Option<crate::pagemeta::PageMeta>> {
         let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();

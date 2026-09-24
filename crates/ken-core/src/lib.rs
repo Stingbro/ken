@@ -28,6 +28,7 @@ pub mod memory;
 pub mod model;
 pub mod ocr;
 pub mod pagemeta;
+pub mod vocab;
 pub mod pipeline;
 pub mod proc;
 pub mod profiler;
