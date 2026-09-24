@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Install the statically-linked sqlite-vec (`vec0`) extension into SQLite's
 /// process-global auto-extension list exactly once. sqlite-vec is compiled into
@@ -521,6 +521,22 @@ impl Db {
             if !has_scope {
                 self.conn
                     .execute_batch("ALTER TABLE chats ADD COLUMN scope TEXT;")?;
+            }
+        }
+        if version < 14 {
+            // knowledge-layer: each file's kenignore tier (0 full, 1
+            // search-only), kept by the scan so a change of a repo's kind or
+            // a `~` line re-tiers files already indexed, and so extraction
+            // coverage counts only files that are read for entities. 0 for
+            // every existing row: the next scan corrects it.
+            let has_tier: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'tier'")?
+                .exists([])?;
+            if !has_tier {
+                self.conn.execute_batch(
+                    "ALTER TABLE files ADD COLUMN tier INTEGER NOT NULL DEFAULT 0;",
+                )?;
             }
         }
         self.conn.execute(
@@ -1317,7 +1333,7 @@ impl Db {
     pub fn extractable_file_count(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM files f
-             WHERE f.status = 'indexed'
+             WHERE f.status = 'indexed' AND f.tier = 0
                AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)",
             [],
             |r| r.get(0),
@@ -1332,7 +1348,7 @@ impl Db {
     pub fn unqueued_extractable_count(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM files f
-             WHERE f.status = 'indexed'
+             WHERE f.status = 'indexed' AND f.tier = 0
                AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)
                AND NOT EXISTS (SELECT 1 FROM extractions e WHERE e.rel_path = f.rel_path)",
             [],
@@ -1885,6 +1901,43 @@ impl Db {
         )?)
     }
 
+    /// Indexed files at the full tier: the ones read for entities.
+    pub fn entity_tier_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rel_path FROM files WHERE status = 'indexed' AND tier = 0 ORDER BY rel_path",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Store each file's current kenignore tier, then take every file that is
+    /// not at the full tier off the extraction queue. This is how a change of
+    /// a repo's kind, or a new `~` line, reaches files already indexed:
+    /// the scan skips an unchanged file, but not this. Done and errored rows
+    /// stay, so nothing already in the graph loses its record. Returns
+    /// (files re-tiered, pending extractions dropped).
+    pub fn set_file_tiers(&mut self, tiers: &[(String, crate::kenignore::Tier)]) -> Result<(usize, usize)> {
+        let tx = self.conn.transaction()?;
+        let mut retiered = 0;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE files SET tier = ?2 WHERE rel_path = ?1 AND tier <> ?2")?;
+            for (rel, tier) in tiers {
+                retiered += stmt.execute(params![rel, *tier as i64])?;
+            }
+        }
+        let dropped = tx.execute(
+            "DELETE FROM extractions
+              WHERE status = 'pending'
+                AND rel_path IN (SELECT rel_path FROM files WHERE tier <> 0)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok((retiered, dropped))
+    }
+
     pub fn remove_extraction(&mut self, rel_path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM extractions WHERE rel_path = ?1",
@@ -1901,11 +1954,12 @@ impl Db {
     /// leaves any file that already has a row (pending/done/error) untouched, so
     /// it's idempotent and safe to call on every project open. Returns how many
     /// files were enqueued.
+    /// A search-only file (`files.tier` <> 0) is never enqueued (kenignore D3).
     pub fn backfill_extractions(&mut self) -> Result<usize> {
         let mut stmt = self.conn.prepare(
             "SELECT f.rel_path, c.text
                FROM files f JOIN contents c ON c.file_id = f.id
-              WHERE f.status = 'indexed'
+              WHERE f.status = 'indexed' AND f.tier = 0
                 AND NOT EXISTS (
                   SELECT 1 FROM extractions e WHERE e.rel_path = f.rel_path
                 )",

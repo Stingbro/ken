@@ -211,6 +211,24 @@ pub fn built_in_rule_sets() -> Vec<Rule> {
     Vec::new()
 }
 
+/// The rule a repo's kind contributes: its index state, set once for the
+/// whole repo. A code or reference repo is searchable only; a repo that is
+/// also team or wiki, or has no kind yet, adds nothing, so it reads as today.
+/// Callers fold this after the built-ins and before the user's
+/// `.kenignore`, so a `!docs/` line there still reads a code repo's docs
+/// for entities. Held in the registry, not written into the repo.
+pub fn kind_rules(kind: &[crate::registry::RepoKind]) -> Vec<Rule> {
+    if kind.is_empty() || kind.iter().any(|k| k.reads_entities()) {
+        return Vec::new();
+    }
+    vec![Rule { tier: Tier::SearchOnly, pattern: "*".into() }]
+}
+
+/// [`kind_rules`] for the repo at `root`, from the default registry.
+pub fn kind_rules_for(root: &Path) -> Vec<Rule> {
+    kind_rules(&crate::registry::kind_of(root))
+}
+
 fn is_hard_ignored(path: &str) -> bool {
     Path::new(path)
         .components()
@@ -429,6 +447,31 @@ mod tests {
             classify("a/b/c/x.generated.ts", false, &[&rules]),
             Tier::SearchOnly
         );
+    }
+
+    #[test]
+    fn kind_sets_the_repo_index_state_and_the_users_file_still_wins() {
+        use crate::registry::RepoKind;
+        let code = kind_rules(&[RepoKind::Code]);
+        assert_eq!(classify("src/main.rs", false, &[&code]), Tier::SearchOnly);
+        assert_eq!(classify("README.md", false, &[&code]), Tier::SearchOnly);
+        assert_eq!(classify("a/b/c/deep.md", false, &[&code]), Tier::SearchOnly);
+        assert_eq!(
+            classify("x.md", false, &[&kind_rules(&[RepoKind::Reference])]),
+            Tier::SearchOnly
+        );
+
+        // Team, wiki, a wiki that holds code, and not-yet-said read in full.
+        for kind in [vec![RepoKind::Team], vec![RepoKind::Wiki], vec![RepoKind::Wiki, RepoKind::Code], vec![]] {
+            assert!(kind_rules(&kind).is_empty(), "{kind:?}");
+        }
+
+        // A user line after the kind rule reads a code repo's docs in full,
+        // and a bare line still takes a path out.
+        let user = parse("!docs/\nsecret/\n");
+        assert_eq!(classify("docs/arch.md", false, &[&code, &user]), Tier::Full);
+        assert_eq!(classify("secret/x.md", false, &[&code, &user]), Tier::Ignore);
+        assert_eq!(classify("src/lib.rs", false, &[&code, &user]), Tier::SearchOnly);
     }
 
     #[test]

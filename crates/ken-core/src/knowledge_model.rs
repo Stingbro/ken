@@ -493,12 +493,9 @@ pub fn build_knowledge_model(
     today: &str,
     cancel: &CancelToken,
 ) -> Result<ModelCounts> {
-    let files: Vec<String> = db
-        .list_files()?
-        .into_iter()
-        .filter(|f| f.status == "indexed")
-        .map(|f| f.rel_path)
-        .collect();
+    // Full tier only: a search-only file (a code or reference repo, a `~`
+    // line) never reaches the graph, the deep rebuild included.
+    let files = db.entity_tier_paths()?;
     let prompt = compose_extraction_prompt(&files, today);
     match assistant::oneshot(binary, &project.root, &prompt, EXTRACTION_TIMEOUT, cancel)? {
         OneshotOutcome::Completed(text) => {

@@ -31,6 +31,14 @@ impl RepoKind {
     pub fn syncs(self) -> bool {
         matches!(self, RepoKind::Team | RepoKind::Wiki)
     }
+
+    /// Kinds whose files are read for entities. Code and reference repos
+    /// are only made searchable: entities read out of code are functions
+    /// and variables that clutter the graph, and each one costs a local
+    /// model generation.
+    pub fn reads_entities(self) -> bool {
+        matches!(self, RepoKind::Team | RepoKind::Wiki)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

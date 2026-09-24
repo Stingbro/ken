@@ -49,7 +49,17 @@ PC (dev), not measured anywhere.
     no kind, so sync goes off. For sr-docs and any other wiki or team
     repo, either set its kind or switch Sync on in Settings (which
     writes `sync.auto: true`).
-  - Still to do for step 2: the index state per repo from its kind.
+- **Step 2 index state, step 5 extraction scope, and step 3's re-tier
+  (kenignore task 1.6).** `kenignore::kind_rules`: a code or reference
+  repo (and not also team or wiki) gets a built-in `~*` between the
+  global built-ins and the user's `.kenignore`, so `!docs/` there still
+  reads a code repo's docs. A repo with no kind reads as before. Schema
+  v14 adds `files.tier`; every scan and file refresh stores it and drops
+  pending extractions for non-full files, so a kind change reaches
+  unchanged files. Coverage, the unqueued check and the open-time
+  backfill count full-tier files only; the deep rebuild sends only
+  full-tier files. Already-extracted entities from a re-tiered file
+  stay in the graph (removing them is still open).
 
 ## The steps, in order
 

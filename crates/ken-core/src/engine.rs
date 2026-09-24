@@ -790,11 +790,12 @@ pub fn rebuild_semantic_index_with_profile(
     db.ensure_vec_chunks(embedder.dim())?;
 
     // kenignore (D2/D3): tier is classified once per file here, against the
-    // same rule sets scan.rs uses. Built-in rule sets (task 1.3) are not yet
-    // wired up (no ken-memory/ken-tasks pseudo-members exist in this repo
-    // yet), so only the user's `.kenignore` participates for now.
+    // same rule sets scan.rs uses: the repo's kind, then the user's
+    // `.kenignore`. The global built-ins are empty (see
+    // `kenignore::built_in_rule_sets`).
+    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
     let user_rules = project.kenignore_rules();
-    let rule_sets: &[&[crate::kenignore::Rule]] = &[&user_rules];
+    let rule_sets: &[&[crate::kenignore::Rule]] = &[&kind_rules, &user_rules];
 
     for (done, file) in files.into_iter().enumerate() {
         if token.is_cancelled() {

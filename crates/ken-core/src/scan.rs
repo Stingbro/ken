@@ -170,10 +170,12 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
 
     // kenignore (D2): built-ins first, user `.kenignore` appended last so a
     // `!` line can override them. Loaded once per scan, not per file —
-    // `classify` is pure and re-parsing per path would be wasted work.
+    // `classify` is pure and re-parsing per path would be wasted work. The
+    // repo's kind sits between them: it sets the whole repo's state.
     let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
     let user_rules = project.kenignore_rules();
-    let rule_sets: [&[crate::kenignore::Rule]; 2] = [&built_in_rules, &user_rules];
+    let rule_sets: [&[crate::kenignore::Rule]; 3] = [&built_in_rules, &kind_rules, &user_rules];
 
     // What's on disk (rel_path -> size, mtime, cloud placeholder?, tier)
     let mut on_disk: HashMap<String, (i64, i64, bool, crate::kenignore::Tier)> = HashMap::new();
@@ -293,6 +295,13 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         stats.changed_paths.push(rel.clone());
     }
 
+    // Re-tier. An unchanged file skipped `index_one` above, so a change of
+    // the repo's kind or a new `~` line reaches it only here; files that are
+    // now search-only also leave the extraction queue.
+    let tiers: Vec<(String, crate::kenignore::Tier)> =
+        on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
+    db.set_file_tiers(&tiers)?;
+
     Ok(stats)
 }
 
@@ -375,8 +384,9 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     // contributions on Full->SearchOnly, etc.) — that belongs to task 1.6 and
     // the src-tauri watcher work, out of scope here.
     let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
     let user_rules = project.kenignore_rules();
-    let rule_sets: [&[crate::kenignore::Rule]; 2] = [&built_in_rules, &user_rules];
+    let rule_sets: [&[crate::kenignore::Rule]; 3] = [&built_in_rules, &kind_rules, &user_rules];
     let tier = crate::kenignore::classify(rel, false, &rule_sets);
     let excluded = excluded || tier == crate::kenignore::Tier::Ignore;
     if !excluded && abs.is_file() {
@@ -389,6 +399,7 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
             .unwrap_or(0);
         let dataless = cloud::is_dataless(&meta);
         index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
+        db.set_file_tiers(&[(rel.to_string(), tier)])?;
         Ok(true)
     } else if db.get_file(rel)?.is_some() {
         db.remove_file(rel)?;
@@ -881,6 +892,36 @@ mod tests {
                 "is_ken_allowlisted_path({rel:?})"
             );
         }
+    }
+
+    /// Making a whole repo search-only (a code or reference kind writes the
+    /// same `~*` rule) must reach files already indexed, though none of them
+    /// changed: they leave the extraction queue and the coverage count, and
+    /// a project reopen's backfill does not put them back.
+    #[test]
+    fn a_repo_made_search_only_leaves_the_extraction_queue_without_a_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plan.md"), "# Plan\nShip it.\n").unwrap();
+        fs::write(dir.path().join("notes.md"), "Some notes.\n").unwrap();
+        let project = Project::create(dir.path(), "Retier").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(db.next_pending_extraction().unwrap().is_some(), "full tier: queued");
+        assert_eq!(db.extraction_coverage().unwrap().1, 2);
+
+        fs::write(dir.path().join(".kenignore"), "~*\n").unwrap();
+        let stats = scan(&project, &mut db).unwrap();
+        assert_eq!(stats.updated + stats.added, 0, "no file changed: {stats:?}");
+        assert!(db.next_pending_extraction().unwrap().is_none(), "search-only: off the queue");
+        assert_eq!(db.extraction_coverage().unwrap().1, 0, "not counted as extractable");
+        assert_eq!(db.backfill_extractions().unwrap(), 0, "backfill leaves search-only alone");
+        assert_eq!(db.unqueued_extractable_count().unwrap(), 0);
+
+        // Back to full: the files are extractable again and backfill queues them.
+        fs::remove_file(dir.path().join(".kenignore")).unwrap();
+        scan(&project, &mut db).unwrap();
+        assert_eq!(db.extraction_coverage().unwrap().1, 2);
+        assert_eq!(db.backfill_extractions().unwrap(), 2);
     }
 
     #[test]
