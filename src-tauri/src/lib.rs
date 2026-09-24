@@ -7501,6 +7501,26 @@ fn workspace_kg_root(guard: &AppState) -> std::path::PathBuf {
         .unwrap_or_else(|| guard.base_dir.clone())
 }
 
+/// The project ids of a team (a manifest group, set at set-up or derived
+/// from a group folder), for a team's view of the merged graph. None when
+/// no team is asked for, or the name is not a group here.
+fn team_project_ids(guard: &AppState, team: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    let team = team.filter(|t| !t.is_empty())?;
+    let ws = guard.workspace.as_ref()?;
+    let names = ws.ws.config.effective_group_members(team);
+    Some(
+        ws.ws
+            .members
+            .iter()
+            .filter(|m| names.contains(&m.name))
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id.to_string()),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 /// The members the merged graph is built over: every member the workspace
 /// manifest lists that has an index on disk and is read for entities (a
 /// team or wiki repo, or one whose kind is not said yet), whether or not it
@@ -7862,7 +7882,11 @@ const WORKSPACE_KG_SEARCH_LIMIT: usize = 50;
 /// to until a schema migration adds one. Fine at workspace scale. Flag-gated
 /// (task 2.3).
 #[tauri::command]
-fn workspace_kg_search(state: State<SharedState>, query: String) -> CmdResult<Vec<WorkspaceKgSearchHitDto>> {
+fn workspace_kg_search(
+    state: State<SharedState>,
+    query: String,
+    team: Option<String>,
+) -> CmdResult<Vec<WorkspaceKgSearchHitDto>> {
     let guard = state.lock().unwrap();
     if !federated_kg_enabled(&guard.app_settings) {
         return Err("federatedKg flag is off".into());
@@ -7872,11 +7896,19 @@ fn workspace_kg_search(state: State<SharedState>, query: String) -> CmdResult<Ve
         return Ok(Vec::new());
     }
     let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
+    // A team's view: only entities with a link into one of its repos.
+    let team_ids = team_project_ids(&guard, team.as_deref());
+    let in_team = |id: i64| -> bool {
+        team_ids.as_ref().is_none_or(|ids| {
+            kg.list_links_for_global(id).map(|ls| ls.iter().any(|l| ids.contains(&l.project_id))).unwrap_or(false)
+        })
+    };
     let mut hits: Vec<WorkspaceKgSearchHitDto> = kg
         .list_global_entities()
         .map_err(err)?
         .into_iter()
         .filter(|e| e.name.to_lowercase().contains(&q) || e.summary.to_lowercase().contains(&q))
+        .filter(|e| in_team(e.id))
         .map(|e| WorkspaceKgSearchHitDto {
             uri: format!("kg://{}", e.id),
             id: e.id,

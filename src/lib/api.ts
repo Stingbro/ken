@@ -2035,8 +2035,8 @@ export const api = {
   /** Case-insensitive substring search over global entity names + summaries
    *  (name matches ranked above summary-only matches), capped at 50 hits.
    *  An empty/whitespace-only query always returns `[]` (no "list all"). */
-  workspaceKgSearch: (query: string) =>
-    invoke<WorkspaceKgSearchHit[]>("workspace_kg_search", { query }),
+  workspaceKgSearch: (query: string, team: string | null = null) =>
+    invoke<WorkspaceKgSearchHit[]>("workspace_kg_search", { query, team }),
 
   // ---- Memory (ken-memory task 4.1) ----
   /** Create (`"create"`, slug must not exist) or replace (`"replace"`, slug

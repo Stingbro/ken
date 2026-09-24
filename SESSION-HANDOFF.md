@@ -134,8 +134,11 @@ PC (dev), not measured anywhere.
   only with no workspace open); the build, the three KG read commands,
   routed search and the MCP (`kg_root`, via the last-opened workspace) all
   use it. The old app-data `kg.sqlite` is left in place, unused. Not
-  unit-tested (src-tauri has no tests for it); check in the app. A graph
-  per team inside one workspace waits for step 4's teams.
+  unit-tested (src-tauri has no tests for it); check in the app. A
+  team's graph is a view of the merged one, not a second build (which
+  would multiply model cost): `workspace_kg_search` takes `team` and keeps
+  entities with a link into that group's repos; the graph screen passes
+  the scope picker's group. The overview counts are still whole-workspace.
 - **Step 13, drift.** New `drift` module: the Docs check (a page's
   `sources:` measured with git from the commit its `verified:` date pins,
   falling back to `updated:`, to the default branch read from

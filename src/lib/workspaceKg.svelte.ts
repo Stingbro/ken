@@ -21,6 +21,7 @@ import {
 } from "./api";
 import type { MapEdgeInput, MapEntity } from "./knowledge";
 import { stableHash } from "./knowledge";
+import { scope } from "./scope.svelte";
 
 /** Stable hue (0-359) for a member project id — "member-hue nodes (stable
  *  hue per project_id)" (federated-kg task 3.3). Reuses the same FNV-1a hash
@@ -122,7 +123,8 @@ class WorkspaceKgStore {
     }
     this.searching = true;
     try {
-      const hits = await api.workspaceKgSearch(q);
+      // A team picked in the scope picker narrows the graph to its repos.
+      const hits = await api.workspaceKgSearch(q, scope.groupName);
       this.searchHits = hits;
       const next = new Map(this.nodes);
       for (const hit of hits) {
