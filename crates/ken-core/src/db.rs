@@ -512,12 +512,16 @@ impl Db {
             // NULL means "this project only" — the pre-feature behavior and
             // the value every existing row gets, so upgrading changes no
             // chat's meaning. `"all"` is every workspace member; any other
-            // value names a group.
-            self.conn.execute_batch(
-                r#"
-                ALTER TABLE chats ADD COLUMN scope TEXT;
-                "#,
-            )?;
+            // value names a group. Guarded like `model` above: tests rewind
+            // schema_version on a DB that already has the column.
+            let has_scope: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('chats') WHERE name = 'scope'")?
+                .exists([])?;
+            if !has_scope {
+                self.conn
+                    .execute_batch("ALTER TABLE chats ADD COLUMN scope TEXT;")?;
+            }
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -2940,14 +2944,14 @@ mod tests {
 
         db.migrate().unwrap();
 
-        // Version advanced to 12.
+        // Version advanced past 12, to the current schema.
         let version: String = db
             .conn
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, "12");
+        assert_eq!(version, SCHEMA_VERSION.to_string());
         // Pre-existing file survived the migration.
         let surviving: i64 = db
             .conn
