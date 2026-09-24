@@ -372,6 +372,15 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         db.set_index_control(&result)?;
     }
 
+    // The link report is a writing queue for a library, so it is filed for
+    // team and wiki repos only: a code repo's READMEs are not its pages.
+    let kind = crate::registry::kind_of(&project.root);
+    if kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)) {
+        let report = crate::links::report(db)?;
+        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        crate::links::file_review_item(db, &report, now)?;
+    }
+
     Ok(stats)
 }
 
@@ -445,6 +454,8 @@ fn index_one(
     if kind == FileKind::Md {
         let meta = (status == STATUS_INDEXED).then(|| crate::pagemeta::parse(&text)).flatten();
         db.set_page_meta(rel, meta.as_ref())?;
+        let links = if status == STATUS_INDEXED { crate::links::extract(rel, &text) } else { Vec::new() };
+        db.set_page_links(rel, &links)?;
     }
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size

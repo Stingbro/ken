@@ -112,7 +112,19 @@ PC (dev), not measured anywhere.
   words only); `search_member` runs them after the original and appends new
   chunks. The app's single-project `hybrid_search` now calls
   `search_member` too, so it gains lines, page facts, bands and aliases.
-  ken-core on this PC: 791 pass, 53 fail (all pre-existing, Windows);
+- **Step 10, page links.** New `links` module, the third index. At index
+  time each Markdown page's links are stored raw in `page_links` (schema
+  v14), code blocks and inline code stripped first: `[[Name]]` (label and
+  heading dropped) and relative `[text](path)` resolved against the page's
+  folder; URLs and anchors skipped. Resolution runs when asked: a name by
+  page file stem or frontmatter alias (other files by full name, for
+  embeds), a path by path (`.md` optional). `links::report`: both kinds
+  counted apart, missing names most-asked first, broken paths by section,
+  names two pages claim. After each scan of a team or wiki repo one open
+  Review item of kind `links` is kept (replaced only when its text
+  changes, resolved when clean). `page_links` command gives a page's
+  outgoing and incoming links; the Map does not use it yet.
+  ken-core on this PC: 796 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 479/479.
 
 ## The steps, in order

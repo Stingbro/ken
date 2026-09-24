@@ -1634,6 +1634,9 @@ export interface FamilyInboxItem {
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   indexHealth: () => invoke<IndexHealth>("index_health"),
+  /** A page's links both ways: pages it reaches, pages that reach it. */
+  pageLinks: (path: string) =>
+    invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),
   setProjectKind: (id: string, kind: RepoKind[], team: string | null) =>
     invoke<RegistryEntryStatus[]>("set_project_kind", { id, kind, team }),
   createProject: (path: string, name: string) =>

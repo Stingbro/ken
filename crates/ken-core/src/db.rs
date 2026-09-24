@@ -598,6 +598,12 @@ impl Db {
             // retired or generated. The lists are JSON arrays.
             self.conn.execute_batch(
                 r#"
+                CREATE TABLE IF NOT EXISTS page_links (
+                    from_path TEXT NOT NULL,
+                    kind      TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    PRIMARY KEY (from_path, kind, target)
+                );
                 CREATE TABLE IF NOT EXISTS page_meta (
                     rel_path    TEXT PRIMARY KEY,
                     title       TEXT,
@@ -1027,6 +1033,7 @@ impl Db {
             tx.execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
+            tx.execute("DELETE FROM page_links WHERE from_path = ?1", params![rel_path])?;
         }
         tx.commit()?;
         Ok(())
@@ -2071,6 +2078,94 @@ impl Db {
             }
         }
         Ok(n)
+    }
+
+    /// Extract the links of every indexed Markdown page that has none stored,
+    /// from its stored text. A page with no links is re-read each time,
+    /// which costs a parse, not a file read.
+    pub fn backfill_page_links(&mut self) -> Result<usize> {
+        let rows: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.rel_path, c.text FROM files f JOIN contents c ON c.file_id = f.id
+                  WHERE f.kind = 'md' AND f.status = 'indexed'
+                    AND NOT EXISTS (SELECT 1 FROM page_links l WHERE l.from_path = f.rel_path)",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            rows
+        };
+        let mut n = 0;
+        for (rel, text) in rows {
+            let links = crate::links::extract(&rel, &text);
+            if !links.is_empty() {
+                self.set_page_links(&rel, &links)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Replace the links stored for the page at `from`.
+    pub fn set_page_links(&mut self, from: &str, links: &[crate::links::Link]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM page_links WHERE from_path = ?1", params![from])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO page_links (from_path, kind, target) VALUES (?1, ?2, ?3)")?;
+            for l in links {
+                stmt.execute(params![from, l.kind.as_str(), l.target])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every stored link, as (linking page, link).
+    pub fn all_page_links(&self) -> Result<Vec<(String, crate::links::Link)>> {
+        let mut stmt = self.conn.prepare("SELECT from_path, kind, target FROM page_links ORDER BY from_path")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(from, kind, target)| {
+                crate::links::LinkKind::parse(&kind).map(|kind| (from, crate::links::Link { kind, target }))
+            })
+            .collect())
+    }
+
+    /// Every indexed Markdown page, and every indexed file a path link can
+    /// reach (an image, a PDF): path links are checked against all of them.
+    pub fn page_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT rel_path FROM files ORDER BY rel_path")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Each page's frontmatter aliases, by path.
+    pub fn page_aliases_by_path(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT rel_path, aliases FROM page_meta WHERE aliases <> '[]'")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let aliases: String = r.get(1)?;
+                Ok((r.get::<_, String>(0)?, serde_json::from_str(&aliases).unwrap_or_default()))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The open Review item of `kind`, if one exists: (id, body).
+    pub fn open_review_item_of_kind(&self, kind: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, body FROM review_items WHERE kind = ?1 AND status = 'open' ORDER BY id DESC LIMIT 1",
+                params![kind],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// Indexed files whose file name is one of `names` (case-insensitive),

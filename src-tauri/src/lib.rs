@@ -749,6 +749,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     if let Err(e) = db.backfill_page_meta() {
         eprintln!("warning: page frontmatter backfill failed: {e}");
     }
+    if let Err(e) = db.backfill_page_links() {
+        eprintln!("warning: page links backfill failed: {e}");
+    }
 
     // One-time extraction backfill: a project indexed before the incremental
     // Map landed has no `extractions` rows, and the scanner never re-runs
@@ -6935,6 +6938,15 @@ struct IndexHealthDto {
     /// `ready` | `notInstalled` | `error`: without a local model nothing is
     /// read for entities, and the screen must say which piece is missing.
     llm_status: String,
+}
+
+/// A page's links both ways, resolved now: the pages it reaches and the
+/// pages that reach it (the Map's page neighbours).
+#[tauri::command]
+fn page_links(state: State<SharedState>, path: String) -> CmdResult<ken_core::links::PageLinks> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    ken_core::links::page_links(&active.db, &path).map_err(err)
 }
 
 /// Index health for the focused project: pending, failed and skipped
@@ -13517,6 +13529,7 @@ pub fn run() {
             set_sync_auto,
             set_project_kind,
             index_health,
+            page_links,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,
