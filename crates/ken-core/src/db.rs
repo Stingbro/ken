@@ -1043,7 +1043,27 @@ impl Db {
             tx.execute("DELETE FROM page_links WHERE from_path = ?1", params![rel_path])?;
         }
         tx.commit()?;
-        Ok(())
+        // Its chunks too, or a removed file keeps answering searches.
+        self.delete_chunks(rel_path)
+    }
+
+    /// The chunks of `path` that have no vector yet, as (id, text): what a
+    /// semantic rebuild still has to embed. Chunks are written by every scan
+    /// (keyword search over chunks needs no model); vectors only by the
+    /// rebuild. With no vector table, every chunk counts as missing.
+    pub fn chunks_missing_vectors(&self, path: &str) -> Result<Vec<(i64, String)>> {
+        let sql = if table_exists(&self.conn, "vec_chunks")? {
+            "SELECT c.id, c.text FROM chunks c WHERE c.path = ?1
+               AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)
+             ORDER BY c.seq"
+        } else {
+            "SELECT c.id, c.text FROM chunks c WHERE c.path = ?1 ORDER BY c.seq"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![path], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Remove every indexed file under a folder (used when a folder is

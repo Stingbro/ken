@@ -831,26 +831,15 @@ pub fn rebuild_semantic_index_with_profile(
             .and_then(|p| p.chunking_for(&file.rel_path))
             .unwrap_or_else(|| IndexProfile::default_for(&file.rel_path));
         let chunks = chunker::chunk_file(&file.rel_path, &text, &idx_profile);
-        let changed = db.upsert_chunks(&file.rel_path, &chunks, tier)?;
+        db.upsert_chunks(&file.rel_path, &chunks, tier)?;
 
-        // `changed` is a subsequence of `chunks` in the same relative order
-        // (both walk seq ascending; `upsert_chunks` only omits unchanged
-        // entries). Two-pointer match by content_hash to recover each
-        // changed chunk's text — safe even if two chunks share identical
-        // text (and thus identical hash), since position order is preserved
-        // on both sides.
-        let mut embed_ids: Vec<i64> = Vec::with_capacity(changed.len());
-        let mut embed_texts: Vec<String> = Vec::with_capacity(changed.len());
-        let mut changed_iter = changed.into_iter().peekable();
-        for c in &chunks {
-            if let Some((_, hash)) = changed_iter.peek() {
-                if hash == &c.content_hash {
-                    let (id, _) = changed_iter.next().unwrap();
-                    embed_ids.push(id);
-                    embed_texts.push(c.text.clone());
-                }
-            }
-        }
+        // Embed every chunk with no vector yet, not only the ones this call
+        // changed: the scan writes chunks (for keyword search) before any
+        // rebuild runs, so a chunk can be unchanged here and still unembedded.
+        // `upsert_chunks` drops the vector of a chunk whose text changed, so
+        // those are missing too.
+        let (embed_ids, embed_texts): (Vec<i64>, Vec<String>) =
+            db.chunks_missing_vectors(&file.rel_path)?.into_iter().unzip();
 
         for (id_batch, text_batch) in embed_ids
             .chunks(EMBED_BATCH)

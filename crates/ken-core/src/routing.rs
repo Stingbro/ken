@@ -1022,6 +1022,40 @@ mod tests {
         assert_eq!(world.page.as_ref().and_then(|p| p.section), Some("Platform"));
     }
 
+    /// Keyword search over chunks needs no model: a plain scan writes them,
+    /// so search, citations and page facts work before any semantic index,
+    /// and a later rebuild embeds the chunks the scan already wrote.
+    #[test]
+    fn a_scan_alone_makes_chunks_searchable_and_a_rebuild_embeds_them() {
+        use crate::project::Project;
+        use crate::runner::CancelToken;
+        use crate::{engine, scan};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Platform")).unwrap();
+        std::fs::write(dir.path().join("Platform/World.md"), "---\nverified: 2026-09-05\n---\n# World\n\nEach region loads from disk.\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let hits = search_member(&db, "region", None, 10).unwrap();
+        let world = hits.iter().find(|h| h.path == "Platform/World.md").expect("found without any model");
+        assert!(world.line.is_some());
+        assert_eq!(world.page.as_ref().and_then(|p| p.verified.as_deref()), Some("2026-09-05"));
+
+        let missing_before = db.chunks_missing_vectors("Platform/World.md").unwrap().len();
+        assert!(missing_before > 0);
+        let mut embedder = FakeEmbedder::new();
+        engine::rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap();
+        if db.vec_available() {
+            assert_eq!(db.chunks_missing_vectors("Platform/World.md").unwrap().len(), 0, "the rebuild embedded them");
+        }
+
+        // A removed file's chunks go with it.
+        std::fs::remove_file(dir.path().join("Platform/World.md")).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        assert!(search_member(&db, "region", None, 10).unwrap().is_empty());
+    }
+
     fn fixture_db_with_chunk(rel_path: &str, text: &str) -> Db {
         use crate::project::Project;
         use crate::runner::CancelToken;

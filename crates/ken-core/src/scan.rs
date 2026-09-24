@@ -449,6 +449,16 @@ fn index_one(
             db.set_file_byte_hash(rel, &hash, mtime)?;
         }
     }
+    // Chunks, for keyword search over sections and `repo:path:line`
+    // citations. They need no model, so every indexed file has them; the
+    // semantic rebuild only adds vectors. A file with no readable text has
+    // none.
+    if status == STATUS_INDEXED {
+        let chunks = crate::chunker::chunk_file(rel, &text, &crate::chunker::IndexProfile::default_for(rel));
+        db.upsert_chunks(rel, &chunks, tier)?;
+    } else {
+        db.delete_chunks(rel)?;
+    }
     // What a page says about itself (title, aliases, verified, retired,
     // generated), read from its frontmatter for search to rank and show.
     if kind == FileKind::Md {

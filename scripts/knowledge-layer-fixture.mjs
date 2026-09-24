@@ -9,7 +9,7 @@
 // (default: a sibling of this repo), so the method's own templates are what
 // set-up, drafting, links and drift see.
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +76,15 @@ if (existsSync(join(wow, "templates", "wiki"))) {
   mkdirSync(join(docs, "Research/Ingestion/Ingested"), { recursive: true });
 }
 init(docs);
+// A vocabulary row, so a search in the team's word ("shard") finds the page
+// written in the platform's ("region").
+const vocab = join(docs, "Vocabulary.md");
+const row = "| shard | region | Platform/Save.md |\n";
+if (existsSync(vocab)) {
+  writeFileSync(vocab, readFileSync(vocab, "utf8").replace(/\| \{\{our word\}\} \|[^\n]*\n/, row));
+} else {
+  write(vocab, "# Vocabulary\n\n| our word | the platform's word | where it lives |\n|---|---|---|\n" + row);
+}
 write(join(docs, "README.md"), "# Realms Docs\n\nThe wiki for Realms-Game.\n");
 mkdirSync(join(docs, ".obsidian"), { recursive: true });
 write(
@@ -86,7 +95,7 @@ write(
 write(
   join(docs, "Platform/Save.md"),
   "---\ntitle: Save\naliases: [\"persistence\"]\nverified: 2026-09-05\nsources:\n  - Realms-Game:src/save.rs:2\n---\n" +
-    "# Save\n\nWorlds are written as regions. See [[Combat]] and [[Ghost Page]], and [the old notes](../Platform/Gone.md).\n",
+    "# Save\n\nEach region is written to disk on its own. See [[Combat]] and [[Ghost Page]], and [the old notes](../Platform/Gone.md).\n",
 );
 write(
   join(docs, "Platform/Combat.md"),

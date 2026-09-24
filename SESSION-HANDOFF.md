@@ -230,7 +230,17 @@ PC (dev), not measured anywhere.
   pages. Command `draft_wiki(wiki, extra)`; offered as a checkbox on the
   set-up Index step (wiki repo select, optional documents folder).
   Business docs beyond Current/Project wait for 2b.
-  ken-core on this PC: 811 pass, 53 fail (all pre-existing, Windows);
+- **Chunks without a model.** Found while writing the test plan: chunks
+  were written only by the semantic rebuild, so with Search by meaning off
+  (or no embedding model) project search found nothing, and lines, page
+  facts, bands and aliases had nothing to ride on. Since `d6650c3` the
+  project search box has used chunk search only. Now every scan chunks
+  each indexed file (default profile); the rebuild embeds every chunk
+  with no vector (`Db::chunks_missing_vectors`), not only changed ones;
+  `remove_file` deletes a file's chunks (a removed file kept answering).
+- **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
+  `node scripts/knowledge-layer-fixture.mjs <folder>`.
+  ken-core on this PC: 812 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 482/482.
 
 ## The steps, in order
