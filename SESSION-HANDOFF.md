@@ -124,6 +124,16 @@ PC (dev), not measured anywhere.
   Review item of kind `links` is kept (replaced only when its text
   changes, resolved when clean). `page_links` command gives a page's
   outgoing and incoming links; the Map does not use it yet.
+- **Step 14, the graph per workspace (per team still to do).** The merged
+  graph is built over the workspace manifest's members (every Ok member
+  with an index on disk, read for entities: team, wiki, or no kind yet),
+  not only the members open this session. Its file moved from app data to
+  `<workspace>/.ken-workspace/kg.sqlite` (`workspace_kg_root`; app data
+  only with no workspace open); the build, the three KG read commands,
+  routed search and the MCP (`kg_root`, via the last-opened workspace) all
+  use it. The old app-data `kg.sqlite` is left in place, unused. Not
+  unit-tested (src-tauri has no tests for it); check in the app. A graph
+  per team inside one workspace waits for step 4's teams.
   ken-core on this PC: 796 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 479/479.
 

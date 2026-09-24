@@ -7175,24 +7175,59 @@ fn schedule_workspace_kg_debounce(app: &AppHandle, state: &SharedState) {
 /// `MemberRuntime::db`/`search_db` handles — so a slow build never contends
 /// a member's own write connection or requires holding the global lock
 /// across it.
+/// Where the merged graph lives: beside the open workspace's manifest
+/// (`<workspace>/.ken-workspace/kg.sqlite`, design D1), so each workspace has
+/// its own graph instead of all of them rewriting one file; app data only
+/// when no workspace is open.
+fn workspace_kg_root(guard: &AppState) -> std::path::PathBuf {
+    guard
+        .workspace
+        .as_ref()
+        .map(|w| w.ws.root.clone())
+        .unwrap_or_else(|| guard.base_dir.clone())
+}
+
+/// The members the merged graph is built over: every member the workspace
+/// manifest lists that has an index on disk and is read for entities (a
+/// team or wiki repo, or one whose kind is not said yet), whether or not it
+/// is open this session. With no workspace, the open members.
+fn workspace_kg_members(guard: &AppState) -> Vec<uuid::Uuid> {
+    let pseudo_id = memory_pseudo_member_id(guard);
+    let listed: Vec<(uuid::Uuid, std::path::PathBuf)> = match guard.workspace.as_ref() {
+        Some(w) => w
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some((p.config.id, p.root.clone())),
+                _ => None,
+            })
+            .collect(),
+        None => guard.members.values().map(|m| (m.project.config.id, m.project.root.clone())).collect(),
+    };
+    listed
+        .into_iter()
+        // ken-memory task 2.1 (D3): the pseudo-member's memories never join
+        // the workspace-wide KG.
+        .filter(|(id, _)| Some(*id) != pseudo_id)
+        .filter(|(id, _)| db_path(&guard.base_dir, *id).exists())
+        .filter(|(_, root)| {
+            let kind = ken_core::registry::kind_of(root);
+            kind.is_empty() || kind.iter().any(|k| k.reads_entities())
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
 fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
-    let (base_dir, running, cancel_slot, mut member_ids, enabled) = {
+    let (base_dir, kg_root, running, cancel_slot, mut member_ids, enabled) = {
         let guard = state.lock().unwrap();
-        let pseudo_id = memory_pseudo_member_id(&guard);
         (
             guard.base_dir.clone(),
+            workspace_kg_root(&guard),
             guard.workspace_kg_running.clone(),
             guard.workspace_kg_cancel.clone(),
-            // ken-memory task 2.1 (D3): never federated — the pseudo-
-            // member's own long-term memories get their own per-project
-            // knowledge model like any member, but that model never joins
-            // the workspace-wide KG in v1.
-            guard
-                .members
-                .keys()
-                .copied()
-                .filter(|id| Some(*id) != pseudo_id)
-                .collect::<Vec<_>>(),
+            workspace_kg_members(&guard),
             federated_kg_enabled(&guard.app_settings),
         )
     };
@@ -7222,7 +7257,7 @@ fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
         );
         let federation_llm = AppFederationLlm;
         let build = (|| -> ken_core::Result<ken_core::federation::BuildReport> {
-            let mut kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&base_dir)?;
+            let mut kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&kg_root)?;
             let dbs = member_ids
                 .iter()
                 .map(|id| Db::open_read_only(&base_dir, *id).map(|db| (*id, db)))
@@ -7314,7 +7349,7 @@ fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOver
     if !federated_kg_enabled(&guard.app_settings) {
         return Err("federatedKg flag is off".into());
     }
-    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&guard.base_dir).map_err(err)?;
+    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
     let built_at = kg
         .get_meta("workspace_kg_built_at")
         .map_err(err)?
@@ -7415,7 +7450,7 @@ fn workspace_kg_entity(state: State<SharedState>, id: i64) -> CmdResult<Workspac
     if !federated_kg_enabled(&guard.app_settings) {
         return Err("federatedKg flag is off".into());
     }
-    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&guard.base_dir).map_err(err)?;
+    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
     let entity = kg
         .get_global_entity(id)
         .map_err(err)?
@@ -7521,7 +7556,7 @@ fn workspace_kg_search(state: State<SharedState>, query: String) -> CmdResult<Ve
     if q.is_empty() {
         return Ok(Vec::new());
     }
-    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&guard.base_dir).map_err(err)?;
+    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
     let mut hits: Vec<WorkspaceKgSearchHitDto> = kg
         .list_global_entities()
         .map_err(err)?
@@ -7771,7 +7806,7 @@ async fn route_search(
     let limit = limit.unwrap_or(30);
 
     let group_targets: Option<Vec<uuid::Uuid>>;
-    let (base_dir, kg_enabled, embedder_slot, snapshots) = {
+    let (base_dir, kg_root, kg_enabled, embedder_slot, snapshots) = {
         let guard = state.lock().unwrap();
         if !kg_routing_enabled(&guard.app_settings) {
             return Err("kgRouting flag is off".into());
@@ -7854,6 +7889,7 @@ async fn route_search(
             .or_else(|| snapshots.iter().find_map(|s| s.embedder_slot.clone()));
         (
             guard.base_dir.clone(),
+            workspace_kg_root(&guard),
             federated_kg_enabled(&guard.app_settings),
             embedder_slot,
             snapshots,
@@ -7927,7 +7963,7 @@ async fn route_search(
             },
             (None, None) => {
                 let kg = if kg_enabled {
-                    ken_core::workspace_kg_db::WorkspaceKgDb::open(&plan_base).ok()
+                    ken_core::workspace_kg_db::WorkspaceKgDb::open(&kg_root).ok()
                 } else {
                     None
                 };

@@ -1020,7 +1020,7 @@ kg_search has nothing to search yet. semantic_search and route_query still \
 work without it (route_query just skips straight to broadcasting)."
             .to_string());
     }
-    let kg = WorkspaceKgDb::open(&server.base_dir)
+    let kg = WorkspaceKgDb::open(&kg_root(server))
         .map_err(|e| format!("could not open the workspace knowledge graph: {e}"))?;
     let q = query.trim().to_lowercase();
     let mut hits: Vec<_> = kg
@@ -1175,7 +1175,7 @@ folder in the Ken app first."
     }
 
     let kg = federated_kg_enabled(&app_settings)
-        .then(|| WorkspaceKgDb::open(&server.base_dir).ok())
+        .then(|| WorkspaceKgDb::open(&kg_root(server)).ok())
         .flatten();
     let plan = routing::plan_route(&query, &members, kg.as_ref());
 
@@ -3455,6 +3455,13 @@ argument is required (a name or folder path). {available}"
 /// `--project`-style scoping flag for a workspace to fall back on — ken-mcp
 /// only ever knows "the workspace Ken last had open," mirroring how the app
 /// itself reopens `lastWorkspace` on launch.
+/// Where the app keeps the merged graph: beside the last-opened workspace's
+/// manifest, else app data (no workspace open) — the same rule as the app's
+/// `workspace_kg_root`.
+fn kg_root(server: &Server) -> PathBuf {
+    resolve_workspace_root(server).unwrap_or_else(|_| server.base_dir.clone())
+}
+
 fn resolve_workspace_root(server: &Server) -> Result<PathBuf, String> {
     let registry = Registry::load(&server.base_dir)
         .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
