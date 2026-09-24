@@ -1,0 +1,18 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "src/files/MarkdownEditor.svelte",
+          "src/files/markdown/githubAlert.css"
+        ],
+        "createdAt": "2026-09-23T20:34:14.058Z",
+        "reason": "User confirmed: mermaid error and GitHub alert left rules are intentional"
+      }
+    ]
+  }
+}

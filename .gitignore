@@ -7,3 +7,7 @@ dist/
 harness/decks/
 harness/out/
 src-tauri/binaries/
+
+# Impeccable design-hook local state
+.impeccable/hook.cache.json
+.impeccable/config.local.json

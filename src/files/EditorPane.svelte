@@ -453,18 +453,14 @@
     align-items: center;
     gap: 4px;
     padding: 3px 6px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    /* Its own surface, a step of ink off the pane's `--surface`, with a real
+       edge: in the pane's colour (and faded) it disappeared into the page. */
+    background: color-mix(in srgb, var(--ink) 7%, var(--surface));
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius-control);
-    box-shadow: var(--shadow-control);
+    box-shadow: var(--shadow-card);
     font-size: 11.5px;
     color: var(--ink-tertiary);
-    opacity: 0.82;
-    transition: opacity 0.12s ease;
-  }
-  .actions:hover,
-  .actions:focus-within {
-    opacity: 1;
   }
   .action {
     display: inline-flex;
@@ -480,7 +476,7 @@
     flex: none;
   }
   .action:hover {
-    background: var(--sunken);
+    background: color-mix(in srgb, var(--ink) 14%, var(--surface));
     color: var(--ink);
   }
   .action.icon-only {
