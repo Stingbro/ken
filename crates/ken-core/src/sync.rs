@@ -947,7 +947,7 @@ mod tests {
         fs::create_dir(&bare).unwrap();
         git(&bare, &["init", "--bare", "--initial-branch=main"]);
 
-        git(dir.path(), &["clone", "origin.git", "a"]);
+        git(dir.path(), &["clone", "-c", "core.autocrlf=false", "origin.git", "a"]);
         let a = dir.path().join("a");
         set_identity(&a);
         git(&a, &["checkout", "-B", "main"]);
@@ -956,7 +956,7 @@ mod tests {
         git(&a, &["commit", "-m", "seed"]);
         git(&a, &["push", "-u", "origin", "main"]);
 
-        git(dir.path(), &["clone", "origin.git", "b"]);
+        git(dir.path(), &["clone", "-c", "core.autocrlf=false", "origin.git", "b"]);
         let b = dir.path().join("b");
         set_identity(&b);
 
