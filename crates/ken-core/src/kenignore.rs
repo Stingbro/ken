@@ -204,11 +204,38 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
 ///   (ken-memory 1.6).
 /// - `family::family_builtin_rules()` — a family clone (ken-families 1.6).
 ///
-/// This still returns empty rather than being deleted: it is the
-/// D2-correct plug point for a rule that really is global to every
-/// project, and callers already thread it through.
+/// What does belong here is a rule global to every project: archives. An
+/// archive or disk image answers no question by its name and Ken cannot
+/// read inside it, so it is not indexed; a user `!*.zip` line brings the
+/// names back. Media is not listed: Ken transcribes video. Secrets are not
+/// a rule at all but a hard ignore ([`is_secret_name`]), so no `!` line can
+/// bring them back.
 pub fn built_in_rule_sets() -> Vec<Rule> {
-    Vec::new()
+    ARCHIVE_PATTERNS
+        .iter()
+        .map(|p| Rule { tier: Tier::Ignore, pattern: (*p).into() })
+        .collect()
+}
+
+const ARCHIVE_PATTERNS: &[&str] = &["*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.tgz", "*.iso", "*.jar"];
+
+/// File names that hold secrets, never indexed at any tier: search results,
+/// chunks and entity prompts would all carry their contents. Dotfiles are
+/// already hidden by the walker; this also covers the plain-named ones.
+/// `*.key` includes Keynote decks, which Ken cannot read anyway.
+pub fn is_secret_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == ".env"
+        || n.starts_with(".env.")
+        || n.ends_with(".pem")
+        || n.ends_with(".key")
+        || n.ends_with(".p12")
+        || n.ends_with(".pfx")
+        || n.starts_with("id_rsa")
+        || n.starts_with("id_ed25519")
+        || n.starts_with("id_ecdsa")
+        || n.starts_with("secrets.")
+        || n == "credentials.json"
 }
 
 /// The rule a repo's kind contributes: its index state, set once for the
@@ -230,9 +257,10 @@ pub fn kind_rules_for(root: &Path) -> Vec<Rule> {
 }
 
 fn is_hard_ignored(path: &str) -> bool {
-    Path::new(path)
-        .components()
+    let p = Path::new(path);
+    p.components()
         .any(|c| matches!(c.as_os_str().to_str(), Some(name) if HARD_IGNORE_DIRS.contains(&name)))
+        || p.file_name().and_then(|n| n.to_str()).is_some_and(is_secret_name)
 }
 
 /// Whether `rule`'s glob matches `path` (or one of its parent directories
@@ -490,11 +518,35 @@ mod tests {
     }
 
     #[test]
-    fn built_in_rule_sets_is_currently_an_empty_placeholder() {
-        // ken-memory and ken-tasks (design.md D2/task 1.3) don't exist in
-        // this codebase yet, so there are no built-in rules to contribute.
-        // This test pins that honest-placeholder behavior so a future
-        // implementation change is a deliberate edit, not a silent drift.
-        assert!(built_in_rule_sets().is_empty());
+    fn built_ins_skip_archives_and_a_user_line_brings_them_back() {
+        let built = built_in_rule_sets();
+        for path in ["backups/world.zip", "a.7z", "dist/app.jar", "disk.iso", "x.tar.gz"] {
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignore, "{path}");
+        }
+        assert_eq!(classify("notes.md", false, &[&built]), Tier::Full);
+        assert_eq!(classify("clip.mp4", false, &[&built]), Tier::Full, "media stays: Ken transcribes it");
+        let user = parse("!*.zip\n");
+        assert_eq!(classify("backups/world.zip", false, &[&built, &user]), Tier::Full);
+    }
+
+    #[test]
+    fn secrets_are_hard_ignored_and_no_line_brings_them_back() {
+        let user = parse("!*\n!.env\n!config/credentials.json\n");
+        for path in [
+            ".env",
+            "app/.env.production",
+            "certs/server.pem",
+            "tls.key",
+            "home/id_rsa",
+            "home/id_ed25519.pub",
+            "config/credentials.json",
+            "deploy/secrets.yaml",
+            "Secrets.JSON",
+        ] {
+            assert_eq!(classify(path, false, &[&user]), Tier::Ignore, "{path}");
+        }
+        for path in ["docs/secrets-policy.md", "keys.md", "src/credentials.rs", "monkey.txt"] {
+            assert_eq!(classify(path, false, &[&user]), Tier::Full, "{path}");
+        }
     }
 }

@@ -60,6 +60,15 @@ PC (dev), not measured anywhere.
   backfill count full-tier files only; the deep rebuild sends only
   full-tier files. Already-extracted entities from a re-tiered file
   stay in the graph (removing them is still open).
+- **Step 3, built-in patterns.** Secrets (`.env*`, `*.pem`, `*.key`,
+  `*.p12`, `*.pfx`, `id_rsa*`/`id_ed25519*`/`id_ecdsa*`, `secrets.*`,
+  `credentials.json`) are hard-ignored: no `!` line brings them back.
+  Archives (`*.zip *.7z *.rar *.tar *.gz *.tgz *.iso *.jar`) are the first
+  global built-in rule; `!*.zip` brings them back. Media is untouched
+  (Ken transcribes video). The scan skips linked checkouts (a folder
+  whose `.git` is a file: worktrees, submodules) but still walks nested
+  clones; workspace discovery never offers a linked worktree as a member.
+  ken-core on this PC: 770 pass, 53 fail (all pre-existing, Windows).
 
 ## The steps, in order
 

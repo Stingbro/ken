@@ -626,6 +626,17 @@ pub fn unignore_folder(parent: &Path, folder: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// A linked git worktree: its `.git` is a file pointing into another repo's
+/// `.git/worktrees/`. It is a second checkout of that repo, never a member
+/// of its own.
+pub fn is_git_worktree(dir: &Path) -> bool {
+    let git = dir.join(".git");
+    git.is_file()
+        && fs::read_to_string(&git)
+            .map(|t| t.replace('\\', "/").contains("/worktrees/"))
+            .unwrap_or(false)
+}
+
 pub fn discover_candidates(parent: &Path) -> Result<Vec<Candidate>> {
     let entries = fs::read_dir(parent).map_err(|e| Error::io(parent, e))?;
     let mut dirs: Vec<PathBuf> = entries
@@ -641,7 +652,7 @@ pub fn discover_candidates(parent: &Path) -> Result<Vec<Candidate>> {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.starts_with('.') || crate::scan::is_junk_dir_name(name) {
+        if name.starts_with('.') || crate::scan::is_junk_dir_name(name) || is_git_worktree(&dir) {
             continue;
         }
         // The workspace-root `.kenignore` decides what is even a candidate.
@@ -687,7 +698,10 @@ fn group_folder_children(
         let Some(child_name) = child.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if child_name.starts_with('.') || crate::scan::is_junk_dir_name(child_name) {
+        if child_name.starts_with('.')
+            || crate::scan::is_junk_dir_name(child_name)
+            || is_git_worktree(&child)
+        {
             continue;
         }
         let rel = format!("{folder}/{child_name}");
@@ -1221,6 +1235,30 @@ mod tests {
         assert!(names.contains(&"notes".to_string()));
         assert!(!names.contains(&"SR".to_string()));
         assert!(!names.contains(&"SR/node_modules".to_string()));
+    }
+
+    #[test]
+    fn a_linked_worktree_is_never_offered_as_a_member() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Realms/.git")).unwrap();
+        fs::create_dir_all(dir.path().join("Realms-u7")).unwrap();
+        fs::write(
+            dir.path().join("Realms-u7/.git"),
+            "gitdir: C:\\Code\\Realms\\.git\\worktrees\\u7\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("SR/Tools/.git")).unwrap();
+        fs::create_dir_all(dir.path().join("SR/Tools-u7")).unwrap();
+        fs::write(dir.path().join("SR/Tools-u7/.git"), "gitdir: ../Tools/.git/worktrees/u7\n").unwrap();
+        let names: Vec<String> = discover_candidates(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert!(names.contains(&"Realms".to_string()));
+        assert!(names.contains(&"SR/Tools".to_string()));
+        assert!(!names.contains(&"Realms-u7".to_string()), "{names:?}");
+        assert!(!names.contains(&"SR/Tools-u7".to_string()), "{names:?}");
     }
 
     #[test]

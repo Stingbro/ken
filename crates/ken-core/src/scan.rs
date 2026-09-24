@@ -2,7 +2,7 @@
 //! watcher batches, exclusion changes, and full reindex — one code path.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -65,6 +65,27 @@ pub const JUNK_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "__p
 
 pub fn is_junk_dir_name(name: &str) -> bool {
     JUNK_DIRS.contains(&name)
+}
+
+/// A folder whose `.git` is a file, not a directory, is a linked worktree or
+/// a submodule: another checkout of some repo, indexed (if at all) as its
+/// own project. Walking it would index the same files twice; nine worktrees
+/// held more files than the four real repos they came from. A plain nested
+/// clone (a `.git` directory) is still walked, so a folder of repos indexed
+/// as one project keeps its contents.
+pub fn is_linked_checkout(dir: &Path) -> bool {
+    dir.join(".git").is_file()
+}
+
+/// Whether `rel` sits under a linked checkout below the project root.
+fn inside_linked_checkout(root: &Path, rel: &str) -> bool {
+    let mut dir = root.to_path_buf();
+    let mut parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    parts.pop(); // the entry itself: a file, or the folder the event is about
+    parts.into_iter().any(|seg| {
+        dir.push(seg);
+        is_linked_checkout(&dir)
+    })
 }
 
 /// Microsoft Office writes transient lock files named `~$<document>` beside
@@ -212,7 +233,8 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
             let name = e.file_name().to_string_lossy();
             name != crate::project::CONFIG_DIR
                 && !is_office_lock_name(&name)
-                && !(e.path().is_dir() && is_junk_dir_name(&name))
+                && !(e.path().is_dir()
+                    && (is_junk_dir_name(&name) || (e.depth() > 0 && is_linked_checkout(e.path()))))
         })
         .build()
         .flatten()
@@ -377,7 +399,8 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     let abs = project.root.join(rel);
     let excluded = project.is_excluded(rel)
         || is_hidden_rel(rel)
-        || rel.rsplit('/').next().is_some_and(is_office_lock_name);
+        || rel.rsplit('/').next().is_some_and(is_office_lock_name)
+        || inside_linked_checkout(&project.root, rel);
     // kenignore D3: an Ignore-tier path is treated exactly like `excluded` —
     // no row at all. This is a basic per-event check, not D4's fuller
     // old-tier -> new-tier transition diffing (deleting stale KM
@@ -922,6 +945,38 @@ mod tests {
         scan(&project, &mut db).unwrap();
         assert_eq!(db.extraction_coverage().unwrap().1, 2);
         assert_eq!(db.backfill_extractions().unwrap(), 2);
+    }
+
+    /// A linked worktree (a folder whose `.git` is a file) is another
+    /// checkout: not walked, and a watcher event inside it is a no-op. A
+    /// nested clone and plain folders are still walked. Secrets and archives
+    /// never get a row.
+    #[test]
+    fn worktrees_secrets_and_archives_stay_out_of_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("plan.md"), "# Plan\n").unwrap();
+        fs::create_dir_all(root.join("wt-u7/docs")).unwrap();
+        fs::write(root.join("wt-u7/.git"), "gitdir: ../main/.git/worktrees/u7\n").unwrap();
+        fs::write(root.join("wt-u7/docs/plan.md"), "# Plan, again\n").unwrap();
+        fs::create_dir_all(root.join("vendor-clone/.git")).unwrap();
+        fs::write(root.join("vendor-clone/readme.md"), "kept\n").unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config/credentials.json"), "{\"token\":\"x\"}").unwrap();
+        fs::write(root.join("config/secrets.yaml"), "token: x\n").unwrap();
+        fs::write(root.join("backup.zip"), "PK").unwrap();
+        let project = Project::create(root, "Skips").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        assert!(db.get_file("plan.md").unwrap().is_some());
+        assert!(db.get_file("vendor-clone/readme.md").unwrap().is_some(), "a nested clone is walked");
+        for gone in ["wt-u7/docs/plan.md", "config/credentials.json", "config/secrets.yaml", "backup.zip"] {
+            assert!(db.get_file(gone).unwrap().is_none(), "{gone}");
+        }
+        assert!(!refresh_path(&project, &mut db, "wt-u7/docs/plan.md").unwrap());
+        assert!(db.get_file("wt-u7/docs/plan.md").unwrap().is_none());
+        assert!(!refresh_path(&project, &mut db, "config/credentials.json").unwrap());
     }
 
     #[test]
