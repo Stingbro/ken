@@ -171,6 +171,16 @@ PC (dev), not measured anywhere.
   dialog or Scan again button in the UI yet; not tried in the app.
   ken-core on this PC: 803 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 482/482.
+- **Step 15, teams and settings.** Each feature flag has a plain `label`
+  and `applies` (this repo, this machine, the team, mine) from white box
+  frame 10e, with Ken in place of Wright; Settings and onboarding show
+  them with the registry description, code name small. `find_ken_mcp`
+  looks in `%LOCALAPPDATA%Programsken-mcp` (install.ps1) and uses
+  `where` on Windows. New `family_send` command and a Send form in the
+  family tray: a task, message or notification to a teammate's inbox
+  from the app, the same lane-2 write as the MCP tool. Not yet: a
+  separate Ken Settings page for sync and the connector (they stay where
+  they were), and `shared/` as a scratch pad in the UI.
 
 ## The steps, in order
 

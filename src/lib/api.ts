@@ -2355,6 +2355,15 @@ export const api = {
    *  mark the original seen/archived. */
   familyPushBack: (familyId: string, itemId: string, note: string) =>
     invoke<void>("family_push_back", { familyId, itemId, note }),
+  /** Send a task, message or notification to a teammate's inbox from the
+   *  app (the MCP's family_send, without an agent). Delivery, not assignment. */
+  familySend: (
+    familyId: string,
+    to: string,
+    kind: "task" | "message" | "notification",
+    title: string,
+    body: string,
+  ) => invoke<void>("family_send", { familyId, to, kind, title, body }),
   /** `family-sync`: emitted after every poll tick and every on-demand
    *  command that touches a connection's transport. App-global, like
    *  `board-state` — a family connection has no single owning project. */

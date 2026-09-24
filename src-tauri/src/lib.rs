@@ -13478,6 +13478,68 @@ fn family_push_back(app: AppHandle, state: State<SharedState>, family_id: String
     Ok(())
 }
 
+/// Send a task, message or notification to a teammate's inbox from the app,
+/// the same lane-2 write the MCP `family_send` tool makes. Delivery is not
+/// assignment: the item waits in their inbox until they accept or read it.
+#[tauri::command]
+fn family_send(
+    app: AppHandle,
+    state: State<SharedState>,
+    family_id: String,
+    to: String,
+    kind: String,
+    title: String,
+    body: String,
+) -> CmdResult<()> {
+    let id: uuid::Uuid = family_id.parse().map_err(err)?;
+    let (base_dir, settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    if !ken_families_enabled(&settings) {
+        return Err(KEN_FAMILIES_DISABLED_MSG.into());
+    }
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("give the item a title".into());
+    }
+    let kind = family::InboxKind::parse(&kind).ok_or("kind must be task, message or notification")?;
+    let conn = find_family_connection(&settings, id)?;
+    let clone_root = family_clone_root(&base_dir, id);
+    let manifest = FamilyManifest::load(&clone_root).map_err(err)?;
+    let to = to.trim().to_string();
+    if !manifest.has_member(&to) {
+        return Err(format!("\"{to}\" is not a member of this team. Members: {}.", manifest.member_ids().join(", ")));
+    }
+    let new_item = family::NewInboxItem {
+        id: None,
+        kind: Some(kind),
+        from: conn.member_id.clone(),
+        title: title.clone(),
+        body,
+        task: None,
+    };
+    let new_id = tasks::new_ulid();
+    let content = family::render_inbox_item(&new_item, &new_id, &iso_datetime_now());
+    let rel_path = format!("{}/{}", family::inbox_rel(&to), family::inbox_item_file_name(&new_id, kind, &title));
+
+    let mut transport = SystemGit::open(&clone_root).map_err(err)?;
+    let engine = family_engine_handle(&state, id, &clone_root);
+    {
+        let mut eng = engine.lock().unwrap();
+        eng.commit(
+            &mut transport,
+            &Lane::member(&conn.member_id),
+            &[PendingWrite::new(rel_path, content)],
+            &format!("Ken: deliver {} to {to}", kind.as_str()),
+        )
+        .map_err(err)?;
+    }
+    let report = { engine.lock().unwrap().poll(&mut transport) };
+    emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
+    Ok(())
+}
+
 /// Bring the main window back from the tray: unhide it, restore it if the
 /// user minimized it, and focus it. Shared by the tray's left click and its
 /// "Open Ken" item so both do exactly the same thing.
@@ -13800,6 +13862,7 @@ pub fn run() {
             family_set_item_status,
             family_accept_task,
             family_push_back,
+            family_send,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Ken")

@@ -11,7 +11,8 @@
   // and it only ever happens from the explicit "Accept" click below —
   // nothing in this file calls `families.acceptTask` except that handler.
   import { families } from "../lib/families.svelte";
-  import type { FamilyInboxItem } from "../lib/api";
+  import { api, type FamilyInboxItem, type FamilyInboxKind, type FamilyMember } from "../lib/api";
+  import Send from "@lucide/svelte/icons/send";
   import SquareCheck from "@lucide/svelte/icons/square-check";
   import MessageSquare from "@lucide/svelte/icons/message-square";
   import Bell from "@lucide/svelte/icons/bell";
@@ -64,6 +65,58 @@
     pushBackNote = "";
   }
 
+  // Send from the app (knowledge-layer step 15): the same inbox delivery the
+  // MCP family_send tool makes, so a person does not need an agent to send.
+  // Delivery is not assignment: it waits in their inbox until they act.
+  let composeOpen = $state(false);
+  let composeFamily = $state("");
+  let composeMembers = $state<FamilyMember[]>([]);
+  let composeTo = $state("");
+  let composeKind = $state<FamilyInboxKind>("message");
+  let composeTitle = $state("");
+  let composeBody = $state("");
+  let composeBusy = $state(false);
+  let composeSent = $state<string | null>(null);
+
+  async function pickFamily(familyId: string) {
+    composeFamily = familyId;
+    composeTo = "";
+    try {
+      const own = families.connections.find((c) => c.connection.familyId === familyId)?.connection.memberId;
+      composeMembers = (await api.familyManifestGet(familyId)).members.filter((m) => m.id !== own);
+      composeTo = composeMembers[0]?.id ?? "";
+    } catch (e) {
+      composeMembers = [];
+      actionError = String(e);
+    }
+  }
+
+  function openCompose() {
+    composeOpen = true;
+    composeSent = null;
+    actionError = null;
+    const first = families.connections[0]?.connection.familyId;
+    if (first && !composeFamily) void pickFamily(first);
+  }
+
+  async function sendCompose() {
+    if (!composeFamily || !composeTo || !composeTitle.trim() || composeBusy) return;
+    composeBusy = true;
+    actionError = null;
+    try {
+      await api.familySend(composeFamily, composeTo, composeKind, composeTitle.trim(), composeBody);
+      const who = composeMembers.find((m) => m.id === composeTo)?.name ?? composeTo;
+      composeSent = `Sent to ${who}'s inbox. It waits there until they act on it.`;
+      composeTitle = "";
+      composeBody = "";
+      composeOpen = false;
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      composeBusy = false;
+    }
+  }
+
   async function sendPushBack(familyId: string, item: FamilyInboxItem) {
     const note = pushBackNote.trim();
     if (!note) return;
@@ -83,7 +136,45 @@
   <div class="head">
     <span class="title">Family inbox</span>
     <span class="count">{families.totalUnread}</span>
+    {#if families.connections.length > 0 && !composeOpen}
+      <button class="btn-mini" onclick={openCompose}><Send size={11} strokeWidth={1.75} />Send</button>
+    {/if}
   </div>
+
+  {#if composeOpen}
+    <div class="compose">
+      {#if families.connections.length > 1}
+        <select value={composeFamily} onchange={(e) => void pickFamily(e.currentTarget.value)} aria-label="Team">
+          {#each families.connections as c (c.connection.familyId)}
+            <option value={c.connection.familyId}>{c.connection.name}</option>
+          {/each}
+        </select>
+      {/if}
+      <div class="compose-row">
+        <select bind:value={composeTo} aria-label="To">
+          {#each composeMembers as m (m.id)}<option value={m.id}>{m.name || m.id}</option>{/each}
+        </select>
+        <select bind:value={composeKind} aria-label="Kind">
+          <option value="message">message</option>
+          <option value="task">task</option>
+          <option value="notification">notification</option>
+        </select>
+      </div>
+      <input bind:value={composeTitle} placeholder="Title" aria-label="Title" />
+      <textarea bind:value={composeBody} rows="3" placeholder="Details (optional)" aria-label="Details"></textarea>
+      <div class="push-back-actions">
+        <button
+          class="btn-mini primary"
+          disabled={composeBusy || !composeTo || !composeTitle.trim()}
+          onclick={() => void sendCompose()}>Send</button
+        >
+        <button class="btn-mini ghost" onclick={() => (composeOpen = false)}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+  {#if composeSent}
+    <p class="note">{composeSent}</p>
+  {/if}
 
   {#if actionError}
     <p class="note warn">{actionError}</p>
@@ -176,6 +267,21 @@
 </div>
 
 <style>
+  .compose {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .compose-row {
+    display: flex;
+    gap: 6px;
+  }
+  .compose-row select {
+    flex: 1;
+  }
   .scrim {
     position: fixed;
     inset: 0;
