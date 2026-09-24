@@ -4475,7 +4475,19 @@ fn finish_recording(
     };
 
     let doc = record::build_document(&header, &body);
-    std::fs::write(recordings.join(&md_name), &doc).map_err(err)?;
+    // In a library with an inbox, a transcript lands in Raw/ so it is
+    // ingested like any other source; the audio stays in Recordings/ (Ken
+    // cannot read a WAV, and ingest would stop on it). An audio-only or
+    // failed recording stays whole in Recordings/, where retry expects it.
+    let raw_dir = root.join(ken_core::ingest::RAW);
+    let (md_dir, md_name, md_rel) = if storage != "audio" && failure.is_none() && raw_dir.is_dir() {
+        let name = record::unique_name(&raw_dir, &md_stem, "md");
+        let rel = format!("{}/{name}", ken_core::ingest::RAW);
+        (raw_dir, name, rel)
+    } else {
+        (recordings.clone(), md_name, md_rel)
+    };
+    std::fs::write(md_dir.join(&md_name), &doc).map_err(err)?;
     let _ = std::fs::remove_dir_all(tmp_dir);
 
     let mic_rel = mic_moved.map(|(_, rel)| rel);

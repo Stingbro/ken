@@ -202,8 +202,10 @@ PC (dev), not measured anywhere.
   as done on the card. Ingests screen: tabs Ingest (new inbox view),
   Recipes (was Knowledge docs), Automations; rail says Ingest. Not yet:
   writing what a note calls for (Current pages rewritten in place,
-  rulings, tickets), recordings landing in Raw as their transcript,
-  staging for memory/automation/chat writes to wiki pages.
+  rulings, tickets), staging for memory/automation/chat writes to wiki
+  pages. A recording made in Ken in a library with `Raw/` now writes its
+  transcript there (audio stays in Recordings/; audio-only or failed
+  transcription stays whole in Recordings/).
 - **Item 4b, the first wiki from an analysis.** New `wikidraft` module:
   `gather` reads each workspace repo's READMEs/CLAUDE.md/START-HERE/AGENTS,
   up to 10 top-level docs, its two-level layout, CODEOWNERS and `git
