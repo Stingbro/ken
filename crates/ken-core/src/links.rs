@@ -106,7 +106,8 @@ pub fn extract(from: &str, text: &str) -> Vec<Link> {
         let Some(end) = after.find("]]") else { break };
         let inner = &after[..end];
         let name = inner.split(['|', '#']).next().unwrap_or("").trim();
-        if !name.is_empty() && !name.contains('\n') {
+        // A template placeholder (`[[{{ingested note}}]]`) is not a link.
+        if !name.is_empty() && !name.contains('\n') && !name.contains("{{") {
             push(Link { kind: LinkKind::Name, target: name.to_string() });
         }
         rest = &after[end + 2..];
@@ -122,7 +123,7 @@ pub fn extract(from: &str, text: &str) -> Vec<Link> {
         let raw = raw.trim_start_matches('<').trim_end_matches('>');
         let target = raw.split('#').next().unwrap_or("");
         let is_url = target.contains("://") || target.starts_with("mailto:") || target.starts_with('/');
-        if !target.is_empty() && !is_url {
+        if !target.is_empty() && !is_url && !target.contains("{{") {
             let decoded = target.replace("%20", " ");
             push(Link { kind: LinkKind::Path, target: join(from, &decoded) });
         }
@@ -376,7 +377,7 @@ mod tests {
         let text = "See [[Rules]] and [[Team|the team]] and [[Lifecycle#L3]].\n\
                     Also [the map](../Platform/World.md \"title\") and [site](https://x.io) and [top](#here).\n\
                     ```\n[[Not A Link]]\n```\n\
-                    Inline `[[Also Not]]` code.\n";
+                    Inline `[[Also Not]]` code. A template's [[{{ingested note}}]] and [x]({{path}}).\n";
         let links = extract("Ways-of-Working/Index.md", text);
         assert_eq!(
             links,
