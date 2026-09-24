@@ -135,14 +135,22 @@ will need their own lines there once decided.
   `C:\Users\Owner\Documents\Hytale Code\ken`): has the full build
   environment and an installed Ken with real indexes. The measurement
   above belongs there.
-- **This PC** (`C:\Code\ken`, `C:\Code\Ways-of-Working`, checked
-  2026-09-24): Rust 1.97.1, Node 20.20, VS 2022 Build Tools with C++,
-  CMake and Ninja. Missing the Vulkan SDK and LLVM (`libclang`), so
-  the app does not build yet. No D: drive, so `CARGO_TARGET_DIR=D:\kt`
-  in `migration/test-workspace.bat` needs changing here. Ken has never
-  run here (`%APPDATA%\ken` absent). GitHub: `Stingbro` owns both
-  repos; `StingBros` is a second login on this PC with no access to
+- **This PC** (`C:\Code\ken`, `C:\Code\Ways-of-Working`, set up
+  2026-09-24): Rust 1.97.1, VS 2022 Build Tools, Vulkan SDK 1.4.357,
+  LLVM, Node 24.19 in Program Files (nvm-windows still selects Node 20
+  on PATH; `scripts\win-build.cmd` uses Node 24 for its own run). The
+  full app `cargo check` passes. Build with `scripts\win-build.cmd`
+  (`doctor`, `core`, `test`, `check`, `sidecar`, `dev`, `build`),
+  target dir `C:\kt`. winget's msstore source fails here on a
+  certificate check; use `--source winget`. GitHub: `Stingbro` owns
+  both repos; `StingBros` is a second login with no access to
   Ways-of-Working.
+- **ken-core tests on Windows** (`scripts\win-build.cmd core`): 759
+  pass, 55 fail. About 45 spawn the fake Claude CLI, a bash script
+  Windows cannot launch (os error 193); the rest (pdf, scan, import,
+  recipe, cloud) are unexamined, likely CRLF or path separators. The
+  old recipe ran only `workspace::`, so the full suite was never green
+  on Windows.
 
 ## Carried over from the 2026-09-01 handoff
 
@@ -153,9 +161,10 @@ will need their own lines there once decided.
   history of this file (`606fe3e`) for the full sequence. Task 5.3
   (live verification) waits on it.
 - **Build recipe:** plain `cargo test` fails (Vulkan/Ninja env). Use
-  `openspec/changes/workspace-group-folders/migration/test-workspace.bat`
-  (vcvars64 + VULKAN_SDK + Ninja + LIBCLANG_PATH, release profile),
-  adjusting its paths per machine.
+  `scripts\win-build.cmd`, which finds MSVC, Ninja, Vulkan and LLVM
+  on any machine; it supersedes
+  `openspec/changes/workspace-group-folders/migration/test-workspace.bat`,
+  whose paths are the other PC's.
 - **Never write JSON or config with PowerShell `Set-Content`:** PS 5.1
   writes a BOM and `AppSettings::load` silently rejects BOM'd JSON.
   Use the Write/Edit tools or Node.
