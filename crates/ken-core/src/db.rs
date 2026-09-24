@@ -558,6 +558,25 @@ impl Db {
             if !has_line {
                 self.conn.execute_batch("ALTER TABLE chunks ADD COLUMN line INTEGER;")?;
             }
+            // And what each Markdown page says about itself in its
+            // frontmatter (`pagemeta`), read at index time, so a hit can carry
+            // its verified date and rank by whether it is binding, evidence,
+            // retired or generated. The lists are JSON arrays.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS page_meta (
+                    rel_path    TEXT PRIMARY KEY,
+                    title       TEXT,
+                    aliases     TEXT NOT NULL DEFAULT '[]',
+                    status      TEXT,
+                    verified    TEXT,
+                    updated     TEXT,
+                    sources     TEXT NOT NULL DEFAULT '[]',
+                    replaced_by TEXT NOT NULL DEFAULT '[]',
+                    generated   INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+            )?;
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -973,6 +992,7 @@ impl Db {
             tx.execute("DELETE FROM extractions WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
+            tx.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
         }
         tx.commit()?;
         Ok(())
@@ -1925,6 +1945,85 @@ impl Db {
             params![MAX_EXTRACTION_ATTEMPTS],
             |r| r.get(0),
         )?)
+    }
+
+    /// Store (or, with None, forget) what a page's frontmatter says.
+    pub fn set_page_meta(&mut self, rel_path: &str, meta: Option<&crate::pagemeta::PageMeta>) -> Result<()> {
+        let Some(m) = meta else {
+            self.conn.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
+            return Ok(());
+        };
+        let json = |v: &Vec<String>| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
+        self.conn.execute(
+            r#"INSERT INTO page_meta (rel_path, title, aliases, status, verified, updated, sources, replaced_by, generated)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               ON CONFLICT(rel_path) DO UPDATE SET
+                 title = ?2, aliases = ?3, status = ?4, verified = ?5, updated = ?6,
+                 sources = ?7, replaced_by = ?8, generated = ?9"#,
+            params![
+                rel_path,
+                m.title,
+                json(&m.aliases),
+                m.status,
+                m.verified,
+                m.updated,
+                json(&m.sources),
+                json(&m.replaced_by),
+                m.generated as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the frontmatter of every indexed Markdown page that has no
+    /// `page_meta` row, from its stored text (no file read). Pages indexed
+    /// before frontmatter was read get theirs on the next open. Returns how
+    /// many pages had frontmatter.
+    pub fn backfill_page_meta(&mut self) -> Result<usize> {
+        let rows: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.rel_path, c.text FROM files f JOIN contents c ON c.file_id = f.id
+                  WHERE f.kind = 'md' AND f.status = 'indexed'
+                    AND NOT EXISTS (SELECT 1 FROM page_meta p WHERE p.rel_path = f.rel_path)",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            rows
+        };
+        let mut n = 0;
+        for (rel, text) in rows {
+            if let Some(meta) = crate::pagemeta::parse(&text) {
+                self.set_page_meta(&rel, Some(&meta))?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// What a page's frontmatter said when it was last indexed.
+    pub fn page_meta(&self, rel_path: &str) -> Result<Option<crate::pagemeta::PageMeta>> {
+        let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT title, aliases, status, verified, updated, sources, replaced_by, generated
+                   FROM page_meta WHERE rel_path = ?1",
+                params![rel_path],
+                |r| {
+                    Ok(crate::pagemeta::PageMeta {
+                        title: r.get(0)?,
+                        aliases: list(r.get(1)?),
+                        status: r.get(2)?,
+                        verified: r.get(3)?,
+                        updated: r.get(4)?,
+                        sources: list(r.get(5)?),
+                        replaced_by: list(r.get(6)?),
+                        generated: r.get::<_, i64>(7)? != 0,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// The line a chunk starts on, when it has been chunked since lines were

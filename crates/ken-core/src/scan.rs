@@ -407,6 +407,12 @@ fn index_one(
             db.set_file_byte_hash(rel, &hash, mtime)?;
         }
     }
+    // What a page says about itself (title, aliases, verified, retired,
+    // generated), read from its frontmatter for search to rank and show.
+    if kind == FileKind::Md {
+        let meta = (status == STATUS_INDEXED).then(|| crate::pagemeta::parse(&text)).flatten();
+        db.set_page_meta(rel, meta.as_ref())?;
+    }
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
     // churn without a content change never re-runs extraction. kenignore D3/
@@ -1057,6 +1063,28 @@ mod tests {
         let stats = scan(&project, &mut db).unwrap();
         assert_eq!(stats.updated, 1, "{stats:?}");
         assert!(db.get_file("plan.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pages_frontmatter_is_stored_at_index_time_and_backfilled_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("Rules.md");
+        fs::write(&page, "---\ntitle: Rules\naliases: [\"binding rules\"]\nverified: 2026-09-20\n---\n# Rules\n").unwrap();
+        let project = Project::create(dir.path(), "Meta").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        let meta = db.page_meta("Rules.md").unwrap().unwrap();
+        assert_eq!(meta.aliases, vec!["binding rules"]);
+        assert_eq!(meta.verified.as_deref(), Some("2026-09-20"));
+
+        // A page indexed before frontmatter was read gets it on open.
+        db.set_page_meta("Rules.md", None).unwrap();
+        assert_eq!(db.backfill_page_meta().unwrap(), 1);
+        assert!(db.page_meta("Rules.md").unwrap().is_some());
+
+        fs::write(&page, "# Rules, no frontmatter now, and longer\n").unwrap();
+        scan(&project, &mut db).unwrap();
+        assert_eq!(db.page_meta("Rules.md").unwrap(), None);
     }
 
     #[test]

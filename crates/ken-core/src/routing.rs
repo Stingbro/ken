@@ -353,8 +353,16 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
     let mut hits = search::merge_and_rerank(&fts_hits, &vec_hits, query);
     for hit in &mut hits {
         hit.line = db.chunk_line(hit.chunk_id)?;
+        hit.page = crate::pagemeta::hit_page(&hit.path, db.page_meta(&hit.path)?);
     }
+    // Binding and verified first, evidence and pages no longer current
+    // last; relevance order holds within each band (stable sort).
+    hits.sort_by_key(hit_band);
     Ok(hits)
+}
+
+fn hit_band(hit: &HybridHit) -> u8 {
+    hit.page.as_ref().map_or(1, |p| p.band)
 }
 
 /// A handle `execute_plan` needs to search one planned target: identity plus
@@ -402,6 +410,9 @@ pub struct RoutedHit {
     pub line: Option<i64>,
     /// The human citation, see [`locator`].
     pub locator: String,
+    /// For a Markdown page: section, verified or evidence date, and whether
+    /// it is retired or generated.
+    pub page: Option<crate::pagemeta::HitPage>,
     /// `kg://<entity-id>` per entity that selected this hit's plan (empty
     /// unless the plan's reason was `KgEntities` — see the module doc's
     /// "KG breadcrumbs are plan-level, not per-hit").
@@ -544,14 +555,19 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     address,
                     line: hit.line,
                     locator: locator(&mh.member_name, &hit.path, hit.line, sha.as_deref(), wiki),
+                    page: hit.page.clone(),
                     kg_breadcrumbs: breadcrumbs.clone(),
                 },
             ));
         }
     }
+    // The page band leads across members too: a binding page in one repo
+    // ranks ahead of a Research note in another, whatever their RRF scores.
+    let band = |h: &RoutedHit| h.page.as_ref().map_or(1, |p| p.band);
     candidates.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        band(&a.3)
+            .cmp(&band(&b.3))
+            .then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
     });
@@ -594,6 +610,7 @@ mod tests {
             snippet: format!("snippet for {path}"),
             source: Source::Keyword,
             line: None,
+            page: None,
         }
     }
 
@@ -908,6 +925,42 @@ mod tests {
 
         // KG-routed plan: breadcrumb present and well-formed.
         assert_eq!(result.kg_breadcrumbs, vec!["kg://42".to_string()]);
+    }
+
+    /// Across members, a binding page outranks a better-scoring Research
+    /// note or retired page; within a band the RRF order holds.
+    #[test]
+    fn binding_pages_lead_the_merged_list_across_members() {
+        use crate::pagemeta::{hit_page, PageMeta};
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast };
+        let paged = |path: &str, id: i64, meta: Option<PageMeta>| HybridHit {
+            page: hit_page(path, meta),
+            ..hit(path, id)
+        };
+        let retired = PageMeta { status: Some("retired".into()), ..Default::default() };
+        let member_hits = vec![
+            MemberHits {
+                project_id: a,
+                member_name: "A".into(),
+                status: MemberStatus::Searched,
+                hits: vec![paged("Research/old.md", 1, None), paged("Current/Project.md", 2, None)],
+            },
+            MemberHits {
+                project_id: b,
+                member_name: "B".into(),
+                status: MemberStatus::Searched,
+                hits: vec![
+                    paged("Ways-of-Working/Old-rules.md", 3, Some(retired)),
+                    paged("Ways-of-Working/Rules.md", 4, None),
+                ],
+            },
+        ];
+        let order: Vec<String> = merge_routed(&plan, &member_hits, 10).results.into_iter().map(|h| h.path).collect();
+        assert_eq!(
+            order,
+            vec!["Ways-of-Working/Rules.md", "Current/Project.md", "Research/old.md", "Ways-of-Working/Old-rules.md"]
+        );
     }
 
     #[test]

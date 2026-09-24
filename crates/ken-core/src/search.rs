@@ -70,6 +70,9 @@ pub struct HybridHit {
     /// the database (`routing::search_member`); None before that, or for a
     /// chunk stored before lines were recorded.
     pub line: Option<i64>,
+    /// For a Markdown page: its section, freshness and whether it is still
+    /// current (`pagemeta::hit_page`). Filled with `line`.
+    pub page: Option<crate::pagemeta::HitPage>,
 }
 
 /// Merge FTS and KNN chunk hits per B4 "FTS-priority fill": FTS hits fill
@@ -103,6 +106,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             snippet: hit.text.clone(),
             source,
             line: None,
+            page: None,
         });
     }
 
@@ -119,6 +123,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             snippet: hit.text.clone(),
             source: Source::Semantic,
             line: None,
+            page: None,
         });
     }
 
@@ -382,6 +387,7 @@ mod tests {
             snippet: snippet.to_string(),
             source,
             line: None,
+            page: None,
         }
     }
 

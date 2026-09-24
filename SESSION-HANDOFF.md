@@ -81,7 +81,20 @@ PC (dev), not measured anywhere.
   team or wiki repo. The MCP search output leads with the locator; the
   app DTO and `RoutedHit` TS type carry both. Old chunks have no line
   until the file is re-chunked.
-  ken-core on this PC: 775 pass, 53 fail (all pre-existing, Windows).
+- **Step 9, frontmatter.** New `pagemeta` module: a tolerant reader (not
+  YAML: template pages carry `{{date}}` and `#` comments) for `title`,
+  `aliases`, `status`, `verified`, `updated`/`date`, `sources`,
+  `replaced_by`/`superseded_by`, `generated`; and the library section from
+  the path (Markdown only). Stored per page in `page_meta` (schema v14) at
+  index time; `backfill_page_meta` on project open fills pages indexed
+  before. Hits carry `page` (section, title, verified, Research date,
+  retired, generated, replaced_by, band). Ranking bands: Ways-of-Working
+  and Platform first, Research/retired/generated last, stable within a
+  band, and across members in `merge_routed`. MCP output adds "retired,
+  see ...", "generated", "evidence from <date>" or "verified <date>".
+  Not yet: serving a retired page's replacement in its place (the hit
+  names it), and the app UI showing these (the data is on the DTO).
+  ken-core on this PC: 785 pass, 53 fail (all pre-existing, Windows).
 
 ## The steps, in order
 

@@ -744,6 +744,12 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         eprintln!("warning: stored-kind refresh failed: {e}");
     }
 
+    // Pages indexed before frontmatter was read get their title, aliases,
+    // verified date and retired/generated state from the stored text.
+    if let Err(e) = db.backfill_page_meta() {
+        eprintln!("warning: page frontmatter backfill failed: {e}");
+    }
+
     // One-time extraction backfill: a project indexed before the incremental
     // Map landed has no `extractions` rows, and the scanner never re-runs
     // index_one for unchanged files — so those files would show "0 of N
@@ -7571,6 +7577,9 @@ struct RoutedHitDto {
     line: Option<i64>,
     /// `repo:path:line`, `repo@sha:…`, led by `[[Note]]` in a wiki repo.
     locator: String,
+    /// For a Markdown page: section, verified or evidence date, retired or
+    /// generated, and what replaces it.
+    page: Option<ken_core::pagemeta::HitPage>,
     /// `kg://<entity-id>` per entity that selected this hit's plan; empty
     /// unless the plan's reason was `KgEntities` (routing.rs module doc: "KG
     /// breadcrumbs are plan-level, not per-hit").
@@ -7594,6 +7603,7 @@ impl From<routing::RoutedHit> for RoutedHitDto {
             address: h.address,
             line: h.line,
             locator: h.locator,
+            page: h.page,
             kg_breadcrumbs: h.kg_breadcrumbs,
         }
     }

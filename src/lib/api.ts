@@ -901,7 +901,24 @@ export interface RoutedHit {
   line: number | null;
   /** How to cite it: `repo:path:line`, `repo@sha:…`, led by `[[Note]]` in a wiki. */
   locator: string;
+  /** Present for a Markdown page. */
+  page: HitPage | null;
   kgBreadcrumbs: string[];
+}
+
+/** What a hit on a wiki page carries (mirrors `pagemeta::HitPage`). */
+export interface HitPage {
+  section: string | null;
+  title: string | null;
+  /** When a person last read it against its sources, `YYYY-MM-DD`. */
+  verified: string | null;
+  /** For Research: the date the evidence is from. */
+  dated: string | null;
+  retired: boolean;
+  generated: boolean;
+  replacedBy: string[];
+  /** 0 binding, 1 the rest, 2 evidence or no longer current. */
+  band: number;
 }
 
 export type RouteMemberStatus = "searched" | "index-building" | "unavailable";

@@ -1292,6 +1292,9 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
             source_label(hit.source),
             hit.snippet
         ));
+        if let Some(note) = hit.page.as_ref().and_then(page_note) {
+            out.push_str(&format!(" ({note})"));
+        }
         if !hit.kg_breadcrumbs.is_empty() {
             out.push_str(&format!(" ({})", hit.kg_breadcrumbs.join(" ")));
         }
@@ -2771,6 +2774,25 @@ fn pipeline_digest_tool(server: &Server, args: &Value) -> Result<String, String>
         }
     }
     Ok(out)
+}
+
+/// What an agent must know before it trusts a page hit: that it is retired
+/// (and what replaces it), generated, dated evidence, or when a person last
+/// verified it.
+fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
+    if p.retired {
+        return Some(match p.replaced_by.is_empty() {
+            true => "retired".to_string(),
+            false => format!("retired, see {}", p.replaced_by.join(", ")),
+        });
+    }
+    if p.generated {
+        return Some("generated: fix the generator, not the page".to_string());
+    }
+    if let Some(d) = &p.dated {
+        return Some(format!("evidence from {d}, not current state"));
+    }
+    p.verified.as_ref().map(|v| format!("verified {v}"))
 }
 
 fn source_label(source: Source) -> &'static str {
