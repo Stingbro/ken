@@ -181,6 +181,26 @@ PC (dev), not measured anywhere.
   from the app, the same lane-2 write as the MCP tool. Not yet: a
   separate Ken Settings page for sync and the connector (they stay where
   they were), and `shared/` as a scratch pad in the UI.
+- **Step 12, Ingest and Recipes (first cut).** New `ingest` module: the
+  library inbox. `waiting` lists `Research/Ingestion/Raw/`; `ingest_one`
+  reads a source's text, prompts with the library's own
+  `Templates/Ingested-note.md` (or the method's, built in), writes
+  `Ingested/<date>-<name>.md` with `source:` set, moves the source to
+  `Ingested/<date>-<name>/`, and files one Review card (kind `ingest`,
+  body = What It Overturns / Actions / Rulings) whose payload holds the
+  placement and a hash of the note. `undo` moves the source back and
+  removes the note unless it was edited. The model call is injected, so
+  tests run on Windows. App: `start_ingest_pass` after a scan of a team or
+  wiki repo (one at a time, Claude CLI, 10 min per source, a failure
+  files one `ingest-failed` item and stops the pass); commands
+  `ingest_status`, `ingest_now`, `ingest_undo`. Review: Open, Undo, Mark
+  as done on the card. Ingests screen: tabs Ingest (new inbox view),
+  Recipes (was Knowledge docs), Automations; rail says Ingest. Not yet:
+  writing what a note calls for (Current pages rewritten in place,
+  rulings, tickets), recordings landing in Raw as their transcript,
+  staging for memory/automation/chat writes to wiki pages.
+  ken-core on this PC: 806 pass, 53 fail (all pre-existing, Windows);
+  ken-mcp 39/39; frontend 482/482.
 
 ## The steps, in order
 

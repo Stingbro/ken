@@ -72,6 +72,13 @@ export type SetupMoved =
   | { change: "Gone"; member: string }
   | { change: "NewWorktree"; pattern: string; evidence: string };
 
+export interface IngestStatus {
+  hasInbox: boolean;
+  waiting: string[];
+  running: boolean;
+  claudeFound: boolean;
+}
+
 /** Mirrors `drift::DriftRun`: one standing sweep. */
 export interface DriftRun {
   at: number;
@@ -334,7 +341,8 @@ export type InboxKind =
   | "stored"
   | "conflict"
   | "conflict-copy"
-  | "automation-proposal";
+  | "automation-proposal"
+  | "ingest";
 
 export interface InboxItem {
   /** Kind-prefixed, stable across refreshes: "run-12", "stale-people", … */
@@ -1703,6 +1711,12 @@ export interface FamilyInboxItem {
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   indexHealth: () => invoke<IndexHealth>("index_health"),
+  /** What waits in the library inbox (Research/Ingestion/Raw/). */
+  ingestStatus: () => invoke<IngestStatus>("ingest_status"),
+  /** Read what waits in Raw/ now; false when a pass is already running. */
+  ingestNow: () => invoke<boolean>("ingest_now"),
+  /** Undo an ingest card: source back to Raw/, note removed unless edited. */
+  ingestUndo: (itemId: number) => invoke<boolean>("ingest_undo", { itemId }),
   /** The last drift sweep (null before the first). */
   driftStatus: () => invoke<DriftRun | null>("drift_status"),
   /** Run the drift sweep now. */

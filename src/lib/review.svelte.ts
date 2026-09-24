@@ -28,7 +28,8 @@ export type InboxAction =
   | "edit-manually"
   | "keep-copy"
   | "keep-original"
-  | "open-both";
+  | "open-both"
+  | "undo-ingest";
 
 export function actionsFor(kind: InboxKind): InboxAction[] {
   switch (kind) {
@@ -47,6 +48,10 @@ export function actionsFor(kind: InboxKind): InboxAction[] {
       return ["accept-draft", "keep-mine", "take-theirs", "edit-manually"];
     case "conflict-copy":
       return ["keep-copy", "keep-original", "open-both"];
+    case "ingest":
+      // One card of key takeaways per source: read it, undo a wrong one,
+      // or mark it seen. Nobody confirms a note.
+      return ["open-files", "undo-ingest", "mark-done"];
   }
 }
 
@@ -131,6 +136,8 @@ export function dotFor(kind: InboxKind): string {
       return "var(--accent)";
     case "stored":
       return "var(--needs-input)";
+    case "ingest":
+      return "var(--accent)";
     case "conflict":
     case "conflict-copy":
     case "failed-file":
@@ -157,6 +164,7 @@ export function inboxFileRef(item: InboxItem): string | null {
     case "conflict":
     case "conflict-copy":
     case "stored":
+    case "ingest":
       return item.sourceRef;
     default:
       return null;
@@ -275,6 +283,12 @@ class ReviewStore {
 
   async runNow(item: InboxItem) {
     await api.runIngest(item.sourceRef, true);
+    await this.refresh();
+  }
+
+  /** Undo an ingest card (source back to Raw/, note removed unless edited). */
+  async undoIngest(item: InboxItem) {
+    await api.ingestUndo(numericId(item));
     await this.refresh();
   }
 

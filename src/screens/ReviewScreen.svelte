@@ -39,6 +39,7 @@
     "keep-copy": "Keep this copy",
     "keep-original": "Keep the original",
     "open-both": "Open in Files",
+    "undo-ingest": "Undo",
   };
 
   function act(action: InboxAction, it: InboxItem) {
@@ -61,6 +62,9 @@
         break;
       case "mark-done":
         void review.markDone(it);
+        break;
+      case "undo-ingest":
+        void review.undoIngest(it);
         break;
       case "accept-draft":
       case "keep-mine":

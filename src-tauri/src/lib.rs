@@ -1170,6 +1170,8 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                     // The standing sweep, when due: team and wiki repos only,
                     // on the index this scan just brought up to date.
                     run_drift_if_due(&scan_project, &mut db, false);
+                    // And the library inbox: anything waiting in Raw/.
+                    start_ingest_pass(&scan_project, &base, false);
                 }
                 Err(e) => {
                     let _ = scan_app.emit("scan-error", e.to_string());
@@ -5921,7 +5923,7 @@ fn inbox_rank(kind: &str) -> u8 {
         "approval" => 0,
         "automation-proposal" => 1,
         "conflict" | "conflict-copy" => 2,
-        "stored" => 3,
+        "stored" | "ingest" => 3,
         "broken-recipe" => 4,
         "failed-file" => 5,
         _ => 6, // stale
@@ -5932,7 +5934,7 @@ fn inbox_rank(kind: &str) -> u8 {
 /// (conflicts render their own detail); anything else stays generic.
 fn stored_kind(kind: &str) -> String {
     match kind {
-        "conflict" | "conflict-copy" | "automation-proposal" => kind.to_string(),
+        "conflict" | "conflict-copy" | "automation-proposal" | "ingest" => kind.to_string(),
         _ => "stored".to_string(),
     }
 }
@@ -7038,6 +7040,121 @@ fn run_drift_if_due(project: &Project, db: &mut Db, force: bool) -> Option<ken_c
             None
         }
     }
+}
+
+/// Projects with an ingest pass in flight, so a scan that lands mid-pass
+/// does not start a second one over the same inbox.
+static INGEST_RUNNING: std::sync::LazyLock<Mutex<std::collections::HashSet<uuid::Uuid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Read every source waiting in a team or wiki repo's `Research/Ingestion/
+/// Raw/`, one at a time on a background thread, through the Claude CLI.
+/// Each becomes a dated note and one Review card; a source that fails stays
+/// in Raw with a Review item saying why. `force` runs it for any kind.
+/// Returns whether a pass started.
+fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
+    let root = project.root.clone();
+    if !ken_core::ingest::has_inbox(&root) || ken_core::ingest::waiting(&root).is_empty() {
+        return false;
+    }
+    let library = ken_core::registry::kind_of(&root)
+        .iter()
+        .any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki));
+    if !library && !force {
+        return false;
+    }
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return false;
+    };
+    let id = project.config.id;
+    if !INGEST_RUNNING.lock().unwrap().insert(id) {
+        return false;
+    }
+    let base = base.to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(mut db) = Db::open(&base, id) {
+            for raw in ken_core::ingest::waiting(&root) {
+                let today = local_date_today();
+                let generate = |prompt: &str| -> ken_core::Result<String> {
+                    match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
+                        ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+                        ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
+                        ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
+                        ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
+                    }
+                };
+                if let Err(e) = ken_core::ingest::ingest_one(&root, &mut db, &raw, &today, engine::now_epoch(), generate) {
+                    let open = db.list_open_review_items().unwrap_or_default();
+                    if !open.iter().any(|it| it.kind == "ingest-failed" && it.source_ref == raw) {
+                        let _ = db.insert_review_item(
+                            "ingest-failed",
+                            &format!("Could not ingest {}", raw.rsplit('/').next().unwrap_or(&raw)),
+                            &format!("It stays in Raw/. {e}"),
+                            &raw,
+                            None,
+                            engine::now_epoch(),
+                        );
+                    }
+                    break; // one failure (often the CLI) stops the pass; the next scan retries
+                }
+            }
+        }
+        INGEST_RUNNING.lock().unwrap().remove(&id);
+    });
+    true
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestStatusDto {
+    has_inbox: bool,
+    waiting: Vec<String>,
+    running: bool,
+    claude_found: bool,
+}
+
+/// What waits in the focused project's library inbox.
+#[tauri::command]
+fn ingest_status(state: State<SharedState>) -> CmdResult<IngestStatusDto> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    let root = &active.project.root;
+    Ok(IngestStatusDto {
+        has_inbox: ken_core::ingest::has_inbox(root),
+        waiting: ken_core::ingest::waiting(root),
+        running: INGEST_RUNNING.lock().unwrap().contains(&active.project.config.id),
+        claude_found: ken_core::runner::discover_claude().is_some(),
+    })
+}
+
+/// Read what waits in Raw/ now, whatever the repo's kind.
+#[tauri::command]
+fn ingest_now(state: State<SharedState>) -> CmdResult<bool> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    if ken_core::runner::discover_claude().is_none() {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    }
+    Ok(start_ingest_pass(&active.project, &guard.base_dir, true))
+}
+
+/// Undo an ingest card: the source goes back to Raw/, the note is removed
+/// unless a person edited it, and the card is resolved.
+#[tauri::command]
+fn ingest_undo(state: State<SharedState>, item_id: i64) -> CmdResult<bool> {
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, None)?;
+    let item = active
+        .db
+        .list_open_review_items()
+        .map_err(err)?
+        .into_iter()
+        .find(|it| it.id == item_id && it.kind == ken_core::ingest::REVIEW_KIND)
+        .ok_or("no open ingest card with that id")?;
+    let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
+    let removed = ken_core::ingest::undo(&active.project.root, &card).map_err(err)?;
+    active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
+    Ok(removed)
 }
 
 /// The last drift sweep for the focused project, if one has run.
@@ -13758,6 +13875,9 @@ pub fn run() {
             setup_propose,
             setup_confirm,
             setup_rescan,
+            ingest_status,
+            ingest_now,
+            ingest_undo,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

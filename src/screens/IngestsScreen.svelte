@@ -7,6 +7,7 @@
   import { timeAgo } from "../lib/format";
   import IngestForm from "../ingests/IngestForm.svelte";
   import AutomationsPane from "../ingests/AutomationsPane.svelte";
+  import IngestInbox from "../ingests/IngestInbox.svelte";
   import TemplateGallery from "../ingests/TemplateGallery.svelte";
   import type { IngestTemplate } from "../lib/templates";
   import type { IngestMode, IngestRefresh, RunRow } from "../lib/api";
@@ -31,7 +32,9 @@
   let galleryOpen = $state(false);
   // Knowledge docs (the ingests list/detail) vs. Automations. Both stores init
   // on mount so live events keep either tab current even while it's hidden.
-  let tab = $state<"docs" | "automations">("docs");
+  // Ingest is the library inbox; Recipes (once "Knowledge docs") keep an
+  // output page fresh from its sources; Automations are unchanged.
+  let tab = $state<"ingest" | "docs" | "automations">("ingest");
 
   onMount(() => {
     void ingests.init();
@@ -209,14 +212,21 @@
 
 <div class="wrap">
   <div class="tabbar">
-    <div class="tabs" role="tablist" aria-label="Ingests view">
+    <div class="tabs" role="tablist" aria-label="Ingest view">
+      <button
+        class="seg"
+        class:on={tab === "ingest"}
+        role="tab"
+        aria-selected={tab === "ingest"}
+        onclick={() => (tab = "ingest")}
+      >Ingest</button>
       <button
         class="seg"
         class:on={tab === "docs"}
         role="tab"
         aria-selected={tab === "docs"}
         onclick={() => (tab = "docs")}
-      >Knowledge docs</button>
+      >Recipes</button>
       <button
         class="seg"
         class:on={tab === "automations"}
@@ -227,13 +237,15 @@
     </div>
   </div>
 
-  {#if tab === "docs"}
+  {#if tab === "ingest"}
+    <IngestInbox />
+  {:else if tab === "docs"}
 <div class="screen">
   <!-- list pane -->
   <div class="list">
     <div class="list-head">
-      Ingests
-      <button class="plus" title="New ingest" onclick={startCreate}>+</button>
+      Recipes
+      <button class="plus" title="New recipe" onclick={startCreate}>+</button>
     </div>
 
     {#if ingests.doctor && !ingests.doctor.found}

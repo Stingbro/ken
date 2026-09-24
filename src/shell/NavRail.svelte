@@ -36,7 +36,7 @@
     { key: "home", icon: LayoutGrid, label: "Home" },
     { key: "files", icon: Files, label: "Files" },
     { key: "review", icon: SquareCheck, label: "Review" },
-    { key: "ingests", icon: Layers, label: "Ingests" },
+    { key: "ingests", icon: Layers, label: "Ingest" },
     { key: "map", icon: Network, label: "Map" },
     { key: "timeline", icon: Clock, label: "Timeline" },
     { key: "record", icon: Mic, label: "Record" },
