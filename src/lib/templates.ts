@@ -10,9 +10,26 @@ export interface IngestTemplate {
   mode: IngestMode;
   refresh: IngestRefresh;
   instruction: string;
+  /** Folders the recipe reads; empty or absent means the whole project. */
+  sources?: string[];
 }
 
 export const TEMPLATES: IngestTemplate[] = [
+  {
+    // The method's Current section, kept true by Ingest: each ingested note
+    // rewrites the pages it changes, in place, never appended to. Its edits
+    // go through staging like every recipe's, and a first run over the
+    // template pages is weighed like any other.
+    id: "current",
+    name: "Current, from ingested notes",
+    description: "What is true now about the project and the team, rewritten in place from each ingested note",
+    output: "Current/",
+    mode: "collection",
+    refresh: "on-change",
+    sources: ["Research/Ingestion/Ingested"],
+    instruction:
+      "Keep the pages in Current/ (Project, Team, Who-Does-What, and any others there) true to the ingested notes. Rewrite a page in place when a note changes what it says; never append history, and never add a page a note does not call for. Keep each page's frontmatter: set updated: to today, set changed_by: to the note as a [[wiki link]], and add the note to sources:. Never set or change verified: (only a person does). Change only what the notes support; when two notes disagree, the newer one wins and the older one is named. Leave a page unchanged when no note touches it.",
+  },
   {
     id: "people",
     name: "People",

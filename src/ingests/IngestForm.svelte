@@ -19,6 +19,7 @@
       output: string;
       mode: IngestMode;
       refresh: IngestRefresh;
+      sources?: string[];
     };
   } = $props();
 
@@ -42,7 +43,7 @@
   let instruction = $state(preset?.instruction ?? "");
   let mode = $state<IngestMode>(preset?.mode ?? "single");
   let refresh = $state<IngestRefresh>(preset?.refresh ?? "on-change");
-  let selectedSources = $state<string[]>([]);
+  let selectedSources = $state<string[]>(preset?.sources ?? []);
   let outputFolder = $state(seedFolder); // project-relative folder from the dialog
   let outputName = $state(seedName); // single-mode document filename
   let error = $state<string | null>(null);

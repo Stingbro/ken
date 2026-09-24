@@ -24,14 +24,15 @@
     output: string;
     mode: IngestMode;
     refresh: IngestRefresh;
+    sources?: string[];
   };
 
   let formOpen = $state(false);
   let editingSlug = $state<string | null>(null);
   let formPreset = $state<FormPreset | null>(null);
   let galleryOpen = $state(false);
-  // Knowledge docs (the ingests list/detail) vs. Automations. Both stores init
-  // on mount so live events keep either tab current even while it's hidden.
+  // Both stores init on mount so live events keep either tab current even
+  // while it's hidden.
   // Ingest is the library inbox; Recipes (once "Knowledge docs") keep an
   // output page fresh from its sources; Automations are unchanged.
   let tab = $state<"ingest" | "docs" | "automations">("ingest");
@@ -205,6 +206,7 @@
       output: t.output,
       mode: t.mode,
       refresh: t.refresh,
+      sources: t.sources,
     };
     formOpen = true;
   }

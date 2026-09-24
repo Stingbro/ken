@@ -388,7 +388,12 @@ pub fn evaluate(
     let threshold = rules.review_threshold_pct as f64 / 100.0;
     let human_edited_mid_run = outputs_changed_since(project, &plan.output_snapshot);
 
-    let hold = !plan.first_run && (ratio > threshold || human_edited_mid_run);
+    // A first run is exempt only when it writes into nothing: the output has
+    // no files yet. A first run over pages a person wrote (a Current page
+    // from the templates, say) is weighed like any other, so an agent never
+    // replaces a person's page unseen.
+    let exempt = plan.first_run && plan.output_snapshot.is_empty();
+    let hold = !exempt && (ratio > threshold || human_edited_mid_run);
     if hold {
         let reason = if human_edited_mid_run {
             "an output file was edited while the run was in flight".to_string()
@@ -568,6 +573,22 @@ mod tests {
         assert!(!p.staging.exists(), "staging cleaned after apply");
     }
 
+    /// A first run over a page that already exists (a person's, or a filled
+    /// template) is not exempt: rewriting most of it waits for review.
+    #[test]
+    fn a_first_run_over_an_existing_page_is_held_when_it_rewrites_most_of_it() {
+        let (_d, project, db, recipe) = setup(Mode::Single, "knowledge/People.md");
+        let existing: String = (0..20).map(|i| format!("person {i}\n")).collect();
+        fs::create_dir_all(project.root.join("knowledge")).unwrap();
+        fs::write(project.root.join("knowledge/People.md"), &existing).unwrap();
+        let p = plan(&project, &db, &recipe, &DEFAULT_RULES, false).unwrap().unwrap();
+        assert!(p.first_run);
+        stage(&project, "people", "knowledge/People.md", "# People\n- someone else\n");
+        let outcome = evaluate(&project, &recipe, &DEFAULT_RULES, &p).unwrap();
+        assert!(!outcome.applied, "{outcome:?}");
+        assert_eq!(fs::read_to_string(project.root.join("knowledge/People.md")).unwrap(), existing);
+    }
+
     #[test]
     fn small_change_applies_large_change_holds() {
         let (_d, project, mut db, recipe) = setup(Mode::Single, "knowledge/People.md");
@@ -648,8 +669,14 @@ mod tests {
         // Stray write outside the output path must be ignored.
         stage(&project, "people", "etc/evil.md", "nope");
 
+        // A first run, but over a folder that already has a page: removing it
+        // is most of the output, so it waits for review rather than applying.
         let outcome = evaluate(&project, &recipe, &DEFAULT_RULES, &p).unwrap();
-        assert!(outcome.applied); // first run
+        assert!(!outcome.applied, "{outcome:?}");
+        assert!(project.root.join("people/old-timer.md").exists(), "nothing changed while held");
+        // Approved, it applies as before.
+        let outcome = apply_staged(&project, &recipe, &p.staging).unwrap();
+        assert!(outcome.applied);
         assert!(project.root.join("people/priya.md").is_file());
         assert!(!project.root.join("people/old-timer.md").exists());
         assert!(!project.root.join("etc/evil.md").exists());

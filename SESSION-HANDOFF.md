@@ -204,9 +204,18 @@ PC (dev), not measured anywhere.
   `ingest_status`, `ingest_now`, `ingest_undo`. Review: Open, Undo, Mark
   as done on the card. Ingests screen: tabs Ingest (new inbox view),
   Recipes (was Knowledge docs), Automations; rail says Ingest. Not yet:
-  writing what a note calls for (Current pages rewritten in place,
-  rulings, tickets), staging for memory/automation/chat writes to wiki
-  pages. A recording made in Ken in a library with `Raw/` now writes its
+  rulings and tickets from a note; staging for chat edits (they are
+  Claude Code's own file tools and would need a PreToolUse hook; the MCP
+  has no wiki-writing tool, memory writes to the workspace memory folder,
+  automations already stage a proposal). Current pages rewritten in place
+  from notes: the recipe template "Current, from ingested notes"
+  (collection, output `Current/`, sources `Research/Ingestion/Ingested`),
+  so the recipe engine's staging and holds apply. `refresh::evaluate` now
+  exempts a first run only when its output has no files yet, so a first
+  run over existing pages is weighed like any other (one test updated to
+  approve its held first run). svelte-check shows 19 warnings: the new
+  one is IngestForm's `preset.sources`, the same initial-value pattern as
+  its eight other preset fields. A recording made in Ken in a library with `Raw/` now writes its
   transcript there (audio stays in Recordings/; audio-only or failed
   transcription stays whole in Recordings/).
 - **Item 4b, the first wiki from an analysis.** New `wikidraft` module:
@@ -221,7 +230,7 @@ PC (dev), not measured anywhere.
   pages. Command `draft_wiki(wiki, extra)`; offered as a checkbox on the
   set-up Index step (wiki repo select, optional documents folder).
   Business docs beyond Current/Project wait for 2b.
-  ken-core on this PC: 810 pass, 53 fail (all pre-existing, Windows);
+  ken-core on this PC: 811 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 482/482.
 
 ## The steps, in order
