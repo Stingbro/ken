@@ -25,7 +25,10 @@
     mermaidPreviewToggleText,
     renderMermaidPreview,
   } from "./markdown/mermaid";
-  import { slashShortcutInputRule } from "./markdown/slashShortcuts";
+  import {
+    slashShortcutInputRule,
+    slashShortcutKeys,
+  } from "./markdown/slashShortcuts";
   import { anchorLinkPlugin } from "./markdown/anchors";
   import { headingLinkPlugin } from "./markdown/headingLink";
   import { tableContextMenu } from "./markdown/tableMenu";
@@ -250,6 +253,7 @@
           previewToggleText: mermaidPreviewToggleText,
         },
         [Crepe.Feature.BlockEdit]: {
+          listGroup: { taskList: { label: "Checklist" } },
           buildMenu: (builder) => {
             const quote = builder
               .build()
@@ -271,6 +275,7 @@
     crepe.editor.use(githubAlertPlugins);
     crepe.editor.use(headingBackspace);
     crepe.editor.use(slashShortcutInputRule);
+    crepe.editor.use(slashShortcutKeys);
     crepe.editor.use(anchorLinkPlugin);
     crepe.editor.use(headingLinkPlugin);
     // After the GFM preset: the table schema extension replaces the preset's
@@ -366,6 +371,105 @@
     letter-spacing: -0.01em;
     /* A touch more breathing room after headings. */
     margin-bottom: 0.55em;
+  }
+
+  /* --- Links -------------------------------------------------------------- */
+  /* Every link in the document reads as one, the table of contents included:
+     accent ink and an underline. Crepe's reset says as much already, but the
+     app-wide `a` rule (no underline) and the TOC's own styling both pull
+     against it, so Ken states it once here, with the app's deeper hover. */
+  .measure :global(.milkdown .ProseMirror a) {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .measure :global(.milkdown .ProseMirror a:hover) {
+    color: var(--accent-deep);
+  }
+
+  /* --- Crepe controls ----------------------------------------------------- */
+  /* Crepe draws every button glyph in `--crepe-color-outline`, the same token
+     it uses for hairlines. Mapped to Ken's `--border-strong` that is right for
+     the borders but leaves the icons all but invisible, worst of all in dark
+     mode. The token stays a border colour; the glyphs are recoloured one rule
+     at a time to the secondary ink, rising to full ink on hover. Active and
+     primary states keep Crepe's accent. */
+  .measure :global(.milkdown .milkdown-block-handle .operation-item svg),
+  .measure :global(.milkdown .milkdown-toolbar .toolbar-item svg),
+  .measure :global(.milkdown .milkdown-slash-menu .menu-groups .menu-group li svg),
+  .measure
+    :global(.milkdown .milkdown-code-block .tools .language-button .expand-icon svg),
+  .measure :global(.milkdown .milkdown-link-preview > .link-preview > .link-icon > svg),
+  .measure :global(.milkdown .milkdown-link-preview > .link-preview > .button > svg),
+  .measure :global(.milkdown .milkdown-link-edit > .link-edit > .button > svg),
+  .measure :global(.milkdown .milkdown-image-block .image-edit .image-icon svg),
+  .measure
+    :global(.milkdown .milkdown-image-inline .empty-image-inline .image-icon svg) {
+    color: var(--ink-secondary);
+    fill: var(--ink-secondary);
+  }
+  .measure :global(.milkdown .milkdown-image-block .image-edit .image-icon) {
+    color: var(--ink-secondary);
+  }
+  .measure :global(.milkdown .milkdown-block-handle .operation-item:hover svg),
+  .measure
+    :global(.milkdown .milkdown-toolbar .toolbar-item:not(.active):hover svg),
+  .measure
+    :global(.milkdown .milkdown-slash-menu .menu-groups .menu-group li:hover svg),
+  .measure
+    :global(.milkdown .milkdown-slash-menu .menu-groups .menu-group li.active svg),
+  .measure
+    :global(
+      .milkdown .milkdown-code-block .tools .language-button:hover .expand-icon svg
+    ),
+  .measure
+    :global(.milkdown .milkdown-link-preview > .link-preview > .link-icon:hover > svg),
+  .measure
+    :global(.milkdown .milkdown-link-preview > .link-preview > .button:hover > svg),
+  .measure :global(.milkdown .milkdown-link-edit > .link-edit > .button:hover > svg) {
+    color: var(--ink);
+    fill: var(--ink);
+  }
+  /* Crepe paints its floating popups in `--crepe-color-surface`, which is
+     Ken's `--surface` — the pane's own colour — so a menu read as a hole in
+     the page rather than something above it. Each overlay gets its own
+     surface, a step of ink mixed into the pane (darker on paper, lighter in
+     dark mode), a real edge, and a hover a further step on so rows stay
+     distinguishable. Scoped to the overlays: in-document blocks (code, table
+     cells) keep the page surface. */
+  .measure :global(.milkdown .milkdown-slash-menu),
+  .measure :global(.milkdown .milkdown-toolbar),
+  .measure :global(.milkdown .milkdown-link-preview),
+  .measure :global(.milkdown .milkdown-link-edit),
+  .measure :global(.milkdown .milkdown-code-block .list-wrapper),
+  .measure :global(.milkdown .milkdown-table-block .cell-handle .button-group) {
+    --crepe-color-surface: color-mix(in srgb, var(--ink) 7%, var(--surface));
+    --crepe-color-surface-low: var(--crepe-color-surface);
+    --crepe-color-hover: color-mix(in srgb, var(--ink) 14%, var(--surface));
+  }
+  .measure :global(.milkdown .milkdown-slash-menu),
+  .measure :global(.milkdown .milkdown-toolbar),
+  .measure :global(.milkdown .milkdown-link-preview > .link-preview),
+  .measure :global(.milkdown .milkdown-link-edit > .link-edit),
+  .measure :global(.milkdown .milkdown-code-block .list-wrapper),
+  .measure :global(.milkdown .milkdown-table-block .cell-handle .button-group) {
+    border: 1px solid var(--border-strong);
+  }
+
+  /* The rules above outrank Crepe's own, so its accent for an active format
+     (bold, italic…) is restated. */
+  .measure :global(.milkdown .milkdown-toolbar .toolbar-item.active svg) {
+    color: var(--accent);
+    fill: var(--accent);
+  }
+  /* The same token colours the text caret in Crepe's small inputs (code
+     language search, image URL) and the virtual cursor beside marks. */
+  .measure :global(.milkdown .milkdown-code-block .tools input),
+  .measure :global(.milkdown .milkdown-image-block input),
+  .measure :global(.milkdown .milkdown-image-inline input) {
+    caret-color: var(--ink);
+  }
+  .measure :global(.milkdown .ProseMirror-focused) {
+    --prosemirror-virtual-cursor-color: var(--ink);
   }
 
   /* --- Mermaid ------------------------------------------------------------ */
@@ -502,7 +606,7 @@
     border: 1px solid var(--border);
     border-radius: 7px;
     background: var(--surface);
-    color: var(--ink-tertiary);
+    color: var(--ink-secondary);
     box-shadow: var(--shadow-card);
     opacity: 0;
     transition: opacity 120ms ease;
@@ -527,22 +631,18 @@
      controls; everything else in the table block is Crepe's. */
   .measure :global(.milkdown .milkdown-table-block .cell-handle),
   .measure :global(.milkdown .milkdown-table-block .line-handle .add-button) {
-    color: var(--ink-tertiary);
+    color: var(--ink-secondary);
     border: 1px solid var(--border-strong);
   }
   .measure :global(.milkdown .milkdown-table-block .cell-handle svg),
   .measure
     :global(.milkdown .milkdown-table-block .line-handle .add-button svg) {
-    fill: var(--ink-tertiary);
+    fill: var(--ink-secondary);
   }
   .measure :global(.milkdown .milkdown-table-block .cell-handle:hover),
   .measure
     :global(.milkdown .milkdown-table-block .line-handle .add-button:hover) {
     border-color: var(--ink-tertiary);
-  }
-  /* The align/delete popup floats over body text, so it needs a real edge. */
-  .measure :global(.milkdown .milkdown-table-block .cell-handle .button-group) {
-    border: 1px solid var(--border);
   }
   .measure
     :global(.milkdown .milkdown-table-block .cell-handle .button-group svg) {
@@ -559,20 +659,126 @@
   }
   /* Crepe draws bullet dots and ordinals in its outline colour, which reads as
      chrome; a list marker belongs to the text it marks, so it follows the item's
-     own ink. Task checkboxes are controls and keep Crepe's colour. */
+     own ink (the drawn bullets below use `currentcolor`). Task checkboxes are
+     controls; see below. */
   .measure :global(.milkdown .milkdown-list-item-block li .label-wrapper) {
     color: inherit;
   }
+  /* Task checkboxes are controls, so they keep a control's colour rather than
+     the text's — but Crepe's outline colour is a hairline, too faint to read
+     as a box, so they take the same secondary ink as Crepe's other buttons. */
+  .measure
+    :global(
+      .milkdown .milkdown-list-item-block li .label-wrapper .label.checked svg
+    ),
+  .measure
+    :global(
+      .milkdown .milkdown-list-item-block li .label-wrapper .label.unchecked svg
+    ) {
+    fill: var(--ink-secondary);
+  }
+  /* Crepe sets an ordinal in a fixed 32px box at the editor's inherited
+     14.5px, while its paragraphs are 16px on a 1.85 line — so "1." sat smaller
+     than its text and a few pixels high. The marker's box mirrors the
+     paragraph's instead (Crepe's `p`: 16px, `padding: 4px 0`; Ken's line
+     height), which puts ordinals on the text's baseline and centres bullets on
+     its first line. Task checkboxes keep Crepe's box. */
+  .measure
+    :global(
+      .milkdown .milkdown-list-item-block li .label-wrapper:has(> .label.ordered)
+    ),
+  .measure
+    :global(
+      .milkdown .milkdown-list-item-block li .label-wrapper:has(> .label.bullet)
+    ) {
+    height: auto;
+    align-items: flex-start;
+  }
+  .measure :global(.milkdown .milkdown-list-item-block li .label.ordered),
+  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet) {
+    box-sizing: border-box;
+    height: calc(1.85em + 8px);
+    padding: 4px 0;
+    font-size: 16px;
+    line-height: 1.85;
+  }
+  .measure :global(.milkdown .milkdown-list-item-block li .label.ordered) {
+    /* "10." and up are wider than the 24px gutter; end-aligned flex lets
+       them run left into the indent rather than wrap or push the text. */
+    display: flex;
+    justify-content: flex-end;
+    white-space: nowrap;
+  }
+  /* Bullets alternate with depth, as a word processor's do: disc, open
+     circle, square, then round again. Crepe's node view doesn't know an
+     item's depth, so it is counted here in `ul` ancestors only — the first
+     bullets under a numbered item are discs, not circles. Each extra `ul` in
+     a selector also raises its specificity, so the deepest match wins. Task
+     items (`.checked`/`.unchecked`) aren't `.bullet`, and the TOC hides its
+     labels, so neither is touched. Crepe's SVG dot is replaced by a drawn
+     one; both follow the item's ink. */
+  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet svg) {
+    display: none;
+  }
+  .measure :global(.milkdown ul .milkdown-list-item-block li .label.bullet::before),
+  .measure
+    :global(.milkdown ul ul ul ul .milkdown-list-item-block li .label.bullet::before) {
+    content: "";
+    box-sizing: border-box;
+    width: 6px;
+    height: 6px;
+    border: none;
+    border-radius: 50%;
+    background: currentcolor;
+  }
+  .measure
+    :global(.milkdown ul ul .milkdown-list-item-block li .label.bullet::before),
+  .measure
+    :global(
+      .milkdown ul ul ul ul ul .milkdown-list-item-block li .label.bullet::before
+    ) {
+    border: 1.25px solid currentcolor;
+    border-radius: 50%;
+    background: transparent;
+  }
+  .measure
+    :global(.milkdown ul ul ul .milkdown-list-item-block li .label.bullet::before),
+  .measure
+    :global(
+      .milkdown ul ul ul ul ul ul .milkdown-list-item-block li .label.bullet::before
+    ) {
+    /* A square reads heavier than a disc of the same width. */
+    width: 5px;
+    height: 5px;
+    border: none;
+    border-radius: 0;
+    background: currentcolor;
+  }
+  /* A seventh level and deeper is a disc again. */
   .measure
     :global(
       .milkdown
+        ul
+        ul
+        ul
+        ul
+        ul
+        ul
+        ul
         .milkdown-list-item-block
         li
-        .label-wrapper
-        .label:not(.checked):not(.unchecked)
-        svg
+        .label.bullet::before
     ) {
-    fill: currentcolor;
+    width: 6px;
+    height: 6px;
+    border: none;
+    border-radius: 50%;
+    background: currentcolor;
   }
   /* Footnote definitions read as an aside, not as body copy. */
   .measure :global(.milkdown dl[data-type="footnote_definition"]) {
@@ -706,13 +912,7 @@
      own scale, so `2.25em` above resolves against it and matches a real H1. */
   .measure :global(.milkdown ul.ken-toc a) {
     font-size: 0.95em;
-    color: var(--ink);
-    text-decoration: none;
     cursor: pointer;
-  }
-  .measure :global(.milkdown ul.ken-toc a:hover) {
-    color: var(--accent-deep);
-    text-decoration: underline;
   }
 
   .measure :global(.milkdown .ken-heading-link) {
@@ -735,7 +935,7 @@
     border-radius: 6px;
     background: transparent;
     box-shadow: none;
-    color: var(--ink-tertiary);
+    color: var(--ink-secondary);
     opacity: 0;
     transition: opacity 120ms ease;
     user-select: none;
