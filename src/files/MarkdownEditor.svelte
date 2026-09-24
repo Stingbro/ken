@@ -35,6 +35,10 @@
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
   import { addTocMenuItem, tocPlugins } from "./markdown/toc";
   import { tableLayoutPlugin } from "./markdown/tableLayout";
+  import {
+    configureListDelimiter,
+    listStylePlugins,
+  } from "./markdown/listStyles";
   import ImageLightbox from "./markdown/ImageLightbox.svelte";
   import { lightbox } from "./markdown/lightbox.svelte";
   import { CURRENT_CLASS, MARK_CLASS } from "../lib/find-dom";
@@ -284,6 +288,9 @@
     // Same reason: the bullet-list schema extension replaces the commonmark
     // preset's own `bullet_list` node.
     crepe.editor.use(tocPlugins);
+    // After the commonmark preset: it extends the preset's `ordered_list`.
+    crepe.editor.use(listStylePlugins);
+    crepe.editor.config(configureListDelimiter);
     crepe.editor.use(tableLayoutPlugin);
     crepe.editor.use(tableContextMenu);
     crepe.editor.config(disableHeadingDowngrade);
@@ -681,8 +688,9 @@
      14.5px, while its paragraphs are 16px on a 1.85 line — so "1." sat smaller
      than its text and a few pixels high. The marker's box mirrors the
      paragraph's instead (Crepe's `p`: 16px, `padding: 4px 0`; Ken's line
-     height), which puts ordinals on the text's baseline and centres bullets on
-     its first line. Task checkboxes keep Crepe's box. */
+     height), which puts ordinals on the text's baseline and centres bullets
+     and task checkboxes on its first line (Crepe's own 32px box left the
+     checkbox 2px high of it). */
   .measure
     :global(
       .milkdown .milkdown-list-item-block li .label-wrapper:has(> .label.ordered)
@@ -690,12 +698,25 @@
   .measure
     :global(
       .milkdown .milkdown-list-item-block li .label-wrapper:has(> .label.bullet)
+    ),
+  .measure
+    :global(
+      .milkdown .milkdown-list-item-block li .label-wrapper:has(> .label.checked)
+    ),
+  .measure
+    :global(
+      .milkdown
+        .milkdown-list-item-block
+        li
+        .label-wrapper:has(> .label.unchecked)
     ) {
     height: auto;
     align-items: flex-start;
   }
   .measure :global(.milkdown .milkdown-list-item-block li .label.ordered),
-  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet) {
+  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet),
+  .measure :global(.milkdown .milkdown-list-item-block li .label.checked),
+  .measure :global(.milkdown .milkdown-list-item-block li .label.unchecked) {
     box-sizing: border-box;
     height: calc(1.85em + 8px);
     padding: 4px 0;
@@ -717,10 +738,17 @@
      items (`.checked`/`.unchecked`) aren't `.bullet`, and the TOC hides its
      labels, so neither is touched. Crepe's SVG dot is replaced by a drawn
      one; both follow the item's ink. */
-  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet) {
+  .measure :global(.milkdown .milkdown-list-item-block li .label.bullet),
+  .measure :global(.milkdown .milkdown-list-item-block li .label.checked),
+  .measure :global(.milkdown .milkdown-list-item-block li .label.unchecked) {
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+  /* The checkbox glyph keeps its own size inside the taller box. */
+  .measure :global(.milkdown .milkdown-list-item-block li .label.checked svg),
+  .measure :global(.milkdown .milkdown-list-item-block li .label.unchecked svg) {
+    flex: none;
   }
   .measure :global(.milkdown .milkdown-list-item-block li .label.bullet svg) {
     display: none;
