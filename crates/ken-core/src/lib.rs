@@ -27,6 +27,7 @@ pub mod local_llm;
 pub mod memory;
 pub mod model;
 pub mod ocr;
+pub mod drift;
 pub mod links;
 pub mod pagemeta;
 pub mod vocab;

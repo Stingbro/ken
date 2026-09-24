@@ -30,6 +30,29 @@ export interface IndexHealth {
   llmStatus: "ready" | "notInstalled" | "error";
 }
 
+/** Mirrors `drift::DriftRun`: one standing sweep. */
+export interface DriftRun {
+  at: number;
+  /** 0 clean · 1 a Finding or a broken instrument · 2 drift only. */
+  exitCode: number;
+  pagesExamined: number;
+  rulingsExamined: number;
+  codeCitations: number;
+  crossReferences: number;
+  mismatches: {
+    subject: string;
+    citation: string;
+    severity: "autoRecleared" | "judgment" | "finding";
+    detail: string;
+    research: boolean;
+  }[];
+  aged: [string, string | null][];
+  voidReason: string | null;
+  uncontrolled: boolean;
+  unmeasured: string[];
+  branches: string[];
+}
+
 /** What a repo is for; decides sync and how deep Ken reads it. */
 export type RepoKind = "team" | "wiki" | "code" | "reference";
 
@@ -1634,6 +1657,10 @@ export interface FamilyInboxItem {
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   indexHealth: () => invoke<IndexHealth>("index_health"),
+  /** The last drift sweep (null before the first). */
+  driftStatus: () => invoke<DriftRun | null>("drift_status"),
+  /** Run the drift sweep now. */
+  runDriftNow: () => invoke<DriftRun | null>("run_drift_now"),
   /** A page's links both ways: pages it reaches, pages that reach it. */
   pageLinks: (path: string) =>
     invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),

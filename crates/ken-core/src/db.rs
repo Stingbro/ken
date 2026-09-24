@@ -598,6 +598,13 @@ impl Db {
             // retired or generated. The lists are JSON arrays.
             self.conn.execute_batch(
                 r#"
+                CREATE TABLE IF NOT EXISTS drift_runs (
+                    id        INTEGER PRIMARY KEY,
+                    at        INTEGER NOT NULL,
+                    exit_code INTEGER NOT NULL,
+                    pages     INTEGER NOT NULL,
+                    log       TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS page_links (
                     from_path TEXT NOT NULL,
                     kind      TEXT NOT NULL,
@@ -2104,6 +2111,31 @@ impl Db {
             }
         }
         Ok(n)
+    }
+
+    /// Record a drift sweep: when, its exit code, how many pages, and the
+    /// whole result as the log.
+    pub fn insert_drift_run(&mut self, run: &crate::drift::DriftRun) -> Result<()> {
+        let log = serde_json::to_string(run).map_err(|e| crate::Error::Other(e.to_string()))?;
+        self.conn.execute(
+            "INSERT INTO drift_runs (at, exit_code, pages, log) VALUES (?1, ?2, ?3, ?4)",
+            params![run.at, run.exit_code, run.pages_examined as i64, log],
+        )?;
+        Ok(())
+    }
+
+    /// When the last drift sweep ran, if one has.
+    pub fn last_drift_run_at(&self) -> Result<Option<i64>> {
+        Ok(self.conn.query_row("SELECT MAX(at) FROM drift_runs", [], |r| r.get::<_, Option<i64>>(0))?)
+    }
+
+    /// The last drift sweep's full result.
+    pub fn last_drift_run(&self) -> Result<Option<crate::drift::DriftRun>> {
+        let log: Option<String> = self
+            .conn
+            .query_row("SELECT log FROM drift_runs ORDER BY at DESC, id DESC LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        Ok(log.and_then(|l| serde_json::from_str(&l).ok()))
     }
 
     /// Replace the links stored for the page at `from`.

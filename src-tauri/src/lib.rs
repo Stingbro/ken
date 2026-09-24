@@ -1167,6 +1167,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                     }
                     enqueue_transcriptions(&scan_app, &scan_state, project_id, &stats.videos_needing_transcript);
                     emit_member(&scan_app, project_id, "index-updated", stats);
+                    // The standing sweep, when due: team and wiki repos only,
+                    // on the index this scan just brought up to date.
+                    run_drift_if_due(&scan_project, &mut db, false);
                 }
                 Err(e) => {
                     let _ = scan_app.emit("scan-error", e.to_string());
@@ -6938,6 +6941,59 @@ struct IndexHealthDto {
     /// `ready` | `notInstalled` | `error`: without a local model nothing is
     /// read for entities, and the screen must say which piece is missing.
     llm_status: String,
+}
+
+/// Run the drift sweep for a team or wiki repo when it is due (weekly unless
+/// `drift.intervalDays` says otherwise), or now when `force`. It spawns git
+/// per cited file, so callers run it off the UI thread. Returns the run.
+fn run_drift_if_due(project: &Project, db: &mut Db, force: bool) -> Option<ken_core::drift::DriftRun> {
+    let kind = ken_core::registry::kind_of(&project.root);
+    let library = kind
+        .iter()
+        .any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki));
+    if !library && !force {
+        return None;
+    }
+    let now = engine::now_epoch();
+    if !force && !ken_core::drift::due(db, project, now).unwrap_or(false) {
+        return None;
+    }
+    match ken_core::drift::sweep(project, db, now) {
+        Ok(run) => {
+            if let Err(e) = ken_core::drift::file_run(db, &run) {
+                eprintln!("warning: could not record the drift sweep: {e}");
+            }
+            Some(run)
+        }
+        Err(e) => {
+            eprintln!("warning: drift sweep failed: {e}");
+            None
+        }
+    }
+}
+
+/// The last drift sweep for the focused project, if one has run.
+#[tauri::command]
+fn drift_status(state: State<SharedState>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    active.db.last_drift_run().map_err(err)
+}
+
+/// Run the drift sweep now, whatever the interval or the repo's kind.
+#[tauri::command]
+async fn run_drift_now(state: State<'_, SharedState>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
+    let (base, project) = {
+        let guard = state.lock().unwrap();
+        let active = member(&guard, None)?;
+        (guard.base_dir.clone(), active.project.clone())
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut db = Db::open(&base, project.config.id).map_err(err)?;
+        Ok(run_drift_if_due(&project, &mut db, true))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// A page's links both ways, resolved now: the pages it reaches and the
@@ -13566,6 +13622,8 @@ pub fn run() {
             set_project_kind,
             index_health,
             page_links,
+            drift_status,
+            run_drift_now,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

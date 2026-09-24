@@ -134,7 +134,24 @@ PC (dev), not measured anywhere.
   use it. The old app-data `kg.sqlite` is left in place, unused. Not
   unit-tested (src-tauri has no tests for it); check in the app. A graph
   per team inside one workspace waits for step 4's teams.
-  ken-core on this PC: 796 pass, 53 fail (all pre-existing, Windows);
+- **Step 13, drift.** New `drift` module: the Docs check (a page's
+  `sources:` measured with git from the commit its `verified:` date pins,
+  falling back to `updated:`, to the default branch read from
+  `origin/HEAD`, the fallback named in the run), the Decision check (per
+  decisions-log entry from its own date, superseded skipped), and the
+  30-day age rule. Only `repo:path[:line]` is measured (repo = this repo,
+  a registered project, or a sibling folder); `[[Note]]` and `D-nnn` are
+  counted as cross-references; placeholders and `...` skipped. Severity:
+  Finding (path gone, line past end, checked before any pin), Judgment,
+  AutoRecleared (whitespace/comment-only diff). Research in its own
+  bucket; retired and generated pages skipped. Controls and minimum from
+  `project.json` `drift: {controlMoved, controlClean, minPages,
+  intervalDays}`; a wrong control or too few pages voids the run; no
+  controls = `uncontrolled`, said in the report. Exit codes 0/1/2. Runs
+  recorded in `drift_runs` (schema v14); one open Review item of kind
+  `drift`. The app runs it after a background scan of a team or wiki repo
+  when due (weekly); commands `drift_status`, `run_drift_now`.
+  ken-core on this PC: 800 pass, 53 fail (all pre-existing, Windows);
   ken-mcp 39/39; frontend 479/479.
 
 ## The steps, in order
