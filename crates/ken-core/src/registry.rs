@@ -54,6 +54,32 @@ pub struct RegistryEntry {
     /// The team this repo belongs to, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
+    /// How deep Ken reads the repo when a person chose other than what the
+    /// kind implies (a code repo whose docs are read for entities, say).
+    /// None means follow the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<IndexState>,
+}
+
+/// A repo's index state, set once for the whole repo: the three kenignore
+/// tiers. `Off` repos are not members at all, so only these two are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexState {
+    Off,
+    Search,
+    Entities,
+}
+
+impl IndexState {
+    /// The state a repo of these kinds gets unless a person says otherwise.
+    pub fn for_kind(kind: &[RepoKind]) -> IndexState {
+        if kind.is_empty() || kind.iter().any(|k| k.reads_entities()) {
+            IndexState::Entities
+        } else {
+            IndexState::Search
+        }
+    }
 }
 
 /// A recently opened workspace (recent-projects' sibling list — see
@@ -136,6 +162,16 @@ pub fn entry_of(id: Uuid) -> Option<(PathBuf, Vec<RepoKind>)> {
     reg.projects.into_iter().find(|e| e.id == id).map(|e| (e.path, e.kind))
 }
 
+/// The kinds and index override registered for the repo at `root`, from
+/// the default registry.
+pub fn index_of(root: &Path) -> (Vec<RepoKind>, Option<IndexState>) {
+    default_base_dir()
+        .and_then(|base| Registry::load(&base))
+        .ok()
+        .and_then(|reg| reg.entry_at(root).map(|e| (e.kind.clone(), e.index)))
+        .unwrap_or_default()
+}
+
 /// [`Registry::kind_of`] against the registry in the default app-data
 /// directory. Empty when it cannot be read.
 pub fn kind_of(root: &Path) -> Vec<RepoKind> {
@@ -179,6 +215,7 @@ impl Registry {
                 path: project.root.clone(),
                 kind: Vec::new(),
                 team: None,
+                index: None,
             }),
         }
     }
@@ -196,6 +233,21 @@ impl Registry {
         }
         entry.team = team.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         true
+    }
+
+    /// Set how deep Ken reads a project, or None to follow its kind.
+    pub fn set_index(&mut self, id: Uuid, index: Option<IndexState>) -> bool {
+        let Some(entry) = self.projects.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        entry.index = index.filter(|i| *i != IndexState::for_kind(&entry.kind));
+        true
+    }
+
+    /// The registered entry for the repo at `root`.
+    pub fn entry_at(&self, root: &Path) -> Option<&RegistryEntry> {
+        let want = canonical(root);
+        self.projects.iter().find(|e| canonical(&e.path) == want)
     }
 
     /// The kinds registered for the repo at `root`, empty when it is not

@@ -7,6 +7,8 @@ import {
   type RegistryEntryStatus,
   type ScanStats,
   type SemanticIndexState,
+  type SetupIgnoreRow,
+  type SetupRepoRow,
   type SyncStateName,
   type WorkspaceOverview,
 } from "./api";
@@ -600,6 +602,13 @@ class AppStore {
    *  names, then open it (launcher flow). */
   async createWorkspace(parent: string, name: string, members: string[]) {
     const overview = await api.createWorkspace(parent, name, members);
+    this.workspace = overview;
+    await this.loadFocusedMemberState(overview);
+  }
+
+  /** Set-up's Confirm: write what the person chose and open the workspace. */
+  async confirmSetup(parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) {
+    const overview = await api.setupConfirm(parent, name, rows, ignores);
     this.workspace = overview;
     await this.loadFocusedMemberState(overview);
   }

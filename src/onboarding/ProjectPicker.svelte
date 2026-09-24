@@ -17,8 +17,12 @@
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import SetupFlow from "./SetupFlow.svelte";
 
   let error = $state<string | null>(null);
+  // Set-up (Folder, Team, Repos, Index): the knowledge-layer way in for a
+  // folder of code repos. The older workspace wizard below stays as is.
+  let setupOpen = $state(false);
 
   async function forgetId(id: string) {
     await api.forgetProject(id);
@@ -337,6 +341,8 @@
           <button class="btn btn-ghost" onclick={() => (pendingPath = null)}>Back</button>
         </div>
       </div>
+    {:else if setupOpen}
+      <SetupFlow onclose={() => (setupOpen = false)} />
     {:else if wsParent}
       <div class="confirm">
         <div class="mono path">{wsParent}</div>
@@ -437,6 +443,14 @@
            than building one from a folder of repos. -->
       <div class="choose-row" class:stacked={app.workspaceFlagEnabled}>
         {#if app.workspaceFlagEnabled}
+          <button class="choice" onclick={() => (setupOpen = true)}>
+            <span class="choice-title">Set up Ken for your code</span>
+            <span class="choice-note">
+              Point Ken at the folder your repos live in. It proposes teams, what
+              each repo is and how deep to read it; nothing is written until you
+              confirm.
+            </span>
+          </button>
           <button class="choice" onclick={chooseWorkspaceFolder}>
             <span class="choice-title">Several projects</span>
             <span class="choice-note">
@@ -458,7 +472,7 @@
       <div class="error">{error}</div>
     {/if}
 
-    {#if app.registry.length > 0 && !pendingPath && !wsParent}
+    {#if app.registry.length > 0 && !pendingPath && !wsParent && !setupOpen}
       <div class="recent-label">Recent projects</div>
       <div class="recents">
         {#each app.registry as entry (entry.id)}

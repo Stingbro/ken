@@ -30,6 +30,48 @@ export interface IndexHealth {
   llmStatus: "ready" | "notInstalled" | "error";
 }
 
+/** A repo's index state: not indexed, searchable only, read for entities. */
+export type IndexState = "off" | "search" | "entities";
+
+/** Mirrors `setup::RepoRow`: one repo the set-up scan found. */
+export interface SetupRepoRow {
+  member: string;
+  include: boolean;
+  kind: RepoKind[];
+  team: string | null;
+  index: IndexState;
+  evidence: string[];
+  remote: string | null;
+  existing: boolean;
+  hasGit: boolean;
+}
+
+/** Mirrors `setup::IgnoreRow`: one ignore line the scan would add. */
+export interface SetupIgnoreRow {
+  pattern: string;
+  state: IndexState;
+  reason: string;
+  evidence: string;
+  ticked: boolean;
+  /** Shown, never a choice (built in). */
+  fixed: boolean;
+}
+
+export interface SetupProposal {
+  folder: string;
+  repos: number;
+  withoutGit: number;
+  rows: SetupRepoRow[];
+  teams: string[];
+  ignores: SetupIgnoreRow[];
+  existingWorkspace: boolean;
+}
+
+export type SetupMoved =
+  | { change: "NewFolder"; member: string; evidence: string[] }
+  | { change: "Gone"; member: string }
+  | { change: "NewWorktree"; pattern: string; evidence: string };
+
 /** Mirrors `drift::DriftRun`: one standing sweep. */
 export interface DriftRun {
   at: number;
@@ -1689,6 +1731,14 @@ export const api = {
    *  folder names, then open it (same activation path as `openWorkspace`). */
   createWorkspace: (parent: string, name: string, members: string[]) =>
     invoke<WorkspaceOverview>("create_workspace", { parent, name, members }),
+  /** Set-up: scan a code folder and propose repos and ignore lines. Reads only. */
+  setupPropose: (parent: string) => invoke<SetupProposal>("setup_propose", { parent }),
+  /** Set-up Confirm: writes the manifest, kinds, teams, index states and
+   *  ignore lines, then opens the workspace. */
+  setupConfirm: (parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) =>
+    invoke<WorkspaceOverview>("setup_confirm", { parent, name, rows, ignores }),
+  /** Scan again: what moved since set-up. Never changes anything. */
+  setupRescan: (parent: string) => invoke<SetupMoved[]>("setup_rescan", { parent }),
   /** Members + per-member status + counts for the currently open workspace. */
   workspaceOverview: () => invoke<WorkspaceOverview>("workspace_overview"),
   /** Switch focus to `id`, activating a dormant member (LRU-evicting past

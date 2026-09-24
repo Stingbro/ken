@@ -32,6 +32,7 @@ pub mod links;
 pub mod pagemeta;
 pub mod vocab;
 pub mod pipeline;
+pub mod setup;
 pub mod proc;
 pub mod profiler;
 pub mod project;

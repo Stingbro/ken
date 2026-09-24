@@ -2274,6 +2274,55 @@ fn focus_project(app: AppHandle, state: State<SharedState>, id: String) -> CmdRe
     focus_member_inner(&app, state.inner(), uuid)
 }
 
+/// Set-up, step one to three: scan a code folder and propose a row per repo
+/// (kind, team, index state, evidence) and the ignore entries. Reads only.
+#[tauri::command]
+async fn setup_propose(state: State<'_, SharedState>, parent: String) -> CmdResult<ken_core::setup::Proposal> {
+    {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+    }
+    // `git worktree list` per repo: off the UI thread.
+    tauri::async_runtime::spawn_blocking(move || ken_core::setup::propose(Path::new(&parent)).map_err(err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Set-up, Confirm: write the manifest, the registry's kinds, teams and
+/// index states, and the ticked ignore lines, then open the workspace so
+/// indexing starts. The only set-up step that writes.
+#[tauri::command]
+fn setup_confirm(
+    app: AppHandle,
+    state: State<SharedState>,
+    parent: String,
+    name: String,
+    rows: Vec<ken_core::setup::RepoRow>,
+    ignores: Vec<ken_core::setup::IgnoreRow>,
+) -> CmdResult<WorkspaceOverviewDto> {
+    let base = {
+        let guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        guard.base_dir.clone()
+    };
+    let ws = ken_core::setup::confirm(&base, Path::new(&parent), &name, &rows, &ignores, &local_date_today())
+        .map_err(err)?;
+    open_workspace_inner(&app, state.inner(), ws)
+}
+
+/// Scan again: what moved since set-up (new folders, gone members, new
+/// worktrees). Reports; never changes the set-up.
+#[tauri::command]
+async fn setup_rescan(parent: String) -> CmdResult<Vec<ken_core::setup::Moved>> {
+    tauri::async_runtime::spawn_blocking(move || ken_core::setup::rescan(Path::new(&parent)).map_err(err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Immediate subfolder candidates for the workspace-creation UI (task 3.2) —
 /// a thin flag-gated wrapper over `ken_core::workspace::discover_candidates`.
 #[tauri::command]
@@ -7268,8 +7317,9 @@ fn workspace_kg_members(guard: &AppState) -> Vec<uuid::Uuid> {
         .filter(|(id, _)| Some(*id) != pseudo_id)
         .filter(|(id, _)| db_path(&guard.base_dir, *id).exists())
         .filter(|(_, root)| {
-            let kind = ken_core::registry::kind_of(root);
-            kind.is_empty() || kind.iter().any(|k| k.reads_entities())
+            let (kind, index) = ken_core::registry::index_of(root);
+            index.unwrap_or_else(|| ken_core::registry::IndexState::for_kind(&kind))
+                == ken_core::registry::IndexState::Entities
         })
         .map(|(id, _)| id)
         .collect()
@@ -13624,6 +13674,9 @@ pub fn run() {
             page_links,
             drift_status,
             run_drift_now,
+            setup_propose,
+            setup_confirm,
+            setup_rescan,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

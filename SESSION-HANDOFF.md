@@ -151,8 +151,26 @@ PC (dev), not measured anywhere.
   recorded in `drift_runs` (schema v14); one open Review item of kind
   `drift`. The app runs it after a background scan of a team or wiki repo
   when due (weekly); commands `drift_status`, `run_drift_now`.
-  ken-core on this PC: 800 pass, 53 fail (all pre-existing, Windows);
-  ken-mcp 39/39; frontend 479/479.
+- **Step 4, set-up (first cut).** New `setup` module: `propose(folder)`
+  reads only (discovery, `.git/config` origin, repo markers, library signs
+  such as DECISIONS.md/.obsidian/Research/Ingestion/Current/, team signs
+  such as tickets/ decisions/ ideas/, a docs README naming a sibling,
+  `git worktree list`) and proposes a row per repo (kind, team, index
+  state, evidence) plus ignore rows (worktrees; secrets shown as a fixed
+  built-in). `confirm` is the only write: workspace manifest (teams as
+  groups unless already a group folder), registry kind/team/index,
+  ticked ignore lines under a dated comment, declined rows in
+  `.ken-workspace/setup.json` so they are not proposed twice. `rescan`
+  reports new folders, gone members and new worktrees; never writes.
+  Registry gains `index` (search/entities override; `kind_rules_for` and
+  the graph members honour it). Commands `setup_propose`, `setup_confirm`
+  (opens the workspace), `setup_rescan`; `SetupFlow.svelte` (4 steps) is
+  the first choice on the start screen, beside the old wizard. Gaps:
+  confirm still creates `.ken/project.json` in each member, code repos
+  included (dropping it touches every Project::open); no Add a repo
+  dialog or Scan again button in the UI yet; not tried in the app.
+  ken-core on this PC: 803 pass, 53 fail (all pre-existing, Windows);
+  ken-mcp 39/39; frontend 482/482.
 
 ## The steps, in order
 

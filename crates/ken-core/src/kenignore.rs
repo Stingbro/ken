@@ -251,9 +251,17 @@ pub fn kind_rules(kind: &[crate::registry::RepoKind]) -> Vec<Rule> {
     vec![Rule { tier: Tier::SearchOnly, pattern: "*".into() }]
 }
 
-/// [`kind_rules`] for the repo at `root`, from the default registry.
+/// The repo's rule from the default registry: a person's index choice when
+/// they made one, else what its kind implies ([`kind_rules`]).
 pub fn kind_rules_for(root: &Path) -> Vec<Rule> {
-    kind_rules(&crate::registry::kind_of(root))
+    use crate::registry::IndexState;
+    let (kind, index) = crate::registry::index_of(root);
+    match index {
+        Some(IndexState::Search) => vec![Rule { tier: Tier::SearchOnly, pattern: "*".into() }],
+        Some(IndexState::Entities) => Vec::new(),
+        Some(IndexState::Off) => vec![Rule { tier: Tier::Ignore, pattern: "*".into() }],
+        None => kind_rules(&kind),
+    }
 }
 
 fn is_hard_ignored(path: &str) -> bool {

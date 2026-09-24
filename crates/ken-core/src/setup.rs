@@ -1,0 +1,590 @@
+//! Set-up for Ken on its own: Folder, Team, Repos, Index. The scan reads a
+//! code folder and proposes one row per repo (kind, team, index state, with
+//! the evidence for each), and the ignore entries it would add; nothing is
+//! written until a person confirms, and Ken reads nothing until then. Scan
+//! again reports what moved instead of overwriting.
+//!
+//! What the scan reads, cheaply and without a model: folder grouping, `.git`
+//! and its `origin` URL (read from `.git/config`, no process), repo markers,
+//! the signs of a library (a decisions log, a vault, the method's sections),
+//! the signs of a team repo (tickets, decisions, ideas), a README that names
+//! a sibling, and `git worktree list` for second checkouts.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::registry::{IndexState, Registry, RepoKind};
+use crate::workspace::{self, Workspace};
+use crate::Result;
+
+/// One repo the scan found, as a row a person can change before Confirm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoRow {
+    /// Folder relative to the code folder (`Game` or `SR/Game`).
+    pub member: String,
+    pub include: bool,
+    pub kind: Vec<RepoKind>,
+    pub team: Option<String>,
+    pub index: IndexState,
+    /// Why the scan proposed what it did, one fact per entry.
+    pub evidence: Vec<String>,
+    pub remote: Option<String>,
+    /// Already a Ken project (it has `.ken/project.json`).
+    pub existing: bool,
+    pub has_git: bool,
+}
+
+/// One ignore line the scan would add to the code folder's `.kenignore`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IgnoreRow {
+    pub pattern: String,
+    /// `off` (a bare line) or `search` (a `~` line).
+    pub state: IndexState,
+    pub reason: String,
+    pub evidence: String,
+    pub ticked: bool,
+    /// Shown so a person sees it, never a choice (secrets are built in).
+    pub fixed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proposal {
+    pub folder: PathBuf,
+    pub repos: usize,
+    pub without_git: usize,
+    pub rows: Vec<RepoRow>,
+    pub teams: Vec<String>,
+    pub ignores: Vec<IgnoreRow>,
+    /// The folder already has a Ken workspace: Confirm updates it.
+    pub existing_workspace: bool,
+}
+
+/// What a second scan found that the confirmed set-up does not have.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "change")]
+pub enum Moved {
+    NewFolder { member: String, evidence: Vec<String> },
+    Gone { member: String },
+    NewWorktree { pattern: String, evidence: String },
+}
+
+/// What a person took out, so it is not proposed twice
+/// (`.ken-workspace/setup.json`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Declined {
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub ignores: Vec<String>,
+}
+
+fn declined_path(parent: &Path) -> PathBuf {
+    parent.join(workspace::CONFIG_DIR).join("setup.json")
+}
+
+pub fn declined(parent: &Path) -> Declined {
+    fs::read_to_string(declined_path(parent))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// The `origin` URL from `.git/config`, if any.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let cfg = fs::read_to_string(repo.join(".git").join("config")).ok()?;
+    let mut in_origin = false;
+    for line in cfg.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_origin = t == "[remote \"origin\"]";
+            continue;
+        }
+        if in_origin {
+            if let Some(url) = t.strip_prefix("url").map(str::trim).and_then(|r| r.strip_prefix('=')) {
+                return Some(url.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn exists_ci(dir: &Path, rel: &str) -> bool {
+    dir.join(rel).exists()
+        || fs::read_dir(dir).ok().is_some_and(|mut it| {
+            it.any(|e| e.ok().is_some_and(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(rel)))
+        })
+}
+
+/// A repo's kinds from what is in it, with the evidence.
+pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
+    let mut kind = Vec::new();
+    let mut ev = Vec::new();
+    let library: Vec<&str> = [
+        ("_meta/DECISIONS.md", "_meta/DECISIONS.md"),
+        ("DECISIONS.md", "a decisions log"),
+        (".obsidian", "an Obsidian vault"),
+        ("Research/Ingestion", "Research/Ingestion"),
+        ("Ways-of-Working", "a Ways-of-Working section"),
+        ("Current", "a Current section"),
+        ("Vocabulary.md", "a Vocabulary page"),
+        ("START-HERE.md", "START-HERE.md"),
+    ]
+    .into_iter()
+    .filter(|(p, _)| dir.join(p).exists())
+    .map(|(_, e)| e)
+    .collect();
+    let team: Vec<&str> = [("tickets", "tickets/"), ("decisions", "decisions/"), ("ideas", "ideas/"), (".wright", ".wright/")]
+        .into_iter()
+        .filter(|(p, _)| dir.join(p).is_dir())
+        .map(|(_, e)| e)
+        .collect();
+    let code: Vec<&str> = crate::profiler::REPO_MARKERS
+        .iter()
+        .copied()
+        .filter(|m| *m != ".git" && exists_ci(dir, m))
+        .chain(
+            fs::read_dir(dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().to_lowercase().ends_with(".sln"))
+                .then_some("*.sln"),
+        )
+        .collect();
+    if !team.is_empty() {
+        kind.push(RepoKind::Team);
+        ev.push(team.join(", "));
+    }
+    if library.len() >= 1 {
+        kind.push(RepoKind::Wiki);
+        ev.push(library.join(", "));
+    }
+    if !code.is_empty() {
+        kind.push(RepoKind::Code);
+        ev.push(code.join(", "));
+    }
+    (kind, ev)
+}
+
+/// The owner in a git remote URL (`github.com/owner/repo`, `git@host:owner/repo`).
+pub fn remote_owner(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
+    let path = rest.split_once([':', '/']).map(|(_, p)| p)?;
+    let owner = path.trim_start_matches('/').split('/').next()?;
+    (!owner.is_empty()).then(|| owner.to_string())
+}
+
+fn readme_text(dir: &Path) -> String {
+    ["README.md", "START-HERE.md", "CLAUDE.md", "readme.md"]
+        .iter()
+        .filter_map(|f| fs::read_to_string(dir.join(f)).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase()
+}
+
+fn names_word(haystack: &str, word: &str) -> bool {
+    let w = word.to_lowercase();
+    w.len() >= 4
+        && haystack.match_indices(&w).any(|(i, _)| {
+            let before = haystack[..i].chars().next_back();
+            let after = haystack[i + w.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_alphanumeric())
+        })
+}
+
+/// A team name from a docs repo's folder name: `Realms-Docs` → `Realms`.
+fn team_from_docs(leaf: &str) -> String {
+    let lower = leaf.to_lowercase();
+    for suffix in ["-docs", "_docs", " docs", "-wiki", "_wiki", "-knowledge"] {
+        if lower.ends_with(suffix) {
+            return leaf[..leaf.len() - suffix.len()].to_string();
+        }
+    }
+    leaf.to_string()
+}
+
+/// Second checkouts of the repos found: every `git worktree list` path under
+/// the folder other than the repo itself, as a folder relative to it.
+fn worktrees(parent: &Path, repo: &Path) -> Vec<(String, String)> {
+    let mut cmd = std::process::Command::new("git");
+    let Ok(out) = crate::proc::quiet(&mut cmd).args(["worktree", "list", "--porcelain"]).current_dir(repo).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (me, root) = (canon(repo), canon(parent));
+    let mut found = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    for line in text.lines().chain(std::iter::once("")) {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p));
+        } else if line.is_empty() {
+            if let Some(p) = path.take().map(|p| canon(&p)) {
+                if p != me {
+                    if let Ok(rel) = p.strip_prefix(&root) {
+                        let rel = rel.to_string_lossy().replace('\\', "/");
+                        let leaf = repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        found.push((rel, format!("a second checkout of {leaf}")));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Scan `parent` and propose the set-up. Reads only; writes nothing.
+pub fn propose(parent: &Path) -> Result<Proposal> {
+    let candidates = workspace::discover_candidates(parent)?;
+    let declined = declined(parent);
+    let existing_ws = Workspace::open(parent).ok();
+    let mut rows: Vec<RepoRow> = Vec::new();
+    for c in candidates {
+        let dir = parent.join(&c.name);
+        let has_git = dir.join(".git").is_dir();
+        let (kind, mut evidence) = detect(&dir);
+        if !has_git && kind.is_empty() {
+            evidence.push("no git · documents".into());
+        }
+        let remote = has_git.then(|| origin_url(&dir)).flatten();
+        if let Some(r) = &remote {
+            evidence.push(format!("remote {r}"));
+        }
+        let index = if !has_git && kind.is_empty() && c.file_count == 0 && c.markers.is_empty() {
+            IndexState::Off
+        } else {
+            IndexState::for_kind(&kind)
+        };
+        let member_of_ws = existing_ws.as_ref().is_some_and(|w| w.config.members.contains(&c.name));
+        rows.push(RepoRow {
+            include: !declined.members.contains(&c.name) && (member_of_ws || existing_ws.is_none()) && index != IndexState::Off,
+            team: workspace::member_group(&c.name).map(str::to_string),
+            member: c.name,
+            kind,
+            index,
+            evidence,
+            remote,
+            existing: c.existing,
+            has_git,
+        });
+    }
+
+    // A docs repo whose README names a sibling proposes them as one team.
+    let texts: Vec<String> = rows.iter().map(|r| readme_text(&parent.join(&r.member))).collect();
+    for i in 0..rows.len() {
+        if !rows[i].kind.contains(&RepoKind::Wiki) {
+            continue;
+        }
+        let team = rows[i].team.clone().unwrap_or_else(|| team_from_docs(workspace::member_leaf(&rows[i].member)));
+        let named: Vec<usize> = (0..rows.len())
+            .filter(|j| *j != i && names_word(&texts[i], workspace::member_leaf(&rows[*j].member)))
+            .collect();
+        if named.is_empty() {
+            continue;
+        }
+        rows[i].team.get_or_insert(team.clone());
+        for j in named {
+            if rows[j].team.is_none() {
+                rows[j].team = Some(team.clone());
+                let by = workspace::member_leaf(&rows[i].member).to_string();
+                rows[j].evidence.push(format!("{by}'s README names it"));
+            }
+        }
+    }
+
+    // Ignore entries: second checkouts, and the secrets that are built in.
+    let already = workspace::ignore_rules(parent);
+    let mut ignores: Vec<IgnoreRow> = Vec::new();
+    for r in rows.iter().filter(|r| r.has_git) {
+        for (rel, evidence) in worktrees(parent, &parent.join(&r.member)) {
+            let pattern = format!("{rel}/");
+            if workspace::is_ignored_folder(&already, &rel) || ignores.iter().any(|i| i.pattern == pattern) {
+                continue;
+            }
+            ignores.push(IgnoreRow {
+                ticked: !declined.ignores.contains(&pattern),
+                pattern,
+                state: IndexState::Off,
+                reason: "Git worktree".into(),
+                evidence,
+                fixed: false,
+            });
+        }
+    }
+    ignores.push(IgnoreRow {
+        pattern: ".env* *.pem *.key id_rsa* secrets.* credentials.json".into(),
+        state: IndexState::Off,
+        reason: "Secrets".into(),
+        evidence: "built in: never read, and no line brings them back".into(),
+        ticked: true,
+        fixed: true,
+    });
+
+    let mut teams: Vec<String> = rows.iter().filter_map(|r| r.team.clone()).collect();
+    teams.sort();
+    teams.dedup();
+    Ok(Proposal {
+        folder: parent.to_path_buf(),
+        repos: rows.iter().filter(|r| r.has_git).count(),
+        without_git: rows.iter().filter(|r| !r.has_git).count(),
+        rows,
+        teams,
+        ignores,
+        existing_workspace: existing_ws.is_some(),
+    })
+}
+
+/// Write the confirmed set-up: the workspace manifest (members, teams as
+/// groups), each repo's kind, team and index state in the registry at
+/// `base`, the ticked ignore lines under a dated comment, and what was
+/// declined. The only step that writes.
+pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores: &[IgnoreRow], today: &str) -> Result<Workspace> {
+    let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include && r.index != IndexState::Off).collect();
+    let members: Vec<String> = chosen.iter().map(|r| r.member.clone()).collect();
+
+    // Ignore lines first, so the workspace opens with them in force.
+    let fresh: Vec<&IgnoreRow> = {
+        let already = workspace::ignore_rules(parent);
+        ignores
+            .iter()
+            .filter(|i| i.ticked && !i.fixed)
+            .filter(|i| !workspace::is_ignored_folder(&already, i.pattern.trim_end_matches('/')))
+            .collect()
+    };
+    if !fresh.is_empty() {
+        let path = workspace::ignore_path(parent);
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("\n# Ken proposed these at set-up on {today}. Edit or delete freely.\n"));
+        for i in fresh {
+            // gitignore syntax: `#` starts a comment only at the start of a
+            // line, so the reason goes on its own line above the pattern.
+            let line = if i.state == IndexState::Search { format!("~{}", i.pattern) } else { i.pattern.clone() };
+            text.push_str(&format!("# {}: {}\n{line}\n", i.reason, i.evidence));
+        }
+        fs::write(&path, text).map_err(|e| crate::Error::io(&path, e))?;
+    }
+
+    let mut ws = match Workspace::open(parent) {
+        Ok(mut ws) => {
+            for m in &members {
+                if !ws.config.members.contains(m) {
+                    ws.config.members.push(m.clone());
+                }
+            }
+            ws.save()?;
+            Workspace::open(parent)?
+        }
+        Err(_) => Workspace::create(parent, name, &members)?,
+    };
+
+    // Teams become groups, except where the team is already a group folder.
+    let derived: Vec<String> = ws.config.derived_groups().into_iter().map(|g| g.name).collect();
+    let mut teams: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for r in &chosen {
+        if let Some(t) = &r.team {
+            teams.entry(t.clone()).or_default().push(r.member.clone());
+        }
+    }
+    for (team, ms) in teams {
+        if !derived.iter().any(|d| d.eq_ignore_ascii_case(&team)) {
+            ws.config.set_group(&team, &ms)?;
+        }
+    }
+    ws.save()?;
+
+    let mut reg = Registry::load(base)?;
+    for m in &ws.members {
+        let workspace::MemberStatus::Ok(p) = &m.status else { continue };
+        let Some(row) = chosen.iter().find(|r| r.member == m.name) else { continue };
+        reg.add(p);
+        reg.set_kind(p.config.id, row.kind.clone(), row.team.clone());
+        reg.set_index(p.config.id, Some(row.index));
+    }
+    reg.save(base)?;
+
+    let mut d = declined(parent);
+    // Only what a person took out; a folder with nothing to index was never
+    // offered, so it is not a refusal.
+    for r in rows.iter().filter(|r| !r.include && r.index != IndexState::Off) {
+        if !d.members.contains(&r.member) {
+            d.members.push(r.member.clone());
+        }
+    }
+    for i in ignores.iter().filter(|i| !i.ticked && !i.fixed) {
+        if !d.ignores.contains(&i.pattern) {
+            d.ignores.push(i.pattern.clone());
+        }
+    }
+    let path = declined_path(parent);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| crate::Error::io(dir, e))?;
+    }
+    let json = serde_json::to_string_pretty(&d).map_err(|e| crate::Error::Other(e.to_string()))?;
+    fs::write(&path, json + "\n").map_err(|e| crate::Error::io(&path, e))?;
+
+    Workspace::open(parent)
+}
+
+/// Scan again and report what moved since set-up: folders that are new (and
+/// were not declined), members gone from disk, and new second checkouts.
+/// Writes nothing.
+pub fn rescan(parent: &Path) -> Result<Vec<Moved>> {
+    let ws = Workspace::open(parent)?;
+    let proposal = propose(parent)?;
+    let declined = declined(parent);
+    let mut out = Vec::new();
+    for r in &proposal.rows {
+        if !ws.config.members.contains(&r.member) && !declined.members.contains(&r.member) && r.index != IndexState::Off {
+            out.push(Moved::NewFolder { member: r.member.clone(), evidence: r.evidence.clone() });
+        }
+    }
+    for m in &ws.members {
+        if matches!(m.status, workspace::MemberStatus::Missing) {
+            out.push(Moved::Gone { member: m.name.clone() });
+        }
+    }
+    for i in proposal.ignores.iter().filter(|i| !i.fixed && i.ticked) {
+        out.push(Moved::NewWorktree { pattern: i.pattern.clone(), evidence: i.evidence.clone() });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A code folder like the report's: a docs repo whose README names the
+    /// game, the game with a worktree beside it, a group folder of tools, a
+    /// folder of documents with no git, and an empty folder.
+    fn code_folder() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        fs::create_dir_all(p.join("Realms-Docs/_meta")).unwrap();
+        fs::create_dir_all(p.join("Realms-Docs/.obsidian")).unwrap();
+        fs::write(p.join("Realms-Docs/_meta/DECISIONS.md"), "# Decisions\n").unwrap();
+        fs::write(p.join("Realms-Docs/README.md"), "Docs for Realms-Game and its tools.\n").unwrap();
+        fs::create_dir_all(p.join("Realms-Docs/.git")).unwrap();
+
+        let game = p.join("Realms-Game");
+        fs::create_dir_all(&game).unwrap();
+        git(&game, &["init", "-q", "-b", "main"]);
+        git(&game, &["config", "user.email", "t@t"]);
+        git(&game, &["config", "user.name", "t"]);
+        git(&game, &["remote", "add", "origin", "git@github.com:Stingbro/Realms-Game.git"]);
+        fs::write(game.join("Cargo.toml"), "[package]\n").unwrap();
+        git(&game, &["add", "-A"]);
+        git(&game, &["commit", "-q", "-m", "init"]);
+        git(&game, &["worktree", "add", "-q", "../Realms-Game-u7", "-b", "u7"]);
+
+        fs::create_dir_all(p.join("SR/tools/.git")).unwrap();
+        fs::write(p.join("SR/tools/package.json"), "{}").unwrap();
+        fs::create_dir_all(p.join("Personal")).unwrap();
+        fs::write(p.join("Personal/notes.md"), "notes\n").unwrap();
+        fs::create_dir_all(p.join("Empty")).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_scan_proposes_kinds_teams_states_and_worktrees_with_evidence() {
+        let d = code_folder();
+        let p = propose(d.path()).unwrap();
+        let row = |m: &str| p.rows.iter().find(|r| r.member == m).unwrap_or_else(|| panic!("{m}: {:?}", p.rows));
+
+        let docs = row("Realms-Docs");
+        assert_eq!(docs.kind, vec![RepoKind::Wiki]);
+        assert_eq!(docs.index, IndexState::Entities);
+        assert_eq!(docs.team.as_deref(), Some("Realms"));
+        assert!(docs.evidence.iter().any(|e| e.contains("DECISIONS")), "{:?}", docs.evidence);
+
+        let game = row("Realms-Game");
+        assert_eq!((game.kind.clone(), game.index), (vec![RepoKind::Code], IndexState::Search));
+        assert_eq!(game.team.as_deref(), Some("Realms"), "named by the docs README");
+        assert_eq!(game.remote.as_deref(), Some("git@github.com:Stingbro/Realms-Game.git"));
+
+        assert_eq!(row("SR/tools").team.as_deref(), Some("SR"), "the group folder is the team");
+        let personal = row("Personal");
+        assert!(personal.kind.is_empty() && personal.index == IndexState::Entities && !personal.has_git);
+        assert!(!p.rows.iter().any(|r| r.member == "Realms-Game-u7"), "a worktree is never a row");
+        assert_eq!(row("Empty").index, IndexState::Off);
+
+        let wt = p.ignores.iter().find(|i| i.reason == "Git worktree").expect("worktree proposed");
+        assert_eq!(wt.pattern, "Realms-Game-u7/");
+        assert!(wt.ticked && !wt.fixed);
+        assert!(p.ignores.iter().any(|i| i.reason == "Secrets" && i.fixed));
+        assert_eq!(p.teams, vec!["Realms", "SR"]);
+        assert!(!d.path().join(".kenignore").exists(), "propose writes nothing");
+        assert!(!d.path().join(".ken-workspace").exists());
+    }
+
+    #[test]
+    fn confirm_writes_the_manifest_registry_and_ignores_and_rescan_reports_what_moved() {
+        let d = code_folder();
+        let base = tempfile::tempdir().unwrap();
+        let mut p = propose(d.path()).unwrap();
+        // A person takes Personal out and reads the game's docs for entities.
+        p.rows.iter_mut().find(|r| r.member == "Personal").unwrap().include = false;
+        p.rows.iter_mut().find(|r| r.member == "Realms-Game").unwrap().index = IndexState::Entities;
+        let ws = confirm(base.path(), d.path(), "Code", &p.rows, &p.ignores, "2026-09-24").unwrap();
+
+        let mut members = ws.config.members.clone();
+        members.sort();
+        assert_eq!(members, vec!["Realms-Docs", "Realms-Game", "SR/tools"]);
+        assert_eq!(ws.config.group("Realms").map(|g| g.members.len()), Some(2));
+        assert!(ws.config.group("SR").is_none(), "SR is already a group folder");
+
+        let reg = Registry::load(base.path()).unwrap();
+        let game = reg.entry_at(&d.path().join("Realms-Game")).unwrap();
+        assert_eq!(game.kind, vec![RepoKind::Code]);
+        assert_eq!(game.team.as_deref(), Some("Realms"));
+        assert_eq!(game.index, Some(IndexState::Entities), "a choice other than the kind's is kept");
+        let docs = reg.entry_at(&d.path().join("Realms-Docs")).unwrap();
+        assert_eq!(docs.index, None, "the kind's own state is not stored twice");
+
+        let ignore = fs::read_to_string(d.path().join(".kenignore")).unwrap();
+        assert!(ignore.contains("# Ken proposed these at set-up on 2026-09-24"));
+        assert!(ignore.contains("Realms-Game-u7/"));
+        assert!(!ignore.contains("credentials.json"), "built-ins are not written");
+        assert_eq!(declined(d.path()).members, vec!["Personal"]);
+
+        // Scan again: nothing new, since Personal was declined and the
+        // worktree is now ignored. A new folder is reported, not added.
+        assert_eq!(rescan(d.path()).unwrap(), Vec::<Moved>::new());
+        fs::create_dir_all(d.path().join("NewGame/.git")).unwrap();
+        fs::write(d.path().join("NewGame/go.mod"), "module x\n").unwrap();
+        let moved = rescan(d.path()).unwrap();
+        assert!(matches!(&moved[..], [Moved::NewFolder { member, .. }] if member == "NewGame"), "{moved:?}");
+        assert!(!Workspace::open(d.path()).unwrap().config.members.contains(&"NewGame".to_string()));
+    }
+
+    #[test]
+    fn remote_owners_and_docs_team_names() {
+        assert_eq!(remote_owner("git@github.com:Stingbro/ken.git").as_deref(), Some("Stingbro"));
+        assert_eq!(remote_owner("https://github.com/smo-key/ken.git").as_deref(), Some("smo-key"));
+        assert_eq!(team_from_docs("Shattered-Realms-Docs"), "Shattered-Realms");
+        assert_eq!(team_from_docs("sr-docs"), "sr");
+        assert!(names_word("docs for realms-game and", "Realms-Game"));
+        assert!(!names_word("gamers", "game"), "short and partial words do not count");
+    }
+}
