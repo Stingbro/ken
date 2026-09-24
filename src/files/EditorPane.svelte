@@ -13,6 +13,7 @@
   import { isEditable, timeAgo } from "../lib/format";
   import { delimiterForPath } from "../lib/csv";
   import MarkdownEditor from "./MarkdownEditor.svelte";
+  import PageLinks from "./PageLinks.svelte";
   import PlainEditor from "./PlainEditor.svelte";
   import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
@@ -399,6 +400,9 @@
     {/key}
   {:else if meta}
     <PreviewPane {relPath} {kind} {meta} />
+  {/if}
+  {#if meta?.kind === "md"}
+    <PageLinks {relPath} refresh={reloadKey} />
   {/if}
 </div>
 

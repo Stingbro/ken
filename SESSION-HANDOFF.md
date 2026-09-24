@@ -123,7 +123,9 @@ PC (dev), not measured anywhere.
   names two pages claim. After each scan of a team or wiki repo one open
   Review item of kind `links` is kept (replaced only when its text
   changes, resolved when clean). `page_links` command gives a page's
-  outgoing and incoming links; the Map does not use it yet.
+  outgoing and incoming links, shown as Linked from / Links to under a
+  Markdown page in Files (`PageLinks.svelte`). The entity Map is unchanged:
+  its nodes are entities, not pages.
 - **Step 14, the graph per workspace (per team still to do).** The merged
   graph is built over the workspace manifest's members (every Ok member
   with an index on disk, read for entities: team, wiki, or no kind yet),
