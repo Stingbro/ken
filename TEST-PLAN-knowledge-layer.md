@@ -240,6 +240,23 @@ keyword index over sections.
 - [ ] Nothing was pushed anywhere: `git -C "<test folder>\Realms-Wiki" remote`
   prints nothing.
 
+## 15. Claude in chat: edits reviewed, sources clickable (needs Claude)
+
+- [ ] Open `Realms-Docs/Platform/Save.md`. In chat, ask: "Rename the title to
+  Saving and add a line that saves are versioned." A card shows the edit as a
+  diff, each change with its old and new line numbers, and the same diff sits
+  over the open page. Nothing is written yet.
+- [ ] Deny the title change, Accept the other, **Apply choices**. Only the
+  accepted line lands on disk; Claude's next message says which change was
+  left out and does not redo it.
+- [ ] Ask for another edit and **Deny all**: the file is unchanged. Ask again
+  and **Accept all**: Claude makes the edit as proposed.
+- [ ] Edit the page yourself while a proposal waits, then Apply choices: it
+  refuses and says the file changed.
+- [ ] Ask "Where do we decide how saves are written?" The answer cites files
+  as links. Clicking one opens it in Files at the cited line or heading, which
+  flashes. Claude never opens a tab or switches screen by itself.
+
 ## After
 
 - [ ] Close Ken; delete the test folder and `Realms-Game-u7`/`u8` beside it.
