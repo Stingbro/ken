@@ -2641,17 +2641,24 @@ async fn search_all_projects(
         (actives, roster)
     };
 
-    // Each active member's FTS, off the global lock on the blocking pool.
+    // Each active member's FTS, off the global lock on the blocking pool,
+    // all members at once: twenty repos cost the slowest one, not the sum.
     let q = query.clone();
     let per_member: Vec<(String, String, Vec<SearchHit>)> =
         tauri::async_runtime::spawn_blocking(move || {
-            actives
-                .into_iter()
-                .map(|(pid, name, db)| {
-                    let hits = db.lock().unwrap().search(&q, limit).unwrap_or_default();
-                    (pid.to_string(), name, hits)
-                })
-                .collect()
+            std::thread::scope(|s| {
+                let handles: Vec<_> = actives
+                    .into_iter()
+                    .map(|(pid, name, db)| {
+                        let q = &q;
+                        s.spawn(move || {
+                            let hits = db.lock().unwrap().search(q, limit).unwrap_or_default();
+                            (pid.to_string(), name, hits)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            })
         })
         .await
         .map_err(|e| e.to_string())?;

@@ -974,13 +974,19 @@ impl Db {
             return Ok(Vec::new());
         }
         let fts_query = build_fts_query(&tokens);
+        // Rank inside the full-text table first and join only the top `k`:
+        // joined first, SQLite reads every match's section text before it
+        // sorts, which for a common word at tens of thousands of files cost
+        // most of a second. Same rows, same order.
         let mut stmt = self.conn.prepare(
             r#"SELECT c.id, c.path, c.text
-               FROM chunks_fts f
-               JOIN chunks c ON c.id = f.rowid
-               WHERE f.text MATCH ?1
-               ORDER BY bm25(chunks_fts)
-               LIMIT ?2"#,
+               FROM (SELECT rowid AS id, rank AS r
+                     FROM chunks_fts
+                     WHERE chunks_fts MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2) t
+               JOIN chunks c ON c.id = t.id
+               ORDER BY t.r"#,
         )?;
         let rows = stmt.query_map(params![fts_query, k as i64], |r| {
             Ok(FtsHit {
