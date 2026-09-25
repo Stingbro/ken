@@ -2217,6 +2217,13 @@ export const api = {
     listen<IngestEvent>("ingest-run-changed", (e) => fn(e.payload)),
   onIndexUpdated: (fn: (stats: ScanStats) => void): Promise<UnlistenFn> =>
     listen<ScanStats>("index-updated", (e) => fn(e.payload)),
+  /** Claude, asked by the person, opens a file in Ken (ken-mcp open_in_ken). */
+  onKenOpen: (
+    fn: (req: { projectId: string | null; path: string; line: number | null; anchor: string | null }) => void,
+  ): Promise<UnlistenFn> =>
+    listen<{ projectId: string | null; path: string; line: number | null; anchor: string | null }>("ken-open", (e) =>
+      fn(e.payload),
+    ),
   onFileSaved: (fn: (relPath: string) => void): Promise<UnlistenFn> =>
     listen<string>("file-saved", (e) => fn(e.payload)),
   onSyncState: (fn: (ev: SyncStateEvent) => void): Promise<UnlistenFn> =>

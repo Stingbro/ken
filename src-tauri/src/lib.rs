@@ -803,6 +803,12 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         Some(h) => h.clone(),
         None => {
             let h = Arc::new(HookListener::start().map_err(err)?);
+            // Ken's MCP server asks the app to open a file (only when the
+            // person asked Claude to): the frontend focuses and opens it.
+            let ui_app = app.clone();
+            h.set_ui_handler(move |v| {
+                let _ = ui_app.emit("ken-open", v);
+            });
             guard.hooks = Some(h.clone());
             h
         }
@@ -985,6 +991,28 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
             },
         ))
     });
+    // Ken's own MCP server in every chat session of this project: Ken's
+    // search, with ken:// citations, and opening a file when asked.
+    if let (Some(engine), Some(mcp)) = (&chat_engine, find_ken_mcp()) {
+        let cfg = serde_json::json!({
+            "mcpServers": {
+                "ken": {
+                    "command": mcp,
+                    "args": ["--project", project.root],
+                    "env": {
+                        "KEN_APP_URL": hooks.ui_url(),
+                        "KEN_APP_TOKEN": hooks.token(),
+                        "KEN_PROJECT_ID": project.config.id.to_string(),
+                    }
+                }
+            }
+        });
+        let dir = guard.base_dir.join("chat-mcp");
+        let path = dir.join(format!("{}.json", project.config.id));
+        if std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, cfg.to_string())).is_ok() {
+            engine.set_mcp_config(Some(path));
+        }
+    }
 
     // Sync engine: active git sync when the folder is a repo with a
     // remote; passive conflicted-copy detection otherwise. Notices become

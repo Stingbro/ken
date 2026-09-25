@@ -153,7 +153,32 @@ and do not retry a declined change unless they ask.\n\
 project-relative, with the line when you know it: [Save.md, line 12](Platform/Save.md#L12), or a heading: \
 [Save format](Platform/Save.md#save-format). A hit from Ken's search tools that carries a ken:// address is linked \
 by that address, with #L<line> when it has a line. Never open files or switch the person's screen yourself; a link \
-is how they go there.";
+is how they go there.\n\
+3. Search with Ken first. Ken's tools (route_query across the workspace, semantic_search in one project, kg_search \
+over the knowledge graph, search_knowledge, read_document) search the team's wiki, docs and code with Ken's own \
+ranking and return ken:// addresses to cite. open_in_ken opens a file for the person: use it only when they explicitly \
+ask you to open or show something.";
+
+/// Ken's own MCP tools the chat may use without asking: they read Ken's
+/// index, or open a file for the person when they asked. Its tools that
+/// write (memories, tasks, messages to teammates) are declined in chat.
+pub const KEN_MCP_ALLOWED: [&str; 10] = [
+    "search_knowledge",
+    "read_document",
+    "list_documents",
+    "list_projects",
+    "kg_search",
+    "semantic_search",
+    "route_query",
+    "task_list",
+    "family_inbox",
+    "open_in_ken",
+];
+
+/// The name Claude Code gives a tool of Ken's MCP server (`ken`).
+fn ken_mcp_tool(tool: &str) -> Option<&str> {
+    tool.strip_prefix("mcp__ken__")
+}
 
 /// An edit Claude asked to make, worked out against the file as it is now,
 /// for the user to review: the text before and the text after.
@@ -411,6 +436,9 @@ struct Conversation {
 pub struct ChatEngine {
     binary: PathBuf,
     project_root: PathBuf,
+    /// Ken's MCP server for this project, as a Claude Code `--mcp-config`
+    /// file, when ken-mcp was found.
+    mcp_config: Mutex<Option<PathBuf>>,
     live: Arc<Mutex<HashMap<String, Conversation>>>,
     on_update: Arc<dyn Fn(ChatUpdate) + Send + Sync>,
 }
@@ -424,9 +452,15 @@ impl ChatEngine {
         ChatEngine {
             binary,
             project_root,
+            mcp_config: Mutex::new(None),
             live: Arc::new(Mutex::new(HashMap::new())),
             on_update: Arc::new(on_update),
         }
+    }
+
+    /// Give new chat sessions Ken's MCP server (a `--mcp-config` file).
+    pub fn set_mcp_config(&self, path: Option<PathBuf>) {
+        *self.mcp_config.lock().unwrap() = path;
     }
 
     pub fn is_live(&self, chat_id: &str) -> bool {
@@ -607,6 +641,9 @@ impl ChatEngine {
             "--append-system-prompt",
             KEN_GUIDE,
         ]);
+        if let Some(cfg) = self.mcp_config.lock().unwrap().clone() {
+            cmd.arg("--mcp-config").arg(cfg);
+        }
         // Only forward a validated stable alias; anything else falls back to the
         // CLI's own default model.
         if let Some(alias) = model.and_then(valid_model_alias) {
@@ -685,6 +722,17 @@ impl ChatEngine {
                                 status: "needs_input".into(),
                                 detail: None,
                             });
+                        } else if let Some(tool) = ken_mcp_tool(&tool_name) {
+                            // Ken's read tools run; its write tools are for
+                            // the person to do in Ken.
+                            let response = if KEN_MCP_ALLOWED.contains(&tool) {
+                                serde_json::json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id })
+                            } else {
+                                serde_json::json!({ "behavior": "deny", "message": format!("{tool} changes Ken's data; in this chat you may read and cite, and the person does this in Ken.") })
+                            };
+                            let reply = control_reply(&request_id, response);
+                            let mut w = pump_stdin.lock().unwrap();
+                            let _ = writeln!(w, "{reply}").and_then(|_| w.flush());
                         } else if tool_name == "NotebookEdit" {
                             // Notebooks keep the old behaviour: allowed as asked.
                             let reply = control_reply(

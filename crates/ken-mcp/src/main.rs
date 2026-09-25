@@ -784,7 +784,75 @@ auto-accept in this system.",
         }));
     }
 
+    // Only when Ken's own chat started this server: it can reach the app.
+    if app_bridge().is_some() {
+        tools.push(json!({
+            "name": "open_in_ken",
+            "description": "Open a file in Ken for the person, at a line or a heading. Use this ONLY when the \
+person explicitly asks you to open, show or take them to something; otherwise cite the file as a link and let \
+them click it. Accepts a ken:// address from Ken's search tools, or a project-relative path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "A ken://<project-id>/<path> address, or a project-relative path." },
+                    "line": { "type": "integer", "description": "1-based line to scroll to." },
+                    "heading": { "type": "string", "description": "A heading's text or slug to scroll to, in a Markdown page." },
+                    "project": project_arg
+                },
+                "required": ["target"]
+            }
+        }));
+    }
+
     Value::Array(tools)
+}
+
+/// Ken's app, when its chat started this server: the URL and token its
+/// local listener checks.
+fn app_bridge() -> Option<(String, String)> {
+    let url = std::env::var("KEN_APP_URL").ok().filter(|u| !u.is_empty())?;
+    let token = std::env::var("KEN_APP_TOKEN").ok().filter(|t| !t.is_empty())?;
+    Some((url, token))
+}
+
+/// Ask Ken to open a file: one POST to its local listener.
+fn open_in_ken(server: &Server, args: &Value) -> Result<String, String> {
+    let bridge = app_bridge().ok_or("open_in_ken works only in Ken's own chat")?;
+    open_in_ken_via(server, args, &bridge)
+}
+
+fn open_in_ken_via(server: &Server, args: &Value, (url, token): &(String, String)) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let target = require_str(args, "target")?;
+    let (project_id, path) = match target.strip_prefix("ken://").and_then(|r| r.split_once('/')) {
+        Some((id, path)) => (id.to_string(), path.to_string()),
+        None => {
+            let (project, _) = resolve_project(server, args)?;
+            (project.config.id.to_string(), target.trim_start_matches("./").replace('\\', "/"))
+        }
+    };
+    let (path, frag_line) = match path.split_once("#L") {
+        Some((p, l)) => (p.to_string(), l.split('-').next().and_then(|n| n.parse::<u64>().ok())),
+        None => (path, None),
+    };
+    let line = args.get("line").and_then(Value::as_u64).or(frag_line);
+    let anchor = args.get("heading").and_then(Value::as_str).map(str::to_string);
+    let body = json!({ "projectId": project_id, "path": path, "line": line, "anchor": anchor }).to_string();
+    let rest = url.strip_prefix("http://").ok_or("bad app URL")?;
+    let (host, route) = rest.split_once('/').map(|(h, r)| (h, format!("/{r}"))).unwrap_or((rest, "/".into()));
+    let mut stream = std::net::TcpStream::connect(host).map_err(|e| format!("Ken is not reachable: {e}"))?;
+    let req = format!(
+        "POST {route} HTTP/1.1\r\nHost: {host}\r\nX-Ken-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    if reply.starts_with("HTTP/1.1 200") {
+        Ok(format!("Opened {path}{} in Ken.", line.map(|l| format!(" at line {l}")).unwrap_or_default()))
+    } else {
+        Err(format!("Ken did not open it: {}", reply.lines().next().unwrap_or("no reply")))
+    }
 }
 
 // --- tools ---
@@ -795,6 +863,7 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "kg_search" => kg_search(server, args),
         "semantic_search" => semantic_search(server, args),
         "route_query" => route_query(server, args),
+        "open_in_ken" => open_in_ken(server, args),
         "memory_write" => memory_write_tool(server, args),
         "journal_append" => journal_append_tool(server, args),
         "task_create" => task_create_tool(server, args),
@@ -842,7 +911,13 @@ different words — all terms must match.",
                 ));
                 for (i, hit) in hits.iter().enumerate() {
                     let snippet = hit.snippet.replace("<mark>", "**").replace("</mark>", "**");
-                    out.push_str(&format!("\n{}. {} — {}", i + 1, hit.rel_path, snippet));
+                    out.push_str(&format!(
+                        "\n{}. {} ({}) — {}",
+                        i + 1,
+                        hit.rel_path,
+                        ken_address(project.config.id, &hit.rel_path),
+                        snippet
+                    ));
                 }
             }
             Ok(out)
@@ -1104,9 +1179,10 @@ this server has no query embedding model; see the tool description):\n",
         ));
         for (i, hit) in hits.iter().enumerate() {
             out.push_str(&format!(
-                "\n{}. {} [{}] {} — {}",
+                "\n{}. {}{} [{}] {} — {}",
                 i + 1,
                 ken_address(project.config.id, &hit.path),
+                hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
                 source_label(hit.source),
                 hit.path,
                 hit.snippet
@@ -1314,10 +1390,11 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
     for (i, hit) in report.results.iter().enumerate() {
         // The locator is what to cite; the ken:// address is what to open.
         out.push_str(&format!(
-            "\n{}. {} ({}) [{}] — {}",
+            "\n{}. {} ({}{}) [{}] — {}",
             i + 1,
             hit.locator,
             hit.address,
+            hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
             source_label(hit.source),
             hit.snippet
         ));
@@ -3967,6 +4044,24 @@ mod tests {
         assert!(text.starts_with("Route: named project match"), "{text}");
         assert!(text.contains("a.md"), "{text}");
         assert!(!text.contains("b.md"), "{text}");
+    }
+
+    #[test]
+    fn open_in_ken_asks_the_app_with_its_token() {
+        let (_base, _ra, _rb, server) = two_project_fixture();
+        let listener = ken_core::hooks::HookListener::start().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        listener.set_ui_handler(move |v| {
+            let _ = tx.send(v);
+        });
+        let bridge = (listener.ui_url(), listener.token().to_string());
+        let said = open_in_ken_via(&server, &json!({"target": "ken://abc-123/Platform/Save.md#L12"}), &bridge).unwrap();
+        assert_eq!(said, "Opened Platform/Save.md at line 12 in Ken.");
+        let v = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!((v["projectId"].as_str(), v["path"].as_str(), v["line"].as_u64()), (Some("abc-123"), Some("Platform/Save.md"), Some(12)));
+
+        let wrong = (listener.ui_url(), "not-the-token".to_string());
+        assert!(open_in_ken_via(&server, &json!({"target": "ken://abc-123/a.md"}), &wrong).is_err());
     }
 
     #[test]

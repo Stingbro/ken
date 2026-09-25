@@ -17,6 +17,7 @@
   import WhatsNewDialog from "../whats-new/WhatsNewDialog.svelte";
   import { whatsNew } from "../whats-new/whatsNew.svelte";
   import { onMount } from "svelte";
+  import { api } from "../lib/api";
   import { SvelteSet } from "svelte/reactivity";
 
   // Screens the user has actually opened this session (home is always live).
@@ -28,6 +29,18 @@
   // The shell only renders with a project open, so the release notes never
   // interrupt onboarding.
   onMount(() => whatsNew.init());
+
+  // The person asked Claude in chat to open something: focus its workspace
+  // member if it is another one, then open it at the line or heading.
+  onMount(() => {
+    const off = api.onKenOpen(async (req) => {
+      if (req.projectId && req.projectId !== app.focused && app.workspace?.members.some((m) => m.projectId === req.projectId)) {
+        await app.focusMember(req.projectId);
+      }
+      app.openAt(req.path, { line: req.line ?? undefined, anchor: req.anchor ?? undefined });
+    });
+    return () => void off.then((u) => u());
+  });
 
   function onKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
