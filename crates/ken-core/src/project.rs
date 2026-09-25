@@ -1,6 +1,13 @@
 //! Project lifecycle: `.ken/project.json` inside the project folder is the
 //! shared, text-only source of truth. Unknown fields are preserved on
 //! rewrite so newer Ken versions (or teammates' configs) aren't clobbered.
+//!
+//! A repo Ken must leave untouched (a code or reference repo: Ken never
+//! commits into it, and it should gain no file from Ken) keeps the same
+//! config in Ken's app data instead, keyed by its folder
+//! ([`outside_config_path`]); [`Project::create_outside`] makes one, and
+//! [`Project::open`] and [`Project::save`] find it when the repo has no
+//! `.ken/project.json` of its own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,6 +93,34 @@ pub fn config_path(root: &Path) -> PathBuf {
     root.join(CONFIG_DIR).join(CONFIG_FILE)
 }
 
+/// Where a repo that gets no file from Ken keeps its config: Ken's app data,
+/// `project-configs/<hash of the folder>.json`. None when the app-data
+/// folder cannot be found.
+pub fn outside_config_path(root: &Path) -> Option<PathBuf> {
+    let canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let key = canon.to_string_lossy().trim_start_matches(r"\\?\").to_lowercase().replace('\\', "/");
+    let hash = twox_hash::XxHash64::oneshot(0x4B45_4E43_4647, key.as_bytes());
+    crate::registry::default_base_dir().ok().map(|b| b.join("project-configs").join(format!("{hash:016x}.json")))
+}
+
+/// The config file a project uses: its own `.ken/project.json`, else the
+/// one kept for it in app data, when either exists.
+pub fn existing_config(root: &Path) -> Option<PathBuf> {
+    let inside = config_path(root);
+    if inside.exists() {
+        return Some(inside);
+    }
+    outside_config_path(root).filter(|p| p.exists())
+}
+
+fn write_config(path: &Path, config: &ProjectConfig) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    }
+    let json = serde_json::to_string_pretty(config).map_err(|e| Error::Other(e.to_string()))?;
+    fs::write(path, json + "\n").map_err(|e| Error::io(path, e))
+}
+
 impl Project {
     /// Create a new project in an existing folder. If the folder already has
     /// a `.ken/project.json` (e.g. cloned from a teammate), it is adopted
@@ -94,7 +129,7 @@ impl Project {
         if !root.is_dir() {
             return Err(Error::ProjectMissing(root.to_path_buf()));
         }
-        if config_path(root).exists() {
+        if existing_config(root).is_some() {
             return Project::open(root);
         }
         let config = ProjectConfig {
@@ -112,9 +147,37 @@ impl Project {
         Ok(project)
     }
 
-    /// Open a folder that already contains `.ken/project.json`.
+    /// Make a project whose config lives in Ken's app data, not in the repo:
+    /// the repo gains no `.ken/`. A repo that already has its own
+    /// `.ken/project.json` (a teammate's, say) is adopted unchanged.
+    pub fn create_outside(root: &Path, name: &str) -> Result<Project> {
+        if !root.is_dir() {
+            return Err(Error::ProjectMissing(root.to_path_buf()));
+        }
+        if existing_config(root).is_some() {
+            return Project::open(root);
+        }
+        let path = outside_config_path(root).ok_or_else(|| Error::Other("Ken's app-data folder was not found".into()))?;
+        let config = ProjectConfig {
+            name: name.to_string(),
+            id: Uuid::new_v4(),
+            excluded: Vec::new(),
+            features: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
+        };
+        write_config(&path, &config)?;
+        Ok(Project { root: root.to_path_buf(), config })
+    }
+
+    /// Whether this project's config lives in app data, outside the repo.
+    pub fn is_outside(&self) -> bool {
+        !config_path(&self.root).exists() && outside_config_path(&self.root).is_some_and(|p| p.exists())
+    }
+
+    /// Open a folder that has a `.ken/project.json`, or a config kept for it
+    /// in app data.
     pub fn open(root: &Path) -> Result<Project> {
-        let path = config_path(root);
+        let path = existing_config(root).unwrap_or_else(|| config_path(root));
         let raw = fs::read_to_string(&path).map_err(|e| {
             if !root.is_dir() {
                 Error::ProjectMissing(root.to_path_buf())
@@ -134,12 +197,13 @@ impl Project {
     }
 
     pub fn save(&self) -> Result<()> {
-        let dir = self.root.join(CONFIG_DIR);
-        fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
-        let path = config_path(&self.root);
-        let json = serde_json::to_string_pretty(&self.config)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        fs::write(&path, json + "\n").map_err(|e| Error::io(&path, e))
+        // Kept in app data: stay there, so the repo still gains no file.
+        if self.is_outside() {
+            if let Some(path) = outside_config_path(&self.root) {
+                return write_config(&path, &self.config);
+            }
+        }
+        write_config(&config_path(&self.root), &self.config)
     }
 
     /// Is a project-relative path inside an excluded folder?

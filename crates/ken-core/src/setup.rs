@@ -391,9 +391,28 @@ fn suggest_teams(rows: &mut [RepoRow], dir_of: impl Fn(&RepoRow) -> PathBuf) {
 /// groups), each repo's kind, team and index state in the registry at
 /// `base`, the ticked ignore lines under a dated comment, and what was
 /// declined. The only step that writes.
+/// A repo Ken leaves untouched: code or reference, and not also team or
+/// wiki. It gains no file from Ken; its project config lives in app data.
+pub fn leaves_untouched(kind: &[RepoKind]) -> bool {
+    !kind.is_empty() && kind.iter().all(|k| matches!(k, RepoKind::Code | RepoKind::Reference))
+}
+
+/// Give each untouched repo among `rows` its project in app data before the
+/// workspace adopts it, so opening the workspace finds that one instead of
+/// writing `.ken/project.json` into the repo.
+fn place_untouched(rows: &[&RepoRow], folder: impl Fn(&RepoRow) -> Option<PathBuf>) -> Result<()> {
+    for r in rows.iter().filter(|r| leaves_untouched(&r.kind)) {
+        if let Some(dir) = folder(r) {
+            crate::project::Project::create_outside(&dir, workspace::member_leaf(&r.member))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores: &[IgnoreRow], today: &str) -> Result<Workspace> {
     let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include && r.index != IndexState::Off).collect();
     let members: Vec<String> = chosen.iter().map(|r| r.member.clone()).collect();
+    place_untouched(&chosen, |r| Some(parent.join(&r.member)))?;
 
     // Ignore lines first, so the workspace opens with them in force.
     let fresh: Vec<&IgnoreRow> = {
@@ -507,7 +526,7 @@ fn row_for(dir: &Path, member: String) -> RepoRow {
         index,
         evidence,
         remote,
-        existing: crate::project::config_path(dir).exists(),
+        existing: crate::project::existing_config(dir).is_some(),
         has_git,
         description: readme_summary(dir),
         path: Some(dir.to_path_buf()),
@@ -626,6 +645,7 @@ pub fn confirm_repos(base: &Path, root: &Path, name: &str, rows: &[RepoRow]) -> 
         rows.iter().filter(|r| r.include && r.index != IndexState::Off && r.path.is_some()).collect();
     let members: Vec<(String, PathBuf)> =
         chosen.iter().filter_map(|r| r.path.clone().map(|p| (r.member.clone(), p))).collect();
+    place_untouched(&chosen, |r| r.path.clone())?;
     let mut ws = Workspace::create_at(root, name, &members)?;
 
     let mut teams: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -830,6 +850,12 @@ mod tests {
         let ws = confirm_repos(base.path(), &root, "Code", &rows).unwrap();
         assert!(root.join(".ken-workspace/workspace.json").exists());
         assert!(!p.join(".ken-workspace").exists() && !p.join(".kenignore").exists(), "nothing in a parent");
+        // A code repo gains no file from Ken; the wiki keeps its own config.
+        assert_eq!(row("Realms-Game").kind, vec![RepoKind::Code]);
+        assert!(!p.join("Realms-Game/.ken").exists(), "a code repo gets no .ken/");
+        let game = crate::project::Project::open(&p.join("Realms-Game")).unwrap();
+        assert!(game.is_outside());
+        assert!(p.join("Realms-Docs/.ken/project.json").exists());
         let canon = |x: std::path::PathBuf| plain_canonical(&x);
         assert!(!canon(p.to_path_buf()).to_string_lossy().starts_with(r"\\?\"), "no verbatim prefix");
         assert_eq!(ws.member_root("Personal"), canon(elsewhere.path().join("Personal")));

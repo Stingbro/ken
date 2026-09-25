@@ -265,7 +265,6 @@ keyword index over sections.
 
 ## Known gaps (not bugs to report)
 
-- Set-up still writes `.ken/project.json` into each member, code repos too.
 - Ingest does not yet write rulings, tickets or Current pages from a note by
   itself; the Current recipe does the last, through staging.
 - Chat edits to wiki pages do not go through staging.

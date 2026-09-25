@@ -787,7 +787,7 @@ fn group_folder_children(
 /// already, how many files sit directly in it, and which repo markers
 /// (`crate::profiler::REPO_MARKERS`, `.git`, `*.sln`) does it carry.
 fn scan_candidate(dir: &Path, name: &str) -> Result<Candidate> {
-    let existing = project::config_path(dir).exists();
+    let existing = project::existing_config(dir).is_some();
     let mut file_count = 0usize;
     let mut markers: Vec<String> = Vec::new();
 

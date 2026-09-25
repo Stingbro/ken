@@ -147,6 +147,15 @@ pub fn default_base_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("KEN_DATA_DIR").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
+    // Unit tests never read or write the person's real app data.
+    #[cfg(test)]
+    {
+        static TEST_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        return Ok(TEST_DIR
+            .get_or_init(|| std::env::temp_dir().join(format!("ken-test-data-{}", std::process::id())))
+            .clone());
+    }
+    #[allow(unreachable_code)]
     dirs::data_dir()
         .map(|d| d.join("ken"))
         .ok_or_else(|| Error::Other("no OS data directory available".into()))
@@ -391,8 +400,12 @@ mod tests {
             PathBuf::from("/tmp/ken-test-base")
         );
         std::env::remove_var("KEN_DATA_DIR");
+        // Under test the default is a per-run temp folder, never real app data.
         let default = default_base_dir().unwrap();
-        assert!(default.ends_with("ken"), "unexpected default: {default:?}");
+        assert!(
+            default.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ken-test-data-")),
+            "unexpected default: {default:?}"
+        );
     }
 
     #[test]
