@@ -8104,8 +8104,11 @@ struct WorkspaceKgOverviewDto {
 /// Workspace-KG summary: counts + per-member staleness (federated-kg task
 /// 2.2). Flag-gated (task 2.3) — off returns an error before `kg.sqlite` is
 /// even opened, so a read alone can never create it.
+/// With `team`, the team's graph: a view of the merged one (never a
+/// second build) keeping entities linked into the team's repos, their links
+/// into those repos, the edges between them, and the team's members.
 #[tauri::command]
-fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOverviewDto> {
+fn workspace_kg_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<WorkspaceKgOverviewDto> {
     let guard = state.lock().unwrap();
     if !federated_kg_enabled(&guard.app_settings) {
         return Err("federatedKg flag is off".into());
@@ -8116,12 +8119,24 @@ fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOver
         .map_err(err)?
         .and_then(|s| s.parse::<i64>().ok());
     let llm_passes = kg.get_meta("llm_passes").map_err(err)?.as_deref() == Some("true");
-    let global_entities = kg.list_global_entities().map_err(err)?;
+    let team_ids = team_project_ids(&guard, team.as_deref());
+    let in_team = |p: &str| team_ids.as_ref().is_none_or(|ids| ids.contains(p));
+    let mut kept: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut entity_links = 0usize;
-    for e in &global_entities {
-        entity_links += kg.list_links_for_global(e.id).map_err(err)?.len();
+    for e in kg.list_global_entities().map_err(err)? {
+        let links = kg.list_links_for_global(e.id).map_err(err)?;
+        let team_links = links.iter().filter(|l| in_team(&l.project_id)).count();
+        if team_links > 0 || (team_ids.is_none() && links.is_empty()) {
+            kept.insert(e.id);
+            entity_links += team_links;
+        }
     }
-    let edges = kg.list_all_edges().map_err(err)?.len();
+    let edges = kg
+        .list_all_edges()
+        .map_err(err)?
+        .iter()
+        .filter(|g| kept.contains(&g.src_global_id) && kept.contains(&g.dst_global_id))
+        .count();
 
     let pseudo_id = memory_pseudo_member_id(&guard);
     let mut members = Vec::with_capacity(guard.members.len());
@@ -8129,6 +8144,9 @@ fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOver
         let project_id = m.project.config.id;
         if Some(project_id) == pseudo_id {
             continue; // ken-memory task 2.1 (D3): never federated
+        }
+        if !in_team(&project_id.to_string()) {
+            continue;
         }
         let current_watermark = m.db.knowledge_model_built_at().map_err(err)?;
         let cached = kg.get_watermark(project_id).map_err(err)?;
@@ -8145,7 +8163,7 @@ fn workspace_kg_overview(state: State<SharedState>) -> CmdResult<WorkspaceKgOver
     Ok(WorkspaceKgOverviewDto {
         built_at,
         llm_passes,
-        global_entities: global_entities.len(),
+        global_entities: kept.len(),
         entity_links,
         edges,
         members,

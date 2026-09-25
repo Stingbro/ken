@@ -95,7 +95,8 @@ class WorkspaceKgStore {
 
   async refreshOverview() {
     if (!this.enabled) return;
-    this.overview = await api.workspaceKgOverview().catch(() => null);
+    // A team picked in the scope picker: its graph's counts, not the workspace's.
+    this.overview = await api.workspaceKgOverview(scope.groupName).catch(() => null);
   }
 
   resetGraph() {

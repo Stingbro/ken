@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
+  import { scope } from "../lib/scope.svelte";
   import { app } from "../lib/app.svelte";
   import { knowledge } from "../lib/knowledge.svelte";
   import { memberColor, workspaceKg } from "../lib/workspaceKg.svelte";
@@ -66,6 +67,16 @@
     if (hideChrome) return;
     void knowledge.visit();
     void workspaceKg.init();
+  });
+
+  // Picking another team in the scope picker re-reads that team's graph.
+  $effect(() => {
+    void scope.groupName;
+    if (!workspaceMode) return;
+    untrack(() => {
+      void workspaceKg.refreshOverview();
+      if (workspaceKg.searchQuery) void workspaceKg.search(workspaceKg.searchQuery);
+    });
   });
 
   // Fixed-size world in px: nodes are placed inside it and the whole

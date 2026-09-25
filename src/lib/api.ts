@@ -2100,8 +2100,8 @@ export const api = {
   rebuildWorkspaceKg: () => invoke<void>("rebuild_workspace_kg"),
   /** Workspace-KG summary: counts + per-member staleness. Rejects with the
    *  flag-off error before `kg.sqlite` is ever opened. */
-  workspaceKgOverview: () =>
-    invoke<WorkspaceKgOverview>("workspace_kg_overview"),
+  workspaceKgOverview: (team: string | null = null) =>
+    invoke<WorkspaceKgOverview>("workspace_kg_overview", { team }),
   /** The full wiki-page payload for one global entity — summary, out-links,
    *  back-links, and per-project doc pointers in one call. */
   workspaceKgEntity: (id: number) =>
