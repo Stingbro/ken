@@ -460,7 +460,7 @@ export const CHAT_MODELS: { label: string; value: string | null }[] = [
 export interface ChatMessage {
   id: number;
   chatId: string;
-  role: "user" | "assistant" | "activity" | "divider";
+  role: "user" | "assistant" | "activity" | "question" | "divider";
   content: string;
   createdAt: number;
   /** Set on member-scoped emits of `chat-message` (S9 step 5). */
@@ -1900,6 +1900,9 @@ export const api = {
   hydrateFile: (relPath: string) => invoke<void>("hydrate_file", { relPath }),
   saveFile: (relPath: string, content: string) =>
     invoke<number>("save_file", { relPath, content }),
+  /** Overwrite a file with raw bytes (PDF form fills). Returns the new mtime like saveFile. */
+  saveFileBytes: (relPath: string, bytes: Uint8Array) =>
+    invoke<number>("save_file_bytes", { relPath, bytes: Array.from(bytes) }),
   fileMeta: (relPath: string) => invoke<FileRow | null>("file_meta", { relPath }),
   extractedText: (relPath: string) =>
     invoke<string>("extracted_text", { relPath }),
@@ -1921,6 +1924,12 @@ export const api = {
   createDocument: (relPath: string) =>
     invoke<string>("create_document", { relPath }),
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
+  /// Show a file in Finder/Explorer rather than opening it.
+  revealInFolder: (relPath: string) =>
+    invoke<void>("reveal_in_folder", { relPath }),
+  /// Open an http(s) link in the system browser (anything else is refused by
+  /// the backend).
+  openWebUrl: (url: string) => invoke<void>("open_web_url", { url }),
 
   /// Copy an external file into a staging area so it can be previewed pre-placement.
   importBegin: (srcPath: string) =>
@@ -1992,6 +2001,9 @@ export const api = {
   unreadFiles: () => invoke<string[]>("unread_files"),
   /// Record a file as seen at its current version (on open / "Mark as viewed").
   markSeen: (relPath: string) => invoke<void>("mark_seen", { relPath }),
+  /// Mark every indexed file under one folder seen.
+  markSeenUnder: (relPath: string) =>
+    invoke<void>("mark_seen_under", { relPath }),
   /// Mark every currently-unread file seen.
   markAllSeen: () => invoke<void>("mark_all_seen"),
   syncStatus: () => invoke<SyncStatus>("sync_status"),
@@ -2139,6 +2151,11 @@ export const api = {
       focusedFile,
       scope: scope ?? null,
     }),
+  answerChatQuestion: (
+    chatId: string,
+    messageId: number,
+    answers: Record<string, string>,
+  ) => invoke<void>("answer_chat_question", { chatId, messageId, answers }),
   renameChat: (chatId: string, title: string) =>
     invoke<void>("rename_chat", { chatId, title }),
   setChatPinned: (chatId: string, pinned: boolean) =>

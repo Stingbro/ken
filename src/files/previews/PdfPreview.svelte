@@ -1,13 +1,32 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import type { PageViewport, PDFDocumentProxy } from "pdfjs-dist";
+  import type { PageViewport, PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
   import type { TextItem } from "pdfjs-dist/types/src/display/api";
+  // pdf.js's own stylesheet — it styles the form-field widgets (.annotationLayer)
+  // we mount over the canvas. Its other rules are namespaced to pdf.js class
+  // names Ken doesn't use.
+  import "pdfjs-dist/web/pdf_viewer.css";
   import { api, type OcrRegion } from "../../lib/api";
   import { MATCH_CAP, findTextMatches } from "../../lib/find";
   import { find, type FindAdapter } from "../../lib/find.svelte";
+  import { createFormSaver, type FormStorage } from "./pdfForm";
   import PreviewLoading from "./PreviewLoading.svelte";
 
-  let { relPath }: { relPath: string } = $props();
+  let {
+    relPath,
+    onfillable,
+    onchange,
+    onsaved,
+    onerror,
+  }: {
+    relPath: string;
+    /** The PDF carries fillable form fields, so it isn't read-only after all. */
+    onfillable?: () => void;
+    /** A field was edited and the change isn't on disk yet. */
+    onchange?: () => void;
+    onsaved?: (mtime: number) => void;
+    onerror?: (message: string) => void;
+  } = $props();
 
   let host: HTMLDivElement;
   let error = $state<string | null>(null);
@@ -21,6 +40,10 @@
     viewport: PageViewport;
     /** Text runs, fetched the first time someone searches this document. */
     items?: TextItem[];
+    /** The pdf.js form-widget layer, on a fillable PDF. */
+    layer?: { destroy?: () => void };
+    /** Keeps the widget layer's scale in step with the displayed canvas. */
+    observer?: ResizeObserver;
   }
 
   /** A hit on a page's pdf.js text layer. */
@@ -42,6 +65,8 @@
   type Hit = TextHit | OcrHit;
 
   let doc: PDFDocumentProxy | null = null;
+  /** Set only for a fillable PDF: debounces field edits into a save. */
+  let saver: ReturnType<typeof createFormSaver> | null = null;
   let pages: Page[] = [];
   let hits: Hit[] = [];
   let boxes: HTMLElement[] = [];
@@ -228,6 +253,96 @@
     };
   });
 
+  /**
+   * Mounts pdf.js's interactive widget layer over a rendered page.
+   *
+   * Geometry note: each field is positioned and sized in PERCENTAGES of the
+   * layer (see AnnotationElement._createContainer in pdf.mjs), so pinning the
+   * layer to the page box — which is `max-width: 100%` and therefore shrinks
+   * with a narrow pane — makes every field track the canvas for free. What does
+   * NOT scale that way is text: font sizes and corner radii are written as
+   * `calc(Npx * var(--total-scale-factor))`. So we own that variable and keep it
+   * at the canvas's *displayed* scale via a ResizeObserver — approach (a). The
+   * width/height `setLayerDimensions` writes (absolute px off
+   * `--total-scale-factor`) would fight the shrinking canvas, so they're
+   * replaced with 100%; the call is still made for its `data-main-rotation`.
+   */
+  async function mountFormLayer(
+    pdfjs: typeof import("pdfjs-dist"),
+    entry: Page,
+    page: PDFPageProxy,
+    canvasMap: Map<string, HTMLCanvasElement>,
+  ): Promise<void> {
+    if (!doc) return;
+    const { wrapper, overlay, viewport } = entry;
+
+    const layerDiv = document.createElement("div");
+    layerDiv.className = "annotationLayer";
+    // After the canvas, before the overlay: find highlights stay on top, and the
+    // overlay is pointer-events:none so clicks still reach the fields.
+    wrapper.insertBefore(layerDiv, overlay);
+
+    pdfjs.setLayerDimensions(layerDiv, viewport);
+    layerDiv.style.width = "100%";
+    layerDiv.style.height = "100%";
+
+    const rescale = () => {
+      const shown = wrapper.clientWidth || viewport.width;
+      const effective = viewport.scale * (shown / viewport.width);
+      wrapper.style.setProperty("--total-scale-factor", String(effective));
+      wrapper.style.setProperty("--scale-factor", String(effective));
+    };
+    rescale();
+    const observer = new ResizeObserver(rescale);
+    observer.observe(wrapper);
+    entry.observer = observer;
+
+    // pdf.js insists on a link service even for a form-only layer. Ken has no
+    // in-document navigation, so links resolve to nothing rather than jumping.
+    const linkService = {
+      getDestinationHash: () => "#",
+      getAnchorUrl: () => "#",
+      addLinkAttributes: () => {},
+      executeNamedAction: () => {},
+      executeSetOCGState: () => {},
+      goToDestination: async () => {},
+      getAttachmentContent: async () => null,
+      eventBus: null,
+      isInPresentationMode: false,
+      externalLinkEnabled: false,
+      pagesCount: doc.numPages,
+      page: entry.number,
+      rotation: 0,
+    };
+
+    const annotations = await page.getAnnotations({ intent: "display" });
+    const layer = new pdfjs.AnnotationLayer({
+      div: layerDiv,
+      page,
+      viewport,
+      accessibilityManager: null,
+      // The very map page.render() just filled: AnnotationLayer.render moves
+      // each widget's canvas into its <section> and empties the map as it goes.
+      annotationCanvasMap: canvasMap,
+      annotationEditorUIManager: null,
+      structTreeLayer: null,
+      commentManager: null,
+      linkService,
+      annotationStorage: doc.annotationStorage,
+    });
+    await layer.render({
+      viewport,
+      div: layerDiv,
+      annotations,
+      page,
+      linkService,
+      renderForms: true,
+      annotationStorage: doc.annotationStorage,
+      imageResourcesPath: "",
+    } as never);
+    entry.layer = layer as unknown as { destroy?: () => void };
+  }
+
   onMount(async () => {
     try {
       const pdfjs = await import("pdfjs-dist");
@@ -240,6 +355,30 @@
       doc = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
       loading = false;
 
+      // A PDF with AcroForm fields is fillable in Ken: the widgets render as
+      // real HTML inputs over the canvas and every edit auto-saves. Everything
+      // else stays a plain read-only render.
+      let fillable = false;
+      try {
+        const fields = await doc.getFieldObjects();
+        fillable = !!fields && Object.keys(fields).length > 0;
+      } catch {
+        // A malformed AcroForm shouldn't cost the reader the whole render.
+      }
+      if (fillable) {
+        onfillable?.();
+        // pdf.js only reports edits through the storage; the saver turns that
+        // stream into the same debounce-and-save rhythm as the text editors.
+        saver = createFormSaver({
+          storage: doc.annotationStorage as unknown as FormStorage,
+          serialize: () => doc!.saveDocument(),
+          write: (b) => api.saveFileBytes(relPath, b),
+          onchange,
+          onsaved,
+          onerror,
+        });
+      }
+
       for (let i = 1; i <= doc.numPages && !cancelled; i++) {
         const page = await doc.getPage(i);
         const scale = 1.4;
@@ -250,7 +389,6 @@
         canvas.height = viewport.height * ratio;
         canvas.style.width = `${viewport.width}px`;
         const ctx = canvas.getContext("2d")!;
-        ctx.scale(ratio, ratio);
 
         // Canvas plus an overlay the find boxes are drawn into, in page pixels.
         const wrapper = document.createElement("div");
@@ -260,9 +398,46 @@
         overlay.className = "page-overlay";
         wrapper.append(canvas, overlay);
         host.appendChild(wrapper);
-        pages.push({ number: i, wrapper, overlay, viewport });
+        const entry: Page = { number: i, wrapper, overlay, viewport };
+        pages.push(entry);
 
-        await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+        // A checkbox or radio button always draws itself into its own canvas
+        // (ButtonWidgetAnnotation sets hasOwnCanvas), one per appearance state.
+        // page.render() only produces those canvases if it is handed a map to
+        // put them in — without it the boxes render blank, ticked or not. The
+        // same map instance then goes to the AnnotationLayer, which moves each
+        // canvas into its widget's <section>, where pdf.js's CSS shows the
+        // "checked" or "unchecked" one to match the live <input>.
+        const canvasMap = new Map<string, HTMLCanvasElement>();
+
+        // ENABLE_FORMS keeps the widgets' baked-in appearances off the canvas so
+        // the live HTML fields aren't drawn twice, once stale.
+        await page.render({
+          canvasContext: ctx,
+          viewport,
+          canvas,
+          annotationMode: fillable
+            ? pdfjs.AnnotationMode.ENABLE_FORMS
+            : pdfjs.AnnotationMode.ENABLE,
+          annotationCanvasMap: fillable ? canvasMap : undefined,
+          // HiDPI is expressed as a render transform, NOT a pre-applied
+          // ctx.scale(): pdf.js reads outputScaleX/Y off this matrix
+          // (beginDrawing) and sizes each widget's own canvas from it
+          // (beginAnnotation: ceil(w * outputScaleX * viewportScale)). A scaled
+          // context alone leaves those at 1, so a check mark came out at 1x in
+          // the corner of a 2x box. The page pixels are identical either way,
+          // and the find-highlight math still uses the unscaled `viewport`.
+          transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined,
+        }).promise;
+
+        if (fillable && !cancelled) {
+          try {
+            await mountFormLayer(pdfjs, entry, page, canvasMap);
+          } catch {
+            // That page's widgets stay non-interactive; the rest of the
+            // document still renders and the other pages still fill in.
+          }
+        }
       }
       find.refresh(); // pages arrived after the user already typed a query
     } catch (e) {
@@ -297,6 +472,17 @@
 
   onDestroy(() => {
     cancelled = true;
+    // Flush before unhooking, so a half-typed field isn't lost on tab close —
+    // the same flush-on-close the text editors do.
+    if (saver) {
+      void saver.flush();
+      saver.dispose();
+      saver = null;
+    }
+    for (const page of pages) {
+      page.observer?.disconnect();
+      page.layer?.destroy?.();
+    }
   });
 </script>
 
@@ -332,6 +518,23 @@
     position: absolute;
     inset: 0;
     pointer-events: none;
+    /* Above the form widgets, which pdf.js stacks from z-index 0 upwards, so a
+       find highlight is never hidden behind a field. */
+    z-index: 1000;
+  }
+  /* Form widgets sit between the canvas and the find overlay, pinned to the page
+     box so they scale with the canvas (see mountFormLayer). */
+  .pages :global(.annotationLayer) {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+  }
+  /* Nothing may clip a field: a multi-line value has to scroll inside its own
+     textarea rather than be cut off by the page box. */
+  .pages :global(.annotationLayer textarea) {
+    overflow-y: auto;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
   }
   .pages :global(.pdf-hit) {
     position: absolute;
@@ -343,7 +546,9 @@
     background: color-mix(in srgb, var(--accent) 50%, transparent);
     box-shadow: 0 0 0 1px var(--accent);
   }
-  .pages :global(canvas) {
+  /* The page canvas only — NOT the little per-widget appearance canvases pdf.js
+     puts inside .annotationLayer sections, which must stay unstyled. */
+  .pages :global(.page-box > canvas) {
     display: block;
     max-width: 100%;
     box-shadow: var(--shadow-card);

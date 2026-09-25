@@ -20,8 +20,12 @@ const MAX_LIVE_CONVERSATIONS: usize = 3;
 pub enum ChatUpdate {
     /// A transcript entry to persist/render. role: assistant | activity.
     Message { chat_id: String, role: String, content: String },
-    /// working | done | error
+    /// working | done | error | needs_input
     Status { chat_id: String, status: String, detail: Option<String> },
+    /// The model is asking the user to choose. `payload` is the JSON contract
+    /// the UI and the answer command share:
+    /// `{"requestId":…,"toolUseId":…,"questions":[…]}`.
+    Question { chat_id: String, payload: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,8 +34,19 @@ pub enum ParsedEvent {
     AssistantText(String),
     Activity(String),
     TurnResult { is_error: bool },
+    /// A `can_use_tool` permission request the CLI expects an answer to.
+    ControlRequest {
+        request_id: String,
+        tool_name: String,
+        input: Value,
+        tool_use_id: String,
+    },
     Other,
 }
+
+/// The tool whose permission request is a user-facing question rather than a
+/// permission decision.
+const ASK_TOOL: &str = "AskUserQuestion";
 
 /// Parse one stream-json stdout line. Tolerant: unknown shapes → Other.
 pub fn parse_event(line: &str) -> ParsedEvent {
@@ -60,12 +75,42 @@ pub fn parse_event(line: &str) -> ParsedEvent {
                         }
                     }
                     Some("tool_use") => {
+                        // The question card renders AskUserQuestion; an
+                        // activity line for it would just be noise.
+                        if b.get("name").and_then(Value::as_str) == Some(ASK_TOOL) {
+                            continue;
+                        }
                         return ParsedEvent::Activity(summarize_tool(b));
                     }
                     _ => {}
                 }
             }
             ParsedEvent::Other
+        }
+        Some("control_request") => {
+            let req = v.get("request");
+            if req.and_then(|r| r.get("subtype")).and_then(Value::as_str) != Some("can_use_tool") {
+                return ParsedEvent::Other;
+            }
+            let req = req.unwrap();
+            ParsedEvent::ControlRequest {
+                request_id: v
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tool_name: req
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                input: req.get("input").cloned().unwrap_or(Value::Null),
+                tool_use_id: req
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }
         }
         _ => ParsedEvent::Other,
     }
@@ -328,6 +373,52 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Answer a pending AskUserQuestion. `answers` is keyed by the exact
+    /// question text (multi-select values are comma-separated labels); the
+    /// waiting CLI resumes the turn as soon as the line lands.
+    pub fn answer_question(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        tool_use_id: &str,
+        questions: Value,
+        answers: Value,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {
+                    "behavior": "allow",
+                    "updatedInput": { "questions": questions, "answers": answers },
+                    "toolUseID": tool_use_id,
+                }
+            }
+        });
+        // Same lock dance as `send`: clone the handle out under a short map
+        // lock, then write with the map lock released.
+        let stdin = {
+            let live = self.live.lock().unwrap();
+            live.get(chat_id)
+                .ok_or_else(|| Error::Other("this chat is no longer running".into()))?
+                .stdin
+                .clone()
+        };
+        {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}")
+                .and_then(|_| stdin.flush())
+                .map_err(|e| Error::Other(format!("answer failed: {e}")))?;
+        }
+        (self.on_update)(ChatUpdate::Status {
+            chat_id: chat_id.to_string(),
+            status: "working".into(),
+            detail: None,
+        });
+        Ok(())
+    }
+
     /// Stop a chat's conversation process (mode switch, archive, shutdown).
     pub fn stop(&self, chat_id: &str) {
         if let Some(mut conv) = self.live.lock().unwrap().remove(chat_id) {
@@ -381,6 +472,10 @@ impl ChatEngine {
             "--verbose",
             "--permission-mode",
             "acceptEdits",
+            // Routes permission requests to our stdin/stdout control channel,
+            // which is what makes AskUserQuestion reach the user at all.
+            "--permission-prompt-tool",
+            "stdio",
         ]);
         // Only forward a validated stable alias; anything else falls back to the
         // CLI's own default model.
@@ -402,11 +497,13 @@ impl ChatEngine {
         let stdin = child.stdin.take().ok_or_else(|| Error::Other("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Other("no stdout".into()))?;
         let stderr = child.stderr.take();
+        let stdin = Arc::new(Mutex::new(stdin));
 
         // Event pump.
         let on_update = self.on_update.clone();
         let live_map = self.live.clone();
         let id = chat_id.to_string();
+        let pump_stdin = stdin.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut saw_result = false;
@@ -434,6 +531,50 @@ impl ChatEngine {
                             status: if is_error { "error".into() } else { "done".into() },
                             detail: None,
                         });
+                    }
+                    ParsedEvent::ControlRequest {
+                        request_id,
+                        tool_name,
+                        input,
+                        tool_use_id,
+                    } => {
+                        if tool_name == ASK_TOOL {
+                            let payload = serde_json::json!({
+                                "requestId": request_id,
+                                "toolUseId": tool_use_id,
+                                "questions": input.get("questions").cloned()
+                                    .unwrap_or(Value::Array(Vec::new())),
+                            });
+                            on_update(ChatUpdate::Question {
+                                chat_id: id.clone(),
+                                payload: payload.to_string(),
+                            });
+                            on_update(ChatUpdate::Status {
+                                chat_id: id.clone(),
+                                status: "needs_input".into(),
+                                detail: None,
+                            });
+                        } else {
+                            // Every other permission request is denied, which
+                            // preserves the headless behavior this session had
+                            // before the control channel existed: only the
+                            // acceptEdits policy grants tools, never a prompt.
+                            let reply = serde_json::json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": {
+                                        "behavior": "deny",
+                                        "message": "Denied: this embedded session cannot grant tool permissions",
+                                    }
+                                }
+                            });
+                            let mut w = pump_stdin.lock().unwrap();
+                            if let Err(e) = writeln!(w, "{reply}").and_then(|_| w.flush()) {
+                                eprintln!("chat {id}: deny control_response failed: {e}");
+                            }
+                        }
                     }
                     ParsedEvent::Init | ParsedEvent::Other => {}
                 }
@@ -466,7 +607,7 @@ impl ChatEngine {
             chat_id.to_string(),
             Conversation {
                 child,
-                stdin: Arc::new(Mutex::new(stdin)),
+                stdin,
                 started: Instant::now(),
             },
         );
@@ -769,6 +910,161 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_control_request() {
+        let line = r#"{"type":"control_request","request_id":"req-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Color?","header":"Color","options":[{"label":"Red","description":"warm"}],"multiSelect":false}]},"tool_use_id":"toolu_1","requires_user_interaction":true}}"#;
+        match parse_event(line) {
+            ParsedEvent::ControlRequest { request_id, tool_name, input, tool_use_id } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(tool_name, "AskUserQuestion");
+                assert_eq!(tool_use_id, "toolu_1");
+                assert_eq!(input["questions"][0]["header"], "Color");
+            }
+            other => panic!("expected ControlRequest, got {other:?}"),
+        }
+        // Other tools still parse (the engine denies them).
+        assert!(matches!(
+            parse_event(
+                r#"{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{},"tool_use_id":"t2"}}"#
+            ),
+            ParsedEvent::ControlRequest { .. }
+        ));
+        // Non-permission control requests are not our business.
+        assert_eq!(
+            parse_event(r#"{"type":"control_request","request_id":"r3","request":{"subtype":"interrupt"}}"#),
+            ParsedEvent::Other
+        );
+    }
+
+    #[test]
+    fn ask_user_question_tool_use_is_not_an_activity_line() {
+        // The question card replaces the activity line, so the tool_use block
+        // must be skipped — and other blocks in the same event still scanned.
+        assert_eq!(
+            parse_event(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[]}}]}}"#
+            ),
+            ParsedEvent::Other
+        );
+        assert_eq!(
+            parse_event(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{}},{"type":"tool_use","name":"Read","input":{"file_path":"a.md"}}]}}"#
+            ),
+            ParsedEvent::Activity("Read a.md".into())
+        );
+    }
+
+    fn control_responses(dir: &Path) -> Vec<Value> {
+        let raw = std::fs::read_to_string(dir.join("control_response.txt")).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap_or(Value::Null))
+            .collect()
+    }
+
+    #[test]
+    fn ask_user_question_round_trip() {
+        let (dir, engine, rx) = engine("ask-question");
+        engine.send("chat-q", "askq please", false, None).unwrap();
+
+        // Wait for the question + needs_input pause.
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut payload = None;
+        while Instant::now() < deadline && payload.is_none() {
+            if let Ok(u) = rx.recv_timeout(Duration::from_millis(200)) {
+                if let ChatUpdate::Question { payload: p, .. } = &u {
+                    payload = Some(p.clone());
+                }
+                seen.push(u);
+            }
+        }
+        let payload = payload.expect("no Question update");
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["requestId"], "req-fake-1");
+        assert_eq!(v["toolUseId"], "toolu_fake1");
+        assert_eq!(v["questions"][0]["question"], "Favorite color?");
+        assert_eq!(v["questions"][0]["options"][1]["label"], "Blue");
+        // No activity line for the AskUserQuestion tool_use itself.
+        assert!(!seen.iter().any(|u| matches!(u,
+            ChatUpdate::Message { role, content, .. }
+                if role == "activity" && content.contains("AskUserQuestion"))));
+        // The turn pauses for the user.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && !seen.iter().any(|u| matches!(u,
+                ChatUpdate::Status { status, .. } if status == "needs_input"))
+        {
+            if let Ok(u) = rx.recv_timeout(Duration::from_millis(200)) {
+                seen.push(u);
+            }
+        }
+        assert!(seen.iter().any(|u| matches!(u,
+            ChatUpdate::Status { status, .. } if status == "needs_input")),
+            "no needs_input status: {seen:?}");
+
+        engine
+            .answer_question(
+                "chat-q",
+                "req-fake-1",
+                "toolu_fake1",
+                v["questions"].clone(),
+                serde_json::json!({ "Favorite color?": "Blue" }),
+            )
+            .unwrap();
+
+        let rest = collect_until_done(&rx, 15);
+        assert!(rest.iter().any(|u| matches!(u,
+            ChatUpdate::Message { content, .. } if content.contains("you chose: done"))),
+            "turn did not continue: {rest:?}");
+        assert!(matches!(rest.last().unwrap(),
+            ChatUpdate::Status { status, .. } if status == "done"));
+
+        let replies = control_responses(dir.path());
+        assert_eq!(replies.len(), 1, "expected exactly one control_response");
+        let r = &replies[0]["response"];
+        assert_eq!(replies[0]["type"], "control_response");
+        assert_eq!(r["subtype"], "success");
+        assert_eq!(r["request_id"], "req-fake-1");
+        assert_eq!(r["response"]["behavior"], "allow");
+        assert_eq!(r["response"]["toolUseID"], "toolu_fake1");
+        assert_eq!(r["response"]["updatedInput"]["answers"]["Favorite color?"], "Blue");
+        assert_eq!(
+            r["response"]["updatedInput"]["questions"][0]["question"],
+            "Favorite color?"
+        );
+    }
+
+    #[test]
+    fn other_permission_requests_are_auto_denied() {
+        let (dir, engine, rx) = engine("ask-question");
+        engine.send("chat-b", "askbash now", false, None).unwrap();
+        let updates = collect_until_done(&rx, 15);
+        assert!(!updates.iter().any(|u| matches!(u, ChatUpdate::Question { .. })),
+            "a non-AskUserQuestion request must not prompt the user");
+        assert!(matches!(updates.last().unwrap(),
+            ChatUpdate::Status { status, .. } if status == "done"));
+
+        let replies = control_responses(dir.path());
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["response"]["request_id"], "req-fake-2");
+        assert_eq!(replies[0]["response"]["response"]["behavior"], "deny");
+    }
+
+    #[test]
+    fn answer_question_on_unknown_chat_errors() {
+        let (_d, engine, _rx) = engine("ask-question");
+        assert!(engine
+            .answer_question(
+                "no-such-chat",
+                "req-x",
+                "toolu-x",
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .is_err());
+    }
+
+    #[test]
     fn send_receive_turn() {
         let (_d, engine, rx) = engine("complete");
         engine.send("chat-1", "Who owns billing?", false, None).unwrap();
@@ -920,6 +1216,81 @@ mod tests {
         eprintln!("terminal painted {total} bytes");
         assert!(total >= 500, "TUI produced almost no output: {total} bytes");
         pty.kill();
+    }
+
+    /// Live AskUserQuestion round-trip against the real Claude CLI — run
+    /// explicitly with `cargo test -p ken-core real_ask -- --ignored --nocapture`.
+    /// Uses the real user config (an isolated CLAUDE_CONFIG_DIR has no login and
+    /// the turn dies with "Not logged in"); leaves a trust entry for a temp dir.
+    #[test]
+    #[ignore]
+    fn real_ask_user_question_round_trip() {
+        let Some(binary) = crate::runner::discover_claude() else {
+            panic!("claude CLI not found");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = channel();
+        let engine = ChatEngine::new(binary, dir.path().to_path_buf(), move |u| {
+            let _ = tx.send(u);
+        });
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        engine
+            .send(
+                &chat_id,
+                "Use the AskUserQuestion tool to ask me exactly one question: my \
+                 favorite color, options Red and Blue. Wait for my answer, then \
+                 reply with one sentence naming my choice.",
+                false,
+                Some("haiku"),
+            )
+            .unwrap();
+
+        // Wait for the question.
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let mut payload = None;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline && payload.is_none() {
+            if let Ok(u) = rx.recv_timeout(Duration::from_millis(500)) {
+                eprintln!("update: {u:?}");
+                if let ChatUpdate::Question { payload: p, .. } = &u {
+                    payload = Some(p.clone());
+                }
+                seen.push(u);
+            }
+        }
+        let payload =
+            payload.unwrap_or_else(|| panic!("no Question update; saw: {seen:#?}"));
+        let v: Value = serde_json::from_str(&payload).unwrap();
+        eprintln!("question payload: {v:#}");
+        let question = v["questions"][0]["question"].as_str().unwrap().to_string();
+        assert!(!v["requestId"].as_str().unwrap().is_empty());
+        assert!(!v["toolUseId"].as_str().unwrap().is_empty());
+
+        engine
+            .answer_question(
+                &chat_id,
+                v["requestId"].as_str().unwrap(),
+                v["toolUseId"].as_str().unwrap(),
+                v["questions"].clone(),
+                serde_json::json!({ question: "Blue" }),
+            )
+            .unwrap();
+
+        let updates = collect_until_done(&rx, 240);
+        let reply: String = updates
+            .iter()
+            .filter_map(|u| match u {
+                ChatUpdate::Message { role, content, .. } if role == "assistant" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("reply after answer: {reply}");
+        assert!(reply.contains("Blue"), "answer did not reach the model: {reply}");
+        assert!(matches!(updates.last().unwrap(),
+            ChatUpdate::Status { status, .. } if status == "done"));
     }
 
     #[test]

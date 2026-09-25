@@ -56,6 +56,12 @@
 
   let mode = $state<"wysiwyg" | "plain">("wysiwyg");
   let dirty = $state(false);
+  // A PDF whose form fields can be filled in: the preview saves the file
+  // itself, so the pane reports "Editing…/Saved" and drops the read-only badge.
+  let formFillable = $state(false);
+  // A failed save, shown beside the save dot. Deliberately NOT loadError: that
+  // replaces the whole pane, which would throw away the half-filled form.
+  let saveError = $state<string | null>(null);
   let savedAt = $state<number | null>(null);
   let knownMtime = $state(0);
   let diskChanged = $state(false);
@@ -96,7 +102,8 @@
       !downloading &&
       cloudError === null &&
       loadError === null &&
-      (!editable || (isHtml && !showSource)),
+      (!editable || (isHtml && !showSource)) &&
+      !formFillable,
   );
 
   onMount(async () => {
@@ -122,6 +129,8 @@
     cloudError = null;
     hydration = null;
     needsCloudConfirm = false;
+    formFillable = false;
+    saveError = null;
     resolving = true;
     try {
       meta = await api.fileMeta(relPath);
@@ -267,11 +276,18 @@
        where this bar floats, and the conflict decision takes priority. -->
   {#if !diskChanged}
   <div class="actions">
-    {#if editable}
+    {#if editable || formFillable}
       <span class="save-state">
         <span class="sdot" class:dirty></span>
         {#if dirty}Editing…{:else if savedAt}Saved {timeAgo(Math.floor(savedAt / 1000))}{:else}Saved{/if}
       </span>
+      {#if saveError}
+        <span class="save-error" title={saveError}>Couldn't save</span>
+      {/if}
+      <!-- The editable branch below closes with its own separator. -->
+      {#if !editable}<span class="sep"></span>{/if}
+    {/if}
+    {#if editable}
       {#if meta?.kind === "md" && meta.size <= WYSIWYG_MAX}
         <span class="sep"></span>
         <button class="action" onclick={toggleMode}>
@@ -399,7 +415,23 @@
       {/if}
     {/key}
   {:else if meta}
-    <PreviewPane {relPath} {kind} {meta} />
+    <PreviewPane
+      {relPath}
+      {kind}
+      {meta}
+      onfillable={() => (formFillable = true)}
+      onchange={() => {
+        dirty = true;
+        app.makeTabPersistent(relPath); // filling a form promotes a preview tab
+      }}
+      onsaved={(mtime) => {
+        dirty = false;
+        savedAt = Date.now();
+        knownMtime = mtime;
+        saveError = null;
+      }}
+      onerror={(m) => (saveError = m)}
+    />
   {/if}
   {#if meta?.kind === "md"}
     <PageLinks {relPath} refresh={reloadKey} />
@@ -428,18 +460,14 @@
     align-items: center;
     gap: 4px;
     padding: 3px 6px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    /* Its own surface, a step of ink off the pane's `--surface`, with a real
+       edge: in the pane's colour (and faded) it disappeared into the page. */
+    background: color-mix(in srgb, var(--ink) 7%, var(--surface));
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius-control);
-    box-shadow: var(--shadow-control);
+    box-shadow: var(--shadow-card);
     font-size: 11.5px;
     color: var(--ink-tertiary);
-    opacity: 0.82;
-    transition: opacity 0.12s ease;
-  }
-  .actions:hover,
-  .actions:focus-within {
-    opacity: 1;
   }
   .action {
     display: inline-flex;
@@ -455,7 +483,7 @@
     flex: none;
   }
   .action:hover {
-    background: var(--sunken);
+    background: color-mix(in srgb, var(--ink) 14%, var(--surface));
     color: var(--ink);
   }
   .action.icon-only {
@@ -477,6 +505,15 @@
   }
   /* Non-interactive metadata badge, styled to sit quietly alongside
      .save-state rather than read as a button. */
+  /* Sits beside the save dot rather than replacing the pane: the user keeps the
+     form they filled in and can retry by typing again. */
+  .save-error {
+    padding: 0 4px;
+    flex: none;
+    white-space: nowrap;
+    color: var(--danger);
+    font-size: 11.5px;
+  }
   .read-only {
     display: inline-flex;
     align-items: center;

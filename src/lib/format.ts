@@ -17,6 +17,7 @@ const GLYPHS: Record<string, GlyphStyle> = {
   xlsx: { label: "XLS", bg: "color-mix(in srgb, var(--healthy) 10%, transparent)", border: "color-mix(in srgb, var(--healthy) 35%, transparent)", color: "var(--healthy-text)" },
   pptx: { label: "PPT", bg: "color-mix(in srgb, var(--needs-input) 10%, transparent)", border: "color-mix(in srgb, var(--needs-input) 32%, transparent)", color: "var(--needs-input-text)" },
   pdf: { label: "PDF", bg: "color-mix(in srgb, var(--danger) 9%, transparent)", border: "color-mix(in srgb, var(--danger) 32%, transparent)", color: "var(--danger)" },
+  url: { label: "URL", bg: "color-mix(in srgb, var(--accent) 9%, transparent)", border: "color-mix(in srgb, var(--accent) 30%, transparent)", color: "var(--accent)" },
   image: { label: "IMG", bg: "var(--sunken)", border: "var(--border-strong)", color: "var(--ink-secondary)" },
   binary: { label: "BIN", bg: "var(--sunken)", border: "var(--border-strong)", color: "var(--ink-tertiary)" },
 };

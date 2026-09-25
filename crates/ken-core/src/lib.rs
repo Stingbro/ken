@@ -10,6 +10,7 @@ pub mod chunker;
 pub mod cloud;
 pub mod db;
 pub mod digest;
+pub mod drawio;
 pub mod drift;
 pub mod embedder;
 pub mod engine;

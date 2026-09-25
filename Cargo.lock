@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "ken-app"
-version = "0.1.2"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2483,13 +2483,15 @@ dependencies = [
 
 [[package]]
 name = "ken-core"
-version = "0.1.2"
+version = "0.2.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2",
  "calamine",
  "cpal",
  "dirs",
+ "flate2",
  "hound",
  "ignore",
  "kamadak-exif",
@@ -2526,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "ken-mcp"
-version = "0.1.2"
+version = "0.2.1"
 dependencies = [
  "ken-core",
  "serde",
@@ -4219,9 +4221,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "screencapturekit"
-version = "8.0.0"
+version = "9.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c549b1b0bc1ae3a536a88e3097d394234657402191e6867a3215bd897d43b9fd"
+checksum = "5a801be27969d7ccd11dc5c2d5884b9efb1dd47edd1174e615c0fc2c35148dfc"
 dependencies = [
  "apple-cf",
  "apple-metal",

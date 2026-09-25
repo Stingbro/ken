@@ -25,16 +25,22 @@
     items: MenuEntry[];
   }
 
+  // Opening a menu can itself provoke a scroll: right-clicking inside a
+  // Milkdown table, for instance, makes Crepe scroll the clicked cell into
+  // view a frame later. Scrolls in that window are not the user scrolling
+  // away, so they must not dismiss the menu that just opened.
+  const SCROLL_GRACE_MS = 250;
+  let openedAt = 0;
+
+  // Shared open state for the app's single <ContextMenu/>, which App.svelte
+  // mounts once at the root. Mounting it per-screen would break menus: screens
+  // stay mounted but hidden (`display:none`), and a hidden ancestor swallows the
+  // fixed-position menu.
   let current = $state<OpenState | null>(null);
-  // Only the most-recently-mounted instance renders, so mounting <ContextMenu/>
-  // in several screens never double-draws. Ownership falls back to another live
-  // instance when the owner unmounts, so menus keep working across screens.
-  let seq = 0;
-  let owner = $state(0);
-  const mounted = new Set<number>();
 
   /** Open the shared context menu at viewport coords with the given items. */
   export function openContextMenu(x: number, y: number, items: MenuEntry[]) {
+    openedAt = performance.now();
     current = { x, y, items };
   }
 
@@ -44,22 +50,10 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
-
-  const myId = ++seq;
-  onMount(() => {
-    mounted.add(myId);
-    owner = myId;
-  });
-  onDestroy(() => {
-    mounted.delete(myId);
-    if (owner === myId) owner = mounted.size ? Math.max(...mounted) : 0;
-  });
-
   let menuEl = $state<HTMLDivElement | null>(null);
   let pos = $state({ x: 0, y: 0 });
 
-  const visible = $derived(current !== null && owner === myId);
+  const visible = $derived(current !== null);
 
   // Position on open, clamped to the viewport once the menu has measured.
   $effect(() => {
@@ -82,7 +76,10 @@
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") closeContextMenu();
     };
-    const onScroll = () => closeContextMenu();
+    const onScroll = () => {
+      if (performance.now() - openedAt < SCROLL_GRACE_MS) return;
+      closeContextMenu();
+    };
     window.addEventListener("pointerdown", onDown, true);
     window.addEventListener("keydown", onKey);
     window.addEventListener("scroll", onScroll, true);

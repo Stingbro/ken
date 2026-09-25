@@ -1,14 +1,14 @@
 // Inline-edit state for the Files tree (§12): one edit at a time — a rename of
-// an existing row, or a new-document/new-folder row inside a target folder
-// ("" = project root). Commit talks to the backend; validation errors surface
-// through the tree's existing non-blocking notice (drag.error), and the editor
-// stays open so the user can fix the name.
+// an existing row, or a new-document/new-link/new-folder row inside a target
+// folder ("" = project root). Commit talks to the backend; validation errors
+// surface through the tree's existing non-blocking notice (drag.error), and the
+// editor stays open so the user can fix the name.
 import { api } from "../lib/api";
 import { app } from "../lib/app.svelte";
 import { drag, parentOf } from "./dnd.svelte";
-import { dedupedDocName, siblingNames, validateName } from "./naming";
+import { dedupedDocName, dedupedLinkName, siblingNames, validateName } from "./naming";
 
-export type TreeEditMode = "rename" | "new-document" | "new-folder";
+export type TreeEditMode = "rename" | "new-document" | "new-link" | "new-folder";
 
 class TreeEditState {
   mode = $state<TreeEditMode | null>(null);
@@ -30,10 +30,17 @@ class TreeEditState {
     drag.error = null;
   }
 
-  beginCreate(mode: "new-document" | "new-folder", folder: string) {
+  beginCreate(mode: "new-document" | "new-link" | "new-folder", folder: string) {
     this.mode = mode;
     this.target = folder;
-    this.initial = mode === "new-document" ? dedupedDocName(this.siblings(folder)) : "";
+    // Files get a committable default; a new folder starts blank.
+    const siblings = this.siblings(folder);
+    this.initial =
+      mode === "new-document"
+        ? dedupedDocName(siblings)
+        : mode === "new-link"
+          ? dedupedLinkName(siblings)
+          : "";
     drag.error = null;
   }
 
@@ -68,6 +75,8 @@ class TreeEditState {
         await api.createFolder(path);
         await app.refreshTree();
       } else {
+        // new-document and new-link are the same trip: create the file, then
+        // open it — the extension alone decides how the editor treats it.
         // The backend may dedupe further (race safety) — open what it made.
         const finalRel = await api.createDocument(path);
         await app.refreshTree();

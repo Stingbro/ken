@@ -7,8 +7,11 @@
   import CloudIcon from "@lucide/svelte/icons/cloud";
   import SquareArrowOutUpRight from "@lucide/svelte/icons/square-arrow-out-up-right";
   import Check from "@lucide/svelte/icons/check";
+  import CheckCheck from "@lucide/svelte/icons/check-check";
+  import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Pencil from "@lucide/svelte/icons/pencil";
   import FilePlus from "@lucide/svelte/icons/file-plus";
+  import Link from "@lucide/svelte/icons/link";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import { app } from "../lib/app.svelte";
@@ -56,6 +59,12 @@
     const y = e.clientY;
     const fav = app.isFavorite(node.relPath);
     const kind = isFolder ? "folder" : "file";
+    // A folder is worth marking only when something inside it is still unread.
+    const hasUnread =
+      isFolder &&
+      app.unread.some(
+        (p) => p === node.relPath || p.startsWith(node.relPath + "/"),
+      );
     const items: MenuEntry[] = [
       {
         label: isFolder ? "Expand" : "Open",
@@ -68,6 +77,15 @@
         icon: ExternalLink,
         onSelect: () => void api.openExternal(node.relPath),
       },
+      ...(!isFolder
+        ? ([
+            {
+              label: "Open containing folder",
+              icon: FolderOpen,
+              onSelect: () => void api.revealInFolder(node.relPath),
+            },
+          ] as MenuEntry[])
+        : []),
       "separator",
       ...(isFolder
         ? ([
@@ -87,6 +105,14 @@
                 treeEdit.beginCreate("new-folder", node.relPath);
               },
             },
+            {
+              label: "New link",
+              icon: Link,
+              onSelect: () => {
+                open = true;
+                treeEdit.beginCreate("new-link", node.relPath);
+              },
+            },
           ] as MenuEntry[])
         : []),
       {
@@ -101,6 +127,16 @@
               label: "Mark as viewed",
               icon: Check,
               onSelect: () => void app.markSeen(node.relPath),
+            },
+          ] as MenuEntry[])
+        : []),
+      ...(hasUnread
+        ? ([
+            "separator",
+            {
+              label: "Mark folder as viewed",
+              icon: CheckCheck,
+              onSelect: () => void app.markFolderSeen(node.relPath),
             },
           ] as MenuEntry[])
         : []),
@@ -199,7 +235,7 @@
     {/if}
   </button>
   {#if open && !node.excluded}
-    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === node.relPath}
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-link" || treeEdit.mode === "new-folder") && treeEdit.target === node.relPath}
       <InlineNameRow indent={8 + (depth + 1) * 18} />
     {/if}
     {#each node.children as child (child.relPath)}

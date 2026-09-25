@@ -362,6 +362,9 @@ jobs:
           $triple = (rustc -vV | Select-String '^host: (.+)$').Matches[0].Groups[1].Value
           Copy-Item target/release/ken-mcp.exe "src-tauri/binaries/ken-mcp-$triple.exe"
 
+      # NOTE: the latest.json tauri-action uploads here is PROVISIONAL — each leg
+      # read-modify-writes the shared asset, so a concurrent leg can clobber it.
+      # publish-release rebuilds it from the signed assets once all legs finish.
       - name: Build app bundles and upload to draft release
         id: tauri
         uses: tauri-apps/tauri-action@v0
@@ -423,17 +426,45 @@ jobs:
           esac
 
   # ---------------------------------------------------------------------------
-  # publish-release: flip the draft to published once the build matrix finishes.
-  # Every target is required, so `build` succeeds — and this job runs — only when
-  # all four built and uploaded. If ANY leg fails (Windows included), `build`
-  # fails, this job is skipped, and the release stays a draft rather than being
-  # published with a platform's installer missing.
+  # publish-release: rebuild latest.json, then flip the draft to published once
+  # the build matrix finishes. Every target is required, so `build` succeeds —
+  # and this job runs — only when all four built and uploaded. If ANY leg fails
+  # (Windows included), `build` fails, this job is skipped, and the release stays
+  # a draft rather than being published with a platform's installer missing.
+  #
+  # Why latest.json is rebuilt here: each build leg's tauri-action step MERGES
+  # its own platform into the shared latest.json asset on the draft release — a
+  # read-modify-write with no locking. When two legs finish within the same
+  # window they both read the same manifest and the later upload wins, dropping
+  # the other's entries. That is exactly what happened in v0.2.0: the Linux and
+  # Apple Silicon legs landed a minute apart and the published latest.json had
+  # no darwin-aarch64 / darwin-aarch64-app keys, so Apple Silicon users were
+  # never offered the update. Rebuilding the manifest from the release's signed
+  # .sig assets after ALL legs have uploaded makes a single writer produce a
+  # deterministic, complete manifest — and the script throws (failing the job,
+  # leaving the release a draft) if any required platform is missing.
   # ---------------------------------------------------------------------------
   publish-release:
     needs: [gate, create-release, build]
     if: needs.gate.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Rebuild latest.json from signed assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: node scripts/build-latest-json.mjs
+
       - name: Publish (undraft) the release
         uses: actions/github-script@v7
         env:

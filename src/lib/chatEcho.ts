@@ -32,15 +32,18 @@ export function optimisticUserMessage(
 }
 
 /** Merge a backend chat-message event into the transcript:
- *  - a real id already present → ignore (a re-fired echo);
+ *  - a real id already present → replace it in place (the backend re-emits the
+ *    same id when a message's content changes, e.g. a question gets answered);
  *  - a pending user message with the same content → replace it in place;
  *  - otherwise → append. */
 export function reconcile(
   transcript: TranscriptEntry[],
   incoming: ChatMessage,
 ): TranscriptEntry[] {
-  if (transcript.some((m) => !isPending(m) && m.id === incoming.id)) {
-    return transcript;
+  const existing = transcript.findIndex((m) => !isPending(m) && m.id === incoming.id);
+  if (existing >= 0) {
+    if (transcript[existing].content === incoming.content) return transcript;
+    return transcript.toSpliced(existing, 1, incoming);
   }
   if (incoming.role === "user") {
     const i = transcript.findIndex(

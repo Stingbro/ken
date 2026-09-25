@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  closeAll,
   closeOthers,
+  closeRight,
   closeTab,
   makePersistent,
   openTab,
@@ -72,6 +74,63 @@ describe("tab reducers", () => {
     s = closeOthers(s, "c.md");
     expect(s.tabs.map((t) => t.path).sort()).toEqual(["a.md", "c.md"]);
     expect(s.active).toBe("c.md");
+  });
+
+  it("close to the right leaves the target and everything before it", () => {
+    let s = openTab(empty, "a.md", true);
+    s = openTab(s, "b.md", true);
+    s = openTab(s, "c.md", true);
+    s = openTab(s, "d.md", true);
+    s = closeRight(s, "b.md");
+    expect(s.tabs.map((t) => t.path)).toEqual(["a.md", "b.md"]);
+    // The active tab was closed, so the target takes over.
+    expect(s.active).toBe("b.md");
+  });
+
+  it("close to the right spares pinned tabs and keeps a surviving active", () => {
+    let s = openTab(empty, "a.md", true);
+    s = openTab(s, "b.md", true);
+    s = openTab(s, "c.md", true);
+    s = setPinned(s, "c.md", true); // pinned tabs move leftmost
+    s = { ...s, active: "c.md" };
+    s = closeRight(s, "a.md");
+    expect(s.tabs.map((t) => t.path)).toEqual(["c.md", "a.md"]);
+    expect(s.active).toBe("c.md");
+  });
+
+  it("close to the right is a no-op for the last tab and for unknown paths", () => {
+    let s = openTab(empty, "a.md", true);
+    s = openTab(s, "b.md", true);
+    expect(closeRight(s, "b.md")).toEqual(s);
+    expect(closeRight(s, "gone.md")).toBe(s);
+  });
+
+  it("close all clears everything but pinned tabs", () => {
+    let s = openTab(empty, "a.md", true);
+    s = openTab(s, "b.md", true);
+    s = openTab(s, "c.md", true);
+    s = closeAll(s);
+    expect(s.tabs).toEqual([]);
+    expect(s.active).toBe(null);
+
+    let p = openTab(empty, "a.md", true);
+    p = openTab(p, "b.md", true);
+    p = setPinned(p, "a.md", true);
+    p = { ...p, active: "b.md" };
+    p = closeAll(p);
+    expect(p.tabs.map((t) => t.path)).toEqual(["a.md"]);
+    expect(p.active).toBe("a.md");
+  });
+
+  it("close all keeps the active tab when it is pinned", () => {
+    let s = openTab(empty, "a.md", true);
+    s = openTab(s, "b.md", true);
+    s = setPinned(s, "a.md", true);
+    s = setPinned(s, "b.md", true);
+    s = { ...s, active: "b.md" };
+    s = closeAll(s);
+    expect(s.tabs.map((t) => t.path)).toEqual(["a.md", "b.md"]);
+    expect(s.active).toBe("b.md");
   });
 
   it("rewrites a tab path and active on move", () => {

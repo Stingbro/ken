@@ -33,14 +33,25 @@ export function validateName(name: string, siblings: Iterable<string>): string |
   return null;
 }
 
-/** The prefilled name for a new document: "Untitled.md", counting up past
- *  collisions ("Untitled 2.md", …) so the default is already committable.
- *  Mirrors ken-core fsops::numbered_name, which the backend applies again. */
-export function dedupedDocName(siblings: Iterable<string>): string {
+/** "Untitled<ext>", counting up past collisions ("Untitled 2<ext>", …) so the
+ *  prefilled default is already committable. Mirrors ken-core
+ *  fsops::numbered_name, which the backend applies again. */
+function dedupedUntitled(siblings: Iterable<string>, ext: string): string {
   const taken = new Set([...siblings].map((s) => s.toLowerCase()));
-  if (!taken.has("untitled.md")) return "Untitled.md";
+  if (!taken.has(`untitled${ext}`.toLowerCase())) return `Untitled${ext}`;
   for (let n = 2; ; n++) {
-    const candidate = `Untitled ${n}.md`;
+    const candidate = `Untitled ${n}${ext}`;
     if (!taken.has(candidate.toLowerCase())) return candidate;
   }
+}
+
+/** The prefilled name for a new document: "Untitled.md", "Untitled 2.md", … */
+export function dedupedDocName(siblings: Iterable<string>): string {
+  return dedupedUntitled(siblings, ".md");
+}
+
+/** The prefilled name for a new link (a .url internet shortcut):
+ *  "Untitled.url", "Untitled 2.url", … */
+export function dedupedLinkName(siblings: Iterable<string>): string {
+  return dedupedUntitled(siblings, ".url");
 }

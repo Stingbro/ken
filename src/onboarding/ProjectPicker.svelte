@@ -15,8 +15,8 @@
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
-  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import ConfirmMenu, { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import SetupFlow from "./SetupFlow.svelte";
 
   let error = $state<string | null>(null);
@@ -501,9 +501,6 @@
     {/if}
   </div>
 </div>
-
-<ContextMenu />
-<ConfirmMenu />
 
 <style>
   .wrap {

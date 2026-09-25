@@ -10,6 +10,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[lints]
+workspace = true
+
 [dependencies]
 ken-core = { path = "../crates/ken-core" }
 # `tray-icon` keeps Ken resident when its window is closed: the file

@@ -941,6 +941,19 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                             created_at: now,
                         });
                     }
+                    ChatUpdate::Question { chat_id, payload } => {
+                        let id = db
+                            .append_chat_message(&chat_id, "question", &payload, now)
+                            .unwrap_or(0);
+                        let _ = db.touch_chat(&chat_id, now);
+                        let _ = chat_app.emit("chat-message", ChatMessage {
+                            id,
+                            chat_id,
+                            role: "question".into(),
+                            content: payload,
+                            created_at: now,
+                        });
+                    }
                     ChatUpdate::Status { chat_id, status, detail } => {
                         let _ = db.set_chat_field(&chat_id, ChatField::Status, &status);
                         if let Some(d) = detail {
@@ -1188,13 +1201,17 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     // per generation, merging each delta into the Map/Timeline model and
     // emitting a throttled `knowledge-updated` after each merged file. When the
     // local model isn't ready it idles quietly (the Map shows a plain notice).
-    let worker_app = app.clone();
-    let worker_state = state.clone();
-    let worker_id = project.config.id;
-    let worker_stop = stop.clone();
-    std::thread::spawn(move || {
-        extraction_worker(worker_app, worker_state, worker_id, worker_stop);
-    });
+    // Paused behind `KNOWLEDGE_EXTRACTION_ENABLED` (see its doc comment): the
+    // `stop` plumbing above stays wired either way, so nothing else changes.
+    if KNOWLEDGE_EXTRACTION_ENABLED {
+        let worker_app = app.clone();
+        let worker_state = state.clone();
+        let worker_id = project.config.id;
+        let worker_stop = stop.clone();
+        std::thread::spawn(move || {
+            extraction_worker(worker_app, worker_state, worker_id, worker_stop);
+        });
+    }
 
     // One background OCR worker per open project: drains `ocr_pending`, runs
     // Vision on images/scanned PDFs, and merges the recognized text into the
@@ -1225,6 +1242,20 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
 
     Ok(info)
 }
+
+/// Master switch for the per-project knowledge extraction worker — the
+/// background pass that runs the local LLM over every indexed file and feeds
+/// the Map and Timeline screens.
+///
+/// Off for now: that worker drives llama.cpp on the GPU once per file, so an
+/// otherwise idle Ken keeps the GPU busy and the fans spinning while it chews
+/// through a project.
+///
+/// Re-enabling is a one-line flip: queue rows stay `pending` in the DB when
+/// the worker never starts, so setting this back to `true` resumes exactly
+/// where it left off. Also re-add the `map` and `timeline` entries to
+/// `src/shell/NavRail.svelte` (the screens themselves were left in place).
+const KNOWLEDGE_EXTRACTION_ENABLED: bool = false;
 
 /// How often the background hydration worker wakes to look for cloud-only
 /// documents to pull down. Long on purpose: this is opportunistic work that
@@ -3490,19 +3521,14 @@ async fn hydrate_file(
     Ok(())
 }
 
-#[tauri::command]
-fn save_file(
-    app: AppHandle,
-    state: State<SharedState>,
-    rel_path: String,
-    content: String,
-) -> CmdResult<i64> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    let abs = active.project.resolve(&rel_path).map_err(err)?;
-    std::fs::write(&abs, &content).map_err(err)?;
+/// Post-write bookkeeping shared by `save_file` and `save_file_bytes`: reindex
+/// the file, mark the version as seen, notify the frontend, return the mtime.
+/// Assumes the bytes are already on disk at `rel_path`.
+fn finish_save(app: &AppHandle, guard: &mut AppState, rel_path: &str) -> CmdResult<i64> {
+    let active = member_mut(guard, None)?;
+    let abs = active.project.resolve(rel_path).map_err(err)?;
     // Index immediately — no need to wait for the watcher debounce.
-    scan::refresh_path(&active.project, &mut active.db, &rel_path).map_err(err)?;
+    scan::refresh_path(&active.project, &mut active.db, rel_path).map_err(err)?;
     let mtime = abs
         .metadata()
         .and_then(|m| m.modified())
@@ -3517,19 +3543,50 @@ fn save_file(
     // `guard.base_dir` (its mutable borrow through `active` must end first).
     let seen_version = active
         .db
-        .get_file(&rel_path)
+        .get_file(rel_path)
         .map_err(err)?
         .map(|r| (r.size, r.mtime));
     let project_id = active.project.config.id;
     if let Some(version) = seen_version {
         let base = guard.base_dir.clone();
         let mut us = UserState::load(&base, project_id);
-        if us.mark_seen(&rel_path, version) {
+        if us.mark_seen(rel_path, version) {
             let _ = us.save(&base, project_id);
         }
     }
-    let _ = app.emit("file-saved", &rel_path);
+    let _ = app.emit("file-saved", rel_path);
     Ok(mtime)
+}
+
+#[tauri::command]
+fn save_file(
+    app: AppHandle,
+    state: State<SharedState>,
+    rel_path: String,
+    content: String,
+) -> CmdResult<i64> {
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, None)?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    std::fs::write(&abs, &content).map_err(err)?;
+    finish_save(&app, &mut guard, &rel_path)
+}
+
+/// Overwrite a file with raw bytes. Used by the PDF form filler: `bytes` is the
+/// WHOLE file, not a patch — the caller hands over a fully re-serialized
+/// document. Otherwise identical to `save_file`.
+#[tauri::command]
+fn save_file_bytes(
+    app: AppHandle,
+    state: State<SharedState>,
+    rel_path: String,
+    bytes: Vec<u8>,
+) -> CmdResult<i64> {
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, None)?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    std::fs::write(&abs, &bytes).map_err(err)?;
+    finish_save(&app, &mut guard, &rel_path)
 }
 
 #[tauri::command]
@@ -3973,6 +4030,33 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_path(abs.to_string_lossy(), None::<&str>)
+        .map_err(err)
+}
+
+/// Show a file in Finder/Explorer (selected, not opened). Same shape as
+/// `open_external`: the path is resolved against the project root here so the
+/// frontend never handles an absolute path.
+#[tauri::command]
+fn reveal_in_folder(state: State<SharedState>, app: AppHandle, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .reveal_item_in_dir(abs)
+        .map_err(err)
+}
+
+/// Open a web link in the system browser (e.g. the target of a `.url` file).
+/// Routed through Rust like `record_open_settings`, so validate the scheme
+/// server-side: only http(s) may open — never `file:` or an app scheme that
+/// would launch something local from indexed content.
+#[tauri::command]
+fn open_web_url(app: AppHandle, url: String) -> CmdResult<()> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("refused to open a non-web URL".into());
+    }
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_url(url, None::<&str>)
         .map_err(err)
 }
 
@@ -4627,12 +4711,30 @@ fn finish_recording(
 #[cfg(unix)]
 const EXDEV: i32 = 18;
 
+/// Reconcile the index after a folder (or file) has moved on disk: rewrite every
+/// row keyed by the old path prefix to the new one. A move changes no file's
+/// bytes, size or mtime, so there is nothing to re-read — `Db::rename_prefix`
+/// does the whole job in one SQL transaction (milliseconds, no file I/O),
+/// preserving extracted content, OCR regions and queue state instead of
+/// re-deriving them. Factored out of `move_file` so it's unit-testable without
+/// Tauri.
+fn reindex_moved(db: &mut Db, from_rel: &str, to_rel: &str) -> ken_core::Result<()> {
+    db.rename_prefix(from_rel, to_rel)?;
+    Ok(())
+}
+
 /// Move a file OR folder within the project. Both paths are validated to stay
 /// inside the project root (`resolve` rejects `..`/absolute escapes); overwriting
-/// an existing destination is refused. Folder moves (same-parent rename or a
-/// full move) rename the directory, then reconcile child index rows through the
-/// standard rescan — the same reconciliation the watcher does, but synchronous
-/// so the caller's tree refresh already sees it.
+/// an existing destination is refused.
+///
+/// A folder move (same-parent rename or a full move) renames the directory and
+/// then reconciles the index with `reindex_moved` — a prefix rewrite of the
+/// already-indexed rows. This used to be `remove_folder` + `scan::reindex`,
+/// which is a full `db.clear()` + re-walk + re-extract of the ENTIRE project:
+/// it froze the whole app (heavy work on the IPC thread while holding the global
+/// state mutex) and discarded every extraction, OCR result and transcript in the
+/// project just to rename a directory. The rewrite is pure SQL, so it is safe to
+/// keep synchronous; `index-updated` still fires so the UI refreshes.
 #[tauri::command]
 fn move_file(
     app: AppHandle,
@@ -4688,15 +4790,14 @@ fn move_file(
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
     if from_is_dir {
-        // Drop the old subtree's rows, then rescan so every child re-indexes at
-        // its new path (unchanged files elsewhere are skipped by the scanner).
-        active.db.remove_folder(&from_rel).map_err(err)?;
+        // Pure index bookkeeping: every child row moves to the new prefix with
+        // its content and queue state intact. No rescan, no re-extraction.
+        reindex_moved(&mut active.db, &from_rel, &to_rel).map_err(err)?;
         let project_id = active.project.config.id;
-        let stats = scan::reindex(&active.project, &mut active.db).map_err(err)?;
-        let videos = stats.videos_needing_transcript.clone();
         drop(guard);
-        enqueue_transcriptions(&app, state.inner(), project_id, &videos);
-        emit_member(&app, project_id, "index-updated", stats);
+        // Nothing was re-read, so there are no fresh stats and no new
+        // transcription work — just tell the UI the index moved.
+        emit_member(&app, project_id, "index-updated", ScanStats::default());
     } else {
         scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
         scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
@@ -4719,17 +4820,67 @@ fn deindex_removed(project: &Project, db: &mut Db, rel: &str, is_dir: bool) -> k
     Ok(())
 }
 
+/// Move one path to the OS trash. The single place the app talks to the OS
+/// trash, so every caller gets the same delete method and the same phrasing.
+///
+/// On macOS the `trash` crate defaults to `DeleteMethod::Finder`, which drives
+/// Finder over `osascript`. That has two problems here: it blocks on Finder
+/// (seconds, and forever if Finder is busy or not running), and Finder REFUSES
+/// to trash a folder holding undownloaded iCloud placeholders — it insists the
+/// item "needs to be downloaded" first. `DeleteMethod::NsFileManager` calls
+/// `-[NSFileManager trashItemAtURL:…]` instead: no Finder dependency, no
+/// AppleScript round trip, and dataless items move as-is without being
+/// hydrated first (which is the whole point — you shouldn't have to download a
+/// 50 GB folder to throw it away). The trade-off is that Finder's "Put Back"
+/// may not be offered for these items on some macOS versions; the files are
+/// still in the Trash and can be dragged out.
+///
+/// Every other platform keeps the crate's default behaviour.
+fn trash_path(abs: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::new();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(abs).map_err(trash_err)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(abs).map_err(trash_err)
+    }
+}
+
+/// Readable phrasing for a failed trash. The crate's `Error::Unknown` carries
+/// the raw OS text (an `NSError` debug string on macOS), which is noise in a
+/// toast, so name the action and keep the cause on the end for support.
+fn trash_err(e: trash::Error) -> String {
+    match e {
+        trash::Error::CouldNotAccess { target } => {
+            format!("Couldn't move \u{201c}{target}\u{201d} to the trash — it may have already been removed.")
+        }
+        other => format!("Couldn't move that to the trash. {other}"),
+    }
+}
+
 /// Move a file OR folder to the OS trash (recoverable — it lands in Finder's
 /// Trash / the Recycle Bin, not an unlink). The path is validated to stay inside
 /// the project root (`resolve` rejects `..`/absolute escapes). After the trash
 /// succeeds the index is reconciled via `deindex_removed` and the tree refreshes.
+///
+/// The trash call itself runs on a blocking thread with no lock held: even the
+/// fast path touches the filesystem for every item in a folder tree, and on a
+/// cloud-backed folder that is far from instant. Doing it inline froze the
+/// whole UI (every other IPC command queues behind it) for as long as the OS
+/// took. The state lock is taken twice — briefly, to read the path, and again
+/// after the await to reconcile the index — because a `State` borrow can't be
+/// held across an await point in a Tauri command.
 #[tauri::command]
-fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
-    let abs = {
-        let guard = state.lock().unwrap();
-        let active = member(&guard, None)?;
-        active.project.resolve(&rel_path).map_err(err)?
-    };
+async fn delete_file(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    rel_path: String,
+) -> CmdResult<()> {
+    let abs = resolve_path(&state, &rel_path)?;
 
     let is_dir = abs.is_dir();
     if !abs.is_file() && !is_dir {
@@ -4737,7 +4888,7 @@ fn delete_file(app: AppHandle, state: State<SharedState>, rel_path: String) -> C
     }
 
     // Recoverable delete: hand the path to the OS trash rather than unlinking it.
-    trash::delete(&abs).map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || trash_path(&abs)).await.map_err(err)??;
 
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
@@ -6320,6 +6471,20 @@ fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     };
     let (base, id, mut us) = load_user_state(&guard)?;
     if us.mark_seen(rel_path, (row.size, row.mtime)) {
+        us.save(&base, id).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Mark every indexed file under one folder seen ("Mark folder as viewed").
+/// `rel_path` is the folder; files directly at that path or beneath it count.
+#[tauri::command]
+fn mark_seen_under(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    let files = active.db.list_files().map_err(err)?;
+    let (base, id, mut us) = load_user_state(&guard)?;
+    if us.mark_seen_under(&rel_path, &index_versions(&files)) {
         us.save(&base, id).map_err(err)?;
     }
     Ok(())
@@ -12529,6 +12694,72 @@ fn send_chat_message(
         .map_err(err)
 }
 
+/// Answer a pending AskUserQuestion card. `answers` is keyed by the exact
+/// question text; a multi-select answer is a comma-separated list of labels and
+/// a free-text "Other" answer is just the typed string.
+#[tauri::command]
+fn answer_chat_question(
+    app: AppHandle,
+    state: State<SharedState>,
+    chat_id: String,
+    message_id: i64,
+    answers: std::collections::HashMap<String, String>,
+) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    let engine_arc = active
+        .chat_engine
+        .as_ref()
+        .ok_or(ken_core::runner::MISSING_CLAUDE_HELP)?
+        .clone();
+
+    let msg = active
+        .chat_db
+        .lock()
+        .unwrap()
+        .chat_messages(&chat_id)
+        .map_err(err)?
+        .into_iter()
+        .find(|m| m.id == message_id)
+        .ok_or("question not found")?;
+    if msg.role != "question" {
+        return Err("that message is not a question".into());
+    }
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&msg.content).map_err(|e| format!("bad question payload: {e}"))?;
+    // A second answer would be written to a request the CLI already consumed.
+    if payload.get("answers").is_some_and(|a| !a.is_null()) {
+        return Err("this question has already been answered".into());
+    }
+    let request_id = payload["requestId"].as_str().unwrap_or_default().to_string();
+    let tool_use_id = payload["toolUseId"].as_str().unwrap_or_default().to_string();
+    let questions = payload["questions"].clone();
+    let answers = serde_json::to_value(&answers).map_err(err)?;
+
+    engine_arc
+        .answer_question(&chat_id, &request_id, &tool_use_id, questions, answers.clone())
+        .map_err(err)?;
+
+    let now = engine::now_epoch();
+    payload["answers"] = answers;
+    let content = payload.to_string();
+    let mut db = active.chat_db.lock().unwrap();
+    db.update_chat_message_content(message_id, &content).map_err(err)?;
+    let _ = app.emit("chat-message", ChatMessage {
+        id: message_id,
+        chat_id: chat_id.clone(),
+        role: "question".into(),
+        content,
+        created_at: msg.created_at,
+    });
+    let _ = db.set_chat_field(&chat_id, ChatField::Status, "working");
+    let _ = db.touch_chat(&chat_id, now);
+    if let Ok(Some(row)) = db.get_chat(&chat_id) {
+        let _ = app.emit("chat-updated", row);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn rename_chat(app: AppHandle, state: State<SharedState>, chat_id: String, title: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
@@ -14157,6 +14388,7 @@ pub fn run() {
             is_cloud_only,
             hydrate_file,
             save_file,
+            save_file_bytes,
             file_meta,
             extracted_text,
             get_ocr_regions,
@@ -14172,6 +14404,8 @@ pub fn run() {
             import_commit,
             import_cancel,
             open_external,
+            reveal_in_folder,
+            open_web_url,
             file_mtime,
             media_src,
             video_transcript,
@@ -14204,6 +14438,7 @@ pub fn run() {
             list_ignored,
             unread_files,
             mark_seen,
+            mark_seen_under,
             mark_all_seen,
             sync_status,
             set_sync_auto,
@@ -14251,6 +14486,7 @@ pub fn run() {
             chat_transcript,
             create_chat,
             send_chat_message,
+            answer_chat_question,
             rename_chat,
             set_chat_pinned,
             set_chat_model,
@@ -14388,7 +14624,7 @@ mod tests {
         assert!(db.get_file(rel).unwrap().is_some(), "file should be indexed");
 
         // Same two steps delete_file runs, minus the Tauri State plumbing.
-        trash::delete(&abs).unwrap();
+        trash_path(&abs).unwrap();
         deindex_removed(&project, &mut db, rel, false).unwrap();
 
         assert!(!abs.exists(), "file should be gone from disk (in the trash)");
@@ -14408,7 +14644,7 @@ mod tests {
         scan::refresh_path(&project, &mut db, child).unwrap();
         assert!(db.get_file(child).unwrap().is_some());
 
-        trash::delete(project.root.join("Meetings")).unwrap();
+        trash_path(&project.root.join("Meetings")).unwrap();
         deindex_removed(&project, &mut db, "Meetings", true).unwrap();
 
         assert!(!project.root.join("Meetings").exists());
@@ -14432,6 +14668,57 @@ mod tests {
         let lane = pipeline::resolve_lane(&pl, "doing").expect("lane resolves");
         let admission = pipeline::admit(&task, lane, &pl, &[], pipeline::EntryKind::Unblock);
         assert!(!matches!(admission, pipeline::Admission::Start), "unblock entry reached Start: {admission:?}");
+    }
+
+    /// Moving a folder must reconcile the index in place: rows appear at the new
+    /// paths with their content intact, nothing is left behind at the old paths,
+    /// and search still finds the text. The old implementation cleared the whole
+    /// DB and rescanned the project, which froze the app and threw away every
+    /// extraction/OCR/transcript in the project just to rename a directory.
+    #[test]
+    fn move_file_reindexes_a_folder_subtree_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = Project::create(dir.path(), "Fixture").unwrap();
+        let mut db = Db::open(&dir.path().join("idx"), project.config.id).unwrap();
+
+        std::fs::create_dir_all(project.root.join("Meetings/Q3")).unwrap();
+        std::fs::write(project.root.join("Meetings/kickoff.md"), "Kickoff notes zebra.").unwrap();
+        std::fs::write(project.root.join("Meetings/Q3/review.md"), "Review notes zebra.").unwrap();
+        // A sibling folder sharing the name as a string prefix must not move.
+        std::fs::create_dir_all(project.root.join("Meetings-old")).unwrap();
+        std::fs::write(project.root.join("Meetings-old/stale.md"), "Stale zebra.").unwrap();
+        for rel in ["Meetings/kickoff.md", "Meetings/Q3/review.md", "Meetings-old/stale.md"] {
+            scan::refresh_path(&project, &mut db, rel).unwrap();
+        }
+        let before = db.file_count().unwrap();
+
+        // Same two steps move_file runs for a folder, minus the Tauri plumbing.
+        std::fs::create_dir_all(project.root.join("Archive")).unwrap();
+        std::fs::rename(project.root.join("Meetings"), project.root.join("Archive/Meetings"))
+            .unwrap();
+        reindex_moved(&mut db, "Meetings", "Archive/Meetings").unwrap();
+
+        assert_eq!(db.file_count().unwrap(), before, "no rows dropped or re-created");
+        assert!(db.get_file("Meetings/kickoff.md").unwrap().is_none());
+        assert!(db.get_file("Meetings/Q3/review.md").unwrap().is_none());
+        let moved = db.get_file("Archive/Meetings/kickoff.md").unwrap().expect("moved row");
+        assert_eq!(moved.status, "indexed");
+        assert_eq!(
+            db.get_text("Archive/Meetings/kickoff.md").unwrap().as_deref(),
+            Some("Kickoff notes zebra.")
+        );
+        assert!(db.get_file("Archive/Meetings/Q3/review.md").unwrap().is_some());
+        assert!(db.get_file("Meetings-old/stale.md").unwrap().is_some(), "sibling untouched");
+
+        let paths: Vec<String> = db
+            .search("zebra", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.rel_path)
+            .collect();
+        assert!(paths.contains(&"Archive/Meetings/kickoff.md".to_string()), "got {paths:?}");
+        assert!(paths.contains(&"Archive/Meetings/Q3/review.md".to_string()), "got {paths:?}");
+        assert!(paths.contains(&"Meetings-old/stale.md".to_string()), "got {paths:?}");
     }
 }
 

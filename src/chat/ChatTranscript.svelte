@@ -2,6 +2,7 @@
   import { chats, SUGGESTED_PROMPTS } from "../lib/chats.svelte";
   import { app } from "../lib/app.svelte";
   import { isProjectLink, renderMarkdown } from "../lib/markdown";
+  import QuestionCard from "./QuestionCard.svelte";
 
   let scroller = $state<HTMLDivElement | null>(null);
 
@@ -50,6 +51,8 @@
       </div>
     {:else if msg.role === "activity"}
       <div class="activity mono">{msg.content}</div>
+    {:else if msg.role === "question"}
+      <QuestionCard {msg} />
     {:else}
       <div class="divider"><span>{msg.content}</span></div>
     {/if}

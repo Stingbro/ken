@@ -18,6 +18,7 @@
     type FamilyConnectionState,
   } from "../lib/api";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
+  import { whatsNew } from "../whats-new/whatsNew.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
@@ -1041,6 +1042,23 @@
     </div>
 
     <div class="card">
+      <div class="card-title">Files list</div>
+      <div class="row">
+        <label class="radio">
+          <input
+            type="checkbox"
+            checked={app.followOpen}
+            onchange={(e) => app.setFollowOpen(e.currentTarget.checked)}
+          />
+          Highlight the open file in the files list
+        </label>
+      </div>
+      <p class="note">
+        The folder tree follows and expands to whichever file is open.
+      </p>
+    </div>
+
+    <div class="card">
       <div class="card-title">Offline models</div>
       <p class="note">These run on your Mac — nothing you say or store leaves it.</p>
       {#if modelsLoading}
@@ -1190,6 +1208,19 @@
           <span class="mono small">cargo build -p ken-mcp</span>.
         </p>
       {/if}
+    </div>
+    </section>
+
+    <section class="group">
+      <div class="group-head">About</div>
+
+    <div class="card">
+      <div class="row">
+        <span class="about-version">Ken v{whatsNew.version}</span>
+        <button class="whats-new" onclick={() => whatsNew.show()}>
+          What's new in this version
+        </button>
+      </div>
     </div>
     </section>
 
@@ -1551,6 +1582,24 @@
   }
   .mcp-chip-btn:hover {
     border-color: var(--border-strong);
+  }
+  .about-version {
+    font-size: 13px;
+    color: var(--ink-secondary);
+  }
+  .whats-new {
+    margin-left: auto;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font-family: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .whats-new:hover {
+    text-decoration: underline;
   }
   .mcp-chip-action {
     display: inline-flex;

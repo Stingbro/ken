@@ -1,7 +1,15 @@
 <script lang="ts">
+  import ArrowRightToLine from "@lucide/svelte/icons/arrow-right-to-line";
+  import CircleX from "@lucide/svelte/icons/circle-x";
+  import Copy from "@lucide/svelte/icons/copy";
+  import CopyX from "@lucide/svelte/icons/copy-x";
+  import ExternalLink from "@lucide/svelte/icons/external-link";
+  import Eye from "@lucide/svelte/icons/eye";
+  import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Pin from "@lucide/svelte/icons/pin";
   import PinOff from "@lucide/svelte/icons/pin-off";
   import X from "@lucide/svelte/icons/x";
+  import { api } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { imports } from "../lib/imports.svelte";
   import {
@@ -29,6 +37,13 @@
     return path.split("/").pop() ?? path;
   }
 
+  // Pinned tabs survive "close to the right", so the item only earns its keep
+  // when there's an unpinned tab past this one.
+  function hasClosableRight(path: string): boolean {
+    const idx = app.fileTabs.findIndex((t) => t.path === path);
+    return idx >= 0 && app.fileTabs.slice(idx + 1).some((t) => !t.pinned);
+  }
+
   function tabMenu(e: MouseEvent, path: string, pinned: boolean) {
     e.preventDefault();
     const items: MenuEntry[] = [
@@ -36,11 +51,66 @@
         ? { label: "Unpin", icon: PinOff, onSelect: () => app.setTabPinned(path, false) }
         : { label: "Pin", icon: Pin, onSelect: () => app.setTabPinned(path, true) },
       "separator",
+      {
+        label: "Open in default app",
+        icon: ExternalLink,
+        onSelect: () => void api.openExternal(path),
+      },
+      {
+        label: "Open containing folder",
+        icon: FolderOpen,
+        onSelect: () => void api.revealInFolder(path),
+      },
+      { label: "Reveal in files", icon: Eye, onSelect: () => app.reveal(path) },
+      {
+        label: "Copy path",
+        icon: Copy,
+        onSelect: () => void navigator.clipboard.writeText(path),
+      },
+      "separator",
       { label: "Close", icon: X, onSelect: () => app.closeTab(path) },
-      { label: "Close others", onSelect: () => app.closeOtherTabs(path) },
+      { label: "Close others", icon: CopyX, onSelect: () => app.closeOtherTabs(path) },
+      {
+        label: "Close to the right",
+        icon: ArrowRightToLine,
+        disabled: !hasClosableRight(path),
+        onSelect: () => app.closeTabsToRight(path),
+      },
+      { label: "Close all", icon: CircleX, onSelect: () => app.closeAllTabs() },
     ];
     openContextMenu(e.clientX, e.clientY, items);
   }
+
+  // Tabs are narrow and elide long names, so a hover bubble spells out the file.
+  // It lives outside the tabstrip because that strip clips overflow-y.
+  let tip = $state<{ name: string; path: string; left: number; top: number } | null>(null);
+  let tipEl = $state<HTMLElement | null>(null);
+  let tipTimer: number | undefined;
+
+  function armTip(e: PointerEvent, path: string) {
+    const el = e.currentTarget as HTMLElement;
+    clearTimeout(tipTimer);
+    tipTimer = window.setTimeout(() => {
+      const r = el.getBoundingClientRect();
+      tip = { name: basename(path), path, left: r.left, top: r.bottom + 6 };
+    }, 500);
+  }
+
+  function hideTip() {
+    clearTimeout(tipTimer);
+    tip = null;
+  }
+
+  // Fixed positioning can overhang the viewport, and the bubble's real width
+  // isn't known until it renders, so clamp from the measured box.
+  $effect(() => {
+    const el = tipEl;
+    const left = tip?.left;
+    if (!el || left === undefined) return;
+    el.style.left = `${Math.max(8, Math.min(left, window.innerWidth - el.offsetWidth - 8))}px`;
+  });
+
+  $effect(() => () => clearTimeout(tipTimer));
 
   // Vertical wheel scrolls the strip horizontally when it overflows.
   function onWheel(e: WheelEvent) {
@@ -60,7 +130,7 @@
   <SidebarResizer width={sidebarWidth} {windowWidth} />
   <div class="content">
     {#if app.fileTabs.length > 0}
-      <div class="tabstrip" onwheel={onWheel}>
+      <div class="tabstrip" onwheel={onWheel} onscroll={hideTip}>
         {#each app.fileTabs as tab (tab.path)}
           <div
             class="tab"
@@ -70,16 +140,24 @@
             role="tab"
             tabindex="0"
             aria-selected={app.activeTab === tab.path}
-            title={tab.path}
-            onclick={() => app.activateTab(tab.path)}
+            onpointerenter={(e) => armTip(e, tab.path)}
+            onpointerleave={hideTip}
+            onclick={() => {
+              hideTip();
+              app.activateTab(tab.path);
+            }}
             ondblclick={() => app.makeTabPersistent(tab.path)}
             onauxclick={(e) => {
               if (e.button === 1) {
                 e.preventDefault();
+                hideTip();
                 app.closeTab(tab.path);
               }
             }}
-            oncontextmenu={(e) => tabMenu(e, tab.path, tab.pinned)}
+            oncontextmenu={(e) => {
+              hideTip();
+              tabMenu(e, tab.path, tab.pinned);
+            }}
             onkeydown={(e) => {
               if (e.key === "Enter" || e.key === " ") app.activateTab(tab.path);
             }}
@@ -96,6 +174,7 @@
               aria-label="Close tab"
               onclick={(e) => {
                 e.stopPropagation();
+                hideTip();
                 app.closeTab(tab.path);
               }}
             >
@@ -118,6 +197,18 @@
     {/if}
   </div>
 </div>
+
+{#if tip}
+  <div
+    class="tab-tip"
+    role="tooltip"
+    bind:this={tipEl}
+    style="left: {tip.left}px; top: {tip.top}px"
+  >
+    <span class="tip-name">{tip.name}</span>
+    <span class="tip-path">{tip.path}</span>
+  </div>
+{/if}
 
 {#if imports.staged}
   <ImportDialog staged={imports.staged} close={() => imports.close()} />
@@ -216,6 +307,32 @@
   .tab-close:hover {
     background: var(--border);
     color: var(--ink);
+  }
+  .tab-tip {
+    position: fixed;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    width: max-content;
+    max-width: 360px;
+    padding: 4px 8px;
+    background: var(--ink);
+    border-radius: 6px;
+    line-height: 1.35;
+    pointer-events: none;
+    z-index: 50;
+  }
+  .tip-name {
+    color: var(--surface);
+    font-size: 12px;
+    font-weight: 550;
+  }
+  /* The bubble is light-on-dark, so the muted line dims against the bubble's own
+     text rather than using --ink-tertiary, which would vanish into the fill. */
+  .tip-path {
+    color: color-mix(in srgb, var(--surface) 62%, transparent);
+    font-size: 11px;
+    overflow-wrap: anywhere;
   }
   .empty {
     flex: 1;

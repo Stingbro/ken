@@ -442,7 +442,9 @@ fn run_headless_streaming(
                 ParsedEvent::TurnResult { is_error } => {
                     *result_w.lock().unwrap() = Some(is_error);
                 }
-                ParsedEvent::Init | ParsedEvent::Other => {}
+                // Headless runs never enable the permission control channel,
+                // so a control request here is nothing to act on.
+                ParsedEvent::Init | ParsedEvent::ControlRequest { .. } | ParsedEvent::Other => {}
             }
         }
     });
@@ -504,7 +506,7 @@ pub mod test_support {
 
     /// Behaviours: complete | fail | hang | block | headless-fail |
     /// stream-die | stream-stall | stream-hang | stream-fail |
-    /// stream-die-plain — selected via a
+    /// stream-die-plain | ask-question — selected via a
     /// `behavior` file next to the script (per-tempdir, so parallel tests
     /// never race).
     pub fn write_fake_claude(dir: &Path, behavior: &str) -> PathBuf {
@@ -529,6 +531,7 @@ for ((i=0; i<${#args[@]}; i++)); do
     --input-format)
         [ "${args[$((i+1))]}" = "stream-json" ] && STREAM_INPUT=1; i=$((i+1));;
     --permission-mode) i=$((i+1));;
+    --permission-prompt-tool) i=$((i+1));;
     --output-format) OUTFMT="${args[$((i+1))]}"; i=$((i+1));;
     --verbose) ;;
     *) if [ -z "$PROMPT" ]; then PROMPT="${args[$i]}"; fi;;
@@ -551,6 +554,27 @@ if [ "$STREAM_INPUT" = "1" ]; then
     TEXT=$(printf '%s' "$line" | grep -o '"text":"[^"]*"' | head -1 | sed 's/^"text":"//;s/"$//')
     if printf '%s' "$TEXT" | grep -q usetool; then
       echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes/meeting.md"}}]},"session_id":"'"$SESSION"'"}'
+    fi
+    # AskUserQuestion round trip: tool_use + can_use_tool control_request, then
+    # block on the caller's control_response (recorded verbatim for assertions).
+    if [ "$BEHAVIOR" = "ask-question" ] && printf '%s' "$TEXT" | grep -q askq; then
+      echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","id":"toolu_fake1","input":{"questions":[{"question":"Favorite color?","header":"Color","options":[{"label":"Red","description":"warm"},{"label":"Blue","description":"cool"}],"multiSelect":false}]}}]},"session_id":"'"$SESSION"'"}'
+      echo '{"type":"control_request","request_id":"req-fake-1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","display_name":"AskUserQuestion","input":{"questions":[{"question":"Favorite color?","header":"Color","options":[{"label":"Red","description":"warm"},{"label":"Blue","description":"cool"}],"multiSelect":false}]},"tool_use_id":"toolu_fake1","requires_user_interaction":true}}'
+      read -r reply
+      printf '%s\n' "$reply" >> "$(dirname "$0")/control_response.txt"
+      echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_fake1","content":"answered"}]}}'
+      echo '{"type":"assistant","message":{"content":[{"type":"text","text":"you chose: done"}]},"session_id":"'"$SESSION"'"}'
+      echo '{"type":"result","subtype":"success","is_error":false,"session_id":"'"$SESSION"'"}'
+      continue
+    fi
+    # A non-AskUserQuestion permission request: the engine must auto-deny it and
+    # the turn still ends with a result.
+    if [ "$BEHAVIOR" = "ask-question" ] && printf '%s' "$TEXT" | grep -q askbash; then
+      echo '{"type":"control_request","request_id":"req-fake-2","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"ls"},"tool_use_id":"toolu_fake2"}}'
+      read -r reply
+      printf '%s\n' "$reply" >> "$(dirname "$0")/control_response.txt"
+      echo '{"type":"result","subtype":"success","is_error":false,"session_id":"'"$SESSION"'"}'
+      continue
     fi
     echo '{"type":"assistant","message":{"content":[{"type":"text","text":"echo: '"$TEXT"'"}]},"session_id":"'"$SESSION"'"}'
     echo '{"type":"result","subtype":"success","is_error":false,"session_id":"'"$SESSION"'"}'

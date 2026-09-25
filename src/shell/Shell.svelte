@@ -14,14 +14,28 @@
   import TimelineScreen from "../screens/TimelineScreen.svelte";
   import RecordScreen from "../screens/RecordScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
+  import WhatsNewDialog from "../whats-new/WhatsNewDialog.svelte";
+  import { whatsNew } from "../whats-new/whatsNew.svelte";
+  import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
 
+  // Map and Timeline are paused (see `KNOWLEDGE_EXTRACTION_ENABLED` in
+  // src-tauri/src/lib.rs), so they have no nav entry. Anything that still
+  // points at them — a restored screen, an older link — lands on Home rather
+  // than on a pane the user can't navigate away from.
+  $effect(() => {
+    if (app.screen === "map" || app.screen === "timeline") app.screen = "home";
+  });
 
   // Screens the user has actually opened this session (home is always live).
   const visited = new SvelteSet<string>();
   $effect(() => {
     if (app.screen !== "home") visited.add(app.screen);
   });
+
+  // The shell only renders with a project open, so the release notes never
+  // interrupt onboarding.
+  onMount(() => whatsNew.init());
 
   function onKeydown(e: KeyboardEvent) {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -80,6 +94,7 @@
   {#if app.searchOpen}
     <SearchOverlay />
   {/if}
+  <WhatsNewDialog />
 </div>
 
 <style>

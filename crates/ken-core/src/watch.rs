@@ -162,6 +162,7 @@ fn relevant_path(roots: &[PathBuf], abs: &std::path::Path) -> bool {
                     s.starts_with('.')
                         || crate::scan::is_junk_dir_name(s)
                         || crate::scan::is_office_lock_name(s)
+                        || crate::scan::is_backup_name(s)
                 })
             });
             if !has_excluded_component {

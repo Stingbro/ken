@@ -16,7 +16,7 @@
   import ScopePicker from "./ScopePicker.svelte";
   import { scope } from "../lib/scope.svelte";
   import RecentFiles from "./RecentFiles.svelte";
-  import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import Check from "@lucide/svelte/icons/check";
   import Copy from "@lucide/svelte/icons/copy";
   import BellOff from "@lucide/svelte/icons/bell-off";
@@ -309,8 +309,6 @@
 
   </div>
 </div>
-
-<ContextMenu />
 
 <style>
   .wrap {

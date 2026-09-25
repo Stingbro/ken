@@ -6,6 +6,7 @@
   import X from "@lucide/svelte/icons/x";
   import FilePlus from "@lucide/svelte/icons/file-plus";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
+  import Link from "@lucide/svelte/icons/link";
   import { app } from "../lib/app.svelte";
   import { imports } from "../lib/imports.svelte";
   import { isMarkAllEnabled, showUnreadFilter } from "./filesHeader";
@@ -14,8 +15,6 @@
     openContextMenu,
     type MenuEntry,
   } from "../lib/ui/ContextMenu.svelte";
-  import ContextMenu from "../lib/ui/ContextMenu.svelte";
-  import ConfirmMenu from "../lib/ui/ConfirmMenu.svelte";
   import { canDrop, drag } from "./dnd.svelte";
   import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
@@ -79,6 +78,11 @@
         label: "New folder",
         icon: FolderPlus,
         onSelect: () => treeEdit.beginCreate("new-folder", ""),
+      },
+      {
+        label: "New link",
+        icon: Link,
+        onSelect: () => treeEdit.beginCreate("new-link", ""),
       },
     ]);
   }
@@ -201,7 +205,7 @@
     ondragleave={onRootDragLeave}
     ondrop={onRootDrop}
   >
-    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === ""}
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-link" || treeEdit.mode === "new-folder") && treeEdit.target === ""}
       <InlineNameRow indent={8} />
     {/if}
     {#each tree as node (node.relPath)}
@@ -218,9 +222,6 @@
     {/if}
   </div>
 </div>
-
-<ContextMenu />
-<ConfirmMenu />
 
 <style>
   .tree {
