@@ -59,6 +59,11 @@ pub struct RegistryEntry {
     /// None means follow the kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<IndexState>,
+    /// What the repo is and how to use it, in a person's words (set at
+    /// set-up, first proposed from its README). Read by the first-wiki
+    /// draft so it knows what each source is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A repo's index state, set once for the whole repo: the three kenignore
@@ -172,6 +177,14 @@ pub fn index_of(root: &Path) -> (Vec<RepoKind>, Option<IndexState>) {
         .unwrap_or_default()
 }
 
+/// What a person said the repo at `root` is for, from the default registry.
+pub fn description_of(root: &Path) -> Option<String> {
+    default_base_dir()
+        .and_then(|base| Registry::load(&base))
+        .ok()
+        .and_then(|reg| reg.entry_at(root).and_then(|e| e.description.clone()))
+}
+
 /// [`Registry::kind_of`] against the registry in the default app-data
 /// directory. Empty when it cannot be read.
 pub fn kind_of(root: &Path) -> Vec<RepoKind> {
@@ -216,6 +229,7 @@ impl Registry {
                 kind: Vec::new(),
                 team: None,
                 index: None,
+                description: None,
             }),
         }
     }
@@ -241,6 +255,16 @@ impl Registry {
             return false;
         };
         entry.index = index.filter(|i| *i != IndexState::for_kind(&entry.kind));
+        true
+    }
+
+    /// Set what a repo is for, in a person's words; empty clears it.
+    pub fn set_description(&mut self, id: Uuid, description: &str) -> bool {
+        let Some(entry) = self.projects.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        let d = description.trim();
+        entry.description = (!d.is_empty()).then(|| d.to_string());
         true
     }
 

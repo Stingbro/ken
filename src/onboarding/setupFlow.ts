@@ -25,3 +25,19 @@ export function indexSummary(rows: SetupRepoRow[]): { entities: number; search: 
   }
   return out;
 }
+
+/** Rows for a fresh proposal, keeping what a person already changed on a
+ *  repo they had picked before (matched by folder). */
+export function mergeRows(old: SetupRepoRow[], fresh: SetupRepoRow[]): SetupRepoRow[] {
+  return fresh.map((r) => {
+    const was = old.find((o) => o.path && o.path === r.path);
+    return was
+      ? { ...r, include: was.include, kind: [...was.kind], team: was.team, index: was.index, description: was.description }
+      : { ...r, kind: [...r.kind], evidence: [...r.evidence] };
+  });
+}
+
+/** The team names the rows carry, once each, sorted. */
+export function suggestedTeams(rows: SetupRepoRow[]): string[] {
+  return [...new Set(rows.filter((r) => r.include && r.team).map((r) => r.team as string))].sort();
+}

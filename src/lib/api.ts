@@ -44,6 +44,10 @@ export interface SetupRepoRow {
   remote: string | null;
   existing: boolean;
   hasGit: boolean;
+  /** The repo's folder (always set when repos are picked one by one). */
+  path: string | null;
+  /** What it is for and how it is used; first proposed from its README. */
+  description: string;
 }
 
 /** Mirrors `setup::IgnoreRow`: one ignore line the scan would add. */
@@ -115,6 +119,8 @@ export interface RegistryEntryStatus {
   team?: string;
   /** Set only when a person chose other than what the kind implies. */
   index?: IndexState;
+  /** What the repo is for, in a person's words. */
+  description?: string;
 }
 
 export interface FileRow {
@@ -1763,6 +1769,15 @@ export const api = {
    *  ignore lines, then opens the workspace. */
   setupConfirm: (parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) =>
     invoke<WorkspaceOverview>("setup_confirm", { parent, name, rows, ignores }),
+  /** Set-up from repos picked one by one (a folder of repos stands for
+   *  each inside it). Reads only. */
+  setupProposeRepos: (paths: string[]) => invoke<SetupProposal>("setup_propose_repos", { paths }),
+  /** Confirm picked repos: a new workspace in Ken's app data, or (add) into
+   *  the open one. Opens it. */
+  setupConfirmRepos: (name: string, rows: SetupRepoRow[], add = false) =>
+    invoke<WorkspaceOverview>("setup_confirm_repos", { name, rows, add }),
+  setProjectDescription: (id: string, description: string) =>
+    invoke<RegistryEntryStatus[]>("set_project_description", { id, description }),
   /** Scan again: what moved since set-up. Never changes anything. */
   setupRescan: (parent: string) => invoke<SetupMoved[]>("setup_rescan", { parent }),
   /** Members + per-member status + counts for the currently open workspace. */

@@ -4,6 +4,7 @@
   // (a new folder, a new worktree, a repo gone) and changes nothing until a
   // person adds or skips it. Knowledge-layer step 4.
   import { onMount } from "svelte";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     api,
     memberLeaf,
@@ -48,6 +49,29 @@
   }
   async function setIndex(e: RegistryEntryStatus, index: IndexState) {
     entries = await api.setProjectIndex(e.id, index);
+  }
+  async function setDescription(e: RegistryEntryStatus, text: string) {
+    entries = await api.setProjectDescription(e.id, text);
+  }
+
+  /** Pick more repos into the open workspace, wherever they live; each joins
+   *  with what the scan proposes, and can be changed here after. */
+  async function addRepos() {
+    if (!app.workspace) return;
+    const chosen = await openDialog({ directory: true, multiple: true, title: "Pick repos to add" });
+    const list = Array.isArray(chosen) ? chosen : typeof chosen === "string" ? [chosen] : [];
+    if (list.length === 0) return;
+    busy = true;
+    error = null;
+    try {
+      const p = await api.setupProposeRepos(list);
+      await app.confirmSetupRepos(app.workspace.name, p.rows, true);
+      await load();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
   }
 
   async function scanAgain() {
@@ -139,10 +163,20 @@
         <span class="note">not in Ken's list yet</span>
       {/if}
     </div>
+    {#if entry}
+      <input
+        class="description"
+        placeholder="What is this repo for, and how is it used?"
+        value={entry.description ?? ""}
+        onchange={(e) => void setDescription(entry, e.currentTarget.value)}
+        aria-label="What {member.name} is for"
+      />
+    {/if}
   {/each}
 
   <div class="actions">
-    <button class="btn btn-ghost" disabled={busy} onclick={scanAgain}>{busy ? "Scanning…" : "Scan again"}</button>
+    <button class="btn btn-ghost" disabled={busy} onclick={addRepos}>Add repos…</button>
+    <button class="btn btn-ghost" disabled={busy} onclick={scanAgain}>{busy ? "Working…" : "Scan again"}</button>
   </div>
 
   {#if moved}
@@ -183,6 +217,15 @@
     gap: 8px;
     align-items: center;
     font-size: 12.5px;
+  }
+  .actions {
+    display: flex;
+    gap: 8px;
+  }
+  .description {
+    margin: -2px 0 6px;
+    font-size: 12px;
+    width: 100%;
   }
   .name {
     overflow: hidden;

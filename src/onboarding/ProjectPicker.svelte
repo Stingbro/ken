@@ -447,9 +447,9 @@
         <button class="choice" onclick={() => (setupOpen = true)}>
           <span class="choice-title">Set up Ken for your code</span>
           <span class="choice-note">
-            Point Ken at the folder your repos live in. It proposes teams, what
-            each repo is and how deep to read it; nothing is written until you
-            confirm.
+            Pick the repos Ken should know, wherever they live. It proposes what
+            each is, its team and how deep to read it; nothing is written until
+            you confirm.
           </span>
         </button>
         {#if app.workspaceFlagEnabled}

@@ -133,6 +133,11 @@ pub fn gather(repos: &[(String, PathBuf)], extra: Option<&Path>) -> Vec<Source> 
         }
     };
     for (name, root) in repos {
+        // What a person said this repo is for, at set-up: read first, so the
+        // draft knows how to use each source.
+        if let Some(d) = crate::registry::description_of(root) {
+            push(format!("{name}:(what this repo is for, in the team's words)"), d, &mut out);
+        }
         for f in ["README.md", "readme.md", "README", "CLAUDE.md", "START-HERE.md", "AGENTS.md", "CHANGELOG.md", "RELEASES.md"] {
             if let Some(t) = read_text(&root.join(f)) {
                 push(format!("{name}:{f}"), t, &mut out);
@@ -194,6 +199,7 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
          - Frontmatter: keep the template's keys; set `status: draft`; set `updated: {today}`; do NOT write a `verified:` line (a person verifies it later); list every source you used under `sources:` as its label.\n\
          - The first line under the title says: Drafted by Ken on {today} from the sources listed; not yet verified by a person.\n\
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
+         - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
          - Reply with the finished page only, in Markdown, starting with `---`. No preamble, no code fences around it.\n\n"
     );
     match template {

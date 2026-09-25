@@ -54,6 +54,14 @@ pub struct WorkspaceConfig {
     /// groups byte-identical to one written before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ProjectGroup>,
+    /// Where a member lives when it is not under the workspace root: member
+    /// name → absolute folder. Set when repos are picked one by one and the
+    /// workspace lives in Ken's app data (set-up, `setup::confirm_repos`);
+    /// empty for a workspace that sits in its repos' parent folder, whose
+    /// members resolve relative to it as before (D1). The member name stays
+    /// the short key everything else uses.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub paths: std::collections::BTreeMap<String, PathBuf>,
     /// Fields written by newer versions or other capabilities survive a
     /// round-trip through this one (same idiom as `ProjectConfig::extra`).
     #[serde(flatten)]
@@ -428,6 +436,7 @@ impl Workspace {
             id: Uuid::new_v4(),
             members: member_names.clone(),
             groups: Vec::new(),
+            paths: Default::default(),
             extra: serde_json::Map::new(),
         };
         let workspace = Workspace {
@@ -463,7 +472,7 @@ impl Workspace {
         let members = config
             .members
             .iter()
-            .map(|name| Self::resolve_member_tolerant(parent, name))
+            .map(|name| Self::resolve_member_tolerant(&member_root_in(parent, &config, name), name))
             .collect();
         Ok(Workspace {
             root: parent.to_path_buf(),
@@ -472,8 +481,8 @@ impl Workspace {
         })
     }
 
-    fn resolve_member_tolerant(parent: &Path, name: &str) -> Member {
-        let member_root = parent.join(name);
+    fn resolve_member_tolerant(member_root: &Path, name: &str) -> Member {
+        let member_root = member_root.to_path_buf();
         if !member_root.is_dir() {
             return Member {
                 name: name.to_string(),
@@ -492,6 +501,49 @@ impl Workspace {
         }
     }
 
+    /// The folder a member lives in: its entry in `paths`, else under the
+    /// workspace root.
+    pub fn member_root(&self, name: &str) -> PathBuf {
+        member_root_in(&self.root, &self.config, name)
+    }
+
+    /// A workspace whose members are repos anywhere, picked one by one: the
+    /// manifest lives at `root` (in Ken's app data) and each member is
+    /// `(name, absolute folder)`. Names are the short keys; they must be
+    /// unique and single-segment. Opens an existing manifest at `root`
+    /// instead, adding the members it lacks.
+    pub fn create_at(root: &Path, name: &str, members: &[(String, PathBuf)]) -> Result<Workspace> {
+        fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
+        let mut config = match Workspace::open(root) {
+            Ok(ws) => ws.config,
+            Err(_) => WorkspaceConfig {
+                name: project::normalize_name(name)?,
+                id: Uuid::new_v4(),
+                members: Vec::new(),
+                groups: Vec::new(),
+                paths: Default::default(),
+                extra: serde_json::Map::new(),
+            },
+        };
+        for (member, path) in members {
+            let member = validate_member_name(member)?;
+            if member.contains('/') {
+                return Err(Error::Other(format!("member name {member:?} must be one folder name")));
+            }
+            if !path.is_dir() {
+                return Err(Error::ProjectMissing(path.clone()));
+            }
+            Project::create(path, &member)?;
+            if !config.members.contains(&member) {
+                config.members.push(member.clone());
+            }
+            config.paths.insert(member, path.clone());
+        }
+        let ws = Workspace { root: root.to_path_buf(), config, members: Vec::new() };
+        ws.save()?;
+        Workspace::open(root)
+    }
+
     /// Write the manifest atomically (temp file + rename — see module docs
     /// for why this diverges from `Project::save`'s plain write).
     pub fn save(&self) -> Result<()> {
@@ -504,6 +556,10 @@ impl Workspace {
         fs::write(&tmp, json + "\n").map_err(|e| Error::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| Error::io(&path, e))
     }
+}
+
+fn member_root_in(root: &Path, config: &WorkspaceConfig, name: &str) -> PathBuf {
+    config.paths.get(name).cloned().unwrap_or_else(|| root.join(name))
 }
 
 /// One immediate subfolder of a prospective workspace parent, as surfaced
@@ -1163,6 +1219,7 @@ mod tests {
                 "SR/sr-docs".into(),
             ],
             groups: Vec::new(),
+            paths: Default::default(),
             extra: serde_json::Map::new(),
         };
         let derived = config.derived_groups();

@@ -2318,6 +2318,64 @@ fn setup_confirm(
     open_workspace_inner(&app, state.inner(), ws)
 }
 
+/// Set-up from repos picked one by one, wherever they are: a row per repo
+/// (a group folder stands for the repos in it). Reads only.
+#[tauri::command]
+async fn setup_propose_repos(state: State<'_, SharedState>, paths: Vec<String>) -> CmdResult<ken_core::setup::Proposal> {
+    // Names already in the open workspace, so an added repo gets its own.
+    let taken: Vec<String> = {
+        let guard = state.lock().unwrap();
+        guard.workspace.as_ref().map(|w| w.ws.config.members.clone()).unwrap_or_default()
+    };
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    tauri::async_runtime::spawn_blocking(move || ken_core::setup::propose_repos(&paths, &taken).map_err(err))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Confirm picked repos. With `add` false, a new workspace in Ken's app
+/// data (`workspaces/<id>`), switching the workspace feature on; with `add`
+/// true, into the open workspace. Then opens it so indexing starts.
+#[tauri::command]
+fn setup_confirm_repos(
+    app: AppHandle,
+    state: State<SharedState>,
+    name: String,
+    rows: Vec<ken_core::setup::RepoRow>,
+    add: bool,
+) -> CmdResult<WorkspaceOverviewDto> {
+    let (base, root) = {
+        let mut guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            let mut settings = guard.app_settings.clone();
+            settings.features.insert("workspace".into(), serde_json::Value::Bool(true));
+            settings.save(&guard.base_dir).map_err(err)?;
+            guard.app_settings = settings;
+        }
+        let root = if add {
+            guard.workspace.as_ref().ok_or("no workspace open to add to")?.ws.root.clone()
+        } else {
+            ken_core::setup::workspaces_dir(&guard.base_dir).join(uuid::Uuid::new_v4().to_string())
+        };
+        (guard.base_dir.clone(), root)
+    };
+    let ws = ken_core::setup::confirm_repos(&base, &root, &name, &rows).map_err(err)?;
+    open_workspace_inner(&app, state.inner(), ws)
+}
+
+/// Say what a repo is for, in a person's words; the first-wiki draft reads it.
+#[tauri::command]
+fn set_project_description(state: State<SharedState>, id: String, description: String) -> CmdResult<Vec<RegistryEntryStatus>> {
+    let guard = state.lock().unwrap();
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
+    let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
+    if !registry.set_description(uuid, &description) {
+        return Err(format!("no project with id {id}"));
+    }
+    registry.save(&guard.base_dir).map_err(err)?;
+    Ok(registry.statuses())
+}
+
 /// Scan again: what moved since set-up (new folders, gone members, new
 /// worktrees). Reports; never changes the set-up.
 #[tauri::command]
@@ -13988,6 +14046,9 @@ pub fn run() {
             setup_propose,
             setup_confirm,
             setup_rescan,
+            setup_propose_repos,
+            setup_confirm_repos,
+            set_project_description,
             ingest_status,
             ingest_now,
             ingest_undo,
