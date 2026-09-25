@@ -2,7 +2,18 @@
 import {
   api,
   type ChatRow,
+  type EditProposal,
 } from "./api";
+
+/** A stored edit message's proposal, or null when it is not one. */
+export function parseEditProposal(content: string): EditProposal | null {
+  try {
+    const p = JSON.parse(content) as EditProposal;
+    return typeof p.base === "string" && typeof p.proposed === "string" ? p : null;
+  } catch {
+    return null;
+  }
+}
 import {
   dropPending,
   nextTempId,
@@ -148,6 +159,54 @@ class ChatsStore {
       const j = this.transcript.findIndex((m) => m.id === messageId);
       if (j >= 0) this.transcript = this.transcript.toSpliced(j, 1, before);
       this.sendError = String(e);
+    }
+  }
+
+  /** Edits in the open chat still waiting for a decision, newest last. */
+  get pendingEdits(): { messageId: number; proposal: EditProposal }[] {
+    const out: { messageId: number; proposal: EditProposal }[] = [];
+    for (const m of this.transcript) {
+      if (m.role !== "edit") continue;
+      const p = parseEditProposal(m.content);
+      if (p && !p.decision) out.push({ messageId: m.id, proposal: p });
+    }
+    return out;
+  }
+
+  /** The waiting edit to a file, if any (the editor shows it over the page). */
+  pendingEditFor(relPath: string): { messageId: number; proposal: EditProposal } | null {
+    return this.pendingEdits.find((e) => e.proposal.relPath === relPath) ?? null;
+  }
+
+  /** Answer an edit: every change accepted, none, or some (Ken writes the
+   *  accepted ones and tells Claude which it left out). Flips the card at
+   *  once; the backend re-emits it with the decision it recorded. */
+  async answerEdit(
+    messageId: number,
+    decision: "accepted" | "declined" | "partial",
+    merged: string | null,
+    declinedChanges: string[],
+  ) {
+    if (!this.activeId) return;
+    this.sendError = null;
+    const chatId = this.activeId;
+    const i = this.transcript.findIndex((m) => m.id === messageId);
+    if (i < 0) return;
+    const before = this.transcript[i];
+    const p = parseEditProposal(before.content);
+    if (p) {
+      this.transcript = this.transcript.toSpliced(i, 1, {
+        ...before,
+        content: JSON.stringify({ ...p, decision }),
+      });
+    }
+    try {
+      await api.answerEditProposal(chatId, messageId, decision, merged, declinedChanges);
+    } catch (e) {
+      const j = this.transcript.findIndex((m) => m.id === messageId);
+      if (j >= 0) this.transcript = this.transcript.toSpliced(j, 1, before);
+      this.sendError = String(e);
+      throw e;
     }
   }
 

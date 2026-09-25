@@ -1,8 +1,11 @@
 <script lang="ts">
   import { chats, SUGGESTED_PROMPTS } from "../lib/chats.svelte";
   import { app } from "../lib/app.svelte";
-  import { isProjectLink, renderMarkdown } from "../lib/markdown";
+  import { renderMarkdown } from "../lib/markdown";
+  import { parseCitation } from "../lib/citation";
+  import { parseEditProposal } from "../lib/chats.svelte";
   import QuestionCard from "./QuestionCard.svelte";
+  import EditReview from "./EditReview.svelte";
 
   let scroller = $state<HTMLDivElement | null>(null);
 
@@ -18,14 +21,19 @@
     if (nearBottom) el.scrollTop = el.scrollHeight;
   });
 
-  function onClick(e: MouseEvent) {
-    // Project-relative links open in Files.
+  // A cited source opens in Files at its line or heading; a ken:// address
+  // focuses its workspace member first. Nothing opens unless clicked.
+  async function onClick(e: MouseEvent) {
     const a = (e.target as HTMLElement).closest("a");
-    if (a) {
-      e.preventDefault();
-      const href = a.getAttribute("href") ?? "";
-      if (isProjectLink(href)) app.openInFiles(href);
+    if (!a) return;
+    e.preventDefault();
+    const c = parseCitation(a.getAttribute("href") ?? "");
+    if (!c) return;
+    if (c.projectId && c.projectId !== app.focused) {
+      if (c.projectId === "workspace") return;
+      await app.focusMember(c.projectId);
     }
+    app.openAt(c.path, { line: c.line, anchor: c.anchor });
   }
 
   const working = $derived(chats.active?.status === "working");
@@ -53,6 +61,9 @@
       <div class="activity mono">{msg.content}</div>
     {:else if msg.role === "question"}
       <QuestionCard {msg} />
+    {:else if msg.role === "edit"}
+      {@const proposal = parseEditProposal(msg.content)}
+      {#if proposal}<div class="edit"><EditReview messageId={msg.id} {proposal} /></div>{/if}
     {:else}
       <div class="divider"><span>{msg.content}</span></div>
     {/if}
@@ -182,6 +193,9 @@
     line-height: 1.5;
     color: var(--ink-tertiary);
     padding-left: var(--gutter);
+  }
+  .edit {
+    margin-left: var(--gutter);
   }
   .divider {
     display: flex;

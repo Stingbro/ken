@@ -5,7 +5,8 @@
   import { ingests } from "../lib/ingests.svelte";
   import { review } from "../lib/review.svelte";
   import { digestMarkdown } from "../lib/assist";
-  import { isProjectLink, renderMarkdown } from "../lib/markdown";
+  import { renderMarkdown } from "../lib/markdown";
+  import { parseCitation } from "../lib/citation";
   import { homeRecents, recentlyOpened } from "../lib/recent";
   import HomeSearch from "./HomeSearch.svelte";
   import HomeStatus from "./HomeStatus.svelte";
@@ -68,8 +69,8 @@
     const a = (e.target as HTMLElement).closest("a");
     if (a) {
       e.preventDefault();
-      const href = a.getAttribute("href") ?? "";
-      if (isProjectLink(href)) app.openInFiles(href);
+      const c = parseCitation(a.getAttribute("href") ?? "");
+      if (c && !c.projectId) app.openAt(c.path, { line: c.line, anchor: c.anchor });
     }
   }
 

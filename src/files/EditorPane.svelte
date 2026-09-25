@@ -8,6 +8,8 @@
   import { api, type FileRow } from "../lib/api";
   import type { HydrationProgress } from "../lib/api";
   import { app, forFocused } from "../lib/app.svelte";
+  import { chats } from "../lib/chats.svelte";
+  import EditReview from "../chat/EditReview.svelte";
   import { find } from "../lib/find.svelte";
   import FindBar from "./FindBar.svelte";
   import { isEditable, timeAgo } from "../lib/format";
@@ -22,6 +24,11 @@
   import { isHtmlPath } from "./previews/html";
 
   let { relPath }: { relPath: string } = $props();
+
+  // An edit Claude proposed to this file in chat, shown over the page as a
+  // diff to accept or deny; and the place a clicked citation asked for.
+  const pendingEdit = $derived(chats.pendingEditFor(relPath));
+  const revealHere = $derived(app.revealAt?.path === relPath ? app.revealAt : null);
 
   // .csv/.tsv get the grid editor even though the backend kind is "code"
   // (csv) or "binary" (tsv). Routed by extension, ahead of the plain editor.
@@ -342,6 +349,12 @@
     </div>
   {/if}
 
+  {#if pendingEdit}
+    <div class="proposal">
+      <EditReview messageId={pendingEdit.messageId} proposal={pendingEdit.proposal} showOpen={false} />
+    </div>
+  {/if}
+
   {#if downloading}
     <PreviewLoading
       label="Downloading from the cloud"
@@ -409,9 +422,9 @@
           onchange={onEdit}
         />
       {:else if mode === "wysiwyg" && meta?.kind === "md"}
-        <MarkdownEditor initial={content} onchange={onEdit} />
+        <MarkdownEditor initial={content} onchange={onEdit} reveal={revealHere} />
       {:else}
-        <PlainEditor initial={content} onchange={onEdit} />
+        <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} />
       {/if}
     {/key}
   {:else if meta}
@@ -532,6 +545,12 @@
   }
   .sdot.dirty {
     background: var(--needs-input);
+  }
+  .proposal {
+    margin: 10px 16px 0;
+    max-height: 45vh;
+    overflow: auto;
+    flex: none;
   }
   .conflict {
     display: flex;

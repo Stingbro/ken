@@ -13,6 +13,8 @@ export function renderMarkdown(md: string): string {
       "tbody", "tr", "th", "td", "hr",
     ],
     ALLOWED_ATTR: ["href"],
+    // DOMPurify default URIs, plus ken:// so a cited source stays a link.
+    ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|ken):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
   });
 }
 

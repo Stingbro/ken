@@ -946,10 +946,21 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                             .append_chat_message(&chat_id, "question", &payload, now)
                             .unwrap_or(0);
                         let _ = db.touch_chat(&chat_id, now);
-                        let _ = chat_app.emit("chat-message", ChatMessage {
+                        emit_member(&chat_app, project_id, "chat-message", ChatMessage {
                             id,
                             chat_id,
                             role: "question".into(),
+                            content: payload,
+                            created_at: now,
+                        });
+                    }
+                    ChatUpdate::EditProposal { chat_id, payload } => {
+                        let id = db.append_chat_message(&chat_id, "edit", &payload, now).unwrap_or(0);
+                        let _ = db.touch_chat(&chat_id, now);
+                        emit_member(&chat_app, project_id, "chat-message", ChatMessage {
+                            id,
+                            chat_id,
+                            role: "edit".into(),
                             content: payload,
                             created_at: now,
                         });
@@ -12697,6 +12708,97 @@ fn send_chat_message(
 /// Answer a pending AskUserQuestion card. `answers` is keyed by the exact
 /// question text; a multi-select answer is a comma-separated list of labels and
 /// a free-text "Other" answer is just the typed string.
+/// Answer an edit Claude proposed in chat, after the person read its diff.
+/// `decision` is `accepted` (the CLI makes the edit as asked), `declined`
+/// (nothing is written), or `partial`: Ken writes `merged` (the file with only
+/// the accepted changes) itself, and Claude is told which changes, listed in
+/// `declined_changes`, were left out. A partial write refuses a file that
+/// changed since the proposal.
+#[tauri::command]
+fn answer_edit_proposal(
+    app: AppHandle,
+    state: State<SharedState>,
+    chat_id: String,
+    message_id: i64,
+    decision: String,
+    merged: Option<String>,
+    declined_changes: Vec<String>,
+) -> CmdResult<()> {
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, None)?;
+    let engine_arc = active.chat_engine.as_ref().ok_or(ken_core::runner::MISSING_CLAUDE_HELP)?.clone();
+    let msg = active
+        .chat_db
+        .lock()
+        .unwrap()
+        .chat_messages(&chat_id)
+        .map_err(err)?
+        .into_iter()
+        .find(|m| m.id == message_id)
+        .ok_or("edit not found")?;
+    if msg.role != "edit" {
+        return Err("that message is not an edit".into());
+    }
+    let mut proposal: ken_core::chat::EditProposal =
+        serde_json::from_str(&msg.content).map_err(|e| format!("bad edit payload: {e}"))?;
+    if proposal.decision.is_some() {
+        return Err("this edit has already been answered".into());
+    }
+    let file = proposal.rel_path.clone().unwrap_or_else(|| proposal.path.clone());
+    let list = |v: &[String]| v.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
+    let (allow, note) = match decision.as_str() {
+        "accepted" => (true, format!("The person accepted every change to {file}.")),
+        "declined" => (
+            false,
+            format!("The person reviewed your edit to {file} and declined it; nothing was written. Do not retry it unless they ask."),
+        ),
+        "partial" => {
+            let merged = merged.ok_or("a partial accept needs the merged text")?;
+            let on_disk = std::fs::read_to_string(&proposal.path).unwrap_or_default();
+            if on_disk.replace("\r\n", "\n") != proposal.base.replace("\r\n", "\n") {
+                return Err(format!("{file} changed after Claude proposed this edit; decline it and ask again."));
+            }
+            std::fs::write(&proposal.path, &merged).map_err(err)?;
+            if let Some(rel) = &proposal.rel_path {
+                let _ = scan::refresh_path(&active.project, &mut active.db, rel);
+            }
+            (
+                false,
+                format!(
+                    "The person reviewed your edit to {file} change by change. Ken wrote the changes they accepted and left out these:\n{}\nThe file now holds the accepted version: read it again before editing it further, and do not retry the declined changes unless they ask.",
+                    list(&declined_changes)
+                ),
+            )
+        }
+        other => return Err(format!("unknown decision {other}")),
+    };
+    engine_arc.answer_edit(&chat_id, &proposal, allow, &note).map_err(err)?;
+
+    proposal.decision = Some(decision);
+    proposal.note = Some(note);
+    let content = serde_json::to_string(&proposal).map_err(err)?;
+    let project_id = active.project.config.id;
+    let now = engine::now_epoch();
+    let mut db = active.chat_db.lock().unwrap();
+    db.update_chat_message_content(message_id, &content).map_err(err)?;
+    emit_member(&app, project_id, "chat-message", ChatMessage {
+        id: message_id,
+        chat_id: chat_id.clone(),
+        role: "edit".into(),
+        content,
+        created_at: msg.created_at,
+    });
+    let _ = db.set_chat_field(&chat_id, ChatField::Status, "working");
+    let _ = db.touch_chat(&chat_id, now);
+    if let Ok(Some(row)) = db.get_chat(&chat_id) {
+        let _ = app.emit("chat-updated", row);
+    }
+    if let Some(rel) = proposal.rel_path {
+        emit_member(&app, project_id, "index-updated", ScanStats { changed_paths: vec![rel], ..Default::default() });
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn answer_chat_question(
     app: AppHandle,
@@ -14487,6 +14589,7 @@ pub fn run() {
             create_chat,
             send_chat_message,
             answer_chat_question,
+            answer_edit_proposal,
             rename_chat,
             set_chat_pinned,
             set_chat_model,

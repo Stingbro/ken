@@ -26,6 +26,9 @@ pub enum ChatUpdate {
     /// the UI and the answer command share:
     /// `{"requestId":…,"toolUseId":…,"questions":[…]}`.
     Question { chat_id: String, payload: String },
+    /// Claude wants to edit a file: an [`EditProposal`] as JSON, for the
+    /// user to accept or decline change by change. The CLI waits.
+    EditProposal { chat_id: String, payload: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +135,97 @@ fn summarize_tool(block: &Value) -> String {
         }
         None => name.to_string(),
     }
+}
+
+/// Tools whose permission request is an edit for the user to review as a
+/// diff, accepting or declining each change, instead of a write that just
+/// happens.
+pub const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
+
+/// What every chat session is told about working inside Ken, appended to
+/// Claude Code's own system prompt.
+pub const KEN_GUIDE: &str = "You are working inside Ken, a desktop app where a person reads and edits their team's \
+wiki, docs and code. Two rules for this app:\n\
+1. Edits are reviewed. Every Edit, MultiEdit or Write you make is shown to the person as a diff, and they accept or \
+decline each change. If they decline some, the tool result says which; read the file again before editing it further, \
+and do not retry a declined change unless they ask.\n\
+2. Cite your sources so they can click them. Every fact that comes from a file gets a Markdown link to that file, \
+project-relative, with the line when you know it: [Save.md, line 12](Platform/Save.md#L12), or a heading: \
+[Save format](Platform/Save.md#save-format). A hit from Ken's search tools that carries a ken:// address is linked \
+by that address, with #L<line> when it has a line. Never open files or switch the person's screen yourself; a link \
+is how they go there.";
+
+/// An edit Claude asked to make, worked out against the file as it is now,
+/// for the user to review: the text before and the text after.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditProposal {
+    pub request_id: String,
+    pub tool_use_id: String,
+    pub tool: String,
+    /// The file, absolute, as the tool named it.
+    pub path: String,
+    /// Relative to the project, when inside it.
+    pub rel_path: Option<String>,
+    pub base: String,
+    pub proposed: String,
+    /// The tool's own input, sent back unchanged when every change is accepted.
+    pub input: Value,
+    /// `accepted` · `declined` · `partial`, once decided.
+    #[serde(default)]
+    pub decision: Option<String>,
+    /// What the decision told Claude, once decided.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+fn replace_once(text: &str, old: &str, new: &str, all: bool) -> std::result::Result<String, String> {
+    if old.is_empty() {
+        return Err("the text to replace is empty".into());
+    }
+    let n = text.matches(old).count();
+    match (n, all) {
+        (0, _) => Err("the text to replace is not in the file".into()),
+        (1, _) | (_, true) => Ok(if all { text.replace(old, new) } else { text.replacen(old, new, 1) }),
+        (n, false) => Err(format!("the text to replace appears {n} times; it must be unique")),
+    }
+}
+
+/// Work out an edit tool's result against the file on disk: the text before
+/// and after. `Err` says why it cannot apply (the CLI would fail it too).
+pub fn propose_edit(project_root: &Path, tool: &str, input: &Value) -> std::result::Result<(String, Option<String>, String, String), String> {
+    let path = input.get("file_path").and_then(Value::as_str).ok_or("the edit names no file")?;
+    let abs = if Path::new(path).is_absolute() { PathBuf::from(path) } else { project_root.join(path) };
+    let rel = abs.strip_prefix(project_root).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
+    let base = std::fs::read_to_string(&abs).unwrap_or_default();
+    let proposed = match tool {
+        "Write" => input.get("content").and_then(Value::as_str).unwrap_or_default().to_string(),
+        "Edit" => {
+            let old = input.get("old_string").and_then(Value::as_str).unwrap_or_default();
+            let new = input.get("new_string").and_then(Value::as_str).unwrap_or_default();
+            let all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+            replace_once(&base, old, new, all)?
+        }
+        "MultiEdit" => {
+            let mut text = base.clone();
+            for e in input.get("edits").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let old = e.get("old_string").and_then(Value::as_str).unwrap_or_default();
+                let new = e.get("new_string").and_then(Value::as_str).unwrap_or_default();
+                let all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+                text = replace_once(&text, old, new, all)?;
+            }
+            text
+        }
+        other => return Err(format!("{other} is not an edit")),
+    };
+    Ok((abs.to_string_lossy().to_string(), rel, base, proposed))
+}
+
+fn control_reply(request_id: &str, response: Value) -> Value {
+    serde_json::json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": request_id, "response": response }
+    })
 }
 
 /// The stable tier aliases Claude Code resolves to the latest model of each
@@ -419,6 +513,37 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Answer a pending edit: `allow` lets the CLI make the edit exactly as
+    /// it asked; otherwise it is denied with `message`, which says what the
+    /// user declined (and what Ken applied itself, for a partial accept).
+    pub fn answer_edit(&self, chat_id: &str, proposal: &EditProposal, allow: bool, message: &str) -> Result<()> {
+        let response = if allow {
+            serde_json::json!({ "behavior": "allow", "updatedInput": proposal.input, "toolUseID": proposal.tool_use_id })
+        } else {
+            serde_json::json!({ "behavior": "deny", "message": message })
+        };
+        let payload = control_reply(&proposal.request_id, response);
+        let stdin = {
+            let live = self.live.lock().unwrap();
+            live.get(chat_id)
+                .ok_or_else(|| Error::Other("this chat is no longer running".into()))?
+                .stdin
+                .clone()
+        };
+        {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}")
+                .and_then(|_| stdin.flush())
+                .map_err(|e| Error::Other(format!("answer failed: {e}")))?;
+        }
+        (self.on_update)(ChatUpdate::Status {
+            chat_id: chat_id.to_string(),
+            status: "working".into(),
+            detail: None,
+        });
+        Ok(())
+    }
+
     /// Stop a chat's conversation process (mode switch, archive, shutdown).
     pub fn stop(&self, chat_id: &str) {
         if let Some(mut conv) = self.live.lock().unwrap().remove(chat_id) {
@@ -470,12 +595,17 @@ impl ChatEngine {
             "--output-format",
             "stream-json",
             "--verbose",
+            // Default, not acceptEdits: every Edit/MultiEdit/Write comes back
+            // as a permission request, which Ken shows as a diff to accept or
+            // decline change by change.
             "--permission-mode",
-            "acceptEdits",
+            "default",
             // Routes permission requests to our stdin/stdout control channel,
             // which is what makes AskUserQuestion reach the user at all.
             "--permission-prompt-tool",
             "stdio",
+            "--append-system-prompt",
+            KEN_GUIDE,
         ]);
         // Only forward a validated stable alias; anything else falls back to the
         // CLI's own default model.
@@ -504,6 +634,7 @@ impl ChatEngine {
         let live_map = self.live.clone();
         let id = chat_id.to_string();
         let pump_stdin = stdin.clone();
+        let root = self.project_root.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             let mut saw_result = false;
@@ -554,6 +685,48 @@ impl ChatEngine {
                                 status: "needs_input".into(),
                                 detail: None,
                             });
+                        } else if tool_name == "NotebookEdit" {
+                            // Notebooks keep the old behaviour: allowed as asked.
+                            let reply = control_reply(
+                                &request_id,
+                                serde_json::json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id }),
+                            );
+                            let mut w = pump_stdin.lock().unwrap();
+                            let _ = writeln!(w, "{reply}").and_then(|_| w.flush());
+                        } else if EDIT_TOOLS.contains(&tool_name.as_str()) {
+                            match propose_edit(&root, &tool_name, &input) {
+                                Ok((path, rel_path, base, proposed)) => {
+                                    let proposal = EditProposal {
+                                        request_id,
+                                        tool_use_id,
+                                        tool: tool_name,
+                                        path,
+                                        rel_path,
+                                        base,
+                                        proposed,
+                                        input,
+                                        decision: None,
+                                        note: None,
+                                    };
+                                    on_update(ChatUpdate::EditProposal {
+                                        chat_id: id.clone(),
+                                        payload: serde_json::to_string(&proposal).unwrap_or_default(),
+                                    });
+                                    on_update(ChatUpdate::Status {
+                                        chat_id: id.clone(),
+                                        status: "needs_input".into(),
+                                        detail: None,
+                                    });
+                                }
+                                Err(why) => {
+                                    let reply = control_reply(
+                                        &request_id,
+                                        serde_json::json!({ "behavior": "deny", "message": format!("This edit cannot apply: {why}. Read the file again and retry.") }),
+                                    );
+                                    let mut w = pump_stdin.lock().unwrap();
+                                    let _ = writeln!(w, "{reply}").and_then(|_| w.flush());
+                                }
+                            }
                         } else {
                             // Every other permission request is denied, which
                             // preserves the headless behavior this session had
@@ -1314,5 +1487,38 @@ mod tests {
         }
         assert!(!pty.is_alive());
         drop(rx);
+    }
+    #[test]
+    fn an_edit_is_worked_out_against_the_file_as_it_is() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("Platform")).unwrap();
+        std::fs::write(root.join("Platform/Save.md"), "# Save\n\nSaves are files.\nOne per region.\n").unwrap();
+        let file = root.join("Platform/Save.md").to_string_lossy().to_string();
+
+        let edit = serde_json::json!({ "file_path": file, "old_string": "Saves are files.", "new_string": "Saves are region files." });
+        let (path, rel, base, proposed) = propose_edit(root, "Edit", &edit).unwrap();
+        assert_eq!(path, file);
+        assert_eq!(rel.as_deref(), Some("Platform/Save.md"));
+        assert!(base.contains("Saves are files.") && proposed.contains("Saves are region files."));
+
+        let multi = serde_json::json!({ "file_path": "Platform/Save.md", "edits": [
+            { "old_string": "# Save", "new_string": "# Saving" },
+            { "old_string": "One per region.", "new_string": "One file per region." }
+        ]});
+        let (_, _, _, proposed) = propose_edit(root, "MultiEdit", &multi).unwrap();
+        assert_eq!(proposed, "# Saving\n\nSaves are files.\nOne file per region.\n");
+
+        let new = serde_json::json!({ "file_path": "Platform/New.md", "content": "# New\n" });
+        let (_, rel, base, proposed) = propose_edit(root, "Write", &new).unwrap();
+        assert_eq!((rel.as_deref(), base.as_str(), proposed.as_str()), (Some("Platform/New.md"), "", "# New\n"));
+
+        let missing = serde_json::json!({ "file_path": "Platform/Save.md", "old_string": "not there", "new_string": "x" });
+        assert!(propose_edit(root, "Edit", &missing).unwrap_err().contains("not in the file"));
+        std::fs::write(root.join("twice.md"), "a a").unwrap();
+        let twice = serde_json::json!({ "file_path": "twice.md", "old_string": "a", "new_string": "b" });
+        assert!(propose_edit(root, "Edit", &twice).unwrap_err().contains("2 times"));
+        let all = serde_json::json!({ "file_path": "twice.md", "old_string": "a", "new_string": "b", "replace_all": true });
+        assert_eq!(propose_edit(root, "Edit", &all).unwrap().3, "b b");
     }
 }

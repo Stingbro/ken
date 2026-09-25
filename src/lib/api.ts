@@ -460,11 +460,26 @@ export const CHAT_MODELS: { label: string; value: string | null }[] = [
 export interface ChatMessage {
   id: number;
   chatId: string;
-  role: "user" | "assistant" | "activity" | "question" | "divider";
+  role: "user" | "assistant" | "activity" | "question" | "edit" | "divider";
   content: string;
   createdAt: number;
   /** Set on member-scoped emits of `chat-message` (S9 step 5). */
   project_id?: string;
+}
+
+/** An edit Claude proposed in chat (`chat::EditProposal`): the file before
+ *  and after, for the person to accept or decline change by change. */
+export interface EditProposal {
+  requestId: string;
+  toolUseId: string;
+  tool: string;
+  path: string;
+  relPath: string | null;
+  base: string;
+  proposed: string;
+  /** accepted · declined · partial, once decided. */
+  decision: "accepted" | "declined" | "partial" | null;
+  note: string | null;
 }
 
 export interface PtyChunk {
@@ -2151,6 +2166,15 @@ export const api = {
       focusedFile,
       scope: scope ?? null,
     }),
+  /** Answer an edit proposal: accepted, declined, or partial with the merged
+   *  text Ken writes and the changes that were left out. */
+  answerEditProposal: (
+    chatId: string,
+    messageId: number,
+    decision: "accepted" | "declined" | "partial",
+    merged: string | null,
+    declinedChanges: string[],
+  ) => invoke<void>("answer_edit_proposal", { chatId, messageId, decision, merged, declinedChanges }),
   answerChatQuestion: (
     chatId: string,
     messageId: number,

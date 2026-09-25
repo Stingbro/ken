@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { Crepe } from "@milkdown/crepe";
   import { editorViewCtx, remarkStringifyOptionsCtx } from "@milkdown/kit/core";
   import type { Ctx } from "@milkdown/kit/ctx";
@@ -29,7 +29,9 @@
     slashShortcutInputRule,
     slashShortcutKeys,
   } from "./markdown/slashShortcuts";
-  import { anchorLinkPlugin } from "./markdown/anchors";
+  import { anchorLinkPlugin, findHeadingForTarget, headingSlug } from "./markdown/anchors";
+  import { lineTarget } from "../lib/citation";
+  import type { Reveal } from "../lib/app.svelte";
   import { headingLinkPlugin } from "./markdown/headingLink";
   import { tableContextMenu } from "./markdown/tableMenu";
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
@@ -48,7 +50,44 @@
   let {
     initial,
     onchange,
-  }: { initial: string; onchange: (markdown: string) => void } = $props();
+    reveal = null,
+  }: { initial: string; onchange: (markdown: string) => void; reveal?: Reveal | null } = $props();
+
+  // A clicked citation: scroll to its heading, or to the block its source
+  // line became, and flash it so the eye lands there.
+  $effect(() => {
+    const r = reveal;
+    const v = view;
+    if (!r || !v) return;
+    void r.nonce;
+    untrack(() => revealIn(v, r));
+  });
+
+  function revealIn(v: EditorView, r: Reveal) {
+    const doc = v.state.doc;
+    let pos: number | undefined = r.anchor ? findHeadingForTarget(doc, r.anchor)?.pos : undefined;
+    if (pos === undefined && r.line) {
+      const t = lineTarget(initial, r.line);
+      if (t.phrase) {
+        const phrase = t.phrase;
+        doc.descendants((node, p) => {
+          if (pos !== undefined) return false;
+          if (node.isTextblock && node.textContent.includes(phrase)) {
+            pos = p;
+            return false;
+          }
+          return true;
+        });
+      }
+      if (pos === undefined && t.heading) pos = findHeadingForTarget(doc, headingSlug(t.heading))?.pos;
+    }
+    if (pos === undefined) return;
+    const dom = v.nodeDOM(pos);
+    if (!(dom instanceof HTMLElement)) return;
+    dom.scrollIntoView({ block: "center", behavior: "smooth" });
+    dom.classList.add("ken-reveal");
+    setTimeout(() => dom.classList.remove("ken-reveal"), 1600);
+  }
 
   let host: HTMLDivElement;
   let crepe: Crepe | undefined;
@@ -320,6 +359,12 @@
 <ImageLightbox />
 
 <style>
+  /* A clicked citation's block, flashed so the eye lands on it. */
+  :global(.milkdown .ken-reveal) {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border-radius: 4px;
+    transition: background 1.2s ease-out;
+  }
   .editor-scroll {
     flex: 1;
     min-height: 0;

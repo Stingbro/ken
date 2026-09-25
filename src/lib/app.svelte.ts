@@ -52,6 +52,15 @@ import {
   type TabState,
 } from "../files/tabs";
 
+/** Where to scroll an opened file to: a source line or a heading slug. A new
+ *  `nonce` asks again for the same place. */
+export interface Reveal {
+  path: string;
+  line?: number;
+  anchor?: string;
+  nonce: number;
+}
+
 export type Screen =
   | "home"
   | "files"
@@ -163,6 +172,9 @@ class AppStore {
   scanError = $state<string | null>(null);
 
   searchOpen = $state(false);
+
+  /** The place an open file should scroll to, set by a clicked citation. */
+  revealAt = $state<Reveal | null>(null);
 
   /** Team-sync state for the title-bar dot ("off" = not a synced project). */
   syncState = $state<SyncStateName>("off");
@@ -787,6 +799,12 @@ class AppStore {
     this.openTab(relPath, false);
     this.screen = "files";
     this.searchOpen = false;
+  }
+
+  /** Open a file in Files at a line or a heading (a clicked citation). */
+  openAt(relPath: string, where: { line?: number; anchor?: string }) {
+    this.openInFiles(relPath);
+    this.revealAt = where.line || where.anchor ? { path: relPath, ...where, nonce: Date.now() } : null;
   }
 
   openSettings() {
