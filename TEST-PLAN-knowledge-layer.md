@@ -116,9 +116,11 @@ keyword index over sections.
   "region"): `Platform/Save.md` still comes back.
 - [ ] Delete a page in Files, then search a word only it had: it no longer
   comes back.
-- [ ] (2b) Search **region** again and press **For business readers**: only
+- [ ] (2b) Search **region** again and pick **Business readers**: only
   `Design/Why-regions.md` (a business page) is left; `Platform/Save.md` (dev)
-  is gone. Press it again to see both.
+  is gone. **Developers** shows `Platform/Save.md` and code, not the business
+  page. **Any reader** shows both. Switch to all projects: the same choice
+  applies there.
 - [ ] (MCP, optional) Through `ken-mcp`, search **region**: the line starts
   with a locator like `[[Save]] · Realms-Docs:Platform/Save.md:1`. The app's
   result list does not show the locator yet.
@@ -282,5 +284,6 @@ keyword index over sections.
 
 ## Known gaps (not bugs to report)
 
-- 2b is built by section; the all-projects search and the MCP do not filter
-  by audience yet (the project search box does).
+None known. The reader choice (Any reader, Business readers, Developers)
+applies to the project search, all-projects search, routed search and the
+MCP's search tools.
