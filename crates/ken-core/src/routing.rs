@@ -340,7 +340,7 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
     // The team's other words for what was asked (Vocabulary page, decisions
     // aliases, page aliases): each alternative phrasing runs as its own
     // keyword search, its new chunks after the original's.
-    for alt in crate::vocab::Vocabulary::from_db(db)?.alternatives(query) {
+    for alt in crate::vocab::Vocabulary::cached(db)?.alternatives(query) {
         for hit in db.search_chunks_fts(&alt, limit)? {
             if !fts_hits.iter().any(|h| h.chunk_id == hit.chunk_id) {
                 fts_hits.push(hit);

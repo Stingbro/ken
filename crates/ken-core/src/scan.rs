@@ -266,25 +266,33 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         .git_global(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
+            // The entry's own file type, from the directory listing: a status
+            // call per entry is what made a walk of tens of thousands of
+            // files cost seconds on Windows.
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
             name != crate::project::CONFIG_DIR
                 && !is_office_lock_name(&name)
-                && !(e.path().is_dir()
-                    && (is_junk_dir_name(&name) || (e.depth() > 0 && is_linked_checkout(e.path()))))
+                && !(is_dir && (is_junk_dir_name(&name) || (e.depth() > 0 && is_linked_checkout(e.path()))))
         })
         .build()
         .flatten()
-        .map(|e| e.into_path());
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        // Metadata from the listing where the platform gives it (Windows
+        // does), so a file costs no extra status call.
+        .map(|e| {
+            let meta = e.metadata().ok();
+            (e.into_path(), meta)
+        });
     // `.ken/` is hidden wholesale above (D2 hard-ignore); walk its
     // allowlisted subpaths (`.ken/memory/`, `.ken/tasks/`) separately so
     // ken-memory and ken-tasks documents reach the index like any other file
     // — see `is_ken_allowlisted_path` for exactly what qualifies.
-    let allowlisted = KEN_ALLOWLISTED_SUBDIRS.iter().flat_map(|sub| {
-        ken_owned_subwalk(&project.root.join(crate::project::CONFIG_DIR).join(sub))
-    });
-    for path in walker.chain(allowlisted) {
-        if !path.is_file() {
-            continue;
-        }
+    let allowlisted = KEN_ALLOWLISTED_SUBDIRS
+        .iter()
+        .flat_map(|sub| ken_owned_subwalk(&project.root.join(crate::project::CONFIG_DIR).join(sub)))
+        .filter(|p| p.is_file())
+        .map(|p| (p, None));
+    for (path, listed) in walker.chain(allowlisted) {
         let Ok(rel) = path.strip_prefix(&project.root) else {
             continue;
         };
@@ -299,7 +307,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         if tier == crate::kenignore::Tier::Ignore {
             continue;
         }
-        if let Ok(meta) = path.metadata() {
+        if let Some(meta) = listed.or_else(|| path.metadata().ok()) {
             let mtime = meta
                 .modified()
                 .ok()
@@ -317,17 +325,77 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         .map(|f| (f.rel_path, (f.size, f.mtime, f.status, f.error)))
         .collect();
 
+    // Writes go in batches of BATCH_FILES, one commit each, not several
+    // commits per file; an error rolls the open batch back.
+    db.begin_batch()?;
+    let result = write_changes(project, db, &indexed, &on_disk, &mut stats);
+    match result {
+        Ok(()) => db.commit_batch()?,
+        Err(e) => {
+            db.rollback_batch();
+            return Err(e);
+        }
+    }
+
+    // Re-tier. An unchanged file skipped `index_one` above, so a change of
+    // the repo's kind or a new `~` line reaches it only here; files that are
+    // now search-only also leave the extraction queue.
+    let tiers: Vec<(String, crate::kenignore::Tier)> =
+        on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
+    db.set_file_tiers(&tiers)?;
+
+    if let Some(result) = control_query(db)? {
+        db.set_index_control(&result)?;
+    }
+    // The team's words for search, rebuilt when a page may have changed.
+    if !stats.changed_paths.is_empty() || db.stored_vocabulary()?.is_none() {
+        crate::vocab::Vocabulary::rebuild(db)?;
+    }
+
+    // The link report is a writing queue for a library, so it is filed for
+    // team and wiki repos only: a code repo's READMEs are not its pages.
+    let kind = crate::registry::kind_of(&project.root);
+    if kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)) {
+        let report = crate::links::report(db)?;
+        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        crate::links::file_review_item(db, &report, now)?;
+    }
+
+    Ok(stats)
+}
+
+/// Files written per transaction during a scan.
+const BATCH_FILES: usize = 500;
+
+type OnDisk = HashMap<String, (i64, i64, bool, crate::kenignore::Tier)>;
+type Indexed = HashMap<String, (i64, i64, String, Option<String>)>;
+
+/// A scan's removals, adds and updates, committed every [`BATCH_FILES`]
+/// files inside the batch the caller opened.
+fn write_changes(project: &Project, db: &mut Db, indexed: &Indexed, on_disk: &OnDisk, stats: &mut ScanStats) -> Result<()> {
+    let mut since = 0usize;
+    let mut tick = |db: &mut Db| -> Result<()> {
+        since += 1;
+        if since >= BATCH_FILES {
+            db.commit_batch()?;
+            db.begin_batch()?;
+            since = 0;
+        }
+        Ok(())
+    };
+
     // Removals: indexed but gone from disk (or newly excluded)
     for rel in indexed.keys() {
         if !on_disk.contains_key(rel) {
             db.remove_file(rel)?;
             stats.removed += 1;
             stats.changed_paths.push(rel.clone());
+            tick(db)?;
         }
     }
 
     // Adds/updates
-    for (rel, (size, mtime, dataless, tier)) in &on_disk {
+    for (rel, (size, mtime, dataless, tier)) in on_disk {
         match indexed.get(rel) {
             Some((s, m, status, error)) if s == size
                 && m == mtime
@@ -359,29 +427,9 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
             stats.videos_needing_transcript.push(rel.clone());
         }
         stats.changed_paths.push(rel.clone());
+        tick(db)?;
     }
-
-    // Re-tier. An unchanged file skipped `index_one` above, so a change of
-    // the repo's kind or a new `~` line reaches it only here; files that are
-    // now search-only also leave the extraction queue.
-    let tiers: Vec<(String, crate::kenignore::Tier)> =
-        on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
-    db.set_file_tiers(&tiers)?;
-
-    if let Some(result) = control_query(db)? {
-        db.set_index_control(&result)?;
-    }
-
-    // The link report is a writing queue for a library, so it is filed for
-    // team and wiki repos only: a code repo's READMEs are not its pages.
-    let kind = crate::registry::kind_of(&project.root);
-    if kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)) {
-        let report = crate::links::report(db)?;
-        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        crate::links::file_review_item(db, &report, now)?;
-    }
-
-    Ok(stats)
+    Ok(())
 }
 
 /// Pages tried, in order, as the known page a control query must rank first.
@@ -536,6 +584,10 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
         }
         index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
         db.set_file_tiers(&[(rel.to_string(), tier)])?;
+        // A page's aliases, or the Vocabulary page itself, may have changed.
+        if rel.ends_with(".md") {
+            crate::vocab::Vocabulary::rebuild(db)?;
+        }
         Ok(true)
     } else if db.get_file(rel)?.is_some() {
         db.remove_file(rel)?;

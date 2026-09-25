@@ -296,15 +296,29 @@ fn rule_matches(rule: &Rule, path: &str, is_dir: bool) -> bool {
         rule.pattern.clone()
     };
 
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
-    if builder.add_line(None, &pattern).is_err() {
-        return false;
+    // One compiled matcher per distinct pattern, kept per thread: a scan
+    // classifies every path against every rule, and building a matcher per
+    // rule per path made a rescan of an unchanged repo cost seconds at tens
+    // of thousands of files. Bounded so a stream of new patterns cannot grow
+    // it without end.
+    thread_local! {
+        static MATCHERS: std::cell::RefCell<std::collections::HashMap<String, Option<ignore::gitignore::Gitignore>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
     }
-    let matcher = match builder.build() {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    matcher.matched_path_or_any_parents(path, is_dir).is_ignore()
+    MATCHERS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        let matcher = cache.entry(pattern.clone()).or_insert_with(|| {
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
+            builder.add_line(None, &pattern).ok()?;
+            builder.build().ok()
+        });
+        matcher
+            .as_ref()
+            .is_some_and(|m| m.matched_path_or_any_parents(path, is_dir).is_ignore())
+    })
 }
 
 #[cfg(test)]

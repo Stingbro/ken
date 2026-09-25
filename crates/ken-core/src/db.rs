@@ -205,6 +205,12 @@ impl Db {
         register_vec_extension();
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // The index is derived from the files and a rescan rebuilds it, so a
+        // commit need not wait for the disk: in WAL mode NORMAL never
+        // corrupts the database, and a power cut loses at most the last
+        // commits, which the next scan redoes. FULL waited on every one of a
+        // scan's per-file commits, which made a first scan disk-bound.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Multiple writers share this file on separate connections (the state
         // mutex's Db, the scanner's, the extraction worker's). WAL allows
@@ -681,6 +687,35 @@ impl Db {
         Ok(value)
     }
 
+    /// The vocabulary a scan built (`vocab::Vocabulary::rebuild`), as JSON.
+    pub fn stored_vocabulary(&self) -> Result<Option<String>> {
+        self.meta_get("vocabulary")
+    }
+
+    pub fn store_vocabulary(&self, json: &str) -> Result<()> {
+        self.meta_set("vocabulary", json)
+    }
+
+    /// Start a batch: the writes that follow, until [`Db::commit_batch`],
+    /// land as one transaction. Each write method's own savepoint nests
+    /// inside it, so a scan pays one commit per batch, not several per file.
+    pub fn begin_batch(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub fn commit_batch(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// Drop a batch after an error; a no-op when none is open.
+    pub fn rollback_batch(&self) {
+        if !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+
     fn meta_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
@@ -743,7 +778,7 @@ impl Db {
         chunks: &[crate::chunker::Chunk],
         tier: crate::kenignore::Tier,
     ) -> Result<Vec<(i64, String)>> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let vec_exists = table_exists(&tx, "vec_chunks")?;
         let tier = tier as i64;
 
@@ -817,7 +852,7 @@ impl Db {
     /// `path`. Mirrors [`Db::remove_file`]'s multi-table cleanup breadth;
     /// called when a file is removed or re-classified to the `Ignore` tier.
     pub fn delete_chunks(&mut self, path: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let ids: Vec<i64> = {
             let mut stmt = tx.prepare("SELECT id FROM chunks WHERE path = ?1")?;
             let rows = stmt.query_map(params![path], |r| r.get(0))?;
@@ -850,7 +885,7 @@ impl Db {
         if !self.vec_available || ids.len() != vecs.len() || ids.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         if !table_exists(&tx, "vec_chunks")? {
             return Ok(());
         }
@@ -996,7 +1031,7 @@ impl Db {
         text: &str,
     ) -> Result<()> {
         let name = name_tokens(rel_path);
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             r#"INSERT INTO files (rel_path, kind, size, mtime, status, error)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1032,7 +1067,7 @@ impl Db {
     }
 
     pub fn remove_file(&mut self, rel_path: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let file_id: Option<i64> = tx
             .query_row(
                 "SELECT id FROM files WHERE rel_path = ?1",
@@ -1403,7 +1438,7 @@ impl Db {
 
     /// Drop all indexed data (schema stays). Used by reindex.
     pub fn clear(&mut self) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM contents", [])?;
         tx.execute("DELETE FROM files", [])?;
         tx.execute("DELETE FROM extractions", [])?;
@@ -2171,7 +2206,7 @@ impl Db {
 
     /// Replace the links stored for the page at `from`.
     pub fn set_page_links(&mut self, from: &str, links: &[crate::links::Link]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM page_links WHERE from_path = ?1", params![from])?;
         {
             let mut stmt = tx.prepare("INSERT OR IGNORE INTO page_links (from_path, kind, target) VALUES (?1, ?2, ?3)")?;
@@ -2339,7 +2374,7 @@ impl Db {
     /// stay, so nothing already in the graph loses its record. Returns
     /// (files re-tiered, pending extractions dropped).
     pub fn set_file_tiers(&mut self, tiers: &[(String, crate::kenignore::Tier)]) -> Result<(usize, usize)> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut retiered = 0;
         {
             let mut stmt =
@@ -2430,7 +2465,7 @@ impl Db {
             })?
             .collect::<std::result::Result<_, _>>()?;
         drop(stmt);
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut n = 0;
         for (rel, stored_kind) in rows {
             let new_kind = crate::extract::FileKind::from_path(Path::new(&rel));
@@ -2543,7 +2578,7 @@ impl Db {
         content_hash: &str,
         regions: &[OcrRegionRow],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let matches: bool = tx
             .query_row(
                 "SELECT 1 FROM ocr_pending
@@ -2684,7 +2719,7 @@ impl Db {
         events: &[EventInput],
         built_at: i64,
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM entities", [])?; // cascades to entity_edges
         tx.execute("DELETE FROM events", [])?;
         let mut ids: Vec<i64> = Vec::with_capacity(entities.len());
@@ -2737,7 +2772,7 @@ impl Db {
         delta: &knowledge_model::Extraction,
         at: i64,
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         strip_file(&tx, rel_path)?;
 
         // 1. Existing entity identity → row id (over what survived the strip).
@@ -2866,7 +2901,7 @@ impl Db {
     /// is deleted or excluded). Entities grounded elsewhere survive; orphans
     /// and their edges are GC'd.
     pub fn purge_file_knowledge(&mut self, rel_path: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         strip_file(&tx, rel_path)?;
         tx.commit()?;
         Ok(())

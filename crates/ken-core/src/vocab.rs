@@ -51,6 +51,25 @@ impl Vocabulary {
         Ok(Vocabulary::from_groups(groups))
     }
 
+    /// Build from the index and store it, so searches read one row instead
+    /// of every page's aliases: at tens of thousands of files, building it
+    /// per search made search time grow with the repo. A scan calls this.
+    pub fn rebuild(db: &Db) -> Result<Vocabulary> {
+        let v = Vocabulary::from_db(db)?;
+        let json = serde_json::to_string(&v.groups).map_err(|e| crate::Error::Other(e.to_string()))?;
+        db.store_vocabulary(&json)?;
+        Ok(v)
+    }
+
+    /// The stored vocabulary, or one built now when none is stored yet (an
+    /// index made before this was kept).
+    pub fn cached(db: &Db) -> Result<Vocabulary> {
+        match db.stored_vocabulary()?.and_then(|j| serde_json::from_str::<Vec<Vec<String>>>(&j).ok()) {
+            Some(groups) => Ok(Vocabulary { groups }),
+            None => Vocabulary::from_db(db),
+        }
+    }
+
     pub fn from_groups(groups: Vec<Vec<String>>) -> Vocabulary {
         let groups = groups
             .into_iter()
