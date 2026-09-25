@@ -1,19 +1,23 @@
-//! The library inbox (Ways of Working, docs-system "Ingest"): a source
-//! dropped in `Research/Ingestion/Raw/` is read, distilled into one dated
-//! note from `Templates/Ingested-note.md`, and moved beside the note under
-//! `Research/Ingestion/Ingested/`. A person reads the key takeaways on one
-//! Review card and undoes what is wrong; nobody confirms a note.
+//! The library inbox (Ways of Working, docs-system "Ingest"), in two parts.
+//!
+//! **Processing.** A source dropped in `Research/Ingestion/Raw/` is read and
+//! distilled into one dated note from `Templates/Ingested-note.md` (the
+//! summary, what it overturns, the quotes, rulings, actions), written
+//! straight into its organized home. What follows from it is proposed on
+//! Review, never written ([`follow_ups`]): a change to each wiki page it
+//! touches, a new page where nothing covers a topic yet, and a decisions-log
+//! entry for each ruling said in the room, left for its decider. The source
+//! stays in `Raw/` while this is reviewed, and is not read again.
+//!
+//! **Filing.** When the person is done ([`file`]), the source moves beside
+//! its note, under `Research/Ingestion/Ingested/<Meetings|Recordings|
+//! Documents>/<YYYY-MM>/`. Undo takes either part back.
 //!
 //! This is the Ingest half of what Ken called ingests; the other half, a
 //! stored rule that keeps an output page fresh from its sources, is a
-//! recipe (`recipe.rs`), and stays one.
-//!
-//! The model call is passed in (`generate`), so the app runs Claude headless
-//! and a test runs a stand-in. What follows from a note is proposed, never
-//! written ([`follow_ups`]): a change to each Current page it overturns, and
-//! a decisions-log entry for each ruling said in the room, left for its
-//! decider. Actions become tickets in the team repo, which is Wright's; the
-//! card lists them.
+//! recipe (`recipe.rs`), and stays one. Actions become tickets in the team
+//! repo, which is Wright's; the card lists them. The model call is passed in
+//! (`generate`), so the app runs Claude headless and a test a stand-in.
 
 use std::fs;
 use std::path::Path;
@@ -29,7 +33,26 @@ pub const TEMPLATE: &str = "Templates/Ingested-note.md";
 pub const REVIEW_KIND: &str = "ingest";
 
 /// The method's note template, used when the library has none of its own.
-const DEFAULT_TEMPLATE: &str = "---\ntitle: \"{{What it was}} - {{date}}\"\naliases: [\"{{What it was}} - {{date}}\"]\nstatus: evidence\nupdated: {{date}}\nsource: {{source path}}\npresent: [{{who was there}}]\n---\n\n# {{What it was}} - {{date}}\n\nEvidence, at the time. Cite it; do not read it as current doctrine.\n\nSource: `{{source file}}` ({{length: turns, minutes or pages}}).\n\n## What It Overturns\n\n**{{The one thing that changes what we wrote.}}** {{Which page said otherwise.}}\n\n## What Was Said\n\n- **{{Topic}}.** {{Name}}: *\"{{quote}}\"* → {{what follows from it}}.\n\n## Rulings Said in the Room\n\n- {{The ruling, in the decider's words}} — {{decider}}.\n\n## Actions and Requests\n\n- {{Action}} → {{who}}.\n\n## Open Questions\n\n- {{Question}} → {{who}}.\n";
+const DEFAULT_TEMPLATE: &str = "---\ntitle: \"{{What it was}} - {{date}}\"\naliases: [\"{{What it was}} - {{date}}\"]\nstatus: evidence\nkind: {{meeting, recording or document}}\nupdated: {{date}}\nsource: {{source path}}\npresent: [{{who was there}}]\n---\n\n# {{What it was}} - {{date}}\n\nEvidence, at the time. Cite it; do not read it as current doctrine.\n\nSource: `{{source file}}` ({{length: turns, minutes or pages}}).\n\n## What It Overturns\n\n**{{The one thing that changes what we wrote.}}** {{Which page said otherwise.}}\n\n## What Was Said\n\n- **{{Topic}}.** {{Name}}: *\"{{quote}}\"* → {{what follows from it}}.\n\n## Rulings Said in the Room\n\n- {{The ruling, in the decider's words}} — {{decider}}.\n\n## Actions and Requests\n\n- {{Action}} → {{who}}.\n\n## Open Questions\n\n- {{Question}} → {{who}}.\n";
+
+/// What a source was, which decides its folder once filed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Meeting,
+    Recording,
+    Document,
+}
+
+impl SourceKind {
+    pub fn folder(self) -> &'static str {
+        match self {
+            SourceKind::Meeting => "Meetings",
+            SourceKind::Recording => "Recordings",
+            SourceKind::Document => "Documents",
+        }
+    }
+}
 
 /// Where one ingested source ends up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,21 +60,30 @@ const DEFAULT_TEMPLATE: &str = "---\ntitle: \"{{What it was}} - {{date}}\"\nalia
 pub struct Placement {
     /// Where it was dropped (`Research/Ingestion/Raw/standup.txt`).
     pub raw: String,
-    /// The note (`Research/Ingestion/Ingested/2026-09-24-standup.md`).
+    /// The note (`…/Ingested/Meetings/2026-09/2026-09-24-standup.md`).
     pub note: String,
-    /// The source, moved beside the note
-    /// (`Research/Ingestion/Ingested/2026-09-24-standup/standup.txt`).
+    /// Where the source goes when filed, beside the note
+    /// (`…/Ingested/Meetings/2026-09/2026-09-24-standup/standup.txt`).
     pub source: String,
 }
 
-/// What an ingest card carries: where things went, and a hash of the note
-/// as written, so Undo can tell whether a person has edited it since.
+/// What an ingest card carries: where things went, a hash of the note as
+/// written (so Undo can tell whether a person has edited it since), and
+/// whether the source has been filed yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Card {
     #[serde(flatten)]
     pub placement: Placement,
     pub note_hash: String,
+    /// The source moved beside its note. Cards from before the two parts
+    /// were always filed.
+    #[serde(default = "filed_before")]
+    pub filed: bool,
+}
+
+fn filed_before() -> bool {
+    true
 }
 
 fn hash(text: &str) -> String {
@@ -63,8 +95,8 @@ pub fn has_inbox(root: &Path) -> bool {
     root.join(RAW).is_dir()
 }
 
-/// Sources waiting in `Raw/`, oldest name first: every file there except
-/// dotfiles and an index page.
+/// Files in `Raw/`, oldest name first: every file there except dotfiles and
+/// an index page. Includes sources being reviewed; see [`waiting_new`].
 pub fn waiting(root: &Path) -> Vec<String> {
     let mut out: Vec<String> = fs::read_dir(root.join(RAW))
         .into_iter()
@@ -79,6 +111,25 @@ pub fn waiting(root: &Path) -> Vec<String> {
     out
 }
 
+/// Sources in `Raw/` whose note is written and waiting for the person
+/// (an open, unfiled ingest card).
+pub fn in_review(db: &Db) -> Result<Vec<String>> {
+    Ok(db
+        .list_open_review_items()?
+        .into_iter()
+        .filter(|it| it.kind == REVIEW_KIND)
+        .filter_map(|it| card_of(it.payload.as_deref()))
+        .filter(|c| !c.filed)
+        .map(|c| c.placement.raw)
+        .collect())
+}
+
+/// Sources in `Raw/` not yet processed: [`waiting`] less those in review.
+pub fn waiting_new(root: &Path, db: &Db) -> Result<Vec<String>> {
+    let reviewing = in_review(db)?;
+    Ok(waiting(root).into_iter().filter(|r| !reviewing.contains(r)).collect())
+}
+
 fn slug(name: &str) -> String {
     let s: String = name
         .to_lowercase()
@@ -89,52 +140,81 @@ fn slug(name: &str) -> String {
     if s.is_empty() { "source".into() } else { s }
 }
 
-/// Where a source goes on `date`, not colliding with an earlier one.
-pub fn place(root: &Path, raw: &str, date: &str) -> Placement {
+/// Where a source of `kind` goes on `date` (`YYYY-MM-DD`): its kind's
+/// folder, then the month, not colliding with an earlier one.
+pub fn place(root: &Path, raw: &str, date: &str, kind: SourceKind) -> Placement {
     let file = raw.rsplit('/').next().unwrap_or(raw).to_string();
     let stem = file.rsplit_once('.').map_or(file.as_str(), |(s, _)| s);
+    let month = date.get(..7).unwrap_or(date);
+    let dir = format!("{INGESTED}/{}/{month}", kind.folder());
     let mut base = format!("{date}-{}", slug(stem));
     let mut n = 2;
-    while root.join(INGESTED).join(format!("{base}.md")).exists() || root.join(INGESTED).join(&base).exists() {
+    while root.join(&dir).join(format!("{base}.md")).exists() || root.join(&dir).join(&base).exists() {
         base = format!("{date}-{}-{n}", slug(stem));
         n += 1;
     }
     Placement {
         raw: raw.to_string(),
-        note: format!("{INGESTED}/{base}.md"),
-        source: format!("{INGESTED}/{base}/{file}"),
+        note: format!("{dir}/{base}.md"),
+        source: format!("{dir}/{base}/{file}"),
+    }
+}
+
+/// What kind of source a note came from: its frontmatter `kind:` when the
+/// model set it, else a transcript file is a recording, a source with people
+/// present a meeting, and anything else a document.
+pub fn kind_of(note: &str, raw: &str) -> SourceKind {
+    let field = |key: &str| {
+        note.lines()
+            .skip(1)
+            .take_while(|l| l.trim_end() != "---")
+            .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().trim_matches('"').to_lowercase()))
+    };
+    match field("kind:").as_deref() {
+        Some(k) if k.starts_with("meeting") => return SourceKind::Meeting,
+        Some(k) if k.starts_with("recording") => return SourceKind::Recording,
+        Some(k) if k.starts_with("document") => return SourceKind::Document,
+        _ => {}
+    }
+    let ext = raw.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "vtt" | "srt") {
+        return SourceKind::Recording;
+    }
+    let present = field("present:").unwrap_or_default();
+    let people = present.trim_matches(|c| c == '[' || c == ']').trim();
+    if !people.is_empty() && !people.contains("{{") {
+        SourceKind::Meeting
+    } else {
+        SourceKind::Document
     }
 }
 
 /// The prompt: the template, the source's text, and the rules the method
 /// sets for a note (quotes verbatim, evidence not doctrine, what it
 /// overturns first).
-pub fn prompt(template: &str, placement: &Placement, text: &str, date: &str) -> String {
-    let file = placement.raw.rsplit('/').next().unwrap_or(&placement.raw);
+pub fn prompt(template: &str, raw: &str, text: &str, date: &str) -> String {
+    let file = raw.rsplit('/').next().unwrap_or(raw);
     format!(
         "You are distilling one source from a team's library inbox into one dated note.\n\n\
          Fill in this template. Replace every {{{{…}}}} placeholder; drop a section only if the \
          source has nothing for it, and say so in one line. Today is {date}. The source file is \
-         `{file}` and will be kept at `{source}`: use that for `source:`.\n\n\
+         `{file}`.\n\n\
          Rules:\n\
          - Quotes are the speaker's exact words, typos included, marked [sic]. Never paraphrase inside quotes.\n\
          - This is evidence at the time, not current doctrine. Do not state anything the source does not.\n\
          - Lead \"What It Overturns\" with the one thing that changes what the team wrote, or say nothing overturns.\n\
          - Name who said what. List who was present if the source shows it.\n\
+         - Set `kind:` in the frontmatter to meeting (people talking: a standup, review or call), recording (a \
+           transcript of audio or video that is not a meeting), or document (anything written).\n\
          - Reply with the finished note only, in Markdown, starting with its `---` frontmatter. No preamble, no code fences.\n\n\
          TEMPLATE:\n{template}\n\nSOURCE ({file}):\n{text}\n",
-        source = placement.source,
     )
 }
 
 /// The model's reply as a note: fences stripped, and the frontmatter
-/// `source:` set to where the source really went.
+/// `source:` set to where the source is filed.
 pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
-    let mut t = reply.trim();
-    if let Some(rest) = t.strip_prefix("```markdown").or_else(|| t.strip_prefix("```md")).or_else(|| t.strip_prefix("```")) {
-        t = rest.trim_start();
-        t = t.strip_suffix("```").unwrap_or(t).trim_end();
-    }
+    let t = strip_fences(reply);
     if !t.starts_with("---") {
         return Err(Error::Other("the note did not start with its frontmatter".into()));
     }
@@ -170,8 +250,18 @@ pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
     Ok(out)
 }
 
+fn strip_fences(reply: &str) -> &str {
+    let mut t = reply.trim();
+    if let Some(rest) = t.strip_prefix("```markdown").or_else(|| t.strip_prefix("```md")).or_else(|| t.strip_prefix("```json")).or_else(|| t.strip_prefix("```")) {
+        t = rest.trim_start();
+        t = t.strip_suffix("```").unwrap_or(t).trim_end();
+    }
+    t
+}
+
 /// The card's body: the note's "What It Overturns" and "Actions and
-/// Requests" sections, which are what a person reads to undo a wrong row.
+/// Requests" sections, which are what a person reads to undo a wrong row,
+/// and what filing will do.
 pub fn card_body(note: &str, placement: &Placement) -> String {
     let mut s = String::new();
     for heading in ["## What It Overturns", "## Actions and Requests", "## Rulings Said in the Room"] {
@@ -182,12 +272,18 @@ pub fn card_body(note: &str, placement: &Placement) -> String {
             s.push_str("\n\n");
         }
     }
-    s.push_str(&format!("Note: {}\nSource moved to: {}\n", placement.note, placement.source));
+    let folder = placement.note.rsplit_once('/').map_or(placement.note.as_str(), |(d, _)| d);
+    s.push_str(&format!(
+        "Note: {}\nProposed changes to the wiki follow on their own cards. When you are done with them, \
+         **Done, file it** moves the source from Raw to {folder}/.\n",
+        placement.note
+    ));
     s
 }
 
-/// Read one waiting source, write its note, move the source beside it and
-/// file the Review card. `generate` turns the prompt into the note.
+/// Part one: read one new source, write its note into its organized home and
+/// file the Review card. The source stays in `Raw/` until [`file`].
+/// `generate` turns the prompt into the note.
 pub fn ingest_one(
     root: &Path,
     db: &mut Db,
@@ -201,31 +297,136 @@ pub fn ingest_one(
     if text.trim().is_empty() {
         return Err(Error::Other(format!("{raw} has no text Ken can read (a recording needs its transcript first)")));
     }
-    let placement = place(root, raw, date);
     let template = fs::read_to_string(root.join(TEMPLATE)).unwrap_or_else(|_| DEFAULT_TEMPLATE.to_string());
-    let note = finish_note(&generate(&prompt(&template, &placement, &text, date))?, &placement)?;
+    let reply = generate(&prompt(&template, raw, &text, date))?;
+    let kind = kind_of(strip_fences(&reply), raw);
+    let placement = place(root, raw, date, kind);
+    let note = finish_note(&reply, &placement)?;
 
     let note_abs = root.join(&placement.note);
-    let src_abs = root.join(&placement.source);
-    if let Some(dir) = src_abs.parent() {
+    if let Some(dir) = note_abs.parent() {
         fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     }
     fs::write(&note_abs, &note).map_err(|e| Error::io(&note_abs, e))?;
-    fs::rename(&abs, &src_abs).map_err(|e| Error::io(&abs, e))?;
 
     let stem = placement.note.rsplit('/').next().unwrap_or(&placement.note).trim_end_matches(".md");
-    let card = Card { placement: placement.clone(), note_hash: hash(&note) };
+    let card = Card { placement: placement.clone(), note_hash: hash(&note), filed: false };
     let payload = serde_json::to_string(&card).map_err(|e| Error::Other(e.to_string()))?;
     db.insert_review_item(REVIEW_KIND, &format!("Ingested: {stem}"), &card_body(&note, &placement), &placement.note, Some(&payload), now)?;
     Ok(placement)
 }
 
-// --- What follows from a note: Current pages rewritten, rulings for their
-// deciders. Both are proposals on Review, never writes: a person applies a
-// Current change, and a ruling waits for the person who decides it. -------
+/// Part two: the person is done with a note; its source moves from `Raw/`
+/// beside it. Returns the card, filed.
+pub fn file(root: &Path, card: &Card) -> Result<Card> {
+    if card.filed {
+        return Ok(card.clone());
+    }
+    let raw = root.join(&card.placement.raw);
+    let dest = root.join(&card.placement.source);
+    if !raw.exists() {
+        return Err(Error::Other(format!("{} is no longer in Raw", card.placement.raw)));
+    }
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    }
+    fs::rename(&raw, &dest).map_err(|e| Error::io(&raw, e))?;
+    Ok(Card { filed: true, ..card.clone() })
+}
 
-/// The Current pages an ingested note may change, when the library has them.
-pub const CURRENT_PAGES: [&str; 3] = ["Current/Project.md", "Current/Team.md", "Current/Who-Does-What.md"];
+// --- What follows from a note: pages it changes, pages it calls for,
+// rulings for their deciders. All are proposals on Review, never writes: a
+// person applies a page change, and a ruling waits for its decider. -------
+
+/// Sections an ingest never proposes changes to: the method routes a change
+/// to how the team works through a ticket, and evidence stays evidence.
+const OFF_LIMITS: [&str; 4] = ["Ways-of-Working/", "Research/", "Templates/", "_meta/"];
+
+/// Most existing pages and new pages one note may propose.
+pub const MAX_PAGES: usize = 5;
+
+fn may_propose(page: &str) -> bool {
+    page.ends_with(".md")
+        && !page.contains("..")
+        && !page.starts_with('/')
+        && !OFF_LIMITS.iter().any(|p| page.starts_with(p))
+        && !matches!(page, "START-HERE.md" | "CLAUDE.md" | "README.md")
+}
+
+/// The wiki's pages a note could change, with their titles, for the model to
+/// choose from.
+fn page_list(db: &Db) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for page in db.page_paths()?.into_iter().filter(|p| may_propose(p)) {
+        let title = db.page_meta(&page)?.and_then(|m| m.title).unwrap_or_default();
+        out.push((page, title));
+        if out.len() >= 400 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The plan: which pages the note changes, which new pages it calls for.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Plan {
+    #[serde(default)]
+    pub update: Vec<String>,
+    #[serde(default)]
+    pub create: Vec<NewPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct NewPage {
+    pub path: String,
+    #[serde(default)]
+    pub purpose: String,
+}
+
+pub fn plan_prompt(pages: &[(String, String)], note: &str) -> String {
+    let mut s = String::from(
+        "A note was just ingested into a team's wiki. Decide which existing pages it changes (something they say is \
+         no longer true, or something they should now say) and which new pages it calls for (a topic nothing covers \
+         yet). Only what the note itself supports; most notes change a few pages, many change none.\n\n\
+         Reply with JSON only: {\"update\": [\"path\", …], \"create\": [{\"path\": \"Section/Name.md\", \"purpose\": \"what the page is for\"}, …]}. \
+         Use paths from the list for updates; put a new page in the section it belongs to (Current, Platform, \
+         Design, Conventions, Work, Reference). At most 5 of each.\n\nPAGES IN THE WIKI:\n",
+    );
+    for (p, t) in pages {
+        if t.is_empty() {
+            s.push_str(&format!("- {p}\n"));
+        } else {
+            s.push_str(&format!("- {p} — {t}\n"));
+        }
+    }
+    s.push_str(&format!("\nTHE NOTE:\n{note}\n"));
+    s
+}
+
+/// The model's plan, kept to real pages to update and new pages that may be
+/// made, at most [`MAX_PAGES`] of each.
+pub fn read_plan(reply: &str, pages: &[(String, String)], root: &Path) -> Plan {
+    let t = strip_fences(reply);
+    let json = t.find('{').and_then(|a| t.rfind('}').map(|b| &t[a..=b])).unwrap_or("{}");
+    let mut plan: Plan = serde_json::from_str(json).unwrap_or_default();
+    plan.update.retain(|p| pages.iter().any(|(q, _)| q == p));
+    plan.update.dedup();
+    plan.update.truncate(MAX_PAGES);
+    plan.create.retain(|n| may_propose(&n.path) && !root.join(&n.path).exists());
+    plan.create.truncate(MAX_PAGES);
+    plan
+}
+
+/// "The ruling — decider" lines from the note's "Rulings Said in the Room".
+pub fn rulings_of(note: &str) -> Vec<(String, Option<String>)> {
+    section_bullets(note, "## Rulings Said in the Room")
+        .into_iter()
+        .map(|l| match l.rsplit_once(" — ") {
+            Some((ruling, decider)) => (ruling.trim().to_string(), Some(decider.trim().trim_end_matches('.').to_string())),
+            None => (l, None),
+        })
+        .collect()
+}
 
 /// A section's bullet lines, placeholders and "nothing" lines left out.
 fn section_bullets(note: &str, heading: &str) -> Vec<String> {
@@ -238,25 +439,6 @@ fn section_bullets(note: &str, heading: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.contains("{{") && !l.to_lowercase().starts_with("none") && !l.to_lowercase().starts_with("nothing"))
         .map(str::to_string)
-        .collect()
-}
-
-/// Whether the note says something overturns what the team wrote.
-fn overturns(note: &str) -> bool {
-    let Some(start) = note.find("## What It Overturns") else { return false };
-    let rest = &note[start + "## What It Overturns".len()..];
-    let body = rest[..rest.find("\n## ").unwrap_or(rest.len())].trim().to_lowercase();
-    !body.is_empty() && !body.contains("{{") && !body.starts_with("nothing") && !body.contains("nothing overturns")
-}
-
-/// "The ruling — decider" lines from the note's "Rulings Said in the Room".
-pub fn rulings_of(note: &str) -> Vec<(String, Option<String>)> {
-    section_bullets(note, "## Rulings Said in the Room")
-        .into_iter()
-        .map(|l| match l.rsplit_once(" — ") {
-            Some((ruling, decider)) => (ruling.trim().to_string(), Some(decider.trim().trim_end_matches('.').to_string())),
-            None => (l, None),
-        })
         .collect()
 }
 
@@ -285,16 +467,18 @@ pub fn decisions_entry(log: &str, ruling: &str, decider: Option<&str>, date: &st
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FollowUps {
-    /// Current pages with a proposed change.
-    pub current: Vec<String>,
+    /// Existing pages with a proposed change.
+    pub updated: Vec<String>,
+    /// New pages proposed.
+    pub created: Vec<String>,
     /// Rulings proposed for the decisions log.
     pub rulings: usize,
 }
 
-/// After a note is written: propose a change to each Current page the note
-/// changes (only when it says something overturns), and a decisions-log
-/// entry for each ruling said in the room, each as its own Review card.
-/// `generate` is asked once per Current page that exists.
+/// After a note is written: ask which pages it changes and which new pages
+/// it calls for, propose each (a diff on Review), and propose a
+/// decisions-log entry for each ruling said in the room. `generate` is asked
+/// once for the plan, then once per page.
 pub fn follow_ups(
     root: &Path,
     db: &mut Db,
@@ -308,22 +492,37 @@ pub fn follow_ups(
     let stem = placement.note.rsplit('/').next().unwrap_or(&placement.note).trim_end_matches(".md").to_string();
     let source = [crate::wikidraft::Source { label: format!("[[{stem}]]"), text: note.to_string() }];
 
-    if overturns(note) {
-        for page in CURRENT_PAGES {
-            let Ok(existing) = fs::read_to_string(root.join(page)) else { continue };
-            let change = "rewrite what the note changes about what is true now, citing the note as [[its name]]; keep every other line";
-            let reply = generate(&crate::wikidraft::update_prompt(page, change, &existing, &source, date))
-                .and_then(|r| crate::wikidraft::finish_update(&r, &existing));
-            if let Ok(Some(proposed)) = reply {
-                let p = crate::wikidraft::Proposal { page: page.to_string(), base: existing, proposed };
-                let title = format!("Proposed: {page} from {stem}");
-                let body = format!(
-                    "The note {stem} says something here is no longer true. Ken proposes this change to {page}; apply it \
-                     to write it, or discard it. It applies only while the page still reads as it did."
-                );
-                crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
-                out.current.push(page.to_string());
-            }
+    let pages = page_list(db)?;
+    let plan = generate(&plan_prompt(&pages, note)).map(|r| read_plan(&r, &pages, root)).unwrap_or_default();
+    for page in &plan.update {
+        let Ok(existing) = fs::read_to_string(root.join(page)) else { continue };
+        let change = "work in what the note changes or adds to this page, citing the note as [[its name]]; keep every other line";
+        let reply = generate(&crate::wikidraft::update_prompt(page, change, &existing, &source, date))
+            .and_then(|r| crate::wikidraft::finish_update(&r, &existing));
+        if let Ok(Some(proposed)) = reply {
+            let p = crate::wikidraft::Proposal { page: page.clone(), base: existing, proposed };
+            let title = format!("Proposed: {page} from {stem}");
+            let body = format!(
+                "The note {stem} changes what {page} says. Ken proposes this change; apply it to write it, or discard \
+                 it. It applies only while the page still reads as it did."
+            );
+            crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
+            out.updated.push(page.clone());
+        }
+    }
+    for new in &plan.create {
+        let reply = generate(&crate::wikidraft::prompt(&new.path, &new.purpose, None, &source, date))
+            .and_then(|r| crate::wikidraft::finish(&r));
+        if let Ok(proposed) = reply {
+            let p = crate::wikidraft::Proposal { page: new.path.clone(), base: String::new(), proposed };
+            let title = format!("New page: {} from {stem}", new.path);
+            let body = format!(
+                "The note {stem} covers something no page does yet: {}. Ken drafted {}; create it to write it, or \
+                 discard it.",
+                new.purpose, new.path
+            );
+            crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
+            out.created.push(new.path.clone());
         }
     }
 
@@ -338,10 +537,9 @@ pub fn follow_ups(
             let title = format!("Ruling for {who}: {}", ruling.chars().take(60).collect::<String>());
             let body = format!(
                 "Said in the room, per {stem}: \"{ruling}\". A ruling is its decider's to record: {who} applies this entry \
-                 to the decisions log, or discards it."
+                 to the decisions log, or discards it. With several rulings from one note, apply them in order."
             );
             crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
-            // The next ruling's entry follows this one, so both can apply in turn.
             text = proposed;
             out.rulings += 1;
         }
@@ -349,14 +547,14 @@ pub fn follow_ups(
     Ok(out)
 }
 
-/// Undo one ingest: the source goes back to `Raw/`, and the note is removed
-/// unless someone edited it since (then it is kept and said so). Returns
-/// whether the note was removed.
+/// Undo one ingest: a filed source goes back to `Raw/`, and the note is
+/// removed unless someone edited it since (then it is kept and said so).
+/// Returns whether the note was removed.
 pub fn undo(root: &Path, card: &Card) -> Result<bool> {
     let placement = &card.placement;
     let src = root.join(&placement.source);
     let raw = root.join(&placement.raw);
-    if src.exists() {
+    if card.filed && src.exists() {
         if let Some(dir) = raw.parent() {
             fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
         }
@@ -394,40 +592,45 @@ mod tests {
         d
     }
 
-    const REPLY: &str = "```markdown\n---\ntitle: \"Standup - 2026-09-24\"\nstatus: evidence\nsource: wrong/path.txt\npresent: [Ana, Ben]\n---\n\n# Standup - 2026-09-24\n\n## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n## What Was Said\n\n- **Ship.** Ana: *\"we ship on Friday\"*.\n\n## Actions and Requests\n\n- Fix the save bug → Ben.\n```";
+    const REPLY: &str = "```markdown\n---\ntitle: \"Standup - 2026-09-24\"\nstatus: evidence\nkind: meeting\nsource: wrong/path.txt\npresent: [Ana, Ben]\n---\n\n# Standup - 2026-09-24\n\n## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n## What Was Said\n\n- **Ship.** Ana: *\"we ship on Friday\"*.\n\n## Actions and Requests\n\n- Fix the save bug → Ben.\n```";
 
     #[test]
-    fn a_source_becomes_a_dated_note_beside_it_with_one_review_card() {
+    fn processing_writes_the_note_in_its_home_and_leaves_the_source_for_review() {
         let d = library();
         let root = d.path();
-        assert_eq!(waiting(root), vec![format!("{RAW}/Standup notes.txt")]);
+        let raw = format!("{RAW}/Standup notes.txt");
+        assert_eq!(waiting(root), vec![raw.clone()]);
         let mut db = Db::open_in_memory().unwrap();
         let mut seen_prompt = String::new();
-        let p = ingest_one(root, &mut db, &format!("{RAW}/Standup notes.txt"), "2026-09-24", 100, |prompt| {
+        let p = ingest_one(root, &mut db, &raw, "2026-09-24", 100, |prompt| {
             seen_prompt = prompt.to_string();
             Ok(REPLY.to_string())
         })
         .unwrap();
 
-        assert_eq!(p.note, format!("{INGESTED}/2026-09-24-standup-notes.md"));
-        assert_eq!(p.source, format!("{INGESTED}/2026-09-24-standup-notes/Standup notes.txt"));
-        assert!(seen_prompt.contains("we ship on Friday") && seen_prompt.contains("What It Overturns"));
-        assert!(root.join(&p.source).exists() && !root.join(&p.raw).exists(), "the source moved");
+        assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-09/2026-09-24-standup-notes.md"));
+        assert_eq!(p.source, format!("{INGESTED}/Meetings/2026-09/2026-09-24-standup-notes/Standup notes.txt"));
+        assert!(seen_prompt.contains("we ship on Friday") && seen_prompt.contains("Set `kind:`"));
+        assert!(root.join(&raw).exists(), "the source waits in Raw while the note is reviewed");
         let note = fs::read_to_string(root.join(&p.note)).unwrap();
-        assert!(note.starts_with("---\n"), "fences stripped");
-        assert!(note.contains(&format!("source: {}", p.source)) && !note.contains("wrong/path"));
-        assert!(waiting(root).is_empty());
+        assert!(note.starts_with("---\n") && note.contains(&format!("source: {}", p.source)) && !note.contains("wrong/path"));
+        assert_eq!(waiting(root), vec![raw.clone()]);
+        assert!(waiting_new(root, &db).unwrap().is_empty(), "not read twice");
+        assert_eq!(in_review(&db).unwrap(), vec![raw.clone()]);
 
-        let (id, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
-        assert!(body.contains("Ship date is Friday") && body.contains("Fix the save bug"));
-        assert!(id > 0);
+        let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
+        assert!(body.contains("Ship date is Friday") && body.contains("Fix the save bug") && body.contains("Done, file it"));
+        let card = card_of(db.list_open_review_items().unwrap()[0].payload.as_deref()).unwrap();
+        assert!(!card.filed);
 
-        // Undo puts it back: the source in Raw, the note gone.
-        let open = db.list_open_review_items().unwrap();
-        let card = card_of(open[0].payload.as_deref()).unwrap();
-        assert_eq!(card.placement, p);
-        assert!(undo(root, &card).unwrap());
-        assert_eq!(waiting(root), vec![format!("{RAW}/Standup notes.txt")]);
+        // Filing moves the source beside its note.
+        let filed = file(root, &card).unwrap();
+        assert!(filed.filed && root.join(&p.source).exists() && !root.join(&raw).exists());
+        assert!(file(root, &filed).is_ok(), "filing twice is a no-op");
+
+        // Undo takes both parts back.
+        assert!(undo(root, &filed).unwrap());
+        assert_eq!(waiting(root), vec![raw.clone()]);
         assert!(!root.join(&p.note).exists());
     }
 
@@ -440,16 +643,18 @@ mod tests {
         let p = ingest_one(root, &mut db, &raw, "2026-09-24", 1, |_| Ok(REPLY.into())).unwrap();
         let written = fs::read_to_string(root.join(&p.note)).unwrap();
         fs::write(root.join(&p.note), format!("{written}\nA person added this.\n")).unwrap();
-        let card = Card { placement: p.clone(), note_hash: hash(&written) };
+        let card = Card { placement: p.clone(), note_hash: hash(&written), filed: false };
         assert!(!undo(root, &card).unwrap(), "edited: kept");
-        assert!(root.join(&p.note).exists());
+        assert!(root.join(&p.note).exists() && root.join(&raw).exists());
 
-        let again = place(root, &raw, "2026-09-24");
-        assert_eq!(again.note, format!("{INGESTED}/2026-09-24-standup-notes-2.md"));
+        let again = place(root, &raw, "2026-09-24", SourceKind::Meeting);
+        assert_eq!(again.note, format!("{INGESTED}/Meetings/2026-09/2026-09-24-standup-notes-2.md"));
+        let doc = place(root, &raw, "2026-10-02", SourceKind::Document);
+        assert_eq!(doc.note, format!("{INGESTED}/Documents/2026-10/2026-10-02-standup-notes.md"));
     }
 
     #[test]
-    fn a_reply_without_frontmatter_is_refused_and_nothing_moves() {
+    fn a_reply_without_frontmatter_is_refused_and_nothing_is_written() {
         let d = library();
         let root = d.path();
         let mut db = Db::open_in_memory().unwrap();
@@ -458,6 +663,15 @@ mod tests {
         assert!(root.join(&raw).exists());
         assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none());
     }
+
+    #[test]
+    fn the_kind_comes_from_the_note_else_from_the_source() {
+        assert_eq!(kind_of("---\nkind: recording\npresent: [Ana]\n---\n", "Raw/x.txt"), SourceKind::Recording);
+        assert_eq!(kind_of("---\ntitle: x\n---\n", "Raw/call.vtt"), SourceKind::Recording);
+        assert_eq!(kind_of("---\npresent: [Ana, Ben]\n---\n", "Raw/x.txt"), SourceKind::Meeting);
+        assert_eq!(kind_of("---\npresent: [{{who was there}}]\n---\n", "Raw/spec.pdf"), SourceKind::Document);
+    }
+
     const NOTE: &str = "---\ntitle: \"Standup - 2026-09-24\"\nstatus: evidence\n---\n\n# Standup - 2026-09-24\n\n## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n## Rulings Said in the Room\n\n- We ship region saves before combat — Ana.\n- {{The ruling, in the decider's words}} — {{decider}}.\n\n## Actions and Requests\n\n- Fix the save bug → Ben.\n";
 
     #[test]
@@ -471,53 +685,70 @@ mod tests {
         let log = "# Decisions\n\nD-001 · 2026-09-01 · saves — Worlds save as regions.\n  sources: [[Save]]\n\nD-007 · 2026-09-10 · combat — Later.\n";
         let out = decisions_entry(log, "We ship region saves before combat", Some("Ana"), "2026-09-24", "2026-09-24-standup");
         assert!(out.starts_with(log.trim_end()), "the log is appended to, never rewritten");
-        assert!(out.contains("D-008 · 2026-09-24 · We ship region saves before combat — We ship region saves before combat"));
+        assert!(out.contains("D-008 · 2026-09-24 ·"));
         assert!(out.contains("sources: [[2026-09-24-standup]]") && out.contains("decider: Ana"));
         assert!(decisions_entry("# Decisions\n", "x", None, "2026-09-24", "n").contains("D-001 ·"));
     }
 
     #[test]
-    fn a_note_proposes_current_changes_and_rulings_never_writes_them() {
+    fn a_plan_keeps_real_pages_and_allowed_new_ones() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("Platform")).unwrap();
+        fs::write(d.path().join("Platform/Save.md"), "x").unwrap();
+        let pages = vec![("Current/Project.md".to_string(), "Project".to_string())];
+        let reply = "```json\n{\"update\": [\"Current/Project.md\", \"Nope/Missing.md\"], \"create\": [{\"path\": \"Platform/Release-dates.md\", \"purpose\": \"when we ship\"}, {\"path\": \"Ways-of-Working/New-rule.md\"}, {\"path\": \"Platform/Save.md\"}, {\"path\": \"../escape.md\"}]}\n```";
+        let plan = read_plan(reply, &pages, d.path());
+        assert_eq!(plan.update, vec!["Current/Project.md"]);
+        assert_eq!(plan.create.iter().map(|n| n.path.as_str()).collect::<Vec<_>>(), vec!["Platform/Release-dates.md"]);
+        assert_eq!(read_plan("no json here", &pages, d.path()), Plan::default());
+    }
+
+    #[test]
+    fn a_note_proposes_page_changes_new_pages_and_rulings_never_writes_them() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         fs::create_dir_all(root.join("Current")).unwrap();
         fs::create_dir_all(root.join("_meta")).unwrap();
         let project = "---\ntitle: Project\n---\nWe ship on Monday.\n";
         fs::write(root.join("Current/Project.md"), project).unwrap();
-        fs::write(root.join("Current/Team.md"), "---\ntitle: Team\n---\nAna leads.\n").unwrap();
         let log = "# Decisions\n\nD-001 · 2026-09-01 · saves — Regions.\n";
         fs::write(root.join("_meta/DECISIONS.md"), log).unwrap();
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&crate::project::Project::create(root, "Wiki").unwrap(), &mut db).unwrap();
-        let placement = place(root, "Research/Ingestion/Raw/standup.txt", "2026-09-24");
+        let placement = place(root, "Research/Ingestion/Raw/standup.txt", "2026-09-24", SourceKind::Meeting);
 
-        let mut asked = Vec::new();
         let done = follow_ups(root, &mut db, &placement, NOTE, "2026-09-24", 9, |p| {
-            asked.push(p.to_string());
-            Ok(if p.contains("`Current/Project.md`") {
+            Ok(if p.contains("PAGES IN THE WIKI") {
+                assert!(p.contains("- Current/Project.md — Project") && !p.contains("_meta/DECISIONS.md"), "{p}");
+                "{\"update\": [\"Current/Project.md\"], \"create\": [{\"path\": \"Platform/Release-dates.md\", \"purpose\": \"when we ship\"}]}".into()
+            } else if p.contains("`Current/Project.md`") {
                 "---\ntitle: Project\n---\nWe ship on Friday ([[2026-09-24-standup]]).\n".into()
+            } else if p.contains("`Platform/Release-dates.md`") {
+                "---\ntitle: Release dates\nsources:\n  - \"[[2026-09-24-standup]]\"\n---\n# Release dates\nFriday.\n".into()
             } else {
                 "NO CHANGE".into()
             })
         })
         .unwrap();
-        assert_eq!(done, FollowUps { current: vec!["Current/Project.md".into()], rulings: 1 });
-        assert_eq!(asked.len(), 2, "one ask per Current page that exists");
+        assert_eq!(
+            done,
+            FollowUps { updated: vec!["Current/Project.md".into()], created: vec!["Platform/Release-dates.md".into()], rulings: 1 }
+        );
         assert_eq!(fs::read_to_string(root.join("Current/Project.md")).unwrap(), project, "proposed, not written");
+        assert!(!root.join("Platform/Release-dates.md").exists());
         assert_eq!(fs::read_to_string(root.join("_meta/DECISIONS.md")).unwrap(), log);
-        let items = db.list_open_review_items().unwrap();
-        let titles: Vec<&str> = items.iter().filter(|i| i.kind == crate::wikidraft::PROPOSAL_KIND).map(|i| i.title.as_str()).collect();
-        assert!(titles.iter().any(|t| t.starts_with("Ruling for Ana:")), "{titles:?}");
-        assert!(titles.contains(&"Proposed: Current/Project.md from 2026-09-24-standup"), "{titles:?}");
 
-        // Nothing overturned: Current pages are not asked about.
-        let quiet = NOTE.replace("**Ship date is Friday, not Monday.** Current/Project.md said Monday.", "Nothing overturns.");
-        let mut asked_again = 0;
-        follow_ups(root, &mut db, &placement, &quiet, "2026-09-24", 9, |_| {
-            asked_again += 1;
-            Ok("NO CHANGE".into())
-        })
-        .unwrap();
-        assert_eq!(asked_again, 0);
+        let props: Vec<crate::wikidraft::Proposal> = db
+            .list_open_review_items()
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.kind == crate::wikidraft::PROPOSAL_KIND)
+            .map(|i| serde_json::from_str(i.payload.as_deref().unwrap()).unwrap())
+            .collect();
+        let new_page = props.iter().find(|p| p.page == "Platform/Release-dates.md").unwrap();
+        assert_eq!(new_page.base, "");
+        assert!(new_page.proposed.contains("status: draft"));
+        crate::wikidraft::apply(root, new_page).unwrap();
+        assert!(root.join("Platform/Release-dates.md").exists(), "applying a new page creates it");
     }
 }

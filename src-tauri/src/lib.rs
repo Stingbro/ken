@@ -7390,7 +7390,8 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
     let base = base.to_path_buf();
     std::thread::spawn(move || {
         if let Ok(mut db) = Db::open(&base, id) {
-            for raw in ken_core::ingest::waiting(&root) {
+            // Only new sources: one whose note waits for review is not read again.
+            for raw in ken_core::ingest::waiting_new(&root, &db).unwrap_or_default() {
                 let today = local_date_today();
                 let generate = |prompt: &str| -> ken_core::Result<String> {
                     match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
@@ -7625,7 +7626,10 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64) -> CmdResult<Str
 #[serde(rename_all = "camelCase")]
 struct IngestStatusDto {
     has_inbox: bool,
+    /// New sources in Raw, not yet processed.
     waiting: Vec<String>,
+    /// Sources in Raw whose note is written and waiting to be filed.
+    in_review: Vec<String>,
     running: bool,
     claude_found: bool,
 }
@@ -7638,7 +7642,8 @@ fn ingest_status(state: State<SharedState>) -> CmdResult<IngestStatusDto> {
     let root = &active.project.root;
     Ok(IngestStatusDto {
         has_inbox: ken_core::ingest::has_inbox(root),
-        waiting: ken_core::ingest::waiting(root),
+        waiting: ken_core::ingest::waiting_new(root, &active.db).map_err(err)?,
+        in_review: ken_core::ingest::in_review(&active.db).map_err(err)?,
         running: INGEST_RUNNING.lock().unwrap().contains(&active.project.config.id),
         claude_found: ken_core::runner::discover_claude().is_some(),
     })
@@ -7672,6 +7677,25 @@ fn ingest_undo(state: State<SharedState>, item_id: i64) -> CmdResult<bool> {
     let removed = ken_core::ingest::undo(&active.project.root, &card).map_err(err)?;
     active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
     Ok(removed)
+}
+
+/// Done with an ingest: its source moves from Raw/ beside its note, in its
+/// kind's folder and month, and the card is resolved.
+#[tauri::command]
+fn ingest_file(state: State<SharedState>, item_id: i64) -> CmdResult<String> {
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, None)?;
+    let item = active
+        .db
+        .list_open_review_items()
+        .map_err(err)?
+        .into_iter()
+        .find(|it| it.id == item_id && it.kind == ken_core::ingest::REVIEW_KIND)
+        .ok_or("no open ingest card with that id")?;
+    let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
+    let filed = ken_core::ingest::file(&active.project.root, &card).map_err(err)?;
+    active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
+    Ok(filed.placement.source)
 }
 
 /// The last drift sweep for the focused project, if one has run.
@@ -14677,6 +14701,7 @@ pub fn run() {
             ingest_status,
             ingest_now,
             ingest_undo,
+            ingest_file,
             draft_wiki,
             wiki_add_repos,
             setup_create_wiki,

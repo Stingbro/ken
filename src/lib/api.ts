@@ -78,7 +78,10 @@ export type SetupMoved =
 
 export interface IngestStatus {
   hasInbox: boolean;
+  /** New sources in Raw, not yet processed. */
   waiting: string[];
+  /** Sources in Raw whose note is written and waiting to be filed. */
+  inReview: string[];
   running: boolean;
   claudeFound: boolean;
 }
@@ -1767,6 +1770,8 @@ export const api = {
   ingestNow: () => invoke<boolean>("ingest_now"),
   /** Undo an ingest card: source back to Raw/, note removed unless edited. */
   ingestUndo: (itemId: number) => invoke<boolean>("ingest_undo", { itemId }),
+  /** Done with an ingest: its source moves beside its note. Returns where. */
+  ingestFile: (itemId: number) => invoke<string>("ingest_file", { itemId }),
   /** The last drift sweep (null before the first). */
   driftStatus: () => invoke<DriftRun | null>("drift_status"),
   /** Run the drift sweep now. */

@@ -1,8 +1,8 @@
 <script lang="ts">
-  // The library inbox (knowledge-layer step 12): what waits in
-  // Research/Ingestion/Raw/. Each source is read in the background into one
-  // dated note under Ingested/, and a card of key takeaways lands on Review,
-  // where a person undoes what is wrong.
+  // The library inbox (knowledge-layer step 12), in two parts: each source in
+  // Research/Ingestion/Raw/ is processed into a dated note with its proposed
+  // wiki changes on Review; once the person is done, Done, file it moves the
+  // source beside its note, by kind and month.
   import { onMount } from "svelte";
   import { api, type IngestStatus } from "../lib/api";
   import { app } from "../lib/app.svelte";
@@ -43,9 +43,11 @@
   <h2>Ingest</h2>
   <p class="note">
     Drop a transcript, a document, an export or pasted notes in
-    <span class="mono">Research/Ingestion/Raw/</span>. Ken reads each one into a dated note in
-    <span class="mono">Ingested/</span>, moves the source beside it, and puts a card of key
-    takeaways on Review. You read the card and undo what is wrong; nothing needs confirming.
+    <span class="mono">Research/Ingestion/Raw/</span>. Ken processes each one: a dated note with the
+    summary and what it overturns, and proposed changes to the wiki (pages it changes, new pages it
+    calls for, rulings for their deciders), each on Review. When you are done, <strong>Done, file
+    it</strong> moves the source beside its note in
+    <span class="mono">Ingested/&lt;Meetings, Recordings or Documents&gt;/&lt;month&gt;/</span>.
   </p>
 
   {#if error}<p class="warn">{error}</p>{/if}
@@ -59,8 +61,16 @@
     {#if !status.claudeFound}
       <p class="warn">Reading the inbox needs the Claude Code CLI. Install it and run <span class="mono">claude</span> once to log in.</p>
     {/if}
+    {#if status.inReview.length > 0}
+      <p class="counts"><strong>{status.inReview.length}</strong> processed, waiting on Review to be filed</p>
+      <ul class="waiting">
+        {#each status.inReview as w (w)}
+          <li><button class="link mono" onclick={() => app.openInFiles(w)}>{w.split("/").pop()}</button></li>
+        {/each}
+      </ul>
+    {/if}
     {#if status.waiting.length === 0}
-      <p class="note">Nothing waiting. The inbox is empty, as it should be.</p>
+      <p class="note">{status.inReview.length > 0 ? "Nothing new to process." : "Nothing waiting. The inbox is empty, as it should be."}</p>
     {:else}
       <p class="counts"><strong>{status.waiting.length}</strong> waiting{status.running ? " · reading now" : ""}</p>
       <ul class="waiting">

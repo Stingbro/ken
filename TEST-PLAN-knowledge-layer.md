@@ -139,18 +139,23 @@ keyword index over sections.
 
 - [ ] The rail item reads **Ingest**; its first tab **Ingest** shows
   `2026-09-20 standup.txt` waiting. (Tabs: Ingest · Recipes · Automations.)
-- [ ] **Read them now**. When it finishes: the Raw folder is empty;
-  `Research/Ingestion/Ingested/<today>-2026-09-20-standup.md` exists, with
-  `status: evidence` and `source:` pointing at the moved file beside it.
+- [ ] **Read them now**. When it finishes (part one, processing):
+  `Research/Ingestion/Ingested/Meetings/<this month>/<today>-2026-09-20-standup.md`
+  exists, with `status: evidence`, `kind: meeting`, and `source:` naming
+  where the source will be filed. The source is **still in Raw**; the Ingest
+  tab lists it as processed, waiting on Review to be filed, and a second
+  **Read them now** does not read it again.
 - [ ] Review has **Ingested: …** with what it overturns (the ship date) and the
-  actions (Ben, the save bug). **Undo** puts the source back in Raw and removes
-  the note.
-- [ ] The note overturns the ship date, so Review also has
-  **Proposed: Current/Project.md from …** with the change as a diff. Nothing
-  was written: apply it and the page changes; discard it and it does not.
-- [ ] If the standup had a ruling said in the room, a **Ruling for <decider>**
-  card proposes the next `D-nnn` entry for `_meta/DECISIONS.md`, citing the
-  note. The log is unchanged until it is applied.
+  actions (Ben, the save bug), and beside it the proposals: a
+  **Proposed: Current/Project.md from …** diff, any **New page: …** the note
+  calls for, and a **Ruling for …** card if a ruling was said in the room.
+  Nothing in the wiki changed yet: apply one and only that page changes.
+  No proposal touches Ways-of-Working, Research, Templates or `_meta` pages
+  other than the decisions log.
+- [ ] Part two: **Done, file it** on the ingest card moves the source from Raw
+  to `…/Meetings/<month>/<today>-2026-09-20-standup/2026-09-20 standup.txt`,
+  beside its note, and the card is done. Before filing, **Undo** removes the
+  note unless you edited it; the source stays in Raw to be processed again.
 - [ ] Recipes > new from template: **Current, from ingested notes** is offered,
   with its source set to `Research/Ingestion/Ingested` and output `Current/`.
   (Run it only if you want to see a held first run: over the template pages it
@@ -271,8 +276,8 @@ keyword index over sections.
 
 ## Known gaps (not bugs to report)
 
-- Ingest proposes Current changes and rulings; tickets from a note's actions
-  are Wright's, in the team repo, and stay listed on the ingest card. Undoing
-  an ingest leaves its proposal cards for you to discard.
+- Tickets from a note's actions are Wright's, in the team repo, and stay
+  listed on the ingest card. Undoing an ingest leaves its proposal cards for
+  you to discard.
 - 2b is built by section; the all-projects search and the MCP do not filter
   by audience yet (the project search box does).

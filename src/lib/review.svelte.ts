@@ -31,7 +31,8 @@ export type InboxAction =
   | "keep-original"
   | "open-both"
   | "undo-ingest"
-  | "apply-proposal";
+  | "apply-proposal"
+  | "file-ingest";
 
 export function actionsFor(kind: InboxKind): InboxAction[] {
   switch (kind) {
@@ -53,7 +54,7 @@ export function actionsFor(kind: InboxKind): InboxAction[] {
     case "ingest":
       // One card of key takeaways per source: read it, undo a wrong one,
       // or mark it seen. Nobody confirms a note.
-      return ["open-files", "undo-ingest", "mark-done"];
+      return ["file-ingest", "open-files", "undo-ingest"];
     case "page-proposal":
       // A change to a page a person keeps: apply it, or discard it.
       return ["apply-proposal", "mark-done"];
@@ -305,6 +306,12 @@ class ReviewStore {
   /** Undo an ingest card (source back to Raw/, note removed unless edited). */
   async undoIngest(item: InboxItem) {
     await api.ingestUndo(numericId(item));
+    await this.refresh();
+  }
+
+  /** Done with an ingest: file its source beside its note. */
+  async fileIngest(item: InboxItem) {
+    await api.ingestFile(numericId(item));
     await this.refresh();
   }
 
