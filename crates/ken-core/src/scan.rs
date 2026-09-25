@@ -1310,6 +1310,21 @@ mod tests {
         scan(&project, &mut db).unwrap();
         assert!(db.next_pending_extraction().unwrap().is_some(), "full tier: queued");
         assert_eq!(db.extraction_coverage().unwrap().1, 2);
+        // What the graph read out of them: one entity from plan.md alone, one
+        // also backed by a file that stays full, and an event from notes.md.
+        let entity = |name: &str, sources: &[&str]| crate::db::EntityInput {
+            kind: "topic".into(),
+            name: name.into(),
+            summary: String::new(),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+            connections: Vec::new(),
+        };
+        db.replace_knowledge_model(
+            &[entity("Ship", &["plan.md"]), entity("Notes", &["notes.md", "elsewhere.md"])],
+            &[crate::db::EventInput { date: "2026-09-25".into(), category: "note".into(), text: "x".into(), source: "notes.md".into() }],
+            1,
+        )
+        .unwrap();
 
         fs::write(dir.path().join(".kenignore"), "~*\n").unwrap();
         let stats = scan(&project, &mut db).unwrap();
@@ -1318,6 +1333,11 @@ mod tests {
         assert_eq!(db.extraction_coverage().unwrap().1, 0, "not counted as extractable");
         assert_eq!(db.backfill_extractions().unwrap(), 0, "backfill leaves search-only alone");
         assert_eq!(db.unqueued_extractable_count().unwrap(), 0);
+        // Their entities left the graph with them; one another file backs stays.
+        let (entities, _) = db.list_entities_with_edges().unwrap();
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Notes"], "{names:?}");
+        assert_eq!(entities[0].sources, vec!["elsewhere.md".to_string()]);
 
         // Back to full: the files are extractable again and backfill queues them.
         fs::remove_file(dir.path().join(".kenignore")).unwrap();

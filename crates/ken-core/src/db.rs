@@ -2551,11 +2551,28 @@ impl Db {
     pub fn set_file_tiers(&mut self, tiers: &[(String, crate::kenignore::Tier)]) -> Result<(usize, usize)> {
         let tx = self.conn.savepoint()?;
         let mut retiered = 0;
+        // Files leaving the full tier: what was read out of them for the graph
+        // leaves with them, and their extraction record goes, so a file that
+        // comes back to full is read again rather than counted as done.
+        let mut demoted: Vec<&str> = Vec::new();
         {
+            let mut was = tx.prepare("SELECT tier FROM files WHERE rel_path = ?1")?;
             let mut stmt =
                 tx.prepare("UPDATE files SET tier = ?2 WHERE rel_path = ?1 AND tier <> ?2")?;
             for (rel, tier) in tiers {
-                retiered += stmt.execute(params![rel, *tier as i64])?;
+                let before: Option<i64> = was.query_row(params![rel], |r| r.get(0)).ok();
+                let changed = stmt.execute(params![rel, *tier as i64])?;
+                retiered += changed;
+                if changed > 0 && before == Some(0) && *tier as i64 != 0 {
+                    demoted.push(rel.as_str());
+                }
+            }
+        }
+        strip_files(&tx, &demoted)?;
+        {
+            let mut del = tx.prepare("DELETE FROM extractions WHERE rel_path = ?1")?;
+            for rel in &demoted {
+                del.execute(params![rel])?;
             }
         }
         let dropped = tx.execute(
@@ -3318,6 +3335,40 @@ fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
 /// transaction: delete its events, remove it from every entity's `sources`,
 /// and delete entities left with no sources (their edges cascade via the
 /// `entity_edges` FK `ON DELETE CASCADE`).
+/// [`strip_file`] for many files at once, reading the entities once: a whole
+/// repo re-tiered to search-only would otherwise scan them once per file.
+fn strip_files(conn: &Connection, rel_paths: &[&str]) -> Result<()> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut del = conn.prepare("DELETE FROM events WHERE source = ?1")?;
+        for p in rel_paths {
+            del.execute(params![p])?;
+        }
+    }
+    let gone: std::collections::HashSet<&str> = rel_paths.iter().copied().collect();
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, sources FROM entities")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        mapped.collect::<std::result::Result<_, _>>()?
+    };
+    for (id, sources_json) in rows {
+        let mut sources: Vec<String> = serde_json::from_str(&sources_json).unwrap_or_default();
+        let before = sources.len();
+        sources.retain(|s| !gone.contains(s.as_str()));
+        if sources.len() == before {
+            continue;
+        }
+        if sources.is_empty() {
+            conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
+        } else {
+            conn.execute("UPDATE entities SET sources = ?2 WHERE id = ?1", params![id, serde_json::to_string(&sources).unwrap()])?;
+        }
+    }
+    Ok(())
+}
+
 fn strip_file(conn: &Connection, rel_path: &str) -> Result<()> {
     conn.execute("DELETE FROM events WHERE source = ?1", params![rel_path])?;
 
