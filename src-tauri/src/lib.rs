@@ -7388,6 +7388,18 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
         return false;
     }
     let base = base.to_path_buf();
+    // Where a note's actions become tickets: the team repo on this library's team.
+    let team_repo: Option<std::path::PathBuf> = Registry::load(&base).ok().and_then(|reg| {
+        let team = reg.entry_at(&root)?.team.clone()?;
+        reg.projects
+            .iter()
+            .find(|e| {
+                e.team.as_deref() == Some(team.as_str())
+                    && e.kind.contains(&ken_core::registry::RepoKind::Team)
+                    && e.path.is_dir()
+            })
+            .map(|e| e.path.clone())
+    });
     std::thread::spawn(move || {
         if let Ok(mut db) = Db::open(&base, id) {
             // Only new sources: one whose note waits for review is not read again.
@@ -7414,7 +7426,7 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
                                 ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
                             }
                         };
-                        if let Err(e) = ken_core::ingest::follow_ups(&root, &mut db, placement, &note, &today, engine::now_epoch(), ask) {
+                        if let Err(e) = ken_core::ingest::follow_ups(&root, &mut db, placement, &note, &today, engine::now_epoch(), team_repo.as_deref(), ask) {
                             eprintln!("warning: ingest follow-ups for {raw} failed: {e}");
                         }
                     }
@@ -7675,6 +7687,8 @@ fn ingest_undo(state: State<SharedState>, item_id: i64) -> CmdResult<bool> {
         .ok_or("no open ingest card with that id")?;
     let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
     let removed = ken_core::ingest::undo(&active.project.root, &card).map_err(err)?;
+    // What it proposed goes with it.
+    ken_core::ingest::withdraw(&mut active.db, &card.placement.note, engine::now_epoch()).map_err(err)?;
     active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
     Ok(removed)
 }

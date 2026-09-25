@@ -511,12 +511,39 @@ pub const PROPOSAL_KIND: &str = "page-proposal";
 
 /// A change to one page, held until a person applies it. `base` is the page
 /// as Ken read it; the change applies only while the page still reads so.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Proposal {
     pub page: String,
     pub base: String,
     pub proposed: String,
+    /// The repo the page is in, when not the one whose Review holds the card
+    /// (a ticket in the team repo, proposed from a note in the wiki).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// A decisions-log entry to append, worked out against the log as it is
+    /// when applied: rulings from one note then apply in any order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<RulingEntry>,
+    /// The ingested note this came from, so undoing the ingest withdraws it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+/// A ruling to append to a decisions log.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RulingEntry {
+    pub ruling: String,
+    pub decider: Option<String>,
+    pub date: String,
+    pub note: String,
+}
+
+impl Proposal {
+    pub fn new(page: impl Into<String>, base: impl Into<String>, proposed: impl Into<String>) -> Proposal {
+        Proposal { page: page.into(), base: base.into(), proposed: proposed.into(), ..Default::default() }
+    }
 }
 
 /// Pages a new repo changes, and what each should gain.
@@ -622,7 +649,7 @@ pub fn draft_added(
                 }
             }
             if changed {
-                let p = Proposal { page: index.clone(), base: text.to_string(), proposed };
+                let p = Proposal::new(index.clone(), text.to_string(), proposed);
                 file_proposal(db, &p, &names, now)?;
                 report.proposed.push(index);
             }
@@ -644,7 +671,7 @@ pub fn draft_added(
         let existing = existing.unwrap_or_default();
         match generate(&update_prompt(page, change, &existing, &sources, today)).and_then(|r| finish_update(&r, &existing)) {
             Ok(Some(proposed)) => {
-                file_proposal(db, &Proposal { page: page.to_string(), base: existing, proposed }, &names, now)?;
+                file_proposal(db, &Proposal::new(page.to_string(), existing, proposed), &names, now)?;
                 report.proposed.push(page.to_string());
             }
             Ok(None) => report.kept.push(page.to_string()),
@@ -756,10 +783,18 @@ pub enum ApplyError {
 }
 
 /// Write a proposal, only while the page still reads as `base`: a change
-/// made against an older page would undo whatever a person wrote since.
+/// made against an older page would undo whatever a person wrote since. A
+/// ruling to append goes onto the log as it is now, whatever was added since.
+/// `wiki` is the repo whose Review holds the card; `p.root` wins when set.
 pub fn apply(wiki: &Path, p: &Proposal) -> std::result::Result<(), ApplyError> {
-    let path = wiki.join(&p.page);
+    let root = p.root.as_deref().map(Path::new).unwrap_or(wiki);
+    let path = root.join(&p.page);
     let now = fs::read_to_string(&path).unwrap_or_default();
+    if let Some(r) = &p.append {
+        let log = if now.trim().is_empty() { "# Decisions\n".to_string() } else { now };
+        let text = crate::ingest::decisions_entry(&log, &r.ruling, r.decider.as_deref(), &r.date, &r.note);
+        return write_page(&path, &text).map_err(|e| ApplyError::Io(e.to_string()));
+    }
     if now.replace("\r\n", "\n") != p.base.replace("\r\n", "\n") {
         return Err(ApplyError::Changed);
     }

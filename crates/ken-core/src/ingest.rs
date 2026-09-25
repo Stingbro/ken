@@ -15,9 +15,10 @@
 //!
 //! This is the Ingest half of what Ken called ingests; the other half, a
 //! stored rule that keeps an output page fresh from its sources, is a
-//! recipe (`recipe.rs`), and stays one. Actions become tickets in the team
-//! repo, which is Wright's; the card lists them. The model call is passed in
-//! (`generate`), so the app runs Claude headless and a test a stand-in.
+//! recipe (`recipe.rs`), and stays one. A note's actions become proposed
+//! tickets in the team repo's `tickets/`, in the method's ticket format. The
+//! model call is passed in (`generate`), so the app runs Claude headless and
+//! a test a stand-in. Undoing an ingest withdraws everything it proposed.
 
 use std::fs;
 use std::path::Path;
@@ -473,12 +474,114 @@ pub struct FollowUps {
     pub created: Vec<String>,
     /// Rulings proposed for the decisions log.
     pub rulings: usize,
+    /// Tickets proposed in the team repo.
+    pub tickets: Vec<String>,
+}
+
+/// "Action → who" lines from the note's "Actions and Requests".
+pub fn actions_of(note: &str) -> Vec<(String, Option<String>)> {
+    section_bullets(note, "## Actions and Requests")
+        .into_iter()
+        .map(|l| match l.rsplit_once(" → ").or_else(|| l.rsplit_once(" -> ")) {
+            Some((what, who)) => (what.trim().to_string(), Some(who.trim().trim_end_matches('.').to_string())),
+            None => (l, None),
+        })
+        .collect()
+}
+
+/// The ticket key and next number in a team repo's `tickets/`: the key its
+/// tickets already use (`SR-012.md` → `SR`, 13), else the repo name's
+/// initials.
+pub fn next_ticket(team_repo: &Path) -> (String, u32) {
+    let mut key: Option<String> = None;
+    let mut max = 0;
+    for e in fs::read_dir(team_repo.join("tickets")).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".md") else { continue };
+        let Some((k, n)) = stem.rsplit_once('-') else { continue };
+        let (Ok(n), true) = (n.parse::<u32>(), !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())) else {
+            continue;
+        };
+        key.get_or_insert_with(|| k.to_string());
+        max = max.max(n);
+    }
+    let key = key.unwrap_or_else(|| {
+        let leaf = team_repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let initials: String = leaf
+            .split(|c: char| !c.is_alphanumeric())
+            .filter_map(|w| w.chars().next())
+            .map(|c| c.to_ascii_uppercase())
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if initials.is_empty() { "T".into() } else { initials }
+    });
+    (key, max + 1)
+}
+
+/// One ticket in the method's format, from one action said in a note.
+pub fn ticket_text(id: &str, action: &str, who: Option<&str>, note_stem: &str) -> String {
+    format!(
+        "---
+id: {id}
+kind: ticket
+status: todo
+type:
+size:
+scope: []
+verify: []
+assignee: {}
+---
+
+         ## What and Why
+
+{action}. Asked for in [[{note_stem}]].
+
+## Evidence
+
+Said in [[{note_stem}]].
+
+         ## What Not to Do
+
+(not known yet)
+
+## How You Would Know It Worked
+
+(to be written before the work starts)
+
+         ## thread
+
+",
+        who.unwrap_or("")
+    )
+}
+
+/// Take back what an undone ingest proposed: every open proposal card from
+/// its note is resolved. Returns how many.
+pub fn withdraw(db: &mut Db, note: &str, now: i64) -> Result<usize> {
+    let mut n = 0;
+    for it in db.list_open_review_items()? {
+        if it.kind != crate::wikidraft::PROPOSAL_KIND {
+            continue;
+        }
+        let from = it
+            .payload
+            .as_deref()
+            .and_then(|p| serde_json::from_str::<crate::wikidraft::Proposal>(p).ok())
+            .and_then(|p| p.from);
+        if from.as_deref() == Some(note) {
+            db.resolve_review_item(it.id, now)?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// After a note is written: ask which pages it changes and which new pages
-/// it calls for, propose each (a diff on Review), and propose a
-/// decisions-log entry for each ruling said in the room. `generate` is asked
-/// once for the plan, then once per page.
+/// it calls for, propose each (a diff on Review), a decisions-log entry for
+/// each ruling said in the room, and a ticket in `team_repo` (the team's
+/// team repo, when it has one) for each action. `generate` is asked once
+/// for the plan, then once per page.
+#[allow(clippy::too_many_arguments)]
 pub fn follow_ups(
     root: &Path,
     db: &mut Db,
@@ -486,8 +589,10 @@ pub fn follow_ups(
     note: &str,
     date: &str,
     now: i64,
+    team_repo: Option<&Path>,
     mut generate: impl FnMut(&str) -> Result<String>,
 ) -> Result<FollowUps> {
+    let from = Some(placement.note.clone());
     let mut out = FollowUps::default();
     let stem = placement.note.rsplit('/').next().unwrap_or(&placement.note).trim_end_matches(".md").to_string();
     let source = [crate::wikidraft::Source { label: format!("[[{stem}]]"), text: note.to_string() }];
@@ -500,7 +605,7 @@ pub fn follow_ups(
         let reply = generate(&crate::wikidraft::update_prompt(page, change, &existing, &source, date))
             .and_then(|r| crate::wikidraft::finish_update(&r, &existing));
         if let Ok(Some(proposed)) = reply {
-            let p = crate::wikidraft::Proposal { page: page.clone(), base: existing, proposed };
+            let p = crate::wikidraft::Proposal { from: from.clone(), ..crate::wikidraft::Proposal::new(page.clone(), existing, proposed) };
             let title = format!("Proposed: {page} from {stem}");
             let body = format!(
                 "The note {stem} changes what {page} says. Ken proposes this change; apply it to write it, or discard \
@@ -514,7 +619,7 @@ pub fn follow_ups(
         let reply = generate(&crate::wikidraft::prompt(&new.path, &new.purpose, None, &source, date))
             .and_then(|r| crate::wikidraft::finish(&r));
         if let Ok(proposed) = reply {
-            let p = crate::wikidraft::Proposal { page: new.path.clone(), base: String::new(), proposed };
+            let p = crate::wikidraft::Proposal { from: from.clone(), ..crate::wikidraft::Proposal::new(new.path.clone(), "", proposed) };
             let title = format!("New page: {} from {stem}", new.path);
             let body = format!(
                 "The note {stem} covers something no page does yet: {}. Ken drafted {}; create it to write it, or \
@@ -529,19 +634,52 @@ pub fn follow_ups(
     let rulings = rulings_of(note);
     if !rulings.is_empty() {
         let log = db.paths_named(&["decisions.md"])?.into_iter().next().unwrap_or_else(|| "_meta/DECISIONS.md".to_string());
-        let mut text = fs::read_to_string(root.join(&log)).unwrap_or_else(|_| "# Decisions\n".to_string());
+        let text = fs::read_to_string(root.join(&log)).unwrap_or_else(|_| "# Decisions\n".to_string());
         for (ruling, decider) in &rulings {
+            // Shown as the entry against the log now; applied against the log
+            // as it is then, so rulings from one note apply in any order.
             let proposed = decisions_entry(&text, ruling, decider.as_deref(), date, &stem);
-            let p = crate::wikidraft::Proposal { page: log.clone(), base: text.clone(), proposed: proposed.clone() };
+            let p = crate::wikidraft::Proposal {
+                append: Some(crate::wikidraft::RulingEntry {
+                    ruling: ruling.clone(),
+                    decider: decider.clone(),
+                    date: date.to_string(),
+                    note: stem.clone(),
+                }),
+                from: from.clone(),
+                ..crate::wikidraft::Proposal::new(log.clone(), text.clone(), proposed)
+            };
             let who = decider.as_deref().unwrap_or("its decider");
             let title = format!("Ruling for {who}: {}", ruling.chars().take(60).collect::<String>());
             let body = format!(
                 "Said in the room, per {stem}: \"{ruling}\". A ruling is its decider's to record: {who} applies this entry \
-                 to the decisions log, or discards it. With several rulings from one note, apply them in order."
+                 to the decisions log, or discards it. It takes the next number when applied."
             );
             crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
-            text = proposed;
             out.rulings += 1;
+        }
+    }
+
+    // Actions become tickets in the team repo, each a new file to create.
+    if let Some(team) = team_repo {
+        let (key, mut next) = next_ticket(team);
+        for (action, who) in actions_of(note) {
+            let id = format!("{key}-{next:03}");
+            next += 1;
+            let page = format!("tickets/{id}.md");
+            let p = crate::wikidraft::Proposal {
+                root: Some(team.to_string_lossy().to_string()),
+                from: from.clone(),
+                ..crate::wikidraft::Proposal::new(page.clone(), "", ticket_text(&id, &action, who.as_deref(), &stem))
+            };
+            let team_name = team.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let title = format!("Ticket {id} in {team_name}: {}", action.chars().take(60).collect::<String>());
+            let body = format!(
+                "An action from {stem}{}. Ken drafted {page} in {team_name} in the method's ticket format; create it,                  or discard it. Its type and size are for the team to set.",
+                who.as_deref().map(|w| format!(", for {w}")).unwrap_or_default()
+            );
+            crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
+            out.tickets.push(id);
         }
     }
     Ok(out)
@@ -716,8 +854,12 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&crate::project::Project::create(root, "Wiki").unwrap(), &mut db).unwrap();
         let placement = place(root, "Research/Ingestion/Raw/standup.txt", "2026-09-24", SourceKind::Meeting);
+        let team = tempfile::tempdir().unwrap();
+        let team_repo = team.path().join("Realms-Team");
+        fs::create_dir_all(team_repo.join("tickets")).unwrap();
+        fs::write(team_repo.join("tickets/RT-004.md"), "---\nid: RT-004\n---\n").unwrap();
 
-        let done = follow_ups(root, &mut db, &placement, NOTE, "2026-09-24", 9, |p| {
+        let done = follow_ups(root, &mut db, &placement, NOTE, "2026-09-24", 9, Some(&team_repo), |p| {
             Ok(if p.contains("PAGES IN THE WIKI") {
                 assert!(p.contains("- Current/Project.md — Project") && !p.contains("_meta/DECISIONS.md"), "{p}");
                 "{\"update\": [\"Current/Project.md\"], \"create\": [{\"path\": \"Platform/Release-dates.md\", \"purpose\": \"when we ship\"}]}".into()
@@ -732,7 +874,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             done,
-            FollowUps { updated: vec!["Current/Project.md".into()], created: vec!["Platform/Release-dates.md".into()], rulings: 1 }
+            FollowUps {
+                updated: vec!["Current/Project.md".into()],
+                created: vec!["Platform/Release-dates.md".into()],
+                rulings: 1,
+                tickets: vec!["RT-005".into()],
+            }
         );
         assert_eq!(fs::read_to_string(root.join("Current/Project.md")).unwrap(), project, "proposed, not written");
         assert!(!root.join("Platform/Release-dates.md").exists());
@@ -750,5 +897,38 @@ mod tests {
         assert!(new_page.proposed.contains("status: draft"));
         crate::wikidraft::apply(root, new_page).unwrap();
         assert!(root.join("Platform/Release-dates.md").exists(), "applying a new page creates it");
+
+        // The ticket lands in the team repo, in the method's format.
+        let ticket = props.iter().find(|p| p.page == "tickets/RT-005.md").unwrap();
+        assert!(!team_repo.join("tickets/RT-005.md").exists(), "proposed, not written");
+        crate::wikidraft::apply(root, ticket).unwrap();
+        let text = fs::read_to_string(team_repo.join("tickets/RT-005.md")).unwrap();
+        assert!(text.contains("id: RT-005") && text.contains("assignee: Ben") && text.contains("Fix the save bug"));
+
+        // A ruling appends to the log as it is when applied, so another
+        // entry landing first does not stale it.
+        let ruling = props.iter().find(|p| p.append.is_some()).unwrap();
+        fs::write(root.join("_meta/DECISIONS.md"), format!("{log}\nD-002 · 2026-09-20 · other — Added by hand.\n")).unwrap();
+        crate::wikidraft::apply(root, ruling).unwrap();
+        let after = fs::read_to_string(root.join("_meta/DECISIONS.md")).unwrap();
+        assert!(after.contains("Added by hand.") && after.contains("D-003 · 2026-09-24"), "{after}");
+
+        // Undoing the ingest withdraws what is still open from it.
+        let open_before = db.list_open_review_items().unwrap().iter().filter(|i| i.kind == crate::wikidraft::PROPOSAL_KIND).count();
+        assert_eq!(withdraw(&mut db, &placement.note, 10).unwrap(), open_before);
+        assert_eq!(withdraw(&mut db, &placement.note, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn actions_and_ticket_keys() {
+        assert_eq!(actions_of(NOTE), vec![("Fix the save bug".to_string(), Some("Ben".to_string()))]);
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("Shattered-Realms");
+        fs::create_dir_all(&repo).unwrap();
+        assert_eq!(next_ticket(&repo), ("SR".to_string(), 1));
+        fs::create_dir_all(repo.join("tickets")).unwrap();
+        fs::write(repo.join("tickets/SRX-012.md"), "").unwrap();
+        fs::write(repo.join("tickets/TICKET.md"), "").unwrap();
+        assert_eq!(next_ticket(&repo), ("SRX".to_string(), 13));
     }
 }

@@ -152,10 +152,16 @@ keyword index over sections.
   Nothing in the wiki changed yet: apply one and only that page changes.
   No proposal touches Ways-of-Working, Research, Templates or `_meta` pages
   other than the decisions log.
+- [ ] With a team repo on the same team (kind **team**), the save-bug action is
+  a **Ticket <KEY>-nnn in <team repo>** card: a new `tickets/<KEY>-nnn.md` in
+  the method's ticket format, assignee Ben. Create it and the file appears in
+  the team repo. Two rulings from one note apply in either order, each taking
+  the next `D-nnn` when applied.
 - [ ] Part two: **Done, file it** on the ingest card moves the source from Raw
   to `…/Meetings/<month>/<today>-2026-09-20-standup/2026-09-20 standup.txt`,
   beside its note, and the card is done. Before filing, **Undo** removes the
-  note unless you edited it; the source stays in Raw to be processed again.
+  note unless you edited it, withdraws every proposal still open from it, and
+  leaves the source in Raw to be processed again.
 - [ ] Recipes > new from template: **Current, from ingested notes** is offered,
   with its source set to `Research/Ingestion/Ingested` and output `Current/`.
   (Run it only if you want to see a held first run: over the template pages it
@@ -276,8 +282,5 @@ keyword index over sections.
 
 ## Known gaps (not bugs to report)
 
-- Tickets from a note's actions are Wright's, in the team repo, and stay
-  listed on the ingest card. Undoing an ingest leaves its proposal cards for
-  you to discard.
 - 2b is built by section; the all-projects search and the MCP do not filter
   by audience yet (the project search box does).
