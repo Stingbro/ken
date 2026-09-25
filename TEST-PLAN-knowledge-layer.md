@@ -28,34 +28,47 @@ Steps refer to the report "Ken at Level Two" and to `SESSION-HANDOFF.md`.
 - [ ] On the start screen, the first choice reads **Set up Ken for your code**,
   even if you have never turned on any feature.
 
-## 2. Folder, Team, Repos (step 4)
+## 2. Repos, Team (step 4)
 
-- [ ] Choose the test folder. **Folder** shows **2 repositories · 1 folder
-  without git**, and the test folder's path.
+There is no "where is your code?" step: you pick the repos themselves.
+
+- [ ] **Pick repos…**: select `Realms-Docs` and `Realms-Game` together (the
+  dialog takes several). Then **Add more repos…**: pick `Realms-Game-u7` and
+  `Personal`.
+- [ ] The **Repos** table:
+  - `Realms-Docs`: kind **wiki**, **read for entities**, evidence mentions
+    `_meta/DECISIONS.md` and an Obsidian vault; its description is prefilled
+    from its README ("The wiki for Realms-Game.").
+  - `Realms-Game`: kind **code**, **searchable only**, evidence mentions
+    `Cargo.toml` and its remote; description from its README.
+  - `Personal`: no kind, **read for entities**, "no git · documents".
+  - `Realms-Game-u7`: unticked, **not indexed**, "a second checkout (git
+    worktree) of another repo".
+  - Each row shows the repo's full folder.
+- [ ] Write a description on `Realms-Game` ("The game: Rust, saves by
+  region."). Add more repos again: your text is still there.
+- [ ] ✕ on `Personal` takes it out.
+- [ ] (A folder of repos) Pick the whole test folder: its repos appear as rows,
+  not the folder itself.
 - [ ] No file has appeared in the test folder yet (no `.kenignore`, no
   `.ken-workspace`).
-- [ ] **Team**: "Use the teams this folder suggests" names **Realms**.
-- [ ] **Repos** table:
-  - `Realms-Docs`: kind **wiki**, index **read for entities**, team **Realms**,
-    evidence mentions `_meta/DECISIONS.md` and an Obsidian vault.
-  - `Realms-Game`: kind **code**, index **searchable only**, team **Realms**,
-    evidence mentions `Cargo.toml`, its remote, and "Realms-Docs's README names it".
-  - `Personal`: no kind, **read for entities**, no team, "no git · documents".
-  - `Realms-Game-u7` is **not** a row.
-- [ ] **Skip list**: `Realms-Game-u7/` ticked ("a second checkout of
-  Realms-Game"), and a greyed Secrets row you cannot untick.
+- [ ] **Team**: `Realms-Docs` and `Realms-Game` show team **Realms** (the docs
+  README names the game), and "Suggested: Realms".
 
 ## 3. Index and Confirm (steps 4, 2, 4b)
 
-- [ ] **Index** says **2 read for entities · 1 searchable only · 0 not indexed**.
+- [ ] **Index** counts what you kept (with Personal taken out and the worktree
+  off: **1 read for entities · 1 searchable only · 1 not indexed**).
 - [ ] (3c, needs Claude) Tick **Draft the first wiki pages from these repos**;
   it offers `Realms-Docs`. Leave it ticked if Claude is set up.
 - [ ] Confirm. The workspace opens.
-- [ ] The test folder now has `.kenignore` with
-  `# Ken proposed these at set-up on <today>`, a comment line, then
-  `Realms-Game-u7/`. It has **no** secrets line (those are built in).
-- [ ] `.ken-workspace\workspace.json` lists the 3 members and a group
-  **Realms** with Realms-Docs and Realms-Game.
+- [ ] The test folder is still untouched: no `.kenignore`, no `.ken-workspace`.
+  The workspace is in `%APPDATA%\ken\workspaces\<id>\.ken-workspace\workspace.json`:
+  it lists the members, a `paths` entry per member with its folder, and a
+  group **Realms**.
+- [ ] Settings > Projects > **Repos** shows each repo's description, editable.
+- [ ] (3c) The first-wiki draft's Review card lists
+  `Realms-Game:(what this repo is for, in the team's words)` among its sources.
 - [ ] (3c) Within a few minutes, Review has **First wiki drafted: N pages to
   read**. The drafted pages (for example `Current/Project.md`) say
   `status: draft`, have no `verified:` line, cite sources like
@@ -178,14 +191,11 @@ keyword index over sections.
 - [ ] With **Realms** picked in the scope picker, the graph search shows only
   entities from Realms repos.
 
-## 13. Scan again (step 4)
+## 13. Adding repos later (step 4)
 
-- [ ] Make a new folder in the test folder with a `go.mod` and `git init`.
-  Settings > Repos > **Scan again** lists it as a new folder with **Add**. Add
-  it: it joins the workspace.
-- [ ] `git worktree add ..\Realms-Game-u8 -b u8` inside `Realms-Game`; Scan
-  again lists the worktree with **Skip it**; skipping adds its line to
-  `.kenignore`.
+- [ ] Settings > Projects > Repos > **Add repos…**: pick `Personal`. It joins
+  the workspace with its proposed kind and README description.
+- [ ] Rename a member's folder; **Scan again** names it as gone.
 
 ## After
 

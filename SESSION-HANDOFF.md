@@ -248,6 +248,20 @@ PC (dev), not measured anywhere.
   (`DriftRun.business_pages`, said in the report). The first-wiki draft
   adds `Work/Releases.md` from CHANGELOG/RELEASES and git tags. Not yet:
   the audience filter in all-projects search and the MCP.
+- **Set-up picks repos one by one (2026-09-25).** No folder step: the
+  person picks each repo (several at a time; a folder of repos stands for
+  each inside it; a worktree comes back off). `setup::propose_repos`,
+  `setup::confirm_repos`; the workspace lives in Ken's app data
+  (`%APPDATA%\ken\workspaces\<id>`), nothing is written in a shared parent.
+  `WorkspaceConfig.paths` maps a member's short name to its folder
+  (`Workspace::member_root`, `create_at`); workspaces in a parent folder
+  keep resolving members relative to it. Each repo has a `description`
+  (proposed from its README's first paragraph, editable at set-up and in
+  Settings > Repos; registry `description`, `set_project_description`),
+  read first by the first-wiki draft. Settings > Repos > Add repos… adds
+  picked repos to the open workspace. `plain_canonical` strips Windows'
+  verbatim path prefix. The folder-based `propose`/`confirm` remain for
+  Scan again in parent-folder workspaces.
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
   ken-core on this PC: 812 pass, 53 fail (all pre-existing, Windows);
