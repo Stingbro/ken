@@ -3,7 +3,8 @@
   // numbers are derived live from `app.files`; the counting/copy lives in
   // ./homeStatus so it can be unit-tested.
   import { app } from "../lib/app.svelte";
-  import { api, type IndexHealth } from "../lib/api";
+  import { api, type DriftRun, type IndexHealth } from "../lib/api";
+  import { review } from "../lib/review.svelte";
   import { timeAgo } from "../lib/format";
   import {
     cloudPresentation,
@@ -31,6 +32,29 @@
       () => (health = null),
     );
   });
+  // The last drift sweep, for a wiki or team repo that has had one, and a
+  // way to run it now instead of waiting for its interval.
+  let drift = $state<DriftRun | null>(null);
+  let drifting = $state(false);
+  $effect(() => {
+    void app.project?.id;
+    api.driftStatus().then(
+      (d) => (drift = d),
+      () => (drift = null),
+    );
+  });
+  async function checkDrift() {
+    drifting = true;
+    try {
+      drift = await api.runDriftNow();
+      await review.refresh();
+    } catch {
+      /* the Review card, or its absence, says what happened */
+    } finally {
+      drifting = false;
+    }
+  }
+
   const figures = $derived(health ? healthFigures(health) : []);
   const warning = $derived(health ? healthWarning(health) : null);
 </script>
@@ -77,6 +101,19 @@
     {/if}
     {#if warning}
       <p class="health-warning" role="status">{warning}</p>
+    {/if}
+
+    {#if drift}
+      <div class="drift">
+        <span>
+          Drift checked {timeAgo(drift.at)}:
+          {drift.measured ?? drift.codeCitations} citations measured{#if drift.reused}, {drift.reused}
+            carried from the last check (their files unchanged){/if}.
+        </span>
+        <button class="btn btn-ghost" disabled={drifting} onclick={checkDrift}>
+          {drifting ? "Checking…" : "Check for drift now"}
+        </button>
+      </div>
     {/if}
 
     <div class="sync">
@@ -164,6 +201,18 @@
     }
   }
 
+  .drift {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    font-size: 12.5px;
+    color: var(--ink-secondary);
+  }
+  .drift .btn {
+    margin-left: auto;
+  }
   .sync {
     display: flex;
     align-items: center;

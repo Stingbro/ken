@@ -169,6 +169,18 @@ keyword index over sections.
     (never verified);
   - that no controls are declared.
 - [ ] Nothing in the wiki was edited by the sweep.
+- [ ] Home › **Check for drift now** with nothing committed in `Realms-Game`: the card
+  reads the same. Then commit a real change to `src/combat.rs` in
+  `Realms-Game` and check again: `Platform/Combat.md` now appears under
+  **Is the page still true?**, and nothing else changes. (The sweep asks git
+  once per repo what changed and re-measures only those files.)
+
+## 10b. The watcher at scale
+
+- [ ] With `Realms-Docs` focused, edit and save `Platform/Save.md` outside
+  Ken. Search finds the new words within a couple of seconds.
+- [ ] Create `Realms-Docs/build/` with a file in it and add `build/` to its
+  `.gitignore` first: the file never shows in search.
 
 ## 11. Settings and the team (step 15)
 

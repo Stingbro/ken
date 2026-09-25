@@ -1,6 +1,6 @@
 # Session handoff — Ken at Level 2 (`knowledge-layer`)
 
-Last updated: 2026-09-24. Branch: `knowledge-layer`, cut from
+Last updated: 2026-09-25. Branch: `knowledge-layer`, cut from
 `ken-workspace-home` at `f00218c`. Read this top to bottom before doing
 anything. It replaces the 2026-09-01 handoff (SR group folders); what
 still applies from that one is under "Carried over" at the end.
@@ -262,10 +262,41 @@ PC (dev), not measured anywhere.
   picked repos to the open workspace. `plain_canonical` strips Windows'
   verbatim path prefix. The folder-based `propose`/`confirm` remain for
   Scan again in parent-folder workspaces.
+- **The wiki at team level (2026-09-25, `55c2c9a`).** A wiki belongs to a
+  team. Set-up's Team step picks each team's wiki: a wiki repo already
+  picked, a new one (`wikinew`: the Ways-of-Working `templates/wiki`
+  bundled at `b824813` under `crates/ken-core/templates/wiki`, filled with
+  the team, the wiki's name, the repos and their descriptions, `updated:`
+  dates only, never `verified:`; `git init` and one commit, nothing
+  pushed), or none. The draft is two passes (`wikidraft::draft_team`):
+  `Repo-Map/<repo>.md` per repo from that repo alone (own 60k budget),
+  `Repo-Map/Index.md` written by Ken, then the team pages from the repo
+  pages. `team_repos`/`wiki_for` scope a wiki to its team's repos. Adding
+  repos (Settings > Repos): they wait for team and description, then
+  `wiki_add_repos` drafts their pages and files one `page-proposal` card
+  per kept page (architecture, who does what, project, vocabulary, Repo Map
+  index) with a diff; `apply_page_proposal` refuses a page that changed
+  since. Removing a repo does not yet flag the pages that cite it.
+- **Scale (2026-09-25).** Benchmark: `examples/scale_bench.rs`;
+  `examples/search_probe.rs` times searches on a built index.
+  - Scans: one commit per 500 files, `synchronous=NORMAL`, metadata from
+    the listing (`4dfdf97`).
+  - Drift from git diff (`df2b2ff`): `PinCache` in meta `drift_cache`; one
+    `git diff --name-only <last> <now>` per repo, only citations of changed
+    files re-measured; pins once per repo and date; `DriftRun.measured`/
+    `reused`.
+  - Watcher rescans only the named paths (`1a8f2c7`, `scan::scan_paths`,
+    reads `.gitignore`s like the walk; a folder, >2,000 paths or a failure
+    falls back to the full scan).
+  - Search (`4b3edcb`): section FTS ranks before the join (common words at
+    50k files 0.9–1.3 s → ~50–200 ms, same hits); plain all-projects search
+    runs repos in parallel.
+  - Not done: embeddings stay on for code repos; text is stored twice
+    (contents + chunks) — size accepted for now (~12 KB per file).
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
-  ken-core on this PC: 812 pass, 53 fail (all pre-existing, Windows);
-  ken-mcp 39/39; frontend 482/482.
+  ken-core on this PC: 824 pass, 53 fail (all pre-existing, Windows);
+  ken-mcp 39/39; frontend 485/485.
 
 ## The steps, in order
 
