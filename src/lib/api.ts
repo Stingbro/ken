@@ -463,11 +463,29 @@ export const CHAT_MODELS: { label: string; value: string | null }[] = [
 export interface ChatMessage {
   id: number;
   chatId: string;
-  role: "user" | "assistant" | "activity" | "question" | "edit" | "divider";
+  role: "user" | "assistant" | "activity" | "question" | "edit" | "tool" | "divider";
   content: string;
   createdAt: number;
   /** Set on member-scoped emits of `chat-message` (S9 step 5). */
   project_id?: string;
+}
+
+/** A piece of a chat reply as it streams (`chat-delta`). Not kept: the whole
+ *  reply follows as an `assistant` message. */
+export interface ChatDelta {
+  chatId: string;
+  text: string;
+  project_id?: string;
+}
+
+/** A tool Claude called in chat: the content of a `tool` message. */
+export interface ToolCard {
+  toolUseId: string;
+  name: string;
+  summary: string;
+  status: "running" | "done" | "error";
+  /** The start of the result, once it came back. */
+  result?: string;
 }
 
 /** An edit Claude proposed in chat (`chat::EditProposal`): the file before
@@ -2215,6 +2233,8 @@ export const api = {
     listen<ChatRow>("chat-updated", (e) => fn(e.payload)),
   onChatMessage: (fn: (msg: ChatMessage) => void): Promise<UnlistenFn> =>
     listen<ChatMessage>("chat-message", (e) => fn(e.payload)),
+  onChatDelta: (fn: (d: ChatDelta) => void): Promise<UnlistenFn> =>
+    listen<ChatDelta>("chat-delta", (e) => fn(e.payload)),
   onChatPtyData: (fn: (chunk: PtyChunk) => void): Promise<UnlistenFn> =>
     listen<PtyChunk>("chat-pty-data", (e) => fn(e.payload)),
 

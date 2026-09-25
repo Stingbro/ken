@@ -460,6 +460,13 @@ will need their own lines there once decided.
   (research) goes in a temp file with a one-line pointer. Cancelling a
   session now ends node too: each child is put in a job object
   (`proc::track`), not `taskkill`.
+- **Chat streams, with tool cards (as in Headway).** The chat CLI runs
+  with `--include-partial-messages`; `chat::parse_events` reads every
+  block of a line. Text deltas go out as `chat-delta` (shown, not kept)
+  until the whole reply lands. Each tool call is a `tool` message
+  (`{toolUseId,name,summary,status}`), updated in place with its status
+  and the start of its result. UI: `src/chat/ToolCard.svelte`,
+  `toolCard.ts`, `chats.draft`. Test plan §15.
 
 ## Carried over from the 2026-09-01 handoff
 

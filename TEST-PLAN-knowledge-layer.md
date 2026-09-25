@@ -275,6 +275,12 @@ keyword index over sections.
 - [ ] Ask "Where do we decide how saves are written?" The answer cites files
   as links. Clicking one opens it in Files at the cited line or heading, which
   flashes. Claude never opens a tab or switches screen by itself.
+- [ ] While Claude answers, the reply appears word by word with a cursor,
+  then settles into the finished message with no jump or duplicate.
+- [ ] Each tool Claude uses shows as a card ("Ken route query …", "Read …",
+  "Grep …") with a spinner, then a tick. Click a card to see the start of its
+  result; a failed tool shows `!`, a red edge, and opens by itself.
+- [ ] Close and reopen the chat: the cards are still there, none spinning.
 
 ## After
 

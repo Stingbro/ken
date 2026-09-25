@@ -6,3 +6,5 @@ crates/ken-core/templates/** text eol=lf
 # Test fixtures are read byte for byte (PDF offsets, sizes, hashes).
 crates/ken-core/fixtures/** -text
 *.pdf binary
+# Node strips a shebang only when the line ends in LF.
+*.mjs text eol=lf

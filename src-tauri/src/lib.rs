@@ -929,13 +929,59 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     let chat_engine = ken_core::runner::discover_claude().map(|binary| {
         let chat_app = app.clone();
         let update_db = chat_db.clone();
+        // Each tool card's message id by its tool_use_id, so its result
+        // updates the card in place.
+        let tool_cards: Mutex<std::collections::HashMap<String, i64>> = Mutex::new(std::collections::HashMap::new());
         Arc::new(ChatEngine::new(
             binary,
             project.root.clone(),
             move |update: ChatUpdate| {
                 let now = engine::now_epoch();
+                // Streamed text is shown, not kept: no database needed.
+                if let ChatUpdate::Delta { chat_id, text } = &update {
+                    emit_member(&chat_app, project_id, "chat-delta", serde_json::json!({
+                        "chatId": chat_id,
+                        "text": text,
+                    }));
+                    return;
+                }
                 let mut db = update_db.lock().unwrap();
                 match update {
+                    ChatUpdate::Delta { .. } => {}
+                    ChatUpdate::Tool { chat_id, payload } => {
+                        let id = db.append_chat_message(&chat_id, "tool", &payload, now).unwrap_or(0);
+                        let _ = db.touch_chat(&chat_id, now);
+                        if let Some(tool_use_id) = serde_json::from_str::<serde_json::Value>(&payload)
+                            .ok()
+                            .and_then(|v| v.get("toolUseId").and_then(|t| t.as_str()).map(str::to_string))
+                            .filter(|t| !t.is_empty())
+                        {
+                            tool_cards.lock().unwrap().insert(tool_use_id, id);
+                        }
+                        emit_member(&chat_app, project_id, "chat-message", ChatMessage {
+                            id,
+                            chat_id,
+                            role: "tool".into(),
+                            content: payload,
+                            created_at: now,
+                        });
+                    }
+                    ChatUpdate::ToolResult { chat_id, tool_use_id, is_error, preview } => {
+                        let Some(id) = tool_cards.lock().unwrap().remove(&tool_use_id) else { return };
+                        let Ok(Some(old)) = db.chat_message_content(id) else { return };
+                        let Ok(mut card) = serde_json::from_str::<serde_json::Value>(&old) else { return };
+                        card["status"] = serde_json::json!(if is_error { "error" } else { "done" });
+                        card["result"] = serde_json::json!(preview);
+                        let content = card.to_string();
+                        let _ = db.update_chat_message_content(id, &content);
+                        emit_member(&chat_app, project_id, "chat-message", ChatMessage {
+                            id,
+                            chat_id,
+                            role: "tool".into(),
+                            content,
+                            created_at: now,
+                        });
+                    }
                     ChatUpdate::Message { chat_id, role, content } => {
                         let id = db.append_chat_message(&chat_id, &role, &content, now).unwrap_or(0);
                         let _ = db.touch_chat(&chat_id, now);

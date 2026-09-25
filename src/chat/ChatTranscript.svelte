@@ -6,6 +6,8 @@
   import { parseEditProposal } from "../lib/chats.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import EditReview from "./EditReview.svelte";
+  import ToolCardView from "./ToolCard.svelte";
+  import { parseToolCard } from "./toolCard";
 
   let scroller = $state<HTMLDivElement | null>(null);
 
@@ -13,7 +15,9 @@
   // don't yank them down while they're reading earlier messages.
   $effect(() => {
     const len = chats.transcript.length;
+    const streamed = chats.draft.length;
     void len;
+    void streamed;
     const el = scroller;
     if (!el) return;
     const nearBottom =
@@ -39,6 +43,9 @@
   const working = $derived(chats.active?.status === "working");
 </script>
 
+<!-- Delegated clicks on citation links; Enter on a focused link fires the
+     same click, so keyboards are covered. -->
+<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
 <div class="scroll" bind:this={scroller} onclick={onClick} role="log">
   {#if chats.transcript.length === 0}
     <div class="starters">
@@ -59,6 +66,10 @@
       </div>
     {:else if msg.role === "activity"}
       <div class="activity mono">{msg.content}</div>
+    {:else if msg.role === "tool"}
+      {@const card = parseToolCard(msg.content, working)}
+      {#if card}<div class="tool"><ToolCardView {card} /></div>
+      {:else}<div class="activity mono">{msg.content}</div>{/if}
     {:else if msg.role === "question"}
       <QuestionCard {msg} />
     {:else if msg.role === "edit"}
@@ -69,7 +80,12 @@
     {/if}
   {/each}
 
-  {#if working}
+  {#if chats.draft}
+    <div class="assistant streaming" aria-live="polite">
+      <span class="mark">K</span>
+      <div class="md">{@html renderMarkdown(chats.draft)}</div>
+    </div>
+  {:else if working}
     <div class="working">
       <span class="pulse"></span>Ken is working…
     </div>
@@ -194,8 +210,25 @@
     color: var(--ink-tertiary);
     padding-left: var(--gutter);
   }
-  .edit {
+  .edit,
+  .tool {
     margin-left: var(--gutter);
+  }
+  .streaming .md :global(> :last-child)::after {
+    content: "▍";
+    margin-left: 1px;
+    color: var(--ink-tertiary);
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .streaming .md :global(> :last-child)::after {
+      animation: none;
+    }
   }
   .divider {
     display: flex;

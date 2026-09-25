@@ -2084,6 +2084,14 @@ impl Db {
         Ok(())
     }
 
+    /// One message's content (a tool card, before its result is added).
+    pub fn chat_message_content(&self, message_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT content FROM chat_messages WHERE id = ?1", params![message_id], |r| r.get(0))
+            .optional()?)
+    }
+
     pub fn chat_messages(&self, chat_id: &str) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, chat_id, role, content, created_at

@@ -464,13 +464,19 @@ fn run_headless_streaming(
                         on_activity(&truncate(one, 120).to_string());
                     }
                 }
-                ParsedEvent::Activity(s) => on_activity(&s),
+                ParsedEvent::Tool { summary, .. } => on_activity(&summary),
                 ParsedEvent::TurnResult { is_error } => {
                     *result_w.lock().unwrap() = Some(is_error);
                 }
                 // Headless runs never enable the permission control channel,
                 // so a control request here is nothing to act on.
-                ParsedEvent::Init | ParsedEvent::ControlRequest { .. } | ParsedEvent::Other => {}
+                // Headless runs don't ask for partial messages, and a tool's
+                // result isn't activity.
+                ParsedEvent::Init
+                | ParsedEvent::ControlRequest { .. }
+                | ParsedEvent::TextDelta(_)
+                | ParsedEvent::ToolDone { .. }
+                | ParsedEvent::Other => {}
             }
         }
     });

@@ -29,13 +29,27 @@ pub enum ChatUpdate {
     /// Claude wants to edit a file: an [`EditProposal`] as JSON, for the
     /// user to accept or decline change by change. The CLI waits.
     EditProposal { chat_id: String, payload: String },
+    /// A piece of the reply as it streams. Not kept: the whole reply follows
+    /// as a `Message`, which replaces what streamed.
+    Delta { chat_id: String, text: String },
+    /// Claude called a tool: a card to keep. `payload` is
+    /// `{"toolUseId":…,"name":…,"summary":…,"status":"running"}`.
+    Tool { chat_id: String, payload: String },
+    /// A tool's result, for the card with that `tool_use_id`.
+    ToolResult { chat_id: String, tool_use_id: String, is_error: bool, preview: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedEvent {
     Init,
     AssistantText(String),
-    Activity(String),
+    /// A piece of the reply as it is written (`--include-partial-messages`).
+    /// The whole text follows as `AssistantText`, which replaces it.
+    TextDelta(String),
+    /// Claude called a tool: its id, name, and a one-line summary.
+    Tool { id: String, name: String, summary: String },
+    /// A tool's result came back.
+    ToolDone { id: String, is_error: bool, preview: String },
     TurnResult { is_error: bool },
     /// A `can_use_tool` permission request the CLI expects an answer to.
     ControlRequest {
@@ -51,52 +65,79 @@ pub enum ParsedEvent {
 /// permission decision.
 const ASK_TOOL: &str = "AskUserQuestion";
 
-/// Parse one stream-json stdout line. Tolerant: unknown shapes → Other.
+/// Parse one stream-json stdout line into its first event. Tolerant:
+/// unknown shapes → Other.
 pub fn parse_event(line: &str) -> ParsedEvent {
+    parse_events(line).into_iter().next().unwrap_or(ParsedEvent::Other)
+}
+
+/// Every event in one stream-json stdout line, in order: an assistant
+/// message can carry text and several tool calls, and a user message
+/// several tool results.
+pub fn parse_events(line: &str) -> Vec<ParsedEvent> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return ParsedEvent::Other;
+        return vec![ParsedEvent::Other];
     };
-    match v.get("type").and_then(Value::as_str) {
-        Some("system") => ParsedEvent::Init,
-        Some("result") => ParsedEvent::TurnResult {
+    let blocks = || {
+        v.pointer("/message/content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let str_of = |b: &Value, k: &str| b.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let events: Vec<ParsedEvent> = match v.get("type").and_then(Value::as_str) {
+        Some("system") => vec![ParsedEvent::Init],
+        Some("result") => vec![ParsedEvent::TurnResult {
             is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-        },
-        Some("assistant") => {
-            let blocks = v
-                .pointer("/message/content")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            // One event usually carries one block; prefer text, else tool.
-            for b in &blocks {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            if !t.trim().is_empty() {
-                                return ParsedEvent::AssistantText(t.to_string());
-                            }
-                        }
-                    }
-                    Some("tool_use") => {
-                        // The question card renders AskUserQuestion; an
-                        // activity line for it would just be noise.
-                        if b.get("name").and_then(Value::as_str) == Some(ASK_TOOL) {
-                            continue;
-                        }
-                        return ParsedEvent::Activity(summarize_tool(b));
-                    }
-                    _ => {}
+        }],
+        Some("stream_event") => {
+            // Only the main conversation streams into the transcript; a
+            // subagent's partial text (parent_tool_use_id set) does not.
+            let top = v.get("parent_tool_use_id").is_none_or(Value::is_null);
+            let delta = v.pointer("/event/delta");
+            match delta {
+                Some(d) if top && d.get("type").and_then(Value::as_str) == Some("text_delta") => {
+                    let t = str_of(d, "text");
+                    if t.is_empty() { vec![] } else { vec![ParsedEvent::TextDelta(t)] }
                 }
+                _ => vec![],
             }
-            ParsedEvent::Other
         }
+        Some("assistant") => blocks()
+            .iter()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let t = str_of(b, "text");
+                    (!t.trim().is_empty()).then_some(ParsedEvent::AssistantText(t))
+                }
+                // The question card renders AskUserQuestion; a tool card for
+                // it would just be noise.
+                Some("tool_use") if b.get("name").and_then(Value::as_str) != Some(ASK_TOOL) => {
+                    Some(ParsedEvent::Tool {
+                        id: str_of(b, "id"),
+                        name: b.get("name").and_then(Value::as_str).unwrap_or("Tool").to_string(),
+                        summary: summarize_tool(b),
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        Some("user") => blocks()
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .map(|b| ParsedEvent::ToolDone {
+                id: str_of(b, "tool_use_id"),
+                is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                preview: result_preview(b.get("content")),
+            })
+            .collect(),
         Some("control_request") => {
             let req = v.get("request");
             if req.and_then(|r| r.get("subtype")).and_then(Value::as_str) != Some("can_use_tool") {
-                return ParsedEvent::Other;
+                return vec![ParsedEvent::Other];
             }
             let req = req.unwrap();
-            ParsedEvent::ControlRequest {
+            vec![ParsedEvent::ControlRequest {
                 request_id: v
                     .get("request_id")
                     .and_then(Value::as_str)
@@ -113,27 +154,53 @@ pub fn parse_event(line: &str) -> ParsedEvent {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-            }
+            }]
         }
-        _ => ParsedEvent::Other,
+        _ => vec![],
+    };
+    if events.is_empty() { vec![ParsedEvent::Other] } else { events }
+}
+
+/// The start of a tool result, for its card: text only, at most a few lines.
+fn result_preview(content: Option<&Value>) -> String {
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    let mut out: String = text.lines().take(8).collect::<Vec<_>>().join("\n");
+    if out.chars().count() > 600 {
+        out = out.chars().take(600).collect::<String>() + "…";
+    } else if text.lines().count() > 8 {
+        out.push_str("\n…");
     }
+    out
 }
 
 /// "Read notes/meeting.md" — a human-readable one-liner for a tool_use block.
 fn summarize_tool(block: &Value) -> String {
-    let name = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+    let raw = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+    let name = match ken_mcp_tool(raw) {
+        Some(t) => format!("Ken {}", t.replace('_', " ")),
+        None => raw.to_string(),
+    };
     let input = block.get("input");
     let arg = input.and_then(|i| {
-        ["file_path", "path", "pattern", "command", "query", "url", "notebook_path"]
+        ["file_path", "path", "pattern", "command", "query", "url", "notebook_path", "description"]
             .iter()
             .find_map(|k| i.get(k).and_then(Value::as_str))
     });
     match arg {
         Some(a) => {
-            let a = if a.len() > 80 { &a[..80] } else { a };
+            // By characters: a byte cut can land inside one and panic.
+            let a: String = a.chars().take(80).collect();
             format!("{name} {a}")
         }
-        None => name.to_string(),
+        None => name,
     }
 }
 
@@ -629,6 +696,8 @@ impl ChatEngine {
             "--output-format",
             "stream-json",
             "--verbose",
+            // The reply streams in as it is written, not all at once.
+            "--include-partial-messages",
             // Default, not acceptEdits: every Edit/MultiEdit/Write comes back
             // as a permission request, which Ken shows as a diff to accept or
             // decline change by change.
@@ -678,7 +747,8 @@ impl ChatEngine {
             let reader = BufReader::new(stdout);
             let mut saw_result = false;
             for line in reader.lines().map_while(|l| l.ok()) {
-                match parse_event(&line) {
+                for event in parse_events(&line) {
+                match event {
                     ParsedEvent::AssistantText(text) => {
                         saw_result = false;
                         on_update(ChatUpdate::Message {
@@ -687,12 +757,20 @@ impl ChatEngine {
                             content: text,
                         });
                     }
-                    ParsedEvent::Activity(summary) => {
-                        on_update(ChatUpdate::Message {
-                            chat_id: id.clone(),
-                            role: "activity".into(),
-                            content: summary,
+                    ParsedEvent::TextDelta(text) => {
+                        on_update(ChatUpdate::Delta { chat_id: id.clone(), text });
+                    }
+                    ParsedEvent::Tool { id: tool_use_id, name, summary } => {
+                        let payload = serde_json::json!({
+                            "toolUseId": tool_use_id,
+                            "name": name,
+                            "summary": summary,
+                            "status": "running",
                         });
+                        on_update(ChatUpdate::Tool { chat_id: id.clone(), payload: payload.to_string() });
+                    }
+                    ParsedEvent::ToolDone { id: tool_use_id, is_error, preview } => {
+                        on_update(ChatUpdate::ToolResult { chat_id: id.clone(), tool_use_id, is_error, preview });
                     }
                     ParsedEvent::TurnResult { is_error } => {
                         saw_result = true;
@@ -800,6 +878,7 @@ impl ChatEngine {
                         }
                     }
                     ParsedEvent::Init | ParsedEvent::Other => {}
+                }
                 }
             }
             // Stdout closed: process ended. Mid-turn death is an error the
@@ -1126,7 +1205,7 @@ mod tests {
             parse_event(
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.md"}}]}}"#
             ),
-            ParsedEvent::Activity("Read a.md".into())
+            ParsedEvent::Tool { id: String::new(), name: "Read".into(), summary: "Read a.md".into() }
         );
         // Unknown types are tolerated.
         assert_eq!(parse_event(r#"{"type":"mystery"}"#), ParsedEvent::Other);
@@ -1159,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_question_tool_use_is_not_an_activity_line() {
+    fn ask_user_question_tool_use_is_not_a_tool_card() {
         // The question card replaces the activity line, so the tool_use block
         // must be skipped — and other blocks in the same event still scanned.
         assert_eq!(
@@ -1172,8 +1251,49 @@ mod tests {
             parse_event(
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{}},{"type":"tool_use","name":"Read","input":{"file_path":"a.md"}}]}}"#
             ),
-            ParsedEvent::Activity("Read a.md".into())
+            ParsedEvent::Tool { id: String::new(), name: "Read".into(), summary: "Read a.md".into() }
         );
+    }
+
+    #[test]
+    fn a_message_yields_every_block_in_order() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Grep","input":{"pattern":"save"}},{"type":"tool_use","id":"t2","name":"mcp__ken__route_query","input":{"query":"save format"}}]}}"#;
+        assert_eq!(
+            parse_events(line),
+            vec![
+                ParsedEvent::AssistantText("Looking.".into()),
+                ParsedEvent::Tool { id: "t1".into(), name: "Grep".into(), summary: "Grep save".into() },
+                ParsedEvent::Tool { id: "t2".into(), name: "mcp__ken__route_query".into(), summary: "Ken route query save format".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_results_and_text_deltas_parse() {
+        let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":[{"type":"text","text":"no such file"}]}]}}"#;
+        assert_eq!(
+            parse_events(line),
+            vec![ParsedEvent::ToolDone { id: "t1".into(), is_error: true, preview: "no such file".into() }]
+        );
+        let delta = r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}}"#;
+        assert_eq!(parse_events(delta), vec![ParsedEvent::TextDelta("Hel".into())]);
+        // A subagent's stream and a tool's input stream are not reply text.
+        let sub = r#"{"type":"stream_event","parent_tool_use_id":"t9","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}}"#;
+        assert_eq!(parse_events(sub), vec![ParsedEvent::Other]);
+        let json = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        assert_eq!(parse_events(json), vec![ParsedEvent::Other]);
+    }
+
+    #[test]
+    fn a_long_result_is_cut_for_its_card_and_a_long_arg_by_characters() {
+        let long = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("
+");
+        let preview = result_preview(Some(&Value::String(long)));
+        assert!(preview.starts_with("line 1
+line 2") && preview.ends_with("…"), "{preview}");
+        assert!(!preview.contains("line 9"));
+        let wide = serde_json::json!({ "name": "Grep", "input": { "pattern": "é".repeat(100) } });
+        assert_eq!(summarize_tool(&wide).chars().count(), "Grep ".len() + 80);
     }
 
     fn control_responses(dir: &Path) -> Vec<Value> {
@@ -1208,10 +1328,9 @@ mod tests {
         assert_eq!(v["toolUseId"], "toolu_fake1");
         assert_eq!(v["questions"][0]["question"], "Favorite color?");
         assert_eq!(v["questions"][0]["options"][1]["label"], "Blue");
-        // No activity line for the AskUserQuestion tool_use itself.
+        // No tool card for the AskUserQuestion tool_use itself.
         assert!(!seen.iter().any(|u| matches!(u,
-            ChatUpdate::Message { role, content, .. }
-                if role == "activity" && content.contains("AskUserQuestion"))));
+            ChatUpdate::Tool { payload, .. } if payload.contains("AskUserQuestion"))));
         // The turn pauses for the user.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline
@@ -1307,13 +1426,12 @@ mod tests {
 
     #[test]
     #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
-    fn tool_use_becomes_activity_line() {
+    fn tool_use_becomes_a_tool_card() {
         let (_d, engine, rx) = engine("complete");
         engine.send("chat-2", "usetool please", false, None).unwrap();
         let updates = collect_until_done(&rx, 15);
         assert!(updates.iter().any(|u| matches!(u,
-            ChatUpdate::Message { role, content, .. }
-                if role == "activity" && content == "Read notes/meeting.md")));
+            ChatUpdate::Tool { payload, .. } if payload.contains("Read notes/meeting.md"))));
     }
 
     #[test]

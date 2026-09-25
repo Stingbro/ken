@@ -33,6 +33,8 @@ class ChatsStore {
   /** chat id currently in terminal mode (at most one). */
   terminalId = $state<string | null>(null);
   sendError = $state<string | null>(null);
+  /** The reply streaming into the open chat, until the whole of it lands. */
+  draft = $state<string>("");
 
   get active(): ChatRow | null {
     return this.rows.find((r) => r.id === this.activeId) ?? null;
@@ -63,11 +65,19 @@ class ChatsStore {
       if (i >= 0) this.rows = this.rows.toSpliced(i, 1, row);
       else this.rows = [row, ...this.rows];
       this.resort();
+      // A turn that ended (or broke) leaves nothing streaming.
+      if (row.id === this.activeId && row.status !== "working") this.draft = "";
+    });
+    await api.onChatDelta((d) => {
+      if (!forFocused(d.project_id)) return;
+      if (d.chatId === this.activeId) this.draft += d.text;
     });
     await api.onChatMessage((msg) => {
       if (!forFocused(msg.project_id)) return;
       if (msg.chatId === this.activeId) {
         this.transcript = reconcile(this.transcript, msg);
+        // The whole reply replaces what streamed of it.
+        if (msg.role === "assistant") this.draft = "";
       }
     });
     await this.refresh();
@@ -93,6 +103,7 @@ class ChatsStore {
       await this.exitTerminal();
     }
     this.activeId = id;
+    this.draft = "";
     this.transcript = await api.chatTranscript(id).catch(() => []);
     // Ingest and research sessions open straight into the terminal —
     // that's where they live.
