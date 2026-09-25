@@ -11339,6 +11339,61 @@ fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<
     workspace_members_overview(state)
 }
 
+/// What removing a member did: the fresh roster, and the team wiki that got
+/// a Review card listing the pages still citing it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovedMemberDto {
+    members: Vec<MemberOverviewDto>,
+    /// The wiki carrying the card, and how many pages it lists.
+    wiki: Option<String>,
+    citing_pages: usize,
+}
+
+/// Take a repo out of the open workspace: out of the manifest and its
+/// groups, its runtime closed. The folder, its files and its index stay; the
+/// repo stays in Ken's list. When the team it was on has a wiki, that wiki
+/// gets one Review card listing the pages that still cite it.
+#[tauri::command]
+fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult<RemovedMemberDto> {
+    let (wiki, citing_pages) = {
+        let mut guard = state.lock().unwrap();
+        if !workspace_enabled(&guard.app_settings) {
+            return Err(WORKSPACE_DISABLED_MSG.into());
+        }
+        // The team's wiki, found before the member leaves the roster.
+        let team = wiki_team_members(&guard)?;
+        let wiki = ken_core::wikidraft::wiki_for(&name, &team).map(|w| w.name.clone());
+        let wiki_target = wiki.as_deref().and_then(|w| wiki_target(&guard, w).ok());
+        let base = guard.base_dir.clone();
+        let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
+        let id = ws.ws.members.iter().find(|m| m.name == name).and_then(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id),
+            _ => None,
+        });
+        if !ws.ws.config.remove_member(&name) {
+            return Err(format!("\"{name}\" is not in this workspace"));
+        }
+        ws.ws.members.retain(|m| m.name != name);
+        ws.ws.save().map_err(err)?;
+        if let Some(id) = id {
+            guard.members.remove(&id);
+            if guard.focused == Some(id) {
+                guard.focused = guard.members.keys().next().copied();
+            }
+        }
+        let mut pages = 0;
+        if let Some((_, wiki_id)) = wiki_target {
+            if let Ok(mut db) = Db::open(&base, wiki_id) {
+                let repo = ken_core::workspace::member_leaf(&name);
+                pages = ken_core::wikidraft::file_removed_card(&mut db, repo, engine::now_epoch()).map_err(err)?.unwrap_or(0);
+            }
+        }
+        (wiki.filter(|_| pages > 0), pages)
+    };
+    Ok(RemovedMemberDto { members: workspace_members_overview(state)?, wiki, citing_pages })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectGroupDto {
@@ -14640,6 +14695,7 @@ pub fn run() {
             workspace_remove_group,
             workspace_candidates,
             workspace_add_member,
+            workspace_remove_member,
             workspace_ignored,
             workspace_ignore_candidate,
             workspace_unignore_candidate,

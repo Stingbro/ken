@@ -16,6 +16,7 @@
   } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { KINDS, toggleKind } from "../onboarding/setupFlow";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
 
   let entries = $state<RegistryEntryStatus[]>([]);
   let moved = $state<SetupMoved[] | null>(null);
@@ -97,6 +98,35 @@
         const added = rows.filter((r) => r.include && r.index !== "off").map((r) => r.member);
         updating = await api.wikiAddRepos(added);
       }
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Removing a repo: out of the workspace, folder untouched; the team wiki
+  // says which of its pages still cite it.
+  let removedNote = $state<string | null>(null);
+  function askRemove(e: MouseEvent, name: string) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openConfirm(r.left, r.bottom + 4, {
+      title: `Remove ${memberLeaf(name)} from the workspace?`,
+      body: "Its folder and files stay on disk and in Ken's list. If its team has a wiki, a Review card there lists the pages that still cite it.",
+      confirmLabel: "Remove from workspace",
+      onConfirm: () => void removeMember(name),
+    });
+  }
+  async function removeMember(name: string) {
+    busy = true;
+    error = null;
+    try {
+      const res = await api.workspaceRemoveMember(name);
+      await app.refreshWorkspace();
+      await load();
+      removedNote = res.wiki
+        ? `${memberLeaf(name)} removed. ${res.citingPages} ${res.citingPages === 1 ? "page" : "pages"} in ${memberLeaf(res.wiki)} still cite it; a card on its Review lists them.`
+        : `${memberLeaf(name)} removed.`;
     } catch (e) {
       error = String(e);
     } finally {
@@ -189,6 +219,13 @@
           <option value="search">searchable only</option>
           <option value="off">not indexed</option>
         </select>
+        <button
+          class="btn-mini"
+          disabled={busy}
+          title="Remove from the workspace"
+          aria-label="Remove {member.name} from the workspace"
+          onclick={(e) => askRemove(e, member.name)}>Remove</button
+        >
       {:else}
         <span class="note">not in Ken's list yet</span>
       {/if}
@@ -250,6 +287,7 @@
       </div>
     </div>
   {/if}
+  {#if removedNote}<p class="note">{removedNote}</p>{/if}
   {#if updating.length > 0}
     <p class="note">
       Updating {updating.join(", ")} in the background. Open the wiki's Review to read the new pages and
@@ -291,7 +329,7 @@
   }
   .row {
     display: grid;
-    grid-template-columns: minmax(120px, 1fr) auto 110px 150px;
+    grid-template-columns: minmax(120px, 1fr) auto 110px 150px auto;
     gap: 8px;
     align-items: center;
     font-size: 12.5px;

@@ -1889,6 +1889,10 @@ export const api = {
   workspaceCandidates: () => invoke<WorkspaceCandidate[]>("workspace_candidates"),
   /** Join an existing sibling folder to the open workspace. It lands
    *  dormant and opens on first focus. */
+  /** Take a repo out of the workspace (its folder and files stay). Its
+   *  team wiki gets a Review card listing the pages that still cite it. */
+  workspaceRemoveMember: (name: string) =>
+    invoke<{ members: MemberOverview[]; wiki: string | null; citingPages: number }>("workspace_remove_member", { name }),
   workspaceAddMember: (folder: string) =>
     invoke<MemberOverview[]>("workspace_add_member", { folder }),
   /** Folders dismissed as "not a project" (world data, vendored source). */

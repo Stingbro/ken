@@ -691,6 +691,57 @@ pub fn wiki_for<'a>(member: &str, members: &'a [TeamMember]) -> Option<&'a TeamM
     wikis.into_iter().next()
 }
 
+// --- A repo removed from the team: the pages that still cite it. -----------
+
+/// The wiki pages that cite `repo`: each page with the citations that name
+/// it (its `sources:`), and the repo's own Repo Map page. Read from the index.
+pub fn citing_pages(db: &Db, repo: &str) -> Result<Vec<(String, Vec<String>)>> {
+    let leaf = crate::workspace::member_leaf(repo);
+    let own = repo_page(repo);
+    let mut out = Vec::new();
+    for page in db.page_paths()?.into_iter().filter(|p| p.ends_with(".md")) {
+        let Some(meta) = db.page_meta(&page)? else { continue };
+        let cites: Vec<String> = meta
+            .sources
+            .iter()
+            .filter(|s| {
+                matches!(crate::drift::classify(s), crate::drift::Citation::Code(c) if c.repo.eq_ignore_ascii_case(leaf))
+            })
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .collect();
+        if !cites.is_empty() || page.eq_ignore_ascii_case(&own) {
+            out.push((page, cites));
+        }
+    }
+    Ok(out)
+}
+
+/// File one Review card on the wiki listing the pages that still cite a repo
+/// that left the team, so a person rewrites or retires them. Nothing is
+/// edited. `None` when no page cites it.
+pub fn file_removed_card(db: &mut Db, repo: &str, now: i64) -> Result<Option<usize>> {
+    let pages = citing_pages(db, repo)?;
+    if pages.is_empty() {
+        return Ok(None);
+    }
+    let own = repo_page(repo);
+    let mut body = format!(
+        "**{repo}** was removed from the team. These pages still cite it; each needs rewriting without it, or retiring \
+         (`status: retired` with what replaced it). Nothing was changed.\n\n"
+    );
+    for (page, cites) in &pages {
+        if page.eq_ignore_ascii_case(&own) {
+            body.push_str(&format!("- {page} — its Repo Map page\n"));
+        } else {
+            body.push_str(&format!("- {page} — cites {}\n", cites.join(", ")));
+        }
+    }
+    let title = format!("{repo} left the team: {} pages cite it", pages.len());
+    let first = pages.first().map(|(p, _)| p.clone()).unwrap_or_default();
+    db.insert_review_item(REVIEW_KIND, &title, &body, &first, None, now)?;
+    Ok(Some(pages.len()))
+}
+
 /// Why a proposal could not be applied.
 #[derive(Debug, PartialEq)]
 pub enum ApplyError {
@@ -879,6 +930,34 @@ mod tests {
         assert!(finish_update("Sure, here it is", page).is_err());
         assert!(finish_update("---\ntitle: A\n---\nText and more.", page).unwrap().is_some());
     }
+    #[test]
+    fn a_removed_repo_lists_the_pages_that_cite_it() {
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Wiki");
+        fs::create_dir_all(wiki.join("Platform")).unwrap();
+        fs::create_dir_all(wiki.join("Repo-Map")).unwrap();
+        fs::write(wiki.join("Platform/Save.md"), "---\nsources:\n  - Tools:src/save.rs:3\n  - Game:src/x.rs\n---\n# Save\n").unwrap();
+        fs::write(wiki.join("Platform/Combat.md"), "---\nsources:\n  - Game:src/hit.rs\n---\n# Combat\n").unwrap();
+        fs::write(wiki.join("Repo-Map/Tools.md"), "---\ntitle: Tools\n---\n# Tools\n").unwrap();
+        let project = crate::project::Project::create(&wiki, "Wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let mut pages = citing_pages(&db, "Tools").unwrap();
+        pages.sort();
+        assert_eq!(
+            pages,
+            vec![
+                ("Platform/Save.md".to_string(), vec!["Tools:src/save.rs:3".to_string()]),
+                ("Repo-Map/Tools.md".to_string(), vec![]),
+            ]
+        );
+        assert_eq!(file_removed_card(&mut db, "Tools", 7).unwrap(), Some(2));
+        let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
+        assert!(body.contains("Platform/Save.md — cites Tools:src/save.rs:3") && body.contains("its Repo Map page"));
+        assert_eq!(file_removed_card(&mut db, "Nobody", 7).unwrap(), None);
+    }
+
     #[test]
     fn a_wiki_covers_its_teams_repos_and_a_repo_finds_its_teams_wiki() {
         use crate::registry::RepoKind;

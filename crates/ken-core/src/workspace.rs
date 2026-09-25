@@ -301,6 +301,20 @@ impl WorkspaceConfig {
         Ok(())
     }
 
+    /// Take a member out of the workspace: its name, its folder mapping and
+    /// its place in every group (a group left empty goes too). The folder
+    /// itself is never touched. Returns whether it was a member.
+    pub fn remove_member(&mut self, name: &str) -> bool {
+        let before = self.members.len();
+        self.members.retain(|m| m != name);
+        self.paths.remove(name);
+        for g in &mut self.groups {
+            g.members.retain(|m| m != name);
+        }
+        self.groups.retain(|g| !g.members.is_empty());
+        self.members.len() != before
+    }
+
     /// Remove a group. Returns whether one was actually removed, so a
     /// caller can tell "deleted" from "already gone" without a prior read.
     pub fn remove_group(&mut self, name: &str) -> bool {
@@ -1011,6 +1025,25 @@ mod tests {
         assert!(ignore_folder(dir.path(), "a/b/c").is_err());
         assert!(ignore_folder(dir.path(), "../escape").is_err());
         assert!(ignore_folder(dir.path(), "  ").is_err());
+    }
+
+    #[test]
+    fn a_member_leaves_its_groups_and_its_folder_mapping() {
+        let dir = tempdir().unwrap();
+        for m in ["alpha", "beta"] {
+            fs::create_dir_all(dir.path().join(m)).unwrap();
+        }
+        let mut ws = Workspace::create(dir.path(), "WS", &["alpha".into(), "beta".into()]).unwrap();
+        ws.config.set_group("Realms", &["alpha".into(), "beta".into()]).unwrap();
+        ws.config.set_group("Solo", &["beta".into()]).unwrap();
+        ws.config.paths.insert("beta".into(), dir.path().join("beta"));
+        assert!(ws.config.remove_member("beta"));
+        assert_eq!(ws.config.members, vec!["alpha"]);
+        assert!(!ws.config.paths.contains_key("beta"));
+        assert_eq!(ws.config.group("Realms").map(|g| g.members.clone()), Some(vec!["alpha".to_string()]));
+        assert!(ws.config.group("Solo").is_none(), "a group left empty goes");
+        assert!(!ws.config.remove_member("beta"));
+        assert!(dir.path().join("beta").is_dir(), "the folder stays");
     }
 
     #[test]
