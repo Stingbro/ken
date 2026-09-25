@@ -293,10 +293,36 @@ PC (dev), not measured anywhere.
     runs repos in parallel.
   - Not done: embeddings stay on for code repos; text is stored twice
     (contents + chunks) — size accepted for now (~12 KB per file).
+- **Upstream merged (2026-09-25, `d725957`).** 40 commits from
+  `smo-key/ken` main (editor work, v0.2.x); remote `upstream`. Upstream's
+  single-project handlers now go through `member`/`member_mut`. Background
+  extraction is back on (`KNOWLEDGE_EXTRACTION_ENABLED`, Map/Timeline in
+  the nav); it only reads files marked for entities.
+- **Chat like Headway (2026-09-25).** Default permission mode: every
+  Edit/MultiEdit/Write is an `EditProposal` shown as a git-style diff with
+  per-change Accept/Deny (chat card and over the open page;
+  `answer_edit_proposal`). `KEN_GUIDE` appended to the system prompt: edits
+  are reviewed, cite sources as links, never navigate unasked. Citations
+  (`path#L12`, `path:12`, `#slug`, `ken://…#L12`) open at the place
+  (`app.openAt`, `revealAt`). Ken's MCP runs in every chat (`--mcp-config`
+  in app data `chat-mcp/<id>.json`); read tools allowed, write tools
+  declined; `open_in_ken` posts to the hook listener's `/ken-ui` (token)
+  only when the person asks.
+- **More (2026-09-25):** remove a repo from the workspace (its team wiki
+  lists the pages citing it); code/reference repos get no `.ken/` (config
+  in app data `project-configs/<hash>.json`); a file made search-only leaves
+  the graph; a team's graph overview has its own counts; unit tests use a
+  temp data folder, never real app data.
+- **Ingest in two parts (`e41583d`).** Processing writes the note straight
+  into `Ingested/<Meetings|Recordings|Documents>/<YYYY-MM>/` and proposes
+  page changes, new pages and rulings on Review (one planning ask;
+  Ways-of-Working/Research/Templates/_meta off-limits); the source waits in
+  Raw (`in_review`, `waiting_new`). **Done, file it** (`ingest_file`) moves
+  it beside the note.
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
-  ken-core on this PC: 824 pass, 53 fail (all pre-existing, Windows);
-  ken-mcp 39/39; frontend 485/485.
+  ken-core on this PC: 856 pass, 55 fail (all Windows-only: fake bash CLI, CRLF);
+  ken-mcp 40/40; frontend 691/691 (plus upstream's release-script test, CRLF).
 
 ## The steps, in order
 
