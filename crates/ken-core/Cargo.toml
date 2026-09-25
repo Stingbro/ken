@@ -83,6 +83,9 @@ local-llm = ["dep:llama-cpp-2"]
 [target.'cfg(windows)'.dependencies]
 whisper-rs = { version = "0.16", features = ["vulkan"], optional = true }
 llama-cpp-2 = { version = "=0.1.151", default-features = false, features = ["vulkan"], optional = true }
+# Job objects, so cancelling a `claude.cmd` session ends node too (proc::track),
+# and on-disk size of a downloading cloud file (cloud::allocated_bytes).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [target.'cfg(not(any(target_os = "macos", windows)))'.dependencies]
 whisper-rs = { version = "0.16", optional = true }

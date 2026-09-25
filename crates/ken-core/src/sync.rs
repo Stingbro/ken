@@ -410,22 +410,13 @@ Write ONLY the merged file to `{staging}/{rel_path}`. Do not modify any other fi
     );
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let spawned = Command::new(binary)
-        .args([
-            "-p",
-            &prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            &session_id,
-        ])
+    // The prompt on stdin, never an argument (see `proc::spawn_with_input`).
+    let mut cmd = Command::new(binary);
+    cmd.args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--session-id", &session_id])
         .current_dir(root)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let spawned = crate::proc::spawn_with_input(&mut cmd, &prompt);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
@@ -437,7 +428,7 @@ Write ONLY the merged file to `{staging}/{rel_path}`. Do not modify any other fi
     let deadline = Instant::now() + timeout;
     loop {
         if cancel.load(Ordering::Relaxed) || Instant::now() > deadline {
-            let _ = child.kill();
+            crate::proc::kill_tree(&mut child);
             let _ = child.wait();
             break;
         }
@@ -1109,6 +1100,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn draft_merge_uses_fake_claude() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_fake_claude(dir.path(), "complete");
@@ -1298,6 +1290,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn engine_files_conflict_item_with_draft() {
         let (_d, _bare, a, b) = fixture();
         // Both sides get the seed doc at the path the fake claude writes.

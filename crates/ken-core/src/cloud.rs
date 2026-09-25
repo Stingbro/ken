@@ -196,17 +196,35 @@ fn hydration_sample(path: &Path) -> Option<(u64, u64)> {
     if total == 0 {
         return None;
     }
-    Some((allocated_bytes(&meta).min(total), total))
+    Some((allocated_bytes(path, &meta).min(total), total))
 }
 
 #[cfg(unix)]
-fn allocated_bytes(meta: &Metadata) -> u64 {
+fn allocated_bytes(_path: &Path, meta: &Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     meta.blocks().saturating_mul(512)
 }
 
-#[cfg(not(unix))]
-fn allocated_bytes(_meta: &Metadata) -> u64 {
+/// The bytes actually on disk. For a placeholder mid-download that's the part
+/// the provider has written so far. Asks by path, so the file is never opened
+/// (opening one could itself start a download).
+#[cfg(windows)]
+fn allocated_bytes(path: &Path, _meta: &Metadata) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut high = 0u32;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `high` is a
+    // valid out pointer.
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == INVALID_FILE_SIZE && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+        return 0;
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn allocated_bytes(_path: &Path, _meta: &Metadata) -> u64 {
     0
 }
 

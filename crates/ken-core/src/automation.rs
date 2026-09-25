@@ -409,7 +409,7 @@ mod tests {
         let staging = std::path::Path::new("/tmp/stg");
         let p = proposal_prompt(&a, &matched, staging);
         assert!(p.contains("Recordings/a.md"));
-        assert!(p.contains("PROPOSAL_FILE=/tmp/stg/proposal.md"));
+        assert!(p.contains(&format!("PROPOSAL_FILE={}", staging.join("proposal.md").display())));
         assert!(p.to_lowercase().contains("do not") || p.to_lowercase().contains("must not"));
         assert!(p.contains(&a.prompt));
     }

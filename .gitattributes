@@ -3,3 +3,6 @@
 *.bat text eol=crlf
 # The bundled wiki template is written into new wikis byte for byte.
 crates/ken-core/templates/** text eol=lf
+# Test fixtures are read byte for byte (PDF offsets, sizes, hashes).
+crates/ken-core/fixtures/** -text
+*.pdf binary

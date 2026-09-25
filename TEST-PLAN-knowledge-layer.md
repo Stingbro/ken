@@ -287,3 +287,10 @@ keyword index over sections.
 None known. The reader choice (Any reader, Business readers, Developers)
 applies to the project search, all-projects search, routed search and the
 MCP's search tools.
+
+On Windows, check by hand what the ignored fake-CLI tests cover there:
+- [ ] Run a research question: the report follows the whole prompt (it
+  reaches `claude.cmd` as a file), and Cancel stops it.
+- [ ] Start a chat, send two turns, then close it: no `node.exe` left in
+  Task Manager.
+- [ ] Run an ingest and a morning digest: both complete.

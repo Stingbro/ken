@@ -167,6 +167,41 @@ pub fn run_session(
     }
 }
 
+/// The prompt argument for an interactive session. A `.cmd`/`.bat` launcher
+/// (how npm installs claude on Windows) runs through cmd.exe, which ends the
+/// command at a line break and expands `%VAR%` even inside quotes, so a
+/// multi-line prompt would arrive cut to its first line. Then the prompt goes
+/// in a file and the argument is a one-line pointer to it; the file's folder
+/// is returned so the session can be allowed to read it.
+fn tui_prompt_arg(binary: &Path, session_id: &str, prompt: &str) -> Result<(String, Option<PathBuf>)> {
+    let batch = binary
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    let plain = !prompt.contains(['\n', '\r', '%', '"', '^', '&', '|', '<', '>']);
+    if !batch || plain {
+        return Ok((prompt.to_string(), None));
+    }
+    let dir = std::env::temp_dir().join("ken-prompts");
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Other(format!("prompt file: {e}")))?;
+    let file = dir.join(format!("{session_id}.md"));
+    std::fs::write(&file, prompt).map_err(|e| Error::Other(format!("prompt file: {e}")))?;
+    let arg = format!(
+        "Your full instructions are in the file {}. Read that file now and follow it exactly.",
+        file.display()
+    );
+    Ok((arg, Some(file)))
+}
+
+/// Deletes a file when dropped (the prompt file, once its session is over).
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn run_hidden_tui(
     cfg: &RunnerConfig,
     project_root: &Path,
@@ -188,14 +223,15 @@ fn run_hidden_tui(
             })
             .map_err(|e| Error::Other(format!("pty: {e}")))?;
 
+        let (prompt_arg, prompt_file) = tui_prompt_arg(&cfg.binary, session_id, prompt)?;
+        let _cleanup = prompt_file.as_ref().map(|f| RemoveOnDrop(f.clone()));
         let mut cmd = CommandBuilder::new(&cfg.binary);
-        cmd.args([
-            "--session-id",
-            session_id,
-            "--permission-mode",
-            "acceptEdits",
-            prompt,
-        ]);
+        cmd.args(["--session-id", session_id, "--permission-mode", "acceptEdits"]);
+        if let Some(dir) = prompt_file.as_ref().and_then(|f| f.parent()) {
+            cmd.arg("--add-dir");
+            cmd.arg(dir);
+        }
+        cmd.arg(&prompt_arg);
         cmd.cwd(project_root);
         let mut child = pair
             .slave
@@ -333,22 +369,13 @@ fn run_headless(
     prompt: &str,
     cancel: &CancelToken,
 ) -> Result<RunOutcome> {
-    let child = std::process::Command::new(&cfg.binary)
-        .args([
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            session_id,
-        ])
+    // The prompt on stdin, never an argument (see `proc::spawn_with_input`).
+    let mut cmd = std::process::Command::new(&cfg.binary);
+    cmd.args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--session-id", session_id])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
 
     use assistant::DriveResult;
@@ -408,9 +435,9 @@ fn run_headless_streaming(
     mut on_activity: impl FnMut(&str) + Send + 'static,
 ) -> Result<RunOutcome> {
     use std::io::BufRead;
-    let mut child = std::process::Command::new(&cfg.binary)
-        .args([
-            "-p", prompt,
+    let mut cmd = std::process::Command::new(&cfg.binary);
+    cmd.args([
+            "-p",
             "--output-format", "stream-json",
             "--verbose",
             "--permission-mode", "acceptEdits",
@@ -418,9 +445,8 @@ fn run_headless_streaming(
         ])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let mut child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", cfg.binary.display())))?;
 
     let stdout = child.stdout.take().ok_or_else(|| Error::Other("no stdout".into()))?;
@@ -455,7 +481,7 @@ fn run_headless_streaming(
     let deadline = Instant::now() + cfg.timeout;
     let outcome = loop {
         if cancel.is_cancelled() {
-            let _ = child.kill();
+            crate::proc::kill_tree(&mut child);
             break RunOutcome::Cancelled;
         }
         match child.try_wait() {
@@ -472,7 +498,7 @@ fn run_headless_streaming(
             }
             Ok(None) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
+                    crate::proc::kill_tree(&mut child);
                     break RunOutcome::TimedOut(err_buf.lock().unwrap().clone());
                 }
                 std::thread::sleep(Duration::from_millis(150));
@@ -537,6 +563,10 @@ for ((i=0; i<${#args[@]}; i++)); do
     *) if [ -z "$PROMPT" ]; then PROMPT="${args[$i]}"; fi;;
   esac
 done
+# Like the real CLI: `-p` with no prompt argument reads the prompt on stdin.
+if [ "$HEADLESS" = "1" ] && [ "$STREAM_INPUT" != "1" ] && [ -z "$PROMPT" ]; then
+  PROMPT=$(cat)
+fi
 
 # Conversation mode: JSONL in, events out. One assistant reply per user line.
 if [ "$STREAM_INPUT" = "1" ]; then
@@ -722,6 +752,9 @@ case "$BEHAVIOR" in
     exit 0;;
 esac
 "#;
+        // Unix only in practice: the tests that run it are ignored on Windows,
+        // where a generated launcher chaining cmd → bash → curl reads as
+        // malware to endpoint security (it quarantined files on a dev box).
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
         {
@@ -737,6 +770,25 @@ mod tests {
     use super::test_support::write_fake_claude;
     use super::*;
     use crate::hooks::{install_hooks, HookListener};
+
+    #[test]
+    fn a_multiline_prompt_reaches_a_cmd_launcher_as_a_file() {
+        let prompt = "Research this.\nWrite to 100% of OUTPUT_FILE=a.md";
+        let (arg, file) = tui_prompt_arg(Path::new(r"C:\npm\claude.cmd"), "sess-pf", prompt).unwrap();
+        let file = file.expect("a batch launcher gets a prompt file");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), prompt);
+        assert!(!arg.contains('\n') && !arg.contains('%'), "{arg}");
+        assert!(arg.contains(&file.display().to_string()));
+        drop(RemoveOnDrop(file.clone()));
+        assert!(!file.exists(), "the prompt file goes when the session ends");
+    }
+
+    #[test]
+    fn other_prompts_stay_on_the_command_line() {
+        let multi = "one\ntwo";
+        assert_eq!(tui_prompt_arg(Path::new("/usr/local/bin/claude"), "s", multi).unwrap(), (multi.to_string(), None));
+        assert_eq!(tui_prompt_arg(Path::new(r"C:\npm\claude.cmd"), "s", "plain").unwrap(), ("plain".to_string(), None));
+    }
 
     /// The exact layout `npm install -g @anthropic-ai/claude-code` leaves on
     /// Windows: an extensionless `#!/bin/sh` launcher beside `claude.cmd`.
@@ -794,6 +846,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn hidden_tui_completes_on_stop_hook() {
         let (dir, bin, hooks) = setup("complete");
         let staging = dir.path().join(".ken/.staging/people");
@@ -813,6 +866,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn process_death_is_failure_with_detail() {
         let (dir, bin, hooks) = setup("fail");
         let outcome = run_session(
@@ -832,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn timeout_kills_and_reports() {
         let (dir, bin, hooks) = setup("hang");
         let outcome = run_session(
@@ -848,6 +903,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn notification_reports_blocked_then_cancel_works() {
         let (dir, bin, hooks) = setup("block");
         let cancel = CancelToken::new();
@@ -872,6 +928,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_completes_and_fails() {
         let (dir, bin, hooks) = setup("complete");
         let staging = dir.path().join(".ken/.staging/people");
@@ -906,6 +963,7 @@ mod tests {
     /// The v2.x CLI exits 0 and reports failure inside the trailing result
     /// event of a JSON array; an ingest must not be reported as Completed.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_honors_error_in_array_result_event() {
         let (dir, bin, hooks) = setup("headless-array-error");
         let outcome = run_session(
@@ -928,6 +986,7 @@ mod tests {
     /// a final assistant message did its work — report Completed (an ingest is
     /// applied only on Completed), not Failed.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_recovers_when_no_result_event_but_exit_zero() {
         let (dir, bin, hooks) = setup("headless-array-noresult");
         let outcome = run_session(
@@ -946,6 +1005,7 @@ mod tests {
     /// Same shape but a non-zero exit is a genuine failure — recovery must not
     /// mask it.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_fails_when_no_result_event_and_nonzero_exit() {
         let (dir, bin, hooks) = setup("headless-array-noresult-nonzero");
         let outcome = run_session(
@@ -962,6 +1022,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_streaming_reports_activity_and_completes() {
         let (dir, bin, hooks) = setup("complete");
         let staging = dir.path().join(".ken/.staging/people");
@@ -989,6 +1050,7 @@ mod tests {
     /// exit, no stream-json result event — the `(false, None)` arm must report
     /// Failed, never Completed.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_streaming_fails_on_nonzero_exit_without_result_event() {
         let (dir, bin, hooks) = setup("stream-die-plain");
         let outcome = run_ingest_session(
@@ -1006,6 +1068,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn headless_streaming_maps_error_result_to_failure() {
         let (dir, bin, hooks) = setup("stream-fail");
         let outcome = run_ingest_session(

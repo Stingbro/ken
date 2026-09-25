@@ -581,7 +581,7 @@ impl ChatEngine {
     /// Stop a chat's conversation process (mode switch, archive, shutdown).
     pub fn stop(&self, chat_id: &str) {
         if let Some(mut conv) = self.live.lock().unwrap().remove(chat_id) {
-            let _ = conv.child.kill();
+            crate::proc::kill_tree(&mut conv.child);
             let _ = conv.child.wait();
         }
     }
@@ -611,7 +611,7 @@ impl ChatEngine {
                 .map(|(id, _)| id.clone())
             {
                 if let Some(mut conv) = live.remove(&oldest) {
-                    let _ = conv.child.kill();
+                    crate::proc::kill_tree(&mut conv.child);
                     let _ = conv.child.wait();
                 }
             }
@@ -638,9 +638,10 @@ impl ChatEngine {
             // which is what makes AskUserQuestion reach the user at all.
             "--permission-prompt-tool",
             "stdio",
-            "--append-system-prompt",
-            KEN_GUIDE,
         ]);
+        // One line: on Windows the CLI is a `.cmd` launcher, and a line break
+        // in any argument to one fails the spawn.
+        cmd.arg("--append-system-prompt").arg(KEN_GUIDE.replace('\n', " "));
         if let Some(cfg) = self.mcp_config.lock().unwrap().clone() {
             cmd.arg("--mcp-config").arg(cfg);
         }
@@ -661,6 +662,7 @@ impl ChatEngine {
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Other(format!("spawn {}: {e}", self.binary.display())))?;
+        crate::proc::track(&child);
         let stdin = child.stdin.take().ok_or_else(|| Error::Other("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Other("no stdout".into()))?;
         let stderr = child.stderr.take();
@@ -1183,6 +1185,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn ask_user_question_round_trip() {
         let (dir, engine, rx) = engine("ask-question");
         engine.send("chat-q", "askq please", false, None).unwrap();
@@ -1256,6 +1259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn other_permission_requests_are_auto_denied() {
         let (dir, engine, rx) = engine("ask-question");
         engine.send("chat-b", "askbash now", false, None).unwrap();
@@ -1272,6 +1276,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn answer_question_on_unknown_chat_errors() {
         let (_d, engine, _rx) = engine("ask-question");
         assert!(engine
@@ -1286,6 +1291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn send_receive_turn() {
         let (_d, engine, rx) = engine("complete");
         engine.send("chat-1", "Who owns billing?", false, None).unwrap();
@@ -1300,6 +1306,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn tool_use_becomes_activity_line() {
         let (_d, engine, rx) = engine("complete");
         engine.send("chat-2", "usetool please", false, None).unwrap();
@@ -1310,6 +1317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn second_turn_reuses_process_and_death_recovers_with_resume() {
         let (_d, engine, rx) = engine("stream-die");
         // First turn completes, then the fake dies (exit 7).
@@ -1328,6 +1336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn blocked_stdin_does_not_freeze_the_engine() {
         // A fake that stops draining stdin mid-session: a large send() will
         // wedge on the pipe write. The engine must not hold its `live` map
@@ -1515,6 +1524,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn terminal_attach_round_trip() {
         isolate_claude_config();
         let dir = tempfile::tempdir().unwrap();

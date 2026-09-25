@@ -436,12 +436,30 @@ will need their own lines there once decided.
   certificate check; use `--source winget`. GitHub: `Stingbro` owns
   both repos; `StingBros` is a second login with no access to
   Ways-of-Working.
-- **ken-core tests on Windows** (`scripts\win-build.cmd core`): 759
-  pass, 55 fail. About 45 spawn the fake Claude CLI, a bash script
-  Windows cannot launch (os error 193); the rest (pdf, scan, import,
-  recipe, cloud) are unexamined, likely CRLF or path separators. The
-  old recipe ran only `workspace::`, so the full suite was never green
-  on Windows.
+- **SentinelOne on this PC.** On 2026-09-25 it uninstalled Claude and
+  quarantined files after a test run that wrote `.cmd` launchers into
+  temp dirs (cmd → bash → curl) and used `taskkill /T /F`. It took
+  `install.ps1`, `scripts/win-build.cmd`, `test-workspace.bat`,
+  `drawio-viewer.min.js`, `svelte.config.js` and parts of
+  `node_modules` (every `.bin/*.cmd` shim, `vitest/dist/cli.js`).
+  Restore the tracked files with `git checkout -- <file>` and
+  `node_modules` with `npm ci` once IT clears them. Never use the
+  in-app browser here; run things one at a time.
+- **ken-core tests on Windows:** 859 pass, 0 fail, 57 ignored. The 53
+  that run the bash fake Claude CLI are ignored on Windows (covered on
+  macOS/Linux). The rest were real: fixture PDFs were CRLF-converted
+  (now `-text` in `.gitattributes`); `/etc` is rooted but not absolute
+  on Windows (import and recipe path checks now use components); cloud
+  hydration measured nothing on Windows (now `GetCompressedFileSizeW`);
+  one test hard-coded `/`. ken-mcp 42/42. The app `cargo check` needs
+  `scripts\win-build.cmd` back (llama.cpp's Vulkan build fails without
+  its environment).
+- **Windows spawn fixes (real bugs):** a `claude.cmd` launcher cannot
+  take an argument with a line break, so `-p` prompts go on stdin, the
+  chat guide is one line, and a multi-line terminal-session prompt
+  (research) goes in a temp file with a one-line pointer. Cancelling a
+  session now ends node too: each child is put in a job object
+  (`proc::track`), not `taskkill`.
 
 ## Carried over from the 2026-09-01 handoff
 

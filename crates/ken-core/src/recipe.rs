@@ -266,7 +266,13 @@ pub fn validate(recipe: &Recipe) -> Result<()> {
     if out.is_empty() {
         return fail("output location can't be empty");
     }
-    if Path::new(out).is_absolute() || out.split('/').any(|c| c == "..") {
+    // has_root(): on Windows "/etc" is rooted but not absolute, and join()
+    // would still escape the project (as in `Project::resolve`); so would a
+    // drive prefix like "C:foo".
+    let escapes = Path::new(out).components().any(|c| {
+        matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir)
+    });
+    if escapes || out.split(['/', '\\']).any(|c| c == "..") {
         return fail("output must be a folder or file inside the project");
     }
     if out.starts_with(".ken") {

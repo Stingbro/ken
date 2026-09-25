@@ -150,22 +150,14 @@ pub fn oneshot(
         ));
     }
     let session_id = uuid::Uuid::new_v4().to_string();
-    let child = std::process::Command::new(binary)
-        .args([
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--permission-mode",
-            "acceptEdits",
-            "--session-id",
-            &session_id,
-        ])
+    // The prompt goes in on stdin: on Windows an argument with a line break
+    // cannot reach the `.cmd` launcher at all (see `proc::spawn_with_input`).
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--session-id", &session_id])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    let child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", binary.display())))?;
 
     let outcome = match drive_child(child, timeout, Duration::from_millis(100), cancel) {
@@ -222,7 +214,7 @@ pub(crate) fn drive_child(
     let deadline = Instant::now() + timeout;
     loop {
         if cancel.is_cancelled() {
-            let _ = child.kill();
+            crate::proc::kill_tree(&mut child);
             join();
             return DriveResult::Cancelled;
         }
@@ -235,7 +227,7 @@ pub(crate) fn drive_child(
             }
             Ok(None) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
+                    crate::proc::kill_tree(&mut child);
                     join();
                     return DriveResult::TimedOut(out_buf.lock().unwrap().clone());
                 }
@@ -298,6 +290,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_returns_result_text() {
         let (dir, bin) = setup("complete");
         let text = "The **cutover** moved to Sept 12.\nSOURCES: notes/a.md, People.md";
@@ -314,6 +307,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_default_result_without_file() {
         let (dir, bin) = setup("complete");
         let outcome = oneshot(
@@ -328,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_failure_reports_detail() {
         let (dir, bin) = setup("headless-fail");
         let outcome = oneshot(
@@ -347,6 +342,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_cancel_kills_session() {
         let (dir, bin) = setup("hang");
         let cancel = CancelToken::new();
@@ -367,6 +363,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_timeout_kills_session() {
         let (dir, bin) = setup("hang");
         let outcome = oneshot(
@@ -492,6 +489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_recovers_assistant_text_when_no_result_event() {
         // Exit 0 + assistant text, no result wrapper → Completed with the text.
         let (dir, bin) = setup("headless-array-noresult");
@@ -510,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_fails_when_no_result_and_nonzero_exit() {
         // The recovery must not mask a real failure: non-zero exit → Failed.
         let (dir, bin) = setup("headless-array-noresult-nonzero");
@@ -553,6 +552,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_reads_array_output_end_to_end() {
         let (dir, bin) = setup("headless-array");
         let outcome = oneshot(
@@ -569,6 +569,7 @@ mod tests {
     /// A child that floods stderr must not deadlock on the pipe buffer:
     /// without a stderr drain thread this test only ends at the timeout.
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_survives_stderr_flood() {
         let (dir, bin) = setup("stderr-flood");
         let outcome = oneshot(
@@ -583,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn oneshot_failure_includes_stderr() {
         let (dir, bin) = setup("headless-stderr-fail");
         let outcome = oneshot(

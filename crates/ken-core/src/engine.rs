@@ -1283,6 +1283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn source_change_emits_queued_with_eta() {
         let r = rig_debounce("complete", 800);
         r.engine.sources_changed(vec!["notes/a.md".into()]);
@@ -1295,6 +1296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn second_due_job_reports_waiting() {
         // A slow first run so the second stays blocked long enough to observe.
         let r = rig("stream-hang"); // fake sleeps 300s in streamed headless
@@ -1316,6 +1318,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn noop_run_is_recorded_not_silent() {
         let r = rig("complete");
         {
@@ -1334,6 +1337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn trigger_runs_and_applies_first_run() {
         let r = rig("complete");
         r.engine.trigger("people", false);
@@ -1349,6 +1353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn sources_changed_triggers_but_own_output_does_not() {
         let r = rig("complete");
         // Own output path: nothing should run.
@@ -1362,6 +1367,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn over_threshold_holds_then_approve_applies() {
         let r = rig("complete");
         // Existing large output very different from what the fake writes,
@@ -1490,6 +1496,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn running_event_carries_live_activity() {
         let r = rig("complete");
         r.engine.trigger("people", true);
@@ -1509,6 +1516,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn failed_run_reports_detail() {
         // Ingests use the streaming headless path; `stream-fail` emits an
         // error terminal result and a non-zero exit, which must surface as a
@@ -1520,6 +1528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn discard_leaves_output_untouched() {
         let r = rig("complete");
         fs::create_dir_all(r.project.root.join("knowledge")).unwrap();
@@ -1546,6 +1555,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn automation_phase1_stages_a_proposal_review_item() {
         let r = rig_with_automation("complete", false);
         r.engine.run_automation("weekly");
@@ -1563,6 +1573,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn automation_auto_apply_runs_single_session_to_fresh() {
         let r = rig_with_automation("complete", true);
         r.engine.run_automation("weekly");
@@ -1574,6 +1585,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn automation_apply_phase_runs_from_proposal() {
         let r = rig_with_automation("complete", false);
         r.engine.apply_automation("weekly", "## Proposed actions\n- do the thing");
@@ -1582,6 +1594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn approve_proposal_resolves_item_and_queues_apply() {
         let r = rig_with_automation("complete", false);
         r.engine.run_automation("weekly");
@@ -1601,6 +1614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn discard_proposal_just_resolves() {
         let r = rig_with_automation("complete", false);
         r.engine.run_automation("weekly");
@@ -1613,6 +1627,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn source_change_matching_an_automation_runs_it_and_stages_a_proposal() {
         // Watch a folder the recipes don't, so only the automation reacts.
         let r = rig_with_automation_globs("complete", false, vec!["Recordings/*.md".into()]);
@@ -1632,6 +1647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn source_change_not_matching_an_automation_does_not_run_it() {
         // Automation watches Recordings/; a change under notes/ must not fire it
         // (the recipes will fire, but no automation-kind event may appear).
@@ -1646,6 +1662,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn cancel_is_kind_aware() {
         // A slow ingest named "people" is running; cancelling the *automation*
         // "people" must NOT stop it — only the ingest-kind cancel does.

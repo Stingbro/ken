@@ -1226,6 +1226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn build_stores_the_model_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_fake_claude(dir.path(), "complete");
@@ -1248,6 +1249,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn failed_build_keeps_the_old_model() {
         let dir = tempfile::tempdir().unwrap();
         let project =
