@@ -12,6 +12,10 @@
 //! - **Age rule**: a page not verified in thirty days is raised even when
 //!   nothing it cites moved.
 //!
+//! A sweep works from what changed: once per repo it asks git which files
+//! moved since the last sweep's commit, re-measures only the citations of
+//! those files, and carries every other result over (see `PinCache`).
+//!
 //! Only code citations (`repo:path[:line]`) are measured; a `[[Note]]` or a
 //! `D-nnn` is a cross-reference, counted apart. Research pages report in
 //! their own bucket. Every run can carry two controls (a page known to have
@@ -119,6 +123,12 @@ pub struct DriftRun {
     pub unmeasured: Vec<String>,
     /// Branches measured against, per repo, with a note when it fell back.
     pub branches: Vec<String>,
+    /// Citations measured with git this sweep, and those carried from the
+    /// last sweep because no commit since touched their file.
+    #[serde(default)]
+    pub measured: usize,
+    #[serde(default)]
+    pub reused: usize,
 }
 
 impl DriftRun {
@@ -395,11 +405,78 @@ fn chrono_free_epoch(date: &str) -> Option<i64> {
     Some((era * 146_097 + doe - 719_468) * 86_400)
 }
 
+/// What one citation measured to, kept between sweeps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum Measured {
+    Clean,
+    Hit(Severity, String),
+    Unmeasured(String),
+}
+
+/// The sweep's memory: per repo, the commit the last sweep measured
+/// against, and each citation's result there. A result holds until a
+/// commit touches its file, so a sweep asks git once per repo which files
+/// changed since (`git diff --name-only <last> <now>`) and re-measures only
+/// the citations of those files. The result is what a full sweep gives:
+/// a file untouched since the last sweep reads the same at both commits.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PinCache {
+    /// Repo folder → the branch head the results were measured at.
+    heads: std::collections::HashMap<String, String>,
+    /// Citation key → result. Keyed by repo, branch, pin, path and line, so a
+    /// page re-verified (a new pin) measures afresh.
+    results: std::collections::HashMap<String, Measured>,
+}
+
+impl PinCache {
+    fn load(db: &Db) -> PinCache {
+        db.drift_cache().ok().flatten().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+    }
+
+    fn key(repo: &Path, branch: &str, pin: Option<&str>, c: &CodeCitation) -> String {
+        format!("{}\u{1f}{branch}\u{1f}{}\u{1f}{}\u{1f}{:?}", repo.display(), pin.unwrap_or("-"), c.path, c.line)
+    }
+
+    /// Bring one repo's results up to `head`: drop those whose file changed
+    /// since the last sweep, or all of them when git cannot say.
+    fn advance(&mut self, repo: &Path, head: Option<&str>) {
+        let r = repo.display().to_string();
+        let prefix = format!("{r}\u{1f}");
+        let old = self.heads.get(&r).cloned();
+        match (old.as_deref(), head) {
+            (Some(o), Some(h)) if o == h => {}
+            (Some(o), Some(h)) => match git(repo, &["diff", "--name-only", o, h]) {
+                Some(changed) => {
+                    let changed: std::collections::HashSet<&str> = changed.lines().map(str::trim).collect();
+                    self.results.retain(|k, _| {
+                        !k.starts_with(&prefix) || k.split('\u{1f}').nth(3).is_none_or(|p| !changed.contains(p))
+                    });
+                }
+                // The old head is gone (a force push): nothing carries over.
+                None => self.results.retain(|k, _| !k.starts_with(&prefix)),
+            },
+            _ => self.results.retain(|k, _| !k.starts_with(&prefix)),
+        }
+        match head {
+            Some(h) => {
+                self.heads.insert(r, h.to_string());
+            }
+            None => {
+                self.heads.remove(&r);
+            }
+        }
+    }
+}
+
 /// Run the sweep over one wiki or team repo.
 pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     let cfg = DriftConfig::of(project);
     let mut run = DriftRun { at: now, ..Default::default() };
     let mut branches: std::collections::HashMap<PathBuf, (String, Option<String>)> = Default::default();
+    let mut cache = PinCache::load(db);
+    let mut advanced: std::collections::HashSet<PathBuf> = Default::default();
+    let mut pins: std::collections::HashMap<(PathBuf, String), Option<String>> = Default::default();
+    let mut used: std::collections::HashSet<String> = Default::default();
     let mut measure_one = |subject: &str, raw: &str, since: &str, research: bool, run: &mut DriftRun| {
         let c = match classify(raw) {
             Citation::Code(c) => c,
@@ -424,17 +501,43 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
                 run.branches.push(n);
             }
         }
-        let pin = pin_at(&repo_root, &branch, since);
-        match measure(&repo_root, pin.as_deref(), &branch, &c) {
-            Ok(Some((severity, detail))) => run.mismatches.push(Mismatch {
+        // Once per repo per sweep: which files changed since the last sweep.
+        if advanced.insert(repo_root.clone()) {
+            let head = git(&repo_root, &["rev-parse", &branch]);
+            cache.advance(&repo_root, head.as_deref());
+        }
+        let pin = pins
+            .entry((repo_root.clone(), since.to_string()))
+            .or_insert_with(|| pin_at(&repo_root, &branch, since))
+            .clone();
+        let key = PinCache::key(&repo_root, &branch, pin.as_deref(), &c);
+        used.insert(key.clone());
+        let result = match cache.results.get(&key) {
+            Some(m) => {
+                run.reused += 1;
+                m.clone()
+            }
+            None => {
+                run.measured += 1;
+                let m = match measure(&repo_root, pin.as_deref(), &branch, &c) {
+                    Ok(None) => Measured::Clean,
+                    Ok(Some((severity, detail))) => Measured::Hit(severity, detail),
+                    Err(why) => Measured::Unmeasured(why),
+                };
+                cache.results.insert(key, m.clone());
+                m
+            }
+        };
+        match result {
+            Measured::Hit(severity, detail) => run.mismatches.push(Mismatch {
                 subject: subject.to_string(),
                 citation: raw.trim().to_string(),
                 severity,
                 detail,
                 research,
             }),
-            Ok(None) => {}
-            Err(why) => run.unmeasured.push(format!("{subject} — {}: {why} ({since})", raw.trim())),
+            Measured::Clean => {}
+            Measured::Unmeasured(why) => run.unmeasured.push(format!("{subject} — {}: {why} ({since})", raw.trim())),
         }
     };
 
@@ -476,6 +579,12 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
                 measure_one(&subject, src, &since, false, &mut run);
             }
         }
+    }
+
+    // Keep only what this sweep cited, so the memory stays the size of the wiki.
+    cache.results.retain(|k, _| used.contains(k));
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = db.store_drift_cache(&json);
     }
 
     // Controls and the minimum count.
@@ -650,6 +759,24 @@ mod tests {
         assert!(!run.uncontrolled);
         assert_eq!(run.exit_code, 1, "a live Finding");
         assert!(run.branches.iter().any(|b| b.contains("measured against main")), "{:?}", run.branches);
+        assert_eq!((run.measured, run.reused), (5, 0), "the first sweep measures every code citation");
+
+        // Nothing committed since: every result carries over, the same as a
+        // full sweep, with one git call per repo to see nothing moved.
+        let again = sweep(&project, &db, now).unwrap();
+        assert_eq!(again.mismatches, run.mismatches);
+        assert_eq!(again.unmeasured, run.unmeasured);
+        assert_eq!((again.measured, again.reused), (0, 5));
+
+        // A commit touching one file re-measures only the citations of it.
+        commit_at(&code, "src/combat.rs", "// hits\nfn hit() { crit(); }\n", "2026-09-20");
+        let after = sweep(&project, &db, now).unwrap();
+        assert_eq!((after.measured, after.reused), (1, 4));
+        assert!(after
+            .mismatches
+            .iter()
+            .any(|m| m.subject == "Platform/Combat.md" && m.severity == Severity::Judgment));
+        assert!(after.void_reason.as_deref().is_some_and(|v| v.contains("known-clean")), "the clean control moved");
 
         // A known-clean control that is flagged voids the run.
         project.config.extra.insert("drift".into(), serde_json::json!({"controlMoved": "Platform/Save.md", "controlClean": "Platform/Old.md"}));

@@ -696,6 +696,15 @@ impl Db {
         self.meta_set("vocabulary", json)
     }
 
+    /// The drift sweep's results carried between runs (see `drift`).
+    pub fn drift_cache(&self) -> Result<Option<String>> {
+        self.meta_get("drift_cache")
+    }
+
+    pub fn store_drift_cache(&self, json: &str) -> Result<()> {
+        self.meta_set("drift_cache", json)
+    }
+
     /// Start a batch: the writes that follow, until [`Db::commit_batch`],
     /// land as one transaction. Each write method's own savepoint nests
     /// inside it, so a scan pays one commit per batch, not several per file.

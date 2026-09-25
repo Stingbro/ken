@@ -104,6 +104,10 @@ export interface DriftRun {
   uncontrolled: boolean;
   unmeasured: string[];
   branches: string[];
+  /** Citations measured with git this sweep, and those carried from the
+   *  last sweep because no commit since touched their file. */
+  measured: number;
+  reused: number;
 }
 
 /** What a repo is for; decides sync and how deep Ken reads it. */

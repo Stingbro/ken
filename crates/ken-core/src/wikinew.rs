@@ -145,7 +145,9 @@ pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
-        fs::write(&dest, fill(path, text, team, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
+        // LF, whatever the checkout Ken was built from used.
+        let text = text.replace("\r\n", "\n");
+        fs::write(&dest, fill(path, &text, team, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
     }
     git(dir, &["init", "-q"])?;
     git(dir, &["add", "-A"])?;
