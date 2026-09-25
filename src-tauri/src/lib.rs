@@ -2537,6 +2537,7 @@ async fn search_all_projects(
     state: State<'_, SharedState>,
     query: String,
     limit: Option<usize>,
+    audience: Option<String>,
 ) -> CmdResult<SearchAllProjectsDto> {
     let limit = limit.unwrap_or(30);
 
@@ -2576,7 +2577,7 @@ async fn search_all_projects(
                 .collect()
         };
         // No scope: this caller is the all-projects search by definition.
-        let dto = route_search(app, state, query, Some(limit), None, None).await?;
+        let dto = route_search(app, state, query, Some(limit), None, None, audience).await?;
         return Ok(adapt_route_search_to_all_projects(dto, manifest_extras));
     }
 
@@ -2651,8 +2652,17 @@ async fn search_all_projects(
                     .into_iter()
                     .map(|(pid, name, db)| {
                         let q = &q;
+                        let audience = audience.as_deref();
                         s.spawn(move || {
-                            let hits = db.lock().unwrap().search(q, limit).unwrap_or_default();
+                            let db = db.lock().unwrap();
+                            let filtered = audience.is_some_and(|a| !a.is_empty() && a != "any");
+                            let mut hits = db.search(q, if filtered { limit * 3 } else { limit }).unwrap_or_default();
+                            if filtered {
+                                hits.retain(|h| {
+                                    ken_core::pagemeta::suits(audience, ken_core::pagemeta::audience_at(&db, &h.rel_path))
+                                });
+                                hits.truncate(limit);
+                            }
                             (pid.to_string(), name, hits)
                         })
                     })
@@ -3050,11 +3060,13 @@ async fn hybrid_search(
         // The one shared composition (keyword + semantic, vocabulary
         // alternatives, lines, page facts and bands), same as workspace
         // search and the MCP.
-        let mut merged = ken_core::routing::search_member(&db, &query, query_vec.as_deref(), limit).map_err(err)?;
-        // Item 2b: keep only pages written for this audience.
-        if let Some(want) = audience.as_deref().filter(|a| !a.is_empty()) {
-            merged.retain(|h| h.page.as_ref().and_then(|p| p.audience) == Some(want));
-        }
+        // Item 2b: keep what suits the reader chosen (business, dev, any),
+        // reading further down the ranking so a filter still fills the page.
+        let filtered = audience.as_deref().is_some_and(|a| !a.is_empty() && a != "any");
+        let fetch = if filtered { limit * 3 } else { limit };
+        let mut merged = ken_core::routing::search_member(&db, &query, query_vec.as_deref(), fetch).map_err(err)?;
+        merged.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
+        merged.truncate(limit);
         let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
         let tiers = db.chunk_tiers(&chunk_ids).map_err(err)?;
 
@@ -8360,8 +8372,13 @@ async fn route_search(
     limit: Option<usize>,
     scope: Option<uuid::Uuid>,
     group: Option<String>,
+    audience: Option<String>,
 ) -> CmdResult<RouteSearchDto> {
     let limit = limit.unwrap_or(30);
+    // Item 2b: a reader chosen (business, dev) reads further down each
+    // member's ranking so the filter still fills the page.
+    let filtered = audience.as_deref().is_some_and(|a| !a.is_empty() && a != "any");
+    let fetch = if filtered { limit * 3 } else { limit };
 
     let group_targets: Option<Vec<uuid::Uuid>>;
     let (base_dir, kg_root, kg_enabled, embedder_slot, snapshots) = {
@@ -8572,6 +8589,7 @@ async fn route_search(
         let query_vec = query_vec.clone();
         let counter = done_counter.clone();
         let ev_app = app.clone();
+        let audience = audience.clone();
         handles.push(tauri::async_runtime::spawn_blocking(
             move || -> routing::MemberHits {
                 let result = if let Some(db) = db {
@@ -8584,12 +8602,18 @@ async fn route_search(
                         }
                     } else {
                         let db = db.lock().unwrap();
-                        match routing::search_member(&db, &query, query_vec.as_deref(), limit) {
-                            Ok(hits) => routing::MemberHits {
+                        match routing::search_member(&db, &query, query_vec.as_deref(), fetch) {
+                            Ok(mut hits) => routing::MemberHits {
+                                hits: {
+                                    hits.retain(|h| {
+                                        ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience))
+                                    });
+                                    hits.truncate(limit);
+                                    hits
+                                },
                                 project_id: target_id,
                                 member_name: name,
                                 status: routing::MemberStatus::Searched,
-                                hits,
                             },
                             Err(_) => routing::MemberHits {
                                 project_id: target_id,

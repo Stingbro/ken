@@ -110,6 +110,9 @@ export interface DriftRun {
   reused: number;
 }
 
+/** Who a search is for (item 2b); null is any reader. */
+export type Audience = "business" | "dev" | null;
+
 /** What a repo is for; decides sync and how deep Ken reads it. */
 export type RepoKind = "team" | "wiki" | "code" | "reference";
 
@@ -1818,8 +1821,8 @@ export const api = {
    *  BM25 scores aren't comparable across corpora). Requires `workspace`;
    *  upgrades to `routeSearch` when `kgRouting` is also on (kg-routing
    *  proposal: "same UI slot, richer results"). */
-  searchAllProjects: (query: string, limit = 30) =>
-    invoke<SearchAllProjectsResult>("search_all_projects", { query, limit }),
+  searchAllProjects: (query: string, limit = 30, audience: Audience = null) =>
+    invoke<SearchAllProjectsResult>("search_all_projects", { query, limit, audience }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
   renameProject: (id: string, name: string) =>
     invoke<ProjectInfo>("rename_project", { id, name }),
@@ -1838,8 +1841,9 @@ export const api = {
    *  on for the project); transparently degrades to FTS-only results when
    *  it's off, so callers can always route through this instead of `search`. */
   /** `audience` "business" keeps only pages written for readers who never
-   *  see code (Current, Design, Work, or `audience: business`). */
-  hybridSearch: (query: string, limit = 30, audience: "business" | "dev" | null = null) =>
+   *  see code (Current, Design, Work, or `audience: business`); "dev" keeps
+   *  everything else but the method pages, code included; null is any. */
+  hybridSearch: (query: string, limit = 30, audience: Audience = null) =>
     invoke<HybridHit[]>("hybrid_search", { query, limit, audience }),
   /** Route `query` across every open workspace member (kg-routing task 4.1):
    *  plan (Named/KG-guided/Broadcast), fan out hybrid search over the
@@ -1851,12 +1855,14 @@ export const api = {
     limit = 30,
     scope?: string | null,
     group?: string | null,
+    audience: Audience = null,
   ) =>
     invoke<RouteSearchResult>("route_search", {
       query,
       limit,
       scope: scope ?? null,
       group: group ?? null,
+      audience,
     }),
   /** Named groups of members, stored in the workspace manifest. */
   workspaceGroups: () => invoke<ProjectGroup[]>("workspace_groups"),

@@ -234,6 +234,7 @@ match; the last word may be a prefix.",
                 "properties": {
                     "query": { "type": "string", "description": "Search terms." },
                     "limit": { "type": "integer", "description": "Maximum hits to return (default 20)." },
+                    "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "project": project_arg
                 },
                 "required": ["query"]
@@ -312,6 +313,7 @@ maturity. Hits carry ken:// addresses.",
                 "properties": {
                     "query": { "type": "string", "description": "Search terms." },
                     "limit": { "type": "integer", "description": "Maximum hits to return (default 20)." },
+                    "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "project": project_arg
                 },
                 "required": ["query"]
@@ -331,7 +333,8 @@ picked the target when the knowledge graph did the routing.",
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search terms — also matched against project names for direct routing." },
-                    "limit": { "type": "integer", "description": "Maximum merged hits to return (default 20)." }
+                    "limit": { "type": "integer", "description": "Maximum merged hits to return (default 20)." },
+                    "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                 },
                 "required": ["query"]
             }
@@ -817,9 +820,12 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
                 .unwrap_or(20);
             let (project, note) = resolve_project(server, args)?;
             let db = open_index(server, &project)?;
-            let hits = db
-                .search(&query, limit)
+            let audience = audience_arg(args);
+            let mut hits = db
+                .search(&query, fetch_for(audience.as_deref(), limit))
                 .map_err(|e| format!("search failed: {e}"))?;
+            hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), ken_core::pagemeta::audience_at(&db, &h.rel_path)));
+            hits.truncate(limit);
             let mut out = note.unwrap_or_default();
             if hits.is_empty() {
                 out.push_str(&format!(
@@ -1077,7 +1083,11 @@ which is off. Use search_knowledge instead."
     }
     let (project, note) = resolve_project(server, args)?;
     let db = open_index(server, &project)?;
-    let hits = routing::search_member(&db, &query, None, limit).map_err(|e| format!("search failed: {e}"))?;
+    let audience = audience_arg(args);
+    let mut hits = routing::search_member(&db, &query, None, fetch_for(audience.as_deref(), limit))
+        .map_err(|e| format!("search failed: {e}"))?;
+    hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
+    hits.truncate(limit);
     let mut out = note.unwrap_or_default();
     if hits.is_empty() {
         out.push_str(&format!(
@@ -1118,6 +1128,20 @@ this server has no query embedding model; see the tool description):\n",
 /// `query_vec` unconditionally `None` — the "honest adaptation" its module
 /// doc explicitly anticipates for a caller in ken-mcp's position, ending in
 /// the same pure `merge_routed` call `execute_plan` itself makes.
+/// The reader a search is for (item 2b): `business`, `dev`, or none for any.
+fn audience_arg(args: &Value) -> Option<String> {
+    args.get("audience").and_then(|a| a.as_str()).map(str::to_string).filter(|a| !a.is_empty() && a != "any")
+}
+
+/// Hits to read before filtering by audience, so a filter still fills the page.
+fn fetch_for(audience: Option<&str>, limit: usize) -> usize {
+    if audience.is_some() {
+        limit * 3
+    } else {
+        limit
+    }
+}
+
 fn route_query(server: &Server, args: &Value) -> Result<String, String> {
     let query = require_str(args, "query")?;
     let limit = args
@@ -1178,6 +1202,7 @@ folder in the Ken app first."
         .then(|| WorkspaceKgDb::open(&kg_root(server)).ok())
         .flatten();
     let plan = routing::plan_route(&query, &members, kg.as_ref());
+    let audience = audience_arg(args);
 
     let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
     for &project_id in &plan.targets {
@@ -1224,12 +1249,16 @@ folder in the Ken app first."
             });
             continue;
         };
-        match routing::search_member(db, &query, None, limit) {
-            Ok(hits) => member_hits.push(MemberHits {
+        match routing::search_member(db, &query, None, fetch_for(audience.as_deref(), limit)) {
+            Ok(mut hits) => member_hits.push(MemberHits {
+                hits: {
+                    hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
+                    hits.truncate(limit);
+                    hits
+                },
                 project_id,
                 member_name: info.name.clone(),
                 status: MemberStatus::Searched,
-                hits,
             }),
             Err(_) => member_hits.push(MemberHits {
                 project_id,

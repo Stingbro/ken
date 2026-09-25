@@ -262,6 +262,29 @@ impl Audience {
     }
 }
 
+/// Whether a search result suits the reader chosen: `business`, `dev`, or
+/// none/`any` for everything. Business readers get pages written for them;
+/// developers get everything else but the method's own pages, code and
+/// documents outside the sections included. `audience` is the hit's
+/// ([`HitPage::audience`], none for a file that is not a page).
+pub fn suits(want: Option<&str>, audience: Option<&str>) -> bool {
+    match want.map(str::trim).filter(|w| !w.is_empty() && *w != "any") {
+        Some("business") => audience == Some("business"),
+        Some("dev") => !matches!(audience, Some("business") | Some("method")),
+        _ => true,
+    }
+}
+
+/// The audience of the file at `path`, read from the index: a Markdown
+/// page's frontmatter and section, none for anything else.
+pub fn audience_at(db: &crate::db::Db, path: &str) -> Option<&'static str> {
+    if !path.ends_with(".md") {
+        return None;
+    }
+    let meta = db.page_meta(path).ok().flatten();
+    audience_of(section_of(path), meta.as_ref()).map(Audience::name)
+}
+
 /// A page's audience: its frontmatter `audience:` when it says, else its
 /// section. Current, Design and Work are business; Conventions, Platform and
 /// Reference are dev; Ways-of-Working is the method. Research is evidence
@@ -413,6 +436,17 @@ mod tests {
         assert_eq!(old.replaced_by, vec!["[[Rules]]"]);
         assert_eq!(old.dated, None, "only Research is stamped");
         assert_eq!(hit_page("src/main.rs", None), None);
+    }
+
+    #[test]
+    fn a_reader_gets_business_pages_or_everything_else_or_all() {
+        for any in [None, Some(""), Some("any")] {
+            assert!(suits(any, Some("business")) && suits(any, Some("method")) && suits(any, None));
+        }
+        assert!(suits(Some("business"), Some("business")));
+        assert!(!suits(Some("business"), Some("dev")) && !suits(Some("business"), None), "code is not for business readers");
+        assert!(suits(Some("dev"), Some("dev")) && suits(Some("dev"), None), "developers get pages and code");
+        assert!(!suits(Some("dev"), Some("business")) && !suits(Some("dev"), Some("method")));
     }
 
     #[test]

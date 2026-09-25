@@ -3,6 +3,7 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import {
     api,
+    type Audience,
     type QuickAnswer,
     type HybridHit,
     type RoutePlan,
@@ -226,7 +227,7 @@
         // project chosen on Home); `pinnedMember` is the overlay's own
         // in-place narrowing for a single query.
         const res = await api
-          .routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName)
+          .routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, audience)
           .catch(() => null);
         if (q !== query.trim() || !res) return; // stale or failed
         routedPlan = res.plan;
@@ -248,7 +249,7 @@
         }));
       } else {
         routedPlan = null;
-        const res = await api.searchAllProjects(q, 30).catch(() => null);
+        const res = await api.searchAllProjects(q, 30, audience).catch(() => null);
         if (q !== query.trim() || !res) return;
         coverageNotes = res.memberStatus
           .filter((s) => s.status !== "searched")
@@ -273,7 +274,7 @@
     // toggle existed.
     routedPlan = null;
     coverageNotes = [];
-    const found = await api.hybridSearch(q, 30, businessOnly ? "business" : null);
+    const found = await api.hybridSearch(q, 30, audience);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
     results = fromHybrid(found);
@@ -281,9 +282,16 @@
     selected = 0;
   }
 
-  // Item 2b: pages for readers who never see code (Current, Design, Work,
-  // or a page that says `audience: business`). Project scope only.
-  let businessOnly = $state(false);
+  // Item 2b: who the results are for, in every scope. Business: pages for
+  // readers who never see code (Current, Design, Work, or a page that says
+  // `audience: business`). Developers: everything else but the method's
+  // own pages, code included. Any: everything.
+  let audience = $state<Audience>(null);
+  const READERS: { v: Audience; label: string; title: string }[] = [
+    { v: null, label: "Any reader", title: "Everything" },
+    { v: "business", label: "Business readers", title: "Only pages written for people who never read code: Current, Design, Work" },
+    { v: "dev", label: "Developers", title: "Dev pages and code; not the business pages or the method" },
+  ];
 
   function setScope(next: Scope) {
     if (scope === next) return;
@@ -386,22 +394,22 @@
       {/if}
     </div>
   {/if}
-  {#if !app.workspace || scope === "project"}
-    <div class="scope-row">
+  <div class="scope-row" role="group" aria-label="Who the results are for">
+    {#each READERS as opt (opt.label)}
       <button
         class="scope-btn"
-        class:active={businessOnly}
-        aria-pressed={businessOnly}
-        title="Only pages written for people who never read code: Current, Design, Work"
+        class:active={audience === opt.v}
+        aria-pressed={audience === opt.v}
+        title={opt.title}
         onclick={() => {
-          businessOnly = !businessOnly;
+          audience = opt.v;
           void run();
         }}
       >
-        For business readers
+        {opt.label}
       </button>
-    </div>
-  {/if}
+    {/each}
+  </div>
 
   {#if answer}
     <div class="qa">
