@@ -350,7 +350,15 @@ export type InboxKind =
   | "conflict"
   | "conflict-copy"
   | "automation-proposal"
-  | "ingest";
+  | "ingest"
+  | "page-proposal";
+
+/** A proposed change to one wiki page a person keeps (a repo was added). */
+export interface PageProposalPayload {
+  page: string;
+  base: string;
+  proposed: string;
+}
 
 export interface InboxItem {
   /** Kind-prefixed, stable across refreshes: "run-12", "stale-people", … */
@@ -1723,6 +1731,14 @@ export const api = {
    *  member and an optional folder of documents. Background; a Review card
    *  lists the result. Never touches a page a person wrote. */
   draftWiki: (wiki: string, extra: string | null) => invoke<void>("draft_wiki", { wiki, extra }),
+  /** Repos joined: each team wiki covering them drafts their Repo Map pages
+   *  and proposes changes to kept pages. Returns the wikis being updated. */
+  wikiAddRepos: (members: string[]) => invoke<string[]>("wiki_add_repos", { members }),
+  /** A team wiki from the bundled template, in a new or empty folder. */
+  setupCreateWiki: (dir: string, team: string, repos: { name: string; description: string }[], taken: string[]) =>
+    invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken }),
+  /** Apply a proposed page change; returns the page written. */
+  applyPageProposal: (itemId: number) => invoke<string>("apply_page_proposal", { itemId }),
   /** What waits in the library inbox (Research/Ingestion/Raw/). */
   ingestStatus: () => invoke<IngestStatus>("ingest_status"),
   /** Read what waits in Raw/ now; false when a pass is already running. */

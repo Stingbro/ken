@@ -6018,7 +6018,7 @@ fn inbox_rank(kind: &str) -> u8 {
         "approval" => 0,
         "automation-proposal" => 1,
         "conflict" | "conflict-copy" => 2,
-        "stored" | "ingest" => 3,
+        "stored" | "ingest" | "page-proposal" => 3,
         "broken-recipe" => 4,
         "failed-file" => 5,
         _ => 6, // stale
@@ -6029,7 +6029,7 @@ fn inbox_rank(kind: &str) -> u8 {
 /// (conflicts render their own detail); anything else stays generic.
 fn stored_kind(kind: &str) -> String {
     match kind {
-        "conflict" | "conflict-copy" | "automation-proposal" | "ingest" => kind.to_string(),
+        "conflict" | "conflict-copy" | "automation-proposal" | "ingest" | "page-proposal" => kind.to_string(),
         _ => "stored".to_string(),
     }
 }
@@ -7199,47 +7199,186 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
     true
 }
 
+/// Every workspace member as the wiki sees it: folder, kinds and team from
+/// the registry.
+fn wiki_team_members(guard: &AppState) -> CmdResult<Vec<ken_core::wikidraft::TeamMember>> {
+    let ws = guard.workspace.as_ref().ok_or("open the workspace first")?;
+    let reg = Registry::load(&guard.base_dir).map_err(err)?;
+    Ok(ws
+        .ws
+        .members
+        .iter()
+        .filter_map(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) => {
+                let entry = reg.entry_at(&p.root);
+                Some(ken_core::wikidraft::TeamMember {
+                    name: m.name.clone(),
+                    root: p.root.clone(),
+                    kind: entry.map(|e| e.kind.clone()).unwrap_or_default(),
+                    team: entry.and_then(|e| e.team.clone()),
+                })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// The wiki member's folder and project id.
+fn wiki_target(guard: &AppState, wiki: &str) -> CmdResult<(std::path::PathBuf, uuid::Uuid)> {
+    let ws = guard.workspace.as_ref().ok_or("open the workspace first")?;
+    ws.ws
+        .members
+        .iter()
+        .find(|m| m.name == wiki)
+        .and_then(|m| match &m.status {
+            ken_core::workspace::MemberStatus::Ok(p) => Some((p.root.clone(), p.config.id)),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{wiki} is not a member of this workspace"))
+}
+
+/// One model call through the Claude CLI, run in the wiki's folder.
+fn claude_generate(binary: std::path::PathBuf, root: std::path::PathBuf) -> impl FnMut(&str) -> ken_core::Result<String> {
+    move |prompt: &str| match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
+        ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+        ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
+        ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
+        ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
+    }
+}
+
 /// Draft the first wiki pages (item 4b) into the workspace member `wiki`,
-/// from every workspace member plus an optional folder of documents. Runs
-/// in the background through the Claude CLI; the result is one Review card.
-/// Never touches a page a person wrote.
+/// from its team's repos plus an optional folder of documents: a Repo Map
+/// page per repo, each from that repo alone, then the team pages from those
+/// pages. Runs in the background through the Claude CLI; the result is one
+/// Review card. Never touches a page a person wrote.
 #[tauri::command]
 fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
     let (base, wiki_root, wiki_id, repos) = {
         let guard = state.lock().unwrap();
-        let ws = guard.workspace.as_ref().ok_or("open the workspace first")?;
-        let mut repos: Vec<(String, std::path::PathBuf)> = Vec::new();
-        let mut target: Option<(std::path::PathBuf, uuid::Uuid)> = None;
-        for m in &ws.ws.members {
-            if let ken_core::workspace::MemberStatus::Ok(p) = &m.status {
-                repos.push((ken_core::workspace::member_leaf(&m.name).to_string(), p.root.clone()));
-                if m.name == wiki {
-                    target = Some((p.root.clone(), p.config.id));
-                }
-            }
-        }
-        let (root, id) = target.ok_or_else(|| format!("{wiki} is not a member of this workspace"))?;
-        (guard.base_dir.clone(), root, id, repos)
+        let members = wiki_team_members(&guard)?;
+        let (root, id) = wiki_target(&guard, &wiki)?;
+        (guard.base_dir.clone(), root, id, ken_core::wikidraft::team_repos(&wiki, &members))
     };
     let Some(binary) = ken_core::runner::discover_claude() else {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     };
+    let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
     std::thread::spawn(move || {
-        let sources = ken_core::wikidraft::gather(&repos, extra.as_deref().map(Path::new));
         let Ok(mut db) = Db::open(&base, wiki_id) else { return };
-        let generate = |prompt: &str| -> ken_core::Result<String> {
-            match ken_core::assistant::oneshot(&binary, &wiki_root, prompt, Duration::from_secs(600), &CancelToken::new())? {
-                ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
-                ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
-                ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
-                ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
-            }
-        };
-        if let Err(e) = ken_core::wikidraft::draft(&wiki_root, &mut db, &sources, &local_date_today(), engine::now_epoch(), generate) {
+        let generate = claude_generate(binary, wiki_root.clone());
+        let extra = extra.as_deref().map(Path::new);
+        if let Err(e) = ken_core::wikidraft::draft_team(
+            &wiki_root,
+            &wiki_name,
+            &mut db,
+            &repos,
+            extra,
+            &local_date_today(),
+            engine::now_epoch(),
+            generate,
+        ) {
             eprintln!("warning: first-wiki draft failed: {e}");
         }
     });
     Ok(())
+}
+
+/// Repos joined the workspace: for each team wiki that covers any of them,
+/// draft their Repo Map pages and propose changes to the pages its people
+/// keep, in the background. Returns the wikis being updated.
+#[tauri::command]
+fn wiki_add_repos(state: State<SharedState>, members: Vec<String>) -> CmdResult<Vec<String>> {
+    let (base, all) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), wiki_team_members(&guard)?)
+    };
+    let mut by_wiki: std::collections::BTreeMap<String, Vec<(String, std::path::PathBuf)>> = Default::default();
+    for m in &members {
+        let Some(w) = ken_core::wikidraft::wiki_for(m, &all) else { continue };
+        if let Some(added) = all.iter().find(|x| &x.name == m) {
+            by_wiki.entry(w.name.clone()).or_default().push((added.name.clone(), added.root.clone()));
+        }
+    }
+    if by_wiki.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    };
+    let wikis: Vec<String> = by_wiki.keys().cloned().collect();
+    for (wiki, added) in by_wiki {
+        let (root, id) = {
+            let guard = state.lock().unwrap();
+            wiki_target(&guard, &wiki)?
+        };
+        let team = ken_core::wikidraft::team_repos(&wiki, &all);
+        let (base, binary) = (base.clone(), binary.clone());
+        let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
+        std::thread::spawn(move || {
+            let Ok(mut db) = Db::open(&base, id) else { return };
+            let generate = claude_generate(binary, root.clone());
+            if let Err(e) = ken_core::wikidraft::draft_added(
+                &root,
+                &wiki_name,
+                &mut db,
+                &added,
+                &team,
+                &local_date_today(),
+                engine::now_epoch(),
+                generate,
+            ) {
+                eprintln!("warning: wiki update for added repos failed: {e}");
+            }
+        });
+    }
+    Ok(wikis)
+}
+
+/// Create a team's wiki from the bundled Ways-of-Working template at `dir`
+/// (a new or empty folder) and return its set-up row. Local only: a remote
+/// and a push are the person's step.
+#[tauri::command]
+async fn setup_create_wiki(
+    dir: String,
+    team: String,
+    repos: Vec<ken_core::wikinew::Covered>,
+    taken: Vec<String>,
+) -> CmdResult<ken_core::setup::RepoRow> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ken_core::setup::create_wiki(Path::new(&dir), &team, &repos, &taken, &local_date_today()).map_err(err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Apply a proposed change to a page a person keeps, only while the page
+/// still reads as it did when Ken proposed it.
+#[tauri::command]
+fn apply_page_proposal(state: State<SharedState>, item_id: i64) -> CmdResult<String> {
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, None)?;
+    let item = active
+        .db
+        .list_open_review_items()
+        .map_err(err)?
+        .into_iter()
+        .find(|it| it.id == item_id && it.kind == ken_core::wikidraft::PROPOSAL_KIND)
+        .ok_or("no open proposal with that id")?;
+    let proposal: ken_core::wikidraft::Proposal =
+        serde_json::from_str(item.payload.as_deref().unwrap_or("")).map_err(|_| "the card has no proposed change")?;
+    match ken_core::wikidraft::apply(&active.project.root, &proposal) {
+        Ok(()) => {}
+        Err(ken_core::wikidraft::ApplyError::Changed) => {
+            return Err(format!(
+                "{} changed after Ken proposed this, so applying it would undo that edit. Discard it; the next repo added proposes again.",
+                proposal.page
+            ))
+        }
+        Err(ken_core::wikidraft::ApplyError::Io(e)) => return Err(e),
+    }
+    active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
+    Ok(proposal.page)
 }
 
 #[derive(Serialize)]
@@ -14053,6 +14192,9 @@ pub fn run() {
             ingest_now,
             ingest_undo,
             draft_wiki,
+            wiki_add_repos,
+            setup_create_wiki,
+            apply_page_proposal,
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,

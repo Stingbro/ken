@@ -12,6 +12,7 @@
     type RegistryEntryStatus,
     type RepoKind,
     type SetupMoved,
+    type SetupRepoRow,
   } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { KINDS, toggleKind } from "../onboarding/setupFlow";
@@ -54,8 +55,19 @@
     entries = await api.setProjectDescription(e.id, text);
   }
 
-  /** Pick more repos into the open workspace, wherever they live; each joins
-   *  with what the scan proposes, and can be changed here after. */
+  // Repos picked to add, shown for their team and what each is for before
+  // they join; then each team's wiki gets their Repo Map pages and proposed
+  // changes to the pages its people keep.
+  let pending = $state<SetupRepoRow[] | null>(null);
+  let updateWiki = $state(true);
+  let updating = $state<string[]>([]);
+  const wikiTeams = $derived(
+    new Set(entries.filter((e) => (e.kind ?? []).includes("wiki") && e.team).map((e) => e.team as string)),
+  );
+  const pendingCovered = $derived((pending ?? []).some((r) => r.include && r.team && wikiTeams.has(r.team)));
+
+  /** Pick more repos into the open workspace, wherever they live; each is
+   *  proposed from what is in it and waits here until Add. */
   async function addRepos() {
     if (!app.workspace) return;
     const chosen = await openDialog({ directory: true, multiple: true, title: "Pick repos to add" });
@@ -64,9 +76,27 @@
     busy = true;
     error = null;
     try {
-      const p = await api.setupProposeRepos(list);
-      await app.confirmSetupRepos(app.workspace.name, p.rows, true);
+      pending = (await api.setupProposeRepos(list)).rows;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function confirmAdd() {
+    if (!app.workspace || !pending) return;
+    busy = true;
+    error = null;
+    try {
+      const rows = pending;
+      await app.confirmSetupRepos(app.workspace.name, rows, true);
       await load();
+      pending = null;
+      if (updateWiki) {
+        const added = rows.filter((r) => r.include && r.index !== "off").map((r) => r.member);
+        updating = await api.wikiAddRepos(added);
+      }
     } catch (e) {
       error = String(e);
     } finally {
@@ -179,6 +209,54 @@
     <button class="btn btn-ghost" disabled={busy} onclick={scanAgain}>{busy ? "Working…" : "Scan again"}</button>
   </div>
 
+  {#if pending}
+    <div class="pending">
+      <p class="note">
+        Adding {pending.length === 1 ? "this repo" : `these ${pending.length} repos`}. Give each its team and a
+        line on what it is for; the team's wiki reads both.
+      </p>
+      {#each pending as row (row.path ?? row.member)}
+        <div class="row">
+          <label class="mono name"><input type="checkbox" bind:checked={row.include} /> {row.member}</label>
+          <span class="evidence">{row.kind.join(", ") || "kind not said"}</span>
+          <input
+            class="team"
+            placeholder="team"
+            value={row.team ?? ""}
+            oninput={(e) => (row.team = e.currentTarget.value.trim() || null)}
+            aria-label="Team for {row.member}"
+          />
+        </div>
+        <input
+          class="description"
+          placeholder="What is this repo for, and how is it used?"
+          bind:value={row.description}
+          aria-label="What {row.member} is for"
+        />
+      {/each}
+      {#if pendingCovered}
+        <label class="note">
+          <input type="checkbox" bind:checked={updateWiki} />
+          Update the team's wiki: draft a Repo Map page for each, and propose changes to the pages its
+          people keep (the architecture, who does what, the project, the vocabulary) as Review cards to
+          apply or discard.
+        </label>
+      {/if}
+      <div class="actions">
+        <button class="btn btn-primary" disabled={busy || pending.every((r) => !r.include)} onclick={confirmAdd}>
+          {busy ? "Adding…" : "Add"}
+        </button>
+        <button class="btn btn-ghost" disabled={busy} onclick={() => (pending = null)}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+  {#if updating.length > 0}
+    <p class="note">
+      Updating {updating.join(", ")} in the background. Open the wiki's Review to read the new pages and
+      the proposed changes.
+    </p>
+  {/if}
+
   {#if moved}
     {#if moved.length === 0}
       <p class="note">Nothing moved since set-up.</p>
@@ -255,6 +333,14 @@
     font-size: 12.5px;
     color: var(--ink-tertiary);
     line-height: 1.5;
+  }
+  .pending {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
   }
   .evidence {
     font-size: 11.5px;

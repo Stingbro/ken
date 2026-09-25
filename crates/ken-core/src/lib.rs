@@ -54,6 +54,7 @@ pub mod user_state;
 pub mod vocab;
 pub mod watch;
 pub mod wikidraft;
+pub mod wikinew;
 pub mod workspace;
 pub mod workspace_digest;
 pub mod workspace_kg_db;

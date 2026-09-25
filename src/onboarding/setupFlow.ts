@@ -41,3 +41,40 @@ export function mergeRows(old: SetupRepoRow[], fresh: SetupRepoRow[]): SetupRepo
 export function suggestedTeams(rows: SetupRepoRow[]): string[] {
   return [...new Set(rows.filter((r) => r.include && r.team).map((r) => r.team as string))].sort();
 }
+
+/** What a team does for its wiki at set-up: use a wiki repo already picked,
+ *  create a new one from the template, or none for now. */
+export type WikiChoice =
+  | { mode: "existing"; member: string }
+  | { mode: "new"; parent: string | null; name: string }
+  | { mode: "none" };
+
+/** Included wiki repos on a team. */
+export function teamWikis(rows: SetupRepoRow[], team: string): SetupRepoRow[] {
+  return rows.filter((r) => r.include && r.team === team && r.kind.includes("wiki"));
+}
+
+/** A team with a wiki repo picked uses it; otherwise none until a person
+ *  chooses to create one. */
+export function defaultWikiChoice(rows: SetupRepoRow[], team: string): WikiChoice {
+  const w = teamWikis(rows, team)[0];
+  return w ? { mode: "existing", member: w.member } : { mode: "none" };
+}
+
+/** The team's repos a new wiki lists on its Start Here page. */
+export function coveredRepos(rows: SetupRepoRow[], team: string): { name: string; description: string }[] {
+  return rows
+    .filter((r) => r.include && r.team === team && !r.kind.includes("wiki"))
+    .map((r) => ({ name: r.member, description: r.description }));
+}
+
+/** A new wiki's folder: `name` inside `parent`, in the parent's own separator. */
+export function newWikiPath(parent: string, name: string): string {
+  const sep = parent.includes("\\") ? "\\" : "/";
+  return parent.replace(/[\\/]+$/, "") + sep + name.trim();
+}
+
+/** Every "create" choice has a folder and a name. */
+export function wikiChoicesReady(choices: Record<string, WikiChoice>): boolean {
+  return Object.values(choices).every((c) => c.mode !== "new" || (!!c.parent && c.name.trim().length > 0));
+}

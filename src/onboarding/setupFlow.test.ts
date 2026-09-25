@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { SetupRepoRow } from "../lib/api";
-import { indexSummary, mergeRows, noTeams, suggestedTeams, toggleKind } from "./setupFlow";
+import {
+  coveredRepos,
+  defaultWikiChoice,
+  indexSummary,
+  mergeRows,
+  newWikiPath,
+  noTeams,
+  suggestedTeams,
+  teamWikis,
+  toggleKind,
+  wikiChoicesReady,
+} from "./setupFlow";
 
 const row = (member: string, over: Partial<SetupRepoRow> = {}): SetupRepoRow => ({
   member,
@@ -46,5 +57,20 @@ describe("setup flow", () => {
       row("empty", { index: "off", include: false }),
     ];
     expect(indexSummary(rows)).toEqual({ entities: 1, search: 1, off: 2 });
+  });
+
+  it("a team uses its wiki repo, or none until a person creates one", () => {
+    const rows = [row("docs", { kind: ["wiki"] }), row("game", { kind: ["code"], description: "The client" }), row("ops", { team: "Ops" })];
+    expect(teamWikis(rows, "Realms").map((r) => r.member)).toEqual(["docs"]);
+    expect(defaultWikiChoice(rows, "Realms")).toEqual({ mode: "existing", member: "docs" });
+    expect(defaultWikiChoice(rows, "Ops")).toEqual({ mode: "none" });
+    expect(coveredRepos(rows, "Realms")).toEqual([{ name: "game", description: "The client" }]);
+  });
+
+  it("a new wiki needs a folder and a name", () => {
+    expect(newWikiPath("C:\\Code\\", "Realms-Wiki")).toBe("C:\\Code\\Realms-Wiki");
+    expect(newWikiPath("/home/me/code", " Realms-Wiki ")).toBe("/home/me/code/Realms-Wiki");
+    expect(wikiChoicesReady({ A: { mode: "new", parent: null, name: "W" } })).toBe(false);
+    expect(wikiChoicesReady({ A: { mode: "new", parent: "C:/x", name: "W" }, B: { mode: "none" } })).toBe(true);
   });
 });

@@ -11,6 +11,7 @@ import {
   type ConflictResolution,
   type InboxItem,
   type InboxKind,
+  type PageProposalPayload,
 } from "./api";
 import { forFocused } from "./app.svelte";
 
@@ -29,7 +30,8 @@ export type InboxAction =
   | "keep-copy"
   | "keep-original"
   | "open-both"
-  | "undo-ingest";
+  | "undo-ingest"
+  | "apply-proposal";
 
 export function actionsFor(kind: InboxKind): InboxAction[] {
   switch (kind) {
@@ -52,6 +54,9 @@ export function actionsFor(kind: InboxKind): InboxAction[] {
       // One card of key takeaways per source: read it, undo a wrong one,
       // or mark it seen. Nobody confirms a note.
       return ["open-files", "undo-ingest", "mark-done"];
+    case "page-proposal":
+      // A change to a page a person keeps: apply it, or discard it.
+      return ["apply-proposal", "mark-done"];
   }
 }
 
@@ -60,6 +65,16 @@ export function conflictPayload(item: InboxItem): ConflictPayload | null {
   if (item.kind !== "conflict" || !item.payload) return null;
   try {
     return JSON.parse(item.payload) as ConflictPayload;
+  } catch {
+    return null;
+  }
+}
+
+/** Parsed page-proposal payload, or null when absent/malformed. */
+export function proposalPayload(item: InboxItem): PageProposalPayload | null {
+  if (item.kind !== "page-proposal" || !item.payload) return null;
+  try {
+    return JSON.parse(item.payload) as PageProposalPayload;
   } catch {
     return null;
   }
@@ -137,6 +152,7 @@ export function dotFor(kind: InboxKind): string {
     case "stored":
       return "var(--needs-input)";
     case "ingest":
+    case "page-proposal":
       return "var(--accent)";
     case "conflict":
     case "conflict-copy":
@@ -290,6 +306,13 @@ class ReviewStore {
   async undoIngest(item: InboxItem) {
     await api.ingestUndo(numericId(item));
     await this.refresh();
+  }
+
+  /** Apply a proposed page change; returns the page written. */
+  async applyProposal(item: InboxItem): Promise<string> {
+    const page = await api.applyPageProposal(numericId(item));
+    await this.refresh();
+    return page;
   }
 
   async markDone(item: InboxItem) {

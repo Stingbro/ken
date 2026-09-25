@@ -14,6 +14,7 @@
   import { timeAgo } from "../lib/format";
   import type { InboxItem } from "../lib/api";
   import ConflictDetail from "../review/ConflictDetail.svelte";
+  import ProposalDetail from "../review/ProposalDetail.svelte";
   import ContextMenu, { openContextMenu } from "../lib/ui/ContextMenu.svelte";
   import Check from "@lucide/svelte/icons/check";
   import BellOff from "@lucide/svelte/icons/bell-off";
@@ -40,7 +41,14 @@
     "keep-original": "Keep the original",
     "open-both": "Open in Files",
     "undo-ingest": "Undo",
+    "apply-proposal": "Apply the change",
   };
+
+  let actError = $state<string | null>(null);
+  $effect(() => {
+    void review.selected;
+    actError = null;
+  });
 
   function act(action: InboxAction, it: InboxItem) {
     switch (action) {
@@ -65,6 +73,10 @@
         break;
       case "undo-ingest":
         void review.undoIngest(it);
+        break;
+      case "apply-proposal":
+        actError = null;
+        review.applyProposal(it).catch((e) => (actError = String(e)));
         break;
       case "accept-draft":
       case "keep-mine":
@@ -159,6 +171,10 @@
         {:else}
           <div class="card">
             <div class="body">{item.body}</div>
+            {#if item.kind === "page-proposal" && !itemIsDone}
+              <ProposalDetail {item} />
+            {/if}
+            {#if actError}<div class="act-error">{actError}</div>{/if}
             {#if itemIsDone}
               <div class="resolved-note">Resolved {timeAgo(item.when)}.</div>
             {:else}
@@ -352,6 +368,11 @@
   }
   .btn.ignore:hover {
     color: var(--ink);
+  }
+  .act-error {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--danger);
   }
   .resolved-note {
     font-size: 12px;

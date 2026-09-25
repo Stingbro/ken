@@ -193,9 +193,40 @@ keyword index over sections.
 
 ## 13. Adding repos later (step 4)
 
-- [ ] Settings > Projects > Repos > **Add repos…**: pick `Personal`. It joins
-  the workspace with its proposed kind and README description.
+- [ ] Settings > Projects > Repos > **Add repos…**: pick `Personal`. It waits
+  in a panel with its proposed kind, a team box and its README description;
+  nothing joins until **Add**.
+- [ ] Set its team to `Realms` (the team whose wiki is `Realms-Docs`). The
+  **Update the team's wiki** box appears, ticked. Click **Add**. A note says
+  `Realms-Docs` is being updated.
+- [ ] Focus `Realms-Docs` (needs Claude). After a minute or two:
+  - `Repo-Map/Personal.md` exists, `status: draft`, citing `Personal:` sources.
+  - Review has one card "Personal added to the wiki: … drafted, … proposed".
+  - Each page a person keeps that the repo changes (the architecture, who does
+    what, the project, the vocabulary, the Repo Map index) has its own card,
+    "Proposed: <page> with Personal", showing the change as a diff.
+  - **Apply the change** writes it. Edit a proposed page first, then apply its
+    card: it refuses and says the page changed. **Mark as done** discards.
 - [ ] Rename a member's folder; **Scan again** names it as gone.
+
+## 14. A new team wiki (the wiki at team level)
+
+- [ ] Start set-up again (start screen › Set up Ken…). Pick `Realms-Game`
+  and `Personal` only, not `Realms-Docs`. In **Team**, set both to `Realms`.
+- [ ] **Each team's wiki** lists `Realms` with **No wiki for now**. Choose
+  **Create a new wiki…**; the name reads `Realms-Wiki`. **Next** stays off
+  until **Choose where…** picks a folder (the test folder).
+- [ ] Confirm with **Draft the first wiki pages** ticked. On disk,
+  `<test folder>\Realms-Wiki` has the template's pages and a `.git` with one
+  commit. `START-HERE.md` lists `Realms-Wiki`, `Realms-Game` and `Personal`
+  with what each is for. No page has a `verified:` date filled in.
+- [ ] Settings > Projects > Repos lists `Realms-Wiki` as a wiki on `Realms`.
+- [ ] With Claude, after a few minutes: `Repo-Map/Realms-Game.md`,
+  `Repo-Map/Personal.md` and `Repo-Map/Index.md` exist, then Current/Project,
+  Team, Who-Does-What, the architecture page and Work/Releases. Review on
+  `Realms-Wiki` has one card listing them all.
+- [ ] Nothing was pushed anywhere: `git -C "<test folder>\Realms-Wiki" remote`
+  prints nothing.
 
 ## After
 

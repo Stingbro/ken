@@ -7,7 +7,20 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, type IndexState, type RepoKind, type SetupRepoRow } from "../lib/api";
   import { app } from "../lib/app.svelte";
-  import { indexSummary, KINDS, mergeRows, noTeams, suggestedTeams, toggleKind } from "./setupFlow";
+  import {
+    coveredRepos,
+    defaultWikiChoice,
+    indexSummary,
+    KINDS,
+    mergeRows,
+    newWikiPath,
+    noTeams,
+    suggestedTeams,
+    teamWikis,
+    toggleKind,
+    wikiChoicesReady,
+    type WikiChoice,
+  } from "./setupFlow";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -28,12 +41,50 @@
   // and release pages into a wiki repo from these repos and their
   // descriptions, for a person to read.
   let draftWiki = $state(false);
-  let draftInto = $state("");
   let draftExtra = $state<string | null>(null);
-  const wikiRows = $derived(rows.filter((r) => r.include && r.kind.includes("wiki")));
+
+  // The wiki is the team's: each team uses a wiki repo it picked, creates a
+  // new one from the method's template, or has none for now.
+  let wikiChoices = $state<Record<string, WikiChoice>>({});
+  // Wikis already created this session, by team, so a retry after a failed
+  // Confirm does not try to create the folder again.
+  let created = $state<Record<string, SetupRepoRow>>({});
   $effect(() => {
-    if (!wikiRows.some((r) => r.member === draftInto)) draftInto = wikiRows[0]?.member ?? "";
+    const next: Record<string, WikiChoice> = {};
+    for (const t of teams) {
+      const was = wikiChoices[t];
+      const stillValid = was && (was.mode !== "existing" || teamWikis(rows, t).some((w) => w.member === was.member));
+      next[t] = stillValid ? was : defaultWikiChoice(rows, t);
+    }
+    if (JSON.stringify(next) !== JSON.stringify(wikiChoices)) wikiChoices = next;
   });
+
+  function chooseWiki(team: string, value: string) {
+    wikiChoices[team] =
+      value === "__new"
+        ? { mode: "new", parent: null, name: `${team}-Wiki` }
+        : value === "__none"
+          ? { mode: "none" }
+          : { mode: "existing", member: value };
+  }
+
+  async function chooseWikiParent(team: string) {
+    const folder = await openDialog({ directory: true, title: `Where the ${team} wiki goes` });
+    const c = wikiChoices[team];
+    if (typeof folder === "string" && c?.mode === "new") wikiChoices[team] = { ...c, parent: folder };
+  }
+
+  /** Wikis to draft into: each team's (existing or to be created), then any
+   *  wiki repo on no team. */
+  const draftTargets = $derived([
+    ...teams.flatMap((t) => {
+      const c = wikiChoices[t];
+      if (c?.mode === "existing") return [c.member];
+      if (c?.mode === "new") return [c.name.trim()];
+      return [];
+    }),
+    ...rows.filter((r) => r.include && !r.team && r.kind.includes("wiki")).map((r) => r.member),
+  ]);
 
   async function chooseExtra() {
     const folder = await openDialog({ directory: true, title: "A folder of documents to read too (a Confluence export, say)" });
@@ -78,8 +129,29 @@
     busy = true;
     error = null;
     try {
-      await app.confirmSetupRepos(name.trim() || "Code", rows);
-      if (draftWiki && draftInto) await api.draftWiki(draftInto, draftExtra);
+      // New team wikis first: each is laid down from the template and joins
+      // the set-up as its team's wiki.
+      const wikis: string[] = [];
+      let all = [...rows];
+      for (const t of teams) {
+        const c = wikiChoices[t];
+        if (c?.mode === "existing") wikis.push(c.member);
+        if (c?.mode !== "new" || !c.parent) continue;
+        const row =
+          created[t] ??
+          (await api.setupCreateWiki(
+            newWikiPath(c.parent, c.name),
+            t,
+            coveredRepos(rows, t),
+            rows.map((r) => r.member),
+          ));
+        created[t] = row;
+        all = [...all.filter((r) => r.path !== row.path), row];
+        wikis.push(row.member);
+      }
+      for (const r of rows) if (r.include && !r.team && r.kind.includes("wiki")) wikis.push(r.member);
+      await app.confirmSetupRepos(name.trim() || "Code", all);
+      if (draftWiki) for (const w of wikis) await api.draftWiki(w, draftExtra);
       onclose();
     } catch (e) {
       error = String(e);
@@ -194,8 +266,54 @@
         No team suggested; type a name to group repos, or leave them each on their own.
       {/if}
     </p>
+    {#if teams.length > 0}
+      <h3>Each team's wiki</h3>
+      <p class="note">
+        A team keeps one wiki: what is true now, how it works, and a page per repo on what lives
+        where. Use a wiki repo you picked, or create one from the Ways-of-Working template.
+      </p>
+      <div class="table" role="table">
+        {#each teams as t (t)}
+          {@const c = wikiChoices[t] ?? { mode: "none" }}
+          <div class="tr wikis" role="row">
+            <span class="mono">{t}</span>
+            <span>
+              <select
+                aria-label="Wiki for {t}"
+                value={c.mode === "existing" ? c.member : c.mode === "new" ? "__new" : "__none"}
+                onchange={(e) => chooseWiki(t, (e.currentTarget as HTMLSelectElement).value)}
+              >
+                {#each teamWikis(rows, t) as w (w.member)}<option value={w.member}>Use {w.member}</option>{/each}
+                <option value="__new">Create a new wiki…</option>
+                <option value="__none">No wiki for now</option>
+              </select>
+            </span>
+            <span class="new-wiki">
+              {#if c.mode === "new"}
+                <input
+                  class="team"
+                  value={c.name}
+                  aria-label="Name of the new {t} wiki"
+                  oninput={(e) => (wikiChoices[t] = { ...c, name: (e.currentTarget as HTMLInputElement).value })}
+                />
+                <button class="btn btn-ghost" onclick={() => chooseWikiParent(t)}>
+                  {c.parent ? `In ${c.parent}` : "Choose where…"}
+                </button>
+              {/if}
+            </span>
+          </div>
+        {/each}
+      </div>
+      {#if Object.values(wikiChoices).some((c) => c.mode === "new")}
+        <p class="note">
+          A new wiki is a new folder with the template's pages, its Start Here listing the team's
+          repos and what each is for, and one git commit. It stays on this computer; adding a remote
+          and pushing is yours to do.
+        </p>
+      {/if}
+    {/if}
     <div class="actions">
-      <button class="btn btn-primary" onclick={() => (step = "index")}>Next</button>
+      <button class="btn btn-primary" disabled={!wikiChoicesReady(wikiChoices)} onclick={() => (step = "index")}>Next</button>
       <button class="btn btn-ghost" onclick={kenOnly}>None, Ken only</button>
       <button class="btn btn-ghost" onclick={() => (step = "repos")}>Back</button>
     </div>
@@ -212,22 +330,20 @@
     <label class="name">
       Workspace name <input bind:value={name} />
     </label>
-    {#if wikiRows.length > 0}
+    {#if draftTargets.length > 0}
       <div class="draft">
         <label>
           <input type="checkbox" bind:checked={draftWiki} />
-          Draft the first wiki pages from these repos
+          Draft the first wiki pages from each team's repos
         </label>
         {#if draftWiki}
           <p class="note">
-            Claude reads each repo's description, READMEs, docs, layout, release tags and who
-            commits where, and drafts Current/Project, Team, Who-Does-What, the architecture page
-            and the release notes into
-            <select bind:value={draftInto} aria-label="Wiki to draft into">
-              {#each wikiRows as w (w.member)}<option value={w.member}>{w.member}</option>{/each}
-            </select>.
-            Each page is marked draft and names its sources; a page someone already wrote is left
-            alone. A card on Review lists what was drafted.
+            Into {draftTargets.join(", ")}. Claude first writes a Repo Map page for each repo from
+            that repo alone: its description, READMEs, docs, layout, release tags and who commits
+            where. Then it drafts Current/Project, Team, Who-Does-What, the architecture page and the
+            release notes from those pages, so a team of twenty repos is read in full. Each page is
+            marked draft and names its sources; a page someone already wrote is left alone. A card
+            on Review lists what was drafted.
           </p>
           <button class="btn btn-ghost" onclick={chooseExtra}>
             {draftExtra ? `Also reading ${draftExtra.split(/[\\/]/).pop()}` : "Also read a folder of documents…"}
@@ -306,6 +422,26 @@
   .tr.teams {
     grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr);
     align-items: center;
+  }
+  .tr.wikis {
+    grid-template-columns: minmax(120px, 0.8fr) minmax(170px, 1fr) minmax(220px, 1.6fr);
+    align-items: center;
+  }
+  .new-wiki {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    min-width: 0;
+  }
+  .new-wiki .btn {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 60%;
+  }
+  h3 {
+    margin: 6px 0 0;
+    font-size: 14px;
   }
   .description {
     width: 100%;

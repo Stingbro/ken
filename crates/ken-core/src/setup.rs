@@ -592,6 +592,25 @@ pub fn propose_repos(picked: &[PathBuf], taken: &[String]) -> Result<Proposal> {
     })
 }
 
+/// Create a team's wiki at `dir` from the bundled template (see
+/// [`crate::wikinew`]), covering `repos`, and return its set-up row: a wiki
+/// on `team`, read for entities. `taken` are names already in use.
+pub fn create_wiki(dir: &Path, team: &str, repos: &[crate::wikinew::Covered], taken: &[String], today: &str) -> Result<RepoRow> {
+    crate::wikinew::create(dir, team, repos, today)?;
+    let mut row = propose_repos(&[dir.to_path_buf()], taken)?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
+    row.include = true;
+    row.kind = vec![RepoKind::Wiki];
+    row.team = Some(team.to_string());
+    row.index = IndexState::Entities;
+    row.description = format!("The {team} team's wiki: what is true now, how the team works, and what lives where in each repo.");
+    row.evidence.insert(0, "created at set-up from the Ways-of-Working template".into());
+    Ok(row)
+}
+
 /// Where a workspace of picked repos lives: Ken's app data.
 pub fn workspaces_dir(base: &Path) -> PathBuf {
     base.join("workspaces")
@@ -834,5 +853,18 @@ mod tests {
         assert_eq!(team_from_docs("sr-docs"), "sr");
         assert!(names_word("docs for realms-game and", "Realms-Game"));
         assert!(!names_word("gamers", "game"), "short and partial words do not count");
+    }
+    #[test]
+    fn a_new_wiki_joins_set_up_as_the_teams_wiki() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("Realms-Wiki");
+        let covered = vec![crate::wikinew::Covered { name: "Game".into(), description: "The client.".into() }];
+        let row = create_wiki(&dir, "Realms", &covered, &["Game".into()], "2026-09-25").unwrap();
+        assert_eq!(row.member, "Realms-Wiki");
+        assert_eq!(row.kind, vec![RepoKind::Wiki]);
+        assert_eq!(row.team.as_deref(), Some("Realms"));
+        assert_eq!(row.index, IndexState::Entities);
+        assert!(row.include && row.has_git);
+        assert!(fs::read_to_string(dir.join("START-HERE.md")).unwrap().contains("| `Game` | The client. |"));
     }
 }

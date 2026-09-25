@@ -121,71 +121,92 @@ fn git_authors(root: &Path) -> Option<String> {
     (out.status.success() && !top.is_empty()).then(|| top.join("\n"))
 }
 
-/// Read what the draft is made from: per repo its READMEs and briefs, up to
-/// ten top-level docs, its layout, CODEOWNERS and who commits; then every
-/// readable document in `extra`. Clipped to [`SOURCE_BUDGET`] in all.
-pub fn gather(repos: &[(String, PathBuf)], extra: Option<&Path>) -> Vec<Source> {
-    let mut out: Vec<Source> = Vec::new();
-    let push = |label: String, text: String, out: &mut Vec<Source>| {
+//// Characters of source text read from one repo for its Repo Map page, so
+/// every repo gets its own budget however many the team has.
+const REPO_BUDGET: usize = 60_000;
+
+fn pusher(budget: usize) -> impl Fn(String, String, &mut Vec<Source>) {
+    move |label: String, text: String, out: &mut Vec<Source>| {
         let used: usize = out.iter().map(|s| s.text.len()).sum();
-        if used < SOURCE_BUDGET {
-            out.push(Source { label, text: clip(&text, PER_FILE.min(SOURCE_BUDGET - used)) });
-        }
-    };
-    for (name, root) in repos {
-        // What a person said this repo is for, at set-up: read first, so the
-        // draft knows how to use each source.
-        if let Some(d) = crate::registry::description_of(root) {
-            push(format!("{name}:(what this repo is for, in the team's words)"), d, &mut out);
-        }
-        for f in ["README.md", "readme.md", "README", "CLAUDE.md", "START-HERE.md", "AGENTS.md", "CHANGELOG.md", "RELEASES.md"] {
-            if let Some(t) = read_text(&root.join(f)) {
-                push(format!("{name}:{f}"), t, &mut out);
-            }
-        }
-        for dir in ["docs", "doc", "documentation"] {
-            let mut docs: Vec<PathBuf> = fs::read_dir(root.join(dir))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "md"))
-                .collect();
-            docs.sort();
-            for p in docs.into_iter().take(10) {
-                if let Some(t) = read_text(&p) {
-                    let rel = format!("{dir}/{}", p.file_name().unwrap().to_string_lossy());
-                    push(format!("{name}:{rel}"), t, &mut out);
-                }
-            }
-        }
-        push(format!("{name}:(layout)"), layout(root), &mut out);
-        for f in ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"] {
-            if let Ok(t) = fs::read_to_string(root.join(f)) {
-                push(format!("{name}:{f}"), t, &mut out);
-            }
-        }
-        if let Some(a) = git_authors(root) {
-            push(format!("{name}:(git authors, commits · name)"), a, &mut out);
-        }
-        if let Some(t) = git_tags(root) {
-            push(format!("{name}:(release tags, newest first)"), t, &mut out);
+        if used < budget {
+            out.push(Source { label, text: clip(&text, PER_FILE.min(budget - used)) });
         }
     }
-    if let Some(dir) = extra {
-        let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "documents".into());
-        let walker = ignore::WalkBuilder::new(dir).hidden(true).build().flatten();
-        for e in walker.filter(|e| e.path().is_file()).take(200) {
-            if let Some(t) = read_text(e.path()) {
-                let rel = e.path().strip_prefix(dir).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
-                push(format!("{label}:{rel}"), t, &mut out);
+}
+
+/// What one repo's page is made from: its description first, its READMEs
+/// and briefs, up to ten top-level docs, its layout, CODEOWNERS, who
+/// commits and its release tags. Clipped to [`REPO_BUDGET`].
+pub fn gather_repo(name: &str, root: &Path) -> Vec<Source> {
+    let mut out: Vec<Source> = Vec::new();
+    let push = pusher(REPO_BUDGET);
+    // What a person said this repo is for, at set-up: read first, so the
+    // draft knows how to use each source.
+    if let Some(d) = crate::registry::description_of(root) {
+        push(format!("{name}:(what this repo is for, in the team's words)"), d, &mut out);
+    }
+    for f in ["README.md", "readme.md", "README", "CLAUDE.md", "START-HERE.md", "AGENTS.md", "CHANGELOG.md", "RELEASES.md"] {
+        if let Some(t) = read_text(&root.join(f)) {
+            push(format!("{name}:{f}"), t, &mut out);
+        }
+    }
+    for dir in ["docs", "doc", "documentation"] {
+        let mut docs: Vec<PathBuf> = fs::read_dir(root.join(dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        docs.sort();
+        for p in docs.into_iter().take(10) {
+            if let Some(t) = read_text(&p) {
+                let rel = format!("{dir}/{}", p.file_name().unwrap().to_string_lossy());
+                push(format!("{name}:{rel}"), t, &mut out);
             }
+        }
+    }
+    push(format!("{name}:(layout)"), layout(root), &mut out);
+    for f in ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"] {
+        if let Ok(t) = fs::read_to_string(root.join(f)) {
+            push(format!("{name}:{f}"), t, &mut out);
+        }
+    }
+    if let Some(a) = git_authors(root) {
+        push(format!("{name}:(git authors, commits · name)"), a, &mut out);
+    }
+    if let Some(t) = git_tags(root) {
+        push(format!("{name}:(release tags, newest first)"), t, &mut out);
+    }
+    out
+}
+
+/// Every readable document in a folder a person added (a Confluence
+/// export, say), clipped to [`SOURCE_BUDGET`].
+pub fn gather_extra(dir: &Path) -> Vec<Source> {
+    let mut out: Vec<Source> = Vec::new();
+    let push = pusher(SOURCE_BUDGET);
+    let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "documents".into());
+    let walker = ignore::WalkBuilder::new(dir).hidden(true).build().flatten();
+    for e in walker.filter(|e| e.path().is_file()).take(200) {
+        if let Some(t) = read_text(e.path()) {
+            let rel = e.path().strip_prefix(dir).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
+            push(format!("{label}:{rel}"), t, &mut out);
         }
     }
     out
 }
 
-/// A page Ken may write: missing, or a template nobody has filled in.
+/// Every repo's sources, each within its own budget, then `extra`.
+pub fn gather(repos: &[(String, PathBuf)], extra: Option<&Path>) -> Vec<Source> {
+    let mut out: Vec<Source> = repos.iter().flat_map(|(n, r)| gather_repo(n, r)).collect();
+    if let Some(dir) = extra {
+        out.extend(gather_extra(dir));
+    }
+    out
+}
+
+// A page Ken may write: missing, or a template nobody has filled in.
 pub fn may_draft(existing: Option<&str>) -> bool {
     existing.is_none_or(|t| t.contains("{{"))
 }
@@ -257,7 +278,7 @@ pub fn finish(reply: &str) -> Result<String> {
     Ok(out)
 }
 
-/// What a draft run did.
+//// What a draft run did.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftReport {
@@ -266,41 +287,56 @@ pub struct DraftReport {
     pub kept: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub sources: Vec<String>,
+    /// Changes to pages a person keeps, filed for them to apply or discard.
+    #[serde(default)]
+    pub proposed: Vec<String>,
 }
 
-/// Draft every page of [`PAGES`] the wiki does not already have, then file
-/// one Review card listing what was drafted and kept.
-pub fn draft(
+fn write_page(path: &Path, text: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    }
+    fs::write(path, text).map_err(|e| Error::io(path, e))
+}
+
+/// Draft each of `pages` the wiki does not already have into `report`.
+fn draft_pages(
     wiki: &Path,
-    db: &mut Db,
+    pages: &[(String, String)],
     sources: &[Source],
     today: &str,
-    now: i64,
-    mut generate: impl FnMut(&str) -> Result<String>,
-) -> Result<DraftReport> {
-    let mut report = DraftReport { sources: sources.iter().map(|s| s.label.clone()).collect(), ..Default::default() };
-    for (page, purpose) in PAGES {
+    report: &mut DraftReport,
+    generate: &mut impl FnMut(&str) -> Result<String>,
+) -> Result<()> {
+    for (page, purpose) in pages {
         let path = wiki.join(page);
         let existing = fs::read_to_string(&path).ok();
         if !may_draft(existing.as_deref()) {
-            report.kept.push(page.to_string());
+            report.kept.push(page.clone());
             continue;
         }
         match generate(&prompt(page, purpose, existing.as_deref(), sources, today)).and_then(|r| finish(&r)) {
             Ok(text) => {
-                if let Some(dir) = path.parent() {
-                    fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-                }
-                fs::write(&path, text).map_err(|e| Error::io(&path, e))?;
-                report.drafted.push(page.to_string());
+                write_page(&path, &text)?;
+                report.drafted.push(page.clone());
             }
-            Err(e) => report.failed.push((page.to_string(), e.to_string())),
+            Err(e) => report.failed.push((page.clone(), e.to_string())),
         }
     }
+    Ok(())
+}
+
+fn file_card(db: &mut Db, report: &DraftReport, title: &str, now: i64) -> Result<()> {
     let mut body = String::new();
     if !report.drafted.is_empty() {
         body.push_str("**Drafted for you to read against their sources** (each is `status: draft`, not verified):\n");
         for p in &report.drafted {
+            body.push_str(&format!("- {p}\n"));
+        }
+    }
+    if !report.proposed.is_empty() {
+        body.push_str("\n**Changes proposed** to pages a person keeps, each on its own card to apply or discard:\n");
+        for p in &report.proposed {
             body.push_str(&format!("- {p}\n"));
         }
     }
@@ -317,10 +353,361 @@ pub fn draft(
         }
     }
     body.push_str(&format!("\nRead from {} sources: {}\n", report.sources.len(), report.sources.join(", ")));
-    let title = format!("First wiki drafted: {} pages to read", report.drafted.len());
     let first = report.drafted.first().cloned().unwrap_or_default();
-    db.insert_review_item(REVIEW_KIND, &title, &body, &first, None, now)?;
+    db.insert_review_item(REVIEW_KIND, title, &body, &first, None, now)?;
+    Ok(())
+}
+
+fn team_pages() -> Vec<(String, String)> {
+    PAGES.iter().map(|(p, u)| (p.to_string(), u.to_string())).collect()
+}
+
+/// Draft every page of [`PAGES`] the wiki does not already have, then file
+/// one Review card listing what was drafted and kept.
+pub fn draft(
+    wiki: &Path,
+    db: &mut Db,
+    sources: &[Source],
+    today: &str,
+    now: i64,
+    mut generate: impl FnMut(&str) -> Result<String>,
+) -> Result<DraftReport> {
+    let mut report = DraftReport { sources: sources.iter().map(|s| s.label.clone()).collect(), ..Default::default() };
+    draft_pages(wiki, &team_pages(), sources, today, &mut report, &mut generate)?;
+    let title = format!("First wiki drafted: {} pages to read", report.drafted.len());
+    file_card(db, &report, &title, now)?;
     Ok(report)
+}
+
+// --- The wiki at team scale: a Repo Map page per repo, then the team pages
+// drafted from those pages, so twenty repos never overflow one prompt. ----
+
+/// The section for what lives where in the code (the template's `Repo-Map/`).
+pub const REPO_MAP: &str = "Repo-Map";
+
+const REPO_PURPOSE: &str = "one repo's page in the Repo Map: what the repo is for (the team's own description first), \
+    what lives where in it (its layout and entry points), who owns it and who commits, how it is built and released, \
+    and how it connects to the team's other repos";
+
+/// A repo's page in the wiki: `Repo-Map/<name>.md`.
+pub fn repo_page(name: &str) -> String {
+    format!("{REPO_MAP}/{}.md", crate::workspace::member_leaf(name))
+}
+
+/// The Repo Map's index: a table of every repo page with what it is for.
+/// Written by Ken, not the model: it is a list, and a list has no facts to
+/// get wrong.
+pub fn repo_map_index(repos: &[(String, String)], today: &str) -> String {
+    let mut s = format!(
+        "---\ntitle: \"Repo Map\"\naliases: [\"Repo-Map\", \"what lives where\"]\ntags: [moc]\nupdated: {today}\n---\n\n\
+         # Repo Map\n\nWhat lives where in the code, one page per repo. Open the repo's page before searching its files.\n\n\
+         | repo | what it is for |\n|---|---|\n"
+    );
+    for (name, description) in repos {
+        s.push_str(&index_row(name, description));
+    }
+    s
+}
+
+fn index_row(name: &str, description: &str) -> String {
+    let leaf = crate::workspace::member_leaf(name);
+    let d = description.split_whitespace().collect::<Vec<_>>().join(" ").replace('|', "/");
+    format!("| [[{leaf}]] | {} |\n", if d.is_empty() { "(not said yet)" } else { &d })
+}
+
+/// The repo pages and descriptions the team pages are drafted from, each
+/// repo's share of [`SOURCE_BUDGET`] equal, then `extra`.
+pub fn team_sources(wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)], extra: &[Source]) -> Vec<Source> {
+    let share = (SOURCE_BUDGET * 2 / 3) / repos.len().max(1);
+    let mut out = Vec::new();
+    for (name, root) in repos {
+        if let Some(d) = crate::registry::description_of(root) {
+            out.push(Source { label: format!("{name}:(what this repo is for, in the team's words)"), text: clip(&d, 2_000) });
+        }
+        let page = repo_page(name);
+        if let Some(t) = read_text(&wiki.join(&page)) {
+            out.push(Source { label: format!("{wiki_name}:{page}"), text: clip(&t, share) });
+        }
+        // The release notes read changelogs and tags, which a repo page
+        // summarises away.
+        for f in ["CHANGELOG.md", "RELEASES.md"] {
+            if let Some(t) = read_text(&root.join(f)) {
+                out.push(Source { label: format!("{name}:{f}"), text: clip(&t, 3_000) });
+            }
+        }
+        if let Some(t) = git_tags(root) {
+            out.push(Source { label: format!("{name}:(release tags, newest first)"), text: clip(&t, 2_000) });
+        }
+    }
+    let used: usize = out.iter().map(|s| s.text.len()).sum();
+    let mut left = SOURCE_BUDGET.saturating_sub(used);
+    for s in extra {
+        if left == 0 {
+            break;
+        }
+        let text = clip(&s.text, left.min(PER_FILE));
+        left = left.saturating_sub(text.len());
+        out.push(Source { label: s.label.clone(), text });
+    }
+    out
+}
+
+/// Pass one: each repo's Repo Map page, from that repo alone.
+fn draft_repo_pages(
+    wiki: &Path,
+    repos: &[(String, PathBuf)],
+    today: &str,
+    report: &mut DraftReport,
+    generate: &mut impl FnMut(&str) -> Result<String>,
+) -> Result<()> {
+    for (name, root) in repos {
+        let sources = gather_repo(name, root);
+        report.sources.extend(sources.iter().map(|s| s.label.clone()));
+        draft_pages(wiki, &[(repo_page(name), REPO_PURPOSE.to_string())], &sources, today, report, generate)?;
+    }
+    Ok(())
+}
+
+/// Draft a team's wiki: a Repo Map page per repo (each from that repo
+/// alone), the Repo Map index, then the team pages of [`PAGES`] from the
+/// repo pages and descriptions. `repos` are the team's repos, the wiki
+/// itself left out. One Review card lists it all.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_team(
+    wiki: &Path,
+    wiki_name: &str,
+    db: &mut Db,
+    repos: &[(String, PathBuf)],
+    extra: Option<&Path>,
+    today: &str,
+    now: i64,
+    mut generate: impl FnMut(&str) -> Result<String>,
+) -> Result<DraftReport> {
+    let mut report = DraftReport::default();
+    draft_repo_pages(wiki, repos, today, &mut report, &mut generate)?;
+    let index = format!("{REPO_MAP}/Index.md");
+    let index_path = wiki.join(&index);
+    if may_draft(fs::read_to_string(&index_path).ok().as_deref()) {
+        let listed: Vec<(String, String)> =
+            repos.iter().map(|(n, r)| (n.clone(), crate::registry::description_of(r).unwrap_or_default())).collect();
+        write_page(&index_path, &repo_map_index(&listed, today))?;
+        report.drafted.push(index);
+    }
+    let extra = extra.map(gather_extra).unwrap_or_default();
+    let sources = team_sources(wiki, wiki_name, repos, &extra);
+    report.sources.extend(sources.iter().map(|s| s.label.clone()));
+    report.sources.dedup();
+    draft_pages(wiki, &team_pages(), &sources, today, &mut report, &mut generate)?;
+    let title = format!("First wiki drafted: {} pages to read", report.drafted.len());
+    file_card(db, &report, &title, now)?;
+    Ok(report)
+}
+
+// --- A repo added later: its page is new, so Ken drafts it; the pages a
+// person already keeps get a proposed change, never a write. -------------
+
+/// Review kind of a proposed change to one page.
+pub const PROPOSAL_KIND: &str = "page-proposal";
+
+/// A change to one page, held until a person applies it. `base` is the page
+/// as Ken read it; the change applies only while the page still reads so.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proposal {
+    pub page: String,
+    pub base: String,
+    pub proposed: String,
+}
+
+/// Pages a new repo changes, and what each should gain.
+const ON_ADD: &[(&str, &str)] = &[
+    ("Conventions/ARCHITECTURE.md", "work the new repos into the layers, what may call what, and the diagram"),
+    ("Current/Who-Does-What.md", "add who owns each new repo and who to ask"),
+    ("Current/Project.md", "say what the new repos add to the project, only if they change what it is or does"),
+    (
+        "Vocabulary.md",
+        "add a row to the word table for each term the new repos use for something the team already names differently",
+    ),
+];
+
+pub fn update_prompt(page: &str, change: &str, existing: &str, sources: &[Source], today: &str) -> String {
+    let mut s = format!(
+        "You are proposing a change to one page of a team's wiki, `{page}`, because repos were added to the team. \
+         A person keeps this page; they will see your change as a diff and apply it or not. The change: {change}.\n\n\
+         Rules:\n\
+         - Change only what the new repos change. Keep every other line exactly as it is, in the same order.\n\
+         - Use only what the sources below say, and cite each new fact inline as its label in backticks.\n\
+         - Set `updated: {today}` in the frontmatter; leave any `verified:` line as it is.\n\
+         - If the new repos change nothing on this page, reply exactly NO CHANGE.\n\
+         - Otherwise reply with the whole page, starting with `---`. No preamble, no code fences around it.\n\n\
+         THE PAGE NOW:\n{existing}\n\nSOURCES (the new repos):\n"
+    );
+    for src in sources {
+        s.push_str(&format!("\n=== {} ===\n{}\n", src.label, src.text));
+    }
+    s
+}
+
+/// The model's reply as a proposed page, or `None` for no change.
+pub fn finish_update(reply: &str, existing: &str) -> Result<Option<String>> {
+    let mut t = reply.trim();
+    if t.eq_ignore_ascii_case("NO CHANGE") {
+        return Ok(None);
+    }
+    if let Some(rest) = t.strip_prefix("```markdown").or_else(|| t.strip_prefix("```md")).or_else(|| t.strip_prefix("```")) {
+        t = rest.trim_start().strip_suffix("```").unwrap_or(rest).trim();
+    }
+    if existing.starts_with("---") && !t.starts_with("---") {
+        return Err(Error::Other("the proposed page lost its frontmatter".into()));
+    }
+    let page = format!("{t}\n");
+    Ok((page.trim() != existing.trim()).then_some(page))
+}
+
+fn file_proposal(db: &mut Db, p: &Proposal, added: &[String], now: i64) -> Result<()> {
+    let names = added.join(", ");
+    let title = format!("Proposed: {} with {names}", p.page);
+    let body = format!(
+        "Ken read {names} and proposes this change to {}, a page a person keeps. Apply it to write it, or discard it. \
+         It applies only while the page still reads as it did when Ken proposed it.",
+        p.page
+    );
+    let payload = serde_json::to_string(p).map_err(|e| Error::Other(e.to_string()))?;
+    db.insert_review_item(PROPOSAL_KIND, &title, &body, &p.page, Some(&payload), now)?;
+    Ok(())
+}
+
+/// Repos joined the team: draft their Repo Map pages, then for each page of
+/// [`ON_ADD`] and the Repo Map index, draft it when it is still missing or a
+/// template, or file a proposed change when a person keeps it. `all` is
+/// every repo of the team now, the added ones included.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_added(
+    wiki: &Path,
+    wiki_name: &str,
+    db: &mut Db,
+    added: &[(String, PathBuf)],
+    all: &[(String, PathBuf)],
+    today: &str,
+    now: i64,
+    mut generate: impl FnMut(&str) -> Result<String>,
+) -> Result<DraftReport> {
+    let mut report = DraftReport::default();
+    let names: Vec<String> = added.iter().map(|(n, _)| n.clone()).collect();
+    draft_repo_pages(wiki, added, today, &mut report, &mut generate)?;
+
+    // The index: a new one lists every repo; a kept one gains a row per new repo.
+    let index = format!("{REPO_MAP}/Index.md");
+    let existing = fs::read_to_string(wiki.join(&index)).ok();
+    let describe = |r: &Path| crate::registry::description_of(r).unwrap_or_default();
+    match existing.as_deref().filter(|t| !may_draft(Some(t))) {
+        None => {
+            let listed: Vec<(String, String)> = all.iter().map(|(n, r)| (n.clone(), describe(r))).collect();
+            write_page(&wiki.join(&index), &repo_map_index(&listed, today))?;
+            report.drafted.push(index);
+        }
+        Some(text) => {
+            let mut proposed = text.trim_end().to_string();
+            proposed.push('\n');
+            let mut changed = false;
+            for (n, r) in added {
+                if !text.contains(&format!("[[{}]]", crate::workspace::member_leaf(n))) {
+                    proposed.push_str(&index_row(n, &describe(r)));
+                    changed = true;
+                }
+            }
+            if changed {
+                let p = Proposal { page: index.clone(), base: text.to_string(), proposed };
+                file_proposal(db, &p, &names, now)?;
+                report.proposed.push(index);
+            }
+        }
+    }
+
+    let sources = team_sources(wiki, wiki_name, added, &[]);
+    report.sources.extend(sources.iter().map(|s| s.label.clone()));
+    for (page, change) in ON_ADD {
+        let existing = fs::read_to_string(wiki.join(page)).ok();
+        if may_draft(existing.as_deref()) {
+            // Still missing or a template: draft it whole, from every repo.
+            let purpose =
+                PAGES.iter().find(|(p, _)| p == page).map(|(_, u)| u.to_string()).unwrap_or_else(|| change.to_string());
+            let everything = team_sources(wiki, wiki_name, all, &[]);
+            draft_pages(wiki, &[(page.to_string(), purpose)], &everything, today, &mut report, &mut generate)?;
+            continue;
+        }
+        let existing = existing.unwrap_or_default();
+        match generate(&update_prompt(page, change, &existing, &sources, today)).and_then(|r| finish_update(&r, &existing)) {
+            Ok(Some(proposed)) => {
+                file_proposal(db, &Proposal { page: page.to_string(), base: existing, proposed }, &names, now)?;
+                report.proposed.push(page.to_string());
+            }
+            Ok(None) => report.kept.push(page.to_string()),
+            Err(e) => report.failed.push((page.to_string(), e.to_string())),
+        }
+    }
+    report.sources.dedup();
+    let title =
+        format!("{} added to the wiki: {} drafted, {} proposed", names.join(", "), report.drafted.len(), report.proposed.len());
+    file_card(db, &report, &title, now)?;
+    Ok(report)
+}
+
+// --- Which repos a wiki covers: a wiki belongs to a team, and covers the
+// team's repos. -----------------------------------------------------------
+
+/// A workspace member as the wiki sees it: its name, folder, kinds and team.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamMember {
+    pub name: String,
+    pub root: PathBuf,
+    pub kind: Vec<crate::registry::RepoKind>,
+    pub team: Option<String>,
+}
+
+impl TeamMember {
+    fn is_wiki(&self) -> bool {
+        self.kind.contains(&crate::registry::RepoKind::Wiki)
+    }
+}
+
+/// The repos a wiki drafts from: the other members on its team, wikis left
+/// out. A wiki with no team covers every member that has no team.
+pub fn team_repos(wiki: &str, members: &[TeamMember]) -> Vec<(String, PathBuf)> {
+    let Some(w) = members.iter().find(|m| m.name == wiki) else { return Vec::new() };
+    members
+        .iter()
+        .filter(|m| m.name != wiki && !m.is_wiki() && m.team == w.team)
+        .map(|m| (m.name.clone(), m.root.clone()))
+        .collect()
+}
+
+/// The wiki that covers `member`: the wiki on its team (the first by name
+/// when a team has two).
+pub fn wiki_for<'a>(member: &str, members: &'a [TeamMember]) -> Option<&'a TeamMember> {
+    let m = members.iter().find(|m| m.name == member)?;
+    let mut wikis: Vec<&TeamMember> = members.iter().filter(|w| w.is_wiki() && w.name != member && w.team == m.team).collect();
+    wikis.sort_by(|a, b| a.name.cmp(&b.name));
+    wikis.into_iter().next()
+}
+
+/// Why a proposal could not be applied.
+#[derive(Debug, PartialEq)]
+pub enum ApplyError {
+    /// The page changed after Ken proposed; the proposal is out of date.
+    Changed,
+    Io(String),
+}
+
+/// Write a proposal, only while the page still reads as `base`: a change
+/// made against an older page would undo whatever a person wrote since.
+pub fn apply(wiki: &Path, p: &Proposal) -> std::result::Result<(), ApplyError> {
+    let path = wiki.join(&p.page);
+    let now = fs::read_to_string(&path).unwrap_or_default();
+    if now.replace("\r\n", "\n") != p.base.replace("\r\n", "\n") {
+        return Err(ApplyError::Changed);
+    }
+    write_page(&path, &p.proposed).map_err(|e| ApplyError::Io(e.to_string()))
 }
 
 #[cfg(test)]
@@ -386,5 +773,133 @@ mod tests {
         assert!(fs::read_to_string(wiki.path().join("Conventions/ARCHITECTURE.md")).unwrap().contains("status: draft"));
         let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
         assert!(body.contains("Left alone") && body.contains("Current/Team.md"));
+    }
+    fn page(title: &str) -> String {
+        format!("---\ntitle: {title}\nsources:\n  - x\n---\n# {title}\nDrafted by Ken.\n")
+    }
+
+    fn repo(dir: &Path, name: &str, readme: &str) -> (String, PathBuf) {
+        let root = dir.join(name);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("README.md"), readme).unwrap();
+        (name.to_string(), root)
+    }
+
+    #[test]
+    fn a_team_wiki_is_drafted_repo_by_repo_then_from_the_repo_pages() {
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        let repos = vec![repo(d.path(), "Game", "# Game\nThe client.\n"), repo(d.path(), "Tools", "# Tools\nThe editor.\n")];
+        let mut db = Db::open_in_memory().unwrap();
+        let mut prompts: Vec<String> = Vec::new();
+        let report = draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-09-25", 5, |p| {
+            prompts.push(p.to_string());
+            Ok(page("Drafted"))
+        })
+        .unwrap();
+        assert_eq!(&report.drafted[..3], &["Repo-Map/Game.md", "Repo-Map/Tools.md", "Repo-Map/Index.md"]);
+        assert!(report.drafted.contains(&"Conventions/ARCHITECTURE.md".to_string()));
+        // Pass one reads one repo each.
+        assert!(prompts[0].contains("=== Game:README.md ===") && !prompts[0].contains("Tools:README.md"));
+        assert!(prompts[1].contains("=== Tools:README.md ===") && !prompts[1].contains("Game:README.md"));
+        // Pass two reads the repo pages, not the raw repos.
+        let team = &prompts[2];
+        assert!(team.contains("=== Wiki:Repo-Map/Game.md ===") && team.contains("=== Wiki:Repo-Map/Tools.md ==="), "{team}");
+        assert!(!team.contains("=== Game:README.md ==="));
+        let index = fs::read_to_string(wiki.join("Repo-Map/Index.md")).unwrap();
+        assert!(index.contains("| [[Game]] | (not said yet) |") && index.contains("| [[Tools]] |"));
+    }
+
+    #[test]
+    fn every_repo_gets_its_own_budget_however_many_there_are() {
+        let d = tempfile::tempdir().unwrap();
+        let big = "word ".repeat(40_000);
+        let repos: Vec<(String, PathBuf)> = (0..20).map(|i| repo(d.path(), &format!("r{i}"), &big)).collect();
+        let s = gather(&repos, None);
+        assert!(s.iter().any(|s| s.label == "r19:README.md"), "the last repo is still read");
+    }
+
+    #[test]
+    fn an_added_repo_gets_its_page_and_kept_pages_get_proposals() {
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Wiki");
+        fs::create_dir_all(wiki.join("Repo-Map")).unwrap();
+        fs::create_dir_all(wiki.join("Current")).unwrap();
+        fs::create_dir_all(wiki.join("Conventions")).unwrap();
+        let index = "---\ntitle: Repo Map\n---\n| repo | what it is for |\n|---|---|\n| [[Game]] | The client. |\n";
+        fs::write(wiki.join("Repo-Map/Index.md"), index).unwrap();
+        let arch = "---\ntitle: Architecture\n---\nGame calls the server.\n";
+        fs::write(wiki.join("Conventions/ARCHITECTURE.md"), arch).unwrap();
+        fs::write(wiki.join("Current/Who-Does-What.md"), "---\ntitle: Who\n---\nAna owns Game.\n").unwrap();
+        fs::write(wiki.join("Current/Project.md"), "---\ntitle: Project\n---\nA game.\n").unwrap();
+        let game = repo(d.path(), "Game", "# Game\n");
+        let tools = repo(d.path(), "Tools", "# Tools\nThe level editor.\n");
+        let mut db = Db::open_in_memory().unwrap();
+        let report = draft_added(&wiki, "Wiki", &mut db, &[tools.clone()], &[game, tools], "2026-09-25", 9, |p| {
+            Ok(if p.contains("`Repo-Map/Tools.md`") {
+                page("Tools")
+            } else if p.contains("`Conventions/ARCHITECTURE.md`") {
+                "---\ntitle: Architecture\n---\nGame calls the server. Tools writes levels the Game loads.\n".into()
+            } else if p.contains("`Vocabulary.md`") {
+                page("Vocabulary")
+            } else {
+                "NO CHANGE".into()
+            })
+        })
+        .unwrap();
+        assert!(report.drafted.contains(&"Repo-Map/Tools.md".to_string()), "{report:?}");
+        assert!(report.drafted.contains(&"Vocabulary.md".to_string()), "a missing page is drafted whole");
+        assert_eq!(report.proposed, vec!["Repo-Map/Index.md", "Conventions/ARCHITECTURE.md"]);
+        assert_eq!(report.kept, vec!["Current/Who-Does-What.md", "Current/Project.md"]);
+        assert_eq!(fs::read_to_string(wiki.join("Conventions/ARCHITECTURE.md")).unwrap(), arch, "a kept page is never written");
+
+        let items = db.list_open_review_items().unwrap();
+        let mut props: Vec<Proposal> = items
+            .iter()
+            .filter(|i| i.kind == PROPOSAL_KIND)
+            .map(|i| serde_json::from_str(i.payload.as_deref().unwrap()).unwrap())
+            .collect();
+        props.sort_by(|a, b| b.page.cmp(&a.page)); // Repo-Map/Index.md, then Conventions/…
+        assert_eq!(props.len(), 2);
+        assert!(props[0].proposed.ends_with("| [[Game]] | The client. |\n| [[Tools]] | (not said yet) |\n"));
+
+        // Applied while the page reads as it did; refused once it changed.
+        apply(&wiki, &props[1]).unwrap();
+        assert!(fs::read_to_string(wiki.join("Conventions/ARCHITECTURE.md")).unwrap().contains("Tools writes levels"));
+        fs::write(wiki.join("Repo-Map/Index.md"), format!("{index}| [[Server]] | added by hand |\n")).unwrap();
+        assert_eq!(apply(&wiki, &props[0]), Err(ApplyError::Changed));
+    }
+
+    #[test]
+    fn an_update_reply_of_no_change_or_the_same_page_proposes_nothing() {
+        let page = "---\ntitle: A\n---\nText.\n";
+        assert_eq!(finish_update("NO CHANGE", page).unwrap(), None);
+        assert_eq!(finish_update(page, page).unwrap(), None);
+        assert!(finish_update("Sure, here it is", page).is_err());
+        assert!(finish_update("---\ntitle: A\n---\nText and more.", page).unwrap().is_some());
+    }
+    #[test]
+    fn a_wiki_covers_its_teams_repos_and_a_repo_finds_its_teams_wiki() {
+        use crate::registry::RepoKind;
+        let m = |name: &str, kind: RepoKind, team: Option<&str>| TeamMember {
+            name: name.into(),
+            root: PathBuf::from(name),
+            kind: vec![kind],
+            team: team.map(String::from),
+        };
+        let members = vec![
+            m("Realms-Wiki", RepoKind::Wiki, Some("Realms")),
+            m("Game", RepoKind::Code, Some("Realms")),
+            m("Server", RepoKind::Code, Some("Realms")),
+            m("Ops-Wiki", RepoKind::Wiki, Some("Ops")),
+            m("Infra", RepoKind::Code, Some("Ops")),
+            m("Scratch", RepoKind::Code, None),
+        ];
+        let names = |v: Vec<(String, PathBuf)>| v.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names(team_repos("Realms-Wiki", &members)), vec!["Game", "Server"]);
+        assert_eq!(names(team_repos("Ops-Wiki", &members)), vec!["Infra"]);
+        assert_eq!(wiki_for("Server", &members).map(|w| w.name.as_str()), Some("Realms-Wiki"));
+        assert_eq!(wiki_for("Scratch", &members), None, "no team wiki, no update");
     }
 }

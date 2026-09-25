@@ -1,3 +1,5 @@
 # cmd.exe mis-parses labels and goto in LF batch files.
 *.cmd text eol=crlf
 *.bat text eol=crlf
+# The bundled wiki template is written into new wikis byte for byte.
+crates/ken-core/templates/** text eol=lf
