@@ -86,13 +86,13 @@ pub fn start(
                     let held_too_long =
                         first_event.is_some_and(|t| t.elapsed() >= max_hold);
                     if held_too_long {
-                        flush(&project, &mut db, &mut pending, &mut first_event, &on_update);
+                        flush(&project, &roots, &mut db, &mut pending, &mut first_event, &on_update);
                     }
                 }
                 Ok(Err(_)) => { /* backend hiccup; the next scan reconciles */ }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if !pending.is_empty() {
-                        flush(&project, &mut db, &mut pending, &mut first_event, &on_update);
+                        flush(&project, &roots, &mut db, &mut pending, &mut first_event, &on_update);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -108,14 +108,31 @@ pub fn start(
 
 fn flush(
     project: &Project,
+    roots: &[PathBuf],
     db: &mut Db,
     pending: &mut HashSet<PathBuf>,
     first_event: &mut Option<Instant>,
     on_update: &impl Fn(&ScanStats),
 ) {
-    pending.clear();
+    // Rescan only the paths the events named; a folder among them, a burst
+    // too big to be worth it, or a failure falls back to the full scan. At
+    // tens of thousands of files a full scan is seconds, for one saved file.
+    let mut rels: Vec<String> = pending
+        .drain()
+        .filter_map(|abs| {
+            roots.iter().find_map(|root| abs.strip_prefix(root).ok()).map(|r| r.to_string_lossy().replace('\\', "/"))
+        })
+        .filter(|r| !r.is_empty())
+        .collect();
+    rels.sort();
+    rels.dedup();
     *first_event = None;
-    if let Ok(stats) = scan::scan(project, db) {
+    let scoped = if rels.is_empty() { Ok(None) } else { scan::scan_paths(project, db, &rels) };
+    let stats = match scoped {
+        Ok(Some(stats)) => Ok(stats),
+        _ => scan::scan(project, db),
+    };
+    if let Ok(stats) = stats {
         let changed =
             stats.added + stats.updated + stats.removed + stats.failed > 0;
         if changed {

@@ -95,8 +95,8 @@ fn main() {
         vec![1_000, 10_000, 50_000]
     };
     fs::create_dir_all(&work).unwrap();
-    println!("| files (code + wiki) | first scan | rescan, unchanged | rescan, dates moved | re-tier to search-only | search, median | link report | index health | DB size | chunks |");
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("| files (code + wiki) | first scan | rescan, unchanged | rescan, dates moved | one page saved (watcher) | re-tier to search-only | search, median | link report | index health | DB size | chunks |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
     for n in sizes {
         let root = work.join(format!("repo-{n}"));
         if root.exists() {
@@ -120,6 +120,11 @@ fn main() {
             let _ = fs::File::options().write(true).open(f).and_then(|h| h.set_modified(later));
         }
         let (touched_stats, touched) = time(|| scan::scan(&project, &mut db).unwrap());
+
+        // One page saved, as the watcher sees it: only that path rescanned.
+        let page = root.join("Platform/page-0.md");
+        fs::write(&page, wiki_page(0, (n / 10).max(1)).replace("how saves are written", "how saves are written and read")).unwrap();
+        let (_, saved) = time(|| scan::scan_paths(&project, &mut db, &["Platform/page-0.md".to_string()]).unwrap());
 
         // Searches (each builds the vocabulary from the index, as the app does).
         let queries = ["region", "shard", "save chunk", "flushes when a chunk", "crash loses", "load map key", "topic 42", "page"];
@@ -150,10 +155,11 @@ fn main() {
         let chunks = count(&conn, "SELECT COUNT(*) FROM chunks");
         let total = stats.added;
         println!(
-            "| {total} | {} | {} | {} | {} | {} | {} | {} | {:.0} MB | {chunks} |",
+            "| {total} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0} MB | {chunks} |",
             ms(first),
             ms(again),
             ms(touched),
+            ms(saved),
             ms(retier),
             ms(median),
             ms(links),

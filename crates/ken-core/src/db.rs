@@ -1122,7 +1122,8 @@ impl Db {
 
     /// Remove every indexed file under a folder (used when a folder is
     /// excluded or deleted).
-    pub fn remove_folder(&mut self, rel_folder: &str) -> Result<()> {
+    /// Remove every indexed file under a folder; returns how many.
+    pub fn remove_folder(&mut self, rel_folder: &str) -> Result<usize> {
         let prefix = format!("{}/", rel_folder.trim_matches('/'));
         let mut stmt = self.conn.prepare(
             "SELECT rel_path FROM files WHERE rel_path = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
@@ -1132,10 +1133,11 @@ impl Db {
             .query_map(params![rel_folder.trim_matches('/'), like], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
         drop(stmt);
+        let n = paths.len();
         for p in paths {
             self.remove_file(&p)?;
         }
-        Ok(())
+        Ok(n)
     }
 
     pub fn get_file(&self, rel_path: &str) -> Result<Option<FileRow>> {

@@ -601,6 +601,205 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
     }
 }
 
+/// A repo's `.gitignore` files, read as a walk reads them, for one path at
+/// a time: the nearest file that says anything about a path decides.
+struct GitIgnores {
+    root: PathBuf,
+    on: bool,
+    dirs: HashMap<PathBuf, Option<ignore::gitignore::Gitignore>>,
+    exclude: Option<ignore::gitignore::Gitignore>,
+}
+
+impl GitIgnores {
+    fn of(project: &Project) -> GitIgnores {
+        let root = project.root.clone();
+        let on = root.join(".git").exists();
+        let exclude = on.then(|| root.join(".git/info/exclude")).filter(|p| p.is_file()).map(|p| {
+            let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
+            b.add(p);
+            b.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+        });
+        GitIgnores { root, on, dirs: HashMap::new(), exclude }
+    }
+
+    /// Whether git would leave `rel` out, as the scan's walk does in a repo.
+    fn ignored(&mut self, rel: &str) -> bool {
+        use ignore::Match;
+        if !self.on {
+            return false;
+        }
+        let abs = self.root.join(rel);
+        let mut dir = abs.parent().map(Path::to_path_buf);
+        while let Some(d) = dir {
+            if !d.starts_with(&self.root) {
+                break;
+            }
+            let gi = self.dirs.entry(d.clone()).or_insert_with(|| {
+                let f = d.join(".gitignore");
+                f.is_file().then(|| ignore::gitignore::Gitignore::new(&f).0)
+            });
+            if let Some(gi) = gi {
+                match gi.matched_path_or_any_parents(&abs, false) {
+                    Match::Ignore(_) => return true,
+                    Match::Whitelist(_) => return false,
+                    Match::None => {}
+                }
+            }
+            if d == self.root {
+                break;
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        self.exclude.as_ref().is_some_and(|x| x.matched_path_or_any_parents(&abs, false).is_ignore())
+    }
+}
+
+/// What refreshing one path did.
+enum Refreshed {
+    Unchanged,
+    Indexed { added: bool, status: &'static str },
+    Removed,
+}
+
+/// One path against the index, with the rules already loaded: index it if
+/// it exists and is included, remove it otherwise. A folder is not handled
+/// here (the caller scans).
+fn refresh_one(
+    project: &Project,
+    db: &mut Db,
+    rel: &str,
+    rule_sets: &[&[crate::kenignore::Rule]; 3],
+    git: &mut GitIgnores,
+) -> Result<Refreshed> {
+    let abs = project.root.join(rel);
+    let excluded = project.is_excluded(rel)
+        || is_hidden_rel(rel)
+        || rel.rsplit('/').next().is_some_and(is_office_lock_name)
+        || inside_linked_checkout(&project.root, rel)
+        || git.ignored(rel);
+    let tier = crate::kenignore::classify(rel, false, rule_sets);
+    let excluded = excluded || tier == crate::kenignore::Tier::Ignore;
+    if !excluded && abs.is_file() {
+        let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let dataless = cloud::is_dataless(&meta);
+        let before = db.get_file(rel)?;
+        if let Some(f) = &before {
+            if f.size == meta.len() as i64 && f.mtime == mtime && !needs_retry(&f.status, f.error.as_deref(), dataless) {
+                db.set_file_tiers(&[(rel.to_string(), tier)])?;
+                return Ok(Refreshed::Unchanged);
+            }
+        }
+        if !dataless && only_mtime_moved(db, rel, &abs, meta.len() as i64, mtime)? {
+            db.set_file_tiers(&[(rel.to_string(), tier)])?;
+            return Ok(Refreshed::Unchanged);
+        }
+        let status = index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
+        db.set_file_tiers(&[(rel.to_string(), tier)])?;
+        Ok(Refreshed::Indexed { added: before.is_none(), status })
+    } else if db.get_file(rel)?.is_some() {
+        db.remove_file(rel)?;
+        Ok(Refreshed::Removed)
+    } else {
+        Ok(Refreshed::Unchanged)
+    }
+}
+
+/// Most paths a scoped rescan takes; a bigger burst (a checkout, a sync
+/// client catching up) is cheaper as one full scan.
+pub const SCOPED_MAX: usize = 2_000;
+
+/// Rescan only `rels`, the paths a watcher saw change, instead of the whole
+/// repo: what a full scan would do to those paths, and the same follow-ups
+/// (the control query, the vocabulary, the link report) when a page moved.
+/// `None` when a full scan is the right tool: too many paths, or a folder
+/// among them (a folder moved in brings files no event named).
+pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Option<ScanStats>> {
+    if rels.len() > SCOPED_MAX || rels.iter().any(|r| project.root.join(r).is_dir()) {
+        return Ok(None);
+    }
+    let built_in_rules = crate::kenignore::built_in_rule_sets();
+    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
+    let user_rules = project.kenignore_rules();
+    let rule_sets: [&[crate::kenignore::Rule]; 3] = [&built_in_rules, &kind_rules, &user_rules];
+    let mut git = GitIgnores::of(project);
+    let mut stats = ScanStats::default();
+
+    db.begin_batch()?;
+    let mut gone_folders: Vec<&String> = Vec::new();
+    let result = (|| -> Result<()> {
+        for rel in rels {
+            let abs = project.root.join(rel);
+            if !abs.exists() && db.get_file(rel)?.is_none() {
+                // Nothing indexed under this name: a folder that went away,
+                // or a file never indexed. Its subtree is reconciled below.
+                gone_folders.push(rel);
+                continue;
+            }
+            match refresh_one(project, db, rel, &rule_sets, &mut git)? {
+                Refreshed::Unchanged => stats.unchanged += 1,
+                Refreshed::Removed => {
+                    stats.removed += 1;
+                    stats.changed_paths.push(rel.clone());
+                }
+                Refreshed::Indexed { added, status } => {
+                    if added {
+                        stats.added += 1;
+                    } else {
+                        stats.updated += 1;
+                    }
+                    if status == STATUS_FAILED {
+                        stats.failed += 1;
+                    }
+                    if status == STATUS_METADATA_ONLY && FileKind::from_path(&abs) == FileKind::Video {
+                        stats.videos_needing_transcript.push(rel.clone());
+                    }
+                    stats.changed_paths.push(rel.clone());
+                }
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => db.commit_batch()?,
+        Err(e) => {
+            db.rollback_batch();
+            return Err(e);
+        }
+    }
+    for rel in gone_folders {
+        let removed = db.remove_folder(rel)?;
+        if removed > 0 {
+            stats.removed += removed;
+            stats.changed_paths.push(rel.clone());
+        }
+    }
+
+    let pages_moved = stats.changed_paths.iter().any(|p| p.ends_with(".md"));
+    if !stats.changed_paths.is_empty() {
+        if let Some(result) = control_query(db)? {
+            db.set_index_control(&result)?;
+        }
+    }
+    if pages_moved || db.stored_vocabulary()?.is_none() {
+        crate::vocab::Vocabulary::rebuild(db)?;
+    }
+    if pages_moved {
+        let kind = crate::registry::kind_of(&project.root);
+        if kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)) {
+            let report = crate::links::report(db)?;
+            let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            crate::links::file_review_item(db, &report, now)?;
+        }
+    }
+    Ok(Some(stats))
+}
+
 /// Hidden for single-path reindex purposes. Mirrors the walker's rule — any
 /// dot-prefixed component hides the path — with the same `.ken/` allowlist
 /// carve-out, so a memory or task file created through the UI (which reaches
@@ -1379,5 +1578,51 @@ mod tests {
             !hits.iter().any(|h| h.rel_path == "notes/plain.txt"),
             "old path gone from index: {hits:?}",
         );
+    }
+    fn indexed(db: &Db) -> Vec<(String, i64)> {
+        let mut v: Vec<(String, i64)> = db.list_files().unwrap().into_iter().map(|f| (f.rel_path, f.size)).collect();
+        v.sort();
+        v
+    }
+
+    /// A scoped rescan of the paths a watcher named leaves the index as a
+    /// full scan would, and hands a folder back to the full scan.
+    #[test]
+    fn a_scoped_rescan_does_what_a_full_scan_does_to_those_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("a.md"), "# A\n").unwrap();
+        fs::write(root.join("b.md"), "# B\n").unwrap();
+        fs::write(root.join("notes/one.txt"), "one").unwrap();
+        fs::write(root.join("notes/two.txt"), "two").unwrap();
+        let project = Project::create(root, "Scoped").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+
+        // An edit, a new file, a deletion, a gitignored build file, a gone folder.
+        fs::write(root.join("a.md"), "# A\n\nMore about A.\n").unwrap();
+        fs::write(root.join("c.md"), "# C\n").unwrap();
+        fs::remove_file(root.join("b.md")).unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join("build/out.txt"), "generated").unwrap();
+        fs::remove_dir_all(root.join("notes")).unwrap();
+        let rels: Vec<String> = ["a.md", "b.md", "c.md", "build/out.txt", "notes"].iter().map(|s| s.to_string()).collect();
+        let stats = scan_paths(&project, &mut db, &rels).unwrap().expect("no folder on disk among them");
+        assert_eq!((stats.added, stats.updated, stats.removed), (1, 1, 3), "{stats:?}");
+        let scoped = indexed(&db);
+
+        let mut full = Db::open_in_memory().unwrap();
+        scan(&project, &mut full).unwrap();
+        assert_eq!(scoped, indexed(&full), "the same index as a full scan");
+        assert!(!scoped.iter().any(|(p, _)| p.starts_with("build/")), "gitignored, as the walk leaves it");
+        assert!(db.search("More about", 5).unwrap().iter().any(|h| h.rel_path == "a.md"));
+
+        // A folder among the paths: a full scan's job.
+        fs::create_dir_all(root.join("moved-in")).unwrap();
+        fs::write(root.join("moved-in/x.md"), "# X\n").unwrap();
+        assert!(scan_paths(&project, &mut db, &["moved-in".to_string()]).unwrap().is_none());
     }
 }
