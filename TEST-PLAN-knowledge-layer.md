@@ -145,6 +145,12 @@ keyword index over sections.
 - [ ] Review has **Ingested: …** with what it overturns (the ship date) and the
   actions (Ben, the save bug). **Undo** puts the source back in Raw and removes
   the note.
+- [ ] The note overturns the ship date, so Review also has
+  **Proposed: Current/Project.md from …** with the change as a diff. Nothing
+  was written: apply it and the page changes; discard it and it does not.
+- [ ] If the standup had a ruling said in the room, a **Ruling for <decider>**
+  card proposes the next `D-nnn` entry for `_meta/DECISIONS.md`, citing the
+  note. The log is unchanged until it is applied.
 - [ ] Recipes > new from template: **Current, from ingested notes** is offered,
   with its source set to `Research/Ingestion/Ingested` and output `Current/`.
   (Run it only if you want to see a held first run: over the template pages it
@@ -265,8 +271,8 @@ keyword index over sections.
 
 ## Known gaps (not bugs to report)
 
-- Ingest does not yet write rulings, tickets or Current pages from a note by
-  itself; the Current recipe does the last, through staging.
-- Chat edits to wiki pages do not go through staging.
+- Ingest proposes Current changes and rulings; tickets from a note's actions
+  are Wright's, in the team repo, and stay listed on the ingest card. Undoing
+  an ingest leaves its proposal cards for you to discard.
 - 2b is built by section; the all-projects search and the MCP do not filter
   by audience yet (the project search box does).

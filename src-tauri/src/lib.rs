@@ -7400,7 +7400,25 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
                         ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
                     }
                 };
-                if let Err(e) = ken_core::ingest::ingest_one(&root, &mut db, &raw, &today, engine::now_epoch(), generate) {
+                let done = ken_core::ingest::ingest_one(&root, &mut db, &raw, &today, engine::now_epoch(), generate);
+                // What follows from the note: Current changes and rulings,
+                // proposed on Review, never written.
+                if let Ok(placement) = &done {
+                    if let Ok(note) = std::fs::read_to_string(root.join(&placement.note)) {
+                        let ask = |prompt: &str| -> ken_core::Result<String> {
+                            match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
+                                ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+                                ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
+                                ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
+                                ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
+                            }
+                        };
+                        if let Err(e) = ken_core::ingest::follow_ups(&root, &mut db, placement, &note, &today, engine::now_epoch(), ask) {
+                            eprintln!("warning: ingest follow-ups for {raw} failed: {e}");
+                        }
+                    }
+                }
+                if let Err(e) = done {
                     let open = db.list_open_review_items().unwrap_or_default();
                     if !open.iter().any(|it| it.kind == "ingest-failed" && it.source_ref == raw) {
                         let _ = db.insert_review_item(

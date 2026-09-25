@@ -572,8 +572,13 @@ fn file_proposal(db: &mut Db, p: &Proposal, added: &[String], now: i64) -> Resul
          It applies only while the page still reads as it did when Ken proposed it.",
         p.page
     );
+    file_page_proposal(db, p, &title, &body, now)
+}
+
+/// File one proposed page change as a Review card, to apply or discard.
+pub fn file_page_proposal(db: &mut Db, p: &Proposal, title: &str, body: &str, now: i64) -> Result<()> {
     let payload = serde_json::to_string(p).map_err(|e| Error::Other(e.to_string()))?;
-    db.insert_review_item(PROPOSAL_KIND, &title, &body, &p.page, Some(&payload), now)?;
+    db.insert_review_item(PROPOSAL_KIND, title, body, &p.page, Some(&payload), now)?;
     Ok(())
 }
 
