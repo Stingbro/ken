@@ -1258,15 +1258,14 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
 /// background pass that runs the local LLM over every indexed file and feeds
 /// the Map and Timeline screens.
 ///
-/// Off for now: that worker drives llama.cpp on the GPU once per file, so an
-/// otherwise idle Ken keeps the GPU busy and the fans spinning while it chews
-/// through a project.
-///
-/// Re-enabling is a one-line flip: queue rows stay `pending` in the DB when
-/// the worker never starts, so setting this back to `true` resumes exactly
-/// where it left off. Also re-add the `map` and `timeline` entries to
-/// `src/shell/NavRail.svelte` (the screens themselves were left in place).
-const KNOWLEDGE_EXTRACTION_ENABLED: bool = false;
+/// On: the knowledge graph behind hybrid search is built from it. It was
+/// paused upstream while testing (it drove llama.cpp on the GPU once per file
+/// across a whole project); on this branch it reads only files a repo's kind
+/// and index state mark for entities (team and wiki repos by default), so a
+/// code repo costs it nothing. Switching it off leaves queue rows `pending`,
+/// so switching back on resumes where it left off; the `map` and `timeline`
+/// entries in `src/shell/NavRail.svelte` go with it.
+const KNOWLEDGE_EXTRACTION_ENABLED: bool = true;
 
 /// How often the background hydration worker wakes to look for cloud-only
 /// documents to pull down. Long on purpose: this is opportunistic work that
