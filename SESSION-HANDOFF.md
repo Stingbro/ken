@@ -442,18 +442,18 @@ will need their own lines there once decided.
   `install.ps1`, `scripts/win-build.cmd`, `test-workspace.bat`,
   `drawio-viewer.min.js`, `svelte.config.js` and parts of
   `node_modules` (every `.bin/*.cmd` shim, `vitest/dist/cli.js`).
-  Restore the tracked files with `git checkout -- <file>` and
-  `node_modules` with `npm ci` once IT clears them. Never use the
-  in-app browser here; run things one at a time.
+  All restored the same day (`git checkout`, `npm ci`, and a fresh
+  extract of `tauri-plugin-dialog-2.7.1`, whose `api-iife.js` it had
+  taken from the cargo registry). Never use the in-app browser here;
+  run things one at a time.
 - **ken-core tests on Windows:** 859 pass, 0 fail, 57 ignored. The 53
   that run the bash fake Claude CLI are ignored on Windows (covered on
   macOS/Linux). The rest were real: fixture PDFs were CRLF-converted
   (now `-text` in `.gitattributes`); `/etc` is rooted but not absolute
   on Windows (import and recipe path checks now use components); cloud
   hydration measured nothing on Windows (now `GetCompressedFileSizeW`);
-  one test hard-coded `/`. ken-mcp 42/42. The app `cargo check` needs
-  `scripts\win-build.cmd` back (llama.cpp's Vulkan build fails without
-  its environment).
+  one test hard-coded `/`. ken-mcp 42/42. Frontend 697 pass,
+  svelte-check 0 errors, `scripts\win-build.cmd check` passes.
 - **Windows spawn fixes (real bugs):** a `claude.cmd` launcher cannot
   take an argument with a line break, so `-p` prompts go on stdin, the
   chat guide is one line, and a multi-line terminal-session prompt
