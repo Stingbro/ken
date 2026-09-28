@@ -583,6 +583,17 @@ fn phase_drift_change(base: &Path, parent: &Path, member: &str, file: &str) -> R
     let _ = git(&["add", file]);
     let c = git(&["commit", "-q", "-m", "eval: change a cited file"]).map_err(|e| Error::Other(e.to_string()))?;
     println!("# Drift after changing `{member}/{file}`\n\ncommit: {}\n", String::from_utf8_lossy(&c.stderr).trim());
+    // Drift measures what is merged upstream, so the change is pushed, as a
+    // teammate's merge would land. Only to a remote that is a folder in the
+    // evaluation's own area, never to a real one.
+    let origin = git(&["remote", "get-url", "origin"]).map(|o| String::from_utf8_lossy(&o.stdout).trim().replace('\\', "/")).unwrap_or_default();
+    let area = parent.parent().unwrap_or(parent).to_string_lossy().replace('\\', "/");
+    if !origin.is_empty() && origin.to_lowercase().starts_with(&area.to_lowercase()) {
+        let p = git(&["push", "-q", "origin", "HEAD"]).map_err(|e| Error::Other(e.to_string()))?;
+        println!("pushed to `{origin}`: {}\n", if p.status.success() { "ok".into() } else { String::from_utf8_lossy(&p.stderr).trim().to_string() });
+    } else {
+        println!("not pushed: `{origin}` is outside `{area}`, so drift will not see this change until it is merged there\n");
+    }
     let wiki = Project::open(&parent.join(wiki_name()))?;
     let db = Db::open(base, wiki.config.id)?;
     let t = Instant::now();

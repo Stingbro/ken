@@ -1405,6 +1405,34 @@ mod tests {
         assert_eq!(db.backfill_extractions().unwrap(), 2);
     }
 
+    /// A folder a `.kenignore` line drops leaves the code map with its files,
+    /// so find-usages never points into it; unignored, it is mapped again.
+    #[test]
+    fn an_ignored_folder_leaves_the_code_map() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("app")).unwrap();
+        fs::create_dir_all(dir.path().join("web")).unwrap();
+        fs::write(dir.path().join("app/auth.py"), "def current_user():\n    return 1\n").unwrap();
+        fs::write(dir.path().join("web/page.py"), "from app.auth import current_user\n\ndef show():\n    return current_user()\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        let paths = |db: &Db| {
+            let mut p: Vec<String> = db.code_symbols(None, None, None, 100).unwrap().into_iter().map(|s| s.path).collect();
+            p.dedup();
+            p
+        };
+        assert_eq!(paths(&db), vec!["app/auth.py", "web/page.py"]);
+
+        fs::write(dir.path().join(".kenignore"), "web/\n").unwrap();
+        scan(&project, &mut db).unwrap();
+        assert_eq!(paths(&db), vec!["app/auth.py"], "the ignored folder's symbols went with its files");
+
+        fs::remove_file(dir.path().join(".kenignore")).unwrap();
+        scan(&project, &mut db).unwrap();
+        assert_eq!(paths(&db), vec!["app/auth.py", "web/page.py"]);
+    }
+
     /// A linked worktree (a folder whose `.git` is a file) is another
     /// checkout: not walked, and a watcher event inside it is a no-op. A
     /// nested clone and plain folders are still walked. Secrets and archives

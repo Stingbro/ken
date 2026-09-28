@@ -338,9 +338,9 @@ fn repo_heads(repos: &[(String, PathBuf)]) -> HashMap<String, String> {
     repos
         .iter()
         .filter_map(|(name, root)| {
-            let (branch, _) = crate::drift::default_branch(root);
+            // The commit the draft read: what is checked out, whichever branch.
             let mut cmd = std::process::Command::new("git");
-            let out = crate::proc::quiet(&mut cmd).args(["rev-parse", "--short=12", &branch]).current_dir(root).output().ok()?;
+            let out = crate::proc::quiet(&mut cmd).args(["rev-parse", "--short=12", "HEAD"]).current_dir(root).output().ok()?;
             let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
             (out.status.success() && !sha.is_empty()).then(|| (name.clone(), sha))
         })

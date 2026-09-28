@@ -283,14 +283,22 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// The branch to measure against: the remote's default, read from git, else
-/// the checked-out branch, said so.
+/// the checked-out branch, said so. A checkout on a branch the default does
+/// not contain (a long-lived design branch, a worktree kept for one) is what
+/// Ken read and the wiki was drafted from, so it is measured against that
+/// branch's upstream, said so.
 pub fn default_branch(root: &Path) -> (String, Option<String>) {
-    if let Some(r) = git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
-        return (r, None);
-    }
     let head = git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "HEAD".into());
-    let note = format!("no remote default branch found; measured against {head}, not the default");
-    (head, Some(note))
+    let Some(default) = git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) else {
+        let note = format!("no remote default branch found; measured against {head}, not the default");
+        return (head, Some(note));
+    };
+    if git(root, &["merge-base", "--is-ancestor", "HEAD", &default]).is_some() {
+        return (default, None);
+    }
+    let branch = git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).unwrap_or(head);
+    let note = format!("checked out on {branch}, which {default} does not contain; measured against {branch}");
+    (branch, Some(note))
 }
 
 /// The last commit on `branch` at or before the end of `date` (`YYYY-MM-DD`).
@@ -323,8 +331,8 @@ fn still_there(repo_root: &Path, branch: &str, c: &CodeCitation) -> Option<(Seve
     let file = repo_root.join(&c.path);
     let at_head = git(repo_root, &["cat-file", "-e", &format!("{branch}:{}", c.path)]).is_some();
     if !at_head {
-        let detail = if file.exists() { "not on the default branch" } else { "the path no longer exists" };
-        return Some((Severity::Finding, detail.to_string()));
+        let detail = if file.exists() { format!("not on {branch}") } else { "the path no longer exists".to_string() };
+        return Some((Severity::Finding, detail));
     }
     if let Some(line) = c.line {
         let text = git(repo_root, &["show", &format!("{branch}:{}", c.path)]).unwrap_or_default();
@@ -936,6 +944,53 @@ updated: {{date}}
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
         let run = sweep(&project, &db, chrono_free_epoch("2026-09-03").unwrap()).unwrap();
+        let hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
+        assert_eq!(hits, vec![("Repo-Map/app.md", Severity::Judgment)], "{:?} {:?}", run.mismatches, run.branches);
+    }
+
+    /// A repo checked out on a long-lived branch the default does not hold
+    /// (a design branch): the wiki was read from it, so it is measured
+    /// against it, and a change pushed to it is still found.
+    #[test]
+    fn a_checkout_on_another_branch_is_measured_against_that_branch() {
+        let parent = tempfile::tempdir().unwrap();
+        let upstream = parent.path().join("upstream.git");
+        git_ok(parent.path(), &["init", "-q", "--bare", "-b", "main", upstream.to_str().unwrap()]);
+        let seed = parent.path().join("seed");
+        git_ok(parent.path(), &["clone", "-q", upstream.to_str().unwrap(), seed.to_str().unwrap()]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t")] {
+            git_ok(&seed, &["config", k, v]);
+        }
+        commit_at(&seed, "README.md", "# App\n", "2026-09-01");
+        git_ok(&seed, &["push", "-q", "origin", "main"]);
+        git_ok(&seed, &["checkout", "-q", "-b", "design"]);
+        commit_at(&seed, "docs/DEMO.md", "# Demo\nChicago only.\n", "2026-09-02");
+        git_ok(&seed, &["push", "-q", "origin", "design"]);
+        let code = parent.path().join("app");
+        git_ok(parent.path(), &["clone", "-q", "-b", "design", upstream.to_str().unwrap(), code.to_str().unwrap()]);
+        let read_at = {
+            let out = Command::new("git").args(["rev-parse", "--short=12", "HEAD"]).current_dir(&code).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Repo-Map")).unwrap();
+        fs::write(
+            wiki.join("Repo-Map/app.md"),
+            format!("---\ntitle: App\nupdated: 2026-09-02\nsources:\n  - app@{read_at}:docs/DEMO.md\n---\n# App\n"),
+        )
+        .unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let run = sweep(&project, &db, chrono_free_epoch("2026-09-03").unwrap()).unwrap();
+        assert!(run.mismatches.is_empty(), "{:?}", run.mismatches);
+        assert!(run.branches.iter().any(|b| b.contains("measured against origin/design")), "{:?}", run.branches);
+
+        commit_at(&seed, "docs/DEMO.md", "# Demo\nChicago and Dallas.\n", "2026-09-03");
+        git_ok(&seed, &["push", "-q", "origin", "design"]);
+        crate::scan::scan(&project, &mut db).unwrap();
+        let run = sweep(&project, &db, chrono_free_epoch("2026-09-04").unwrap()).unwrap();
         let hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
         assert_eq!(hits, vec![("Repo-Map/app.md", Severity::Judgment)], "{:?} {:?}", run.mismatches, run.branches);
     }
