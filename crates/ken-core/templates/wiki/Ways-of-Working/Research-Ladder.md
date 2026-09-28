@@ -26,11 +26,11 @@ Cheapest first, with the team repo after the library, because the cheap sources 
 
 1. the library, starting at [[START-HERE]] and [[Vocabulary]]
 2. the team repo: tickets and the decisions log
-3. our code and the data files: the code map first (find the definition, find its usages, the file's outline, what it imports and what imports it), then grep
+3. our code and the data files: the code map first (definition, usages, outline, imports), then grep
 4. the platform's config and source
 
-For *why* something is the way it is, ask the history: the commits that touched a file, or the commits that mention a word in their message or their diff.
+For why code is as it is, read its git history: the commits that touched the file, or the commits whose message or diff contains the term.
 
-The instant a question takes the shape "does X exist" or "what are the options for X", the next action is a library search. Search the library three ways at once: the knowledge graph, search, and the links between its pages. Search tags every hit with its kind (code, test, spec, doc, config, data, design, meeting, ticket); search everything to see the mix, or keep one kind when you know what you want. An empty or thin result proves nothing until you have ruled out a wrong term, a filtered path and a timed-out tool; for a wrong term, check [[Vocabulary]]. When the index finds little, look yourself: read the repos directly before you answer. Before you report that something does not exist, search all four sources in the search order. Name what you searched.
+The instant a question takes the shape "does X exist" or "what are the options for X", the next action is a library search. Search the library three ways at once: the knowledge graph, search, and the links between its pages. Every hit carries its kind (code, test, spec, doc, config, data, design, meeting, ticket); filter by kind when you know which one you need. An empty result proves nothing until you have ruled out a wrong term, a filtered path and a timed-out tool; for a wrong term, check [[Vocabulary]]. If search returns little, read the repos directly before you answer. Before you report that something does not exist, search all four sources in the search order. Name what you searched.
 
 A finding lists every page it read. It marks each page accurate, or stale and corrected. It also lists each page it found missing. When you find the answer below the library, write it back into the page that owns it before you close the question.
