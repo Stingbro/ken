@@ -308,7 +308,7 @@ fn phase_wiki(base: &Path, parent: &Path) -> Result<()> {
         engine::now_epoch(),
         generate,
     )?;
-    println!("- drafted: {:?}\n- kept: {:?}\n- failed: {:?}\n- proposed: {:?}\n- sources used: {}", report.drafted, report.kept, report.failed, report.proposed, report.sources.len());
+    println!("- drafted: {:?}\n- kept: {:?}\n- failed: {:?}\n- proposed: {:?}\n- still to fill: {:?}\n- sources used: {}", report.drafted, report.kept, report.failed, report.proposed, report.to_fill, report.sources.len());
     let stats = scan::scan(&wiki, &mut db)?;
     println!("- wiki rescanned: {} added, {} updated", stats.added, stats.updated);
     Ok(())

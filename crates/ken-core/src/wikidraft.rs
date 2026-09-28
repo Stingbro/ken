@@ -55,6 +55,11 @@ pub const PAGES: &[(&str, &str)] = &[
         "Work/Releases.md",
         "a business doc (item 2b): what changed in each release, newest first, in words for someone who never reads code, from changelogs and release tags",
     ),
+    (
+        "Vocabulary.md",
+        "the team's words, both directions: each term the team, the client or the business uses, what it means in plain words, \
+         and the word the code or the platform uses for it where that differs; glossaries first",
+    ),
 ];
 
 fn clip(s: &str, n: usize) -> String {
@@ -217,7 +222,7 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
         "You are drafting one page of a team's wiki, `{page}`, for a person to review. The page is: {purpose}.\n\n\
          Rules:\n\
          - Use only what the sources below say. Where they say nothing, write `(not in the sources yet)` rather than guess.\n\
-         - Cite the source of every fact inline, as its label in backticks, e.g. `ken:README.md`.\n\
+         - Cite sources inline as their labels in backticks, e.g. `ken:README.md`, once at the end of each paragraph, list item or table row, for every source it used.\n\
          - Frontmatter: keep the template's keys; set `status: draft`; set `updated: {today}`; do NOT write a `verified:` line (a person verifies it later); list every source you used under `sources:` as its label.\n\
          - The first line under the title says: Drafted by Ken on {today} from the sources listed; not yet verified by a person.\n\
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
@@ -291,6 +296,33 @@ pub struct DraftReport {
     /// Changes to pages a person keeps, filed for them to apply or discard.
     #[serde(default)]
     pub proposed: Vec<String>,
+    /// Placeholders left in the wiki after the draft, as `page: placeholder`.
+    #[serde(default)]
+    pub to_fill: Vec<String>,
+}
+
+/// The template placeholders still in `wiki`'s pages, as `page: placeholder`.
+/// A `verified:` date is a person's to set, and `Templates/` are copied from,
+/// so neither counts.
+pub fn placeholders_left(wiki: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let pages = crate::wikinew::TEMPLATE
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| p.ends_with(".md") && !crate::wikinew::is_copy_template(p));
+    for page in pages {
+        let Ok(text) = fs::read_to_string(wiki.join(page)) else { continue };
+        for line in text.lines().filter(|l| !l.trim_start().starts_with("verified:")) {
+            let mut rest = line;
+            while let Some(i) = rest.find("{{") {
+                let Some(j) = rest[i..].find("}}") else { break };
+                out.push(format!("{page}: {}", &rest[i..i + j + 2]));
+                rest = &rest[i + j + 2..];
+            }
+        }
+    }
+    out.dedup();
+    out
 }
 
 fn write_page(path: &Path, text: &str) -> Result<()> {
@@ -420,6 +452,12 @@ fn file_card(db: &mut Db, report: &DraftReport, title: &str, now: i64) -> Result
             body.push_str(&format!("- {p}: {e}\n"));
         }
     }
+    if !report.to_fill.is_empty() {
+        body.push_str("\n**Still to fill by a person** (the sources could not say):\n");
+        for p in &report.to_fill {
+            body.push_str(&format!("- {p}\n"));
+        }
+    }
     body.push_str(&format!("\nRead from {} sources: {}\n", report.sources.len(), report.sources.join(", ")));
     let first = report.drafted.first().cloned().unwrap_or_default();
     db.insert_review_item(REVIEW_KIND, title, &body, &first, None, now)?;
@@ -442,6 +480,7 @@ pub fn draft(
 ) -> Result<DraftReport> {
     let mut report = DraftReport { sources: sources.iter().map(|s| s.label.clone()).collect(), ..Default::default() };
     draft_pages(wiki, &team_pages(), sources, today, &mut report, &mut generate)?;
+    report.to_fill = placeholders_left(wiki);
     let title = format!("First wiki drafted: {} pages to read", report.drafted.len());
     file_card(db, &report, &title, now)?;
     Ok(report)
@@ -567,6 +606,7 @@ pub fn draft_team(
     report.sources.dedup();
     draft_pages(wiki, &team_pages(), &sources, today, &mut report, &mut generate)?;
     pin_drafted(wiki, &report.drafted, repos)?;
+    report.to_fill = placeholders_left(wiki);
     let title = format!("First wiki drafted: {} pages to read", report.drafted.len());
     file_card(db, &report, &title, now)?;
     Ok(report)
@@ -939,7 +979,7 @@ mod tests {
         assert_eq!(report.kept, vec!["Current/Team.md"]);
         assert_eq!(
             report.drafted,
-            vec!["Current/Project.md", "Current/Who-Does-What.md", "Conventions/ARCHITECTURE.md", "Work/Releases.md"]
+            vec!["Current/Project.md", "Current/Who-Does-What.md", "Conventions/ARCHITECTURE.md", "Work/Releases.md", "Vocabulary.md"]
         );
         assert!(prompts[0].contains("{{one paragraph}}"), "the template page's own text is the template");
         assert!(prompts.iter().all(|p| p.contains("=== game:README.md ===")));
@@ -948,6 +988,18 @@ mod tests {
         let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
         assert!(body.contains("Left alone") && body.contains("Current/Team.md"));
     }
+
+    #[test]
+    fn what_the_draft_could_not_fill_is_named_for_a_person() {
+        let wiki = tempfile::tempdir().unwrap();
+        crate::wikinew::create(wiki.path(), "Payments", &[], "2026-09-28").unwrap();
+        let left = placeholders_left(wiki.path());
+        assert!(left.contains(&"START-HERE.md: {{The trap that costs the most}}".to_string()), "{left:?}");
+        assert!(left.contains(&"CLAUDE.md: {{project-specific gotcha}}".to_string()));
+        assert!(!left.iter().any(|l| l.contains("{{Domain}}")), "Ken names the Domain section itself");
+        assert!(!left.iter().any(|l| l.starts_with("Templates/") || l.contains("{{date}}")), "{left:?}");
+    }
+
     fn page(title: &str) -> String {
         format!("---\ntitle: {title}\nsources:\n  - x\n---\n# {title}\nDrafted by Ken.\n")
     }

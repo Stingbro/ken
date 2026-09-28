@@ -62,7 +62,7 @@ pub struct Covered {
 
 /// Pages that are templates for people to copy keep their placeholders,
 /// dates included.
-fn is_copy_template(path: &str) -> bool {
+pub(crate) fn is_copy_template(path: &str) -> bool {
     path.starts_with("Templates/") || path.ends_with("/RULE.md") || path.ends_with("/CONVENTION.md")
 }
 
@@ -77,7 +77,9 @@ fn one_line(s: &str) -> String {
 
 /// One template file with what Ken knows filled in.
 pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], today: &str) -> String {
-    let mut t = text.replace("{{team_name}}", team).replace("{{wiki_repo}}", wiki);
+    // The section on how the system works is named `Domain` until the team
+    // names it after its own subject.
+    let mut t = text.replace("{{team_name}}", team).replace("{{wiki_repo}}", wiki).replace("{{Domain}}", "Domain");
     if !is_copy_template(path) {
         // `updated:` only; a `verified:` date is a person's.
         t = t
