@@ -259,6 +259,18 @@ keyword index over sections.
 - [ ] Nothing was pushed anywhere: `git -C "<test folder>\Realms-Wiki" remote`
   prints nothing.
 
+## 14b. The map comes from Claude (needs Claude)
+
+- [ ] With no on-device language model installed (only the embedding
+  model), open a project with notes and no map. About a minute after the
+  first scan the Map shows "building", then entities and a timeline, within
+  a few minutes. The Map's progress shows all files analyzed.
+- [ ] Edit two notes and wait: within about half an hour the Map is rebuilt
+  once (not once per note).
+- [ ] Hide Claude Code (rename it off PATH) and reopen: Home and the Map say
+  Claude Code isn't installed and how to install it; search still works.
+- [ ] ⌘K a question: the quick answer comes from Claude.
+
 ## 15. Claude in chat: edits reviewed, sources clickable (needs Claude)
 
 - [ ] Open `Realms-Docs/Platform/Save.md`. In chat, ask: "Rename the title to

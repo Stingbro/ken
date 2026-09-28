@@ -904,6 +904,18 @@ mod llama {
     use super::{Engine, Utf8Streamer};
     use crate::{Error, Result};
 
+    /// A JSON object, as GBNF (llama.cpp's own `json.gbnf`, rooted at an
+    /// object: every JSON generation asks for one).
+    const JSON_GRAMMAR: &str = r#"
+root   ::= object
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+object ::= "{" ws ( string ":" ws value ("," ws string ":" ws value)* )? "}" ws
+array  ::= "[" ws ( value ("," ws value)* )? "]" ws
+string ::= "\"" ( [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) )* "\"" ws
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+ws     ::= | " " | "\n" [ \t]{0,20}
+"#;
+
     /// The real llama.cpp engine. Holds the backend + weights for the process
     /// lifetime; a fresh context is created per generation (cheap next to load).
     pub struct LlamaEngine {
@@ -965,8 +977,15 @@ mod llama {
             ctx.decode(&mut batch)
                 .map_err(|e| Error::Other(format!("decode failed: {e}")))?;
 
+            // Greedy is the JSON path (`generate_json`): a grammar holds the
+            // model to a JSON object token by token. Unconstrained, a 4B
+            // model left about half of a real team's documents unparseable
+            // (Markdown instead of JSON, a trailing comma, a stray token).
             let mut sampler = if greedy {
-                LlamaSampler::chain_simple([LlamaSampler::greedy()])
+                match LlamaSampler::grammar(&self.model, JSON_GRAMMAR, "root") {
+                    Ok(grammar) => LlamaSampler::chain_simple([grammar, LlamaSampler::greedy()]),
+                    Err(_) => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+                }
             } else {
                 LlamaSampler::chain_simple([
                     LlamaSampler::temp(0.7),
@@ -982,8 +1001,10 @@ mod llama {
             let mut n_cur = batch.n_tokens();
 
             for _ in 0..max_tokens {
+                // `sample` accepts the token it picks (llama_sampler_sample
+                // does). Accepting it again fed the grammar every token twice,
+                // which empties it and aborts the process in llama.cpp.
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-                sampler.accept(token);
                 if self.model.is_eog_token(token) {
                     break;
                 }

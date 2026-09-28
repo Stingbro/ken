@@ -443,10 +443,8 @@
   {:else if !modelInstalled && isQuestionQuery(query.trim())}
     <div class="qa qa-hint">
       <div class="qa-body">
-        Instant answers run on your Mac.
-        <button class="qa-dig" onclick={() => app.openSettings()}>
-          Download the answers model in Settings
-        </button>
+        Answers come from Claude Code. Install it (npm install -g @anthropic-ai/claude-code)
+        and run <code>claude</code> once to sign in.
       </div>
     </div>
   {/if}

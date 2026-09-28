@@ -158,9 +158,9 @@ describe("index health", () => {
     ]);
   });
 
-  it("says which piece is missing without a model, before anything else", () => {
+  it("says Claude Code is missing, before anything else", () => {
     const h = { ...base, llmStatus: "notInstalled" as const, control: { ...base.control!, ok: false } };
-    expect(healthWarning(h)).toMatch(/No on-device model/);
+    expect(healthWarning(h)).toMatch(/Claude Code isn.t installed/);
   });
 
   it("names the control page and what came first when the check misses", () => {

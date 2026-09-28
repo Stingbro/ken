@@ -345,12 +345,12 @@ pub fn propose(parent: &Path) -> Result<Proposal> {
     let mut ignores: Vec<IgnoreRow> = Vec::new();
     for r in rows.iter().filter(|r| r.has_git) {
         for (rel, evidence) in worktrees(parent, &parent.join(&r.member)) {
-            let pattern = format!("{rel}/");
+            let pattern = workspace::folder_line(&rel);
             if workspace::is_ignored_folder(&already, &rel) || ignores.iter().any(|i| i.pattern == pattern) {
                 continue;
             }
             ignores.push(IgnoreRow {
-                ticked: !declined.ignores.contains(&pattern),
+                ticked: !declined.ignores.iter().any(|d| d.trim_start_matches('/') == pattern.trim_start_matches('/')),
                 pattern,
                 state: IndexState::Off,
                 reason: "Git worktree".into(),
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(row("Empty").index, IndexState::Off);
 
         let wt = p.ignores.iter().find(|i| i.reason == "Git worktree").expect("worktree proposed");
-        assert_eq!(wt.pattern, "Realms-Game-u7/");
+        assert_eq!(wt.pattern, "/Realms-Game-u7/", "anchored: that folder, not any of the name");
         assert!(wt.ticked && !wt.fixed);
         assert!(p.ignores.iter().any(|i| i.reason == "Secrets" && i.fixed));
         assert_eq!(p.teams, vec!["Realms", "SR"]);
@@ -846,7 +846,7 @@ mod tests {
 
         let ignore = fs::read_to_string(d.path().join(".kenignore")).unwrap();
         assert!(ignore.contains("# Ken proposed these at set-up on 2026-09-24"));
-        assert!(ignore.contains("Realms-Game-u7/"));
+        assert!(ignore.contains("/Realms-Game-u7/"));
         assert!(!ignore.contains("credentials.json"), "built-ins are not written");
         assert_eq!(declined(d.path()).members, vec!["Personal"]);
 

@@ -152,15 +152,15 @@ export function healthFigures(h: IndexHealth): HealthFigure[] {
 
 /**
  * The one sentence Home owes the reader when the index cannot be trusted:
- * no local model (so nothing is read for entities, while search still
+ * no Claude Code (so nothing is read for entities, while search still
  * works), or the control query missed its page. Null when all is well.
  */
 export function healthWarning(h: IndexHealth): string | null {
   if (h.llmStatus === "notInstalled") {
-    return "No on-device model is chosen, so nothing is read for the graph. Search still works. Choose the on-device model in Settings.";
+    return "Claude Code isn't installed, so nothing is read for the graph. Search still works. Install it (npm install -g @anthropic-ai/claude-code) and run `claude` once to sign in.";
   }
   if (h.llmStatus === "error") {
-    return "The on-device model hit a snag, so nothing is read for the graph. Search still works. Open Settings to check the model.";
+    return "Claude Code hit a snag, so nothing is read for the graph. Search still works. Run `claude` once to check it signs in.";
   }
   if (h.control && !h.control.ok) {
     const top = h.control.top ? `; ${h.control.top} came first` : "";

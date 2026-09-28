@@ -176,6 +176,14 @@ pub trait FederationLlm {
     /// Federation's `parse_*` functions tolerate any non-conforming output,
     /// so an implementation may return whatever the model produced verbatim.
     fn complete(&self, prompt: &str) -> Result<String>;
+
+    /// A judgement over a batch: are these pairs the same thing, how are
+    /// these related. Few calls, and the ones a small model gets wrong most,
+    /// so an implementation may send them to a stronger model. Defaults to
+    /// [`complete`](Self::complete).
+    fn judge(&self, prompt: &str) -> Result<String> {
+        self.complete(prompt)
+    }
 }
 
 /// A workspace member handed to [`build_workspace_kg`]: its `project_id`
@@ -343,7 +351,10 @@ fn names_nest(a: &str, b: &str) -> bool {
     let words = |s: &str| -> HashSet<String> { s.split(' ').filter(|t| t.len() >= MIN_SHARED_TOKEN_LEN).map(str::to_string).collect() };
     let (wa, wb) = (words(a), words(b));
     let (short, long) = if wa.len() <= wb.len() { (wa, wb) } else { (wb, wa) };
-    !short.is_empty() && short.is_subset(&long)
+    // One word inside a longer name ("analytics" in "adobe cx analytics",
+    // "dma" in "dma analysis") is usually the general thing and a specific
+    // one; a typo of it is still caught by edit distance.
+    short.len() >= 2 && short.is_subset(&long)
 }
 
 /// Is one normalized name a substring of the other?
@@ -642,7 +653,7 @@ fn merge_snapshots(
             let prompt = compose_adjudication_prompt(&inputs);
             // A generation failure is non-fatal (design D2/D5: "no" is the
             // default on any failure) — treat it as all-no-merge.
-            let verdicts = match llm.complete(&prompt) {
+            let verdicts = match llm.judge(&prompt) {
                 Ok(raw) => parse_adjudication(&raw, pairs.len()),
                 Err(_) => Vec::new(),
             };
@@ -829,7 +840,7 @@ fn merge_snapshots(
                 })
                 .collect();
             let prompt = compose_linking_prompt(&inputs);
-            let relations = match llm.complete(&prompt) {
+            let relations = match llm.judge(&prompt) {
                 Ok(raw) => parse_linking(&raw, ranked.len()),
                 Err(_) => vec!["related".to_string(); ranked.len()],
             };
@@ -1286,6 +1297,7 @@ mod tests {
         // longer is.
         assert!(!names_nest("marketing brief", "brief development"));
         assert!(names_nest("brief builder", "brief builder agent"));
+        assert!(!names_nest("analytics", "adobe cx analytics"), "one general word is not asked about");
     }
 
     #[test]

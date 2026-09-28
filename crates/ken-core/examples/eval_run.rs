@@ -350,11 +350,26 @@ fn phase_extract(base: &Path, parent: &Path, minutes: u64) -> Result<()> {
 
 // ---------------------------------------------------------------- kg
 
-struct LocalLlm;
+/// As the app does it: the batched judgements (same thing? how related?)
+/// on Claude; no local generation.
+struct LocalLlm {
+    claude: Option<PathBuf>,
+    root: PathBuf,
+}
 
 impl FederationLlm for LocalLlm {
-    fn complete(&self, prompt: &str) -> Result<String> {
-        local_llm::generate_stream(prompt, Priority::Background, &mut |_| true)
+    // No local generation (the app's policy): summaries fall back to the
+    // longest member summary.
+    fn complete(&self, _prompt: &str) -> Result<String> {
+        Err(Error::Other("no local generation".into()))
+    }
+
+    fn judge(&self, prompt: &str) -> Result<String> {
+        let Some(bin) = &self.claude else { return self.complete(prompt) };
+        match assistant::oneshot(bin, &self.root, prompt, Duration::from_secs(300), &CancelToken::new())? {
+            assistant::OneshotOutcome::Completed(text) => Ok(text),
+            other => Err(Error::Other(format!("claude: {other:?}"))),
+        }
     }
 }
 
@@ -373,7 +388,7 @@ fn phase_kg(base: &Path, parent: &Path) -> Result<()> {
     let ms = kg_members(base, parent)?;
     let fed: Vec<federation::Member> = ms.iter().map(|(_, id, db)| federation::Member { project_id: *id, db }).collect();
     let mut kg = WorkspaceKgDb::open(parent)?;
-    let llm = LocalLlm;
+    let llm = LocalLlm { claude: ken_core::runner::discover_claude(), root: parent.to_path_buf() };
     let rep = federation::build_workspace_kg(&mut kg, &fed, Some(&llm), engine::now_epoch(), &CancelToken::new())?;
     let names: HashMap<String, &str> = ms.iter().map(|(n, id, _)| (id.to_string(), n.as_str())).collect();
     println!("# Workspace knowledge graph\n\nMembers: {:?}\n\n{rep:#?}\n", ms.iter().map(|m| &m.0).collect::<Vec<_>>());

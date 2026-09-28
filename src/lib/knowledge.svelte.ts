@@ -35,7 +35,7 @@ class KnowledgeStore {
     return { analyzed: m.analyzed, total: m.total, failed };
   }
 
-  /** The local model can't extract right now — show the plain notice. */
+  /** Nothing can map right now (Claude Code missing) — show the plain notice. */
   get llmPaused(): boolean {
     return (
       this.model?.llmStatus === "notInstalled" ||
@@ -45,10 +45,10 @@ class KnowledgeStore {
 
   get llmNotice(): string {
     if (this.model?.llmStatus === "error") {
-      return "Ken's on-device model hit a snag — mapping is paused. Open Settings to check the model.";
+      return "Mapping hit a snag with Claude Code. Try Deep rebuild, or run `claude` once to check it signs in.";
     }
     // notInstalled
-    return "Ken maps your project on your Mac. Choose the on-device model in Settings to begin.";
+    return "Ken maps your project with Claude Code. Install it (npm install -g @anthropic-ai/claude-code) and run `claude` once to sign in.";
   }
 
   /** Call on screen mount: subscribe once, re-read every visit. */

@@ -667,12 +667,19 @@ pub fn ignore_folder(parent: &Path, folder: &str) -> Result<bool> {
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!("{folder}/\n"));
+    text.push_str(&format!("{}\n", folder_line(folder)));
     fs::write(&path, text).map_err(|e| Error::io(&path, e))?;
     Ok(true)
 }
 
-/// Remove the plain `folder/` line this module writes. Returns false when
+/// The line that ignores one workspace folder: anchored (`/Game/`), so it
+/// means that folder and not any folder of that name anywhere below.
+pub fn folder_line(folder: &str) -> String {
+    format!("/{}/", folder.trim().trim_matches('/'))
+}
+
+/// Remove the `/folder/` line this module writes (or the unanchored
+/// `folder/` it wrote before). Returns false when
 /// no such literal line exists — a folder excluded by a hand-written glob
 /// (`sr-universe-*/`) is deliberately NOT rewritten here, because editing
 /// someone's glob to carve out one folder is a guess about intent.
@@ -682,11 +689,8 @@ pub fn unignore_folder(parent: &Path, folder: &str) -> Result<bool> {
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(false);
     };
-    let target = format!("{folder}/");
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|line| line.trim() != target && line.trim() != folder)
-        .collect();
+    let forms = [folder_line(folder), format!("{folder}/"), folder.to_string(), format!("/{folder}")];
+    let kept: Vec<&str> = text.lines().filter(|line| !forms.iter().any(|f| line.trim() == f)).collect();
     if kept.len() == text.lines().count() {
         return Ok(false);
     }

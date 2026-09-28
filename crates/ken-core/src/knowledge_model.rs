@@ -496,6 +496,11 @@ pub fn build_knowledge_model(
     // Full tier only: a search-only file (a code or reference repo, a `~`
     // line) never reaches the graph, the deep rebuild included.
     let files = db.entity_tier_paths()?;
+    // What was waiting before the build reads: the build covers it.
+    let waiting: Vec<(String, String)> = {
+        let listed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        db.waiting_extractions()?.into_iter().filter(|(p, _)| listed.contains(p.as_str())).collect()
+    };
     let prompt = compose_extraction_prompt(&files, today);
     match assistant::oneshot(binary, &project.root, &prompt, EXTRACTION_TIMEOUT, cancel)? {
         OneshotOutcome::Completed(text) => {
@@ -507,6 +512,11 @@ pub fn build_knowledge_model(
                 &extraction.events,
                 engine::now_epoch(),
             )?;
+            // The whole project was just read: the per-file queue it covered
+            // is done, so the local model works only on what changes next,
+            // not hours of files the map already holds. A file edited while
+            // the build ran keeps its new hash and stays queued.
+            db.settle_extractions(&waiting, engine::now_epoch())?;
             Ok(ModelCounts {
                 entities: extraction.entities.len(),
                 edges,
@@ -1236,11 +1246,13 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_file("notes/meeting.md", "md", 10, 1, "indexed", None, "text")
             .unwrap();
+        db.enqueue_extraction_if_changed("notes/meeting.md", "h1").unwrap();
 
         let counts =
             build_knowledge_model(&bin, &project, &mut db, "2026-07-12", &CancelToken::new())
                 .unwrap();
         assert_eq!(counts, ModelCounts { entities: 3, edges: 1, events: 2 });
+        assert!(db.next_pending_extraction().unwrap().is_none(), "the build covered the queue");
         let (entities, edges) = db.list_entities_with_edges().unwrap();
         assert_eq!(entities.len(), 3);
         assert_eq!(edges.len(), 1);

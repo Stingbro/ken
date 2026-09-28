@@ -3942,7 +3942,7 @@ fn scan_and_profile(
         return None;
     }
 
-    if matches!(ken_core::local_llm::llm_status(), ken_core::local_llm::LlmStatus::Ready) {
+    if LOCAL_GENERATION && matches!(ken_core::local_llm::llm_status(), ken_core::local_llm::LlmStatus::Ready) {
         emit(ProfileStateEvent::Refining);
         let tree = ken_core::profiler::tree_sample(&stats);
         let prompt = ken_core::profiler::compose_profile_prompt(&stats, &tree);
@@ -7184,10 +7184,8 @@ async fn quick_answer(
     }
 
     let my_gen = qa_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let local_ready = matches!(
-        ken_core::local_llm::llm_status(),
-        ken_core::local_llm::LlmStatus::Ready
-    );
+    let local_ready = LOCAL_GENERATION
+        && matches!(ken_core::local_llm::llm_status(), ken_core::local_llm::LlmStatus::Ready);
 
     if local_ready {
         let prompt = local_quick_answer_prompt(&query, &sources);
@@ -7276,10 +7274,24 @@ fn run_claude_quick_answer(
 /// The on-device language model's state, for the ⌘K "not installed" hint.
 #[tauri::command]
 fn llm_status() -> &'static str {
-    match ken_core::local_llm::llm_status() {
-        ken_core::local_llm::LlmStatus::Ready => "ready",
-        ken_core::local_llm::LlmStatus::NotInstalled => "notInstalled",
-        ken_core::local_llm::LlmStatus::Error(_) => "error",
+    generator_status()
+}
+
+/// What maps, answers and judges in Ken (see [`LOCAL_GENERATION`]):
+/// `ready` when it can run, `notInstalled` when Claude Code is missing.
+/// The on-device model's own state matters only to meaning search now.
+fn generator_status() -> &'static str {
+    if LOCAL_GENERATION {
+        return match ken_core::local_llm::llm_status() {
+            ken_core::local_llm::LlmStatus::Ready => "ready",
+            ken_core::local_llm::LlmStatus::NotInstalled => "notInstalled",
+            ken_core::local_llm::LlmStatus::Error(_) => "error",
+        };
+    }
+    if ken_core::runner::discover_claude().is_some() {
+        "ready"
+    } else {
+        "notInstalled"
     }
 }
 
@@ -7290,7 +7302,7 @@ fn llm_status() -> &'static str {
 /// Claude path never warms).
 #[tauri::command]
 fn warm_llm() {
-    if matches!(
+    if LOCAL_GENERATION && matches!(
         ken_core::local_llm::llm_status(),
         ken_core::local_llm::LlmStatus::Ready
     ) {
@@ -7347,11 +7359,7 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     let (entities, edges) = active.db.list_entities_with_edges().map_err(err)?;
     let (analyzed, total) = active.db.extraction_coverage().map_err(err)?;
     let failed = active.db.extraction_failed_count().map_err(err)?;
-    let (llm_status, llm_error) = match ken_core::local_llm::llm_status() {
-        ken_core::local_llm::LlmStatus::Ready => ("ready".to_string(), None),
-        ken_core::local_llm::LlmStatus::NotInstalled => ("notInstalled".to_string(), None),
-        ken_core::local_llm::LlmStatus::Error(e) => ("error".to_string(), Some(e)),
-    };
+    let (llm_status, llm_error) = (generator_status().to_string(), None::<String>);
     Ok(KnowledgeModelDto {
         entities,
         edges,
@@ -7537,6 +7545,19 @@ fn wiki_target(guard: &AppState, wiki: &str) -> CmdResult<(std::path::PathBuf, u
 }
 
 /// One model call through the Claude CLI, run in the wiki's folder.
+/// Ken's generation policy: the on-device model embeds (meaning search) and
+/// nothing else. Everything that writes, extracts, judges or answers runs
+/// through Claude, in-agent Ken; the local 4B model, measured on a real
+/// team's vault, left half its extractions unparseable at ~42 s each and
+/// merged near-miss names it should not have.
+const LOCAL_GENERATION: bool = false;
+
+/// One prompt through Claude, from `root`; the error is for a person.
+fn claude_text(root: &Path, prompt: &str) -> Result<String, String> {
+    let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
+    claude_generate(binary, root.to_path_buf())(prompt).map_err(|e| e.to_string())
+}
+
 fn claude_generate(binary: std::path::PathBuf, root: std::path::PathBuf) -> impl FnMut(&str) -> ken_core::Result<String> {
     move |prompt: &str| match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
         ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
@@ -7798,12 +7819,7 @@ fn index_health(state: State<SharedState>) -> CmdResult<IndexHealthDto> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
     let health = active.db.index_health().map_err(err)?;
-    let llm_status = match ken_core::local_llm::llm_status() {
-        ken_core::local_llm::LlmStatus::Ready => "ready",
-        ken_core::local_llm::LlmStatus::NotInstalled => "notInstalled",
-        ken_core::local_llm::LlmStatus::Error(_) => "error",
-    };
-    Ok(IndexHealthDto { health, llm_status: llm_status.into() })
+    Ok(IndexHealthDto { health, llm_status: generator_status().into() })
 }
 
 /// Rebuild the knowledge model now, by hand. Progress arrives as
@@ -7935,12 +7951,35 @@ fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
 /// closure (federation's merge/adjudication/linking passes need a `&self`
 /// value they can hold across the whole build, not a one-shot closure). A
 /// thin unit struct: `complete` carries no state of its own.
-struct AppFederationLlm;
+/// The workspace graph's model: summaries (one call per merged entity) on
+/// the local model; the two batched judgements, which concepts are the same
+/// and how they relate, on Claude when it is installed. The local 4B model
+/// said "same" to most near-miss pairs on a real workspace ("DMA" and "DMA
+/// Analysis", a tool and the agent that uses it).
+struct AppFederationLlm {
+    local: bool,
+    claude: Option<PathBuf>,
+    root: PathBuf,
+}
 
 impl ken_core::federation::FederationLlm for AppFederationLlm {
     fn complete(&self, prompt: &str) -> ken_core::Result<String> {
+        if !self.local {
+            // No local model: the build falls back to the longest summary.
+            return Err(ken_core::Error::Other("no local model".into()));
+        }
         let mut sink = |_: &str| true;
         ken_core::local_llm::generate_stream(prompt, ken_core::local_llm::Priority::Background, &mut sink)
+    }
+
+    fn judge(&self, prompt: &str) -> ken_core::Result<String> {
+        let Some(binary) = &self.claude else {
+            return self.complete(prompt);
+        };
+        match ken_core::assistant::oneshot(binary, &self.root, prompt, Duration::from_secs(300), &CancelToken::new())? {
+            ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+            other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
+        }
     }
 }
 
@@ -8118,7 +8157,12 @@ fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
             ken_core::local_llm::llm_status(),
             ken_core::local_llm::LlmStatus::Ready
         );
-        let federation_llm = AppFederationLlm;
+        let federation_llm = AppFederationLlm {
+            local: LOCAL_GENERATION && llm_ready,
+            claude: ken_core::runner::discover_claude(),
+            root: kg_root.clone(),
+        };
+        let llm_ready = llm_ready || federation_llm.claude.is_some();
         let build = (|| -> ken_core::Result<ken_core::federation::BuildReport> {
             let mut kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&kg_root)?;
             let dbs = member_ids
@@ -9198,12 +9242,7 @@ fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
 
             let prompt = memory::compose_distill_prompt(&window, &existing);
             let _ = bg_app.emit("memory-state", MemoryStateEvent::Distilling);
-            let raw = ken_core::local_llm::generate_stream(
-                &prompt,
-                ken_core::local_llm::Priority::Background,
-                &mut |_tok| true,
-            )
-            .map_err(|e| e.to_string())?;
+            let raw = claude_text(&ws_root, &prompt)?;
 
             let mut candidates = memory::parse_distill_candidates(&raw);
             candidates.retain(|c| {
@@ -10233,12 +10272,7 @@ fn plan_daily_tasks(app: AppHandle, state: State<SharedState>) -> CmdResult<()> 
                 String::new()
             };
             let prompt = compose_daily_prompt(&journal_recent, &recent_activity);
-            let raw = ken_core::local_llm::generate_stream(
-                &prompt,
-                ken_core::local_llm::Priority::Background,
-                &mut |_tok| true,
-            )
-            .map_err(|e| e.to_string())?;
+            let raw = claude_text(&ws_root, &prompt)?;
             Ok(parse_daily_candidates(&raw))
         })();
 
@@ -12418,6 +12452,57 @@ fn stamp_extraction_slot() {
     *extraction_gate().lock().unwrap() = Instant::now() + EXTRACT_PACING;
 }
 
+/// How often the extraction worker asks whether a map build is due.
+const MAP_CHECK: Duration = Duration::from_secs(15);
+
+/// Build the project's map with Claude when the automatic-build policy says
+/// it is due: Claude Code installed, background extraction on, something to
+/// map, and either no map yet or changes since the last one, settled (see
+/// `knowledge_model::should_auto_build`). True while a Claude build of this
+/// project runs, started here or by hand, so the caller holds off.
+fn map_by_claude(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) -> bool {
+    let job = {
+        let guard = state.lock().unwrap();
+        let Some(active) = guard.members.get(&project_id) else {
+            return false;
+        };
+        if active.knowledge_running.load(Ordering::SeqCst) {
+            return true;
+        }
+        if !ken_core::features::effective_flag(&guard.app_settings, &active.project, "backgroundExtraction") {
+            return false;
+        }
+        let Some(binary) = ken_core::runner::discover_claude() else {
+            return false;
+        };
+        KnowledgeBuild {
+            base: guard.base_dir.clone(),
+            project: active.project.clone(),
+            binary,
+            running: active.knowledge_running.clone(),
+            tracker: active.auto_knowledge.clone(),
+            quiet_failure: true,
+            state: state.clone(),
+        }
+    };
+    let Ok(db) = Db::open_read_only(&job.base, project_id) else {
+        return false;
+    };
+    let never_built = db.knowledge_model_built_at().ok().flatten().is_none();
+    let (_, total) = db.extraction_coverage().unwrap_or((0, 0));
+    drop(db);
+    let ctx = knowledge_model::AutoBuildContext {
+        claude_available: true,
+        in_flight: false,
+        indexed_files: usize::try_from(total).unwrap_or(0),
+        never_built,
+    };
+    if !job.tracker.should_build(ctx, Instant::now()) {
+        return false;
+    }
+    start_knowledge_build(app, job)
+}
+
 fn extraction_worker(
     app: AppHandle,
     state: SharedState,
@@ -12435,12 +12520,24 @@ fn extraction_worker(
     // exactly once per recovery — no content edit required.
     let mut was_ready = false;
     let mut requeue_on_next_open = false;
+    let mut last_map_check = Instant::now() - MAP_CHECK;
     while !stop.load(Ordering::SeqCst) {
-        // Pause quietly unless the local model is ready.
-        let ready = matches!(
-            ken_core::local_llm::llm_status(),
-            ken_core::local_llm::LlmStatus::Ready
-        );
+        // The map comes from Claude: one read of the whole project for the
+        // first map, and again once changes have settled (the automatic-build
+        // policy: a quiet window, at most two builds an hour). Minutes, where
+        // the local model took hours file by file and failed half of them.
+        if last_map_check.elapsed() >= MAP_CHECK {
+            last_map_check = Instant::now();
+            if map_by_claude(&app, &state, project_id) {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+        }
+        // The local, per-file path: off by policy (LOCAL_GENERATION), kept
+        // for a build that turns it back on. Pause quietly unless it is on
+        // and the local model is ready.
+        let ready = LOCAL_GENERATION
+            && matches!(ken_core::local_llm::llm_status(), ken_core::local_llm::LlmStatus::Ready);
         if ready && !was_ready {
             // Just became ready (model installed / selection changed / error
             // acknowledged): return any errored rows to pending on the next

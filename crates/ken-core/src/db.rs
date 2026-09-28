@@ -2234,6 +2234,39 @@ impl Db {
         Ok(())
     }
 
+    /// Every file still waiting for extraction (pending or errored), with the
+    /// hash it was queued at.
+    pub fn waiting_extractions(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rel_path, content_hash FROM extractions WHERE status IN ('pending', 'error')")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Mark these queued files done in one transaction, each only while its
+    /// hash still matches (a file edited since stays queued).
+    pub fn settle_extractions(&mut self, rows: &[(String, String)], at: i64) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE extractions SET extracted_at = ?3, status = 'done', error = NULL
+                 WHERE rel_path = ?1 AND content_hash = ?2",
+            )?;
+            for (path, hash) in rows {
+                n += stmt.execute(params![path, hash, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// How many entities the knowledge model holds.
+    pub fn entity_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))?)
+    }
+
     /// Mark a file's extraction `error` and bump its retry counter — but ONLY
     /// while the queued `content_hash` still matches the row (same guard as
     /// `mark_extraction_done`). The worker pops a hash, drops the DB lock for the
@@ -4175,6 +4208,23 @@ mod tests {
         let (entities, _) = db.list_entities_with_edges().unwrap();
         assert!(entities.is_empty());
         assert!(db.list_events().unwrap().is_empty());
+    }
+
+    /// A whole-project build settles the queue it read, but a file edited
+    /// while it ran (a new hash) stays waiting for the per-file worker.
+    #[test]
+    fn a_build_settles_what_it_read_and_nothing_edited_since() {
+        let mut db = Db::open_in_memory().unwrap();
+        for f in ["a.md", "b.md"] {
+            db.upsert_file(f, "md", 1, 1, "indexed", None, "text").unwrap();
+            db.enqueue_extraction_if_changed(f, "h1").unwrap();
+        }
+        let waiting = db.waiting_extractions().unwrap();
+        assert_eq!(waiting.len(), 2);
+        db.enqueue_extraction_if_changed("b.md", "h2").unwrap(); // edited mid-build
+        assert_eq!(db.settle_extractions(&waiting, 5).unwrap(), 1);
+        assert_eq!(db.next_pending_extraction().unwrap(), Some(("b.md".into(), "h2".into())));
+        assert_eq!(db.entity_count().unwrap(), 0);
     }
 
     #[test]

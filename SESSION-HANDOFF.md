@@ -492,6 +492,27 @@ will need their own lines there once decided.
     format but hit a native assert (abort), so it is not in. Claude's
     whole-project model build is the working path meanwhile. Paraphrased
     code questions ("stop people seeing projects…") still miss.
+- **The local model embeds only (2026-09-28, the user's call).** Every
+  generation runs through Claude (in-agent Ken): `LOCAL_GENERATION = false`
+  in `src-tauri/src/lib.rs` gates the local paths (quick answers, profiler
+  refine, journal distill, daily plan, per-file extraction, graph
+  summaries). The map is Claude's whole-project build, automatic again
+  (`map_by_claude`: first map once the first scan settles, a rebuild once
+  changes go quiet, at most two an hour, the `should_auto_build` policy
+  Arthur kept for the manual rebuild when he retired the tick in `e32ee00`).
+  A build settles the per-file queue it covered. Graph judgements (same
+  thing? how related?) go to Claude via `FederationLlm::judge`; summaries
+  take the longest member summary. The UI's model status now means "Claude
+  Code installed" and its notices say how to install it. The local JSON
+  path is fixed anyway: `sample()` already accepts the token, the second
+  `accept` fed the grammar every token twice (the abort); with a JSON
+  grammar (`common` feature) 9 of 9 hard documents parsed.
+- **Benchmark:** `C:\ken-eval` (not in git): 30 questions on the ATT
+  workspace (14 top-1, 21 top-5) and 20 on a Ken/Headway/Ways-of-Working
+  workspace (7, 14). Run `eval_run ask` after any search or graph change.
+  Open: the new wiki's Ways-of-Working template pages rank in the top band
+  and surface in unrelated questions; code questions often get the spec
+  or design doc first.
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)
