@@ -390,6 +390,25 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
     Ok(hits)
 }
 
+/// [`search_member`] keeping only hits of the content types asked for (none
+/// asked for keeps all). It reads five times deeper when filtering, so a
+/// "code only" search in a repo that is mostly docs still fills the page.
+pub fn search_member_of(
+    db: &Db,
+    query: &str,
+    query_vec: Option<&[f32]>,
+    limit: usize,
+    types: &[crate::contenttype::ContentType],
+) -> Result<Vec<HybridHit>> {
+    if types.is_empty() {
+        return search_member(db, query, query_vec, limit);
+    }
+    let mut hits = search_member(db, query, query_vec, limit * 5)?;
+    hits.retain(|h| crate::contenttype::is_wanted(&h.path, types));
+    hits.truncate(limit);
+    Ok(hits)
+}
+
 /// What a page's band adds to its relevance: less than one filename word.
 pub const W_BAND: f64 = 0.75;
 

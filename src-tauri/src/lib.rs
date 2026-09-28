@@ -1813,6 +1813,9 @@ struct WorkspaceOverviewDto {
 struct AllProjectsHitDto {
     project_id: String,
     member_name: String,
+    /// What the file is for: code, test, spec, doc, config, data, design,
+    /// meeting or ticket (`contenttype::of`).
+    content_type: &'static str,
     #[serde(flatten)]
     hit: SearchHit,
 }
@@ -2594,6 +2597,7 @@ fn adapt_route_search_to_all_projects(
                 .as_str()
                 .to_string();
             AllProjectsHitDto {
+                content_type: ken_core::contenttype::of(&hit.path).as_str(),
                 project_id: hit.project_id,
                 member_name: hit.member_name,
                 hit: SearchHit {
@@ -2653,8 +2657,10 @@ async fn search_all_projects(
     query: String,
     limit: Option<usize>,
     audience: Option<String>,
+    types: Option<String>,
 ) -> CmdResult<SearchAllProjectsDto> {
     let limit = limit.unwrap_or(30);
+    let wanted = ken_core::contenttype::parse_filter(types.as_deref());
 
     let routed = {
         let guard = state.lock().unwrap();
@@ -2692,7 +2698,7 @@ async fn search_all_projects(
                 .collect()
         };
         // No scope: this caller is the all-projects search by definition.
-        let dto = route_search(app, state, query, Some(limit), None, None, audience).await?;
+        let dto = route_search(app, state, query, Some(limit), None, None, audience, types).await?;
         return Ok(adapt_route_search_to_all_projects(dto, manifest_extras));
     }
 
@@ -2768,13 +2774,16 @@ async fn search_all_projects(
                     .map(|(pid, name, db)| {
                         let q = &q;
                         let audience = audience.as_deref();
+                        let wanted = &wanted;
                         s.spawn(move || {
                             let db = db.lock().unwrap();
-                            let filtered = audience.is_some_and(|a| !a.is_empty() && a != "any");
-                            let mut hits = db.search(q, if filtered { limit * 3 } else { limit }).unwrap_or_default();
-                            if filtered {
+                            let by_reader = audience.is_some_and(|a| !a.is_empty() && a != "any");
+                            let fetch = if !wanted.is_empty() { limit * 5 } else if by_reader { limit * 3 } else { limit };
+                            let mut hits = db.search(q, fetch).unwrap_or_default();
+                            if by_reader || !wanted.is_empty() {
                                 hits.retain(|h| {
-                                    ken_core::pagemeta::suits(audience, ken_core::pagemeta::audience_at(&db, &h.rel_path))
+                                    ken_core::contenttype::is_wanted(&h.rel_path, wanted)
+                                        && ken_core::pagemeta::suits(audience, ken_core::pagemeta::audience_at(&db, &h.rel_path))
                                 });
                                 hits.truncate(limit);
                             }
@@ -2796,6 +2805,7 @@ async fn search_all_projects(
         for (pid, name, hits) in &per_member {
             if let Some(hit) = hits.get(i) {
                 results.push(AllProjectsHitDto {
+                    content_type: ken_core::contenttype::of(&hit.rel_path).as_str(),
                     project_id: pid.clone(),
                     member_name: name.clone(),
                     hit: hit.clone(),
@@ -3126,6 +3136,8 @@ struct HybridSearchHitDto {
     line: Option<i64>,
     /// For a Markdown page: section, freshness, retired or generated.
     page: Option<ken_core::pagemeta::HitPage>,
+    /// What the file is for (`contenttype::of`).
+    content_type: &'static str,
 }
 
 /// Chunk-level hybrid (keyword + semantic) search (semantic-index task 2.2).
@@ -3146,8 +3158,10 @@ async fn hybrid_search(
     query: String,
     limit: Option<usize>,
     audience: Option<String>,
+    types: Option<String>,
 ) -> CmdResult<Vec<HybridSearchHitDto>> {
     let limit = limit.unwrap_or(30);
+    let wanted = ken_core::contenttype::parse_filter(types.as_deref());
     let (search_db, semantic_on, embedder_slot) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
@@ -3179,7 +3193,7 @@ async fn hybrid_search(
         // reading further down the ranking so a filter still fills the page.
         let filtered = audience.as_deref().is_some_and(|a| !a.is_empty() && a != "any");
         let fetch = if filtered { limit * 3 } else { limit };
-        let mut merged = ken_core::routing::search_member(&db, &query, query_vec.as_deref(), fetch).map_err(err)?;
+        let mut merged = ken_core::routing::search_member_of(&db, &query, query_vec.as_deref(), fetch, &wanted).map_err(err)?;
         merged.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
         merged.truncate(limit);
         let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
@@ -3189,6 +3203,7 @@ async fn hybrid_search(
             .into_iter()
             .map(|h| {
                 let tier = tiers.get(&h.chunk_id).copied();
+                let content_type = ken_core::contenttype::of(&h.path).as_str();
                 let source = match h.source {
                     hybrid_search_mod::Source::Keyword => "keyword",
                     hybrid_search_mod::Source::Semantic => "semantic",
@@ -3201,6 +3216,7 @@ async fn hybrid_search(
                     source,
                     tier,
                     line: h.line,
+                    content_type,
                     page: h.page,
                 }
             })
@@ -8583,6 +8599,8 @@ struct RoutedHitDto {
     /// unless the plan's reason was `KgEntities` (routing.rs module doc: "KG
     /// breadcrumbs are plan-level, not per-hit").
     kg_breadcrumbs: Vec<String>,
+    /// What the file is for (`contenttype::of`).
+    content_type: &'static str,
 }
 
 impl From<routing::RoutedHit> for RoutedHitDto {
@@ -8593,6 +8611,7 @@ impl From<routing::RoutedHit> for RoutedHitDto {
             hybrid_search_mod::Source::Both => "both",
         };
         RoutedHitDto {
+            content_type: ken_core::contenttype::of(&h.path).as_str(),
             path: h.path,
             chunk_id: h.chunk_id,
             snippet: h.snippet,
@@ -8740,8 +8759,10 @@ async fn route_search(
     scope: Option<uuid::Uuid>,
     group: Option<String>,
     audience: Option<String>,
+    types: Option<String>,
 ) -> CmdResult<RouteSearchDto> {
     let limit = limit.unwrap_or(30);
+    let wanted = ken_core::contenttype::parse_filter(types.as_deref());
     // Item 2b: a reader chosen (business, dev) reads further down each
     // member's ranking so the filter still fills the page.
     let filtered = audience.as_deref().is_some_and(|a| !a.is_empty() && a != "any");
@@ -8957,6 +8978,7 @@ async fn route_search(
         let counter = done_counter.clone();
         let ev_app = app.clone();
         let audience = audience.clone();
+        let wanted = wanted.clone();
         handles.push(tauri::async_runtime::spawn_blocking(
             move || -> routing::MemberHits {
                 let result = if let Some(db) = db {
@@ -8969,7 +8991,7 @@ async fn route_search(
                         }
                     } else {
                         let db = db.lock().unwrap();
-                        match routing::search_member(&db, &query, query_vec.as_deref(), fetch) {
+                        match routing::search_member_of(&db, &query, query_vec.as_deref(), fetch, &wanted) {
                             Ok(mut hits) => routing::MemberHits {
                                 hits: {
                                     hits.retain(|h| {

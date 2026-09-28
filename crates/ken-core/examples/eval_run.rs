@@ -448,10 +448,22 @@ fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
 
         // Hybrid (as the app with meaning search on) and keyword-only.
         let t = Instant::now();
-        let hybrid = match emb.as_mut() {
-            Some(e) => routing::execute_plan(&plan, &handles, e.as_mut(), q, 8),
-            None => routing::execute_plan(&plan, &handles, &mut ken_core::embedder::FakeEmbedder::new(), q, 8),
-        };
+        // As the app's routed search: each target searched (kept to the kinds
+        // in KEN_EVAL_TYPES, if set), then merged by relevance.
+        let types = ken_core::contenttype::parse_filter(std::env::var("KEN_EVAL_TYPES").ok().as_deref());
+        let query_vec = emb.as_mut().and_then(|e| e.embed_query(q).ok());
+        let member_hits: Vec<routing::MemberHits> = plan
+            .targets
+            .iter()
+            .filter_map(|id| handles.iter().find(|h| h.project_id == *id))
+            .map(|h| routing::MemberHits {
+                project_id: h.project_id,
+                member_name: h.name.to_string(),
+                status: routing::MemberStatus::Searched,
+                hits: routing::search_member_of(h.db, q, query_vec.as_deref(), 8, &types).unwrap_or_default(),
+            })
+            .collect();
+        let hybrid = routing::merge_routed(&plan, &member_hits, 8);
         let ms_h = t.elapsed().as_millis();
         let keyword: Vec<MemberHitsLite> = plan
             .targets

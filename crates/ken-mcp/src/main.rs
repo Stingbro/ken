@@ -235,6 +235,7 @@ match; the last word may be a prefix.",
                     "query": { "type": "string", "description": "Search terms." },
                     "limit": { "type": "integer", "description": "Maximum hits to return (default 20)." },
                     "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
+                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                     "project": project_arg
                 },
                 "required": ["query"]
@@ -314,6 +315,7 @@ maturity. Hits carry ken:// addresses.",
                     "query": { "type": "string", "description": "Search terms." },
                     "limit": { "type": "integer", "description": "Maximum hits to return (default 20)." },
                     "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
+                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                     "project": project_arg
                 },
                 "required": ["query"]
@@ -335,6 +337,7 @@ picked the target when the knowledge graph did the routing.",
                     "query": { "type": "string", "description": "Search terms — also matched against project names for direct routing." },
                     "limit": { "type": "integer", "description": "Maximum merged hits to return (default 20)." },
                     "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
+                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                 },
                 "required": ["query"]
             }
@@ -890,10 +893,14 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
             let (project, note) = resolve_project(server, args)?;
             let db = open_index(server, &project)?;
             let audience = audience_arg(args);
+            let types = types_arg(args);
             let mut hits = db
-                .search(&query, fetch_for(audience.as_deref(), limit))
+                .search(&query, fetch_for(audience.as_deref(), &types, limit))
                 .map_err(|e| format!("search failed: {e}"))?;
-            hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), ken_core::pagemeta::audience_at(&db, &h.rel_path)));
+            hits.retain(|h| {
+                ken_core::contenttype::is_wanted(&h.rel_path, &types)
+                    && ken_core::pagemeta::suits(audience.as_deref(), ken_core::pagemeta::audience_at(&db, &h.rel_path))
+            });
             hits.truncate(limit);
             let mut out = note.unwrap_or_default();
             if hits.is_empty() {
@@ -912,8 +919,9 @@ different words — all terms must match.",
                 for (i, hit) in hits.iter().enumerate() {
                     let snippet = hit.snippet.replace("<mark>", "**").replace("</mark>", "**");
                     out.push_str(&format!(
-                        "\n{}. {} ({}) — {}",
+                        "\n{}. {} {} ({}) — {}",
                         i + 1,
+                        kind_tag(&hit.rel_path),
                         hit.rel_path,
                         ken_address(project.config.id, &hit.rel_path),
                         snippet
@@ -1159,7 +1167,8 @@ which is off. Use search_knowledge instead."
     let (project, note) = resolve_project(server, args)?;
     let db = open_index(server, &project)?;
     let audience = audience_arg(args);
-    let mut hits = routing::search_member(&db, &query, None, fetch_for(audience.as_deref(), limit))
+    let types = types_arg(args);
+    let mut hits = routing::search_member_of(&db, &query, None, fetch_for(audience.as_deref(), &types, limit), &types)
         .map_err(|e| format!("search failed: {e}"))?;
     hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
     hits.truncate(limit);
@@ -1179,8 +1188,9 @@ this server has no query embedding model; see the tool description):\n",
         ));
         for (i, hit) in hits.iter().enumerate() {
             out.push_str(&format!(
-                "\n{}. {}{} [{}] {} — {}",
+                "\n{}. {} {}{} [{}] {} — {}",
                 i + 1,
+                kind_tag(&hit.path),
                 ken_address(project.config.id, &hit.path),
                 hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
                 source_label(hit.source),
@@ -1209,13 +1219,26 @@ fn audience_arg(args: &Value) -> Option<String> {
     args.get("audience").and_then(|a| a.as_str()).map(str::to_string).filter(|a| !a.is_empty() && a != "any")
 }
 
-/// Hits to read before filtering by audience, so a filter still fills the page.
-fn fetch_for(audience: Option<&str>, limit: usize) -> usize {
-    if audience.is_some() {
+/// The kinds of file a search keeps (`type`: "code", "spec,doc"); empty keeps all.
+fn types_arg(args: &Value) -> Vec<ken_core::contenttype::ContentType> {
+    ken_core::contenttype::parse_filter(args.get("type").and_then(|t| t.as_str()))
+}
+
+/// Hits to read before filtering by audience or kind, so a filter still
+/// fills the page.
+fn fetch_for(audience: Option<&str>, types: &[ken_core::contenttype::ContentType], limit: usize) -> usize {
+    if !types.is_empty() {
+        limit * 5
+    } else if audience.is_some() {
         limit * 3
     } else {
         limit
     }
+}
+
+/// A hit's kind as its tag in a result line: `[code]`.
+fn kind_tag(path: &str) -> String {
+    format!("[{}]", ken_core::contenttype::of(path).as_str())
 }
 
 fn route_query(server: &Server, args: &Value) -> Result<String, String> {
@@ -1279,6 +1302,7 @@ folder in the Ken app first."
         .flatten();
     let plan = routing::plan_route(&query, &members, kg.as_ref());
     let audience = audience_arg(args);
+    let types = types_arg(args);
 
     let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
     for &project_id in &plan.targets {
@@ -1325,7 +1349,7 @@ folder in the Ken app first."
             });
             continue;
         };
-        match routing::search_member(db, &query, None, fetch_for(audience.as_deref(), limit)) {
+        match routing::search_member_of(db, &query, None, fetch_for(audience.as_deref(), &types, limit), &types) {
             Ok(mut hits) => member_hits.push(MemberHits {
                 hits: {
                     hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
@@ -1390,8 +1414,9 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
     for (i, hit) in report.results.iter().enumerate() {
         // The locator is what to cite; the ken:// address is what to open.
         out.push_str(&format!(
-            "\n{}. {} ({}{}) [{}] — {}",
+            "\n{}. {} {} ({}{}) [{}] — {}",
             i + 1,
+            kind_tag(&hit.path),
             hit.locator,
             hit.address,
             hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
@@ -3822,6 +3847,18 @@ mod tests {
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
         }
+    }
+
+    #[test]
+    fn hits_are_tagged_by_kind_and_a_kind_filter_keeps_only_that() {
+        let mut fx = fixture(true);
+        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("[meeting] notes/meeting.md"), "a meeting note tagged: {text}");
+        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "type": "code"}));
+        assert!(!text.contains("notes/meeting.md"), "code only: {text}");
+        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "type": "meeting,doc"}));
+        assert!(text.contains("notes/meeting.md"), "{text}");
     }
 
     #[test]

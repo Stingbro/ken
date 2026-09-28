@@ -4,6 +4,8 @@
   import {
     api,
     type Audience,
+    type ContentType,
+    type KindFilter,
     type QuickAnswer,
     type HybridHit,
     type RoutePlan,
@@ -67,6 +69,8 @@
     projectId: string | null;
     memberName: string | null;
     kgBreadcrumbs: string[];
+    /** What the file is for: code, spec, doc, … */
+    contentType: ContentType | null;
   }
 
   let results = $state<DisplayHit[]>([]);
@@ -207,6 +211,7 @@
       projectId: null,
       memberName: null,
       kgBreadcrumbs: [],
+      contentType: h.contentType,
     }));
   }
 
@@ -227,7 +232,7 @@
         // project chosen on Home); `pinnedMember` is the overlay's own
         // in-place narrowing for a single query.
         const res = await api
-          .routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, audience)
+          .routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, audience, kinds)
           .catch(() => null);
         if (q !== query.trim() || !res) return; // stale or failed
         routedPlan = res.plan;
@@ -246,10 +251,11 @@
           projectId: h.projectId,
           memberName: h.memberName,
           kgBreadcrumbs: h.kgBreadcrumbs,
+          contentType: h.contentType,
         }));
       } else {
         routedPlan = null;
-        const res = await api.searchAllProjects(q, 30, audience).catch(() => null);
+        const res = await api.searchAllProjects(q, 30, audience, kinds).catch(() => null);
         if (q !== query.trim() || !res) return;
         coverageNotes = res.memberStatus
           .filter((s) => s.status !== "searched")
@@ -263,6 +269,7 @@
           projectId: h.projectId,
           memberName: h.memberName,
           kgBreadcrumbs: [],
+          contentType: h.contentType,
         }));
       }
       searched = true;
@@ -274,7 +281,7 @@
     // toggle existed.
     routedPlan = null;
     coverageNotes = [];
-    const found = await api.hybridSearch(q, 30, audience);
+    const found = await api.hybridSearch(q, 30, audience, kinds);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
     results = fromHybrid(found);
@@ -287,6 +294,20 @@
   // `audience: business`). Developers: everything else but the method's
   // own pages, code included. Any: everything.
   let audience = $state<Audience>(null);
+  // What kind of file to keep: all, or one kind. Every hit shows its kind.
+  let kinds = $state<KindFilter>(null);
+  const KINDS: { v: KindFilter; label: string }[] = [
+    { v: null, label: "Any kind" },
+    { v: "code", label: "Code" },
+    { v: "test", label: "Tests" },
+    { v: "spec", label: "Specs" },
+    { v: "doc", label: "Docs" },
+    { v: "meeting", label: "Meetings" },
+    { v: "ticket", label: "Tickets" },
+    { v: "config", label: "Config" },
+    { v: "data", label: "Data" },
+    { v: "design", label: "Design" },
+  ];
   const READERS: { v: Audience; label: string; title: string }[] = [
     { v: null, label: "Any reader", title: "Everything" },
     { v: "business", label: "Business readers", title: "Only pages written for people who never read code: Current, Design, Work" },
@@ -409,6 +430,19 @@
         {opt.label}
       </button>
     {/each}
+    <select
+      class="kind-select"
+      aria-label="What kind of file"
+      value={kinds ?? ""}
+      onchange={(e) => {
+        kinds = (e.currentTarget as HTMLSelectElement).value || null;
+        void run();
+      }}
+    >
+      {#each KINDS as k (k.label)}
+        <option value={k.v ?? ""}>{k.label}</option>
+      {/each}
+    </select>
   </div>
 
   {#if answer}
@@ -482,6 +516,9 @@
             <span class="meta">
               <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
               <span class="path mono" title={hit.path}>{hit.path.split("/").pop() || hit.path}</span>
+              {#if hit.contentType}
+                <span class="tag tag-kind" title="What this file is">{hit.contentType}</span>
+              {/if}
               {#if hit.memberName}
                 <span class="tag tag-member" title={hit.path}>{hit.memberName}</span>
               {/if}
@@ -719,6 +756,18 @@
   .tag-semantic {
     color: var(--accent);
     background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  .tag-kind {
+    color: var(--ink-tertiary);
+  }
+  .kind-select {
+    margin-left: auto;
+    font-size: 11.5px;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--ink-secondary);
   }
   .tag-member {
     color: var(--ink-secondary);

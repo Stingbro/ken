@@ -8,6 +8,7 @@ pub mod bg_hydrate;
 pub mod chat;
 pub mod chunker;
 pub mod cloud;
+pub mod contenttype;
 pub mod db;
 pub mod digest;
 pub mod drawio;

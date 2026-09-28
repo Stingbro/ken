@@ -259,6 +259,19 @@ keyword index over sections.
 - [ ] Nothing was pushed anywhere: `git -C "<test folder>\Realms-Wiki" remote`
   prints nothing.
 
+## 14a. Every hit says what kind of file it is
+
+- [ ] Search anything: each result shows its kind (code, test, spec, doc,
+  config, data, design, meeting, ticket) beside the file name, in project,
+  all-projects and routed search alike.
+- [ ] Choose "Code" in the kind menu: only code is left, and a question
+  whose answer is in code ("how are tokens validated") now puts the code
+  first rather than the spec describing it. "Specs" and "Tickets" do the
+  same for theirs; "Any kind" brings everything back.
+- [ ] The kind menu and the reader chips combine (Developers + Code).
+- [ ] In chat, ask Claude to "search only specs for …": its Ken search
+  results carry `[spec]` tags and nothing else.
+
 ## 14b. The map comes from Claude (needs Claude)
 
 - [ ] With no on-device language model installed (only the embedding

@@ -116,6 +116,12 @@ export interface DriftRun {
 /** Who a search is for (item 2b); null is any reader. */
 export type Audience = "business" | "dev" | null;
 
+/** What a file is for (`contenttype::of`); every search hit carries one. */
+export type ContentType = "code" | "test" | "spec" | "doc" | "config" | "data" | "design" | "meeting" | "ticket";
+
+/** A search's kind filter: one kind, several comma-separated, or null for all. */
+export type KindFilter = string | null;
+
 /** What a repo is for; decides sync and how deep Ken reads it. */
 export type RepoKind = "team" | "wiki" | "code" | "reference";
 
@@ -159,6 +165,7 @@ export interface SearchHit {
  *  `0` = full, `1` = search-only, `null` = unexpected lookup failure (treat
  *  as no badge, same as `0`). */
 export interface HybridHit {
+  contentType: ContentType;
   path: string;
   chunkId: number;
   snippet: string;
@@ -1003,6 +1010,7 @@ export type MemberStatusEvent =
 export interface AllProjectsHit extends SearchHit {
   projectId: string;
   memberName: string;
+  contentType: ContentType;
 }
 
 export type AllProjectsMemberSearchStatus =
@@ -1049,6 +1057,7 @@ export interface RoutePlan {
  *  comment on `RoutedHitDto`), empty unless the plan's reason was
  *  `kgEntities`. */
 export interface RoutedHit {
+  contentType: ContentType;
   path: string;
   chunkId: number;
   snippet: string;
@@ -1859,8 +1868,8 @@ export const api = {
    *  BM25 scores aren't comparable across corpora). Requires `workspace`;
    *  upgrades to `routeSearch` when `kgRouting` is also on (kg-routing
    *  proposal: "same UI slot, richer results"). */
-  searchAllProjects: (query: string, limit = 30, audience: Audience = null) =>
-    invoke<SearchAllProjectsResult>("search_all_projects", { query, limit, audience }),
+  searchAllProjects: (query: string, limit = 30, audience: Audience = null, types: KindFilter = null) =>
+    invoke<SearchAllProjectsResult>("search_all_projects", { query, limit, audience, types }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
   renameProject: (id: string, name: string) =>
     invoke<ProjectInfo>("rename_project", { id, name }),
@@ -1881,8 +1890,8 @@ export const api = {
   /** `audience` "business" keeps only pages written for readers who never
    *  see code (Current, Design, Work, or `audience: business`); "dev" keeps
    *  everything else but the method pages, code included; null is any. */
-  hybridSearch: (query: string, limit = 30, audience: Audience = null) =>
-    invoke<HybridHit[]>("hybrid_search", { query, limit, audience }),
+  hybridSearch: (query: string, limit = 30, audience: Audience = null, types: KindFilter = null) =>
+    invoke<HybridHit[]>("hybrid_search", { query, limit, audience, types }),
   /** Route `query` across every open workspace member (kg-routing task 4.1):
    *  plan (Named/KG-guided/Broadcast), fan out hybrid search over the
    *  targets, merge with cross-member RRF, and return cited `ken://`/
@@ -1894,6 +1903,7 @@ export const api = {
     scope?: string | null,
     group?: string | null,
     audience: Audience = null,
+    types: KindFilter = null,
   ) =>
     invoke<RouteSearchResult>("route_search", {
       query,
@@ -1901,6 +1911,7 @@ export const api = {
       scope: scope ?? null,
       group: group ?? null,
       audience,
+      types,
     }),
   /** Named groups of members, stored in the workspace manifest. */
   workspaceGroups: () => invoke<ProjectGroup[]>("workspace_groups"),
