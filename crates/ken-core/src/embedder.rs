@@ -119,6 +119,7 @@ mod llama {
     use super::{l2_normalize, Embedder};
     use crate::{Error, Result};
     use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+    use llama_cpp_2::context::LlamaContext;
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
@@ -163,10 +164,25 @@ mod llama {
             })
         }
 
+        /// An embedding context: pooled output, no generation. n_batch and
+        /// n_ubatch are held equal (coordinator constraint) so a whole
+        /// sequence is embedded in a single pooled pass. Making one allocates
+        /// the compute buffers on the GPU, so a batch of texts shares one.
+        fn context(&self) -> Result<LlamaContext<'_>> {
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(N_CTX))
+                .with_n_batch(N_CTX)
+                .with_n_ubatch(N_CTX)
+                .with_embeddings(true)
+                .with_pooling_type(LlamaPoolingType::Mean);
+            self.model
+                .new_context(self.backend, ctx_params)
+                .map_err(|e| Error::Other(format!("couldn't create embedding context: {e}")))
+        }
+
         /// Embed one already-prefixed string into a mean-pooled, L2-normalized
-        /// vector. A fresh context is used per call so state never leaks
-        /// between inputs.
-        fn embed_prefixed(&self, text: &str) -> Result<Vec<f32>> {
+        /// vector in `ctx`, cleared first so state never leaks between inputs.
+        fn embed_prefixed(&self, ctx: &mut LlamaContext<'_>, text: &str) -> Result<Vec<f32>> {
             // The tokenizer takes a C string: a NUL (binary-ish text from a
             // PDF or a data file) would end it, so it is refused outright.
             let text = text.replace('\0', " ");
@@ -183,20 +199,7 @@ mod llama {
             // the first such chunk. Keyword search still sees all of it.
             tokens.truncate(N_CTX as usize);
 
-            // Embedding context: pooled output, no generation. n_batch and
-            // n_ubatch are held equal (coordinator constraint) so the whole
-            // sequence is embedded in a single pooled pass.
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(N_CTX))
-                .with_n_batch(N_CTX)
-                .with_n_ubatch(N_CTX)
-                .with_embeddings(true)
-                .with_pooling_type(LlamaPoolingType::Mean);
-            let mut ctx = self
-                .model
-                .new_context(self.backend, ctx_params)
-                .map_err(|e| Error::Other(format!("couldn't create embedding context: {e}")))?;
-
+            ctx.clear_kv_cache();
             let mut batch = LlamaBatch::new(tokens.len(), 1);
             // logits_all = true so every token's output is enabled, ensuring
             // mean pooling sees the whole sequence.
@@ -216,15 +219,17 @@ mod llama {
 
         /// Embed a query (the `search_query:` side of nomic-embed-text).
         pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-            self.embed_prefixed(&format!("search_query: {text}"))
+            let mut ctx = self.context()?;
+            self.embed_prefixed(&mut ctx, &format!("search_query: {text}"))
         }
     }
 
     impl Embedder for LlamaEmbedder {
         fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let mut ctx = self.context()?;
             texts
                 .iter()
-                .map(|t| self.embed_prefixed(&format!("search_document: {t}")))
+                .map(|t| self.embed_prefixed(&mut ctx, &format!("search_document: {t}")))
                 .collect()
         }
 
@@ -342,5 +347,12 @@ mod tests {
         assert_eq!(q.len(), dim);
         let qnorm: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((qnorm - 1.0).abs() < 1e-3, "query vector not normalized: norm was {qnorm}");
+        // A batch shares one context; a text in it embeds as it does alone.
+        let long = "a much longer passage about invoices, payment terms and the ledger ".repeat(20);
+        let batch = e
+            .embed(&[long, "the quick brown fox".to_string()])
+            .expect("embed batch");
+        let drift: f32 = batch[1].iter().zip(&out[0]).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(drift < 1e-3, "the second text in a batch differs from it alone by {drift}");
     }
 }
