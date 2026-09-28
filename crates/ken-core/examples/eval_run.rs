@@ -77,6 +77,12 @@ fn main() {
         "status" => phase_status(&base, &parent),
         "sql" => phase_sql(&base, &parent, &args[2], &args[3]),
         "model" => phase_model(&base, &parent, &args[2]),
+        "imports" => {
+            let t = Instant::now();
+            let deps = wikidraft::folder_imports(&parent.join(&args[2]));
+            println!("# Imports between folders in `{}`\n\n```\n{}\n```\n\n_{:.1}s_", args[2], deps.as_deref().unwrap_or("(none)"), t.elapsed().as_secs_f64());
+            Ok(())
+        }
         other => Err(Error::Other(format!("unknown phase {other}"))),
     };
     match out {

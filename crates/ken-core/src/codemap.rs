@@ -455,7 +455,8 @@ pub fn resolve_import(from: &str, target: &str, files: &[String]) -> Option<Stri
         let tail = segs[..take].join("/");
         for e in exts {
             for suffix in [format!("{tail}.{e}"), format!("{tail}/mod.{e}"), format!("{tail}/__init__.{e}"), format!("{tail}/index.{e}")] {
-                let hit: Vec<&String> = files.iter().filter(|f| *f == &suffix || f.ends_with(&format!("/{suffix}"))).collect();
+                let slashed = format!("/{suffix}");
+                let hit: Vec<&String> = files.iter().filter(|f| *f == &suffix || f.ends_with(&slashed)).collect();
                 if let [only] = hit.as_slice() {
                     return Some((*only).clone());
                 }

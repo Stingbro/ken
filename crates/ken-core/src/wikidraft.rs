@@ -127,6 +127,44 @@ fn git_authors(root: &Path) -> Option<String> {
     (out.status.success() && !top.is_empty()).then(|| top.join("\n"))
 }
 
+/// Which folders' code imports which, from the code itself: one line per
+/// pair, `from -> to (imports)`, most first. What a layer may call, as the
+/// code has it, for a repo whose docs never say. None for a repo with no
+/// mapped code.
+pub fn folder_imports(root: &Path) -> Option<String> {
+    let mut cmd = Command::new("git");
+    let out = crate::proc::quiet(&mut cmd).args(["ls-files", "-z"]).current_dir(root).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let files: Vec<String> =
+        String::from_utf8_lossy(&out.stdout).split('\0').filter(|f| !f.is_empty()).map(str::to_string).collect();
+    // A folder is named by up to its first four segments, deep enough to
+    // tell `backend/app/api` from `backend/app/services`.
+    let folder = |p: &str| p.rsplit_once('/').map_or(".", |(d, _)| d).split('/').take(4).collect::<Vec<_>>().join("/");
+    let mut edges: HashMap<(String, String), usize> = HashMap::new();
+    for rel in &files {
+        let Some(lang) = crate::codemap::Lang::of(rel) else { continue };
+        let Ok(text) = fs::read_to_string(root.join(rel)) else { continue };
+        if text.len() > 1_000_000 {
+            continue;
+        }
+        for target in crate::codemap::imports_of(lang, &text) {
+            let Some(to) = crate::codemap::resolve_import(rel, &target, &files) else { continue };
+            let (a, b) = (folder(rel), folder(&to));
+            if a != b {
+                *edges.entry((a, b)).or_default() += 1;
+            }
+        }
+    }
+    if edges.is_empty() {
+        return None;
+    }
+    let mut rows: Vec<_> = edges.into_iter().collect();
+    rows.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    Some(rows.into_iter().take(80).map(|((a, b), n)| format!("{a} -> {b} ({n})")).collect::<Vec<_>>().join("\n"))
+}
+
 //// Characters of source text read from one repo for its Repo Map page, so
 /// every repo gets its own budget however many the team has.
 const REPO_BUDGET: usize = 60_000;
@@ -156,6 +194,12 @@ pub fn gather_repo(name: &str, root: &Path) -> Vec<Source> {
             push(format!("{name}:{f}"), t, &mut out);
         }
     }
+    // The shape of the repo before its long docs, so a documentation-heavy
+    // repo cannot crowd it out of the budget.
+    push(format!("{name}:(layout)"), layout(root), &mut out);
+    if let Some(d) = folder_imports(root) {
+        push(format!("{name}:(imports between folders, from the code)"), d, &mut out);
+    }
     for dir in ["docs", "doc", "documentation"] {
         let mut docs: Vec<PathBuf> = fs::read_dir(root.join(dir))
             .into_iter()
@@ -172,7 +216,6 @@ pub fn gather_repo(name: &str, root: &Path) -> Vec<Source> {
             }
         }
     }
-    push(format!("{name}:(layout)"), layout(root), &mut out);
     for f in ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"] {
         if let Ok(t) = fs::read_to_string(root.join(f)) {
             push(format!("{name}:{f}"), t, &mut out);
@@ -493,7 +536,8 @@ pub fn draft(
 pub const REPO_MAP: &str = "Repo-Map";
 
 const REPO_PURPOSE: &str = "one repo's page in the Repo Map: what the repo is for (the team's own description first), \
-    what lives where in it (its layout and entry points), who owns it and who commits, how it is built and released, \
+    what lives where in it (its layout and entry points), which of its folders call which (from the imports between folders), \
+    who owns it and who commits, how it is built and released, \
     and how it connects to the team's other repos";
 
 /// A repo's page in the wiki: `Repo-Map/<name>.md`.
@@ -987,6 +1031,31 @@ mod tests {
         assert!(fs::read_to_string(wiki.path().join("Conventions/ARCHITECTURE.md")).unwrap().contains("status: draft"));
         let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
         assert!(body.contains("Left alone") && body.contains("Current/Team.md"));
+    }
+
+    #[test]
+    fn the_draft_reads_which_folders_call_which_from_the_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (p, t) in [
+            ("app/api/users.py", "from app.services.users import find\n\ndef route():\n    return find()\n"),
+            ("app/api/teams.py", "from app.services.users import find\nfrom app.services import teams\n"),
+            ("app/services/users.py", "from app.db.repo import load\n\ndef find():\n    return load()\n"),
+            ("app/services/teams.py", "def list_teams():\n    return []\n"),
+            ("app/services/__init__.py", ""),
+            ("app/db/repo.py", "def load():\n    return 1\n"),
+            ("README.md", "# App\n"),
+        ] {
+            fs::create_dir_all(root.join(p).parent().unwrap()).unwrap();
+            fs::write(root.join(p), t).unwrap();
+        }
+        let git = |args: &[&str]| assert!(Command::new("git").args(args).current_dir(root).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        let deps = folder_imports(root).expect("imports between folders");
+        assert_eq!(deps, "app/api -> app/services (3)\napp/services -> app/db (1)");
+        let labels: Vec<String> = gather_repo("app", root).into_iter().map(|s| s.label).collect();
+        assert!(labels.contains(&"app:(imports between folders, from the code)".to_string()), "{labels:?}");
     }
 
     #[test]
