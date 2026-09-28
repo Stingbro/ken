@@ -221,10 +221,27 @@ impl Project {
     /// "user rule set" tier in D2's precedence order; callers combine it with
     /// any built-in rule sets (task 1.3) via `kenignore::classify`'s
     /// `rule_sets` slice, user rules last so they can override built-ins.
+    ///
+    /// A workspace member also takes the lines of its workspace's own
+    /// `.kenignore` (the one setup writes, beside `.ken-workspace/`) that
+    /// reach inside it: `member/path` lines, and patterns with no folder in
+    /// them (`*.log`). They come first, so the member's own file overrides.
     pub fn kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
         let path = self.root.join(".kenignore");
         let text = fs::read_to_string(&path).unwrap_or_default();
-        crate::kenignore::parse(&text)
+        let mut rules = self.workspace_kenignore_rules();
+        rules.extend(crate::kenignore::parse(&text));
+        rules
+    }
+
+    fn workspace_kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
+        let Some(ws) = self.root.ancestors().skip(1).take(3).find(|a| a.join(crate::workspace::CONFIG_DIR).is_dir()) else {
+            return Vec::new();
+        };
+        let Ok(text) = fs::read_to_string(ws.join(".kenignore")) else { return Vec::new() };
+        let Ok(member) = self.root.strip_prefix(ws) else { return Vec::new() };
+        let member = member.to_string_lossy().replace('\\', "/");
+        crate::kenignore::parse(&crate::kenignore::lines_for_member(&text, &member))
     }
 
     /// Rename the project, rewriting `.ken/project.json`. The invalid-name

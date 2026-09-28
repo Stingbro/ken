@@ -73,6 +73,10 @@ pub struct HybridHit {
     /// For a Markdown page: its section, freshness and whether it is still
     /// current (`pagemeta::hit_page`). Filled with `line`.
     pub page: Option<crate::pagemeta::HitPage>,
+    /// How well it answers the query ([`rerank`]'s score, then the page
+    /// band's adjustment): the same scale in every member, so hits from
+    /// different repos merge by relevance rather than by repo.
+    pub score: f64,
 }
 
 /// Merge FTS and KNN chunk hits per B4 "FTS-priority fill": FTS hits fill
@@ -107,6 +111,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             source,
             line: None,
             page: None,
+            score: 0.0,
         });
     }
 
@@ -124,6 +129,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             source: Source::Semantic,
             line: None,
             page: None,
+            score: 0.0,
         });
     }
 
@@ -178,6 +184,14 @@ const W_SEMANTIC: f64 = 1.5;
 /// precision prior, deliberately smaller than a single filename-token match.
 const W_AGREEMENT: f64 = 0.75;
 
+/// Cosine similarity from a `vec0` distance, in `[0, 1]`. `vec0` reports L2
+/// distance, and the vectors are unit length, so similarity is `1 - d²/2`;
+/// reading the distance as `1 - d` put a good match (d ≈ 0.8, similarity
+/// 0.68) near zero, and meaning barely counted in the rerank.
+pub fn similarity(distance: f64) -> f64 {
+    (1.0 - distance * distance / 2.0).clamp(0.0, 1.0)
+}
+
 /// Lowercase, split on any non-alphanumeric run, drop empties.
 fn tokenize_lower(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
@@ -226,21 +240,30 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
             let snippet_tokens: HashSet<String> =
                 tokenize_lower(&hit.snippet).into_iter().collect();
 
+            let mut lexical = 0.0;
+            let mut covered = 0usize;
             for qt in &q_tokens {
-                if filename_tokens.contains(qt) {
-                    s += W_FILENAME;
+                let (f, p, t) = (filename_tokens.contains(qt), path_tokens.contains(qt), snippet_tokens.contains(qt));
+                if f {
+                    lexical += W_FILENAME;
                 }
-                if path_tokens.contains(qt) {
-                    s += W_PATH;
+                if p {
+                    lexical += W_PATH;
                 }
-                if snippet_tokens.contains(qt) {
-                    s += W_SNIPPET;
+                if t {
+                    lexical += W_SNIPPET;
                 }
+                covered += usize::from(f || p || t);
             }
+            // Weighed by how much of the question it matches: one word of
+            // four in a file name ("client" in `Client Vocabulary.md` for
+            // "what money is the client paying us") is a quarter of a match,
+            // not a strong one; a hit with every word keeps its full score.
+            s += lexical * covered as f64 / q_tokens.len() as f64;
         }
 
         if let Some(&dist) = best_dist.get(hit.path.as_str()) {
-            s += W_SEMANTIC * (1.0 - dist).clamp(0.0, 1.0);
+            s += W_SEMANTIC * similarity(dist);
         }
 
         if hit.source == Source::Both {
@@ -254,7 +277,13 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
     // Stable sort, best-first. Equal scores keep their incoming (B4) order —
     // this is what guarantees "no signal ⇒ B4 order preserved verbatim".
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    scored.into_iter().map(|(_, h)| h).collect()
+    scored
+        .into_iter()
+        .map(|(s, mut h)| {
+            h.score = s;
+            h
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -388,6 +417,7 @@ mod tests {
             source,
             line: None,
             page: None,
+            score: 0.0,
         }
     }
 

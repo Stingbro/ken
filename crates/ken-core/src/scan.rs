@@ -1156,6 +1156,58 @@ mod tests {
     /// project's 1.7GB `build/` and a server's `run/universe` world data
     /// land in the index.
     #[test]
+    fn a_kenignored_folder_leaves_the_index_at_every_depth() {
+        let (dir, project) = temp_project();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "brands/*/runs/\n").unwrap();
+        let files = [
+            "brands/att/theme.yaml",
+            "brands/att/backend/data/mocks/a.json",
+            "brands/att/backend/components/01-system-context/context/norms.md",
+            "brands/att/backend/components/12-skill/market-analysis/SKILL.md",
+            "brands/att/backend/components/12-skill/market-analysis/deep/x/y.md",
+            "src/keep.md",
+        ];
+        for f in files {
+            fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            fs::write(root.join(f), format!("text of {f}")).unwrap();
+        }
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        for f in files {
+            assert!(db.get_file(f).unwrap().is_some(), "{f} indexed first");
+        }
+        fs::write(root.join(".kenignore"), "brands/\n").unwrap();
+        let stats = scan(&project, &mut db).unwrap();
+        let left: Vec<&str> = files.iter().copied().filter(|f| f.starts_with("brands/") && db.get_file(f).unwrap().is_some()).collect();
+        assert!(left.is_empty(), "still indexed: {left:?} ({stats:?})");
+        assert!(db.get_file("src/keep.md").unwrap().is_some());
+    }
+
+    /// The workspace's own `.kenignore` (the one setup writes) reaches a
+    /// member's scan for the lines that name that member.
+    #[test]
+    fn a_workspace_kenignore_line_takes_a_member_folder_out() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::create_dir_all(ws.path().join(crate::workspace::CONFIG_DIR)).unwrap();
+        let root = ws.path().join("app");
+        fs::create_dir_all(root.join("frontend/src")).unwrap();
+        fs::write(root.join("frontend/src/a.ts"), "export const a = 1;").unwrap();
+        fs::write(root.join("readme.md"), "# App").unwrap();
+        fs::write(ws.path().join(".kenignore"), "app/frontend/\nother/x/\n").unwrap();
+        let project = Project::create(&root, "app").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(db.get_file("frontend/src/a.ts").unwrap().is_none(), "the workspace line applies inside the member");
+        assert!(db.get_file("readme.md").unwrap().is_some());
+        // The member's own file still has the last word.
+        fs::write(root.join(".kenignore"), "!frontend/\n").unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(db.get_file("frontend/src/a.ts").unwrap().is_some());
+    }
+
+    #[test]
     fn gitignore_is_honoured_inside_a_repo() {
         let (dir, project) = temp_project();
         fs::create_dir_all(dir.path().join(".git")).unwrap();

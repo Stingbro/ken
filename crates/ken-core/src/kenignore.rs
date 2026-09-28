@@ -134,6 +134,50 @@ pub fn parse(text: &str) -> Vec<Rule> {
     rules
 }
 
+/// The lines of a workspace-level `.kenignore` that apply inside `member`
+/// (its folder relative to the workspace), rewritten relative to it:
+/// `Game/assets/raw/` becomes `/assets/raw/` for member `Game`, a pattern
+/// with no folder in it (`*.log`, `tmp/`) applies in every member as it is,
+/// and lines about other members, or about a member folder as a whole (which
+/// decide whether it is a member at all), are left out.
+pub fn lines_for_member(workspace_text: &str, member: &str) -> String {
+    let member = member.trim_matches('/');
+    let mut out = String::new();
+    for raw in workspace_text.lines() {
+        let line = raw.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (prefix, pattern) = [r"\~", r"\!", "~", "!"]
+            .iter()
+            .find_map(|p| line.strip_prefix(p).map(|rest| (*p, rest)))
+            .unwrap_or(("", line));
+        let body = pattern.trim_end_matches('/');
+        let anchored = pattern.starts_with('/') || body.contains('/');
+        if !anchored {
+            // A folder line here (`Game-worktrees/`) is about the workspace's
+            // own folders: setup writes them to say what is not a member.
+            // A file pattern (`*.log`) holds everywhere.
+            if !pattern.ends_with('/') {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        let rel = pattern.trim_start_matches('/');
+        let rest = rel
+            .get(..member.len())
+            .filter(|head| head.eq_ignore_ascii_case(member))
+            .and_then(|_| rel.get(member.len()..))
+            .and_then(|tail| tail.strip_prefix('/'))
+            .filter(|rest| !rest.is_empty());
+        if let Some(rest) = rest {
+            out.push_str(&format!("{prefix}/{rest}\n"));
+        }
+    }
+    out
+}
+
 /// Returns the 1-based line numbers of lines that [`parse`] silently skips
 /// as malformed (a bare `~` or `!` with no pattern after it), so callers
 /// that want to surface a warning (e.g. src-tauri's `.kenignore` watcher)
@@ -326,6 +370,18 @@ mod tests {
     use super::*;
 
     // ---- parse ----
+
+    #[test]
+    fn a_workspace_kenignore_reaches_into_the_member_it_names() {
+        let ws = "# setup\nGame-worktrees/\nGame/assets/raw/\n~/Game/docs/old/\n!Game/assets/raw/keep.png\nDocs/drafts/\n*.log\n~tmp/\nGame/\n";
+        assert_eq!(
+            lines_for_member(ws, "Game"),
+            "/assets/raw/\n~/docs/old/\n!/assets/raw/keep.png\n*.log\n",
+            "its own lines rewritten and file patterns kept; other members' lines and the workspace's folder lines left out"
+        );
+        assert_eq!(lines_for_member(ws, "Docs"), "/drafts/\n*.log\n");
+        assert_eq!(lines_for_member("SR/tools/build/\n", "SR/tools"), "/build/\n", "a member in a group folder");
+    }
 
     #[test]
     fn parse_bare_pattern_is_ignore_tier() {

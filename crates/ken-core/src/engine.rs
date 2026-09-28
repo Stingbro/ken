@@ -845,8 +845,20 @@ pub fn rebuild_semantic_index_with_profile(
             .chunks(EMBED_BATCH)
             .zip(embed_texts.chunks(EMBED_BATCH))
         {
-            let vecs = embedder.embed(text_batch)?;
-            db.store_embeddings(id_batch, &vecs)?;
+            match embedder.embed(text_batch) {
+                Ok(vecs) => db.store_embeddings(id_batch, &vecs)?,
+                // One chunk the model can't take must not stop the index:
+                // embed the batch one by one and leave out only what fails
+                // (it stays keyword-searchable, and is retried next build).
+                Err(batch_err) => {
+                    for (id, text) in id_batch.iter().zip(text_batch) {
+                        match embedder.embed(std::slice::from_ref(text)) {
+                            Ok(v) => db.store_embeddings(&[*id], &v)?,
+                            Err(e) => eprintln!("semantic index: {} chunk {id} skipped: {e} (batch: {batch_err})", file.rel_path),
+                        }
+                    }
+                }
+            }
         }
 
         on_progress(done + 1, total);
@@ -1753,6 +1765,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(db.chunk_count().unwrap(), 0, "the Skip-mode profile entry should suppress all chunks");
+    }
+
+    #[test]
+    fn a_chunk_the_model_refuses_is_left_out_not_the_whole_index() {
+        struct Picky(FakeEmbedder);
+        impl Embedder for Picky {
+            fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                if texts.iter().any(|t| t.contains("POISON")) {
+                    return Err(Error::Other("the model refused it".into()));
+                }
+                self.0.embed(texts)
+            }
+            fn dim(&self) -> usize {
+                self.0.dim()
+            }
+            fn model_id(&self) -> String {
+                self.0.model_id()
+            }
+        }
+        let project_dir = tempfile::tempdir().unwrap();
+        let app_dir = tempfile::tempdir().unwrap();
+        fs::write(project_dir.path().join("a.md"), "# Fine\nThe quokka juggles.\n").unwrap();
+        fs::write(project_dir.path().join("b.md"), "# Bad\nPOISON in here.\n").unwrap();
+        fs::write(project_dir.path().join("c.md"), "# Also fine\nSpreadsheets.\n").unwrap();
+        let project = Project::create(project_dir.path(), "T").unwrap();
+        let mut db = Db::open_at(&app_dir.path().join("t.db")).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let mut embedder = Picky(FakeEmbedder::new());
+        assert!(rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap());
+        assert!(db.chunks_missing_vectors("a.md").unwrap().is_empty());
+        assert!(db.chunks_missing_vectors("c.md").unwrap().is_empty(), "files after the bad one still embed");
+        assert_eq!(db.chunks_missing_vectors("b.md").unwrap().len(), 1, "only the refused chunk waits");
     }
 
     #[test]

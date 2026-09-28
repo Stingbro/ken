@@ -98,15 +98,52 @@ pub fn discover_claude() -> Option<PathBuf> {
     if let Some(appdata) = std::env::var_os("APPDATA") {
         fallbacks.push(PathBuf::from(appdata).join("npm"));
     }
+    // `winget install Anthropic.ClaudeCode` links the exe here.
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        fallbacks.push(PathBuf::from(local).join("Microsoft").join("WinGet").join("Links"));
+    }
     fallbacks.iter().find_map(|dir| first_runnable(dir))
 }
 
 /// The first [`CLAUDE_NAMES`] entry in `dir` that exists and looks runnable.
 fn first_runnable(dir: &Path) -> Option<PathBuf> {
+    // npm's launchers side by side are one install: when its `.cmd` points
+    // at an exe that is gone, its `claude` shell script does too.
+    let cmd = dir.join("claude.cmd");
+    if cfg!(windows) && cmd.is_file() && !launcher_target_exists(&cmd) {
+        return None;
+    }
     CLAUDE_NAMES.iter().find_map(|name| {
         let candidate = dir.join(name);
-        is_executable(&candidate).then_some(candidate)
+        (is_executable(&candidate) && launcher_target_exists(&candidate)).then_some(candidate)
     })
+}
+
+/// A `.cmd`/`.bat` launcher is only runnable if what it launches is there.
+/// npm's shim runs `"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"`,
+/// and an update that stalls halfway leaves that exe renamed to
+/// `claude.exe.old.<n>`: the shim remains and every run fails with "is not
+/// recognized". A launcher that names no `%dp0%` path is taken on trust.
+fn launcher_target_exists(launcher: &Path) -> bool {
+    let is_batch = launcher
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    if !is_batch {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(launcher) else { return true };
+    let Some(dir) = launcher.parent() else { return true };
+    let targets: Vec<PathBuf> = text
+        .split('"')
+        .filter_map(|quoted| {
+            let rel = quoted.strip_prefix("%dp0%").or_else(|| quoted.strip_prefix("%~dp0"))?;
+            let rel = rel.trim_start_matches(['\\', '/']);
+            (!rel.is_empty()).then(|| dir.join(rel.replace('\\', std::path::MAIN_SEPARATOR_STR)))
+        })
+        .collect();
+    targets.is_empty() || targets.iter().any(|t| t.is_file())
 }
 
 pub(crate) fn is_executable(path: &Path) -> bool {
@@ -776,6 +813,31 @@ mod tests {
     use super::test_support::write_fake_claude;
     use super::*;
     use crate::hooks::{install_hooks, HookListener};
+
+    #[test]
+    fn a_launcher_whose_exe_is_gone_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n";
+        let cmd = dir.path().join("claude.cmd");
+        std::fs::write(&cmd, shim).unwrap();
+        let bin = dir.path().join("node_modules/@anthropic-ai/claude-code/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A stalled update: only the renamed old exe is left.
+        std::fs::write(bin.join("claude.exe.old.1785513710531"), "x").unwrap();
+        assert!(!launcher_target_exists(&cmd));
+        if cfg!(windows) {
+            // npm's shell-script launcher beside it is the same broken install.
+            std::fs::write(dir.path().join("claude"), "#!/bin/sh\n").unwrap();
+            assert_eq!(first_runnable(dir.path()), None, "the whole folder is passed over");
+        }
+        std::fs::write(bin.join("claude.exe"), "x").unwrap();
+        assert!(launcher_target_exists(&cmd));
+        // No %dp0% target to check: taken on trust, as is anything not batch.
+        let plain = dir.path().join("other.cmd");
+        std::fs::write(&plain, "@node cli.js %*\r\n").unwrap();
+        assert!(launcher_target_exists(&plain));
+        assert!(launcher_target_exists(&dir.path().join("claude.exe")));
+    }
 
     #[test]
     fn a_multiline_prompt_reaches_a_cmd_launcher_as_a_file() {

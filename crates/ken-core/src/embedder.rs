@@ -167,19 +167,21 @@ mod llama {
         /// vector. A fresh context is used per call so state never leaks
         /// between inputs.
         fn embed_prefixed(&self, text: &str) -> Result<Vec<f32>> {
-            let tokens = self
+            // The tokenizer takes a C string: a NUL (binary-ish text from a
+            // PDF or a data file) would end it, so it is refused outright.
+            let text = text.replace('\0', " ");
+            let mut tokens = self
                 .model
-                .str_to_token(text, AddBos::Always)
+                .str_to_token(&text, AddBos::Always)
                 .map_err(|e| Error::Other(format!("tokenize failed: {e}")))?;
             if tokens.is_empty() {
                 return Ok(vec![0.0; self.dim]);
             }
-            if tokens.len() > N_CTX as usize {
-                return Err(Error::Other(format!(
-                    "embedding input too long: {} tokens (max {N_CTX})",
-                    tokens.len()
-                )));
-            }
+            // A dense chunk (a table, minified code) can tokenize past the
+            // window. Its opening stands for it, as it would in a search
+            // result; failing instead stopped the whole meaning index at
+            // the first such chunk. Keyword search still sees all of it.
+            tokens.truncate(N_CTX as usize);
 
             // Embedding context: pooled output, no generation. n_batch and
             // n_ubatch are held equal (coordinator constraint) so the whole

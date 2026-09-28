@@ -80,6 +80,10 @@ pub struct DriftConfig {
     /// Fewer pages examined than this voids the run.
     #[serde(default)]
     pub min_pages: Option<usize>,
+    /// `false` measures against the remote branches as last fetched; by
+    /// default each sweep fetches them first.
+    #[serde(default)]
+    pub fetch: Option<bool>,
 }
 
 impl DriftConfig {
@@ -201,6 +205,8 @@ impl DriftRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeCitation {
     pub repo: String,
+    /// The commit it was read at, when the citation says (`repo@sha:path`).
+    pub at: Option<String>,
     pub path: String,
     pub line: Option<usize>,
 }
@@ -228,7 +234,10 @@ pub fn classify(raw: &str) -> Citation {
     let Some((repo, rest)) = c.split_once(':') else {
         return Citation::Skip;
     };
-    let repo = repo.split('@').next().unwrap_or(repo).trim();
+    let (repo, at) = match repo.split_once('@') {
+        Some((r, sha)) => (r.trim(), Some(sha.trim()).filter(|h| h.len() >= 4 && h.chars().all(|ch| ch.is_ascii_hexdigit())).map(str::to_string)),
+        None => (repo.trim(), None),
+    };
     if repo.is_empty() || repo.contains(' ') || rest.is_empty() {
         return Citation::Skip;
     }
@@ -237,10 +246,11 @@ pub fn classify(raw: &str) -> Citation {
         _ => (rest, None),
     };
     let path = path.trim_start_matches("./").replace('\\', "/");
-    if path.is_empty() || path.contains(' ') && !path.contains('/') {
+    // `repo:(layout)`, `repo:(git authors)`: a fact Ken derived, not a file.
+    if path.is_empty() || path.starts_with('(') || path.contains(' ') && !path.contains('/') {
         return Citation::Skip;
     }
-    Citation::Code(CodeCitation { repo: repo.to_string(), path, line })
+    Citation::Code(CodeCitation { repo: repo.to_string(), at, path, line })
 }
 
 /// The folder a citation's repo names: this project if it is named so,
@@ -421,6 +431,9 @@ enum Measured {
 /// a file untouched since the last sweep reads the same at both commits.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PinCache {
+    /// How results were measured; a cache from another way is dropped.
+    #[serde(default)]
+    version: u32,
     /// Repo folder → the branch head the results were measured at.
     heads: std::collections::HashMap<String, String>,
     /// Citation key → result. Keyed by repo, branch, pin, path and line, so a
@@ -429,8 +442,17 @@ struct PinCache {
 }
 
 impl PinCache {
+    /// Bumped whenever measuring changes (what counts as a citation, how a
+    /// path resolves), so an upgrade never shows results measured the old way.
+    const VERSION: u32 = 2;
+
     fn load(db: &Db) -> PinCache {
-        db.drift_cache().ok().flatten().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+        db.drift_cache()
+            .ok()
+            .flatten()
+            .and_then(|j| serde_json::from_str::<PinCache>(&j).ok())
+            .filter(|c| c.version == Self::VERSION)
+            .unwrap_or(PinCache { version: Self::VERSION, ..Default::default() })
     }
 
     fn key(repo: &Path, branch: &str, pin: Option<&str>, c: &CodeCitation) -> String {
@@ -468,6 +490,51 @@ impl PinCache {
     }
 }
 
+/// How long a fetch may take before the sweep goes on without it.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `git fetch <remote>`: remote-tracking branches only; the working tree,
+/// local branches and the remote are untouched. Never prompts: a remote that
+/// needs a password a person has not stored fails, and is said so.
+fn fetch(root: &Path, remote: &str) -> std::result::Result<(), String> {
+    let mut cmd = Command::new("git");
+    crate::proc::quiet(&mut cmd)
+        .args(["fetch", "--quiet", "--no-tags", remote])
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + FETCH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => {
+                let mut err = String::new();
+                if let Some(mut e) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut e, &mut err);
+                }
+                return Err(err.lines().last().unwrap_or("git fetch failed").trim().to_string());
+            }
+            Ok(None) if std::time::Instant::now() > deadline => {
+                crate::proc::kill_tree(&mut child);
+                return Err(format!("no answer in {}s", FETCH_TIMEOUT.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// A page whose frontmatter title is still a `{{placeholder}}`.
+fn is_template(text: &str) -> bool {
+    text.lines()
+        .take_while(|l| !l.trim_start().starts_with("# "))
+        .any(|l| l.trim_start().starts_with("title:") && l.contains("{{"))
+}
+
 /// Run the sweep over one wiki or team repo.
 pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     let cfg = DriftConfig::of(project);
@@ -477,7 +544,12 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     let mut advanced: std::collections::HashSet<PathBuf> = Default::default();
     let mut pins: std::collections::HashMap<(PathBuf, String), Option<String>> = Default::default();
     let mut used: std::collections::HashSet<String> = Default::default();
-    let mut measure_one = |subject: &str, raw: &str, since: &str, research: bool, run: &mut DriftRun| {
+    let mut repos_in_git: std::collections::HashMap<PathBuf, bool> = Default::default();
+    let mut tracked: std::collections::HashMap<(PathBuf, String), Vec<String>> = Default::default();
+    // `exact`: a citation pinned to its commit (`repo@sha:path`) is measured
+    // from that commit. A draft pins what it read; once a person verifies the
+    // page, its verified date is the pin instead.
+    let mut measure_one = |subject: &str, raw: &str, since: &str, exact: bool, research: bool, run: &mut DriftRun| {
         let c = match classify(raw) {
             Citation::Code(c) => c,
             Citation::Cross => {
@@ -486,14 +558,33 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             }
             Citation::Skip => return,
         };
-        run.code_citations += 1;
         let Some(repo_root) = resolve_repo(&project.root, &c.repo) else {
+            run.code_citations += 1;
             let u = format!("repo `{}` (cited by {subject}) was not found beside this one or in Ken", c.repo);
             if !run.unmeasured.contains(&u) {
                 run.unmeasured.push(u);
             }
             return;
         };
+        // A page citing another page of this wiki is a cross-reference, like
+        // `[[Note]]`: measuring it against git would flag every page not yet
+        // committed (a fresh draft) as missing.
+        if repo_root == project.root && c.path.to_ascii_lowercase().ends_with(".md") {
+            run.cross_references += 1;
+            return;
+        }
+        run.code_citations += 1;
+        // A folder without git can be read but not measured.
+        let in_git = *repos_in_git
+            .entry(repo_root.clone())
+            .or_insert_with(|| git(&repo_root, &["rev-parse", "--is-inside-work-tree"]).is_some_and(|o| o == "true"));
+        if !in_git {
+            let u = format!("`{}` is not a git repository, so its citations cannot be measured", c.repo);
+            if !run.unmeasured.contains(&u) {
+                run.unmeasured.push(u);
+            }
+            return;
+        }
         let (branch, note) = branches.entry(repo_root.clone()).or_insert_with(|| default_branch(&repo_root)).clone();
         if let Some(n) = note {
             let n = format!("{}: {n}", c.repo);
@@ -501,15 +592,34 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
                 run.branches.push(n);
             }
         }
-        // Once per repo per sweep: which files changed since the last sweep.
+        // Once per repo per sweep: bring its remote branches up to date, so
+        // drift is measured against what is merged, not what was there at the
+        // last fetch (nothing else fetches a code repo); then which files
+        // changed since the last sweep.
         if advanced.insert(repo_root.clone()) {
+            if let Some(remote) = branch.split_once('/').map(|(r, _)| r).filter(|_| cfg.fetch != Some(false)) {
+                if let Err(why) = fetch(&repo_root, remote) {
+                    let n = format!("{}: could not fetch {remote} ({why}); measured against its last fetch", c.repo);
+                    if !run.branches.contains(&n) {
+                        run.branches.push(n);
+                    }
+                }
+            }
             let head = git(&repo_root, &["rev-parse", &branch]);
             cache.advance(&repo_root, head.as_deref());
         }
-        let pin = pins
-            .entry((repo_root.clone(), since.to_string()))
-            .or_insert_with(|| pin_at(&repo_root, &branch, since))
-            .clone();
+        let exact_pin = c
+            .at
+            .as_deref()
+            .filter(|_| exact)
+            .and_then(|sha| git(&repo_root, &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")]));
+        let pin = match exact_pin {
+            Some(sha) => Some(sha),
+            None => pins
+                .entry((repo_root.clone(), since.to_string()))
+                .or_insert_with(|| pin_at(&repo_root, &branch, since))
+                .clone(),
+        };
         let key = PinCache::key(&repo_root, &branch, pin.as_deref(), &c);
         used.insert(key.clone());
         let result = match cache.results.get(&key) {
@@ -519,6 +629,20 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             }
             None => {
                 run.measured += 1;
+                // Written by hand (or by a model), a path can differ from the
+                // file in case alone: `readme.md` for `README.md`. Git is
+                // case-sensitive, so measure the tracked path it means.
+                let mut c = c.clone();
+                if git(&repo_root, &["cat-file", "-e", &format!("{branch}:{}", c.path)]).is_none() {
+                    let files = tracked.entry((repo_root.clone(), branch.clone())).or_insert_with(|| {
+                        git(&repo_root, &["ls-tree", "-r", "--name-only", &branch])
+                            .map(|out| out.lines().map(str::to_string).collect())
+                            .unwrap_or_default()
+                    });
+                    if let Some(real) = files.iter().find(|f| f.eq_ignore_ascii_case(&c.path)) {
+                        c.path = real.clone();
+                    }
+                }
                 let m = match measure(&repo_root, pin.as_deref(), &branch, &c) {
                     Ok(None) => Measured::Clean,
                     Ok(Some((severity, detail))) => Measured::Hit(severity, detail),
@@ -547,6 +671,12 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
         if meta.retired() || meta.generated {
             continue; // evidence, or rebuilt from its generator: not a claim to re-verify
         }
+        // A template to copy (`title: "{{Area}} — conventions"`) is not a
+        // claim either. Page meta drops placeholder values, so a page with
+        // no title is checked in its text.
+        if meta.title.is_none() && db.get_text(&page)?.is_some_and(|t| is_template(&t)) {
+            continue;
+        }
         run.pages_examined += 1;
         let section = section_of(&page);
         let research = section == Some(Section::Research);
@@ -556,14 +686,22 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
         }
         let date = meta.verified.clone().or_else(|| meta.updated.clone());
         if !research {
-            let old = meta.verified.as_deref().and_then(|v| days_between(v, now)).is_none_or(|d| d > AGE_DAYS);
+            // Never verified: aged once it has gone unverified for as long
+            // since it was written. A draft from today is waiting for its
+            // first read, not stale; a new wiki is all such pages.
+            let old = meta
+                .verified
+                .as_deref()
+                .or(meta.updated.as_deref())
+                .and_then(|v| days_between(v, now))
+                .is_none_or(|d| d > AGE_DAYS);
             if old {
                 run.aged.push((page.clone(), meta.verified.clone()));
             }
         }
         if let (Some(since), false) = (date, business) {
             for src in &meta.sources {
-                measure_one(&page, src, &since, research, &mut run);
+                measure_one(&page, src, &since, meta.verified.is_none(), research, &mut run);
             }
         }
     }
@@ -576,7 +714,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             let Some(since) = r.date.clone() else { continue };
             let subject = format!("{log}#{}", r.id);
             for src in &r.sources {
-                measure_one(&subject, src, &since, false, &mut run);
+                measure_one(&subject, src, &since, true, false, &mut run);
             }
         }
     }
@@ -651,8 +789,8 @@ mod tests {
 
     #[test]
     fn citations_are_code_cross_references_or_skipped() {
-        assert!(matches!(classify("ken:src/scan.rs:42"), Citation::Code(CodeCitation { ref repo, ref path, line: Some(42) }) if repo == "ken" && path == "src/scan.rs"));
-        assert!(matches!(classify("ken@abc1234:src/lib.rs"), Citation::Code(CodeCitation { ref repo, line: None, .. }) if repo == "ken"));
+        assert!(matches!(classify("ken:src/scan.rs:42"), Citation::Code(CodeCitation { ref repo, ref path, line: Some(42), at: None }) if repo == "ken" && path == "src/scan.rs"));
+        assert!(matches!(classify("ken@abc1234:src/lib.rs"), Citation::Code(CodeCitation { ref repo, line: None, ref at, .. }) if repo == "ken" && at.as_deref() == Some("abc1234")));
         assert!(matches!(classify("\"[[Standup - 2026-09-19]]\""), Citation::Cross));
         assert!(matches!(classify("D-012"), Citation::Cross));
         for skip in ["{{repo:path}}", "repo:path/.../x.rs", "https://example.com/a", "", "just words"] {
@@ -696,6 +834,110 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A wiki drafted today: nothing in it may read as drift. Derived facts
+    /// are not files, its own pages are cross-references, a path in the
+    /// wrong case is the file it means, a folder without git is unmeasured,
+    /// and an unverified draft is not aged.
+    #[test]
+    fn a_fresh_draft_is_clean() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("app");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        git_ok(&code, &["config", "user.email", "t@t"]);
+        git_ok(&code, &["config", "user.name", "t"]);
+        commit_at(&code, "README.md", "# App\n", "2026-09-01");
+        let docs = parent.path().join("designs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("README.md"), "# Designs\n").unwrap();
+
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Repo-Map")).unwrap();
+        fs::write(
+            wiki.join("Repo-Map/app.md"),
+            "---\nupdated: 2026-09-24\nsources:\n  - app:(layout)\n  - app:readme.md\n  - wiki:Repo-Map/designs.md\n  - designs:README.md\n---\n# App\n",
+        )
+        .unwrap();
+        // A template to copy, with no date: not a page to age.
+        fs::create_dir_all(wiki.join("Templates")).unwrap();
+        fs::write(wiki.join("Templates/How-to.md"), "---
+title: \"{{How to do the thing}}\"
+updated: {{date}}
+---
+# {{How}}
+").unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let run = sweep(&project, &db, chrono_free_epoch("2026-09-24").unwrap()).unwrap();
+        assert!(run.mismatches.is_empty(), "{:?}", run.mismatches);
+        assert!(run.aged.is_empty(), "{:?}", run.aged);
+        assert_eq!(run.cross_references, 1, "the wiki's own page");
+        assert!(run.unmeasured.iter().any(|u| u.contains("designs") && u.contains("not a git repository")), "{:?}", run.unmeasured);
+        assert_eq!(run.exit_code, 0);
+
+        // A draft pinned to the commit it read sees a change made the same
+        // day; the date alone would take that commit in as already read.
+        let read_at = {
+            let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&code).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        fs::write(
+            wiki.join("Repo-Map/pinned.md"),
+            format!("---\ntitle: Pinned\nupdated: 2026-09-24\nsources:\n  - app@{}:README.md\n---\n# P\n", &read_at[..12]),
+        )
+        .unwrap();
+        commit_at(&code, "README.md", "# App\nNow with two approvals.\n", "2026-09-24");
+        crate::scan::scan(&project, &mut db).unwrap();
+        let run = sweep(&project, &db, chrono_free_epoch("2026-09-24").unwrap()).unwrap();
+        let hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
+        assert_eq!(hits, vec![("Repo-Map/pinned.md", Severity::Judgment)], "only the pinned page: the dated one took today's commit in");
+
+        // Thirty-odd days on, still unverified: now it is aged.
+        let later = sweep(&project, &db, chrono_free_epoch("2026-10-30").unwrap()).unwrap();
+        assert_eq!(later.aged, vec![("Repo-Map/app.md".to_string(), None), ("Repo-Map/pinned.md".to_string(), None)]);
+    }
+
+    /// A code repo nobody fetches (Ken never syncs code): a change merged
+    /// upstream after the draft is still found, because the sweep fetches.
+    #[test]
+    fn a_change_merged_upstream_is_found_without_a_manual_fetch() {
+        let parent = tempfile::tempdir().unwrap();
+        let upstream = parent.path().join("upstream.git");
+        git_ok(parent.path(), &["init", "-q", "--bare", "-b", "main", upstream.to_str().unwrap()]);
+        let seed = parent.path().join("seed");
+        git_ok(parent.path(), &["clone", "-q", upstream.to_str().unwrap(), seed.to_str().unwrap()]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t")] {
+            git_ok(&seed, &["config", k, v]);
+        }
+        commit_at(&seed, "README.md", "# App\n", "2026-09-01");
+        git_ok(&seed, &["push", "-q", "origin", "main"]);
+        let code = parent.path().join("app");
+        git_ok(parent.path(), &["clone", "-q", upstream.to_str().unwrap(), code.to_str().unwrap()]);
+        let read_at = {
+            let out = Command::new("git").args(["rev-parse", "--short=12", "HEAD"]).current_dir(&code).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // Someone else merges a change; this clone never pulls or fetches.
+        commit_at(&seed, "README.md", "# App\nNow with two approvals.\n", "2026-09-02");
+        git_ok(&seed, &["push", "-q", "origin", "main"]);
+
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Repo-Map")).unwrap();
+        fs::write(
+            wiki.join("Repo-Map/app.md"),
+            format!("---\ntitle: App\nupdated: 2026-09-01\nsources:\n  - app@{read_at}:README.md\n---\n# App\n"),
+        )
+        .unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let run = sweep(&project, &db, chrono_free_epoch("2026-09-03").unwrap()).unwrap();
+        let hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
+        assert_eq!(hits, vec![("Repo-Map/app.md", Severity::Judgment)], "{:?} {:?}", run.mismatches, run.branches);
     }
 
     /// A wiki beside a code repo: a page whose cited code changed is a

@@ -11,6 +11,7 @@ rem   scripts\win-build.cmd check      sidecar, then cargo check of the app
 rem   scripts\win-build.cmd sidecar    build ken-mcp and stage it for Tauri
 rem   scripts\win-build.cmd dev        sidecar, then `npm run tauri dev`
 rem   scripts\win-build.cmd build      sidecar, then `npm run tauri build`
+rem   scripts\win-build.cmd cargo ...  any cargo command in this environment
 rem
 rem CARGO_TARGET_DIR defaults to C:\kt: a short path keeps the CMake builds
 rem under the Windows path limit. Set it first to use another folder.
@@ -74,6 +75,7 @@ if /i "%TASK%"=="check" goto check
 if /i "%TASK%"=="sidecar" goto sidecar
 if /i "%TASK%"=="dev" goto dev
 if /i "%TASK%"=="build" goto build
+if /i "%TASK%"=="cargo" goto cargo
 echo Unknown task "%TASK%". See the top of %~nx0.
 exit /b 2
 
@@ -116,4 +118,16 @@ exit /b %ERRORLEVEL%
 :build
 call :sidecar || exit /b 1
 npm run tauri build
+exit /b %ERRORLEVEL%
+
+:cargo
+rem Everything after `cargo`, run as a cargo command in this environment.
+set "ARGS="
+:cargo_args
+shift
+if "%~1"=="" goto cargo_run
+set "ARGS=!ARGS! %1"
+goto cargo_args
+:cargo_run
+cargo !ARGS!
 exit /b %ERRORLEVEL%

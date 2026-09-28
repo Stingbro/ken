@@ -159,6 +159,11 @@ pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
             if let Ok(v) = serde_json::from_str(&text[start..=end]) {
                 return Ok(v);
             }
+            // The commonest slip of a small model: a comma before a closing
+            // bracket (`{"a": 1,}`). Valid in JavaScript, not in JSON.
+            if let Ok(v) = serde_json::from_str(&drop_trailing_commas(&text[start..=end])) {
+                return Ok(v);
+            }
         }
     }
     // Nothing parsed cleanly. If the text is merely INCOMPLETE — the usual
@@ -169,6 +174,20 @@ pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
     if let Some(repaired) = repair_truncated_json(&text[start..]) {
         if let Ok(v) = serde_json::from_str(&repaired) {
             return Ok(v);
+        }
+    }
+    // Still nothing, and not a cut-off answer. The first bracket may not open
+    // the answer (a `[[link]]` in prose the
+    // model echoed), and a finished object may have text after it (it kept
+    // writing). Try each `{` in turn and take the first whole object there,
+    // whatever follows it.
+    for (pos, _) in text.match_indices('{').take(64) {
+        let tail = drop_trailing_commas(&text[pos..]);
+        let mut values = serde_json::Deserializer::from_str(&tail).into_iter::<serde_json::Value>();
+        if let Some(Ok(v)) = values.next() {
+            if v.as_object().is_some_and(|o| !o.is_empty()) {
+                return Ok(v);
+            }
         }
     }
     let detail = match text.rfind(['}', ']']) {
@@ -196,6 +215,33 @@ pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
 /// a value, or a delimiter. Returns `None` when nothing was left open, which
 /// means the text is malformed rather than truncated and the caller's original
 /// parse error is the honest thing to report.
+/// `text` with every comma that only whitespace separates from a closing
+/// `}` or `]` removed, outside strings.
+fn drop_trailing_commas(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for (i, &c) in chars.iter().enumerate() {
+        if in_string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+        } else if c == ',' && chars[i + 1..].iter().find(|n| !n.is_whitespace()).is_some_and(|n| matches!(n, '}' | ']')) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn repair_truncated_json(slice: &str) -> Option<String> {
     let mut stack: Vec<char> = Vec::new();
     let mut in_str = false;
@@ -496,7 +542,14 @@ impl LlmService {
             let text = self.run(&this_prompt, true, priority, &mut |_| true)?;
             match parse_json_lenient(&text) {
                 Ok(v) => return Ok(v),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    // For diagnosing a model: its unparseable answers, kept.
+                    if let Some(dir) = std::env::var_os("KEN_LLM_DEBUG_DIR") {
+                        let name = format!("unparsed-{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(name), format!("{e}\n---\n{text}"));
+                    }
+                    last_err = Some(e);
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| Error::Other("model produced no JSON".into())))
@@ -1050,6 +1103,21 @@ mod tests {
         let text = "Sure! Here is the JSON:\n```json\n{\"entities\": [\"x\"]}\n```\nDone.";
         let v = parse_json_lenient(text).unwrap();
         assert_eq!(v["entities"][0], "x");
+    }
+
+    #[test]
+    fn json_forgives_a_comma_before_a_closing_bracket() {
+        let text = "{\"entities\": [\n  {\"name\": \"Ben, lead\", \"kind\": \"person\"},\n],\n \"events\": [],\n}";
+        let v = parse_json_lenient(text).unwrap();
+        assert_eq!(v["entities"][0]["name"], "Ben, lead", "a comma inside a string stays");
+        assert_eq!(v["events"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn json_is_found_past_a_bracket_in_prose_and_before_more_text() {
+        let text = "See [[AGENTS]] first.\n{\"entities\": [{\"name\": \"SOW\"}]}\n], and some more {text";
+        let v = parse_json_lenient(text).unwrap();
+        assert_eq!(v["entities"][0]["name"], "SOW");
     }
 
     #[test]

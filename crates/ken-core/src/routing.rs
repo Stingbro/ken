@@ -198,9 +198,25 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
         };
     }
 
+    let mut ready: Vec<&MemberInfo> = members.iter().filter(|m| m.index_ready).collect();
+    ready.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+
     if let Some(kg) = kg {
-        if let Some((targets, matched_ids)) = kg_guided_targets(&normalized_query, members, kg) {
+        if let Some((mut targets, matched_ids)) = kg_guided_targets(&normalized_query, members, kg) {
             if !targets.is_empty() {
+                // The graph says where to look first, not where not to look:
+                // it holds no code repo at all (their files are never mined
+                // for entities) and misses what extraction missed. The other
+                // ready members follow, up to the broadcast cap, so "how is
+                // the Entra ID token validated" still reaches the code.
+                for m in &ready {
+                    if targets.len() >= BROADCAST_CAP.max(KG_TARGET_CAP) {
+                        break;
+                    }
+                    if !targets.contains(&m.project_id) {
+                        targets.push(m.project_id);
+                    }
+                }
                 return RoutePlan {
                     targets,
                     reason: RouteReason::KgEntities(matched_ids),
@@ -209,8 +225,6 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
         }
     }
 
-    let mut ready: Vec<&MemberInfo> = members.iter().filter(|m| m.index_ready).collect();
-    ready.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
     let targets = ready.into_iter().take(BROADCAST_CAP).map(|m| m.project_id).collect();
     RoutePlan {
         targets,
@@ -365,14 +379,26 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
         hit.line = db.chunk_line(hit.chunk_id)?;
         hit.page = crate::pagemeta::hit_page(&hit.path, db.page_meta(&hit.path)?);
     }
-    // Binding and verified first, evidence and pages no longer current
-    // last; relevance order holds within each band (stable sort).
-    hits.sort_by_key(hit_band);
+    // Binding and verified pages count for more, evidence and pages no longer
+    // current for less: a nudge on relevance, not a wall. A strict band order
+    // put a generic process page that barely matched above the page that
+    // answers the question.
+    for hit in &mut hits {
+        hit.score += band_bonus(hit);
+    }
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     Ok(hits)
 }
 
-fn hit_band(hit: &HybridHit) -> u8 {
-    hit.page.as_ref().map_or(1, |p| p.band)
+/// What a page's band adds to its relevance: less than one filename word.
+pub const W_BAND: f64 = 0.75;
+
+fn band_bonus(hit: &HybridHit) -> f64 {
+    match hit.page.as_ref().map_or(1, |p| p.band) {
+        0 => W_BAND,
+        2 => -W_BAND,
+        _ => 0.0,
+    }
 }
 
 /// A handle `execute_plan` needs to search one planned target: identity plus
@@ -532,7 +558,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
 
     // (score, target_order, within-member rank, hit) — sorted score DESC,
     // then the two tie-breaks ASC.
-    let mut candidates: Vec<(f64, usize, usize, RoutedHit)> = Vec::new();
+    let mut candidates: Vec<(f64, usize, usize, RoutedHit, f64)> = Vec::new();
     for mh in member_hits {
         if mh.status != MemberStatus::Searched {
             continue;
@@ -568,20 +594,36 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     page: hit.page.clone(),
                     kg_breadcrumbs: breadcrumbs.clone(),
                 },
+                hit.score,
             ));
         }
     }
-    // The page band leads across members too: a binding page in one repo
-    // ranks ahead of a Research note in another, whatever their RRF scores.
+    // Relevance leads across members: every member scores on the same scale
+    // (the page band already folded in), so the best answer wins whichever
+    // repo holds it. Rank-only fusion gave each repo's first hit the same
+    // weight: a code repo's best guess at a contract question tied the
+    // contract. The band breaks ties between unscored hits; then RRF, the
+    // plan's order and the member's own rank.
     let band = |h: &RoutedHit| h.page.as_ref().map_or(1, |p| p.band);
     candidates.sort_by(|a, b| {
-        band(&a.3)
-            .cmp(&band(&b.3))
+        b.4.total_cmp(&a.4)
+            .then(band(&a.3).cmp(&band(&b.3)))
             .then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
     });
-    let results = candidates.into_iter().take(limit).map(|c| c.3).collect();
+    // One copy of a file kept in several repos (a vendored PDF, a design
+    // asset): the same name and the same text is one answer, at its best rank.
+    let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+    let results = candidates
+        .into_iter()
+        .map(|c| c.3)
+        .filter(|h| {
+            let name = h.path.rsplit('/').next().unwrap_or(&h.path).to_lowercase();
+            seen.insert((name, h.snippet.clone()))
+        })
+        .take(limit)
+        .collect();
 
     let member_status = member_hits
         .iter()
@@ -621,6 +663,7 @@ mod tests {
             source: Source::Keyword,
             line: None,
             page: None,
+            score: 0.0,
         }
     }
 
@@ -671,9 +714,23 @@ mod tests {
             member(p4, "Delta", true, 100),
         ];
         let plan = plan_route("tell me about the zylographs", &members, Some(&kg));
-        assert_eq!(plan.targets.len(), 3, "KG-guided tier must cap at 3");
         assert_eq!(plan.targets[0], p1, "highest pointer density must lead");
+        assert_eq!(plan.targets[..3].len(), 3, "the graph ranks at most 3");
+        assert_eq!(plan.targets.len(), 4, "then the other ready members, up to the broadcast cap");
         assert_eq!(plan.reason, RouteReason::KgEntities(vec![entity]));
+    }
+
+    /// A code repo is never in the graph: a question about an entity the
+    /// graph knows still reaches it.
+    #[test]
+    fn a_graph_route_still_reaches_members_the_graph_does_not_hold() {
+        let kg = WorkspaceKgDb::open_in_memory().unwrap();
+        let entity = kg.insert_global_entity("topic", "Entra ID", "the identity provider", 1).unwrap();
+        let (docs, code) = (Uuid::new_v4(), Uuid::new_v4());
+        kg.insert_entity_link(entity, docs, 1, "Entra ID").unwrap();
+        let members = vec![member(docs, "Project Documents", true, 100), member(code, "app", true, 50)];
+        let plan = plan_route("How are Entra ID tokens validated?", &members, Some(&kg));
+        assert_eq!(plan.targets, vec![docs, code], "the graph's member first, the code after");
     }
 
     #[test]
@@ -744,10 +801,9 @@ mod tests {
     // --- merge_routed: cross-member RRF ordering (task 1.4) ---
 
     #[test]
-    fn cross_member_merge_is_rank_based_not_score_based() {
-        // Spec scenario: member A's top hit merges as rank-1 even though
-        // HybridHit carries no raw score at all to compare — there is
-        // nothing here but each hit's position in its own member's list.
+    fn unscored_hits_merge_by_rank() {
+        // Hits with no relevance score to compare (all 0.0) fall back to
+        // each hit's position in its own member's list.
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let plan = RoutePlan {
@@ -778,6 +834,48 @@ mod tests {
         assert_eq!(report.results[3].path, "b/two.md");
         // B's rank-3 hit (no A counterpart) is last.
         assert_eq!(report.results[4].path, "b/three.md");
+    }
+
+    /// Relevance decides across members: a strong hit in the second repo
+    /// beats a weak first hit in the first, whatever the plan's order.
+    #[test]
+    fn scored_hits_merge_by_relevance_across_members() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast };
+        let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
+        let member_hits = vec![
+            MemberHits {
+                project_id: a,
+                member_name: "code".into(),
+                status: MemberStatus::Searched,
+                hits: vec![scored("design.md", 1, 0.6), scored("spec.md", 2, 0.4)],
+            },
+            MemberHits {
+                project_id: b,
+                member_name: "notes".into(),
+                status: MemberStatus::Searched,
+                hits: vec![scored("SOW.md", 10, 4.2), scored("log.md", 11, 0.5)],
+            },
+        ];
+        let paths: Vec<String> = merge_routed(&plan, &member_hits, 10).results.into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["SOW.md", "design.md", "log.md", "spec.md"]);
+    }
+
+    /// A question in its own words still finds the chunk that says it
+    /// differently: all-words finds nothing, any-word does.
+    #[test]
+    fn a_question_finds_a_chunk_without_every_word() {
+        use crate::project::Project;
+        use crate::scan;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "# Authentication dependency: Entra ID JWT validation.\n").unwrap();
+        std::fs::write(dir.path().join("other.py"), "def unrelated():\n    return 1\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        let hits = search_member(&db, "How are Entra ID JWT tokens validated in the backend?", None, 5).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("auth.py"), "{hits:?}");
+        assert!(hits.iter().all(|h| h.path != "other.py"), "a chunk with none of the words is not a hit");
     }
 
     #[test]

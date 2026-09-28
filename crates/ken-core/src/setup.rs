@@ -153,10 +153,11 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
         .filter(|(p, _)| dir.join(p).is_dir())
         .map(|(_, e)| e)
         .collect();
-    let code: Vec<&str> = crate::profiler::REPO_MARKERS
+    let mut code: Vec<String> = crate::profiler::REPO_MARKERS
         .iter()
         .copied()
         .filter(|m| *m != ".git" && exists_ci(dir, m))
+        .map(str::to_string)
         .chain(
             fs::read_dir(dir)
                 .ok()
@@ -164,9 +165,16 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
                 .flatten()
                 .flatten()
                 .any(|e| e.file_name().to_string_lossy().to_lowercase().ends_with(".sln"))
-                .then_some("*.sln"),
+                .then(|| "*.sln".to_string()),
         )
         .collect();
+    // A monorepo keeps its packages a level or two down
+    // (`services/api/pyproject.toml`, `apps/web/package.json`). Only in a
+    // repo: a folder without git whose children hold markers is a group of
+    // repos, each detected on its own.
+    if code.is_empty() && dir.join(".git").exists() {
+        code = nested_markers(dir, 2);
+    }
     if !team.is_empty() {
         kind.push(RepoKind::Team);
         ev.push(team.join(", "));
@@ -180,6 +188,43 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
         ev.push(code.join(", "));
     }
     (kind, ev)
+}
+
+/// Code markers in the folders below `dir`, at most `depth` levels down, as
+/// the relative paths that prove it (at most three). Skips hidden folders
+/// and the ones dependencies and builds fill.
+fn nested_markers(dir: &Path, depth: usize) -> Vec<String> {
+    const SKIP: [&str; 7] = ["node_modules", "vendor", "target", "dist", "build", "venv", "__pycache__"];
+    let mut found = Vec::new();
+    let mut level: Vec<(PathBuf, String)> = vec![(dir.to_path_buf(), String::new())];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for (path, rel) in &level {
+            let Ok(entries) = fs::read_dir(path) else { continue };
+            let mut dirs: Vec<_> = entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| !n.starts_with('.') && !SKIP.contains(&n.to_lowercase().as_str()))
+                .collect();
+            dirs.sort();
+            for name in dirs {
+                let child = path.join(&name);
+                let child_rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                for m in crate::profiler::REPO_MARKERS.iter().filter(|m| **m != ".git") {
+                    if exists_ci(&child, m) && found.len() < 3 {
+                        found.push(format!("{child_rel}/{m}"));
+                    }
+                }
+                next.push((child, child_rel));
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    found
 }
 
 /// The owner in a git remote URL (`github.com/owner/repo`, `git@host:owner/repo`).
@@ -869,6 +914,28 @@ mod tests {
         // Reopened from app data, members still resolve to their folders.
         let again = Workspace::open(&root).unwrap();
         assert_eq!(again.member_root("Realms-Docs"), canon(p.join("Realms-Docs")));
+    }
+
+    #[test]
+    fn a_monorepo_with_packages_below_the_root_is_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("services/api")).unwrap();
+        fs::write(root.join("services/api/pyproject.toml"), "[project]\n").unwrap();
+        fs::create_dir_all(root.join("apps/web")).unwrap();
+        fs::write(root.join("apps/web/package.json"), "{}").unwrap();
+        // A dependency folder's markers prove nothing.
+        fs::create_dir_all(root.join("docs/node_modules/x")).unwrap();
+        fs::write(root.join("docs/node_modules/x/package.json"), "{}").unwrap();
+        let (kind, evidence) = detect(root);
+        assert_eq!(kind, vec![RepoKind::Code]);
+        assert_eq!(evidence, vec!["apps/web/package.json, services/api/pyproject.toml"]);
+
+        let docs = tempfile::tempdir().unwrap();
+        fs::create_dir_all(docs.path().join("notes/node_modules/y")).unwrap();
+        fs::write(docs.path().join("notes/node_modules/y/package.json"), "{}").unwrap();
+        assert!(detect(docs.path()).0.is_empty(), "only a dependency folder has a marker");
     }
 
     #[test]

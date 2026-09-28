@@ -988,14 +988,32 @@ impl Db {
                JOIN chunks c ON c.id = t.id
                ORDER BY t.r"#,
         )?;
-        let rows = stmt.query_map(params![fts_query, k as i64], |r| {
-            Ok(FtsHit {
-                chunk_id: r.get(0)?,
-                path: r.get(1)?,
-                text: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let mut run = |q: &str| -> Result<Vec<FtsHit>> {
+            let rows = stmt.query_map(params![q, k as i64], |r| {
+                Ok(FtsHit {
+                    chunk_id: r.get(0)?,
+                    path: r.get(1)?,
+                    text: r.get(2)?,
+                })
+            })?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        };
+        let mut hits = run(&fts_query)?;
+        // A question asks in its own words: "how are tokens validated in the
+        // backend" has no chunk with every word ("validation", not
+        // "validated"). When all-words finds too little, chunks with any of
+        // them follow, bm25 putting those with the most and rarest first.
+        if hits.len() < k && tokens.len() > 1 {
+            for hit in run(&build_fts_query_any(&tokens))? {
+                if hits.len() >= k {
+                    break;
+                }
+                if !hits.iter().any(|h| h.chunk_id == hit.chunk_id) {
+                    hits.push(hit);
+                }
+            }
+        }
+        Ok(hits)
     }
 
     /// Chunk-tier lookup for a set of chunk ids (kenignore task 2.4): the
@@ -3547,6 +3565,12 @@ pub fn significant_tokens(query: &str) -> Vec<String> {
 
 /// Build an FTS5 query from tokens: each quoted, all ANDed, last token as
 /// prefix for as-you-type feel.
+/// Any of `tokens` (FTS5 `OR`), each exact: the fallback when all of them
+/// together match too little.
+fn build_fts_query_any(tokens: &[String]) -> String {
+    tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR ")
+}
+
 fn build_fts_query(tokens: &[String]) -> String {
     let last = tokens.len().saturating_sub(1);
     let parts: Vec<String> = tokens

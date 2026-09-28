@@ -460,6 +460,38 @@ will need their own lines there once decided.
   (research) goes in a temp file with a one-line pointer. Cancelling a
   session now ends node too: each child is put in a job object
   (`proc::track`), not `taskkill`.
+- **End-to-end run on a real client workspace (2026-09-28).** Four
+  members (two code repos, a notes vault, a design folder), about 3,400
+  files, run through `examples/eval_run.rs` (a phase per step, ken-core
+  calls as the app makes them). Fixed on the way:
+  - Setup: a monorepo with its packages a level or two down is Code.
+  - Claude discovery: a stale npm `claude.cmd` (exe renamed mid-update) is
+    passed over, whole folder; winget's Links folder is a fallback.
+  - Meaning index: an over-long chunk is truncated, a NUL is dropped, and a
+    chunk the model refuses no longer stops the whole index.
+  - Search: any-word keyword fallback when all-words finds too little;
+    hits carry a relevance score, so members merge by relevance, not by
+    repo; the page band is a bonus, not a wall; cosine from vec0's L2
+    distance; word matches weighed by question coverage; one copy of a
+    file kept in several repos. Curated questions: top-1 3 → 10 of 20,
+    top-5 14 → 15.
+  - Graph routing: graph members first, then the rest (code is never in
+    the graph); it had cut code answers out.
+  - Graph clusters: same name merges when a kind is loose (topic/other);
+    fuzzy candidates need the shorter name nested in the longer (one shared
+    word chained wrong merges).
+  - Drift: derived labels (`repo:(layout)`) skipped, the wiki's own pages
+    are cross-references, path case resolved, no-git folders unmeasured,
+    templates skipped, a never-verified page ages from `updated`, the cache
+    is versioned, each sweep fetches the remote, and a draft pins its code
+    citations (`repo@sha:path`) so a same-day change is seen.
+  - `.kenignore`: the workspace file's member lines reach inside members.
+  - Local extraction: trailing commas and prose around the JSON forgiven.
+  - Open: the 4B local model still fails about half the documents (often
+    writes Markdown, not JSON) at ~42 s each; a llama.cpp grammar fixed the
+    format but hit a native assert (abort), so it is not in. Claude's
+    whole-project model build is the working path meanwhile. Paraphrased
+    code questions ("stop people seeing projects…") still miss.
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)

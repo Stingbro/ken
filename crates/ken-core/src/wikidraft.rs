@@ -15,6 +15,7 @@
 //!
 //! The model call is passed in (`generate`), as for ingest.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -299,6 +300,73 @@ fn write_page(path: &Path, text: &str) -> Result<()> {
     fs::write(path, text).map_err(|e| Error::io(path, e))
 }
 
+/// Each git repo's head on the branch drift measures, by name: what a draft
+/// read, so its citations can say so.
+fn repo_heads(repos: &[(String, PathBuf)]) -> HashMap<String, String> {
+    repos
+        .iter()
+        .filter_map(|(name, root)| {
+            let (branch, _) = crate::drift::default_branch(root);
+            let mut cmd = std::process::Command::new("git");
+            let out = crate::proc::quiet(&mut cmd).args(["rev-parse", "--short=12", &branch]).current_dir(root).output().ok()?;
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (out.status.success() && !sha.is_empty()).then(|| (name.clone(), sha))
+        })
+        .collect()
+}
+
+/// Pin each code citation in a page's `sources:` to the commit its repo
+/// was read at (`repo:path` → `repo@sha:path`). A draft dated today would
+/// otherwise take in every commit made later that same day, and a change
+/// right after drafting would never read as drift.
+pub fn pin_sources(page: &str, heads: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(page.len() + 64);
+    let mut in_front = false;
+    let mut in_sources = false;
+    for (i, line) in page.split_inclusive('\n').enumerate() {
+        let bare = line.trim_end();
+        if bare == "---" {
+            in_front = i == 0;
+            in_sources = false;
+            out.push_str(line);
+            continue;
+        }
+        if in_front && !line.starts_with(' ') && !line.starts_with('-') {
+            in_sources = bare.starts_with("sources:");
+        }
+        let item = bare.trim_start().strip_prefix("- ");
+        let pinned = item.filter(|_| in_front && in_sources).and_then(|item| {
+            let quote = item.chars().next().filter(|q| *q == '"' || *q == '\'');
+            let inner = quote.map_or(item, |q| item.trim_matches(q));
+            let (repo, path) = inner.split_once(':')?;
+            if repo.contains('@') || path.starts_with('(') {
+                return None;
+            }
+            let sha = heads.get(repo)?;
+            Some(line.replacen(&format!("{repo}:"), &format!("{repo}@{sha}:"), 1))
+        });
+        out.push_str(pinned.as_deref().unwrap_or(line));
+    }
+    out
+}
+
+/// Pin the sources of the pages just drafted (see [`pin_sources`]).
+fn pin_drafted(wiki: &Path, drafted: &[String], repos: &[(String, PathBuf)]) -> Result<()> {
+    let heads = repo_heads(repos);
+    if heads.is_empty() {
+        return Ok(());
+    }
+    for page in drafted {
+        let path = wiki.join(page);
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let pinned = pin_sources(&text, &heads);
+        if pinned != text {
+            write_page(&path, &pinned)?;
+        }
+    }
+    Ok(())
+}
+
 /// Draft each of `pages` the wiki does not already have into `report`.
 fn draft_pages(
     wiki: &Path,
@@ -498,6 +566,7 @@ pub fn draft_team(
     report.sources.extend(sources.iter().map(|s| s.label.clone()));
     report.sources.dedup();
     draft_pages(wiki, &team_pages(), &sources, today, &mut report, &mut generate)?;
+    pin_drafted(wiki, &report.drafted, repos)?;
     let title = format!("First wiki drafted: {} pages to read", report.drafted.len());
     file_card(db, &report, &title, now)?;
     Ok(report)
@@ -679,6 +748,7 @@ pub fn draft_added(
         }
     }
     report.sources.dedup();
+    pin_drafted(wiki, &report.drafted, all)?;
     let title =
         format!("{} added to the wiki: {} drafted, {} proposed", names.join(", "), report.drafted.len(), report.proposed.len());
     file_card(db, &report, &title, now)?;
@@ -823,6 +893,19 @@ mod tests {
         let layout = s.iter().find(|s| s.label == "game:(layout)").unwrap();
         assert!(layout.text.contains("src/") && layout.text.contains("  world/") && !layout.text.contains("node_modules"));
         assert!(s.iter().any(|s| s.label.ends_with(":Confluence-Home.txt") && s.text.contains("Q4")));
+    }
+
+    #[test]
+    fn a_draft_pins_its_code_citations_to_the_commit_it_read() {
+        let heads: HashMap<String, String> = [("app".to_string(), "0a1b2c3d4e5f".to_string())].into();
+        let page = "---\ntitle: Arch\nsources:\n  - app:README.md\n  - \"app:src/main.rs:12\"\n  - app:(layout)\n  - app@1234abcd:old.rs\n  - other:x.md\n  - \"[[Save]]\"\nlens: arch\n---\n# Arch\nSee `app:README.md`.\n";
+        let pinned = pin_sources(page, &heads);
+        assert_eq!(
+            pinned,
+            "---\ntitle: Arch\nsources:\n  - app@0a1b2c3d4e5f:README.md\n  - \"app@0a1b2c3d4e5f:src/main.rs:12\"\n  - app:(layout)\n  - app@1234abcd:old.rs\n  - other:x.md\n  - \"[[Save]]\"\nlens: arch\n---\n# Arch\nSee `app:README.md`.\n",
+            "only sources: entries of known repos, and never the text"
+        );
+        assert_eq!(pin_sources(&pinned, &heads), pinned, "pinning twice changes nothing");
     }
 
     #[test]

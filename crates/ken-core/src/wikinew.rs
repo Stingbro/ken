@@ -92,6 +92,14 @@ pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], t
             .collect::<Vec<_>>()
             .join("\n")
             + if text.ends_with('\n') { "\n" } else { "" };
+        // A page with frontmatter but no date would read as unverified for
+        // ever from the first sweep; it was written today.
+        let head_end = t.strip_prefix("---\n").and_then(|rest| rest.find("\n---").map(|i| i + 4));
+        if let Some(end) = head_end {
+            if !t[..end].lines().any(|l| l.trim_start().starts_with("updated:")) {
+                t.insert_str(4, &format!("updated: {today}\n"));
+            }
+        }
     }
     if path == "START-HERE.md" {
         // The repo table: this wiki, then each of the team's repos.
@@ -182,6 +190,22 @@ mod tests {
 
     #[test]
     fn updated_is_dated_and_verified_never_is() {
+        let undated = fill("Ways-of-Working/Agents/Index.md", "---
+title: \"Agents\"
+---
+# Agents
+", "T", "W", &[], "2026-09-28");
+        assert_eq!(undated, "---
+updated: 2026-09-28
+title: \"Agents\"
+---
+# Agents
+", "an undated page is dated today");
+        let copy = "---
+title: \"{{Area}}\"
+---
+";
+        assert_eq!(fill("Templates/How-to.md", copy, "T", "W", &[], "2026-09-28"), copy, "a copy template is left as it is");
         let text = "---\nupdated: {{date}}\nverified: {{date}}      # a person\n---\n";
         let t = fill("Current/Project.md", text, "T", "W", &[], "2026-09-25");
         assert_eq!(t, "---\nupdated: 2026-09-25\nverified: {{date}}      # a person\n---\n");

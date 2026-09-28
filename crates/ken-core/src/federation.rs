@@ -265,24 +265,51 @@ struct Cluster {
 /// map used to resolve edges and co-occurrence.
 fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize, i64), usize>) {
     let mut clusters: Vec<Cluster> = Vec::new();
-    let mut by_key: HashMap<(String, String), usize> = HashMap::new();
     let mut index: HashMap<(usize, i64), usize> = HashMap::new();
+    // Clusters by normalized name; a name can hold more than one when its
+    // kinds conflict (a person and a company both called Jordan).
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (mi, snap) in snapshots.iter().enumerate() {
         for e in &snap.entities {
-            let key = (normalize_name(&e.name), e.kind.clone());
-            let ci = *by_key.entry(key).or_insert_with(|| {
-                clusters.push(Cluster {
-                    kind: e.kind.clone(),
-                    name: e.name.clone(),
-                    locals: Vec::new(),
-                });
-                clusters.len() - 1
-            });
+            let name = normalize_name(&e.name);
+            let same_name = by_name.entry(name).or_default();
+            let found = same_name.iter().copied().find(|&ci| kinds_agree(&clusters[ci].kind, &e.kind));
+            let ci = match found {
+                Some(ci) => ci,
+                None => {
+                    clusters.push(Cluster {
+                        kind: e.kind.clone(),
+                        name: e.name.clone(),
+                        locals: Vec::new(),
+                    });
+                    same_name.push(clusters.len() - 1);
+                    clusters.len() - 1
+                }
+            };
+            // The merged concept takes the most specific kind it was given.
+            if kind_rank(&e.kind) > kind_rank(&clusters[ci].kind) {
+                clusters[ci].kind = e.kind.clone();
+            }
             clusters[ci].locals.push((mi, e.local_id, e.name.clone()));
             index.insert((mi, e.local_id), ci);
         }
     }
     (clusters, index)
+}
+
+/// `topic` and `other` are what a model says when it is not sure: one repo's
+/// "Snowflake" `topic` is another's "Snowflake" `other`. Two specific kinds
+/// that differ (a person, a company) are different things of the same name.
+fn kinds_agree(a: &str, b: &str) -> bool {
+    a == b || kind_rank(a) < 2 || kind_rank(b) < 2
+}
+
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "other" => 0,
+        "topic" => 1,
+        _ => 2,
+    }
 }
 
 /// Levenshtein edit distance (pure, small inputs — normalized entity names).
@@ -308,11 +335,15 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Do two normalized names share a non-trivial token?
-fn shares_token(a: &str, b: &str) -> bool {
-    let ta: HashSet<&str> = a.split(' ').filter(|t| t.len() >= MIN_SHARED_TOKEN_LEN).collect();
-    b.split(' ')
-        .any(|t| t.len() >= MIN_SHARED_TOKEN_LEN && ta.contains(t))
+/// Does every significant word of the shorter name appear in the longer one?
+/// "brief builder" in "brief builder agent" is a question worth asking; one
+/// shared word ("marketing brief", "brief development") is not, and a small
+/// model asked about it merged them, and through them whole chains.
+fn names_nest(a: &str, b: &str) -> bool {
+    let words = |s: &str| -> HashSet<String> { s.split(' ').filter(|t| t.len() >= MIN_SHARED_TOKEN_LEN).map(str::to_string).collect() };
+    let (wa, wb) = (words(a), words(b));
+    let (short, long) = if wa.len() <= wb.len() { (wa, wb) } else { (wb, wa) };
+    !short.is_empty() && short.is_subset(&long)
 }
 
 /// Is one normalized name a substring of the other?
@@ -334,11 +365,11 @@ fn candidate_pairs(clusters: &[Cluster]) -> Vec<(usize, usize)> {
             if pairs.len() >= MAX_ADJUDICATION_PAIRS {
                 return pairs;
             }
-            if clusters[i].kind != clusters[j].kind {
+            if !kinds_agree(&clusters[i].kind, &clusters[j].kind) {
                 continue;
             }
             let (a, b) = (&norms[i], &norms[j]);
-            if shares_token(a, b) || edit_distance(a, b) <= MAX_EDIT_DISTANCE || contains_other(a, b) {
+            if names_nest(a, b) || edit_distance(a, b) <= MAX_EDIT_DISTANCE || contains_other(a, b) {
                 pairs.push((i, j));
             }
         }
@@ -1235,16 +1266,26 @@ mod tests {
                 SnapshotEntity { local_id: 1, kind: "topic".into(), name: "Shattered Realms".into(), summary: String::new(), sources: vec![] },
                 SnapshotEntity { local_id: 2, kind: "topic".into(), name: "Shatterd Realms".into(), summary: String::new(), sources: vec![] },
                 SnapshotEntity { local_id: 3, kind: "topic".into(), name: "Combat System".into(), summary: String::new(), sources: vec![] },
-                // Same normalized text as #1 but a different kind ⇒ never a candidate.
-                SnapshotEntity { local_id: 4, kind: "person".into(), name: "Shattered Realms".into(), summary: String::new(), sources: vec![] },
+                // The same name in two specific kinds: two things, never a candidate.
+                SnapshotEntity { local_id: 4, kind: "person".into(), name: "Jordan".into(), summary: String::new(), sources: vec![] },
+                SnapshotEntity { local_id: 5, kind: "organization".into(), name: "Jordan".into(), summary: String::new(), sources: vec![] },
+                // A loose kind joins the same name: one thing, the specific kind kept.
+                SnapshotEntity { local_id: 6, kind: "other".into(), name: "Snowflake".into(), summary: String::new(), sources: vec![] },
+                SnapshotEntity { local_id: 7, kind: "organization".into(), name: "Snowflake".into(), summary: String::new(), sources: vec![] },
             ],
         };
         let (clusters, _) = tier1_clusters(&[snap]);
-        assert_eq!(clusters.len(), 4, "no exact-merge collisions across kinds");
+        assert_eq!(clusters.len(), 6, "Jordan twice, Snowflake once");
+        let snowflake = clusters.iter().find(|c| c.name == "Snowflake").unwrap();
+        assert_eq!((snowflake.kind.as_str(), snowflake.locals.len()), ("organization", 2));
         let pairs = candidate_pairs(&clusters);
-        // (0,1) shares the "realms" token AND is edit distance 1; nothing else
-        // qualifies (Combat shares no token; the person differs in kind).
+        // (0,1) is edit distance 1; nothing else qualifies (the two Jordans
+        // differ in kind; the rest share no name).
         assert_eq!(pairs, vec![(0, 1)]);
+        // One shared word is not enough to ask; the shorter name nested in the
+        // longer is.
+        assert!(!names_nest("marketing brief", "brief development"));
+        assert!(names_nest("brief builder", "brief builder agent"));
     }
 
     #[test]
