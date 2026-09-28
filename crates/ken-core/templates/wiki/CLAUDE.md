@@ -28,7 +28,10 @@ work is done rather than describing what exists.
 - **Search before saying something is missing.** Before reporting that something
   does not exist, search the code, the data files, the platform's config and the
   platform's source. Name what was searched. Search the library three ways at
-  once: the knowledge graph, search, and the links between its pages.
+  once: the knowledge graph, search, and the links between its pages. If the
+  index finds little, **look yourself** in the repos before answering.
+- **Navigate code like an IDE.** Definition, usages, outline and imports first;
+  grep after. For *why* it changed, read the history.
 - **A finding is evidence at the time, not current state.**
 - **Open the Repo Map or a how-to before searching files.** Repo Map = *where*,
   how-to = *how*, code = the exact signature.

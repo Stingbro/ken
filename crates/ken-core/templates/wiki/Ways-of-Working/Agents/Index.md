@@ -28,8 +28,10 @@ truth for detail.
 1. Open the ticket. Set `status: in-progress`.
 2. Read the **Repo Map** for "where does X live?"
 3. Open **one** matching how-to.
-4. Only then search the code, under the paths the map named. Read the lines
-   around each hit. Do not read a long file whole.
+4. Only then search the code, under the paths the map named. Navigate it the
+   way an IDE does: go to the definition, find its usages, read the file's
+   outline and what it imports. Grep after that. Read the lines around each
+   hit. Do not read a long file whole.
 5. Generated or decompiled sources **last** — see the Research Ladder.
 6. When you learn something lasting, **write it back** into the wiki. Don't
    leave truth only in a chat log.
@@ -39,3 +41,4 @@ truth for detail.
 1. Repo Map = *where* · how-to = *how* · code = the exact signature.
 2. After a hard bug, **compound** the lesson into the how-to or the gotchas.
 3. Do not re-derive what a reference page already holds.
+4. For *why* code is the way it is, read its history before guessing.
