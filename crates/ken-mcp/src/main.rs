@@ -145,6 +145,7 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
             match name {
                 "search_knowledge" | "read_document" | "list_documents" | "list_projects"
                 | "kg_search" | "semantic_search" | "route_query"
+                | "find_definition" | "find_usages" | "file_outline" | "related_files" | "history"
                 | "memory_write" | "journal_append"
                 | "task_create" | "task_list" | "task_update" | "task_complete"
                 | "pipeline_list" | "pipeline_get" | "pipeline_claim" | "pipeline_advance"
@@ -222,7 +223,76 @@ fn tool_definitions(server: &Server) -> Value {
 path from list_projects. Required unless the server was started locked to \
 one project."
     });
+    let code_project = json!({ "type": "string", "description": "Only this project (by name). Default: every project Ken knows, so uses in other repos are found too." });
     let mut tools = vec![
+        json!({
+            "name": "find_definition",
+            "description": "Where a symbol (function, method, class, struct, interface, module) is defined in the code, \
+from Ken's code map (tree-sitter, every indexed repo). Returns each definition's ken:// address with its line, its \
+kind and its doc comment. Use it like 'go to definition'; then read_document or Read the file at that line.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The symbol's name, exactly as written in code (case-insensitive)." },
+                    "project": code_project.clone()
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "find_usages",
+            "description": "Every place a symbol is used (called, referenced, instantiated), each with the function or \
+class it sits in, so its callers. Like 'find usages': who calls this, what breaks if it changes. Names only, no type \
+resolution: two different symbols with one name both show.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The symbol's name (case-insensitive)." },
+                    "limit": { "type": "integer", "description": "Maximum uses to return (default 60)." },
+                    "project": code_project.clone()
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "file_outline",
+            "description": "A code file's definitions in order, nested (classes and their methods), each with its line. \
+Drill into a file before reading all of it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The file's path relative to its project root." },
+                    "project": code_project.clone()
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "related_files",
+            "description": "A code file's neighbours: the files it imports, the files that import it, and the libraries \
+it uses. For how a module fits in and what depends on it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The file's path relative to its project root." },
+                    "project": code_project.clone()
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "history",
+            "description": "When and why something changed, from git (read-only, always current): a file's recent commits (path), or the commits whose message mentions some words or whose change added or removed them (query). Each commit with its date, author, message and the files it touched as ken:// addresses.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A file's path relative to its project root: its history." },
+                    "query": { "type": "string", "description": "Words to find in commit messages and in what changes added or removed." },
+                    "limit": { "type": "integer", "description": "Maximum commits (default 15)." },
+                    "project": code_project.clone()
+                }
+            }
+        }),
         json!({
             "name": "search_knowledge",
             "description": "Full-text search across a Ken project's indexed \
@@ -866,6 +936,11 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "kg_search" => kg_search(server, args),
         "semantic_search" => semantic_search(server, args),
         "route_query" => route_query(server, args),
+        "find_definition" => find_definition(server, args),
+        "find_usages" => find_usages(server, args),
+        "file_outline" => file_outline(server, args),
+        "related_files" => related_files(server, args),
+        "history" => history(server, args),
         "open_in_ken" => open_in_ken(server, args),
         "memory_write" => memory_write_tool(server, args),
         "journal_append" => journal_append_tool(server, args),
@@ -905,8 +980,8 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
             let mut out = note.unwrap_or_default();
             if hits.is_empty() {
                 out.push_str(&format!(
-                    "No matches for {query:?} in project \"{}\". Try fewer or \
-different words — all terms must match.",
+                    "No matches for {query:?} in project \"{}\" (every word must match here; \
+semantic_search is more forgiving). {LOOK_YOURSELF}",
                     project.config.name
                 ));
             } else {
@@ -1175,7 +1250,7 @@ which is off. Use search_knowledge instead."
     let mut out = note.unwrap_or_default();
     if hits.is_empty() {
         out.push_str(&format!(
-            "No matches for {query:?} in project \"{}\".",
+            "No matches for {query:?} in project \"{}\". {LOOK_YOURSELF}",
             project.config.name
         ));
     } else {
@@ -1214,6 +1289,235 @@ this server has no query embedding model; see the tool description):\n",
 /// `query_vec` unconditionally `None` — the "honest adaptation" its module
 /// doc explicitly anticipates for a caller in ken-mcp's position, ending in
 /// the same pure `merge_routed` call `execute_plan` itself makes.
+/// "When and why did this change": a file's commits, or commits whose message
+/// or change matches words, asked of git directly (read-only), so it is as
+/// current as the repo.
+fn history(server: &Server, args: &Value) -> Result<String, String> {
+    let path = args.get("path").and_then(|p| p.as_str()).map(|p| p.replace('\\', "/")).filter(|p| !p.is_empty());
+    let query = args.get("query").and_then(|q| q.as_str()).map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
+    if path.is_none() && query.is_none() {
+        return Err("give a path (a file's history) or a query (commits about it)".into());
+    }
+    let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l.clamp(1, 100) as usize).unwrap_or(15);
+    let roots: Vec<(Uuid, String, PathBuf)> = match args.get("project").and_then(|p| p.as_str()).map(str::trim).filter(|p| !p.is_empty()) {
+        Some(name) => {
+            let (id, root, pname) = resolve_project_by_name(server, name)?;
+            vec![(id, pname, root)]
+        }
+        None => {
+            let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+            registry
+                .projects
+                .iter()
+                .filter(|e| e.path.join(".git").exists())
+                .filter(|e| path.as_ref().is_none_or(|p| e.path.join(p).exists()))
+                .map(|e| (e.id, e.name.clone(), e.path.clone()))
+                .collect()
+        }
+    };
+    let fmt = "--format=%x1e%h%x1f%ad%x1f%an%x1f%s";
+    let n = format!("-n{limit}");
+    let mut out = String::new();
+    let mut count = 0;
+    for (id, project, root) in &roots {
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        match (&path, &query) {
+            (Some(p), _) => runs.push(vec!["log".into(), n.clone(), "--date=short".into(), fmt.into(), "--follow".into(), "--".into(), p.clone()]),
+            (None, Some(q)) => {
+                runs.push(vec!["log".into(), n.clone(), "--date=short".into(), fmt.into(), "--name-only".into(), "-i".into(), format!("--grep={q}")]);
+                runs.push(vec!["log".into(), n.clone(), "--date=short".into(), fmt.into(), "--name-only".into(), format!("-S{q}")]);
+            }
+            _ => {}
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for run in runs {
+            let mut cmd = std::process::Command::new("git");
+            let got = ken_core::proc::quiet(&mut cmd)
+                .args(&run)
+                .current_dir(root)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output();
+            let Ok(got) = got else { continue };
+            if !got.status.success() {
+                continue;
+            }
+            for record in String::from_utf8_lossy(&got.stdout).split('\u{1e}').filter(|r| !r.trim().is_empty()) {
+                let mut lines = record.lines();
+                let head: Vec<&str> = lines.next().unwrap_or("").split('\u{1f}').collect();
+                let [sha, date, author, subject] = head[..] else { continue };
+                if seen.iter().any(|s| s == sha) || count >= limit {
+                    continue;
+                }
+                seen.push(sha.to_string());
+                count += 1;
+                out.push_str(&format!("\n{count}. {sha} {date} {author} — {subject} ({project})"));
+                let files: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).take(6).collect();
+                for f in files {
+                    out.push_str(&format!("\n     {}", ken_address(*id, f)));
+                }
+            }
+        }
+    }
+    if count == 0 {
+        return Ok(format!("No commits found in {} repo(s). {LOOK_YOURSELF}", roots.len()));
+    }
+    let what = match (&path, &query) {
+        (Some(p), _) => format!("history of {p}"),
+        (_, Some(q)) => format!("commits about {q:?} (message or change)"),
+        _ => String::new(),
+    };
+    Ok(format!("{count} commit{} — {what}:{out}", if count == 1 { "" } else { "s" }))
+}
+
+/// The indexes a code question reads: the named project, or every project
+/// Ken knows (uses cross repos).
+fn code_indexes(server: &Server, args: &Value) -> Result<Vec<(Uuid, String, Db)>, String> {
+    if let Some(name) = args.get("project").and_then(|p| p.as_str()).map(str::trim).filter(|p| !p.is_empty()) {
+        let (id, _, pname) = resolve_project_by_name(server, name)?;
+        let db = Db::open_read_only(&server.base_dir, id).map_err(|e| format!("project \"{pname}\" has no index: {e}"))?;
+        return Ok(vec![(id, pname, db)]);
+    }
+    let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    Ok(registry
+        .projects
+        .iter()
+        .filter(|e| e.path.is_dir())
+        .filter_map(|e| Db::open_read_only(&server.base_dir, e.id).ok().map(|db| (e.id, e.name.clone(), db)))
+        .collect())
+}
+
+fn find_definition(server: &Server, args: &Value) -> Result<String, String> {
+    let name = require_str(args, "name")?;
+    let indexes = code_indexes(server, args)?;
+    let mut out = String::new();
+    let mut n = 0;
+    for (id, project, db) in &indexes {
+        for d in ken_core::codemap::definitions(db, &name).map_err(|e| e.to_string())? {
+            n += 1;
+            let docs = d.docs.as_deref().map(|t| format!(" — {}", t.lines().next().unwrap_or("").trim())).unwrap_or_default();
+            out.push_str(&format!(
+                "\n{n}. {} {} — {}#L{} (lines {}-{}, {project}){docs}",
+                d.kind,
+                d.name,
+                ken_address(*id, &d.path),
+                d.line,
+                d.line,
+                d.end_line
+            ));
+        }
+    }
+    if n == 0 {
+        return Ok(format!("No definition of {name:?} in the code map of {} project(s). {LOOK_YOURSELF}", indexes.len()));
+    }
+    Ok(format!("{n} definition{} of {name:?}:{out}", if n == 1 { "" } else { "s" }))
+}
+
+fn find_usages(server: &Server, args: &Value) -> Result<String, String> {
+    let name = require_str(args, "name")?;
+    let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l.clamp(1, 500) as usize).unwrap_or(60);
+    let indexes = code_indexes(server, args)?;
+    let mut lines = Vec::new();
+    let mut mention_lines = Vec::new();
+    let mut callers: Vec<String> = Vec::new();
+    let mut files: std::collections::BTreeSet<String> = Default::default();
+    for (id, project, db) in &indexes {
+        let calls = ken_core::codemap::usages(db, &name, limit).map_err(|e| e.to_string())?;
+        let known: Vec<(String, i64)> = calls.iter().map(|u| (u.path.clone(), u.line)).collect();
+        for u in &calls {
+            if lines.len() >= limit {
+                break;
+            }
+            files.insert(format!("{project}/{}", u.path));
+            if let Some(w) = &u.within {
+                if !callers.contains(w) {
+                    callers.push(w.clone());
+                }
+            }
+            let within = u.within.as_deref().map(|w| format!(" in {w}")).unwrap_or_default();
+            lines.push(format!("{}#L{} ({}{within}, {project})", ken_address(*id, &u.path), u.line, u.kind));
+        }
+        // Uses the grammar does not count as calls: passed as a value, named
+        // in a type, a decorator, an export.
+        for m in ken_core::codemap::mentions(db, &name, &known, limit).map_err(|e| e.to_string())? {
+            if mention_lines.len() >= limit {
+                break;
+            }
+            files.insert(format!("{project}/{}", m.path));
+            let within = m.within.as_deref().map(|w| format!(" in {w}")).unwrap_or_default();
+            mention_lines.push(format!("{}#L{} (referenced{within}, {project})", ken_address(*id, &m.path), m.line));
+        }
+    }
+    let calls_only = lines.len();
+    lines.extend(mention_lines);
+    if lines.is_empty() {
+        return Ok(format!("No uses of {name:?} in the code map of {} project(s). {LOOK_YOURSELF}", indexes.len()));
+    }
+    let mut out = format!(
+        "{} use{} of {name:?} in {} file{} ({calls_only} call{}, {} other reference{})",
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        if calls_only == 1 { "" } else { "s" },
+        lines.len() - calls_only,
+        if lines.len() - calls_only == 1 { "" } else { "s" },
+    );
+    if !callers.is_empty() {
+        out.push_str(&format!("; called from: {}", callers.join(", ")));
+    }
+    out.push(':');
+    for (i, l) in lines.iter().enumerate() {
+        out.push_str(&format!("\n{}. {l}", i + 1));
+    }
+    Ok(out)
+}
+
+/// The index holding `path`: the named project's, or the first that maps it.
+fn index_with_file(server: &Server, args: &Value, path: &str) -> Result<(Uuid, String, Db), String> {
+    let mut indexes = code_indexes(server, args)?;
+    let at = indexes
+        .iter()
+        .position(|(_, _, db)| db.code_symbols(None, Some(path), None, 1).is_ok_and(|s| !s.is_empty()))
+        .ok_or_else(|| format!("No code map for {path:?}: not an indexed code file in a mapped language (Rust, Python, JavaScript, TypeScript, Go, Java, C#). {LOOK_YOURSELF}"))?;
+    Ok(indexes.swap_remove(at))
+}
+
+fn file_outline(server: &Server, args: &Value) -> Result<String, String> {
+    let path = require_str(args, "path")?.replace('\\', "/");
+    let (id, project, db) = index_with_file(server, args, &path)?;
+    let outline = ken_core::codemap::outline(&db, &path).map_err(|e| e.to_string())?;
+    let mut out = format!("{} ({project}) — {} definitions:", ken_address(id, &path), outline.len());
+    for (depth, d) in outline {
+        out.push_str(&format!("\n{}{} {} — L{}-{}", "  ".repeat(depth), d.kind, d.name, d.line, d.end_line));
+    }
+    Ok(out)
+}
+
+fn related_files(server: &Server, args: &Value) -> Result<String, String> {
+    let path = require_str(args, "path")?.replace('\\', "/");
+    let (id, project, db) = index_with_file(server, args, &path)?;
+    let r = ken_core::codemap::related(&db, &path).map_err(|e| e.to_string())?;
+    let list = |files: &[String]| -> String {
+        if files.is_empty() {
+            " (none)".to_string()
+        } else {
+            files.iter().map(|f| format!("\n  - {}", ken_address(id, f))).collect()
+        }
+    };
+    Ok(format!(
+        "{} ({project})\nImports:{}\nImported by:{}\nLibraries and unresolved: {}",
+        ken_address(id, &path),
+        list(&r.imports),
+        list(&r.imported_by),
+        if r.external.is_empty() { "(none)".to_string() } else { r.external.join(", ") }
+    ))
+}
+
+/// Said with every empty search: the index is not the last word. An agent
+/// that reads "no results" as "not there" tells a person something false.
+const LOOK_YOURSELF: &str = "Ken's index can miss things (a file not indexed yet, a recent change, other wording), so this \
+does not mean it isn't there: look directly with Grep, Glob and Read before saying so, and say where you looked.";
+
 /// The reader a search is for (item 2b): `business`, `dev`, or none for any.
 fn audience_arg(args: &Value) -> Option<String> {
     args.get("audience").and_then(|a| a.as_str()).map(str::to_string).filter(|a| !a.is_empty() && a != "any")
@@ -1408,7 +1712,7 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
     out.push('\n');
 
     if report.results.is_empty() {
-        out.push_str("\nNo results.");
+        out.push_str(&format!("\nNo results. {LOOK_YOURSELF}"));
         return out;
     }
     for (i, hit) in report.results.iter().enumerate() {
@@ -3835,18 +4139,73 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_names_four_tools() {
+    fn tools_list_names_the_base_tools() {
         let mut fx = fixture(true);
         let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["search_knowledge", "read_document", "list_documents", "list_projects"]
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"]
         );
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
         }
+    }
+
+    #[test]
+    fn code_tools_find_definitions_usages_outlines_and_neighbours() {
+        let mut fx = fixture(true);
+        std::fs::create_dir_all(fx.root.join("app")).unwrap();
+        std::fs::write(fx.root.join("app/store.py"), "# Keeps the world on disk.\ndef save_world(world):\n    write(world)\n\nclass Store:\n    def open(self):\n        pass\n").unwrap();
+        std::fs::write(fx.root.join("app/game.py"), "from app.store import save_world\n\ndef tick(world):\n    save_world(world)\n").unwrap();
+        let project = Project::open(&fx.root).unwrap();
+        let mut db = Db::open(&fx.server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let (text, is_err) = tool(&mut fx.server, "find_definition", json!({"name": "save_world"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("function save_world") && text.contains("app/store.py#L2"), "{text}");
+        assert!(text.contains("Keeps the world on disk"), "docs: {text}");
+
+        let (text, _) = tool(&mut fx.server, "find_usages", json!({"name": "save_world"}));
+        assert!(text.contains("app/game.py#L4") && text.contains("called from: tick"), "{text}");
+
+        let (text, _) = tool(&mut fx.server, "file_outline", json!({"path": "app/store.py"}));
+        assert!(text.contains("class Store") && text.contains("\n  method open") || text.contains("\n  function open"), "{text}");
+
+        let (text, _) = tool(&mut fx.server, "related_files", json!({"path": "app/game.py"}));
+        assert!(text.contains("Imports:\n  - ken://") && text.contains("app/store.py"), "{text}");
+        let (text, _) = tool(&mut fx.server, "related_files", json!({"path": "app/store.py"}));
+        assert!(text.contains("Imported by:\n  - ken://") && text.contains("app/game.py"), "{text}");
+
+        let (text, _) = tool(&mut fx.server, "find_definition", json!({"name": "nothing_like_it"}));
+        assert!(text.contains("look directly"), "empty says to look: {text}");
+    }
+
+    #[test]
+    fn history_reads_a_files_commits_and_commits_about_words() {
+        let fx = fixture(true);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(&fx.root).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "Tess"]);
+        std::fs::write(fx.root.join("auth.py"), "def check():\n    pass\n").unwrap();
+        git(&["add", "auth.py"]);
+        git(&["commit", "-q", "-m", "add the token check"]);
+        std::fs::write(fx.root.join("auth.py"), "def check():\n    verify_signature()\n").unwrap();
+        git(&["commit", "-q", "-am", "harden it"]);
+        let mut fx = fx;
+        let (text, is_err) = tool(&mut fx.server, "history", json!({"path": "auth.py", "project": "Atlas"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("2 commits") && text.contains("harden it") && text.contains("Tess"), "{text}");
+        let (text, _) = tool(&mut fx.server, "history", json!({"query": "verify_signature", "project": "Atlas"}));
+        assert!(text.contains("harden it") && !text.contains("add the token check"), "by change: {text}");
+        let (text, _) = tool(&mut fx.server, "history", json!({"query": "token check", "project": "Atlas"}));
+        assert!(text.contains("add the token check"), "by message: {text}");
     }
 
     #[test]
@@ -4038,7 +4397,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
             "flag off must be byte-identical to pre-kg-routing tool list"
         );
 
@@ -4060,6 +4419,11 @@ mod tests {
         assert_eq!(
             names,
             [
+                "find_definition",
+                "find_usages",
+                "file_outline",
+                "related_files",
+                "history",
                 "search_knowledge",
                 "read_document",
                 "list_documents",
@@ -4195,7 +4559,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
             "flag off must be byte-identical to pre-ken-memory tool list"
         );
 
@@ -4371,7 +4735,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
             "flag off must be byte-identical to pre-ken-tasks tool list"
         );
 
@@ -4760,7 +5124,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
             "flag off must be byte-identical to pre-ken-families tool list"
         );
 

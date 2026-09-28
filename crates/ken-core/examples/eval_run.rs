@@ -215,6 +215,7 @@ fn phase_index(base: &Path, parent: &Path) -> Result<()> {
         let stats = scan::scan(&p, &mut db)?;
         let _ = db.backfill_page_meta();
         let _ = db.backfill_page_links();
+        let _ = db.backfill_code_map();
         let _ = db.backfill_extractions();
         let tiers = tier_counts(base, p.config.id);
         println!(

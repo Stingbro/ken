@@ -17,6 +17,7 @@
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
   import { kindForPath } from "../lib/format";
+  import { parseCitation } from "../lib/citation";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
 
@@ -74,6 +75,29 @@
   }
 
   let results = $state<DisplayHit[]>([]);
+  // "Ask Ken to look": a read-only Claude pass over the workspace when the
+  // index found nothing that answers, so Ken never says "not there" on the
+  // index's word alone.
+  let look = $state<{ query: string; state: "looking" | "done" | "error"; body: string; sources: string[] } | null>(null);
+  async function askKenToLook() {
+    const q = query.trim();
+    if (!q) return;
+    look = { query: q, state: "looking", body: "", sources: [] };
+    try {
+      const found = await api.lookFor(q);
+      if (look?.query === q) look = { query: q, state: "done", body: found.body, sources: found.sources };
+    } catch (e) {
+      if (look?.query === q) look = { query: q, state: "error", body: String(e), sources: [] };
+    }
+  }
+  async function openCited(source: string) {
+    const c = parseCitation(source);
+    if (!c) return app.openInFiles(source);
+    if (c.projectId && c.projectId !== app.focused && c.projectId !== "workspace") {
+      await app.focusMember(c.projectId);
+    }
+    app.openAt(c.path, { line: c.line, anchor: c.anchor });
+  }
   /** Per-member coverage caveats for the current all-projects search — a
    *  dormant/missing/invalid member (keyword fan-out) or an index-building/
    *  unavailable one (routed) — so a short result list doesn't read as
@@ -542,7 +566,34 @@
         </button>
       {/each}
     </div>
-  {:else if searched}
+  {/if}
+
+  {#if look && look.query === query.trim()}
+    <div class="qa">
+      <div class="qa-head">Ken looked</div>
+      {#if look.state === "looking"}
+        <div class="qa-body qa-thinking">Looking through the folders itself…</div>
+      {:else}
+        <div class="qa-body">{@html renderMarkdown(look.body)}</div>
+        {#if look.sources.length}
+          <div class="qa-foot">
+            {#each look.sources as source (source)}
+              <button class="qa-chip mono" title={source} onclick={() => openCited(source)}>
+                {source.split("/").pop()?.split("#")[0] || source}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
+  {:else if searched && results.length < 3 && query.trim().length >= 3}
+    <div class="look-row">
+      <span>Not much in the index for this.</span>
+      <button class="qa-dig" onclick={askKenToLook}>Ask Ken to look</button>
+    </div>
+  {/if}
+
+  {#if results.length === 0 && searched}
     <div class="empty">
       {#if scope === "all"}
         Nothing across your open projects matches “{query}”.
@@ -871,6 +922,14 @@
     color: var(--accent);
     font-weight: 600;
     cursor: pointer;
+  }
+  .look-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 16px 0;
+    font-size: 12px;
+    color: var(--ink-tertiary);
   }
   .qa-dig:hover {
     text-decoration: underline;

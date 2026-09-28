@@ -395,7 +395,7 @@ pub fn parse_rulings(text: &str) -> Vec<Ruling> {
     out
 }
 
-fn days_between(earlier: &str, now_epoch: i64) -> Option<i64> {
+pub(crate) fn days_between(earlier: &str, now_epoch: i64) -> Option<i64> {
     let d = chrono_free_epoch(earlier)?;
     Some((now_epoch - d) / 86_400)
 }

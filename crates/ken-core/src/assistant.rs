@@ -144,6 +144,47 @@ pub fn oneshot(
     timeout: Duration,
     cancel: &CancelToken,
 ) -> Result<OneshotOutcome> {
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &["--permission-mode".into(), "acceptEdits".into()])
+}
+
+/// The tools a [`look`] may use: reading and searching, nothing that writes
+/// or runs.
+pub const LOOK_TOOLS: &str = "Read,Grep,Glob,LS";
+
+/// A read-only session that searches `dirs` itself: the fallback when Ken's
+/// index found nothing, so "not there" is only said after looking. It may
+/// read and search every folder given and write nothing.
+pub fn look(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut args: Vec<String> = vec![
+        "--permission-mode".into(),
+        "default".into(),
+        "--allowedTools".into(),
+        LOOK_TOOLS.into(),
+        "--disallowedTools".into(),
+        "Edit,MultiEdit,Write,NotebookEdit,Bash".into(),
+    ];
+    for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
+fn run_oneshot(
+    binary: &Path,
+    project_root: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    access: &[String],
+) -> Result<OneshotOutcome> {
     if !runner::is_executable(binary) {
         return Ok(OneshotOutcome::Failed(
             runner::MISSING_CLAUDE_HELP.to_string(),
@@ -153,7 +194,9 @@ pub fn oneshot(
     // The prompt goes in on stdin: on Windows an argument with a line break
     // cannot reach the `.cmd` launcher at all (see `proc::spawn_with_input`).
     let mut cmd = std::process::Command::new(binary);
-    cmd.args(["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--session-id", &session_id])
+    cmd.args(["-p", "--output-format", "json"])
+        .args(access)
+        .args(["--session-id", &session_id])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

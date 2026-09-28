@@ -119,6 +119,38 @@ export type Audience = "business" | "dev" | null;
 /** What a file is for (`contenttype::of`); every search hit carries one. */
 export type ContentType = "code" | "test" | "spec" | "doc" | "config" | "data" | "design" | "meeting" | "ticket";
 
+/** One definition in a code file's outline. Lines are 1-based. */
+export interface CodeSymbol {
+  path: string;
+  name: string;
+  kind: string;
+  line: number;
+  endLine: number;
+  isDef: boolean;
+  docs: string | null;
+  depth: number;
+}
+
+export interface CodeFile {
+  outline: CodeSymbol[];
+  related: { imports: string[]; external: string[]; importedBy: string[] };
+}
+
+/** A definition or use of a symbol, in some workspace project. */
+export interface CodeUse {
+  projectId: string;
+  memberName: string;
+  path: string;
+  line: number;
+  kind: string;
+  within: string | null;
+}
+
+export interface CodeUsages {
+  definitions: CodeUse[];
+  uses: CodeUse[];
+}
+
 /** A search's kind filter: one kind, several comma-separated, or null for all. */
 export type KindFilter = string | null;
 
@@ -1806,6 +1838,11 @@ export const api = {
   /** A page's links both ways: pages it reaches, pages that reach it. */
   pageLinks: (path: string) =>
     invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),
+  /** A code file's outline (definitions, nested) and the files it imports
+   *  and is imported by, from Ken's code map. */
+  codeFile: (path: string) => invoke<CodeFile>("code_file", { path }),
+  /** Go to definition and find usages for a symbol, across the workspace. */
+  codeUsages: (name: string) => invoke<CodeUsages>("code_usages", { name }),
   setProjectIndex: (id: string, index: IndexState | null) =>
     invoke<RegistryEntryStatus[]>("set_project_index", { id, index }),
   setProjectKind: (id: string, kind: RepoKind[], team: string | null) =>
@@ -2119,6 +2156,9 @@ export const api = {
   currentDigest: () => invoke<DigestDto | null>("current_digest"),
   refreshDigest: () => invoke<void>("refresh_digest"),
   quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
+  /** Search found nothing that answers: a read-only Claude session looks
+   *  through the workspace's folders itself and answers with ken:// sources. */
+  lookFor: (query: string) => invoke<{ body: string; sources: string[] }>("look_for", { query }),
   llmStatus: () => invoke<"ready" | "notInstalled" | "error">("llm_status"),
   /// Fire-and-forget: warm the on-device model (⌘K open) so the first answer
   /// streams without paying the load. No-op when no local model is installed.

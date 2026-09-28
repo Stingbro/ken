@@ -383,11 +383,215 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
     // current for less: a nudge on relevance, not a wall. A strict band order
     // put a generic process page that barely matched above the page that
     // answers the question.
+    let intent = query_intent(query);
+    let now = crate::engine::now_epoch();
     for hit in &mut hits {
-        hit.score += band_bonus(hit);
+        hit.score += band_bonus(hit) + hygiene(hit, now) + intent_bonus(intent, &hit.path);
     }
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    follow_links(db, &mut hits)?;
+    find_symbols(db, query, intent, &mut hits)?;
     Ok(hits)
+}
+
+/// What a definition of a symbol the query names adds: as much as a file
+/// name match, so "where is get_current_user" leads with its definition.
+pub const W_SYMBOL: f64 = 3.5;
+
+/// The code map as a signal: a query that names a symbol (an identifier, or
+/// any word when the question is about code) puts where it is defined among
+/// the hits, at its line. Prose questions are left to the text layers.
+fn find_symbols(db: &Db, query: &str, intent: Option<Intent>, hits: &mut Vec<HybridHit>) -> Result<()> {
+    if intent == Some(Intent::Prose) {
+        return Ok(());
+    }
+    let identifier = |w: &str| {
+        w.contains('_') || w.contains("::") || w.chars().zip(w.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase())
+    };
+    let words: Vec<String> = query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .map(|w| w.trim_matches(':').to_string())
+        .filter(|w| w.len() >= 3)
+        .filter(|w| identifier(w) || intent == Some(Intent::Code))
+        .filter(|w| !crate::db::significant_tokens(w).is_empty())
+        .collect();
+    let mut changed = false;
+    for word in words.iter().take(4) {
+        let name = word.rsplit("::").next().unwrap_or(word);
+        for def in db.code_symbols(Some(name), None, Some(true), 5)? {
+            changed = true;
+            if let Some(hit) = hits.iter_mut().find(|h| h.path == def.path) {
+                hit.score += W_SYMBOL;
+                hit.line = Some(def.line);
+            } else if let Some((chunk_id, text)) = db.chunk_at_line(&def.path, def.line)? {
+                hits.push(HybridHit {
+                    path: def.path.clone(),
+                    chunk_id,
+                    snippet: text,
+                    source: search::Source::Keyword,
+                    line: Some(def.line),
+                    page: None,
+                    score: W_SYMBOL,
+                });
+            }
+        }
+    }
+    if changed {
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    }
+    Ok(())
+}
+
+/// What a page linked with a top hit adds: the wiki's own "see also".
+pub const W_LINK: f64 = 0.4;
+/// Pages the top hits link to or from, joined when search missed them.
+const LINKED_ADDED: usize = 3;
+
+/// The wiki's links as a signal: pages linked to or from the best page hits
+/// rank a little higher, and a few the search missed join at the end
+/// ("Permit to Build" beside the Change Order that names it). Pages only;
+/// the text layers already found everything else.
+fn follow_links(db: &Db, hits: &mut Vec<HybridHit>) -> Result<()> {
+    let is_page = |p: &str| p.ends_with(".md") || p.ends_with(".markdown");
+    let top: Vec<String> = hits.iter().filter(|h| is_page(&h.path)).take(3).map(|h| h.path.clone()).collect();
+    if top.is_empty() {
+        return Ok(());
+    }
+    let links = db.all_page_links()?;
+    if links.is_empty() {
+        return Ok(());
+    }
+    let resolver = crate::links::Resolver::from_db(db)?;
+    let mut neighbours: Vec<String> = Vec::new();
+    for (from, link) in &links {
+        let to = resolver.resolve(link);
+        let from_top = top.contains(from);
+        for t in &to {
+            let other = if from_top && !top.contains(t) {
+                Some(t.clone())
+            } else if top.contains(t) && !top.contains(from) {
+                Some(from.clone())
+            } else {
+                None
+            };
+            if let Some(o) = other.filter(|o| !neighbours.contains(o)) {
+                neighbours.push(o);
+            }
+        }
+    }
+    // A "see also" never passes the page that points to it: a linked page
+    // rises among the rest, up to just under the lowest of the top pages.
+    let ceiling = hits
+        .iter()
+        .filter(|h| top.contains(&h.path))
+        .map(|h| h.score)
+        .fold(f64::INFINITY, f64::min)
+        - 1e-6;
+    let mut added = 0;
+    for n in &neighbours {
+        if let Some(hit) = hits.iter_mut().find(|h| &h.path == n) {
+            hit.score = (hit.score + W_LINK).min(ceiling.max(hit.score));
+        } else if added < LINKED_ADDED {
+            if let Some((chunk_id, text)) = db.first_chunk(n)? {
+                added += 1;
+                hits.push(HybridHit {
+                    path: n.clone(),
+                    chunk_id,
+                    snippet: text,
+                    source: search::Source::Keyword,
+                    line: db.chunk_line(chunk_id)?,
+                    page: crate::pagemeta::hit_page(n, db.page_meta(n)?),
+                    score: W_LINK,
+                });
+            }
+        }
+    }
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    Ok(())
+}
+
+/// What a question is after, read from its words: how code works, or what
+/// people wrote and decided. A nudge toward those kinds, never a filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    Code,
+    Prose,
+}
+
+const CODE_WORDS: &[&str] = &[
+    "implement", "implemented", "implementation", "function", "method", "class", "struct", "trait", "interface",
+    "defined", "definition", "declared", "call", "calls", "called", "caller", "callers", "returns", "endpoint",
+    "handler", "module", "import", "imports", "variable", "compile", "exception", "stacktrace", "code", "api",
+];
+const PROSE_WORDS: &[&str] = &[
+    "who", "when", "why", "decided", "decision", "decisions", "meeting", "owner", "owns", "deadline", "budget",
+    "fee", "cost", "agreed", "policy", "roadmap", "milestone", "status", "plan", "contract", "client",
+];
+
+/// The [`Intent`] a query shows, if it shows one clearly. An identifier in
+/// the query (`get_user`, `LlmGateway`, `app::core`, `auth.py`) counts as code.
+pub fn query_intent(query: &str) -> Option<Intent> {
+    let words: Vec<&str> = query.split(|c: char| c.is_whitespace() || matches!(c, '?' | ',' | '"')).filter(|w| !w.is_empty()).collect();
+    let lower = |w: &str| w.to_lowercase();
+    let identifier = words.iter().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '.');
+        w.contains("::")
+            || w.contains("()")
+            || (w.contains('_') && w.len() > 3)
+            || w.chars().zip(w.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase())
+            || [".rs", ".py", ".ts", ".tsx", ".js", ".go", ".java", ".cs"].iter().any(|e| w.ends_with(e))
+    });
+    let code = identifier || words.iter().any(|w| CODE_WORDS.contains(&lower(w).as_str()));
+    let prose = words.iter().any(|w| PROSE_WORDS.contains(&lower(w).as_str()));
+    match (code, prose) {
+        (true, false) => Some(Intent::Code),
+        (false, true) => Some(Intent::Prose),
+        _ => None,
+    }
+}
+
+/// What a hit's kind adds when it is the kind the question is after.
+pub const W_INTENT: f64 = 0.5;
+
+fn intent_bonus(intent: Option<Intent>, path: &str) -> f64 {
+    use crate::contenttype::ContentType as T;
+    match (intent, crate::contenttype::of(path)) {
+        (Some(Intent::Code), T::Code | T::Test) => W_INTENT,
+        (Some(Intent::Prose), T::Doc | T::Meeting | T::Spec | T::Ticket) => W_INTENT,
+        _ => 0.0,
+    }
+}
+
+/// Machine-written text (an inlined search index, a data dump in one line)
+/// matches everything a little and answers nothing: well under any real hit.
+pub const W_BLOB: f64 = 1.5;
+/// A page verified this long ago counts a little less.
+pub const STALE_DAYS: i64 = 180;
+pub const W_STALE: f64 = 0.25;
+
+/// What text that no person wrote, and a page long unchecked, take off.
+fn hygiene(hit: &HybridHit, now: i64) -> f64 {
+    let mut s = 0.0;
+    if machine_written(&hit.snippet) {
+        s -= W_BLOB;
+    }
+    let stale = hit
+        .page
+        .as_ref()
+        .and_then(|p| p.verified.as_deref())
+        .and_then(|v| crate::drift::days_between(v, now))
+        .is_some_and(|d| d > STALE_DAYS);
+    if stale {
+        s -= W_STALE;
+    }
+    s
+}
+
+/// One very long line, or a long chunk with almost no line breaks: written
+/// by a tool, not a person.
+pub fn machine_written(text: &str) -> bool {
+    let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    longest > 1000 || (text.len() > 1500 && text.lines().count() < 4)
 }
 
 /// [`search_member`] keeping only hits of the content types asked for (none
@@ -633,13 +837,19 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
     });
     // One copy of a file kept in several repos (a vendored PDF, a design
     // asset): the same name and the same text is one answer, at its best rank.
+    // A longer passage is the same answer wherever it sits (a copied doc, a
+    // second checkout); a short one only when the file name matches too.
     let mut seen: std::collections::HashSet<(String, String)> = Default::default();
     let results = candidates
         .into_iter()
         .map(|c| c.3)
         .filter(|h| {
-            let name = h.path.rsplit('/').next().unwrap_or(&h.path).to_lowercase();
-            seen.insert((name, h.snippet.clone()))
+            let name = if h.snippet.trim().len() > 80 {
+                String::new()
+            } else {
+                h.path.rsplit('/').next().unwrap_or(&h.path).to_lowercase()
+            };
+            seen.insert((name, h.snippet.trim().to_string()))
         })
         .take(limit)
         .collect();
@@ -853,6 +1063,55 @@ mod tests {
         assert_eq!(report.results[3].path, "b/two.md");
         // B's rank-3 hit (no A counterpart) is last.
         assert_eq!(report.results[4].path, "b/three.md");
+    }
+
+    /// A query naming a function leads with where it is defined, at its line.
+    #[test]
+    fn a_symbol_the_query_names_leads_with_its_definition() {
+        use crate::project::Project;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("app/auth.py"), "import jwt\n\n\ndef get_current_user(token):\n    return jwt.decode(token)\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# Notes\n\nWe talked about get current user flows a lot, current user this, current user that.\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let hits = search_member(&db, "where is get_current_user defined", None, 8).unwrap();
+        assert_eq!(hits.first().map(|h| (h.path.as_str(), h.line)), Some(("app/auth.py", Some(4))), "{hits:?}");
+    }
+
+    /// A page the query's words never reach still comes back when the page
+    /// that answers links to it.
+    #[test]
+    fn a_page_linked_from_the_answer_comes_with_it() {
+        use crate::project::Project;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Change Order.md"), "# Change Order\n\nBuild starts once the [[Permit]] is issued.\n").unwrap();
+        std::fs::write(dir.path().join("Permit.md"), "# Permit\n\nIssued by the client's office by July 17.\n").unwrap();
+        std::fs::write(dir.path().join("Other.md"), "# Other\n\nUnrelated notes.\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let hits = search_member(&db, "when does build start", None, 8).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths.first(), Some(&"Change Order.md"), "{paths:?}");
+        assert!(paths.contains(&"Permit.md"), "the linked page joins: {paths:?}");
+        assert!(!paths.contains(&"Other.md"), "{paths:?}");
+    }
+
+    #[test]
+    fn a_question_says_what_it_is_after_and_machine_text_is_spotted() {
+        assert_eq!(query_intent("How is the token validated in the auth handler?"), Some(Intent::Code));
+        assert_eq!(query_intent("where is get_current_user defined"), Some(Intent::Code));
+        assert_eq!(query_intent("what does LlmGateway.chat return"), Some(Intent::Code));
+        assert_eq!(query_intent("who decided the release date"), Some(Intent::Prose));
+        assert_eq!(query_intent("what is the fee in the contract"), Some(Intent::Prose));
+        assert_eq!(query_intent("tell me about the save format"), None);
+        assert_eq!(query_intent("who calls the save function"), None, "both: no nudge");
+
+        assert!(machine_written(&format!("const SEARCH = [{}];", "{\"a\":1},".repeat(300))));
+        assert!(!machine_written("fn save() {\n    write();\n}\n"));
+        assert!(!machine_written(&"A person wrote this line.\n".repeat(80)));
     }
 
     /// Relevance decides across members: a strong hit in the second repo

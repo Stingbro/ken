@@ -257,9 +257,18 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
 pub fn built_in_rule_sets() -> Vec<Rule> {
     ARCHIVE_PATTERNS
         .iter()
+        .chain(GENERATED_PATTERNS)
         .map(|p| Rule { tier: Tier::Ignore, pattern: (*p).into() })
         .collect()
 }
+
+/// Files a tool writes and no one reads for meaning: minified bundles,
+/// source maps, lockfiles. They match many searches a little and answer none.
+/// A `!` line brings one back.
+const GENERATED_PATTERNS: &[&str] = &[
+    "*.min.js", "*.min.css", "*.map", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock",
+    "uv.lock", "Gemfile.lock", "composer.lock",
+];
 
 const ARCHIVE_PATTERNS: &[&str] = &["*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.tgz", "*.iso", "*.jar"];
 
@@ -605,6 +614,12 @@ mod tests {
         assert_eq!(classify("clip.mp4", false, &[&built]), Tier::Full, "media stays: Ken transcribes it");
         let user = parse("!*.zip\n");
         assert_eq!(classify("backups/world.zip", false, &[&built, &user]), Tier::Full);
+        // What a tool writes: bundles, maps, lockfiles.
+        for path in ["dist/app.min.js", "web/site.min.css", "dist/app.js.map", "package-lock.json", "api/uv.lock", "Cargo.lock"] {
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignore, "{path}");
+        }
+        assert_eq!(classify("src/app.js", false, &[&built]), Tier::Full);
+        assert_eq!(classify("package.json", false, &[&built]), Tier::Full);
     }
 
     #[test]

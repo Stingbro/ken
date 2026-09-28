@@ -272,6 +272,32 @@ keyword index over sections.
 - [ ] In chat, ask Claude to "search only specs for …": its Ken search
   results carry `[spec]` tags and nothing else.
 
+## 14c. Code structure: definitions, usages, imports, history
+
+- [ ] Open a code file (Rust, Python, JS/TS, Go, Java or C#) in Files: under
+  it, Outline (count), Imports and Imported by. Open Outline: definitions
+  nested (methods under their class); click one and the file jumps to it.
+- [ ] Click "usages" on a function: every call and reference across the
+  workspace's repos, each with the function it sits in; "defined" rows
+  first. Click one in another repo: that repo is focused and the file opens
+  at the line.
+- [ ] Search `get_current_user` (any identifier): its definition is first,
+  at its line.
+- [ ] In chat ask "who calls <function>?" and "what depends on <file>?":
+  Claude uses find_usages / related_files and cites ken:// lines. Ask "when
+  did <file> last change and why?": it uses history.
+- [ ] An existing project (indexed before this): the code panel works on
+  first open without a rescan (backfill from stored text).
+
+## 14d. When the index finds nothing (needs Claude)
+
+- [ ] ⌘K a question with few or no hits: "Ask Ken to look" appears. Click
+  it: after a short wait, "Ken looked" with an answer and sources; a source
+  in another repo opens there. Nothing is written.
+- [ ] In chat, ask about something Ken's index cannot find but is in a
+  sibling repo: Claude says Ken's search found nothing, looks with Grep/Read,
+  and cites what it found. It never answers "not there" without looking.
+
 ## 14b. The map comes from Claude (needs Claude)
 
 - [ ] With no on-device language model installed (only the embedding

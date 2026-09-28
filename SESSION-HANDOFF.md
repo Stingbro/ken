@@ -513,6 +513,27 @@ will need their own lines there once decided.
   Open: the new wiki's Ways-of-Working template pages rank in the top band
   and surface in unrelated questions; code questions often get the spec
   or design doc first.
+- **Code map, history, fallback, ranking hygiene (2026-09-28).**
+  - `codemap.rs`: tree-sitter tags (Rust, Python, JS, TS/TSX, Go, Java,
+    C#) into `code_symbols`/`code_imports` (schema 15) at scan, backfilled
+    once from stored text (`code_map_backfilled` meta). Definitions, calls
+    with the enclosing function (callers), whole-word mentions for uses the
+    tags miss (`Depends(fn)`), outlines, imports resolved to files both ways.
+  - MCP: `find_definition`, `find_usages`, `file_outline`, `related_files`,
+    `history` (git log by path, or by message and `-S` change; read-only).
+    Allowed in chat; the guide says to navigate code like an IDE.
+  - Files: `CodeMap.svelte` under code files (outline, imports, imported
+    by, usages across the workspace); `code_file`/`code_usages` commands.
+  - Search: a query naming a symbol leads with its definition (W_SYMBOL).
+  - Fallback: chat gets `--add-dir` for every workspace repo and a rule to
+    look (Grep/Glob/Read) before saying something is absent; empty MCP
+    results say so; ⌘K "Ask Ken to look" runs `assistant::look` (read-only
+    tools only) and returns ken:// sources.
+  - Ranking: minified/maps/lockfiles ignored by default; one-line machine
+    text −1.5; duplicate passages collapse across repos; pages verified over
+    180 days ago −0.25; question shape nudges code vs prose ±0.5; the top
+    page hits' wiki links rise (never past them) and up to 3 linked pages
+    join.
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)

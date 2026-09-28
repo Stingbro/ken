@@ -223,13 +223,25 @@ by that address, with #L<line> when it has a line. Never open files or switch th
 is how they go there.\n\
 3. Search with Ken first. Ken's tools (route_query across the workspace, semantic_search in one project, kg_search \
 over the knowledge graph, search_knowledge, read_document) search the team's wiki, docs and code with Ken's own \
-ranking and return ken:// addresses to cite. open_in_ken opens a file for the person: use it only when they explicitly \
-ask you to open or show something.";
+ranking and return ken:// addresses to cite. For code, navigate like an IDE: find_definition to go to a symbol, \
+find_usages for every use and its callers, file_outline to drill into a file, related_files for what it imports and \
+what imports it; then read the lines they point to. history tells when and why something changed (a file's \
+commits, or commits about some words). open_in_ken opens a file for the person: use it only when they explicitly \
+ask you to open or show something.\n\
+4. Never say something isn't there because Ken's search did not find it. Its index can miss a file, a new change or \
+different wording. When Ken finds nothing, or nothing that answers, look yourself with Grep, Glob and Read, in this \
+project and the workspace's other repos (you may read them all), then answer, say you found it by looking directly, \
+and cite the file. Only after looking may you say it isn't there, and say where you looked.";
 
 /// Ken's own MCP tools the chat may use without asking: they read Ken's
 /// index, or open a file for the person when they asked. Its tools that
 /// write (memories, tasks, messages to teammates) are declined in chat.
-pub const KEN_MCP_ALLOWED: [&str; 10] = [
+pub const KEN_MCP_ALLOWED: [&str; 15] = [
+    "history",
+    "find_definition",
+    "find_usages",
+    "file_outline",
+    "related_files",
     "search_knowledge",
     "read_document",
     "list_documents",
@@ -506,6 +518,9 @@ pub struct ChatEngine {
     /// Ken's MCP server for this project, as a Claude Code `--mcp-config`
     /// file, when ken-mcp was found.
     mcp_config: Mutex<Option<PathBuf>>,
+    /// The workspace's other repos, readable in chat without asking
+    /// (`--add-dir`), so a search Ken's index missed can be done by hand.
+    read_dirs: Mutex<Vec<PathBuf>>,
     live: Arc<Mutex<HashMap<String, Conversation>>>,
     on_update: Arc<dyn Fn(ChatUpdate) + Send + Sync>,
 }
@@ -520,6 +535,7 @@ impl ChatEngine {
             binary,
             project_root,
             mcp_config: Mutex::new(None),
+            read_dirs: Mutex::new(Vec::new()),
             live: Arc::new(Mutex::new(HashMap::new())),
             on_update: Arc::new(on_update),
         }
@@ -528,6 +544,12 @@ impl ChatEngine {
     /// Give new chat sessions Ken's MCP server (a `--mcp-config` file).
     pub fn set_mcp_config(&self, path: Option<PathBuf>) {
         *self.mcp_config.lock().unwrap() = path;
+    }
+
+    /// The other folders a chat may read (the workspace's repos). Edits
+    /// there still come back as proposals to review, like any edit.
+    pub fn set_read_dirs(&self, dirs: Vec<PathBuf>) {
+        *self.read_dirs.lock().unwrap() = dirs;
     }
 
     pub fn is_live(&self, chat_id: &str) -> bool {
@@ -713,6 +735,9 @@ impl ChatEngine {
         cmd.arg("--append-system-prompt").arg(KEN_GUIDE.replace('\n', " "));
         if let Some(cfg) = self.mcp_config.lock().unwrap().clone() {
             cmd.arg("--mcp-config").arg(cfg);
+        }
+        for dir in self.read_dirs.lock().unwrap().iter().filter(|d| **d != self.project_root) {
+            cmd.arg("--add-dir").arg(dir);
         }
         // Only forward a validated stable alias; anything else falls back to the
         // CLI's own default model.

@@ -7,6 +7,7 @@ pub mod automation;
 pub mod bg_hydrate;
 pub mod chat;
 pub mod chunker;
+pub mod codemap;
 pub mod cloud;
 pub mod contenttype;
 pub mod db;

@@ -530,6 +530,13 @@ fn index_one(
         let links = if status == STATUS_INDEXED { crate::links::extract(rel, &text) } else { Vec::new() };
         db.set_page_links(rel, &links)?;
     }
+    // The code map: definitions, references and imports, for "find usages"
+    // and "go to definition". Every tier: a code repo is search-only and
+    // this is exactly what it is searched for.
+    if crate::codemap::Lang::of(rel).is_some() {
+        let map = if status == STATUS_INDEXED { crate::codemap::map_file(rel, &text).unwrap_or_default() } else { Default::default() };
+        db.set_code_map(rel, &map)?;
+    }
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
     // churn without a content change never re-runs extraction. kenignore D3/

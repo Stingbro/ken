@@ -752,6 +752,11 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     if let Err(e) = db.backfill_page_links() {
         eprintln!("warning: page links backfill failed: {e}");
     }
+    // The code map for an index made before it: definitions, usages and
+    // imports parsed from the stored text, no rescan.
+    if let Err(e) = db.backfill_code_map() {
+        eprintln!("warning: code map backfill failed: {e}");
+    }
 
     // One-time extraction backfill: a project indexed before the incremental
     // Map landed has no `extractions` rows, and the scanner never re-runs
@@ -1058,6 +1063,20 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         if std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, cfg.to_string())).is_ok() {
             engine.set_mcp_config(Some(path));
         }
+    }
+    // The workspace's other repos, readable in chat: when Ken's index misses
+    // something, Claude looks for it by hand rather than saying it isn't there.
+    if let (Some(engine), Some(ws)) = (&chat_engine, guard.workspace.as_ref()) {
+        let roots: Vec<PathBuf> = ws
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some(p.root.clone()),
+                _ => None,
+            })
+            .collect();
+        engine.set_read_dirs(roots);
     }
 
     // Sync engine: active git sync when the folder is a repo with a
@@ -7137,6 +7156,77 @@ listing the project-relative paths you used (omit the line if none).\n",
     p
 }
 
+/// What a look found: the answer and the `ken://` sources it cites.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LookAnswer {
+    body: String,
+    sources: Vec<String>,
+}
+
+/// The prompt for [`look_for`]: the question, the folders to search, and how
+/// to cite across them.
+fn look_prompt(query: &str, folders: &[(String, uuid::Uuid, PathBuf)]) -> String {
+    let mut p = format!(
+        "Question: {query}\n\nKen's search index found nothing strong for this, which does not mean it isn't there. \
+Look for the answer yourself with Grep, Glob and Read in these folders:\n"
+    );
+    for (name, id, root) in folders {
+        p.push_str(&format!("- {name}: {} (cite its files as ken://{id}/<path>#L<line>)\n", root.display()));
+    }
+    p.push_str(
+        "\nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
+If after looking it genuinely is not there, say so plainly and say where you looked. End with a final line \
+`SOURCES: ken://…, ken://…` listing the addresses you cited (omit the line if none).\n",
+    );
+    p
+}
+
+/// "Ask Ken to look": when search found nothing, or nothing that answers, a
+/// read-only Claude session searches the workspace's folders itself (Grep,
+/// Glob, Read; nothing that writes or runs) and answers with citations. The
+/// fallback that keeps Ken from saying something isn't there when only its
+/// index missed it.
+#[tauri::command]
+async fn look_for(state: State<'_, SharedState>, query: String) -> CmdResult<LookAnswer> {
+    let (root, folders) = {
+        let guard = state.lock().unwrap();
+        let active = member(&guard, None)?;
+        let mut folders: Vec<(String, uuid::Uuid, PathBuf)> = match guard.workspace.as_ref() {
+            Some(ws) => ws
+                .ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some((m.name.clone(), p.config.id, p.root.clone())),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        if !folders.iter().any(|(_, id, _)| *id == active.project.config.id) {
+            folders.insert(0, (active.project.config.name.clone(), active.project.config.id, active.project.root.clone()));
+        }
+        (active.project.root.clone(), folders)
+    };
+    let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let dirs: Vec<PathBuf> = folders.iter().map(|(_, _, r)| r.clone()).collect();
+        let prompt = look_prompt(&query, &folders);
+        match assistant::look(&binary, &root, &dirs, &prompt, Duration::from_secs(180), &CancelToken::new()).map_err(err)? {
+            OneshotOutcome::Completed(text) => {
+                let parsed = digest::parse_digest(&text);
+                Ok(LookAnswer { body: parsed.body, sources: parsed.sources })
+            }
+            OneshotOutcome::TimedOut => Err("Looking took too long; try a narrower question.".to_string()),
+            OneshotOutcome::Cancelled => Err("cancelled".to_string()),
+            OneshotOutcome::Failed(detail) => Err(detail),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Kick off a background quick answer for a ⌘K query. Prefers the on-device
 /// model — streaming `quick-answer-delta` chunks and a final `quick-answer` —
 /// and falls back silently to the Claude oneshot when the local model isn't
@@ -7826,6 +7916,110 @@ fn page_links(state: State<SharedState>, path: String) -> CmdResult<ken_core::li
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
     ken_core::links::page_links(&active.db, &path).map_err(err)
+}
+
+/// A code file's structure for the Files panel: its definitions in order
+/// (with nesting depth) and the files it imports and is imported by.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeFileDto {
+    outline: Vec<CodeOutlineItem>,
+    related: ken_core::codemap::Related,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeOutlineItem {
+    depth: usize,
+    #[serde(flatten)]
+    symbol: ken_core::codemap::Symbol,
+}
+
+#[tauri::command]
+fn code_file(state: State<SharedState>, path: String) -> CmdResult<CodeFileDto> {
+    let guard = state.lock().unwrap();
+    let active = member(&guard, None)?;
+    let outline = ken_core::codemap::outline(&active.db, &path)
+        .map_err(err)?
+        .into_iter()
+        .map(|(depth, symbol)| CodeOutlineItem { depth, symbol })
+        .collect();
+    let related = ken_core::codemap::related(&active.db, &path).map_err(err)?;
+    Ok(CodeFileDto { outline, related })
+}
+
+/// One use of a symbol, for the Files panel: where, what kind, in what.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeUseDto {
+    project_id: String,
+    member_name: String,
+    path: String,
+    line: i64,
+    /// `call` (the grammar's kind) or `mention` (named some other way).
+    kind: String,
+    within: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeUsagesDto {
+    definitions: Vec<CodeUseDto>,
+    uses: Vec<CodeUseDto>,
+}
+
+/// "Go to definition" and "find usages" for a symbol, across every project
+/// of the open workspace (the focused one alone without a workspace).
+#[tauri::command]
+async fn code_usages(state: State<'_, SharedState>, name: String) -> CmdResult<CodeUsagesDto> {
+    let (base, targets) = {
+        let guard = state.lock().unwrap();
+        let active = member(&guard, None)?;
+        let mut targets: Vec<(uuid::Uuid, String)> = match guard.workspace.as_ref() {
+            Some(ws) => ws
+                .ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some((p.config.id, m.name.clone())),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        if !targets.iter().any(|(id, _)| *id == active.project.config.id) {
+            targets.insert(0, (active.project.config.id, active.project.config.name.clone()));
+        }
+        (guard.base_dir.clone(), targets)
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = CodeUsagesDto { definitions: Vec::new(), uses: Vec::new() };
+        for (id, member_name) in targets {
+            let Ok(db) = Db::open_read_only(&base, id) else { continue };
+            let dto = |path: String, line: i64, kind: String, within: Option<String>| CodeUseDto {
+                project_id: id.to_string(),
+                member_name: member_name.clone(),
+                path,
+                line,
+                kind,
+                within,
+            };
+            for d in ken_core::codemap::definitions(&db, &name).map_err(err)? {
+                out.definitions.push(dto(d.path, d.line, d.kind, None));
+            }
+            let calls = ken_core::codemap::usages(&db, &name, 200).map_err(err)?;
+            let known: Vec<(String, i64)> = calls.iter().map(|u| (u.path.clone(), u.line)).collect();
+            for u in calls {
+                out.uses.push(dto(u.path, u.line, u.kind, u.within));
+            }
+            for m in ken_core::codemap::mentions(&db, &name, &known, 200).map_err(err)? {
+                out.uses.push(dto(m.path, m.line, m.kind, m.within));
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Index health for the focused project: pending, failed and skipped
@@ -14869,6 +15063,8 @@ pub fn run() {
             set_project_index,
             index_health,
             page_links,
+            code_file,
+            code_usages,
             drift_status,
             run_drift_now,
             setup_propose,
@@ -14898,6 +15094,7 @@ pub fn run() {
             current_digest,
             refresh_digest,
             quick_answer,
+            look_for,
             warm_llm,
             knowledge_model,
             refresh_knowledge_model,

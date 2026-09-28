@@ -59,6 +59,18 @@ ureq = { version = "2", default-features = false, features = ["tls", "native-cer
 # declaration keywords (fn/struct/class/def/...), run once per chunk at
 # index time. Not on any hot per-keystroke path.
 regex = "1"
+# The code map (codemap.rs): definitions, references and imports, parsed with
+# tree-sitter and each grammar's own tags query, as GitHub's code navigation
+# does. Local, no model; each grammar builds its C parser through `cc`.
+tree-sitter = "0.27"
+tree-sitter-tags = "0.27"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-c-sharp = "0.23"
 [features]
 default = ["whisper", "local-llm"]
 whisper = ["dep:whisper-rs"]
