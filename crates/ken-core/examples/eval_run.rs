@@ -72,6 +72,7 @@ fn main() {
         "map" => phase_map(&base, &parent),
         "add-repo" => phase_add_repo(&base, &parent, &args[2]),
         "sync" => phase_sync(&base, &parent, &args[2]),
+        "ingest" => phase_ingest(&base, &parent, &args[2]),
         "chat" => phase_chat(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
@@ -379,6 +380,42 @@ fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         );
     }
     println!("## Score\n\n{found} of {asked} answers name an expected file; {not_there} said it was not there.");
+    Ok(())
+}
+
+/// A file through the team wiki's inbox as the app runs it: copied into
+/// Research/Ingestion/Raw/, read into a dated note written against what the
+/// wiki says, then what follows from it proposed (pages, new pages, rulings,
+/// tickets). Prints the takeaways and every proposal.
+fn phase_ingest(base: &Path, parent: &Path, file: &str) -> Result<()> {
+    let wiki = Project::open(&parent.join(wiki_name()))?;
+    let mut db = Db::open(base, wiki.config.id)?;
+    let from = Path::new(file);
+    let name = from.file_name().ok_or_else(|| Error::Other("no file name".into()))?.to_string_lossy().to_string();
+    let raw = format!("{}/{name}", ken_core::ingest::RAW);
+    std::fs::create_dir_all(wiki.root.join(ken_core::ingest::RAW)).map_err(|e| Error::Other(e.to_string()))?;
+    std::fs::copy(from, wiki.root.join(&raw)).map_err(|e| Error::Other(format!("{file}: {e}")))?;
+    scan::scan(&wiki, &mut db)?;
+    println!("# Ingest `{name}` into {}\n", wiki_name());
+    let context = ken_core::ingest::wiki_context(&db, &ken_core::extract::extract(&wiki.root.join(&raw))?.text);
+    let pages: Vec<&str> = context.lines().filter_map(|l| l.strip_prefix("=== ").and_then(|l| l.strip_suffix(" ==="))).collect();
+    println!("wiki passages given to the note: {pages:?}\n");
+    let t = Instant::now();
+    let placement = ken_core::ingest::ingest_one(&wiki.root, &mut db, &raw, &today(), engine::now_epoch(), claude(&wiki.root)?)?;
+    let note = std::fs::read_to_string(wiki.root.join(&placement.note)).map_err(|e| Error::Other(e.to_string()))?;
+    println!("note: `{}` ({:.0}s)\n", placement.note, t.elapsed().as_secs_f64());
+    let tk = ken_core::ingest::takeaways(&note);
+    println!("## Takeaways\n\n**{}** · {} · {:?}\n\n### Overturns\n{}\n\n### Contradictions\n{}\n\n### Rulings\n{}\n\n### Actions\n{}\n",
+        tk.title, tk.kind, tk.present, tk.overturns,
+        tk.contradictions.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"),
+        tk.rulings.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"),
+        tk.actions.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"));
+    let t = Instant::now();
+    let fu = ken_core::ingest::follow_ups(&wiki.root, &mut db, &placement, &note, &today(), engine::now_epoch(), None, claude(&wiki.root)?)?;
+    println!("## Proposed ({:.0}s)\n\nupdated: {:?}\ncreated: {:?}\nrulings: {}\n", t.elapsed().as_secs_f64(), fu.updated, fu.created, fu.rulings);
+    for p in ken_core::ingest::proposals_from(&db, &placement.note)? {
+        println!("- **{}**: {}", p.title, short(&p.body, 200));
+    }
     Ok(())
 }
 

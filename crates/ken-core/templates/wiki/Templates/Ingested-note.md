@@ -19,6 +19,10 @@ Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends
 
 - {{Name}}: *"{{the quote}}"*
 
+## Contradictions
+
+- {{Where the source disagrees with a wiki page, or with itself}} — {{the page, or the two places in the source}}.
+
 ## What Was Said
 
 - **{{Topic}}.** {{Name}}: *"{{quote}}"* → {{what follows from it}}.

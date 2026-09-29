@@ -1943,6 +1943,20 @@ impl Db {
     }
 
     /// Items resolved at or after `since`, newest first.
+    /// Every review item of one kind, open or resolved, newest first: an
+    /// inbox's history.
+    pub fn review_items_of_kind(&self, kind: &str, limit: usize) -> Result<Vec<ReviewItemRow>> {
+        let sql = format!(
+            "SELECT {} FROM review_items WHERE kind = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+            Self::REVIEW_ITEM_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![kind, limit as i64], Self::map_review_item)?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_recent_resolved_review_items(&self, since: i64) -> Result<Vec<ReviewItemRow>> {
         let sql = format!(
             "SELECT {} FROM review_items

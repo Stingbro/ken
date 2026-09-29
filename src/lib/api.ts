@@ -76,6 +76,69 @@ export type SetupMoved =
   | { change: "Gone"; member: string }
   | { change: "NewWorktree"; pattern: string; evidence: string };
 
+/** One source in the library's Raw/ folder and where it is in the read. */
+export interface RawSource {
+  path: string;
+  name: string;
+  state: "queued" | "reading" | "in review" | "failed";
+  detail: string | null;
+}
+
+/** One ingested source: its note, and whether it is still on Review. */
+export interface IngestedSource {
+  id: number;
+  note: string;
+  title: string;
+  kind: string;
+  at: number;
+  open: boolean;
+  /** Proposals from it still waiting. */
+  waiting: number;
+}
+
+/** The Ingest screen: the team library's inbox and its history. */
+export interface IngestOverview {
+  projectId: string;
+  library: string;
+  raw: RawSource[];
+  ingested: IngestedSource[];
+  running: boolean;
+  claudeFound: boolean;
+}
+
+/** A note's key takeaways. */
+export interface IngestTakeaways {
+  title: string;
+  kind: string;
+  present: string[];
+  overturns: string;
+  contradictions: string[];
+  rulings: string[];
+  actions: string[];
+  questions: string[];
+}
+
+/** Something a note proposed, waiting for Apply or Discard. */
+export interface IngestProposal {
+  id: number;
+  kind: "page" | "new page" | "ruling" | "ticket";
+  title: string;
+  page: string;
+  body: string;
+  /** The proposal (page as it is and with the change), for the diff. */
+  payload: string | null;
+}
+
+/** One ingested source for its card on the Ingest screen. */
+export interface IngestCard {
+  id: number;
+  open: boolean;
+  note: string;
+  source: string;
+  takeaways: IngestTakeaways;
+  proposals: IngestProposal[];
+}
+
 export interface IngestStatus {
   hasInbox: boolean;
   /** New sources in Raw, not yet processed. */
@@ -1833,15 +1896,26 @@ export const api = {
   setupCreateWiki: (dir: string, team: string, repos: { name: string; description: string }[], taken: string[]) =>
     invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken }),
   /** Apply a proposed page change; returns the page written. */
-  applyPageProposal: (itemId: number) => invoke<string>("apply_page_proposal", { itemId }),
+  applyPageProposal: (itemId: number, projectId: string | null = null) =>
+    invoke<string>("apply_page_proposal", { itemId, projectId }),
   /** What waits in the library inbox (Research/Ingestion/Raw/). */
-  ingestStatus: () => invoke<IngestStatus>("ingest_status"),
+  ingestStatus: (team: string | null = null) => invoke<IngestStatus>("ingest_status", { team }),
+  /** The Ingest screen for the team's library (its wiki's inbox). */
+  ingestOverview: (team: string | null) => invoke<IngestOverview>("ingest_overview", { team }),
+  ingestCard: (team: string | null, itemId: number) => invoke<IngestCard>("ingest_card", { team, itemId }),
+  /** Copy files into the library's Raw/ and start reading them. */
+  ingestAdd: (team: string | null, paths: string[]) => invoke<string[]>("ingest_add", { team, paths }),
+  /** A file dropped in the window (bytes, no path) into the library's Raw/. */
+  ingestAddBytes: async (team: string | null, file: File) =>
+    invoke<string>("ingest_add_bytes", new Uint8Array(await file.arrayBuffer()), {
+      headers: { "x-name": encodeURIComponent(file.name), "x-team": encodeURIComponent(team ?? "") },
+    }),
   /** Read what waits in Raw/ now; false when a pass is already running. */
-  ingestNow: () => invoke<boolean>("ingest_now"),
+  ingestNow: (team: string | null = null) => invoke<boolean>("ingest_now", { team }),
   /** Undo an ingest card: source back to Raw/, note removed unless edited. */
-  ingestUndo: (itemId: number) => invoke<boolean>("ingest_undo", { itemId }),
+  ingestUndo: (itemId: number, team: string | null = null) => invoke<boolean>("ingest_undo", { itemId, team }),
   /** Done with an ingest: its source moves beside its note. Returns where. */
-  ingestFile: (itemId: number) => invoke<string>("ingest_file", { itemId }),
+  ingestFile: (itemId: number, team: string | null = null) => invoke<string>("ingest_file", { itemId, team }),
   /** The last drift sweep (null before the first). */
   driftStatus: () => invoke<DriftRun | null>("drift_status"),
   /** Run the drift sweep now. */
@@ -2092,8 +2166,8 @@ export const api = {
     invoke<void>("discard_automation_proposal", { itemId }),
   pendingApprovals: () => invoke<RunRow[]>("pending_approvals"),
   reviewInbox: () => invoke<ReviewInbox>("review_inbox"),
-  resolveReviewItem: (id: number) =>
-    invoke<void>("resolve_review_item", { id }),
+  resolveReviewItem: (id: number, projectId: string | null = null) =>
+    invoke<void>("resolve_review_item", { id, projectId }),
   /// Silence a file's issues for this user only (app-data, never synced).
   ignoreFile: (relPath: string) =>
     invoke<void>("ignore_file", { relPath }),

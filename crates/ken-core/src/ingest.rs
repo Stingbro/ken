@@ -20,6 +20,7 @@
 //! model call is passed in (`generate`), so the app runs Claude headless and
 //! a test a stand-in. Undoing an ingest withdraws everything it proposed.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -34,7 +35,7 @@ pub const TEMPLATE: &str = "Templates/Ingested-note.md";
 pub const REVIEW_KIND: &str = "ingest";
 
 /// The method's note template, used when the library has none of its own.
-const DEFAULT_TEMPLATE: &str = "---\ntitle: \"{{What it was}} - {{date}}\"\naliases: [\"{{What it was}} - {{date}}\"]\nstatus: evidence\nkind: {{meeting, recording or document}}\nupdated: {{date}}\nsource: {{source path}}\npresent: [{{who was there}}]\n---\n\n# {{What it was}} - {{date}}\n\nEvidence, at the time. Cite it; do not read it as current doctrine.\n\nSource: `{{source file}}` ({{length: turns, minutes or pages}}).\n\n## What It Overturns\n\n**{{The one thing that changes what we wrote.}}** {{Which page said otherwise.}}\n\n## What Was Said\n\n- **{{Topic}}.** {{Name}}: *\"{{quote}}\"* → {{what follows from it}}.\n\n## Rulings Said in the Room\n\n- {{The ruling, in the decider's words}} — {{decider}}.\n\n## Actions and Requests\n\n- {{Action}} → {{who}}.\n\n## Open Questions\n\n- {{Question}} → {{who}}.\n";
+const DEFAULT_TEMPLATE: &str = "---\ntitle: \"{{What it was}} - {{date}}\"\naliases: [\"{{What it was}} - {{date}}\"]\nstatus: evidence\nkind: {{meeting, recording or document}}\nupdated: {{date}}\nsource: {{source path}}\npresent: [{{who was there}}]\n---\n\n# {{What it was}} - {{date}}\n\nEvidence, at the time. Cite it; do not read it as current doctrine.\n\nSource: `{{source file}}` ({{length: turns, minutes or pages}}).\n\n## What It Overturns\n\n**{{The one thing that changes what we wrote.}}** {{Which page said otherwise.}}\n\n## Contradictions\n\n- {{Where the source disagrees with a wiki page, or with itself}} — {{the page, or the two places in the source}}.\n\n## What Was Said\n\n- **{{Topic}}.** {{Name}}: *\"{{quote}}\"* → {{what follows from it}}.\n\n## Rulings Said in the Room\n\n- {{The ruling, in the decider's words}} — {{decider}}.\n\n## Actions and Requests\n\n- {{Action}} → {{who}}.\n\n## Open Questions\n\n- {{Question}} → {{who}}.\n";
 
 /// What a source was, which decides its folder once filed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +195,21 @@ pub fn kind_of(note: &str, raw: &str) -> SourceKind {
 /// sets for a note (quotes verbatim, evidence not doctrine, what it
 /// overturns first).
 pub fn prompt(template: &str, raw: &str, text: &str, date: &str) -> String {
+    prompt_against(template, raw, text, date, "")
+}
+
+/// [`prompt`], with what the wiki says now about the source's subject
+/// (`wiki`, from [`wiki_context`]), so the note can say what the source
+/// overturns and where it contradicts a page.
+pub fn prompt_against(template: &str, raw: &str, text: &str, date: &str, wiki: &str) -> String {
     let file = raw.rsplit('/').next().unwrap_or(raw);
+    let wiki = if wiki.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "WHAT THE WIKI SAYS NOW (passages Ken found on the source's subject; cite a page by its path):\n{wiki}\n\n"
+        )
+    };
     format!(
         "You are distilling one source from a team's library inbox into one dated note.\n\n\
          Fill in this template. Replace every {{{{…}}}} placeholder; drop a section only if the \
@@ -204,12 +219,54 @@ pub fn prompt(template: &str, raw: &str, text: &str, date: &str) -> String {
          - Quotes are the speaker's exact words, typos included, marked [sic]. Never paraphrase inside quotes.\n\
          - This is evidence at the time, not current doctrine. Do not state anything the source does not.\n\
          - Lead \"What It Overturns\" with the one thing that changes what the team wrote, or say nothing overturns.\n\
+         - Under \"Contradictions\", list each place the source disagrees with what the wiki says (name the page) or \
+           with itself (name both places); write that there are none if there are none. Only what the source and the \
+           passages below show.\n\
          - Name who said what. List who was present if the source shows it.\n\
          - Set `kind:` in the frontmatter to meeting (people talking: a standup, review or call), recording (a \
            transcript of audio or video that is not a meeting), or document (anything written).\n\
          - Reply with the finished note only, in Markdown, starting with its `---` frontmatter. No preamble, no code fences.\n\n\
-         TEMPLATE:\n{template}\n\nSOURCE ({file}):\n{text}\n",
+         TEMPLATE:\n{template}\n\n{wiki}SOURCE ({file}):\n{text}\n",
     )
+}
+
+/// What the wiki says about a source's subject: the passages Ken's search
+/// ranks for the source's most repeated words, a few per page, the inbox and
+/// the templates left out. Given to the note so it can name what the source
+/// overturns and contradicts.
+pub fn wiki_context(db: &Db, text: &str) -> String {
+    const STOP: &[&str] = &[
+        "about", "after", "again", "being", "could", "every", "first", "going", "great", "might", "never", "other",
+        "right", "should", "still", "their", "there", "these", "thing", "think", "those", "under", "where", "which",
+        "while", "would", "yeah", "really", "because", "maybe", "doing", "gonna", "wanna", "we're", "that's", "there's",
+    ];
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for w in text.split(|c: char| !c.is_alphanumeric() && c != '-').map(str::to_lowercase) {
+        if w.chars().count() >= 5 && !STOP.contains(&w.as_str()) && !w.chars().all(|c| c.is_ascii_digit()) {
+            *counts.entry(w).or_default() += 1;
+        }
+    }
+    let mut words: Vec<(String, usize)> = counts.into_iter().filter(|(_, n)| *n > 1).collect();
+    words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let query = words.iter().take(10).map(|(w, _)| w.as_str()).collect::<Vec<_>>().join(" ");
+    if query.is_empty() {
+        return String::new();
+    }
+    let hits = crate::routing::search_member(db, &query, None, 24).unwrap_or_default();
+    let mut out = String::new();
+    let mut pages: Vec<String> = Vec::new();
+    for hit in hits {
+        if hit.path.starts_with("Research/Ingestion") || hit.path.starts_with("Templates/") || !hit.path.ends_with(".md") {
+            continue;
+        }
+        if pages.iter().filter(|p| **p == hit.path).count() >= 2 || (!pages.contains(&hit.path) && pages.len() >= 6) {
+            continue;
+        }
+        pages.push(hit.path.clone());
+        let excerpt: String = hit.snippet.chars().take(700).collect();
+        out.push_str(&format!("\n=== {} ===\n{}\n", hit.path, excerpt.trim()));
+    }
+    out
 }
 
 /// The model's reply as a note: fences stripped, and the frontmatter
@@ -265,7 +322,7 @@ fn strip_fences(reply: &str) -> &str {
 /// and what filing will do.
 pub fn card_body(note: &str, placement: &Placement) -> String {
     let mut s = String::new();
-    for heading in ["## What It Overturns", "## Actions and Requests", "## Rulings Said in the Room"] {
+    for heading in ["## What It Overturns", "## Contradictions", "## Actions and Requests", "## Rulings Said in the Room"] {
         if let Some(start) = note.find(heading) {
             let rest = &note[start..];
             let end = rest[heading.len()..].find("\n## ").map_or(rest.len(), |e| e + heading.len());
@@ -299,7 +356,7 @@ pub fn ingest_one(
         return Err(Error::Other(format!("{raw} has no text Ken can read (a recording needs its transcript first)")));
     }
     let template = fs::read_to_string(root.join(TEMPLATE)).unwrap_or_else(|_| DEFAULT_TEMPLATE.to_string());
-    let reply = generate(&prompt(&template, raw, &text, date))?;
+    let reply = generate(&prompt_against(&template, raw, &text, date, &wiki_context(db, &text)))?;
     let kind = kind_of(strip_fences(&reply), raw);
     let placement = place(root, raw, date, kind);
     let note = finish_note(&reply, &placement)?;
@@ -555,6 +612,73 @@ Said in [[{note_stem}]].
     )
 }
 
+/// A note's key takeaways, section by section, for the Ingest card: what it
+/// overturns, where it contradicts the wiki or itself, the rulings said, the
+/// actions and the open questions. A section the note lacks is empty.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Takeaways {
+    pub title: String,
+    pub kind: String,
+    pub present: Vec<String>,
+    pub overturns: String,
+    pub contradictions: Vec<String>,
+    pub rulings: Vec<String>,
+    pub actions: Vec<String>,
+    pub questions: Vec<String>,
+}
+
+pub fn takeaways(note: &str) -> Takeaways {
+    let section = |heading: &str| -> String {
+        let Some(start) = note.find(heading) else { return String::new() };
+        let rest = &note[start + heading.len()..];
+        let end = rest.find("\n## ").unwrap_or(rest.len());
+        rest[..end].trim().to_string()
+    };
+    let front = |key: &str| -> String {
+        note.lines()
+            .take_while(|l| !l.starts_with("# "))
+            .find_map(|l| l.trim_start().strip_prefix(&format!("{key}:")).map(|v| v.trim().trim_matches('"').to_string()))
+            .unwrap_or_default()
+    };
+    // A section that says there is nothing ("None.", "- none") has no rows.
+    let rows = |heading: &str| -> Vec<String> {
+        section_bullets(note, heading)
+            .into_iter()
+            .filter(|b| !matches!(b.trim_end_matches('.').to_lowercase().as_str(), "none" | "nothing" | "n/a" | "none found"))
+            .collect()
+    };
+    Takeaways {
+        title: note.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("").trim().to_string(),
+        kind: front("kind"),
+        present: front("present").trim_matches(['[', ']']).split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
+        overturns: section("## What It Overturns"),
+        contradictions: rows("## Contradictions"),
+        rulings: rows("## Rulings Said in the Room"),
+        actions: rows("## Actions and Requests"),
+        questions: rows("## Open Questions"),
+    }
+}
+
+/// The open proposals a note made (page changes, new pages, rulings,
+/// tickets), each a Review card a person applies or discards.
+pub fn proposals_from(db: &Db, note: &str) -> Result<Vec<crate::db::ReviewItemRow>> {
+    Ok(db
+        .list_open_review_items()?
+        .into_iter()
+        .filter(|it| {
+            it.kind == crate::wikidraft::PROPOSAL_KIND
+                && it
+                    .payload
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<crate::wikidraft::Proposal>(p).ok())
+                    .and_then(|p| p.from)
+                    .as_deref()
+                    == Some(note)
+        })
+        .collect())
+}
+
 /// Take back what an undone ingest proposed: every open proposal card from
 /// its note is resolved. Returns how many.
 pub fn withdraw(db: &mut Db, note: &str, now: i64) -> Result<usize> {
@@ -675,7 +799,7 @@ pub fn follow_ups(
             let team_name = team.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let title = format!("Ticket {id} in {team_name}: {}", action.chars().take(60).collect::<String>());
             let body = format!(
-                "An action from {stem}{}. Ken drafted {page} in {team_name} in the method's ticket format; create it,                  or discard it. Its type and size are for the team to set.",
+                "An action from {stem}{}. Ken drafted {page} in {team_name} in the method's ticket format; create it, or discard it. Its type and size are for the team to set.",
                 who.as_deref().map(|w| format!(", for {w}")).unwrap_or_default()
             );
             crate::wikidraft::file_page_proposal(db, &p, &title, &body, now)?;
@@ -731,6 +855,43 @@ mod tests {
     }
 
     const REPLY: &str = "```markdown\n---\ntitle: \"Standup - 2026-09-24\"\nstatus: evidence\nkind: meeting\nsource: wrong/path.txt\npresent: [Ana, Ben]\n---\n\n# Standup - 2026-09-24\n\n## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n## What Was Said\n\n- **Ship.** Ana: *\"we ship on Friday\"*.\n\n## Actions and Requests\n\n- Fix the save bug → Ben.\n```";
+
+    #[test]
+    fn a_note_is_read_as_its_takeaways() {
+        let note = "---\ntitle: \"Review - 2026-09-22\"\nkind: meeting\npresent: [chris, dee]\n---\n\n# Review - 2026-09-22\n\n\
+                    ## What It Overturns\n\n**Presets are effort, not size.** Sizes page says otherwise.\n\n\
+                    ## Contradictions\n\n- The Sizes page says a preset is a size — Ways-of-Working/Sizes.md.\n\n\
+                    ## Rulings Said in the Room\n\n- Presets are level of effort — chris.\n\n\
+                    ## Actions and Requests\n\n- Rewrite the sizes page → chris.\n\n## Open Questions\n\n- None.\n";
+        let t = takeaways(note);
+        assert_eq!(t.title, "Review - 2026-09-22");
+        assert_eq!(t.kind, "meeting");
+        assert_eq!(t.present, vec!["chris", "dee"]);
+        assert!(t.overturns.starts_with("**Presets are effort"));
+        assert_eq!(t.contradictions, vec!["The Sizes page says a preset is a size — Ways-of-Working/Sizes.md."]);
+        assert_eq!(t.rulings.len(), 1);
+        assert_eq!(t.actions, vec!["Rewrite the sizes page → chris."]);
+        assert!(t.questions.is_empty(), "\"None.\" is no question");
+    }
+
+    #[test]
+    fn the_note_is_written_against_what_the_wiki_says() {
+        let d = library();
+        let root = d.path();
+        fs::create_dir_all(root.join("Current")).unwrap();
+        fs::write(root.join("Current/Project.md"), "# Project\n\nThe release ships on Monday after the payment review.\n").unwrap();
+        fs::write(root.join(format!("{INGESTED}/old.md")), "# Old\n\nThe release ships on Monday after the payment review.\n").unwrap();
+        let project = crate::project::Project::create(root, "Wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let source = "Ana: the release ships Friday. The release is Friday, the payment review moved.";
+        let wiki = wiki_context(&db, source);
+        assert!(wiki.contains("=== Current/Project.md ===") && wiki.contains("ships on Monday"), "{wiki}");
+        assert!(!wiki.contains(INGESTED), "the inbox is not what the wiki says: {wiki}");
+        let p = prompt_against("TEMPLATE", "Research/Ingestion/Raw/standup.txt", source, "2026-09-24", &wiki);
+        assert!(p.contains("WHAT THE WIKI SAYS NOW") && p.contains("Contradictions"), "{p}");
+    }
 
     #[test]
     fn processing_writes_the_note_in_its_home_and_leaves_the_source_for_review() {

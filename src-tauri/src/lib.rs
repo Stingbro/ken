@@ -6446,9 +6446,10 @@ fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
 }
 
 #[tauri::command]
-fn resolve_review_item(state: State<SharedState>, id: i64) -> CmdResult<()> {
+fn resolve_review_item(state: State<SharedState>, id: i64, project_id: Option<String>) -> CmdResult<()> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let active = member_mut(&mut guard, pid)?;
     active
         .db
         .resolve_review_item(id, engine::now_epoch())
@@ -7453,6 +7454,10 @@ fn run_drift_if_due(project: &Project, db: &mut Db, force: bool) -> Option<ken_c
 static INGEST_RUNNING: std::sync::LazyLock<Mutex<std::collections::HashSet<uuid::Uuid>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+/// The source each library's pass is reading now, for the Ingest screen.
+static INGEST_READING: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 /// Read every source waiting in a team or wiki repo's `Research/Ingestion/
 /// Raw/`, one at a time on a background thread, through the Claude CLI.
 /// Each becomes a dated note and one Review card; a source that fails stays
@@ -7493,6 +7498,7 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
         if let Ok(mut db) = Db::open(&base, id) {
             // Only new sources: one whose note waits for review is not read again.
             for raw in ken_core::ingest::waiting_new(&root, &db).unwrap_or_default() {
+                INGEST_READING.lock().unwrap().insert(id, raw.clone());
                 let today = local_date_today();
                 let generate = |prompt: &str| -> ken_core::Result<String> {
                     match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
@@ -7537,6 +7543,7 @@ fn start_ingest_pass(project: &Project, base: &Path, force: bool) -> bool {
             }
         }
         INGEST_RUNNING.lock().unwrap().remove(&id);
+        INGEST_READING.lock().unwrap().remove(&id);
     });
     true
 }
@@ -7710,9 +7717,10 @@ async fn setup_create_wiki(
 /// Apply a proposed change to a page a person keeps, only while the page
 /// still reads as it did when Ken proposed it.
 #[tauri::command]
-fn apply_page_proposal(state: State<SharedState>, item_id: i64) -> CmdResult<String> {
+fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Option<String>) -> CmdResult<String> {
+    let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let active = member_mut(&mut guard, id)?;
     let item = active
         .db
         .list_open_review_items()
@@ -7736,6 +7744,336 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64) -> CmdResult<Str
     Ok(proposal.page)
 }
 
+/// The library the Ingest screen works on: a repo of the workspace with an
+/// inbox (`Research/Ingestion/Raw/`), the chosen team's first and its wiki
+/// before its team repo, whichever repo is focused. With no workspace, the
+/// focused repo.
+fn inbox_project(guard: &AppState, team: Option<&str>) -> Option<Project> {
+    let reg = Registry::load(&guard.base_dir).ok();
+    let mut best: Option<(i32, Project)> = None;
+    let mut consider = |p: &Project| {
+        if !ken_core::ingest::has_inbox(&p.root) {
+            return;
+        }
+        let entry = reg.as_ref().and_then(|r| r.entry_at(&p.root));
+        let mut score = 0;
+        if team.is_some() && entry.and_then(|e| e.team.as_deref()) == team {
+            score += 4;
+        }
+        if entry.is_some_and(|e| e.kind.contains(&ken_core::registry::RepoKind::Wiki)) {
+            score += 2;
+        }
+        if guard.focused == Some(p.config.id) {
+            score += 1;
+        }
+        if best.as_ref().is_none_or(|(s, _)| score > *s) {
+            best = Some((score, p.clone()));
+        }
+    };
+    match guard.workspace.as_ref() {
+        Some(ws) => {
+            for m in &ws.ws.members {
+                if let ken_core::workspace::MemberStatus::Ok(p) = &m.status {
+                    consider(p);
+                }
+            }
+        }
+        None => {
+            if let Ok(active) = member(guard, None) {
+                consider(&active.project);
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// [`inbox_project`], opened if it was dormant, focus left where it was.
+fn inbox_member(app: &AppHandle, state: &SharedState, team: Option<&str>) -> CmdResult<uuid::Uuid> {
+    let (project, open, focused) = {
+        let guard = state.lock().unwrap();
+        let project = inbox_project(&guard, team).ok_or("No repo of this team has an inbox (Research/Ingestion/Raw/). A wiki made from the Ways of Working template has one.")?;
+        let open = guard.members.contains_key(&project.config.id);
+        (project, open, guard.focused)
+    };
+    let id = project.config.id;
+    if !open {
+        activate(app, state, project, false)?;
+        state.lock().unwrap().focused = focused;
+    }
+    Ok(id)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSourceDto {
+    path: String,
+    name: String,
+    /// `queued` | `reading` | `in review` | `failed`
+    state: String,
+    /// Why it failed, when it did.
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestedDto {
+    /// The ingest card's id.
+    id: i64,
+    note: String,
+    title: String,
+    kind: String,
+    /// When the note was written (Unix seconds).
+    at: i64,
+    /// Still on Review (not yet seen), or seen and filed.
+    open: bool,
+    /// Proposals from it still waiting: page changes, new pages, rulings, tickets.
+    waiting: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestOverviewDto {
+    /// The library's project id and name.
+    project_id: String,
+    library: String,
+    raw: Vec<RawSourceDto>,
+    ingested: Vec<IngestedDto>,
+    running: bool,
+    claude_found: bool,
+}
+
+/// The Ingest screen: the library's inbox for the chosen team, every source
+/// in Raw with where it is in the read, and what has been ingested, newest
+/// first.
+#[tauri::command]
+fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestOverviewDto> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
+    let guard = state.lock().unwrap();
+    let active = member(&guard, Some(id))?;
+    let root = &active.project.root;
+    let db = &active.db;
+    let fresh = ken_core::ingest::waiting_new(root, db).map_err(err)?;
+    let in_review = ken_core::ingest::in_review(db).map_err(err)?;
+    let reading = INGEST_READING.lock().unwrap().get(&id).cloned();
+    let open = db.list_open_review_items().map_err(err)?;
+    let raw = ken_core::ingest::waiting(root)
+        .into_iter()
+        .map(|path| {
+            let failed = open.iter().find(|it| it.kind == "ingest-failed" && it.source_ref == path);
+            let state = if reading.as_deref() == Some(path.as_str()) {
+                "reading"
+            } else if failed.is_some() {
+                "failed"
+            } else if in_review.contains(&path) {
+                "in review"
+            } else if fresh.contains(&path) {
+                "queued"
+            } else {
+                "queued"
+            };
+            RawSourceDto {
+                name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+                state: state.to_string(),
+                detail: failed.map(|f| f.body.clone()),
+                path,
+            }
+        })
+        .collect();
+    let ingested = db
+        .review_items_of_kind(ken_core::ingest::REVIEW_KIND, 200)
+        .map_err(err)?
+        .into_iter()
+        .map(|it| {
+            let note = it.source_ref.clone();
+            let text = std::fs::read_to_string(root.join(&note)).unwrap_or_default();
+            let t = ken_core::ingest::takeaways(&text);
+            IngestedDto {
+                id: it.id,
+                title: if t.title.is_empty() { it.title.trim_start_matches("Ingested: ").to_string() } else { t.title },
+                kind: t.kind,
+                at: it.created_at,
+                open: it.status == "open",
+                waiting: ken_core::ingest::proposals_from(db, &note).map(|p| p.len()).unwrap_or(0),
+                note,
+            }
+        })
+        .collect();
+    Ok(IngestOverviewDto {
+        project_id: id.to_string(),
+        library: active.project.config.name.clone(),
+        raw,
+        ingested,
+        running: INGEST_RUNNING.lock().unwrap().contains(&id),
+        claude_found: ken_core::runner::discover_claude().is_some(),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestProposalDto {
+    id: i64,
+    /// `page` (a change to one), `new page`, `ruling` or `ticket`.
+    kind: String,
+    title: String,
+    /// The page (or ticket file) it writes.
+    page: String,
+    body: String,
+    /// The proposal itself (the page as it is and with the change), for the diff.
+    payload: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestCardDto {
+    id: i64,
+    open: bool,
+    note: String,
+    source: String,
+    takeaways: ken_core::ingest::Takeaways,
+    proposals: Vec<IngestProposalDto>,
+}
+
+/// One ingested source for the Ingest screen: its key takeaways (what it
+/// overturns, its contradictions, rulings, actions, questions) and what it
+/// proposed, each waiting for Apply or Discard.
+#[tauri::command]
+fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<IngestCardDto> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
+    let guard = state.lock().unwrap();
+    let active = member(&guard, Some(id))?;
+    let item = active.db.get_review_item(item_id).map_err(err)?.ok_or("no ingest card with that id")?;
+    let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
+    let text = std::fs::read_to_string(active.project.root.join(&card.placement.note)).unwrap_or_default();
+    let proposals = ken_core::ingest::proposals_from(&active.db, &card.placement.note)
+        .map_err(err)?
+        .into_iter()
+        .map(|it| {
+            let p: Option<ken_core::wikidraft::Proposal> = it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok());
+            let (kind, page) = match &p {
+                Some(p) if p.append.is_some() => ("ruling", p.page.clone()),
+                Some(p) if p.root.is_some() => ("ticket", p.page.clone()),
+                Some(p) if p.base.is_empty() => ("new page", p.page.clone()),
+                Some(p) => ("page", p.page.clone()),
+                None => ("page", String::new()),
+            };
+            IngestProposalDto { id: it.id, kind: kind.into(), title: it.title, page, body: it.body, payload: it.payload }
+        })
+        .collect();
+    Ok(IngestCardDto {
+        id: item.id,
+        open: item.status == "open",
+        source: if card.filed { card.placement.source.clone() } else { card.placement.raw.clone() },
+        note: card.placement.note.clone(),
+        takeaways: ken_core::ingest::takeaways(&text),
+        proposals,
+    })
+}
+
+/// Files dropped on the Ingest screen: each is copied into the library's
+/// `Research/Ingestion/Raw/` (a name already there gets a number) and the
+/// read starts. Returns the paths in Raw.
+#[tauri::command]
+fn ingest_add(app: AppHandle, state: State<SharedState>, team: Option<String>, paths: Vec<String>) -> CmdResult<Vec<String>> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
+    let (project, base) = {
+        let guard = state.lock().unwrap();
+        (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
+    };
+    let mut added = Vec::new();
+    for path in &paths {
+        let from = std::path::Path::new(path);
+        if !from.is_file() {
+            return Err(format!("{path} is not a file"));
+        }
+        let name = from.file_name().map(|n| n.to_string_lossy().to_string()).ok_or("a file with no name")?;
+        let target = raw_target(&project.root, &name)?;
+        std::fs::copy(from, &target).map_err(|e| format!("could not copy {name}: {e}"))?;
+        added.push(format!("{}/{}", ken_core::ingest::RAW, target.file_name().unwrap().to_string_lossy()));
+    }
+    if ken_core::runner::discover_claude().is_none() {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    }
+    // The watcher indexes the new files; the read starts now, not at the
+    // next scan.
+    start_ingest_pass(&project, &base, true);
+    Ok(added)
+}
+
+/// Where a file named `name` goes in a library's Raw/: its own name, or with
+/// a number when that is taken. The folder is made if missing.
+fn raw_target(root: &std::path::Path, name: &str) -> CmdResult<std::path::PathBuf> {
+    let raw_dir = root.join(ken_core::ingest::RAW);
+    std::fs::create_dir_all(&raw_dir).map_err(err)?;
+    // A dropped name is only a name: no folders, nothing above Raw.
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("a file with no name".into());
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut target = raw_dir.join(name);
+    let mut n = 2;
+    while target.exists() {
+        target = raw_dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    Ok(target)
+}
+
+/// `%XX` decoded (what the frontend's encodeURIComponent wrote), as UTF-8.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A file dropped on the Ingest screen, as its bytes (a drop in the window
+/// carries no path): the request body is the file, the `x-name` header its
+/// name and `x-team` the team, both URI-encoded. Written into the library's
+/// Raw/ and the read starts. Returns its path in Raw.
+#[tauri::command]
+fn ingest_add_bytes(app: AppHandle, state: State<SharedState>, request: tauri::ipc::Request<'_>) -> CmdResult<String> {
+    let header = |key: &str| -> Option<String> {
+        request
+            .headers()
+            .get(key)
+            .and_then(|v| v.to_str().ok())
+            .map(percent_decode)
+            .filter(|v| !v.is_empty())
+    };
+    let name = header("x-name").ok_or("the dropped file has no name")?;
+    let team = header("x-team");
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("the dropped file came without its bytes".into());
+    };
+    let id = inbox_member(&app, &state, team.as_deref())?;
+    let (project, base) = {
+        let guard = state.lock().unwrap();
+        (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
+    };
+    let target = raw_target(&project.root, &name)?;
+    std::fs::write(&target, bytes).map_err(|e| format!("could not write {name}: {e}"))?;
+    if ken_core::runner::discover_claude().is_none() {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    }
+    start_ingest_pass(&project, &base, true);
+    Ok(format!("{}/{}", ken_core::ingest::RAW, target.file_name().unwrap().to_string_lossy()))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IngestStatusDto {
@@ -7750,9 +8088,10 @@ struct IngestStatusDto {
 
 /// What waits in the focused project's library inbox.
 #[tauri::command]
-fn ingest_status(state: State<SharedState>) -> CmdResult<IngestStatusDto> {
+fn ingest_status(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestStatusDto> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
+    let active = member(&guard, Some(id))?;
     let root = &active.project.root;
     Ok(IngestStatusDto {
         has_inbox: ken_core::ingest::has_inbox(root),
@@ -7765,9 +8104,10 @@ fn ingest_status(state: State<SharedState>) -> CmdResult<IngestStatusDto> {
 
 /// Read what waits in Raw/ now, whatever the repo's kind.
 #[tauri::command]
-fn ingest_now(state: State<SharedState>) -> CmdResult<bool> {
+fn ingest_now(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<bool> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
+    let active = member(&guard, Some(id))?;
     if ken_core::runner::discover_claude().is_none() {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     }
@@ -7777,9 +8117,10 @@ fn ingest_now(state: State<SharedState>) -> CmdResult<bool> {
 /// Undo an ingest card: the source goes back to Raw/, the note is removed
 /// unless a person edited it, and the card is resolved.
 #[tauri::command]
-fn ingest_undo(state: State<SharedState>, item_id: i64) -> CmdResult<bool> {
+fn ingest_undo(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<bool> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let active = member_mut(&mut guard, Some(id))?;
     let item = active
         .db
         .list_open_review_items()
@@ -7798,9 +8139,10 @@ fn ingest_undo(state: State<SharedState>, item_id: i64) -> CmdResult<bool> {
 /// Done with an ingest: its source moves from Raw/ beside its note, in its
 /// kind's folder and month, and the card is resolved.
 #[tauri::command]
-fn ingest_file(state: State<SharedState>, item_id: i64) -> CmdResult<String> {
+fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<String> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let active = member_mut(&mut guard, Some(id))?;
     let item = active
         .db
         .list_open_review_items()
@@ -15023,6 +15365,10 @@ pub fn run() {
             setup_confirm_repos,
             set_project_description,
             ingest_status,
+            ingest_overview,
+            ingest_card,
+            ingest_add,
+            ingest_add_bytes,
             ingest_now,
             ingest_undo,
             ingest_file,

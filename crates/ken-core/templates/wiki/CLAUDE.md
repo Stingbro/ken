@@ -35,8 +35,7 @@ work is done rather than describing what exists.
 - **A finding is evidence at the time, not current state.**
 - **Open the Repo Map or a how-to before searching files.** Repo Map = *where*,
   how-to = *how*, code = the exact signature.
-- **Every agent edit to a wiki page, from an ingest or a recipe (Ken's stored
-  rule that keeps an output page current), goes through staging**: the tool
+- **Every agent edit to a wiki page, from an ingest, goes through staging**: the tool
   applies it unless it rewrites more than a fifth of the page or lands on one a
   person changed while the run worked. Only three things wait: a ruling, for its
   decider; a change to Ways-of-Working, Conventions or a rule, as a ticket,
