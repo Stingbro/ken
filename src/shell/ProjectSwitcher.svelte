@@ -1,8 +1,6 @@
 <script lang="ts">
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, memberGroup, type RegistryEntryStatus } from "../lib/api";
   import { app } from "../lib/app.svelte";
-  import Plus from "@lucide/svelte/icons/plus";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Pencil from "@lucide/svelte/icons/pencil";
   import Trash2 from "@lucide/svelte/icons/trash-2";
@@ -58,25 +56,23 @@
 
   type Section = { key: string; label: string | null; rows: RegistryEntryStatus[] };
 
-  // Order is deliberate: folder groups first (alphabetical), then workspace
-  // members that sit at the root, then everything registered but outside the
-  // workspace. A project you opened once last month should not be mixed in
-  // with the repos you work in every day.
+  // The repos of this workspace, and only those: Ken works in workspaces,
+  // so a folder outside it is opened as its own workspace, not here. Folder
+  // groups first (alphabetical), then the members at the root.
   const sections = $derived.by((): Section[] => {
-    if (!app.workspace || !grouped) {
+    const members = app.registry.filter((e) => memberNameById.has(e.id));
+    if (!app.workspace) {
       return [{ key: "all", label: null, rows: app.registry }];
+    }
+    if (!grouped) {
+      return [{ key: "all", label: null, rows: members }];
     }
 
     const byGroup = new Map<string, RegistryEntryStatus[]>();
     const rootRows: RegistryEntryStatus[] = [];
-    const outsideRows: RegistryEntryStatus[] = [];
 
-    for (const entry of app.registry) {
-      const name = memberNameById.get(entry.id);
-      if (!name) {
-        outsideRows.push(entry);
-        continue;
-      }
+    for (const entry of members) {
+      const name = memberNameById.get(entry.id) as string;
       const group = memberGroup(name);
       if (!group) {
         rootRows.push(entry);
@@ -93,9 +89,6 @@
 
     if (rootRows.length > 0) {
       out.push({ key: "root", label: "In this workspace", rows: rootRows });
-    }
-    if (outsideRows.length > 0) {
-      out.push({ key: "outside", label: "Other projects", rows: outsideRows });
     }
     return out;
   });
@@ -156,7 +149,7 @@
         label: "Open",
         icon: FolderOpen,
         disabled: !entry.available,
-        onSelect: () => pick(entry.path, entry.available),
+        onSelect: () => pick(entry),
       },
       {
         label: "Rename…",
@@ -179,10 +172,13 @@
     ]);
   }
 
-  async function pick(path: string, available: boolean) {
-    if (!available) return;
+  async function pick(entry: RegistryEntryStatus) {
+    if (!entry.available) return;
     try {
-      await app.openProject(path);
+      // A member of the open workspace is focused, not reopened alone:
+      // opening it as a project would close the workspace around it.
+      if (app.workspace && memberNameById.has(entry.id)) await app.focusMember(entry.id);
+      else await app.openProject(entry.path);
       close();
     } catch (e) {
       error = String(e);
@@ -193,18 +189,6 @@
     e.stopPropagation();
     await api.forgetProject(id);
     await app.refreshRegistry();
-  }
-
-  async function openFolder() {
-    const folder = await openDialog({ directory: true, title: "Open a folder as a Ken project" });
-    if (typeof folder !== "string") return;
-    const name = folder.split("/").pop() ?? "Project";
-    try {
-      await app.createProject(folder, name);
-      close();
-    } catch (e) {
-      error = String(e);
-    }
   }
 </script>
 
@@ -247,7 +231,7 @@
         if (renamingId === entry.id) return;
         // Choosing one project leaves the merged tree behind.
         if (app.treeShowsAllProjects) void app.setTreeShowsAllProjects(false);
-        pick(entry.path, entry.available);
+        pick(entry);
       }}
       oncontextmenu={(e) => rowMenu(e, entry)}
     >
@@ -289,11 +273,6 @@
     </button>
     {/each}
   {/each}
-  <button class="row new" onclick={openFolder}>
-    <span class="badge plus"><Plus size={15} strokeWidth={1.75} /></span>
-    <span class="info"><span class="name">Open a folder…</span>
-      <span class="path">Any folder becomes a Ken project</span></span>
-  </button>
   {#if app.workspace}
     <!-- The opt-out, at the bottom because it is the exception. Only shown
          when there is actually a folder group to flatten. -->
@@ -398,9 +377,6 @@
     font-family: var(--font-serif);
     font-size: 13px;
     flex: none;
-  }
-  .badge.plus {
-    background: var(--accent);
   }
   .info {
     display: flex;

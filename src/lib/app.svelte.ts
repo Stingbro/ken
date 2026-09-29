@@ -341,11 +341,11 @@ class AppStore {
       void this.loadUnread();
       await this.refreshTree();
     } else {
-      // Launch straight into the last-used project when it's still around;
-      // any failure just leaves the picker showing.
-      const lastId = await api.lastProjectId().catch(() => null);
-      const entry = this.registry.find((e) => e.id === lastId && e.available);
-      if (entry) await this.openProject(entry.path).catch(() => {});
+      // Launch straight into the workspace used last when it's still around;
+      // any failure just leaves the start screen showing.
+      const recent = await api.listRecentWorkspaces().catch(() => []);
+      const last = recent.find((w) => w.available);
+      if (last) await this.openWorkspace(last.path).catch(() => {});
     }
   }
 

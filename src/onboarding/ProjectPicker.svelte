@@ -1,29 +1,18 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import {
-    api,
-    memberGroup,
-    memberLeaf,
-    type Candidate,
-    type FeatureInfo,
-    type ProjectProfile,
-    type RecentWorkspace,
-    type RegistryEntryStatus,
-  } from "../lib/api";
+  import { api, type RecentWorkspace } from "../lib/api";
   import { timeAgo } from "../lib/format";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Trash2 from "@lucide/svelte/icons/trash-2";
-  import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import SetupFlow from "./SetupFlow.svelte";
 
+  // Ken works in workspaces: this screen opens one it knows, or sets up a
+  // new one (Folder, Team, Repos, Index).
   let error = $state<string | null>(null);
-  // Set-up (Folder, Team, Repos, Index): the knowledge-layer way in for a
-  // folder of code repos. The older workspace wizard below stays as is.
   let setupOpen = $state(false);
 
   // Workspaces opened before, newest first: open one again in a click.
@@ -42,6 +31,21 @@
       await app.openWorkspace(ws.path);
     } catch (e) {
       error = String(e);
+    }
+  }
+  // A folder picked to open that holds no workspace: said plainly, with the
+  // way to make one.
+  let noWorkspaceAt = $state<string | null>(null);
+  async function openWorkspaceFolder() {
+    error = null;
+    noWorkspaceAt = null;
+    const folder = await openDialog({ directory: true, title: "Choose the workspace's folder" });
+    if (typeof folder !== "string") return;
+    try {
+      await app.openWorkspace(folder);
+    } catch (e) {
+      if (String(e).includes(".ken-workspace")) noWorkspaceAt = folder;
+      else error = String(e);
     }
   }
   async function forgetWorkspace(id: string) {
@@ -64,230 +68,9 @@
     ]);
   }
 
-  async function forgetId(id: string) {
-    await api.forgetProject(id);
-    await app.refreshRegistry();
-  }
-
-  function rowMenu(e: MouseEvent, entry: RegistryEntryStatus) {
-    e.preventDefault();
-    const x = e.clientX;
-    const y = e.clientY;
-    openContextMenu(x, y, [
-      {
-        label: "Open",
-        icon: FolderOpen,
-        disabled: !entry.available,
-        onSelect: () => openExisting(entry.path, entry.available),
-      },
-      "separator",
-      {
-        label: "Remove from Ken…",
-        icon: Trash2,
-        danger: true,
-        onSelect: () =>
-          openConfirm(x, y, {
-            title: `Remove “${entry.name}”?`,
-            body: "Removes it from Ken's list — the folder and its files stay on disk.",
-            confirmLabel: "Remove from Ken",
-            onConfirm: () => void forgetId(entry.id),
-          }),
-      },
-    ]);
-  }
-  let pendingPath = $state<string | null>(null);
-  let pendingName = $state("");
-
-  // Project-scoped feature flags offered during onboarding, plus the
-  // toggles the user actually changed from their default (only those are
-  // written once the project exists — see confirmCreate).
-  let features = $state<FeatureInfo[]>([]);
-  let featureChoices = $state<Record<string, boolean>>({});
-  let featuresOpen = $state(false);
-
-  // project-profiler task 3.2: minimal "analyzing" affordance for the
-  // chosen (not-yet-a-project) folder, driven by `profile_candidates` +
-  // `onProfileState` (path-keyed — see api.ts's `ProfileState`). Only a
-  // single candidate is ever in flight here (this flow creates one project
-  // at a time); a real multi-candidate workspace-creation checklist is
-  // deferred (tasks.md 3.2 note) — Phase 2 never built the picker UI it'd
-  // need.
-  let candidateProfileState = $state<"scanning" | "refining" | "ready" | "error" | null>(null);
-  let candidateProfile = $state<ProjectProfile | null>(null);
-  // Hides the affordance locally without cancelling the backend scan (no
-  // cancel-profile command exists) — "skip" here means "stop waiting to see
-  // it," which is honest since project creation was never gated on it.
-  let analysisDismissed = $state(false);
-  let unlistenProfile: (() => void) | undefined;
-
   onMount(() => {
     void loadRecentWorkspaces();
-    void api.onProfileState((ev) => {
-      if (ev.path !== pendingPath) return;
-      if (ev.state === "ready") candidateProfile = ev.profile;
-      candidateProfileState = ev.state;
-    }).then((fn) => (unlistenProfile = fn));
-    return () => unlistenProfile?.();
   });
-
-  async function chooseFolder() {
-    error = null;
-    const folder = await openDialog({
-      directory: true,
-      title: "Choose the folder that holds your knowledge",
-    });
-    if (typeof folder !== "string") return;
-    pendingPath = folder;
-    pendingName = folder.split("/").pop() ?? "My project";
-    featuresOpen = false;
-    candidateProfileState = null;
-    candidateProfile = null;
-    analysisDismissed = false;
-    try {
-      const all = await api.listFeatures();
-      features = all.filter((f) => f.scope === "project");
-      featureChoices = Object.fromEntries(features.map((f) => [f.name, f.effective]));
-      // `profile_candidates` isn't flag-gated server-side (the folder isn't a
-      // project yet, so there's no per-project override to read) — per its
-      // lib.rs doc comment, callers are expected to check the *global*
-      // `profiler` default themselves first.
-      if (all.find((f) => f.name === "profiler")?.effective) {
-        void api.profileCandidates([folder]);
-      }
-    } catch {
-      features = [];
-      featureChoices = {};
-    }
-  }
-
-  async function confirmCreate() {
-    if (!pendingPath) return;
-    try {
-      const changed = features.filter((f) => featureChoices[f.name] !== f.effective);
-      await app.createProject(pendingPath, pendingName.trim() || "My project");
-      for (const f of changed) {
-        const value = featureChoices[f.name];
-        if (f.name === "semanticIndex") {
-          await app.setSemanticIndex(value);
-        } else {
-          await api.setProjectFeature(f.name, value);
-        }
-      }
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function openExisting(path: string, available: boolean) {
-    if (!available) return;
-    error = null;
-    try {
-      await app.openProject(path);
-    } catch (e) {
-      error = String(e);
-    }
-  }
-
-  async function forget(id: string, e: MouseEvent) {
-    e.stopPropagation();
-    await api.forgetProject(id);
-    await app.refreshRegistry();
-  }
-
-  // ---- Workspace creation flow (workspace task 4.2) ----
-  // Flag-gated (app.workspaceFlagEnabled) parallel wizard to the single-
-  // folder flow above: parent folder → candidate checklist (existing
-  // projects pre-checked, marker/file-count captions, per-candidate
-  // include toggle) → name → the same Features disclosure pattern
-  // `confirmCreate` uses, filtered to workspace-scoped flags → create.
-  type WsStep = "candidates" | "name";
-  let wsParent = $state<string | null>(null);
-  let wsStep = $state<WsStep>("candidates");
-  let wsCandidates = $state<Candidate[]>([]);
-  let wsIncluded = $state<Record<string, boolean>>({});
-  let wsName = $state("");
-  let wsFeatures = $state<FeatureInfo[]>([]);
-  let wsFeatureChoices = $state<Record<string, boolean>>({});
-  let wsFeaturesOpen = $state(false);
-  let wsBusy = $state(false);
-  let wsError = $state<string | null>(null);
-
-  async function chooseWorkspaceFolder() {
-    error = null;
-    const folder = await openDialog({
-      directory: true,
-      title: "Choose the parent folder that holds your projects",
-    });
-    if (typeof folder !== "string") return;
-    wsError = null;
-    wsParent = folder;
-    wsStep = "candidates";
-    wsBusy = true;
-    try {
-      wsCandidates = await api.discoverWorkspaceCandidates(folder);
-      wsIncluded = Object.fromEntries(wsCandidates.map((c) => [c.name, c.existing]));
-    } catch (e) {
-      wsError = String(e);
-      wsCandidates = [];
-    } finally {
-      wsBusy = false;
-    }
-  }
-
-  function wsToName() {
-    if (!wsParent) return;
-    wsName = wsParent.split("/").pop() ?? "Workspace";
-    wsStep = "name";
-    wsFeaturesOpen = false;
-    void api
-      .listFeatures()
-      .then((all) => {
-        wsFeatures = all.filter((f) => f.scope === "workspace");
-        wsFeatureChoices = Object.fromEntries(wsFeatures.map((f) => [f.name, f.effective]));
-      })
-      .catch(() => {
-        wsFeatures = [];
-        wsFeatureChoices = {};
-      });
-  }
-
-  async function confirmCreateWorkspace() {
-    if (!wsParent || wsBusy) return;
-    const members = wsCandidates.filter((c) => wsIncluded[c.name]).map((c) => c.name);
-    if (members.length === 0) {
-      wsError = "Choose at least one folder to include.";
-      return;
-    }
-    wsBusy = true;
-    wsError = null;
-    try {
-      const changed = wsFeatures.filter((f) => wsFeatureChoices[f.name] !== f.effective);
-      await app.createWorkspace(wsParent, wsName.trim() || "Workspace", members);
-      for (const f of changed) {
-        await api.setGlobalFeature(f.name, wsFeatureChoices[f.name]);
-      }
-    } catch (e) {
-      wsError = String(e);
-    } finally {
-      wsBusy = false;
-    }
-  }
-
-  function cancelWorkspaceFlow() {
-    wsParent = null;
-    wsStep = "candidates";
-    wsCandidates = [];
-    wsIncluded = {};
-    wsError = null;
-  }
-
-  function wsBack() {
-    if (wsStep === "name") {
-      wsStep = "candidates";
-    } else {
-      cancelWorkspaceFlow();
-    }
-  }
 </script>
 
 <div class="wrap" data-tauri-drag-region>
@@ -302,214 +85,42 @@
       reads it, keeps watch, and makes every fact findable.
     </p>
 
-    {#if pendingPath}
-      <div class="confirm">
-        <div class="mono path">{pendingPath}</div>
-        <label>
-          Project name
-          <input
-            bind:value={pendingName}
-            onkeydown={(e) => {
-              e.stopPropagation();
-              if (e.key === "Enter") confirmCreate();
-            }}
-          />
-        </label>
-
-        {#if !analysisDismissed && (candidateProfileState === "scanning" || candidateProfileState === "refining" || (candidateProfileState === "ready" && candidateProfile))}
-          <div class="analyzing" role="status" aria-live="polite">
-            {#if candidateProfileState === "ready" && candidateProfile}
-              <span class="kind-badge">{candidateProfile.kind}</span>
-              {#if candidateProfile.summary}
-                <span class="analyzing-text">{candidateProfile.summary}</span>
-              {/if}
-            {:else}
-              <span class="mini-spinner"></span>
-              <span class="analyzing-text">
-                {candidateProfileState === "refining"
-                  ? "Refining analysis…"
-                  : "Analyzing project…"}
-              </span>
-              <button
-                type="button"
-                class="skip-analysis"
-                onclick={() => (analysisDismissed = true)}
-              >
-                Skip
-              </button>
-            {/if}
-          </div>
-        {/if}
-
-        {#if features.length > 0}
-          <div class="features">
-            <button
-              type="button"
-              class="features-toggle"
-              onclick={() => (featuresOpen = !featuresOpen)}
-              aria-expanded={featuresOpen}
-            >
-              <span class="chev" class:open={featuresOpen}>
-                <ChevronRight size={13} strokeWidth={2} />
-              </span>
-              Features
-            </button>
-            {#if featuresOpen}
-              <div class="features-body">
-                {#each features as flag (flag.name)}
-                  <label class="radio feature-row">
-                    <input type="checkbox" bind:checked={featureChoices[flag.name]} />
-                    <span class="feature-text">
-                      <span class="feature-name" title={flag.name}>{flag.label}</span>
-                      <span class="note">{flag.description}</span>
-                    </span>
-                  </label>
-                {/each}
-                <p class="note">You can change these later in Settings.</p>
-              </div>
-            {/if}
-          </div>
-        {/if}
-
-        <div class="confirm-actions">
-          <button class="btn btn-primary" onclick={confirmCreate}>Create project</button>
-          <button class="btn btn-ghost" onclick={() => (pendingPath = null)}>Back</button>
-        </div>
-      </div>
-    {:else if setupOpen}
+    {#if setupOpen}
       <SetupFlow onclose={() => (setupOpen = false)} />
-    {:else if wsParent}
-      <div class="confirm">
-        <div class="mono path">{wsParent}</div>
-
-        {#if wsStep === "candidates"}
-          <div class="ws-candidates">
-            {#if wsBusy}
-              <p class="note">Scanning folders…</p>
-            {:else if wsCandidates.length === 0}
-              <p class="note">No subfolders found in this parent.</p>
-            {:else}
-              {#each wsCandidates as c (c.name)}
-                <label class="radio feature-row">
-                  <input type="checkbox" bind:checked={wsIncluded[c.name]} />
-                  <span class="feature-text">
-                    <span class="feature-name ws-name">
-                      {memberLeaf(c.name)}{#if memberGroup(c.name)}<span class="ws-group"> in {memberGroup(c.name)}/</span>{/if}
-                    </span>
-                    <span class="note">
-                      {c.existing ? "Existing Ken project" : "New"} · {c.fileCount}
-                      {c.fileCount === 1 ? "file" : "files"}{#if c.markers.length > 0} · {c.markers.join(", ")}{/if}
-                    </span>
-                  </span>
-                </label>
-              {/each}
-            {/if}
-          </div>
-          <div class="confirm-actions">
-            <button
-              class="btn btn-primary"
-              disabled={wsBusy || wsCandidates.length === 0}
-              onclick={wsToName}
-            >
-              Next
-            </button>
-            <button class="btn btn-ghost" onclick={cancelWorkspaceFlow}>Cancel</button>
-          </div>
-        {:else}
-          <label>
-            Workspace name
-            <input
-              bind:value={wsName}
-              onkeydown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Enter") confirmCreateWorkspace();
-              }}
-            />
-          </label>
-
-          {#if wsFeatures.length > 0}
-            <div class="features">
-              <button
-                type="button"
-                class="features-toggle"
-                onclick={() => (wsFeaturesOpen = !wsFeaturesOpen)}
-                aria-expanded={wsFeaturesOpen}
-              >
-                <span class="chev" class:open={wsFeaturesOpen}>
-                  <ChevronRight size={13} strokeWidth={2} />
-                </span>
-                Features
-              </button>
-              {#if wsFeaturesOpen}
-                <div class="features-body">
-                  {#each wsFeatures as flag (flag.name)}
-                    <label class="radio feature-row">
-                      <input type="checkbox" bind:checked={wsFeatureChoices[flag.name]} />
-                      <span class="feature-text">
-                        <span class="feature-name" title={flag.name}>{flag.label}</span>
-                        <span class="note">{flag.description}</span>
-                      </span>
-                    </label>
-                  {/each}
-                  <p class="note">You can change these later in Settings.</p>
-                </div>
-              {/if}
-            </div>
-          {/if}
-
-          <div class="confirm-actions">
-            <button class="btn btn-primary" disabled={wsBusy} onclick={confirmCreateWorkspace}>
-              Create workspace
-            </button>
-            <button class="btn btn-ghost" onclick={wsBack}>Back</button>
-          </div>
-        {/if}
-
-        {#if wsError}
-          <div class="error">{wsError}</div>
-        {/if}
-      </div>
     {:else}
-      <!-- Two genuinely different outcomes, so they read as a choice
-           rather than an action plus an afterthought. The old pair —
-           a primary "Choose a folder…" above a ghost "Open a workspace…"
-           — pushed people into single-project mode by emphasis, and
-           "Open a workspace" sounded like opening an existing one rather
-           than building one from a folder of repos. -->
+      <!-- Ken works in workspaces: open one Ken already knows, or set up a
+           new one. Set-up is offered on a fresh install too: confirming it
+           turns the workspace feature on. -->
       <div class="choose-row stacked">
-        <!-- Set-up is offered on a fresh install too: confirming it turns the
-             workspace feature on, so it is the way in, not behind the flag. -->
+        <button class="choice" onclick={openWorkspaceFolder}>
+          <span class="choice-title">Open a workspace</span>
+          <span class="choice-note">
+            Pick the folder of a workspace set up before, on this machine or
+            by a teammate.
+          </span>
+        </button>
         <button class="choice" onclick={() => (setupOpen = true)}>
-          <span class="choice-title">Set up Ken for your code</span>
+          <span class="choice-title">Set up a new workspace</span>
           <span class="choice-note">
             Pick the repos Ken should know, wherever they live. It proposes what
             each is, its team and how deep to read it; nothing is written until
             you confirm.
           </span>
         </button>
-        {#if app.workspaceFlagEnabled}
-          <button class="choice" onclick={chooseWorkspaceFolder}>
-            <span class="choice-title">Several projects</span>
-            <span class="choice-note">
-              Pick the folder that CONTAINS your repos. Ken tracks each one
-              separately and you can search across all of them.
-            </span>
-          </button>
-        {/if}
-        <button class="choice" onclick={chooseFolder}>
-          <span class="choice-title">One project</span>
-          <span class="choice-note">
-            Pick a single folder — one repo, or one set of notes.
-          </span>
-        </button>
       </div>
+      {#if noWorkspaceAt}
+        <div class="error">
+          No Ken workspace in {noWorkspaceAt}.
+          <button class="btn btn-ghost" onclick={() => { noWorkspaceAt = null; setupOpen = true; }}>Set one up</button>
+        </div>
+      {/if}
     {/if}
 
     {#if error}
       <div class="error">{error}</div>
     {/if}
 
-    {#if recentWorkspaces.length > 0 && !pendingPath && !wsParent && !setupOpen}
+    {#if recentWorkspaces.length > 0 && !setupOpen}
       <div class="recent-label">Recent workspaces</div>
       <div class="recents">
         {#each recentWorkspaces as ws (ws.id)}
@@ -531,32 +142,6 @@
             </span>
             {#if !ws.available}
               <span class="forget" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); void forgetWorkspace(ws.id); }} onkeydown={() => {}}>Remove</span>
-            {/if}
-          </button>
-        {/each}
-      </div>
-    {/if}
-
-    {#if app.registry.length > 0 && !pendingPath && !wsParent && !setupOpen}
-      <div class="recent-label">Recent projects</div>
-      <div class="recents">
-        {#each app.registry as entry (entry.id)}
-          <button
-            class="recent"
-            class:unavailable={!entry.available}
-            onclick={() => openExisting(entry.path, entry.available)}
-            oncontextmenu={(e) => rowMenu(e, entry)}
-          >
-            <span class="badge">{entry.name.charAt(0).toUpperCase()}</span>
-            <span class="info">
-              <span class="name">{entry.name}</span>
-              <span class="mono path-small">{entry.path}</span>
-              {#if !entry.available}
-                <span class="missing">Folder not found</span>
-              {/if}
-            </span>
-            {#if !entry.available}
-              <span class="forget" role="button" tabindex="0" onclick={(e) => forget(entry.id, e)} onkeydown={() => {}}>Remove</span>
             {/if}
           </button>
         {/each}
@@ -667,190 +252,6 @@
     font-size: 12px;
     line-height: 1.5;
     color: var(--ink-tertiary);
-  }
-  .ws-candidates {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    max-height: 260px;
-    overflow-y: auto;
-  }
-  .feature-name.ws-name {
-    text-transform: none;
-  }
-  .ws-group {
-    font-weight: 400;
-    color: var(--ink-tertiary);
-  }
-  .confirm {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 16px 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .path {
-    font-size: 12px;
-    color: var(--ink-secondary);
-    word-break: break-all;
-  }
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink-secondary);
-  }
-  input {
-    height: 36px;
-    padding: 0 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border-strong);
-    background: var(--surface);
-    font-size: 14px;
-    color: var(--ink);
-    outline: none;
-    font-family: inherit;
-  }
-  input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
-  }
-  .confirm-actions {
-    display: flex;
-    gap: 8px;
-  }
-  .analyzing {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
-    border-radius: 8px;
-    background: var(--sunken);
-    font-size: 12.5px;
-  }
-  .mini-spinner {
-    width: 12px;
-    height: 12px;
-    flex: none;
-    border: 2px solid color-mix(in srgb, var(--ink-tertiary) 35%, transparent);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: profile-spin 0.7s linear infinite;
-  }
-  @keyframes profile-spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-  .kind-badge {
-    flex: none;
-    padding: 2px 7px;
-    border-radius: 6px;
-    background: var(--ink);
-    color: var(--paper);
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: capitalize;
-  }
-  .analyzing-text {
-    color: var(--ink-secondary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-  }
-  .skip-analysis {
-    flex: none;
-    border: none;
-    background: transparent;
-    padding: 0;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink-tertiary);
-  }
-  .skip-analysis:hover {
-    color: var(--ink-secondary);
-  }
-  .features {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .features-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    align-self: flex-start;
-    border: none;
-    background: transparent;
-    padding: 0;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--ink-tertiary);
-  }
-  .features-toggle:hover {
-    color: var(--ink-secondary);
-  }
-  .chev {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 14px;
-    height: 14px;
-    transition: transform 0.15s ease;
-  }
-  .chev.open {
-    transform: rotate(90deg);
-  }
-  .features-body {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 2px 2px 0;
-    /* Same treatment as `.ws-candidates`: nine flags overflow the panel. */
-    max-height: 260px;
-    overflow-y: auto;
-  }
-  .radio {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .radio input {
-    accent-color: var(--accent);
-    /* The checkbox is a flex item too — without this it shrinks to a sliver
-       when the label text is long. */
-    flex: none;
-  }
-  .feature-row {
-    align-items: flex-start;
-  }
-  .feature-text {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    /* `min-width: auto` (the flex default) refuses to shrink below the
-       content width, so a long candidate note pushes the row past the
-       panel instead of wrapping. These two make it wrap in place. */
-    flex: 1;
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
-  .feature-name {
-    font-weight: 600;
-    text-transform: capitalize;
-  }
-  .note {
-    margin: 0;
-    font-size: 12px;
-    color: var(--ink-tertiary);
-    line-height: 1.5;
   }
   .error {
     font-size: 13px;
