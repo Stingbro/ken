@@ -165,6 +165,8 @@ pub fn folder_imports(root: &Path) -> Option<String> {
     // tell `backend/app/api` from `backend/app/services`.
     let folder = |p: &str| p.rsplit_once('/').map_or(".", |(d, _)| d).split('/').take(4).collect::<Vec<_>>().join("/");
     let mut edges: HashMap<(String, String), usize> = HashMap::new();
+    // How many other files import each file: the hubs to start reading at.
+    let mut importers: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     for rel in &files {
         let Some(lang) = crate::codemap::Lang::of(rel) else { continue };
         let Ok(text) = fs::read_to_string(root.join(rel)) else { continue };
@@ -173,6 +175,9 @@ pub fn folder_imports(root: &Path) -> Option<String> {
         }
         for target in crate::codemap::imports_of(lang, &text) {
             let Some(to) = crate::codemap::resolve_import(rel, &target, &files) else { continue };
+            if &to != rel {
+                importers.entry(to.clone()).or_default().insert(rel.clone());
+            }
             let (a, b) = (folder(rel), folder(&to));
             if a != b {
                 *edges.entry((a, b)).or_default() += 1;
@@ -196,6 +201,12 @@ pub fn folder_imports(root: &Path) -> Option<String> {
     if !both.is_empty() {
         out.push_str("\n\nimport each other (a -> b / b -> a):\n");
         out.push_str(&both.join("\n"));
+    }
+    let mut hubs: Vec<(String, usize)> = importers.into_iter().map(|(f, by)| (f, by.len())).filter(|(_, n)| *n > 1).collect();
+    hubs.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    if !hubs.is_empty() {
+        out.push_str("\n\nmost imported files (how many files import each):\n");
+        out.push_str(&hubs.iter().take(15).map(|(f, n)| format!("{f} ({n})")).collect::<Vec<_>>().join("\n"));
     }
     Some(out)
 }
@@ -571,7 +582,8 @@ pub fn draft(
 pub const REPO_MAP: &str = "Repo-Map";
 
 const REPO_PURPOSE: &str = "one repo's page in the Repo Map: what the repo is for (the team's own description first), \
-    what lives where in it (its layout and entry points), which of its folders call which (from the imports between folders), \
+    what lives where in it (its layout and entry points), which of its folders call which and the files most imported \
+    (from the imports between folders), \
     who owns it and who commits, how it is built and released, \
     and how it connects to the team's other repos";
 
@@ -1094,7 +1106,8 @@ mod tests {
         assert_eq!(
             deps,
             "app/api -> app/services (3)\napp/db -> app/services (1)\napp/services -> app/db (1)\n\n\
-             import each other (a -> b / b -> a):\napp/db <-> app/services (1 / 1)"
+             import each other (a -> b / b -> a):\napp/db <-> app/services (1 / 1)\n\n\
+             most imported files (how many files import each):\napp/services/users.py (2)"
         );
         let labels: Vec<String> = gather_repo("app", root).into_iter().map(|s| s.label).collect();
         assert!(labels.contains(&"app:(imports between folders, from the code)".to_string()), "{labels:?}");

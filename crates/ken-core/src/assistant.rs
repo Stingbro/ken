@@ -162,7 +162,10 @@ Look for the answer yourself with Grep, Glob and Read in these folders:\n"
         p.push_str(&format!("- {name}: {} (cite its files as ken://{id}/<path>#L<line>)\n", root.display()));
     }
     p.push_str(
-        "\nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
+        "\nOn what the system does, the code wins: a ticket, plan or doc says what was intended, not what was built. \
+When the question is about how something works, open the code that does it and cite that file, with the doc beside it \
+if it helps.\n\
+\nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
 If after looking it genuinely is not there, say so plainly and say where you looked. End with a final line \
 `SOURCES: ken://…, ken://…` listing the addresses you cited (omit the line if none).\n",
     );

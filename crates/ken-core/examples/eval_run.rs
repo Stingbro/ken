@@ -440,7 +440,7 @@ fn phase_look(parent: &Path, questions: &Path) -> Result<()> {
     let folders: Vec<(String, uuid::Uuid, PathBuf)> =
         members(parent)?.into_iter().map(|(n, p)| (n, p.config.id, p.root.clone())).collect();
     let dirs: Vec<PathBuf> = folders.iter().map(|(_, _, r)| r.clone()).collect();
-    let (mut asked, mut found, mut not_there) = (0, 0, 0);
+    let (mut asked, mut found, mut named_only, mut not_there) = (0, 0, 0, 0);
     println!("# Ask Ken to look\n");
     for (qi, line) in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
         let n = qi + 1;
@@ -469,18 +469,31 @@ fn phase_look(parent: &Path, questions: &Path) -> Result<()> {
             })
             .collect();
         let hit = cited.iter().any(|c| expects.iter().any(|e| c.to_lowercase().contains(e)));
+        // Right file named in the answer, but not opened and cited.
+        let named = !hit && expects.iter().any(|e| parsed.body.to_lowercase().contains(e));
         let says_missing = parsed.body.to_lowercase().contains("not there") || parsed.body.to_lowercase().contains("could not find");
         asked += 1;
         found += usize::from(hit);
+        named_only += usize::from(named);
         not_there += usize::from(says_missing && !hit);
         println!(
             "## Q{n}. {q}\n\n{} · {:.0}s · expected `{expect}`\n\n{}\n\ncited: {cited:?}\n",
-            if hit { "FOUND" } else if says_missing { "SAID NOT THERE" } else { "MISSED" },
+            if hit {
+                "FOUND"
+            } else if named {
+                "NAMED, NOT CITED"
+            } else if says_missing {
+                "SAID NOT THERE"
+            } else {
+                "MISSED"
+            },
             t.elapsed().as_secs_f64(),
             short(&parsed.body, 600)
         );
     }
-    println!("## Score\n\n{found} of {asked} found an expected file; {not_there} said it was not there.");
+    println!(
+        "## Score\n\n{found} of {asked} cited an expected file; {named_only} more named it without citing it; {not_there} said it was not there."
+    );
     Ok(())
 }
 
