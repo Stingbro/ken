@@ -534,6 +534,39 @@ will need their own lines there once decided.
     180 days ago −0.25; question shape nudges code vs prose ±0.5; the top
     page hits' wiki links rise (never past them) and up to 3 linked pages
     join.
+- **Second end-to-end run, fresh (2026-09-28/29).** Clean clones of the ATT
+  repos under `C:\ken-eval\fresh` with their own scratch remotes
+  (`fresh\remotes`, never the real ones). Phases added to `eval_run`:
+  `imports`, `look`, `map` (Claude's build per member), `add-repo`, `sync`,
+  `chat` (`assistant::chat_oneshot`: the chat's guide, Ken's MCP server,
+  read-only). Fixed on the way:
+  - Embedding: one model context per batch, not per chunk (279 s → 83 s on
+    2,596 chunks). Packing several chunks per call was slower; reverted.
+  - First draft: writes Vocabulary; names the Domain section; the Review
+    card lists the placeholders left for a person; cites once per
+    paragraph or row; release notes add an Unreleased section from the
+    commits after the newest tag; a Repo Map page reads the imports between
+    folders from the code (call order, folders importing each other, the
+    most imported files). `resolve_import` 37 s → 2.4 s on 1,796 files.
+  - Drift: a repo checked out on a branch the default does not contain is
+    pinned to the commit read and measured against its own upstream.
+  - Search: a page titled with a `{{placeholder}}` ranks under real pages.
+  - Look: code wins over tickets on what the system does; Glob/Grep need
+    each folder as the path; the look gets the files search ranked.
+    16 questions search missed: 4 → 12 cited the right file.
+  - Graph: a first name alone never merges with a full name; a merged
+    kind is voted (a specific kind needs half the votes).
+  - MCP history: an old commit's moved path is text, not a dead address.
+  - Chat: links a sibling repo's file by its ken:// address (each turn
+    lists them; `inMember` also opens `Repo Name/path` links there); checks
+    every repo before saying the code does not do something. 30 questions
+    graded by hand: 29 answered correctly with sources; the one wrong
+    (answered from the older prototype only) is right after the rule.
+  - Results: ATT 14/21 (hybrid top-1/top-5), 15 of 30 routed by the graph
+    now, same score; Ken workspace 8/14; code filtered 4/7 and 4/9.
+  - Not done: template updates reaching existing wikis (needs a record of
+    the template version a wiki started from); platforms and tools land in
+    the `other` entity kind.
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)

@@ -73,3 +73,22 @@ export function lineTarget(markdown: string, line: number): { heading?: string; 
   const phrase = plain.length >= 4 ? plain.slice(0, 60) : undefined;
   return { heading: above, phrase };
 }
+
+/** A relative link whose first folder is another workspace repo's name
+ *  (`Project Documents/SOW.md`, written from a chat started in the wiki)
+ *  points into that repo; a project-relative path would look for it in the
+ *  focused one. Longest name first, so a `Group/Child` member wins over its
+ *  group. A `ken://` citation, or a path naming no other repo, is unchanged. */
+export function inMember(
+  c: Citation,
+  members: { id: string | null; name: string }[],
+  focused: string | null,
+): Citation {
+  if (c.projectId) return c;
+  const lower = c.path.toLowerCase();
+  const named = members
+    .filter((m) => m.id && m.id !== focused)
+    .sort((a, b) => b.name.length - a.name.length)
+    .find((m) => lower.startsWith(m.name.toLowerCase() + "/"));
+  return named ? { ...c, projectId: named.id, path: c.path.slice(named.name.length + 1) } : c;
+}

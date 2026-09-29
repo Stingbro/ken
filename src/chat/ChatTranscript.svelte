@@ -2,7 +2,7 @@
   import { chats, SUGGESTED_PROMPTS } from "../lib/chats.svelte";
   import { app } from "../lib/app.svelte";
   import { renderMarkdown } from "../lib/markdown";
-  import { parseCitation } from "../lib/citation";
+  import { inMember, parseCitation } from "../lib/citation";
   import { parseEditProposal } from "../lib/chats.svelte";
   import QuestionCard from "./QuestionCard.svelte";
   import EditReview from "./EditReview.svelte";
@@ -31,8 +31,9 @@
     const a = (e.target as HTMLElement).closest("a");
     if (!a) return;
     e.preventDefault();
-    const c = parseCitation(a.getAttribute("href") ?? "");
-    if (!c) return;
+    const parsed = parseCitation(a.getAttribute("href") ?? "");
+    if (!parsed) return;
+    const c = inMember(parsed, app.members, app.focused);
     if (c.projectId && c.projectId !== app.focused) {
       if (c.projectId === "workspace") return;
       await app.focusMember(c.projectId);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lineTarget, parseCitation } from "./citation";
+import { inMember, lineTarget, parseCitation } from "./citation";
 
 describe("citations", () => {
   it("reads a path with a line, a range, a heading, or a colon line", () => {
@@ -18,6 +18,20 @@ describe("citations", () => {
       anchor: undefined,
     });
     expect(parseCitation("ken://1234/")).toBeNull();
+  });
+
+  it("sends a link that starts with another repo's name to that repo", () => {
+    const members = [
+      { id: "wiki", name: "ATT-Wiki" },
+      { id: "docs", name: "Project Documents" },
+      { id: "code", name: "att-opmodel" },
+    ];
+    const c = inMember(parseCitation("Project%20Documents/07%20Concepts/Market%20Cluster.md#L18")!, members, "wiki");
+    expect(c).toEqual({ projectId: "docs", path: "07 Concepts/Market Cluster.md", line: 18, anchor: undefined });
+    const own = parseCitation("Current/Project.md#L37")!;
+    expect(inMember(own, members, "wiki")).toEqual(own);
+    const addressed = parseCitation("ken://code/BE_PACK/app/auth.py#L3")!;
+    expect(inMember(addressed, members, "wiki")).toEqual(addressed);
   });
 
   it("leaves web links and in-page anchors alone", () => {

@@ -219,7 +219,9 @@ and do not retry a declined change unless they ask.\n\
 2. Cite your sources so they can click them. Every fact that comes from a file gets a Markdown link to that file, \
 project-relative, with the line when you know it: [Save.md, line 12](Platform/Save.md#L12), or a heading: \
 [Save format](Platform/Save.md#save-format). A hit from Ken's search tools that carries a ken:// address is linked \
-by that address, with #L<line> when it has a line. Never open files or switch the person's screen yourself; a link \
+by that address, with #L<line> when it has a line. A file in another of the workspace's repos is linked by that \
+repo's ken:// address (each turn lists them), never a project-relative path; write a space in a path as %20. \
+Never open files or switch the person's screen yourself; a link \
 is how they go there.\n\
 3. Search with Ken first. Ken's tools (route_query across the workspace, semantic_search in one project, kg_search \
 over the knowledge graph, search_knowledge, read_document) search the team's wiki, docs and code with Ken's own \
@@ -234,7 +236,9 @@ project and the workspace's other repos (you may read them all), then answer, sa
 and cite the file. Glob and Grep search only the folder you start in unless given a path: pass each repo's folder \
 as the path. Only after looking may you say it isn't there, and say where you looked.\n\
 5. On what the system does, the code wins: a ticket, plan or doc says what was intended, not what was built. When \
-asked how something works, open the code that does it and cite that file; where the code and a doc disagree, say so.";
+asked how something works, open the code that does it and cite that file; where the code and a doc disagree, say so. \
+Several repos can hold the same product (a prototype and the build that replaced it): before saying the code does \
+not do something, look in every repo of the workspace, and say which repo each finding is from.";
 
 /// Ken's own MCP tools the chat may use without asking: they read Ken's
 /// index, or open a file for the person when they asked. Its tools that
@@ -401,6 +405,22 @@ const MAX_SCOPE_PROJECTS: usize = 12;
 ///
 /// Returns `None` when there is nothing to widen to (no siblings), so a
 /// single-project workspace sends exactly what it sends today.
+/// How to link a file in each repo of the workspace, as (name, id), for a
+/// chat turn: a project-relative link resolves only in the chat's own
+/// project, so a file read in a sibling needs its repo's address. None
+/// outside a workspace.
+pub fn build_cite_preamble(members: &[(String, uuid::Uuid)]) -> Option<String> {
+    if members.len() < 2 {
+        return None;
+    }
+    let mut s = String::from("[Links to files in the workspace's repos:");
+    for (name, id) in members.iter().take(MAX_SCOPE_PROJECTS) {
+        s.push_str(&format!("\n- {name}: ken://{id}/<path>#L<line>"));
+    }
+    s.push(']');
+    Some(s)
+}
+
 pub fn build_scope_preamble(
     focused_name: &str,
     focused_root: &str,
@@ -1110,6 +1130,15 @@ mod tests {
         assert_eq!(valid_model_alias(""), None);
         assert_eq!(valid_model_alias("gpt-4"), None);
         assert_eq!(valid_model_alias("claude-fable-5"), None);
+    }
+
+    #[test]
+    fn a_workspace_turn_says_how_to_link_each_repos_files() {
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert_eq!(build_cite_preamble(&[("wiki".into(), a)]), None, "one project: relative links work");
+        let p = build_cite_preamble(&[("wiki".into(), a), ("Project Documents".into(), b)]).unwrap();
+        assert!(p.contains(&format!("- Project Documents: ken://{b}/<path>#L<line>")), "{p}");
+        assert!(KEN_GUIDE.contains("%20") && KEN_GUIDE.contains("never a project-relative path"));
     }
 
     #[test]

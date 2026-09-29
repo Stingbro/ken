@@ -344,6 +344,7 @@ fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
     let config = serde_json::json!({"mcpServers": {"ken": {"command": mcp, "args": ["--project", wiki.root], "env": {"KEN_DATA_DIR": base}}}});
     std::fs::write(&cfg, config.to_string()).map_err(|e| Error::Other(e.to_string()))?;
     let dirs: Vec<PathBuf> = members(parent)?.into_iter().map(|(_, p)| p.root.clone()).collect();
+    let cite: Vec<(String, uuid::Uuid)> = members(parent)?.into_iter().map(|(n, p)| (n, p.config.id)).collect();
     let (mut asked, mut found, mut not_there) = (0, 0, 0);
     println!("# Ken's chat\n\nstarted in `{}`, MCP `{}`\n", wiki_name(), mcp.display());
     for (qi, line) in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
@@ -354,7 +355,12 @@ fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         let (q, expect) = line.split_once('\t').unwrap_or((line, ""));
         let expects: Vec<String> = expect.split('|').filter(|e| !e.is_empty()).map(|e| e.to_lowercase()).collect();
         let t = Instant::now();
-        let outcome = assistant::chat_oneshot(&binary, &wiki.root, &dirs, &cfg, q, Duration::from_secs(300), &CancelToken::new())?;
+        // As the app sends a workspace turn: how to link each repo's files.
+        let prompt = match ken_core::chat::build_cite_preamble(&cite) {
+            Some(c) => format!("{c}\n\n{q}"),
+            None => q.to_string(),
+        };
+        let outcome = assistant::chat_oneshot(&binary, &wiki.root, &dirs, &cfg, &prompt, Duration::from_secs(300), &CancelToken::new())?;
         let answer = match outcome {
             assistant::OneshotOutcome::Completed(t) => t,
             other => format!("(no answer: {other:?})"),

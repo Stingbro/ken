@@ -17,7 +17,7 @@
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
   import { kindForPath } from "../lib/format";
-  import { parseCitation } from "../lib/citation";
+  import { inMember, parseCitation } from "../lib/citation";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
 
@@ -92,8 +92,9 @@
     }
   }
   async function openCited(source: string) {
-    const c = parseCitation(source);
-    if (!c) return app.openInFiles(source);
+    const parsed = parseCitation(source);
+    if (!parsed) return app.openInFiles(source);
+    const c = inMember(parsed, app.members, app.focused);
     if (c.projectId && c.projectId !== app.focused && c.projectId !== "workspace") {
       await app.focusMember(c.projectId);
     }

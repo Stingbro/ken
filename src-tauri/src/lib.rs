@@ -13150,6 +13150,21 @@ fn send_chat_message(
         }
     };
     let group_label = scope.as_deref().filter(|s| *s != "all").map(str::to_string);
+    // Every repo of the workspace, for linking a file read in any of them.
+    let cite_members: Vec<(String, uuid::Uuid)> = guard
+        .workspace
+        .as_ref()
+        .map(|ws| {
+            ws.ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some((m.name.clone(), p.config.id)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     drop(guard);
 
     // Claude Code shows a blocking trust dialog the first time it touches an
@@ -13193,6 +13208,9 @@ fn send_chat_message(
         group_label.as_deref(),
     ) {
         prompt = format!("{scope_preamble}\n\n{prompt}");
+    }
+    if let Some(cite) = chat::build_cite_preamble(&cite_members) {
+        prompt = format!("{cite}\n\n{prompt}");
     }
     if let Some(mems) = memories_block {
         prompt = format!("{mems}\n\n{prompt}");
