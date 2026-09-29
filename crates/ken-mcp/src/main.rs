@@ -282,12 +282,13 @@ it uses. For how a module fits in and what depends on it.",
         }),
         json!({
             "name": "history",
-            "description": "When and why something changed, from git (read-only, always current): a file's recent commits (path), or the commits whose message mentions some words or whose change added or removed them (query). Each commit with its date, author, message and the files it touched as ken:// addresses.",
+            "description": "When and why something changed (read-only, always current): a file's recent commits (path), the commits whose message mentions some words or whose change added or removed them (query), or with neither, what changed in the last days (what changed this week?): each git repo's commits in that window and, for a folder with no git, the files Ken saw change. Each commit with its date, author, message and the files it touched as ken:// addresses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "A file's path relative to its project root: its history." },
                     "query": { "type": "string", "description": "Words to find in commit messages and in what changes added or removed." },
+                    "days": { "type": "integer", "description": "The window, in days back from today (default 7). Narrows path and query too." },
                     "limit": { "type": "integer", "description": "Maximum commits (default 15)." },
                     "project": code_project.clone()
                 }
@@ -1295,9 +1296,9 @@ this server has no query embedding model; see the tool description):\n",
 fn history(server: &Server, args: &Value) -> Result<String, String> {
     let path = args.get("path").and_then(|p| p.as_str()).map(|p| p.replace('\\', "/")).filter(|p| !p.is_empty());
     let query = args.get("query").and_then(|q| q.as_str()).map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
-    if path.is_none() && query.is_none() {
-        return Err("give a path (a file's history) or a query (commits about it)".into());
-    }
+    // With neither a file nor words, the question is "what changed lately".
+    let recent = path.is_none() && query.is_none();
+    let days = args.get("days").and_then(|d| d.as_u64()).map(|d| d.clamp(1, 3650)).or(recent.then_some(7));
     let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l.clamp(1, 100) as usize).unwrap_or(15);
     let roots: Vec<(Uuid, String, PathBuf)> = match args.get("project").and_then(|p| p.as_str()).map(str::trim).filter(|p| !p.is_empty()) {
         Some(name) => {
@@ -1309,7 +1310,9 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
             registry
                 .projects
                 .iter()
-                .filter(|e| e.path.join(".git").exists())
+                .filter(|e| e.path.is_dir())
+                // A folder without git still has recent changes, from the index.
+                .filter(|e| recent || e.path.join(".git").exists())
                 .filter(|e| path.as_ref().is_none_or(|p| e.path.join(p).exists()))
                 .map(|e| (e.id, e.name.clone(), e.path.clone()))
                 .collect()
@@ -1317,17 +1320,42 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
     };
     let fmt = "--format=%x1e%h%x1f%ad%x1f%an%x1f%s";
     let n = format!("-n{limit}");
+    let since = days.map(|d| format!("--since={d}.days.ago"));
     let mut out = String::new();
     let mut count = 0;
+    let mut changed_files = 0;
     for (id, project, root) in &roots {
-        let mut runs: Vec<Vec<String>> = Vec::new();
-        match (&path, &query) {
-            (Some(p), _) => runs.push(vec!["log".into(), n.clone(), "--date=short".into(), fmt.into(), "--follow".into(), "--".into(), p.clone()]),
-            (None, Some(q)) => {
-                runs.push(vec!["log".into(), n.clone(), "--date=short".into(), fmt.into(), "--name-only".into(), "-i".into(), format!("--grep={q}")]);
-                runs.push(vec!["log".into(), n.clone(), "--date=short".into(), fmt.into(), "--name-only".into(), format!("-S{q}")]);
+        if recent && !root.join(".git").exists() {
+            // No git history: the files Ken saw change, newest first.
+            let Ok(db) = Db::open_read_only(&server.base_dir, *id) else { continue };
+            let from = now_secs() - days.unwrap_or(7) as i64 * 86_400;
+            let mut files: Vec<(String, i64)> =
+                db.list_files().unwrap_or_default().into_iter().filter(|f| f.mtime >= from).map(|f| (f.rel_path, f.mtime)).collect();
+            if files.is_empty() {
+                continue;
             }
-            _ => {}
+            files.sort_by(|a, b| b.1.cmp(&a.1));
+            out.push_str(&format!("\n\n{project} has no git history; {} file(s) changed on disk (from Ken's index):", files.len()));
+            for (rel, mtime) in files.iter().take(limit) {
+                out.push_str(&format!("\n  {} {}", day_of(*mtime), ken_address(*id, rel)));
+            }
+            changed_files += files.len();
+            continue;
+        }
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        let base = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = vec!["log".into(), n.clone(), "--date=short".into(), fmt.into()];
+            v.extend(since.iter().cloned());
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        match (&path, &query) {
+            (Some(p), _) => runs.push(base(&["--follow", "--", p])),
+            (None, Some(q)) => {
+                runs.push(base(&["--name-only", "-i", &format!("--grep={q}")]));
+                runs.push(base(&["--name-only", &format!("-S{q}")]));
+            }
+            (None, None) => runs.push(base(&["--name-only"])),
         }
         let mut seen: Vec<String> = Vec::new();
         for run in runs {
@@ -1364,15 +1392,35 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
             }
         }
     }
-    if count == 0 {
-        return Ok(format!("No commits found in {} repo(s). {LOOK_YOURSELF}", roots.len()));
+    let window = days.map(|d| format!(" in the last {d} day{}", if d == 1 { "" } else { "s" })).unwrap_or_default();
+    if count == 0 && changed_files == 0 {
+        return Ok(format!("Nothing changed{window} in {} repo(s). {LOOK_YOURSELF}", roots.len()));
     }
     let what = match (&path, &query) {
-        (Some(p), _) => format!("history of {p}"),
-        (_, Some(q)) => format!("commits about {q:?} (message or change)"),
-        _ => String::new(),
+        (Some(p), _) => format!("history of {p}{window}"),
+        (_, Some(q)) => format!("commits about {q:?} (message or change){window}"),
+        _ => format!("what changed{window}"),
     };
     Ok(format!("{count} commit{} — {what}:{out}", if count == 1 { "" } else { "s" }))
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// `YYYY-MM-DD` (UTC) of a Unix time, without a date crate (Hinnant's
+/// civil-from-days).
+fn day_of(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// The indexes a code question reads: the named project, or every project
@@ -4180,6 +4228,32 @@ mod tests {
 
         let (text, _) = tool(&mut fx.server, "find_definition", json!({"name": "nothing_like_it"}));
         assert!(text.contains("look directly"), "empty says to look: {text}");
+    }
+
+    #[test]
+    fn history_answers_what_changed_lately_with_or_without_git() {
+        // No file, no words: the question is "what changed this week".
+        let mut fx = fixture(true);
+        let (text, is_err) = tool(&mut fx.server, "history", json!({"project": "Atlas"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("has no git history") && text.contains("notes/meeting.md"), "a folder without git: {text}");
+
+        let root = fx.root.clone();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=Tess", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "the billing notes"]);
+        let (text, is_err) = tool(&mut fx.server, "history", json!({"project": "Atlas", "days": 3}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("the billing notes") && text.contains("in the last 3 days"), "{text}");
     }
 
     #[test]

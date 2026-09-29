@@ -228,8 +228,10 @@ over the knowledge graph, search_knowledge, read_document) search the team's wik
 ranking and return ken:// addresses to cite. For code, navigate like an IDE: find_definition to go to a symbol, \
 find_usages for every use and its callers, file_outline to drill into a file, related_files for what it imports and \
 what imports it; then read the lines they point to. history tells when and why something changed (a file's \
-commits, or commits about some words). open_in_ken opens a file for the person: use it only when they explicitly \
-ask you to open or show something.\n\
+commits, commits about some words, or with neither, what changed in the last `days` across every repo, git or \
+not). Ken's tools and Grep, Glob and Read cover every question about the files; do not run shell commands to look \
+at them. open_in_ken opens a file for the person: use it only when they explicitly ask you to open or show \
+something.\n\
 4. Never say something isn't there because Ken's search did not find it. Its index can miss a file, a new change or \
 different wording. When Ken finds nothing, or nothing that answers, look yourself with Grep, Glob and Read, in this \
 project and the workspace's other repos (you may read them all), then answer, say you found it by looking directly, \
