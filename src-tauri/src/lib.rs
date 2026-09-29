@@ -7170,7 +7170,7 @@ struct LookAnswer {
 /// fallback that keeps Ken from saying something isn't there when only its
 /// index missed it.
 #[tauri::command]
-async fn look_for(state: State<'_, SharedState>, query: String) -> CmdResult<LookAnswer> {
+async fn look_for(state: State<'_, SharedState>, query: String, leads: Option<Vec<String>>) -> CmdResult<LookAnswer> {
     let (root, folders) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
@@ -7194,7 +7194,7 @@ async fn look_for(state: State<'_, SharedState>, query: String) -> CmdResult<Loo
     let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let dirs: Vec<PathBuf> = folders.iter().map(|(_, _, r)| r.clone()).collect();
-        let prompt = assistant::look_prompt(&query, &folders);
+        let prompt = assistant::look_prompt(&query, &folders, &leads.unwrap_or_default());
         match assistant::look(&binary, &root, &dirs, &prompt, Duration::from_secs(180), &CancelToken::new()).map_err(err)? {
             OneshotOutcome::Completed(text) => {
                 let parsed = digest::parse_digest(&text);

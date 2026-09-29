@@ -2158,7 +2158,8 @@ export const api = {
   quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
   /** Search found nothing that answers: a read-only Claude session looks
    *  through the workspace's folders itself and answers with ken:// sources. */
-  lookFor: (query: string) => invoke<{ body: string; sources: string[] }>("look_for", { query }),
+  /** `leads`: what search ranked, as `member/path`, best first; the look reads them first. */
+  lookFor: (query: string, leads: string[] = []) => invoke<{ body: string; sources: string[] }>("look_for", { query, leads }),
   llmStatus: () => invoke<"ready" | "notInstalled" | "error">("llm_status"),
   /// Fire-and-forget: warm the on-device model (⌘K open) so the first answer
   /// streams without paying the load. No-op when no local model is installed.

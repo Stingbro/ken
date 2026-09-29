@@ -71,7 +71,7 @@ fn main() {
         "extract" => phase_extract(&base, &parent, args.get(2).and_then(|m| m.parse().ok()).unwrap_or(30)),
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
-        "look" => phase_look(&parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
+        "look" => phase_look(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "drift" => phase_drift(&base, &parent),
         "drift-change" => phase_drift_change(&base, &parent, &args[2], &args[3]),
         "ignore" => phase_ignore(&base, &parent, &args[2]),
@@ -432,7 +432,7 @@ fn phase_kg(base: &Path, parent: &Path) -> Result<()> {
 /// "Ask Ken to look" on each question (or the numbers in `KEN_EVAL_ONLY`,
 /// e.g. `9,10,15`): the read-only fallback searches the members itself.
 /// Found when a source it cites is an expected file.
-fn phase_look(parent: &Path, questions: &Path) -> Result<()> {
+fn phase_look(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
     let text = std::fs::read_to_string(questions).map_err(|e| Error::Other(format!("{}: {e}", questions.display())))?;
     let only: Vec<usize> =
         std::env::var("KEN_EVAL_ONLY").unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect();
@@ -440,6 +440,17 @@ fn phase_look(parent: &Path, questions: &Path) -> Result<()> {
     let folders: Vec<(String, uuid::Uuid, PathBuf)> =
         members(parent)?.into_iter().map(|(n, p)| (n, p.config.id, p.root.clone())).collect();
     let dirs: Vec<PathBuf> = folders.iter().map(|(_, _, r)| r.clone()).collect();
+    // The leads the app hands the look: what routed search ranked.
+    let mut emb = ken_core::embedder::installed_embedding_model();
+    let kg = WorkspaceKgDb::open(parent).ok();
+    let ms: Vec<(String, Project, Db)> = members(parent)?
+        .into_iter()
+        .filter_map(|(n, p)| Db::open_read_only(base, p.config.id).ok().map(|db| (n, p, db)))
+        .collect();
+    let info: Vec<MemberInfo> = ms
+        .iter()
+        .map(|(n, p, db)| MemberInfo { project_id: p.config.id, name: n.clone(), index_ready: db.vec_available(), last_activity: 0 })
+        .collect();
     let (mut asked, mut found, mut named_only, mut not_there) = (0, 0, 0, 0);
     println!("# Ask Ken to look\n");
     for (qi, line) in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
@@ -450,7 +461,22 @@ fn phase_look(parent: &Path, questions: &Path) -> Result<()> {
         let (q, expect) = line.split_once('\t').unwrap_or((line, ""));
         let expects: Vec<String> = expect.split('|').filter(|e| !e.is_empty()).map(|e| e.to_lowercase()).collect();
         let t = Instant::now();
-        let prompt = assistant::look_prompt(q, &folders);
+        let plan = routing::plan_route(q, &info, kg.as_ref());
+        let query_vec = emb.as_mut().and_then(|e| e.embed_query(q).ok());
+        let member_hits: Vec<routing::MemberHits> = plan
+            .targets
+            .iter()
+            .filter_map(|id| ms.iter().find(|(_, p, _)| p.config.id == *id))
+            .map(|(n, p, db)| routing::MemberHits {
+                project_id: p.config.id,
+                member_name: n.clone(),
+                status: routing::MemberStatus::Searched,
+                hits: routing::search_member(db, q, query_vec.as_deref(), 8).unwrap_or_default(),
+            })
+            .collect();
+        let leads: Vec<String> =
+            routing::merge_routed(&plan, &member_hits, 8).results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect();
+        let prompt = assistant::look_prompt(q, &folders, &leads);
         let outcome = assistant::look(&binary, &parent.join(&folders[0].0), &dirs, &prompt, Duration::from_secs(300), &CancelToken::new())?;
         let answer = match outcome {
             assistant::OneshotOutcome::Completed(t) => t,

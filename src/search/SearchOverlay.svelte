@@ -84,7 +84,8 @@
     if (!q) return;
     look = { query: q, state: "looking", body: "", sources: [] };
     try {
-      const found = await api.lookFor(q);
+      const leads = results.slice(0, 8).map((h) => (h.memberName ? `${h.memberName}/${h.path}` : h.path));
+      const found = await api.lookFor(q, leads);
       if (look?.query === q) look = { query: q, state: "done", body: found.body, sources: found.sources };
     } catch (e) {
       if (look?.query === q) look = { query: q, state: "error", body: String(e), sources: [] };

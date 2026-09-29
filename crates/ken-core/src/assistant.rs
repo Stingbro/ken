@@ -152,8 +152,9 @@ pub fn oneshot(
 pub const LOOK_TOOLS: &str = "Read,Grep,Glob,LS";
 
 /// The prompt for a [`look`]: the question, the folders to search as
-/// (name, id, root), and how to cite across them.
-pub fn look_prompt(query: &str, folders: &[(String, uuid::Uuid, std::path::PathBuf)]) -> String {
+/// (name, id, root), what Ken's search ranked (`folder/path`, best first),
+/// and how to cite across them.
+pub fn look_prompt(query: &str, folders: &[(String, uuid::Uuid, std::path::PathBuf)], leads: &[String]) -> String {
     let mut p = format!(
         "Question: {query}\n\nKen's search index found nothing strong for this, which does not mean it isn't there. \
 Look for the answer yourself with Grep, Glob and Read in these folders:\n"
@@ -161,10 +162,18 @@ Look for the answer yourself with Grep, Glob and Read in these folders:\n"
     for (name, id, root) in folders {
         p.push_str(&format!("- {name}: {} (cite its files as ken://{id}/<path>#L<line>)\n", root.display()));
     }
+    if !leads.is_empty() {
+        p.push_str("\nKen's search ranked these files, best first. One may hold the answer or sit next to it: read them first.\n");
+        for lead in leads.iter().take(8) {
+            p.push_str(&format!("- {lead}\n"));
+        }
+    }
     p.push_str(
         "\nOn what the system does, the code wins: a ticket, plan or doc says what was intended, not what was built. \
 When the question is about how something works, open the code that does it and cite that file, with the doc beside it \
-if it helps.\n\
+if it helps. Code often sits deeper than a doc's path says (under a pack, `src/` or `backend/`): find a named \
+file with Glob `**/<name>` across every folder before deciding it is elsewhere. Glob and Grep search only the \
+folder you start in unless given a path, so pass each folder above as the path.\n\
 \nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
 If after looking it genuinely is not there, say so plainly and say where you looked. End with a final line \
 `SOURCES: ken://…, ken://…` listing the addresses you cited (omit the line if none).\n",
