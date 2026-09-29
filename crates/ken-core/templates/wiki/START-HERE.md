@@ -1,9 +1,10 @@
 # Start Here
 
-**The {{team_name}} knowledge library.** Open this folder as an Obsidian vault
-for graph, backlinks and search across everything.
+**The {{team_name}} knowledge library.** Open it in Ken for the graph, backlinks
+and search across every repo in the workspace; a link may name a page in any of
+them.
 
-Repos, siblings of this vault — resolve them **relatively**, the parent differs
+Repos, siblings of this library — resolve them **relatively**, the parent differs
 per machine, so never write an absolute path into a note.
 
 | repo | what it is |
