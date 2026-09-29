@@ -12,7 +12,7 @@
     type InboxAction,
   } from "../lib/review.svelte";
   import { timeAgo } from "../lib/format";
-  import type { InboxItem } from "../lib/api";
+  import { memberLeaf, type InboxItem } from "../lib/api";
   import ConflictDetail from "../review/ConflictDetail.svelte";
   import ProposalDetail from "../review/ProposalDetail.svelte";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
@@ -125,6 +125,18 @@
   <!-- inbox list -->
   <div class="list">
     <div class="list-head">Inbox</div>
+    {#each review.others as [id, name, n] (id)}
+      <button
+        class="other"
+        title="Review reads one repo at a time: switch to {name}"
+        onclick={async () => {
+          await app.focusMember(id);
+          await review.refresh();
+        }}
+      >
+        {memberLeaf(name)} · {n} waiting
+      </button>
+    {/each}
 
     {#if review.items.length === 0}
       <div class="empty-list">Nothing waiting — you're all caught up.</div>
@@ -413,5 +425,21 @@
     margin: 0;
     color: var(--ink-tertiary);
     font-size: 13px;
+  }
+  .other {
+    display: block;
+    width: calc(100% - 16px);
+    margin: 0 8px 4px;
+    padding: 6px 10px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 8px;
+    background: transparent;
+    text-align: left;
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .other:hover {
+    background: var(--sunken);
   }
 </style>

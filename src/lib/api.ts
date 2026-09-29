@@ -1965,6 +1965,8 @@ export const api = {
   /** The Team screen for the chosen team. */
   teamOverview: (team: string | null) => invoke<TeamOverview>("team_overview", { team }),
   teamSaveIgnores: (lines: string[]) => invoke<void>("team_save_ignores", { lines }),
+  /** Stored Review items waiting in each open repo of the team, as [id, name, count]. */
+  teamReviewCounts: (team: string | null) => invoke<[string, string, number][]>("team_review_counts", { team }),
   /** A new rule page in the wiki, from its rule template; returns its path. */
   teamAddRule: (wikiId: string, rule: string) => invoke<string>("team_add_rule", { wikiId, rule }),
   /** A page's links both ways: pages it reaches, pages that reach it. */

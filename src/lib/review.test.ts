@@ -19,6 +19,7 @@ vi.mock("./api", () => ({
     approveAutomationProposal,
     discardAutomationProposal,
     reviewInbox: vi.fn(async () => ({ items: [], done: [] })),
+    teamReviewCounts: vi.fn(async () => []),
     currentProject: vi.fn(async () => "/proj"),
   },
 }));

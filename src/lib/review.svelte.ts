@@ -13,7 +13,8 @@ import {
   type InboxKind,
   type PageProposalPayload,
 } from "./api";
-import { forFocused } from "./app.svelte";
+import { app, forFocused } from "./app.svelte";
+import { scope } from "./scope.svelte";
 
 /** Actions the detail pane offers, derived from item kind. */
 export type InboxAction =
@@ -204,9 +205,13 @@ class ReviewStore {
   private subscribed = false;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Open-item count — feeds the nav badge. */
+  /** What waits in the team's other open repos, as [id, name, count]:
+   *  Review reads one repo at a time and names the rest. */
+  others = $state<[string, string, number][]>([]);
+
+  /** Open-item count across the team — feeds the nav badge. */
   get count(): number {
-    return this.items.length;
+    return this.items.length + this.others.reduce((n, [, , c]) => n + c, 0);
   }
 
   get selectedItem(): InboxItem | null {
@@ -270,6 +275,8 @@ class ReviewStore {
     const inbox = await api.reviewInbox();
     this.items = inbox.items;
     this.done = inbox.done;
+    const counts = await api.teamReviewCounts(scope.team).catch(() => []);
+    this.others = counts.filter(([id, , n]) => id !== app.focused && n > 0);
     const known = (id: string) =>
       this.items.some((i) => i.id === id) || this.done.some((i) => i.id === id);
     if (this.selected && !known(this.selected)) this.selected = null;

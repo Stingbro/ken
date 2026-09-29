@@ -6274,6 +6274,27 @@ fn stored_kind(kind: &str) -> String {
 /// stale ingests, failed files, and broken recipes stay derived from their
 /// own sources of truth; stored review items are merged in. `done` is the
 /// last 7 days of resolved items.
+/// How many stored items wait on Review in each open repo of the chosen
+/// team (all of the workspace with no team): Review reads one repo at a
+/// time, so the others are named with their count.
+#[tauri::command]
+fn team_review_counts(state: State<SharedState>, team: Option<String>) -> CmdResult<Vec<(String, String, usize)>> {
+    let guard = state.lock().unwrap();
+    let Some(ws) = guard.workspace.as_ref() else { return Ok(Vec::new()) };
+    let names: Option<Vec<String>> = team.as_deref().map(|t| ws.ws.config.effective_group_members(t));
+    let mut out = Vec::new();
+    for m in &ws.ws.members {
+        if names.as_ref().is_some_and(|n| !n.contains(&m.name)) {
+            continue;
+        }
+        let ken_core::workspace::MemberStatus::Ok(p) = &m.status else { continue };
+        let Some(rt) = guard.members.get(&p.config.id) else { continue };
+        let n = rt.db.list_open_review_items().map(|v| v.len()).unwrap_or(0);
+        out.push((p.config.id.to_string(), m.name.clone(), n));
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
     let guard = state.lock().unwrap();
@@ -15625,6 +15646,7 @@ pub fn run() {
             ingest_add,
             ingest_add_bytes,
             team_overview,
+            team_review_counts,
             team_save_ignores,
             team_add_rule,
             ingest_now,
