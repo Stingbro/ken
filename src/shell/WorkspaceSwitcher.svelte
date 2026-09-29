@@ -7,10 +7,28 @@
   // `loadFocusedMemberState`). Styled as a popover anchored under its
   // nav-rail trigger, the same pattern `ProjectSwitcher.svelte` uses for the
   // title-bar project menu.
+  import { onMount } from "svelte";
   import { app, type MemberInfo } from "../lib/app.svelte";
-  import { memberLeaf } from "../lib/api";
+  import { api, memberLeaf, type RecentWorkspace } from "../lib/api";
+  import { timeAgo } from "../lib/format";
 
   let { close }: { close: () => void } = $props();
+
+  // The other workspaces opened recently: switch to one without going back
+  // to the start screen.
+  let others = $state<RecentWorkspace[]>([]);
+  onMount(() => {
+    api.listRecentWorkspaces().then(
+      (list) => (others = list.filter((w) => w.available && w.path !== app.workspace?.root).slice(0, 5)),
+      () => (others = []),
+    );
+  });
+
+  async function switchTo(ws: RecentWorkspace) {
+    close();
+    await app.closeWorkspaceSession();
+    await app.openWorkspace(ws.path);
+  }
 
   function statusLabel(status: MemberInfo["status"]): string {
     switch (status) {
@@ -73,6 +91,15 @@
       {/if}
     </button>
   {/each}
+  {#if others.length > 0}
+    <div class="recent-head">Recent workspaces</div>
+    {#each others as ws (ws.id)}
+      <button class="row" onclick={() => switchTo(ws)} title={ws.path}>
+        <span class="name">{ws.name}</span>
+        <span class="status-label">{timeAgo(ws.openedAt)}</span>
+      </button>
+    {/each}
+  {/if}
 </div>
 
 <style>
@@ -171,6 +198,16 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .recent-head {
+    margin-top: 6px;
+    padding: 8px 10px 4px;
+    border-top: 1px solid var(--border);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--ink-tertiary);
   }
   .status-label {
     flex: none;

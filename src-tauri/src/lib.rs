@@ -2897,6 +2897,29 @@ fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
     registry.save(&guard.base_dir).map_err(err)
 }
 
+/// The workspaces opened recently, newest first, each with whether its folder
+/// is still there: the start screen's "Recent workspaces".
+#[tauri::command]
+fn list_recent_workspaces(state: State<SharedState>) -> CmdResult<Vec<ken_core::registry::RecentWorkspaceStatus>> {
+    let guard = state.lock().unwrap();
+    let mut recent = Registry::load(&guard.base_dir).map_err(err)?.workspace_statuses();
+    recent.sort_by(|a, b| b.entry.opened_at.cmp(&a.entry.opened_at));
+    Ok(recent)
+}
+
+/// Take a workspace off the recent list. Its folders and files stay.
+#[tauri::command]
+fn forget_workspace(state: State<SharedState>, id: String) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let uuid: uuid::Uuid = id.parse().map_err(err)?;
+    let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
+    registry.remove_workspace(uuid);
+    if registry.last_workspace == Some(uuid) {
+        registry.last_workspace = None;
+    }
+    registry.save(&guard.base_dir).map_err(err)
+}
+
 /// Rename a project. The name lives in two stores that must stay in step: the
 /// project's own `.ken/project.json` (source of truth, travels with the folder)
 /// and the user-level registry (drives the switcher/recents). When the renamed
@@ -14988,6 +15011,8 @@ pub fn run() {
             close_workspace,
             search_all_projects,
             forget_project,
+            list_recent_workspaces,
+            forget_workspace,
             rename_project,
             last_project_id,
             current_project,

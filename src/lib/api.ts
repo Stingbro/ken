@@ -171,6 +171,17 @@ export interface RegistryEntryStatus {
   description?: string;
 }
 
+/** A workspace opened recently (the start screen's list). */
+export interface RecentWorkspace {
+  id: string;
+  name: string;
+  /** The folder holding its repos. */
+  path: string;
+  /** Unix seconds. */
+  openedAt: number;
+  available: boolean;
+}
+
 export interface FileRow {
   relPath: string;
   kind: string;
@@ -1908,6 +1919,9 @@ export const api = {
   searchAllProjects: (query: string, limit = 30, audience: Audience = null, types: KindFilter = null) =>
     invoke<SearchAllProjectsResult>("search_all_projects", { query, limit, audience, types }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
+  /** Workspaces opened recently, newest first. */
+  listRecentWorkspaces: () => invoke<RecentWorkspace[]>("list_recent_workspaces"),
+  forgetWorkspace: (id: string) => invoke<void>("forget_workspace", { id }),
   renameProject: (id: string, name: string) =>
     invoke<ProjectInfo>("rename_project", { id, name }),
   lastProjectId: () => invoke<string | null>("last_project_id"),

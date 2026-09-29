@@ -8,8 +8,10 @@
     type Candidate,
     type FeatureInfo,
     type ProjectProfile,
+    type RecentWorkspace,
     type RegistryEntryStatus,
   } from "../lib/api";
+  import { timeAgo } from "../lib/format";
   import { app } from "../lib/app.svelte";
   import KenMark from "../lib/ui/KenMark.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
@@ -23,6 +25,44 @@
   // Set-up (Folder, Team, Repos, Index): the knowledge-layer way in for a
   // folder of code repos. The older workspace wizard below stays as is.
   let setupOpen = $state(false);
+
+  // Workspaces opened before, newest first: open one again in a click.
+  let recentWorkspaces = $state<RecentWorkspace[]>([]);
+  async function loadRecentWorkspaces() {
+    try {
+      recentWorkspaces = await api.listRecentWorkspaces();
+    } catch {
+      recentWorkspaces = [];
+    }
+  }
+  async function openRecentWorkspace(ws: RecentWorkspace) {
+    if (!ws.available) return;
+    error = null;
+    try {
+      await app.openWorkspace(ws.path);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  async function forgetWorkspace(id: string) {
+    await api.forgetWorkspace(id);
+    await loadRecentWorkspaces();
+  }
+  function workspaceMenu(e: MouseEvent, ws: RecentWorkspace) {
+    e.preventDefault();
+    const x = e.clientX;
+    const y = e.clientY;
+    openContextMenu(x, y, [
+      { label: "Open", icon: FolderOpen, disabled: !ws.available, onSelect: () => openRecentWorkspace(ws) },
+      "separator",
+      {
+        label: "Remove from this list",
+        icon: Trash2,
+        danger: true,
+        onSelect: () => void forgetWorkspace(ws.id),
+      },
+    ]);
+  }
 
   async function forgetId(id: string) {
     await api.forgetProject(id);
@@ -81,6 +121,7 @@
   let unlistenProfile: (() => void) | undefined;
 
   onMount(() => {
+    void loadRecentWorkspaces();
     void api.onProfileState((ev) => {
       if (ev.path !== pendingPath) return;
       if (ev.state === "ready") candidateProfile = ev.profile;
@@ -159,12 +200,6 @@
   // projects pre-checked, marker/file-count captions, per-candidate
   // include toggle) → name → the same Features disclosure pattern
   // `confirmCreate` uses, filtered to workspace-scoped flags → create.
-  //
-  // No recent-workspaces section: `Registry` gained recent-workspace
-  // entries (workspace task 1.4) but no command reads them back to the
-  // frontend (grepped `src-tauri/src/lib.rs` for `workspace_statuses`/
-  // `registry.workspaces` — nothing registered). Deferred rather than
-  // invented; see final report.
   type WsStep = "candidates" | "name";
   let wsParent = $state<string | null>(null);
   let wsStep = $state<WsStep>("candidates");
@@ -472,6 +507,34 @@
 
     {#if error}
       <div class="error">{error}</div>
+    {/if}
+
+    {#if recentWorkspaces.length > 0 && !pendingPath && !wsParent && !setupOpen}
+      <div class="recent-label">Recent workspaces</div>
+      <div class="recents">
+        {#each recentWorkspaces as ws (ws.id)}
+          <button
+            class="recent"
+            class:unavailable={!ws.available}
+            onclick={() => openRecentWorkspace(ws)}
+            oncontextmenu={(e) => workspaceMenu(e, ws)}
+          >
+            <span class="badge">{ws.name.charAt(0).toUpperCase()}</span>
+            <span class="info">
+              <span class="name">{ws.name}</span>
+              <span class="mono path-small">{ws.path}</span>
+              {#if ws.available}
+                <span class="path-small">{timeAgo(ws.openedAt)}</span>
+              {:else}
+                <span class="missing">Folder not found</span>
+              {/if}
+            </span>
+            {#if !ws.available}
+              <span class="forget" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); void forgetWorkspace(ws.id); }} onkeydown={() => {}}>Remove</span>
+            {/if}
+          </button>
+        {/each}
+      </div>
     {/if}
 
     {#if app.registry.length > 0 && !pendingPath && !wsParent && !setupOpen}
