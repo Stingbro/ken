@@ -4,6 +4,8 @@
   import { updater } from "../lib/updater.svelte";
   import { timeAgo } from "../lib/format";
   import ProjectSwitcher from "./ProjectSwitcher.svelte";
+  import TeamSwitcher from "./TeamSwitcher.svelte";
+  import { scope } from "../lib/scope.svelte";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import Search from "@lucide/svelte/icons/search";
   import MessagesSquare from "@lucide/svelte/icons/messages-square";
@@ -14,14 +16,15 @@
 
   let switcherOpen = $state(false);
 
-  // In the merged Files tree the button names the mode, not a project —
-  // showing one member's name while the tree lists all of them is the
-  // kind of quiet mismatch that makes people distrust the control.
-  const showingAll = $derived(app.treeShowsAllProjects && !!app.workspace && app.screen === "files");
-  const initial = $derived(
-    showingAll ? "*" : (app.project?.name?.charAt(0).toUpperCase() ?? "?"),
-  );
-  const projectLabel = $derived(showingAll ? "All projects" : (app.project?.name ?? ""));
+  // In a workspace the button is the team switcher: Ken is about one team
+  // at a time, and its repos are picked in Files. Outside one (no workspace
+  // open) it stays the project switcher.
+  $effect(() => {
+    if (app.workspace?.id) void scope.refreshGroups();
+  });
+  const teamLabel = $derived(scope.team ?? app.workspace?.name ?? "");
+  const label = $derived(app.workspace ? teamLabel : (app.project?.name ?? ""));
+  const initial = $derived(label.charAt(0).toUpperCase() || "?");
   const syncTitle = $derived.by(() => {
     if (app.scanError) return app.scanError;
     if (app.syncState === "attention")
@@ -49,9 +52,9 @@
 
   <KenMark size={22} />
 
-  <button class="project" onclick={() => (switcherOpen = !switcherOpen)}>
+  <button class="project" onclick={() => (switcherOpen = !switcherOpen)} title={app.workspace ? "Your team" : "Project"}>
     <span class="badge">{initial}</span>
-    {projectLabel}
+    {label}
     <span
       class="dot"
       class:busy={app.scanning || app.syncState === "syncing"}
@@ -63,7 +66,7 @@
 
   <button class="search" onclick={() => (app.searchOpen = true)}>
     <Search class="lens" size={14} strokeWidth={1.75} aria-hidden="true" />
-    <span class="hint">Search project knowledge…</span>
+    <span class="hint">{app.workspace ? `Search ${teamLabel}…` : "Search project knowledge…"}</span>
     <span class="kbd">⌘K</span>
   </button>
 
@@ -94,7 +97,11 @@
   </button>
 
   {#if switcherOpen}
-    <ProjectSwitcher close={() => (switcherOpen = false)} />
+    {#if app.workspace}
+      <TeamSwitcher close={() => (switcherOpen = false)} />
+    {:else}
+      <ProjectSwitcher close={() => (switcherOpen = false)} />
+    {/if}
   {/if}
 </header>
 

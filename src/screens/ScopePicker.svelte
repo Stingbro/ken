@@ -1,5 +1,6 @@
 <script lang="ts">
-  // "What am I asking about?" — All projects, a group, or one project.
+  // "What am I asking about?" — the team chosen in the title bar, or one
+  // of its repos. No "all": a team is asked about on its own.
   //
   // This is a QUESTION scope, not a focus change: picking one project here
   // narrows search and chat context without moving which project Files or
@@ -11,7 +12,10 @@
 
   const members = $derived(
     (app.workspace?.members ?? []).filter(
-      (m) => m.projectId && (m.status === "active" || m.status === "dormant"),
+      (m) =>
+        m.projectId &&
+        scope.teamProjectIds.includes(m.projectId) &&
+        (m.status === "active" || m.status === "dormant"),
     ),
   );
 
@@ -32,7 +36,7 @@
   });
 
   function onChange() {
-    if (sel === "all") return scope.set("all", null);
+    if (sel === "all") return scope.setTeamScope();
     if (sel.startsWith("g:")) return scope.set("group", sel.slice(2));
     scope.set("project", sel.slice(2));
   }
@@ -42,15 +46,12 @@
   <div class="picker">
     <span class="lead">Asking about</span>
     <select bind:value={sel} onchange={onChange} aria-label="Question scope">
-      <option value="all">All projects</option>
-      {#if scope.groups.length > 0}
-        <optgroup label="Groups">
-          {#each scope.groups as g (g.name)}
-            <option value={`g:${g.name}`}>{g.name} ({g.projectIds.length})</option>
-          {/each}
-        </optgroup>
+      {#if scope.team}
+        <option value={`g:${scope.team}`}>{scope.team} ({scope.teamProjectIds.length})</option>
+      {:else}
+        <option value="all">{app.workspace?.name ?? "This workspace"}</option>
       {/if}
-      <optgroup label="Projects">
+      <optgroup label="Repos">
         {#each members as m (m.projectId)}
           <option value={`p:${m.projectId}`}>{memberLeaf(m.name)}</option>
         {/each}

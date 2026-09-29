@@ -13,6 +13,7 @@
   } from "../lib/api";
   import { app, forFocused } from "../lib/app.svelte";
   import { scope as sharedScope } from "../lib/scope.svelte";
+  const teamName = $derived(sharedScope.team ?? app.workspace?.name ?? "the workspace");
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
@@ -338,7 +339,8 @@
       pinnedMember = null;
       sharedScope.set("project", app.focused ?? null);
     } else {
-      sharedScope.set("all", null);
+      // The broad scope is the team chosen in the title bar.
+      sharedScope.setTeamScope();
     }
     void run();
   }
@@ -396,7 +398,7 @@
       bind:value={query}
       oninput={onInput}
       onkeydown={onKeydown}
-      placeholder={scope === "all" ? "Search all projects…" : "Search project knowledge…"}
+      placeholder={scope === "all" ? `Search ${teamName}…` : "Search this repo…"}
       spellcheck="false"
     />
   </div>
@@ -408,10 +410,10 @@
         class:active={scope === "project"}
         onclick={() => setScope("project")}
       >
-        This project
+        This repo
       </button>
       <button class="scope-btn" class:active={scope === "all"} onclick={() => setScope("all")}>
-        All projects
+        {teamName}
       </button>
       {#if scope === "all" && kgRoutingEnabled}
         <!-- Narrowing within all-projects: pins routing to one member,
@@ -589,7 +591,7 @@
   {#if results.length === 0 && searched}
     <div class="empty">
       {#if scope === "all"}
-        Nothing across your open projects matches “{query}”.
+        Nothing in {teamName} matches “{query}”.
       {:else if app.scanning}
         Nothing matches “{query}” <em>yet</em> — Ken is still reading your folder.
         Search lights up as files are indexed.

@@ -9,8 +9,13 @@
   import { app } from "../lib/app.svelte";
   import { renderMarkdown } from "../lib/markdown";
   import { workspaceHome } from "../lib/workspaceHome.svelte";
+  import { scope } from "../lib/scope.svelte";
 
   const digest = $derived(workspaceHome.digest);
+  // The chosen team's repos only: Home is about the team.
+  const inTeam = (projectId: string) => scope.teamProjectIds.includes(projectId);
+  const teamMembers = $derived((digest?.members ?? []).filter((m) => inTeam(m.projectId)));
+  const teamAwaiting = $derived((digest?.awaiting ?? []).filter((a) => inTeam(a.projectId)));
 
   function chipLabel(relPath: string): string {
     return relPath.split("/").pop() || relPath;
@@ -31,9 +36,9 @@
        writes a digest, which reads as "the workspace layer isn't
        working". Naming the projects still waiting is honest and tells
        the user Home is looking at all of them. -->
-  <div class="overline">Across your projects</div>
+  <div class="overline">Across {scope.team ?? "your repos"}</div>
 
-  {#each digest.members as m (m.projectId)}
+  {#each teamMembers as m (m.projectId)}
     <div class="member">
       <button class="mname" onclick={() => void app.focusMember(m.projectId)}>
         {m.name}
@@ -55,10 +60,10 @@
     </div>
   {/each}
 
-  {#if digest.awaiting.length > 0}
+  {#if teamAwaiting.length > 0}
     <p class="awaiting">
       No digest yet today for
-      {digest.awaiting.map((a) => a.name).join(", ")}.
+      {teamAwaiting.map((a) => a.name).join(", ")}.
     </p>
   {/if}
 {/if}

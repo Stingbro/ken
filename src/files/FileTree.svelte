@@ -8,6 +8,8 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Link from "@lucide/svelte/icons/link";
   import { app } from "../lib/app.svelte";
+  import { scope } from "../lib/scope.svelte";
+  import { memberLeaf } from "../lib/api";
   import { imports } from "../lib/imports.svelte";
   import { isMarkAllEnabled, showUnreadFilter } from "./filesHeader";
   import { buildTree } from "../lib/tree";
@@ -22,6 +24,14 @@
   import TreeNodeRow from "./TreeNodeRow.svelte";
 
   let { width }: { width: number } = $props();
+
+  // The team's repos, one to a row: Files shows one repo at a time, chosen
+  // here (the team itself is chosen in the title bar).
+  const teamRepos = $derived(
+    app.workspace
+      ? app.members.filter((m) => m.id && scope.teamProjectIds.includes(m.id) && m.status !== "missing" && m.status !== "invalid")
+      : [],
+  );
 
   const unreadOnly = $derived(app.filesFilter === "unread");
   const markAllEnabled = $derived(isMarkAllEnabled(app.unread.length));
@@ -115,6 +125,23 @@
 </script>
 
 <div class="tree" style:width="{width}px">
+  {#if teamRepos.length > 1}
+    <div class="tree-head repos-head"><span class="ttl">Repos</span></div>
+    <div class="repos" role="listbox" aria-label="The team's repos">
+      {#each teamRepos as repo (repo.id)}
+        <button
+          class="row repo"
+          class:current={repo.id === app.focused}
+          role="option"
+          aria-selected={repo.id === app.focused}
+          onclick={() => repo.id && repo.id !== app.focused && void app.focusMember(repo.id)}
+        >
+          <span class="repo-badge">{memberLeaf(repo.name).charAt(0).toUpperCase()}</span>
+          <span class="name">{memberLeaf(repo.name)}</span>
+        </button>
+      {/each}
+    </div>
+  {/if}
   {#if app.favorites.length > 0}
     <div class="tree-head">Favorites</div>
     <div class="favorites">
@@ -420,6 +447,29 @@
     background: transparent;
     color: var(--danger);
     padding: 2px;
+    flex: none;
+  }
+  .repos {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 0 8px 8px;
+  }
+  .row.repo.current {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    font-weight: 600;
+  }
+  .repo-badge {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background: var(--ink);
+    color: var(--paper);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-serif);
+    font-size: 9.5px;
     flex: none;
   }
 </style>
