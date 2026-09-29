@@ -35,12 +35,11 @@ work is done rather than describing what exists.
 - **A finding is evidence at the time, not current state.**
 - **Open the Repo Map or a how-to before searching files.** Repo Map = *where*,
   how-to = *how*, code = the exact signature.
-- **Every agent edit to a wiki page, from an ingest, goes through staging**: the tool
-  applies it unless it rewrites more than a fifth of the page or lands on one a
-  person changed while the run worked. Only three things wait: a ruling, for its
-  decider; a change to Ways-of-Working, Conventions or a rule, as a ticket,
-  because work and reviews are read against them; and an edit the tool holds in
-  staging. Everything else is written, and an ingest's edits cite its note. Nobody confirms a
-  note, a link or a small correction.
+- **An ingest proposes; a person confirms.** From a source, Ken shows what it
+  overturns, where it contradicts the library or itself, and each page it would
+  change or add. A change is written when a person applies it, one at a time or
+  all together, and cites the note. A ruling waits for its decider. A change to
+  Ways-of-Working, Conventions or a rule becomes a ticket, because work and
+  reviews are read against them.
 - {{project-specific gotcha}}
 - {{project-specific gotcha}}

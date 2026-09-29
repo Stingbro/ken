@@ -42,7 +42,7 @@
     "open-both": "Open in Files",
     "undo-ingest": "Undo",
     "apply-proposal": "Apply the change",
-    "file-ingest": "Done, file it",
+    "file-ingest": "Seen, file it",
   };
 
   let actError = $state<string | null>(null);

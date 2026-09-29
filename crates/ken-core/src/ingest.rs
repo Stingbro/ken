@@ -332,8 +332,8 @@ pub fn card_body(note: &str, placement: &Placement) -> String {
     }
     let folder = placement.note.rsplit_once('/').map_or(placement.note.as_str(), |(d, _)| d);
     s.push_str(&format!(
-        "Note: {}\nProposed changes to the wiki follow on their own cards. When you are done with them, \
-         **Done, file it** moves the source from Raw to {folder}/.\n",
+        "Note: {}\nIts proposed changes to the wiki are on the Ingest screen, to apply one by one or all \
+         together. **Seen, file it** moves the source from Raw to {folder}/.\n",
         placement.note
     ));
     s
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(in_review(&db).unwrap(), vec![raw.clone()]);
 
         let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
-        assert!(body.contains("Ship date is Friday") && body.contains("Fix the save bug") && body.contains("Done, file it"));
+        assert!(body.contains("Ship date is Friday") && body.contains("Fix the save bug") && body.contains("Seen, file it"));
         let card = card_of(db.list_open_review_items().unwrap()[0].payload.as_deref()).unwrap();
         assert!(!card.filed);
 

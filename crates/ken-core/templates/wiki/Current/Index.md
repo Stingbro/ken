@@ -6,7 +6,7 @@ updated: {{date}}
 
 # Current
 
-What is true now about the project and the team. **Maintained**: each page is rewritten in place when something changes, never appended to. An ingest that changes what is true here rewrites the page through the tool's staging and cites its note; an edit that rewrites more than a fifth of the page, or lands on one a person changed during the run, waits in staging for a person.
+What is true now about the project and the team. **Maintained**: each page is rewritten in place when something changes, never appended to. An ingest that changes what is true here proposes the rewrite, citing its note; it is written when a person applies it.
 
 | page | holds |
 |---|---|

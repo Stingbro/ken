@@ -5,8 +5,8 @@
   // Each source's card holds what a person reviews: what it overturns, where
   // it contradicts the wiki or itself, and the changes it proposes (pages to
   // update, new pages, rulings for their decider, tickets), each applied or
-  // discarded here. "Seen" files the source beside its note; Undo takes it
-  // all back.
+  // discarded here, or all confirmed at once. "Seen" files the source
+  // beside its note; Undo takes it all back.
   import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, type IngestCard, type IngestOverview, type IngestProposal, type InboxItem } from "../lib/api";
@@ -138,6 +138,29 @@
     busy = `p${p.id}`;
     try {
       await api.resolveReviewItem(p.id, overview.projectId);
+    } finally {
+      busy = null;
+      await loadCard(selected);
+      await refresh();
+    }
+  }
+
+  // Confirming the card: every change it proposes, one after another; a
+  // ruling stays for its decider. Stops at the first that cannot apply (a
+  // page changed since it was proposed) and says which.
+  const confirmable = $derived((card?.proposals ?? []).filter((p) => p.kind !== "ruling"));
+  async function applyAll() {
+    if (!overview) return;
+    busy = "all";
+    try {
+      for (const p of confirmable) {
+        try {
+          await api.applyPageProposal(p.id, overview.projectId);
+        } catch (e) {
+          error = `${p.page || p.title}: ${e}`;
+          break;
+        }
+      }
     } finally {
       busy = null;
       await loadCard(selected);
@@ -309,6 +332,11 @@
         <button class="btn btn-ghost" onclick={() => card && inLibrary(card.note)}>Open the note</button>
         {#if card.open}
           <button class="btn btn-ghost" disabled={busy !== null} onclick={undo}>Undo all</button>
+          {#if confirmable.length > 0}
+            <button class="btn btn-primary" disabled={busy !== null} onclick={applyAll}>
+              {busy === "all" ? "Applying…" : `Apply all ${confirmable.length}`}
+            </button>
+          {/if}
           <button class="btn btn-primary" disabled={busy !== null} onclick={seen}>Seen, file it</button>
         {/if}
       </div>

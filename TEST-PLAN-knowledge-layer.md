@@ -157,6 +157,8 @@ keyword index over sections.
   pages it calls for**, **Rulings, for their decider**, **Tickets**. **Show the
   change** opens the diff. Nothing in the wiki changed yet: **Apply** one and
   only that page changes; **Discard** another and it leaves the card.
+  **Apply all n** writes every remaining page change, new page and ticket;
+  a ruling stays for its decider.
 - [ ] With a team repo on the team (kind **team**), the save-bug action is a
   ticket: **Create** writes `tickets/<KEY>-nnn.md` in the team repo.
 - [ ] **Seen, file it** moves the source beside its note and marks it *seen*

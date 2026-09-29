@@ -594,9 +594,10 @@ will need their own lines there once decided.
   - Review names what waits in the team's other repos
     (`team_review_counts`); the rail count is the team's.
   - Chat: `history` answers "what changed lately" (`days`), git or not.
-  - Open for a person: the ingest makes every page change a proposal to
-    apply, while the method's CLAUDE.md rule says small edits are written
-    and only three things wait. Decide which, then align the rule or Ken.
+  - Decided (the user, 2026-09-29): an ingest proposes and a person
+    confirms, each change or all at once (Apply all on the card; a ruling
+    waits for its decider). The template's CLAUDE.md, Current/Index and
+    Research/Ingestion/Index say so, in Ken and in Ways-of-Working.
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)
