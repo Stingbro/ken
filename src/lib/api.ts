@@ -76,6 +76,48 @@ export type SetupMoved =
   | { change: "Gone"; member: string }
   | { change: "NewWorktree"; pattern: string; evidence: string };
 
+/** One repo of a team, as set-up wrote it (the Team screen's rows). */
+export interface TeamRepo {
+  id: string;
+  name: string;
+  path: string;
+  kind: RepoKind[];
+  index: IndexState | null;
+  effectiveIndex: IndexState;
+  description: string;
+  available: boolean;
+  branch: string | null;
+  head: string | null;
+  behind: number | null;
+  files: number;
+}
+
+/** Something a repo lacks for its kind, or a team lacks. */
+export interface TeamGap {
+  repo: string | null;
+  text: string;
+  open: string | null;
+}
+
+export interface TeamPage {
+  path: string;
+  title: string;
+}
+
+/** The Team screen: the chosen team's repos and configuration. */
+export interface TeamOverview {
+  team: string | null;
+  workspace: string;
+  root: string;
+  repos: TeamRepo[];
+  wiki: TeamRepo | null;
+  gaps: TeamGap[];
+  ignores: string[];
+  sweep: DriftRun | null;
+  rules: TeamPage[];
+  templates: TeamPage[];
+}
+
 /** One source in the library's Raw/ folder and where it is in the read. */
 export interface RawSource {
   path: string;
@@ -1917,9 +1959,14 @@ export const api = {
   /** Done with an ingest: its source moves beside its note. Returns where. */
   ingestFile: (itemId: number, team: string | null = null) => invoke<string>("ingest_file", { itemId, team }),
   /** The last drift sweep (null before the first). */
-  driftStatus: () => invoke<DriftRun | null>("drift_status"),
+  driftStatus: (projectId: string | null = null) => invoke<DriftRun | null>("drift_status", { projectId }),
   /** Run the drift sweep now. */
-  runDriftNow: () => invoke<DriftRun | null>("run_drift_now"),
+  runDriftNow: (projectId: string | null = null) => invoke<DriftRun | null>("run_drift_now", { projectId }),
+  /** The Team screen for the chosen team. */
+  teamOverview: (team: string | null) => invoke<TeamOverview>("team_overview", { team }),
+  teamSaveIgnores: (lines: string[]) => invoke<void>("team_save_ignores", { lines }),
+  /** A new rule page in the wiki, from its rule template; returns its path. */
+  teamAddRule: (wikiId: string, rule: string) => invoke<string>("team_add_rule", { wikiId, rule }),
   /** A page's links both ways: pages it reaches, pages that reach it. */
   pageLinks: (path: string) =>
     invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),

@@ -9,6 +9,7 @@
   import Files from "@lucide/svelte/icons/files";
   import SquareCheck from "@lucide/svelte/icons/square-check";
   import Layers from "@lucide/svelte/icons/layers";
+  import UsersRound from "@lucide/svelte/icons/users-round";
   import Kanban from "@lucide/svelte/icons/kanban";
   import Network from "@lucide/svelte/icons/network";
   import Clock from "@lucide/svelte/icons/clock";
@@ -37,6 +38,7 @@
     { key: "files", icon: Files, label: "Files" },
     { key: "review", icon: SquareCheck, label: "Review" },
     { key: "ingests", icon: Layers, label: "Ingest" },
+    { key: "team", icon: UsersRound, label: "Team" },
     { key: "map", icon: Network, label: "Map" },
     { key: "timeline", icon: Clock, label: "Timeline" },
     { key: "record", icon: Mic, label: "Record" },

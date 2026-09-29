@@ -1,0 +1,494 @@
+<script lang="ts">
+  // Team (the Wright white box, frame 9): the chosen team's repos as set-up
+  // wrote them, one row each (kind, how deep Ken reads it, branch, commit,
+  // how far behind its upstream), the workspace's ignore lines, what a scan
+  // found and what a repo lacks for its kind, the wiki's weekly sweep, and
+  // the team's rules and templates. Ken's per-repo settings are these rows,
+  // not a page of their own. Add a repo (9b) and Scan again sit at the top.
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import {
+    api,
+    memberLeaf,
+    type IndexState,
+    type RepoKind,
+    type SetupMoved,
+    type TeamOverview,
+    type TeamRepo,
+  } from "../lib/api";
+  import { app } from "../lib/app.svelte";
+  import { scope } from "../lib/scope.svelte";
+  import { timeAgo } from "../lib/format";
+
+  let overview = $state<TeamOverview | null>(null);
+  let moved = $state<SetupMoved[]>([]);
+  let error = $state<string | null>(null);
+  let busy = $state<string | null>(null);
+  let editingIgnores = $state(false);
+  let ignoresDraft = $state("");
+  let newRule = $state("");
+  let scanned = $state<number | null>(null);
+
+  const team = $derived(scope.team);
+
+  async function refresh() {
+    try {
+      overview = await api.teamOverview(team);
+      error = null;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  $effect(() => {
+    void team;
+    void refresh();
+  });
+
+  async function run(label: string, f: () => Promise<unknown>) {
+    busy = label;
+    error = null;
+    try {
+      await f();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = null;
+      await refresh();
+    }
+  }
+
+  async function scanAgain() {
+    if (!overview) return;
+    const root = overview.root;
+    await run("scan", async () => {
+      moved = await api.setupRescan(root);
+      scanned = Math.floor(Date.now() / 1000);
+    });
+  }
+
+  // One kind per repo here; a repo set up as two (a team repo that is also
+  // its wiki) keeps both unless a person picks one.
+  const KINDS: { v: RepoKind | ""; label: string }[] = [
+    { v: "code", label: "code" },
+    { v: "wiki", label: "wiki" },
+    { v: "team", label: "team" },
+    { v: "reference", label: "reference" },
+    { v: "", label: "not said" },
+  ];
+  const kindValue = (r: TeamRepo) => (r.kind.length > 1 ? r.kind.join("+") : (r.kind[0] ?? ""));
+
+  function setKind(r: TeamRepo, value: string) {
+    const kind = value === "" ? [] : (value.split("+") as RepoKind[]);
+    void run(`k${r.id}`, () => api.setProjectKind(r.id, kind, team));
+  }
+
+  function setIndex(r: TeamRepo, value: string) {
+    void run(`i${r.id}`, () => api.setProjectIndex(r.id, value === "kind" ? null : (value as IndexState)));
+  }
+
+  function takeOut(r: TeamRepo) {
+    void run(`o${r.id}`, async () => {
+      await api.workspaceRemoveMember(r.name);
+      await app.refreshWorkspaceOverview();
+    });
+  }
+
+  async function addRepos() {
+    if (!overview) return;
+    const picked = await openDialog({ directory: true, multiple: true, title: "Add a repo to the team" });
+    const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+    if (paths.length === 0) return;
+    const name = overview.workspace;
+    await run("add", async () => {
+      const proposal = await api.setupProposeRepos(paths);
+      const rows = proposal.rows.map((r) => ({ ...r, include: true, team: team ?? r.team }));
+      await app.confirmSetupRepos(name, rows, true);
+      await scope.refreshGroups();
+      // The wiki drafts each new repo's page and proposes the rest.
+      await api.wikiAddRepos(rows.map((r) => r.member)).catch(() => []);
+    });
+  }
+
+  function addFolder(member: string) {
+    void run(`m${member}`, async () => {
+      await api.workspaceAddMember(member);
+      moved = moved.filter((m) => !("member" in m) || m.member !== member);
+      await app.refreshWorkspaceOverview();
+      await scope.refreshGroups();
+    });
+  }
+
+  function saveIgnores() {
+    const lines = ignoresDraft.split("\n");
+    void run("ignores", async () => {
+      await api.teamSaveIgnores(lines);
+      editingIgnores = false;
+    });
+  }
+
+  function runSweep() {
+    const id = overview?.wiki?.id;
+    if (!id) return;
+    void run("sweep", () => api.runDriftNow(id));
+  }
+
+  function addRule() {
+    const id = overview?.wiki?.id;
+    const rule = newRule.trim();
+    if (!id || !rule) return;
+    void run("rule", async () => {
+      const path = await api.teamAddRule(id, rule);
+      newRule = "";
+      await openInWiki(path);
+    });
+  }
+
+  async function openInWiki(path: string) {
+    const id = overview?.wiki?.id;
+    if (!id) return;
+    if (app.focused !== id) await app.focusMember(id);
+    app.openInFiles(path);
+  }
+
+  const rows = $derived(overview ? [...(overview.wiki ? [overview.wiki] : []), ...overview.repos] : []);
+  const driftCount = $derived(moved.length + rows.filter((r) => (r.behind ?? 0) > 0).length);
+  const sweepFindings = $derived(overview?.sweep?.mismatches.filter((m) => m.severity !== "autoRecleared").length ?? 0);
+</script>
+
+<div class="team">
+  <div class="head">
+    <h2>Team</h2>
+    <strong class="tname">{team ?? overview?.workspace ?? ""}</strong>
+    <span class="spacer"></span>
+    {#if overview}
+      <span class="chip" class:warn={driftCount > 0}>drifted · {driftCount}</span>
+      <span class="chip" class:warn={overview.gaps.length > 0}>gaps · {overview.gaps.length}</span>
+    {/if}
+    <button class="btn btn-ghost" disabled={busy !== null} onclick={addRepos}>+ Add a repo</button>
+    <button class="btn btn-primary" disabled={busy !== null} onclick={scanAgain}>{busy === "scan" ? "Scanning…" : "Scan again"}</button>
+  </div>
+  {#if error}<p class="warn-text">{error}</p>{/if}
+
+  {#if overview}
+    <div class="cols">
+      <div class="left">
+        <div class="divider">
+          repos · {rows.length}{#if scanned} · last scan {timeAgo(scanned)}{/if}
+        </div>
+        <table>
+          <thead>
+            <tr><th>index</th><th>repo</th><th>kind</th><th>branch</th><th>commit</th><th>drift</th><th></th></tr>
+          </thead>
+          <tbody>
+            {#each rows as r (r.id)}
+              <tr class:gone={!r.available}>
+                <td>
+                  <select
+                    value={r.index ?? "kind"}
+                    disabled={busy !== null}
+                    onchange={(e) => setIndex(r, e.currentTarget.value)}
+                    title="How deeply Ken reads it"
+                  >
+                    <option value="kind">{r.effectiveIndex} (its kind)</option>
+                    <option value="entities">entities</option>
+                    <option value="search">search</option>
+                    <option value="off">off</option>
+                  </select>
+                </td>
+                <td class="repo">
+                  <span class="rname">{memberLeaf(r.name)}</span>
+                  <span class="sub mono" title={r.path}>{r.description || r.path}</span>
+                </td>
+                <td>
+                  <select value={kindValue(r)} disabled={busy !== null} onchange={(e) => setKind(r, e.currentTarget.value)}>
+                    {#if r.kind.length > 1}<option value={kindValue(r)}>{r.kind.join(" + ")}</option>{/if}
+                    {#each KINDS as k (k.v)}<option value={k.v}>{k.label}</option>{/each}
+                  </select>
+                </td>
+                <td class="mono">{r.branch ?? "—"}</td>
+                <td class="mono">{r.head ?? "—"}</td>
+                <td>
+                  {#if !r.available}<span class="bad">folder gone</span>
+                  {:else if (r.behind ?? 0) > 0}<span class="bad">{r.behind} newer upstream</span>
+                  {:else}—{/if}
+                </td>
+                <td>
+                  {#if r.id !== overview.wiki?.id}
+                    <button class="link" disabled={busy !== null} onclick={() => takeOut(r)} title="Take it out of the workspace; its folder stays">Take out</button>
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+
+        <div class="divider">ignore list · .kenignore beside the repos · {overview.ignores.length} {overview.ignores.length === 1 ? "line" : "lines"}</div>
+        {#if editingIgnores}
+          <textarea class="mono" rows="8" bind:value={ignoresDraft}></textarea>
+          <p class="note">One path or pattern a line; <span class="mono">~path/</span> keeps it in search but out of the graph. The next scan reads it.</p>
+          <div class="actions">
+            <button class="btn btn-ghost" onclick={() => (editingIgnores = false)}>Cancel</button>
+            <button class="btn btn-primary" disabled={busy !== null} onclick={saveIgnores}>Save</button>
+          </div>
+        {:else}
+          <div class="ignores">
+            <span class="mono">{overview.ignores.length > 0 ? overview.ignores.join(" · ") : "worktrees, dependencies, build outputs and secrets are left out already"}</span>
+            <button
+              class="btn btn-ghost"
+              onclick={() => {
+                ignoresDraft = (overview?.ignores ?? []).join("\n");
+                editingIgnores = true;
+              }}>Edit</button
+            >
+          </div>
+        {/if}
+      </div>
+
+      <div class="right">
+        <div class="divider">drift and gaps · {moved.length + overview.gaps.length}</div>
+        {#each moved as m, i (i)}
+          <div class="entry">
+            {#if m.change === "NewFolder"}
+              <span><strong>{memberLeaf(m.member)}</strong> is a new folder beside the repos.</span>
+              <span class="e-actions"><button class="btn btn-primary" disabled={busy !== null} onclick={() => addFolder(m.member)}>Add to team</button></span>
+            {:else if m.change === "Gone"}
+              <span><strong>{memberLeaf(m.member)}</strong>'s folder is gone.</span>
+            {:else}
+              <span>A new worktree, <span class="mono">{m.pattern}</span>, is left out.</span>
+            {/if}
+          </div>
+        {/each}
+        {#each overview.gaps as g, i (i)}
+          <div class="entry">
+            <span>{g.text}</span>
+            {#if g.open}
+              <span class="e-actions"><button class="btn btn-ghost" onclick={() => g.open && openInWiki(g.open)}>Open</button></span>
+            {/if}
+          </div>
+        {/each}
+        {#if moved.length + overview.gaps.length === 0}
+          <p class="note">Nothing drifted and nothing missing{scanned ? "" : " (Scan again checks for new folders)"}.</p>
+        {/if}
+
+        <div class="divider">standing sweep · the wiki's drift check</div>
+        {#if !overview.wiki}
+          <p class="note">No wiki, so nothing to sweep.</p>
+        {:else if overview.sweep}
+          <div class="entry">
+            <span>
+              Last run {timeAgo(overview.sweep.at)} · {overview.sweep.pagesExamined} pages ·
+              {overview.sweep.voidReason ? `void: ${overview.sweep.voidReason}` : overview.sweep.uncontrolled ? "no controls set" : "both controls held"}
+            </span>
+          </div>
+          <div class="entry">
+            <span>{sweepFindings} {sweepFindings === 1 ? "page" : "pages"} to check against their sources · {overview.sweep.aged.length} unverified for thirty days</span>
+            <span class="e-actions"><button class="btn btn-ghost" onclick={() => (app.screen = "review")}>Open Review</button></span>
+          </div>
+        {:else}
+          <p class="note">The sweep has not run yet.</p>
+        {/if}
+        {#if overview.wiki}
+          <div class="actions"><button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button></div>
+        {/if}
+
+        <div class="divider">rules · Ways-of-Working/Rules · {overview.rules.length}</div>
+        {#each overview.rules as r (r.path)}
+          <button class="page" onclick={() => openInWiki(r.path)}>{r.title}</button>
+        {:else}
+          <p class="note">No rules yet.</p>
+        {/each}
+        {#if overview.wiki}
+          <div class="add-rule">
+            <input bind:value={newRule} placeholder="Add a rule, as a sentence" onkeydown={(e) => e.key === "Enter" && addRule()} />
+            <button class="btn btn-ghost" disabled={!newRule.trim() || busy !== null} onclick={addRule}>Add</button>
+          </div>
+        {/if}
+
+        <div class="divider">templates · {overview.templates.length}</div>
+        {#each overview.templates as t (t.path)}
+          <button class="page" onclick={() => openInWiki(t.path)}>{t.title}</button>
+        {:else}
+          <p class="note">No templates.</p>
+        {/each}
+      </div>
+    </div>
+  {/if}
+</div>
+
+<style>
+  .team {
+    padding: 18px 24px;
+    height: 100%;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  h2 {
+    margin: 0;
+    font-size: 18px;
+  }
+  .tname {
+    font-size: 15px;
+  }
+  .spacer {
+    flex: 1;
+  }
+  .chip {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 99px;
+    border: 1px solid var(--border);
+    color: var(--ink-tertiary);
+  }
+  .chip.warn {
+    color: var(--needs-input);
+    border-color: color-mix(in srgb, var(--needs-input) 45%, transparent);
+  }
+  .cols {
+    display: grid;
+    grid-template-columns: minmax(0, 1.7fr) minmax(280px, 1fr);
+    gap: 24px;
+  }
+  .left,
+  .right {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .divider {
+    margin-top: 10px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-tertiary);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+  th {
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--ink-tertiary);
+    padding: 4px 6px;
+  }
+  td {
+    padding: 6px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  tr.gone {
+    opacity: 0.55;
+  }
+  .repo {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-width: 320px;
+  }
+  .rname {
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .sub {
+    font-size: 11px;
+    color: var(--ink-tertiary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  select {
+    font-size: 12px;
+  }
+  .bad {
+    color: var(--needs-input);
+  }
+  .link {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--ink-tertiary);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .link:hover {
+    color: var(--danger);
+  }
+  .ignores {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+  }
+  .ignores .mono {
+    flex: 1;
+    color: var(--ink-secondary, var(--ink));
+  }
+  textarea {
+    width: 100%;
+    font-size: 12px;
+  }
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .entry {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12.5px;
+    padding: 6px 0;
+    border-bottom: 1px dashed var(--border);
+  }
+  .entry > span:first-child {
+    flex: 1;
+  }
+  .e-actions {
+    display: flex;
+    gap: 6px;
+    flex: none;
+  }
+  .page {
+    background: none;
+    border: none;
+    text-align: left;
+    padding: 4px 0;
+    font-size: 13px;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .page:hover {
+    text-decoration: underline;
+  }
+  .add-rule {
+    display: flex;
+    gap: 6px;
+  }
+  .add-rule input {
+    flex: 1;
+    font-size: 12.5px;
+  }
+  .note {
+    margin: 2px 0;
+    font-size: 12.5px;
+    color: var(--ink-tertiary);
+  }
+  .warn-text {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--needs-input);
+  }
+</style>

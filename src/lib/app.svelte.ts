@@ -66,6 +66,7 @@ export type Screen =
   | "files"
   | "review"
   | "ingests"
+  | "team"
   | "tasks"
   | "map"
   | "record"
@@ -709,7 +710,7 @@ class AppStore {
     await this.refreshWorkspaceOverview();
   }
 
-  private async refreshWorkspaceOverview() {
+  async refreshWorkspaceOverview() {
     const overview = await api.workspaceOverview().catch(() => null);
     if (!overview) return;
     const focusChanged = this.workspace?.focused !== overview.focused;

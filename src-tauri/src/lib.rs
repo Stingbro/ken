@@ -8158,18 +8158,273 @@ fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, 
 
 /// The last drift sweep for the focused project, if one has run.
 #[tauri::command]
-fn drift_status(state: State<SharedState>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
+fn drift_status(state: State<SharedState>, project_id: Option<String>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
+    let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
+    let active = member(&guard, id)?;
     active.db.last_drift_run().map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamRepoDto {
+    id: String,
+    name: String,
+    path: String,
+    kind: Vec<ken_core::registry::RepoKind>,
+    /// Set only when a person chose other than the kind implies.
+    index: Option<ken_core::registry::IndexState>,
+    /// What Ken reads it as now: the choice, else the kind's default.
+    effective_index: ken_core::registry::IndexState,
+    description: String,
+    available: bool,
+    /// The branch checked out, when it is a git repo.
+    branch: Option<String>,
+    /// Its commit, short.
+    head: Option<String>,
+    /// Commits its upstream has that it does not, as of the last fetch.
+    behind: Option<u32>,
+    files: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamGapDto {
+    /// The repo it is about, when it is about one.
+    repo: Option<String>,
+    text: String,
+    /// A path to open to see or fix it.
+    open: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamPageDto {
+    path: String,
+    title: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamOverviewDto {
+    team: Option<String>,
+    workspace: String,
+    /// The folder the workspace lives in (what Scan again reads).
+    root: String,
+    repos: Vec<TeamRepoDto>,
+    /// The team's wiki, when it has one.
+    wiki: Option<TeamRepoDto>,
+    gaps: Vec<TeamGapDto>,
+    /// The workspace's own ignore lines (`.kenignore` beside the repos).
+    ignores: Vec<String>,
+    /// The wiki's last drift sweep.
+    sweep: Option<ken_core::drift::DriftRun>,
+    rules: Vec<TeamPageDto>,
+    templates: Vec<TeamPageDto>,
+}
+
+fn git_line(root: &std::path::Path, args: &[&str]) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    let out = ken_core::proc::quiet(&mut cmd).args(args).current_dir(root).env("GIT_TERMINAL_PROMPT", "0").output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// A wiki page's title: its frontmatter `title`, else its first heading,
+/// else its file name.
+fn page_title(root: &std::path::Path, rel: &str) -> String {
+    let text = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+    text.lines()
+        .find_map(|l| l.trim_start().strip_prefix("title:").map(|t| t.trim().trim_matches('"').to_string()))
+        .filter(|t| !t.contains("{{"))
+        .or_else(|| text.lines().find_map(|l| l.strip_prefix("# ").map(|t| t.trim().to_string())))
+        .unwrap_or_else(|| rel.rsplit('/').next().unwrap_or(rel).trim_end_matches(".md").to_string())
+}
+
+/// The `.md` pages directly in `dir` of `root`, titled, the copy templates
+/// (`RULE.md`) left out.
+fn pages_in(root: &std::path::Path, dir: &str) -> Vec<TeamPageDto> {
+    let mut out: Vec<TeamPageDto> = std::fs::read_dir(root.join(dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            (name.ends_with(".md") && name != "RULE.md" && name != "Index.md").then(|| format!("{dir}/{name}"))
+        })
+        .map(|path| TeamPageDto { title: page_title(root, &path), path })
+        .collect();
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    out
+}
+
+/// The Team screen (the Wright white box, frame 9): the chosen team's repos
+/// as set-up wrote them (kind, index, branch, commit, how far behind its
+/// upstream), what each lacks for its kind, the workspace's ignore lines,
+/// the wiki's last drift sweep, and its rules and templates.
+#[tauri::command]
+fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<TeamOverviewDto> {
+    let guard = state.lock().unwrap();
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let registry = Registry::load(&guard.base_dir).map_err(err)?;
+    let in_team: Option<Vec<String>> = team.as_deref().map(|t| ws.ws.config.effective_group_members(t));
+    let mut repos: Vec<TeamRepoDto> = Vec::new();
+    for m in &ws.ws.members {
+        if in_team.as_ref().is_some_and(|names| !names.contains(&m.name)) {
+            continue;
+        }
+        let ken_core::workspace::MemberStatus::Ok(p) = &m.status else { continue };
+        let entry = registry.entry_at(&p.root);
+        let kind = entry.map(|e| e.kind.clone()).unwrap_or_default();
+        let index = entry.and_then(|e| e.index);
+        let git = p.root.join(".git").exists();
+        let files = guard.members.get(&p.config.id).and_then(|r| r.db.file_count().ok()).unwrap_or(-1);
+        repos.push(TeamRepoDto {
+            id: p.config.id.to_string(),
+            name: m.name.clone(),
+            path: p.root.display().to_string(),
+            effective_index: index.unwrap_or_else(|| ken_core::registry::IndexState::for_kind(&kind)),
+            kind,
+            index,
+            description: entry.and_then(|e| e.description.clone()).unwrap_or_default(),
+            available: p.root.is_dir(),
+            branch: git.then(|| git_line(&p.root, &["rev-parse", "--abbrev-ref", "HEAD"])).flatten(),
+            head: git.then(|| git_line(&p.root, &["rev-parse", "--short=8", "HEAD"])).flatten(),
+            behind: git
+                .then(|| git_line(&p.root, &["rev-list", "--count", "HEAD..@{u}"]))
+                .flatten()
+                .and_then(|n| n.parse().ok()),
+            files,
+        });
+    }
+    let is_wiki = |r: &TeamRepoDto| r.kind.contains(&ken_core::registry::RepoKind::Wiki);
+    let wiki_index = repos.iter().position(is_wiki);
+
+    let mut gaps: Vec<TeamGapDto> = Vec::new();
+    if wiki_index.is_none() {
+        gaps.push(TeamGapDto { repo: None, text: "This team has no wiki. Set-up can make one from the Ways of Working template.".into(), open: None });
+    }
+    for r in &repos {
+        let root = std::path::Path::new(&r.path);
+        if !r.available {
+            gaps.push(TeamGapDto { repo: Some(r.name.clone()), text: format!("{}'s folder is not there any more.", r.name), open: None });
+            continue;
+        }
+        if let Some(n) = r.behind.filter(|n| *n > 0) {
+            gaps.push(TeamGapDto {
+                repo: Some(r.name.clone()),
+                text: format!("{} is {n} commit{} behind its upstream: pull it so Ken reads what is merged.", r.name, if n == 1 { "" } else { "s" }),
+                open: None,
+            });
+        }
+        if r.kind.contains(&ken_core::registry::RepoKind::Code) && !["CLAUDE.md", "AGENTS.md"].iter().any(|f| root.join(f).exists()) {
+            gaps.push(TeamGapDto {
+                repo: Some(r.name.clone()),
+                text: format!("{} has no CLAUDE.md or AGENTS.md, so an agent starts in it without its conventions.", r.name),
+                open: None,
+            });
+        }
+        if r.kind.is_empty() {
+            gaps.push(TeamGapDto { repo: Some(r.name.clone()), text: format!("Nobody has said what {} is: pick its kind.", r.name), open: None });
+        }
+    }
+    let wiki = wiki_index.map(|i| repos.remove(i));
+    let mut sweep = None;
+    let (mut rules, mut templates) = (Vec::new(), Vec::new());
+    if let Some(w) = &wiki {
+        let root = std::path::Path::new(&w.path);
+        let left = ken_core::wikidraft::placeholders_left(root);
+        if !left.is_empty() {
+            gaps.push(TeamGapDto {
+                repo: Some(w.name.clone()),
+                text: format!("The wiki has {} placeholder{} still to fill, first {}.", left.len(), if left.len() == 1 { "" } else { "s" }, left[0]),
+                open: left[0].split(':').next().map(str::to_string),
+            });
+        }
+        for r in &repos {
+            let page = ken_core::wikidraft::repo_page(&r.name);
+            if !root.join(&page).exists() {
+                gaps.push(TeamGapDto {
+                    repo: Some(r.name.clone()),
+                    text: format!("The wiki has no Repo Map page for {}.", r.name),
+                    open: Some("Repo-Map/Index.md".into()),
+                });
+            }
+        }
+        if let Ok(id) = w.id.parse::<uuid::Uuid>() {
+            sweep = guard.members.get(&id).and_then(|m| m.db.last_drift_run().ok().flatten());
+        }
+        rules = pages_in(root, "Ways-of-Working/Rules");
+        templates = pages_in(root, "Templates");
+    }
+    let ignores = std::fs::read_to_string(ws.ws.root.join(".kenignore"))
+        .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
+        .unwrap_or_default();
+    Ok(TeamOverviewDto {
+        team,
+        workspace: ws.ws.config.name.clone(),
+        root: ws.ws.root.display().to_string(),
+        repos,
+        wiki,
+        gaps,
+        ignores,
+        sweep,
+        rules,
+        templates,
+    })
+}
+
+/// Write the workspace's ignore lines (`.kenignore` beside its repos). The
+/// next scan of each repo reads them.
+#[tauri::command]
+fn team_save_ignores(state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
+    let guard = state.lock().unwrap();
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let text: String = lines.iter().map(|l| format!("{}\n", l.trim_end())).collect();
+    std::fs::write(ws.ws.root.join(".kenignore"), text).map_err(err)
+}
+
+/// A new rule in the team wiki's Ways-of-Working/Rules/, from the wiki's own
+/// rule template, named as the rule. Returns its path, to open and write.
+#[tauri::command]
+fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> CmdResult<String> {
+    let guard = state.lock().unwrap();
+    let id: uuid::Uuid = wiki_id.parse().map_err(err)?;
+    let root = guard.members.get(&id).map(|m| m.project.root.clone()).ok_or("the wiki is not open")?;
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return Err("say the rule as a sentence".into());
+    }
+    let slug: String = rule
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let rel = format!("Ways-of-Working/Rules/{slug}.md");
+    let path = root.join(&rel);
+    if path.exists() {
+        return Err(format!("{rel} is already there"));
+    }
+    let template = std::fs::read_to_string(root.join("Ways-of-Working/Rules/RULE.md")).unwrap_or_else(|_| "---\ntitle: \"{{the-rule-as-a-sentence}}\"\nstatus: current\n---\n\n# {{The rule, as a sentence}}\n".into());
+    let text = template
+        .replace("{{the-rule-as-a-sentence}}", rule)
+        .replace("{{The rule, as a sentence}}", rule)
+        .replace("{{date}}", &local_date_today());
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(err)?;
+    std::fs::write(&path, text).map_err(err)?;
+    Ok(rel)
 }
 
 /// Run the drift sweep now, whatever the interval or the repo's kind.
 #[tauri::command]
-async fn run_drift_now(state: State<'_, SharedState>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
+async fn run_drift_now(state: State<'_, SharedState>, project_id: Option<String>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
+    let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let (base, project) = {
         let guard = state.lock().unwrap();
-        let active = member(&guard, None)?;
+        let active = member(&guard, id)?;
         (guard.base_dir.clone(), active.project.clone())
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -15369,6 +15624,9 @@ pub fn run() {
             ingest_card,
             ingest_add,
             ingest_add_bytes,
+            team_overview,
+            team_save_ignores,
+            team_add_rule,
             ingest_now,
             ingest_undo,
             ingest_file,
