@@ -567,6 +567,36 @@ will need their own lines there once decided.
   - Not done: template updates reaching existing wikis (needs a record of
     the template version a wiki started from); platforms and tools land in
     the `other` entity kind.
+- **Workspaces only, and the Wright screens for knowledge (2026-09-29).**
+  - Built in, not flags: `workspace`, `federatedKg`, `kgRouting`
+    (`features::BUILT_IN`; the app's and ken-mcp's checks return true).
+    "Search by meaning" defaults on per repo.
+  - Start screen: Open a workspace, Set up a new workspace, Recent
+    workspaces (`list_recent_workspaces`, `forget_workspace`); no single
+    project. Launch reopens the last workspace.
+  - Title bar: the team switcher (the workspace's groups, one each, no
+    "all"; `scope.team`, kept per workspace). Files lists the team's repos
+    above the tree. Search, Home's scope and digest follow the team.
+  - Ingest (white box 8b): drop or choose files into the team wiki's Raw
+    (`ingest_add`, `ingest_add_bytes` raw body); `ingest_overview`,
+    `ingest_card`. The note is written against the wiki (`wiki_context`)
+    with a Contradictions section. The card: takeaways, then proposals
+    (pages, new pages, rulings, tickets) with diff and Apply / Discard,
+    Seen / Undo all. Every ingest command targets the team's library
+    (`inbox_member`), not the focused repo. Recipes and Automations left
+    the UI; the engine still runs any saved on disk (no new ones can be
+    made): stop it running them when their tests can be run on macOS.
+  - Team (white box 9): `team_overview` (repos with index, kind, branch,
+    commit, behind upstream; gaps; ignores; the wiki's sweep; rules and
+    templates), `team_save_ignores`, `team_add_rule`; Add a repo, Scan
+    again, Take out. Not built, being Wright's: roster, epics, protected
+    paths, Leave this team.
+  - Review names what waits in the team's other repos
+    (`team_review_counts`); the rail count is the team's.
+  - Chat: `history` answers "what changed lately" (`days`), git or not.
+  - Open for a person: the ingest makes every page change a proposal to
+    apply, while the method's CLAUDE.md rule says small edits are written
+    and only three things wait. Decide which, then align the rule or Ken.
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)

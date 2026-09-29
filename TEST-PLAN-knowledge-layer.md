@@ -137,39 +137,32 @@ keyword index over sections.
 - [ ] Open `Platform/Save.md` in Files: under it, **Links to: Combat** and
   **Linked from: Combat**. Clicking one opens it.
 
-## 9. Ingest (step 12, needs Claude)
+## 9. Ingest (the white box's 8b, needs Claude)
 
-- [ ] The rail item reads **Ingest**; its first tab **Ingest** shows
-  `2026-09-20 standup.txt` waiting. (Tabs: Ingest · Recipes · Automations.)
-- [ ] **Read them now**. When it finishes (part one, processing):
-  `Research/Ingestion/Ingested/Meetings/<this month>/<today>-2026-09-20-standup.md`
-  exists, with `status: evidence`, `kind: meeting`, and `source:` naming
-  where the source will be filed. The source is **still in Raw**; the Ingest
-  tab lists it as processed, waiting on Review to be filed, and a second
-  **Read them now** does not read it again.
-- [ ] Review has **Ingested: …** with what it overturns (the ship date) and the
-  actions (Ben, the save bug), and beside it the proposals: a
-  **Proposed: Current/Project.md from …** diff, any **New page: …** the note
-  calls for, and a **Ruling for …** card if a ruling was said in the room.
-  Nothing in the wiki changed yet: apply one and only that page changes.
-  No proposal touches Ways-of-Working, Research, Templates or `_meta` pages
-  other than the decisions log.
-- [ ] With a team repo on the same team (kind **team**), the save-bug action is
-  a **Ticket <KEY>-nnn in <team repo>** card: a new `tickets/<KEY>-nnn.md` in
-  the method's ticket format, assignee Ben. Create it and the file appears in
-  the team repo. Two rulings from one note apply in either order, each taking
-  the next `D-nnn` when applied.
-- [ ] Part two: **Done, file it** on the ingest card moves the source from Raw
-  to `…/Meetings/<month>/<today>-2026-09-20-standup/2026-09-20 standup.txt`,
-  beside its note, and the card is done. Before filing, **Undo** removes the
-  note unless you edited it, withdraws every proposal still open from it, and
-  leaves the source in Raw to be processed again.
-- [ ] Recipes > new from template: **Current, from ingested notes** is offered,
-  with its source set to `Research/Ingestion/Ingested` and output `Current/`.
-  (Run it only if you want to see a held first run: over the template pages it
-  should wait on Review, not apply.)
-- [ ] (Optional) Record a short clip in Ken while `Realms-Docs` is focused: the
-  transcript lands in `Research/Ingestion/Raw/`, the audio in `Recordings/`.
+- [ ] The rail item reads **Ingest** and the screen has no tabs (Recipes and
+  Automations are gone). The chip beside the heading names the team's wiki,
+  **whichever repo is focused**: focus a code repo and open Ingest again; it
+  still shows the wiki's inbox.
+- [ ] Drag `2026-09-20 standup.txt` from Explorer onto the left column (it
+  highlights), or use **Drop files here or choose them**. It appears under
+  **raw** as *in the queue*, then *reading*; a second file with the same name
+  lands as `… (2).txt`.
+- [ ] When it is read: `Research/Ingestion/Ingested/Meetings/<month>/<today>-…md`
+  exists (`status: evidence`, `kind: meeting`, `source:` where it will be
+  filed), the source is still in Raw (*read · on its card*), and it heads the
+  **ingested** list.
+- [ ] Its card on the right: **key takeaways** with what it overturns (the ship
+  date) and **contradictions** naming the wiki page it disagrees with (or
+  "None"); then the proposals grouped as **Pages it would update**, **New
+  pages it calls for**, **Rulings, for their decider**, **Tickets**. **Show the
+  change** opens the diff. Nothing in the wiki changed yet: **Apply** one and
+  only that page changes; **Discard** another and it leaves the card.
+- [ ] With a team repo on the team (kind **team**), the save-bug action is a
+  ticket: **Create** writes `tickets/<KEY>-nnn.md` in the team repo.
+- [ ] **Seen, file it** moves the source beside its note and marks it *seen*
+  in the list. On another source, **Undo all** removes the note (unless you
+  edited it), withdraws its open proposals and leaves the source in Raw.
+- [ ] (Optional) Record a short clip in Ken: the transcript lands in Raw.
 
 ## 10. Drift (step 13)
 
@@ -333,11 +326,48 @@ keyword index over sections.
   result; a failed tool shows `!`, a red edge, and opens by itself.
 - [ ] Close and reopen the chat: the cards are still there, none spinning.
 
+## 16. Workspaces only: the start screen, the team, the repos
+
+- [ ] A fresh start shows **Open a workspace** and **Set up a new workspace**,
+  no "One project". Open a folder with no workspace: it says so and offers
+  **Set one up**. Settings › Features has no "Several repos together", "Team
+  knowledge graph" or "Search across the team"; "Search by meaning" is on.
+- [ ] After opening one, **Recent workspaces** lists it (where and when);
+  right-click › Remove from this list. Ken reopens it on the next launch. The
+  workspace switcher in the rail lists the other recent ones.
+- [ ] The title bar shows the **team** (ATT), not a repo; its menu lists each
+  team on its own, no "All". Files shows the team's **Repos** above the tree;
+  picking one shows its files. The search box says *Search ATT…*, Home's
+  scope picker offers the team or one of its repos, and Home's digest lists
+  the team's repos only.
+- [ ] Review with a code repo focused lists the wiki as *ATT-Wiki · n waiting*
+  when its ingest or drift items wait; the rail count includes them.
+
+## 17. Team (the white box's 9)
+
+- [ ] The rail has **Team**: the team's repos, the wiki first, each with how
+  deep Ken reads it, its kind, branch, commit and drift. Change a repo's index
+  to *off*: its files leave the search after the next scan. **Take out**
+  removes a repo from the workspace; its folder stays.
+- [ ] **Edit** the ignore list, add `Research/raw-exports/`, Save: the
+  workspace's `.kenignore` has the line.
+- [ ] **Drift and gaps** names what a repo lacks: a code repo with no
+  CLAUDE.md, placeholders left in the wiki, a repo with no Repo Map page. A
+  repo behind its upstream shows *n newer upstream*.
+- [ ] Put a new repo folder beside the others, **Scan again**: it is listed as
+  a new folder with **Add to team**; adding it lists it in the table.
+- [ ] **+ Add a repo** with a folder elsewhere: it joins the team, and the
+  wiki's Review gets its Repo Map page and proposals.
+- [ ] **Run the sweep now**: the standing sweep shows the run (pages, controls,
+  pages to check, unverified for thirty days).
+- [ ] **Add a rule** ("Ship small PRs"): `Ways-of-Working/Rules/ship-small-prs.md`
+  opens, made from the wiki's rule template.
+
 ## After
 
 - [ ] Close Ken; delete the test folder and `Realms-Game-u7`/`u8` beside it.
-  The test repos are registered in Ken's list: remove them from the start
-  screen (right-click › Remove from Ken).
+  The test workspace is on the start screen's Recent workspaces:
+  right-click › Remove from this list.
 
 ## Known gaps (not bugs to report)
 
