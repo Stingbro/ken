@@ -1509,69 +1509,20 @@ fn open_project(app: AppHandle, state: State<SharedState>, path: String) -> CmdR
     activate(&app, &state, project, true)
 }
 
-/// Effective `workspace` flag: the global-scope registry default overridden
-/// by `settings.json`'s `features` map. Mirrors the global-layer read in
-/// `list_features` — a global-scope flag has no project layer to consult.
-fn workspace_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
-    let default = ken_core::features::flag("workspace")
-        .map(|f| f.default)
-        .unwrap_or(false);
-    app_settings
-        .features
-        .get("workspace")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(default)
+/// Workspaces, the workspace knowledge graph and search routed across the
+/// workspace are how Ken works, not switches (`features::BUILT_IN`): always
+/// on, whatever an older `settings.json` says. The helpers stay so their
+/// callers read as before.
+fn workspace_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
+    true
 }
 
-/// Effective `federatedKg` flag (federated-kg task 2.3): the global-scope
-/// registry default overridden by `settings.json`'s `features` map, AND-ed
-/// with `workspace_enabled` (proposal: "Requires workspace" — federation is
-/// meaningless with a single open project). Reads straight from the global
-/// layer like `workspace_enabled` does: the design calls `federatedKg`
-/// "workspace-level, in workspace.json features", but no `workspace.json`/
-/// workspace-manifest module exists yet in this codebase (same deviation
-/// `workspace_kg_db.rs` notes for `WorkspaceKgDb::open`), so `settings.json`
-/// is the only durable home this flag has today.
-fn federated_kg_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
-    if !workspace_enabled(app_settings) {
-        return false;
-    }
-    let default = ken_core::features::flag("federatedKg")
-        .map(|f| f.default)
-        .unwrap_or(false);
-    app_settings
-        .features
-        .get("federatedKg")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(default)
+fn federated_kg_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
+    true
 }
 
-/// Effective `kgRouting` flag (kg-routing task 2.1): the global-scope
-/// registry default overridden by `settings.json`'s `features` map, AND-ed
-/// with `workspace_enabled` like `federated_kg_enabled` (proposal:
-/// "Requires semanticIndex and workspace"). The `semanticIndex` half of that
-/// requirement is enforced per-member, not here: `route_search` reads each
-/// open member's actual `db.vec_available()` into `routing::MemberInfo::
-/// index_ready` (semantic-index task 2.2's own degrade-per-project
-/// discipline), so a workspace with only some members semantic-indexed still
-/// routes sensibly rather than an all-or-nothing global gate. Deliberately
-/// NOT AND-ed with `federated_kg_enabled` — design D1: "the KG a soft
-/// dependency" — `route_search` opens `WorkspaceKgDb` only when
-/// `federatedKg` is *also* on and passes `None` to `plan_route` otherwise,
-/// so the KG-guided tier is skipped (Named else Broadcast) rather than this
-/// flag refusing to work at all without it.
-fn kg_routing_enabled(app_settings: &ken_core::settings::AppSettings) -> bool {
-    if !workspace_enabled(app_settings) {
-        return false;
-    }
-    let default = ken_core::features::flag("kgRouting")
-        .map(|f| f.default)
-        .unwrap_or(false);
-    app_settings
-        .features
-        .get("kgRouting")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(default)
+fn kg_routing_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
+    true
 }
 
 /// Effective `kenMemory` flag (ken-memory task 2.4): the global-scope
@@ -2437,19 +2388,7 @@ fn setup_confirm(
     rows: Vec<ken_core::setup::RepoRow>,
     ignores: Vec<ken_core::setup::IgnoreRow>,
 ) -> CmdResult<WorkspaceOverviewDto> {
-    // Confirming set-up is the opt-in to several repos together: switch the
-    // workspace flag on (a fresh install has no settings.json to hold it,
-    // so it could never be turned on before a workspace existed).
-    let base = {
-        let mut guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            let mut settings = guard.app_settings.clone();
-            settings.features.insert("workspace".into(), serde_json::Value::Bool(true));
-            settings.save(&guard.base_dir).map_err(err)?;
-            guard.app_settings = settings;
-        }
-        guard.base_dir.clone()
-    };
+    let base = state.lock().unwrap().base_dir.clone();
     let ws = ken_core::setup::confirm(&base, Path::new(&parent), &name, &rows, &ignores, &local_date_today())
         .map_err(err)?;
     open_workspace_inner(&app, state.inner(), ws)
@@ -2482,13 +2421,7 @@ fn setup_confirm_repos(
     add: bool,
 ) -> CmdResult<WorkspaceOverviewDto> {
     let (base, root) = {
-        let mut guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            let mut settings = guard.app_settings.clone();
-            settings.features.insert("workspace".into(), serde_json::Value::Bool(true));
-            settings.save(&guard.base_dir).map_err(err)?;
-            guard.app_settings = settings;
-        }
+        let guard = state.lock().unwrap();
         let root = if add {
             guard.workspace.as_ref().ok_or("no workspace open to add to")?.ws.root.clone()
         } else {
@@ -3345,15 +3278,6 @@ fn set_global_feature(app: AppHandle, state: State<SharedState>, flag: String, v
     settings.save(&base_dir).map_err(err)?;
     let mut guard = state.lock().unwrap();
     guard.app_settings = settings;
-    // federated-kg task 2.3: turning the flag off cancels any workspace-KG
-    // build in flight, mirroring `apply_semantic_index_flag`'s cancel on
-    // disable. A build already past its flush is unaffected (kg.sqlite is
-    // left as the last completed graph, per design D1 — always safe).
-    if flag == "federatedKg" && !value {
-        if let Some(token) = guard.workspace_kg_cancel.lock().unwrap().take() {
-            token.cancel();
-        }
-    }
     // ken-families task 2.6: "off => no timers" applies immediately, not
     // just to connections created from now on — and flipping it back on
     // should resume every `liveSync` connection's poller without a

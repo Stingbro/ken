@@ -88,9 +88,9 @@ class WorkspaceKgStore {
     });
   }
 
+  /** The workspace graph is built in, no longer a flag. */
   private async checkEnabled(): Promise<boolean> {
-    const features = await api.listFeatures().catch(() => []);
-    return features.find((f) => f.name === "federatedKg")?.effective ?? false;
+    return true;
   }
 
   async refreshOverview() {

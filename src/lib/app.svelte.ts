@@ -131,11 +131,9 @@ class AppStore {
    *  out on `close_workspace`. */
   workspace = $state<WorkspaceOverview | null>(null);
 
-  /** Whether the global `workspace` flag resolves on — gates the launcher's
-   *  "Open a workspace" entry point and the nav-rail switcher (workspace
-   *  task 4.2/4.3). Read once at `init()`; a mid-session flag flip needs a
-   *  restart to take effect, same as every other global flag in this app. */
-  workspaceFlagEnabled = $state(false);
+  /** Workspaces are how Ken works, no longer a flag: always true. Kept so
+   *  the screens that read it stay as they are. */
+  readonly workspaceFlagEnabled = true;
 
   /** Every known member: in Workspace mode, the full roster from
    *  `workspace.members` (workspace task 4.3 — click/`Ctrl+P` cycle target,
@@ -308,12 +306,7 @@ class AppStore {
       this.syncState = ev.state;
       this.syncDetail = ev.detail;
     });
-    // Workspace flag + lifecycle events (workspace task 4.1/4.3). Read once —
-    // a mid-session flip needs a restart, same as every other global flag.
-    this.workspaceFlagEnabled = await api
-      .listFeatures()
-      .then((flags) => flags.find((f) => f.name === "workspace")?.effective ?? false)
-      .catch(() => false);
+    // Workspace lifecycle events (workspace task 4.1/4.3).
     await api.onWorkspaceState((ev) => {
       if (ev.state === "closed") {
         this.workspace = null;
@@ -657,8 +650,6 @@ class AppStore {
    *  more repos into the open one. Opens it. */
   async confirmSetupRepos(name: string, rows: SetupRepoRow[], add = false) {
     const overview = await api.setupConfirmRepos(name, rows, add);
-    // Confirm switched the workspace feature on if it was off.
-    this.workspaceFlagEnabled = true;
     this.workspace = overview;
     await this.loadFocusedMemberState(overview);
   }
@@ -666,8 +657,6 @@ class AppStore {
   /** Set-up's Confirm: write what the person chose and open the workspace. */
   async confirmSetup(parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) {
     const overview = await api.setupConfirm(parent, name, rows, ignores);
-    // Confirm switched the workspace feature on if it was off.
-    this.workspaceFlagEnabled = true;
     this.workspace = overview;
     await this.loadFocusedMemberState(overview);
   }

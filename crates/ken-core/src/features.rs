@@ -42,18 +42,11 @@ pub const FLAGS: &[FlagDef] = &[
         label: "Search by meaning",
         applies: "this repo",
         scope: FlagScope::Project,
-        default: false,
+        default: true,
         description: "Meaning-based search using a local embedding model. \
-                      Requires downloading Nomic Embed v1.5 (~140 MB).",
-    },
-    FlagDef {
-        name: "workspace",
-        label: "Several repos together",
-        applies: "this machine",
-        scope: FlagScope::Global,
-        default: false,
-        description: "Open a parent folder's sibling projects together, \
-                      each with its own DB, engine, and watcher.",
+                      On by default; it needs Nomic Embed v1.5 (~140 MB, \
+                      Settings → Models), and until that is downloaded \
+                      search is by keyword.",
     },
     FlagDef {
         name: "profiler",
@@ -77,29 +70,6 @@ pub const FLAGS: &[FlagDef] = &[
                       files stay queued and resume when it goes back on.",
     },
     FlagDef {
-        name: "federatedKg",
-        label: "Team knowledge graph",
-        applies: "the team",
-        scope: FlagScope::Workspace,
-        default: false,
-        description: "Build a workspace-wide knowledge graph that federates \
-                      each open member's knowledge model into merged \
-                      entities, cross-project edges, and a wiki-page view. \
-                      Requires the workspace flag.",
-    },
-    FlagDef {
-        name: "kgRouting",
-        label: "Search across the team",
-        applies: "the team",
-        scope: FlagScope::Workspace,
-        default: false,
-        description: "Route search across workspace members: aim directly \
-                      at a named project, via the workspace knowledge graph \
-                      when it isn't named, or broadcast when neither \
-                      applies — every result cited with a stable address. \
-                      Requires the workspace flag.",
-    },
-    FlagDef {
         name: "kenMemory",
         label: "Ken memory",
         applies: "mine",
@@ -108,8 +78,7 @@ pub const FLAGS: &[FlagDef] = &[
         description: "Ken's own working memory: long-term memory files, a \
                       daily journal, and an approval-gated promotion pass, \
                       indexed by a reserved workspace pseudo-member and \
-                      injected into chat context. Requires the workspace \
-                      flag.",
+                      injected into chat context.",
     },
     FlagDef {
         name: "kenTasks",
@@ -120,8 +89,7 @@ pub const FLAGS: &[FlagDef] = &[
         description: "A shared task board (Kanban + a daily view) backed by \
                       markdown files in the workspace and per-project \
                       homes, with overarching goals, drag-drop status, and \
-                      MCP claim/complete tools for agent handoff. Requires \
-                      the workspace flag.",
+                      MCP claim/complete tools for agent handoff.",
     },
     FlagDef {
         name: "kenFamilies",
@@ -144,9 +112,19 @@ pub const FLAGS: &[FlagDef] = &[
         description: "A configurable multi-lane pipeline board layered over \
                       the task board: custom lanes, agent kickoff per lane, \
                       run records, blockers, and a digest of what needs \
-                      attention. Requires the workspace and kenTasks flags.",
+                      attention. Requires the task board.",
     },
 ];
+
+/// What were flags and are now how Ken works: a workspace of several repos,
+/// its knowledge graph, and search routed across it. Always on; a value an
+/// older `settings.json` still holds for one is ignored, and none is shown.
+pub const BUILT_IN: &[&str] = &["workspace", "federatedKg", "kgRouting"];
+
+/// Is `name` one of the [`BUILT_IN`] features, always on?
+pub fn built_in(name: &str) -> bool {
+    BUILT_IN.contains(&name)
+}
 
 /// Registry lookup by name. `None` means the flag is not implemented and any
 /// attempt to set it must be rejected.
@@ -163,6 +141,9 @@ pub fn flag(name: &str) -> Option<&'static FlagDef> {
 ///   4. global `settings.json` `features` map;
 ///   5. registry default (false for an unregistered name).
 pub fn effective_flag(app_settings: &AppSettings, project: &Project, name: &str) -> bool {
+    if built_in(name) {
+        return true;
+    }
     if let Some(v) = project.config.features.get(name).and_then(Value::as_bool) {
         return v;
     }
@@ -207,9 +188,11 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 10);
+        assert_eq!(FLAGS.len(), 7);
         assert!(flag("semanticIndex").is_some());
-        assert!(flag("workspace").is_some());
+        for name in BUILT_IN {
+            assert!(flag(name).is_none(), "{name} is how Ken works, not a switch");
+        }
         // The only flag in the registry that defaults ON: background
         // extraction is the behaviour Ken shipped with, and the switch exists
         // to stop it rather than to start it.
@@ -219,12 +202,6 @@ mod tests {
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);
-        let federated_kg = flag("federatedKg").expect("federatedKg flag registered");
-        assert_eq!(federated_kg.scope, FlagScope::Workspace);
-        assert!(!federated_kg.default);
-        let kg_routing = flag("kgRouting").expect("kgRouting flag registered");
-        assert_eq!(kg_routing.scope, FlagScope::Workspace);
-        assert!(!kg_routing.default);
         let ken_memory = flag("kenMemory").expect("kenMemory flag registered");
         assert_eq!(ken_memory.scope, FlagScope::Workspace);
         assert!(!ken_memory.default);
@@ -240,19 +217,32 @@ mod tests {
     }
 
     #[test]
+    fn built_in_features_are_on_whatever_settings_say() {
+        let project = project_with(Map::new(), Map::new());
+        let mut off = Map::new();
+        for name in BUILT_IN {
+            off.insert(name.to_string(), Value::Bool(false));
+        }
+        let settings = settings_with(off);
+        for name in BUILT_IN {
+            assert!(effective_flag(&settings, &project, name), "{name}");
+        }
+    }
+
+    #[test]
     fn registry_default_when_nothing_set() {
         let project = project_with(Map::new(), Map::new());
         let settings = AppSettings::default();
-        assert!(!effective_flag(&settings, &project, "semanticIndex"));
+        assert!(effective_flag(&settings, &project, "semanticIndex"), "meaning search is on unless turned off");
     }
 
     #[test]
     fn global_default_used_when_project_silent() {
         let project = project_with(Map::new(), Map::new());
         let mut features = Map::new();
-        features.insert("semanticIndex".into(), true.into());
+        features.insert("semanticIndex".into(), false.into());
         let settings = settings_with(features);
-        assert!(effective_flag(&settings, &project, "semanticIndex"));
+        assert!(!effective_flag(&settings, &project, "semanticIndex"));
     }
 
     #[test]

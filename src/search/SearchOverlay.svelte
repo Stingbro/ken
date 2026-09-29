@@ -49,7 +49,8 @@
       ? "all"
       : "project",
   );
-  let kgRoutingEnabled = $state(false);
+  // Routed search is built in (no longer the kgRouting flag).
+  const kgRoutingEnabled = true;
   /** Narrow the all-projects scope to one member (ken-home-workspace
    *  3.3). `null` = every member. Routed search pins the plan to this id
    *  and skips the KG entirely — same result shape either way. */
@@ -140,16 +141,6 @@
     // load is paid before the user's first question, not during it. No-op when
     // no local model is installed.
     void api.warmLlm().catch(() => {});
-    // Resolve once whether the "All projects" scope should route (kgRouting)
-    // or stay keyword-only (workspace) — only matters in Workspace mode.
-    if (app.workspace) {
-      void api
-        .listFeatures()
-        .then((flags) => {
-          kgRoutingEnabled = flags.find((f) => f.name === "kgRouting")?.effective ?? false;
-        })
-        .catch(() => {});
-    }
     let unlistenFinal: UnlistenFn | undefined;
     let unlistenDelta: UnlistenFn | undefined;
     let unlistenRouted: UnlistenFn | undefined;

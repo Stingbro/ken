@@ -3272,25 +3272,18 @@ fn global_flag(app_settings: &AppSettings, name: &str) -> bool {
         .unwrap_or(default)
 }
 
-fn workspace_enabled(app_settings: &AppSettings) -> bool {
-    global_flag(app_settings, "workspace")
+/// Workspaces, the workspace graph and routed search are how Ken works, not
+/// switches (`features::BUILT_IN`), as in the app.
+fn workspace_enabled(_app_settings: &AppSettings) -> bool {
+    true
 }
 
-/// Mirrors src-tauri's `federated_kg_enabled` (proposal: federatedKg
-/// "Requires the workspace flag").
-fn federated_kg_enabled(app_settings: &AppSettings) -> bool {
-    workspace_enabled(app_settings) && global_flag(app_settings, "federatedKg")
+fn federated_kg_enabled(_app_settings: &AppSettings) -> bool {
+    true
 }
 
-/// design.md: "kgRouting (workspace-level). Requires semanticIndex and
-/// workspace". The `workspace` half is checked the same way
-/// `federated_kg_enabled` checks it; `semanticIndex` is per-project, not a
-/// single global toggle, so it isn't checked here — it instead shows up as
-/// `MemberInfo::index_ready` gating which *members* `route_query` can
-/// actually target, which is the only place a per-project flag can mean
-/// anything for a workspace-wide gate.
-fn kg_routing_enabled(app_settings: &AppSettings) -> bool {
-    workspace_enabled(app_settings) && global_flag(app_settings, "kgRouting")
+fn kg_routing_enabled(_app_settings: &AppSettings) -> bool {
+    true
 }
 
 /// `kenMemory` (workspace-level, requires `workspace` — proposal.md
@@ -4152,7 +4145,7 @@ mod tests {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"]
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query"]
         );
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
@@ -4400,31 +4393,6 @@ mod tests {
     }
 
     #[test]
-    fn kg_routing_tools_absent_and_erroring_when_flag_off() {
-        let mut fx = fixture(true); // default settings — kgRouting unset, off
-        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        let names: Vec<_> = reply["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
-            "flag off must be byte-identical to pre-kg-routing tool list"
-        );
-
-        // Dispatch still recognizes the tool names (not "unknown tool") and
-        // explains the flag rather than erroring opaquely.
-        for name in ["kg_search", "semantic_search", "route_query"] {
-            let (text, is_err) = tool(&mut fx.server, name, json!({"query": "billing"}));
-            assert!(is_err, "{name}: {text}");
-            assert!(text.contains("kgRouting"), "{name}: {text}");
-        }
-    }
-
-    #[test]
     fn kg_routing_tools_appear_and_route_query_returns_a_named_plan_when_flag_on() {
         let (_base, _ra, _rb, mut server) = two_project_fixture();
         let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
@@ -4505,30 +4473,15 @@ mod tests {
     }
 
     #[test]
-    fn kg_search_reports_federated_kg_off_without_erroring() {
-        // two_project_fixture turns on workspace+kgRouting but not
-        // federatedKg — kg_search should explain, not fail the call.
-        let (_base, _ra, _rb, mut server) = two_project_fixture();
-        let (text, is_err) = tool(&mut server, "kg_search", json!({"query": "anything"}));
-        assert!(!is_err, "{text}");
-        assert!(text.contains("federatedKg"), "{text}");
-    }
-
-    #[test]
-    fn list_projects_enriches_only_when_kg_routing_is_on() {
+    fn list_projects_says_which_projects_routed_search_can_use() {
+        // Routed search is built in: on whatever settings.json says.
         let mut fx = fixture(true);
-        let (text_off, is_err) = tool(&mut fx.server, "list_projects", json!({}));
-        assert!(!is_err);
-        assert!(!text_off.contains("search ready"), "{text_off}");
-
         let mut settings = AppSettings::default();
-        settings.features.insert("workspace".into(), true.into());
-        settings.features.insert("kgRouting".into(), true.into());
+        settings.features.insert("kgRouting".into(), false.into());
         settings.save(&fx.server.base_dir).unwrap();
-
-        let (text_on, is_err) = tool(&mut fx.server, "list_projects", json!({}));
-        assert!(!is_err, "{text_on}");
-        assert!(text_on.contains("search ready"), "{text_on}");
+        let (text, is_err) = tool(&mut fx.server, "list_projects", json!({}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("search ready"), "{text}");
     }
 
     // --- ken-memory (task 3.2) ---
@@ -4573,7 +4526,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query"],
             "flag off must be byte-identical to pre-ken-memory tool list"
         );
 
@@ -4749,7 +4702,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query"],
             "flag off must be byte-identical to pre-ken-tasks tool list"
         );
 
@@ -5138,7 +5091,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query"],
             "flag off must be byte-identical to pre-ken-families tool list"
         );
 
