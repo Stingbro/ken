@@ -264,6 +264,24 @@ struct Cluster {
     /// `(member_index, local_entity_id, local_name)` — member index is into
     /// the `snapshots` slice.
     locals: Vec<(usize, i64, String)>,
+    /// The kind each local entity was given, one per local.
+    votes: Vec<String>,
+}
+
+/// The kind a merged concept shows: a specific kind when at least half of
+/// what merged says it, else the loose kind most said. One member calling a
+/// product an organization, against three calling it a topic, is a mislabel.
+fn voted_kind(votes: &[String]) -> Option<String> {
+    let count = |k: &str| votes.iter().filter(|v| v.as_str() == k).count();
+    if votes.is_empty() {
+        return None;
+    }
+    let specific = votes.iter().filter(|v| kind_rank(v) == 2).max_by_key(|v| count(v));
+    specific
+        .filter(|k| count(k) * 2 >= votes.len())
+        .cloned()
+        .or_else(|| votes.iter().any(|v| v == "topic").then(|| "topic".to_string()))
+        .or_else(|| Some("other".to_string()))
 }
 
 /// Tier-1 resolution (task 1.3): group local entities by `(normalized name,
@@ -289,6 +307,7 @@ fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize
                         kind: e.kind.clone(),
                         name: e.name.clone(),
                         locals: Vec::new(),
+                        votes: Vec::new(),
                     });
                     same_name.push(clusters.len() - 1);
                     clusters.len() - 1
@@ -299,7 +318,13 @@ fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize
                 clusters[ci].kind = e.kind.clone();
             }
             clusters[ci].locals.push((mi, e.local_id, e.name.clone()));
+            clusters[ci].votes.push(e.kind.clone());
             index.insert((mi, e.local_id), ci);
+        }
+    }
+    for c in &mut clusters {
+        if let Some(k) = voted_kind(&c.votes) {
+            c.kind = k;
         }
     }
     (clusters, index)
@@ -380,6 +405,14 @@ fn candidate_pairs(clusters: &[Cluster]) -> Vec<(usize, usize)> {
                 continue;
             }
             let (a, b) = (&norms[i], &norms[j]);
+            // A first name alone inside a full name ("Kyle" in "Kyle
+            // Ahlstrom") could be any Kyle: a team had two. Not a question to
+            // ask, whoever answers it.
+            let first_name_only = [&clusters[i].kind, &clusters[j].kind].iter().any(|k| k.as_str() == "person")
+                && (!a.contains(' ') || !b.contains(' '));
+            if first_name_only && edit_distance(a, b) > MAX_EDIT_DISTANCE {
+                continue;
+            }
             if names_nest(a, b) || edit_distance(a, b) <= MAX_EDIT_DISTANCE || contains_other(a, b) {
                 pairs.push((i, j));
             }
@@ -671,6 +704,7 @@ fn merge_snapshots(
     let mut root_to_final: HashMap<usize, usize> = HashMap::new();
     let mut clusters: Vec<FinalCluster> = Vec::new();
     let mut ci0_to_final: Vec<usize> = vec![0; clusters0.len()];
+    let mut final_votes: Vec<Vec<String>> = Vec::new();
     for (ci0, c) in clusters0.iter().enumerate() {
         let root = uf.find(ci0);
         let fi = *root_to_final.entry(root).or_insert_with(|| {
@@ -684,7 +718,16 @@ fn merge_snapshots(
             clusters.len() - 1
         });
         clusters[fi].locals.extend(c.locals.iter().cloned());
+        if final_votes.len() <= fi {
+            final_votes.resize(fi + 1, Vec::new());
+        }
+        final_votes[fi].extend(c.votes.iter().cloned());
         ci0_to_final[ci0] = fi;
+    }
+    for (c, votes) in clusters.iter_mut().zip(&final_votes) {
+        if let Some(k) = voted_kind(votes) {
+            c.kind = k;
+        }
     }
 
     // `(member, local_id) -> final cluster index`, composed through tier-2.
@@ -1298,6 +1341,31 @@ mod tests {
         assert!(!names_nest("marketing brief", "brief development"));
         assert!(names_nest("brief builder", "brief builder agent"));
         assert!(!names_nest("analytics", "adobe cx analytics"), "one general word is not asked about");
+    }
+
+    #[test]
+    fn a_merged_kind_is_what_most_of_it_says() {
+        let v = |ks: &[&str]| voted_kind(&ks.iter().map(|k| k.to_string()).collect::<Vec<_>>()).unwrap();
+        assert_eq!(v(&["topic", "other", "organization", "other"]), "topic", "one mislabel loses");
+        assert_eq!(v(&["other", "organization"]), "organization", "a specific kind wins a tie");
+        assert_eq!(v(&["person", "person", "topic"]), "person");
+        assert_eq!(v(&["other", "other"]), "other");
+    }
+
+    #[test]
+    fn a_first_name_alone_is_never_asked_to_join_a_full_name() {
+        let person = |id, name: &str| SnapshotEntity { local_id: id, kind: "person".into(), name: name.into(), summary: String::new(), sources: vec![] };
+        let snap = MemberSnapshot {
+            project_id: pa(),
+            watermark: Some(1),
+            edges: vec![],
+            entities: vec![person(1, "Kyle"), person(2, "Kyle Ahlstrom"), person(3, "Kyle Royse"), person(4, "Kyle Alhstrom")],
+        };
+        let (clusters, _) = tier1_clusters(&[snap]);
+        let names = |(i, j): (usize, usize)| (clusters[i].name.clone(), clusters[j].name.clone());
+        let pairs: Vec<(String, String)> = candidate_pairs(&clusters).into_iter().map(names).collect();
+        assert!(!pairs.iter().any(|(a, b)| a == "Kyle" || b == "Kyle"), "{pairs:?}");
+        assert!(pairs.iter().any(|(a, b)| [a.as_str(), b.as_str()] == ["Kyle Ahlstrom", "Kyle Alhstrom"] || [a.as_str(), b.as_str()] == ["Kyle Alhstrom", "Kyle Ahlstrom"]), "a typo is still asked: {pairs:?}");
     }
 
     #[test]

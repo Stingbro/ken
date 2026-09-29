@@ -69,6 +69,10 @@ fn main() {
         "embed" => phase_embed(&base, &parent),
         "wiki" => phase_wiki(&base, &parent),
         "extract" => phase_extract(&base, &parent, args.get(2).and_then(|m| m.parse().ok()).unwrap_or(30)),
+        "map" => phase_map(&base, &parent),
+        "add-repo" => phase_add_repo(&base, &parent, &args[2]),
+        "sync" => phase_sync(&base, &parent, &args[2]),
+        "chat" => phase_chat(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "look" => phase_look(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
@@ -322,6 +326,210 @@ fn phase_wiki(base: &Path, parent: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- extract
+
+/// Ken's chat on each question (or `KEN_EVAL_ONLY`), headless: the chat's
+/// guide and Ken's MCP server over this evaluation's data, started in the
+/// team wiki with every member readable. Found when an expected file is in
+/// the answer (it cites `ken://<id>/<path>`).
+fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(questions).map_err(|e| Error::Other(format!("{}: {e}", questions.display())))?;
+    let only: Vec<usize> =
+        std::env::var("KEN_EVAL_ONLY").unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect();
+    let binary = ken_core::runner::discover_claude().ok_or_else(|| Error::Other("Claude Code not found".into()))?;
+    let mcp = std::env::current_exe().map_err(|e| Error::Other(e.to_string()))?.parent().and_then(|d| d.parent()).map(|d| d.join("ken-mcp.exe")).filter(|p| p.exists())
+        .ok_or_else(|| Error::Other("ken-mcp.exe not built next to the harness".into()))?;
+    let wiki = Project::open(&parent.join(wiki_name()))?;
+    let cfg = base.join("chat-mcp").join("eval.json");
+    std::fs::create_dir_all(cfg.parent().unwrap()).map_err(|e| Error::Other(e.to_string()))?;
+    let config = serde_json::json!({"mcpServers": {"ken": {"command": mcp, "args": ["--project", wiki.root], "env": {"KEN_DATA_DIR": base}}}});
+    std::fs::write(&cfg, config.to_string()).map_err(|e| Error::Other(e.to_string()))?;
+    let dirs: Vec<PathBuf> = members(parent)?.into_iter().map(|(_, p)| p.root.clone()).collect();
+    let (mut asked, mut found, mut not_there) = (0, 0, 0);
+    println!("# Ken's chat\n\nstarted in `{}`, MCP `{}`\n", wiki_name(), mcp.display());
+    for (qi, line) in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
+        let n = qi + 1;
+        if !only.is_empty() && !only.contains(&n) {
+            continue;
+        }
+        let (q, expect) = line.split_once('\t').unwrap_or((line, ""));
+        let expects: Vec<String> = expect.split('|').filter(|e| !e.is_empty()).map(|e| e.to_lowercase()).collect();
+        let t = Instant::now();
+        let outcome = assistant::chat_oneshot(&binary, &wiki.root, &dirs, &cfg, q, Duration::from_secs(300), &CancelToken::new())?;
+        let answer = match outcome {
+            assistant::OneshotOutcome::Completed(t) => t,
+            other => format!("(no answer: {other:?})"),
+        };
+        let lower = answer.to_lowercase();
+        let hit = expects.iter().any(|e| lower.contains(e));
+        let missing = !hit && (lower.contains("isn't there") || lower.contains("not there") || lower.contains("could not find") || lower.contains("couldn't find"));
+        asked += 1;
+        found += usize::from(hit);
+        not_there += usize::from(missing);
+        println!(
+            "## Q{n}. {q}\n\n{} · {:.0}s · expected `{expect}`\n\n{}\n",
+            if hit { "FOUND" } else if missing { "SAID NOT THERE" } else { "MISSED" },
+            t.elapsed().as_secs_f64(),
+            short(&answer, 700)
+        );
+    }
+    println!("## Score\n\n{found} of {asked} answers name an expected file; {not_there} said it was not there.");
+    Ok(())
+}
+
+/// Wiki sync as the app runs it, against a bare remote in the evaluation's
+/// own folder (`<parent>/../remotes/<member>.git`), never a real one: commit
+/// all and push, then a teammate's pushed change pulled back.
+fn phase_sync(base: &Path, parent: &Path, member: &str) -> Result<()> {
+    use ken_core::sync;
+    let p = Project::open(&parent.join(member))?;
+    let kind = Registry::load(base)?.entry_at(&p.root).map(|e| e.kind.clone()).unwrap_or_default();
+    let area = parent.parent().unwrap_or(parent);
+    let remote = area.join("remotes").join(format!("{member}.git"));
+    let git = |dir: &Path, args: &[&str]| -> std::result::Result<String, String> {
+        let o = std::process::Command::new("git")
+            .args(["-c", "user.name=Ken eval", "-c", "user.email=ken-eval@example.invalid"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if o.status.success() { Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) }
+    };
+    let (origin, branch) = sync::remote_and_branch(&p.root);
+    if origin.is_none() {
+        std::fs::create_dir_all(remote.parent().unwrap()).map_err(|e| Error::Other(e.to_string()))?;
+        git(area, &["init", "-q", "--bare", &remote.to_string_lossy()]).map_err(Error::Other)?;
+        git(&p.root, &["remote", "add", "origin", &remote.to_string_lossy()]).map_err(Error::Other)?;
+    }
+    let url = git(&p.root, &["remote", "get-url", "origin"]).map_err(Error::Other)?.replace('\\', "/");
+    if !url.to_lowercase().starts_with(&area.to_string_lossy().replace('\\', "/").to_lowercase()) {
+        return Err(Error::Other(format!("origin `{url}` is outside the evaluation folder; not pushing")));
+    }
+    let branch = branch.unwrap_or_else(|| "main".into());
+    println!("# Sync `{member}`\n\nsync on by default for its kind {kind:?}: {}\nremote: `{url}` branch `{branch}`\n", sync::sync_auto(&p, &kind));
+    sync::ensure_excludes(&p.root)?;
+    // First push sets the upstream, as a person does once.
+    let committed = sync::commit_all(&p.root)?;
+    let first = git(&p.root, &["push", "-q", "-u", "origin", &branch]);
+    println!("commit: {committed} · first push: {first:?}");
+    let tracked = git(&remote, &["ls-tree", "-r", "--name-only", &branch]).unwrap_or_default();
+    println!(
+        "on the remote: {} files · .ken/project.json {} · staging {}",
+        tracked.lines().count(),
+        if tracked.lines().any(|l| l == ".ken/project.json") { "committed" } else { "MISSING" },
+        if tracked.lines().any(|l| l.starts_with(".ken/.staging")) { "LEAKED" } else { "kept out" }
+    );
+
+    // A local edit, synced.
+    let page = p.root.join("Current/Project.md");
+    let mut text = std::fs::read_to_string(&page).map_err(|e| Error::Other(e.to_string()))?;
+    text.push_str("\nNote from the evaluation's sync step.\n");
+    std::fs::write(&page, &text).map_err(|e| Error::Other(e.to_string()))?;
+    let committed = sync::commit_all(&p.root)?;
+    println!("local edit: committed {committed}, push {:?}", sync::push(&p.root)?.eq_name());
+    let subject = git(&remote, &["log", "-1", "--format=%s", &branch]).unwrap_or_default();
+    println!("remote's newest commit: {subject:?}");
+
+    // A teammate's change, pulled.
+    let mate = area.join("remotes").join(format!("{member}-teammate"));
+    let _ = std::fs::remove_dir_all(&mate);
+    git(area, &["clone", "-q", &remote.to_string_lossy(), &mate.to_string_lossy()]).map_err(Error::Other)?;
+    std::fs::write(mate.join("Current/Teammate.md"), "# Teammate\n\nAdded on another machine.\n").map_err(|e| Error::Other(e.to_string()))?;
+    git(&mate, &["add", "-A"]).map_err(Error::Other)?;
+    git(&mate, &["commit", "-q", "-m", "a teammate's page"]).map_err(Error::Other)?;
+    git(&mate, &["push", "-q"]).map_err(Error::Other)?;
+    let pulled = sync::pull(&p.root, |_| false)?;
+    println!("pull: {} · teammate's page here: {}", match pulled {
+        sync::PullOutcome::Clean => "clean".to_string(),
+        sync::PullOutcome::Conflicts(c) => format!("{} conflicts", c.len()),
+        sync::PullOutcome::Failed(e) => format!("failed: {e}"),
+    }, p.root.join("Current/Teammate.md").exists());
+    Ok(())
+}
+
+trait PushName {
+    fn eq_name(&self) -> String;
+}
+impl PushName for ken_core::sync::PushOutcome {
+    fn eq_name(&self) -> String {
+        match self {
+            ken_core::sync::PushOutcome::Pushed => "pushed".into(),
+            ken_core::sync::PushOutcome::NoRemote => "no remote".into(),
+            ken_core::sync::PushOutcome::Failed(e) => format!("failed: {e}"),
+        }
+    }
+}
+
+/// A repo joins the team later: `folder` (beside the others) is ticked at
+/// set-up, confirmed onto the team, indexed, and the wiki gets its Repo Map
+/// page drafted and proposed changes for the pages a person keeps.
+fn phase_add_repo(base: &Path, parent: &Path, folder: &str) -> Result<()> {
+    let prop = setup::propose(parent)?;
+    let mut rows = prop.rows.clone();
+    let Some(row) = rows.iter_mut().find(|r| r.member == folder) else {
+        return Err(Error::Other(format!("{folder} is not a candidate beside the others")));
+    };
+    row.include = true;
+    row.team = Some(team());
+    println!("# `{folder}` joins the team\n\nproposed as {:?} {:?}", row.kind, row.index);
+    setup::confirm(base, parent, &team(), &rows, &prop.ignores, &today())?;
+    let added = Project::open(&parent.join(folder))?;
+    let mut adb = Db::open(base, added.config.id)?;
+    let stats = scan::scan(&added, &mut adb)?;
+    println!("indexed: {} files", stats.added + stats.updated);
+
+    let wiki = Project::open(&parent.join(wiki_name()))?;
+    let all = wikidraft::team_repos(&wiki_name(), &team_members(base, parent)?);
+    println!("team repos now: {:?}\n", all.iter().map(|r| &r.0).collect::<Vec<_>>());
+    let mut db = Db::open(base, wiki.config.id)?;
+    let report = wikidraft::draft_added(
+        &wiki.root,
+        &wiki_name(),
+        &mut db,
+        &[(folder.to_string(), added.root.clone())],
+        &all,
+        &today(),
+        engine::now_epoch(),
+        claude(&wiki.root)?,
+    )?;
+    println!("- drafted: {:?}\n- proposed: {:?}\n- kept (no change): {:?}\n- failed: {:?}", report.drafted, report.proposed, report.kept, report.failed);
+    let conn = rusqlite::Connection::open(ken_core::db::db_path(base, wiki.config.id)).map_err(|e| Error::Other(e.to_string()))?;
+    let mut stmt = conn
+        .prepare("SELECT kind, title, body FROM review_items WHERE status != 'resolved' ORDER BY id DESC LIMIT 6")
+        .map_err(|e| Error::Other(e.to_string()))?;
+    let cards: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| Error::Other(e.to_string()))?
+        .flatten()
+        .collect();
+    for (kind, title, body) in cards {
+        println!("\n### card ({kind}): {title}\n\n{}", short(&body, 700));
+    }
+    Ok(())
+}
+
+/// Each member's knowledge map built by Claude, as the app does now: the
+/// members whose files are read for entities (search-only repos have none).
+fn phase_map(base: &Path, parent: &Path) -> Result<()> {
+    let binary = ken_core::runner::discover_claude().ok_or_else(|| Error::Other("Claude Code not found".into()))?;
+    println!("# Knowledge map (Claude)\n\n| member | files read | entities | edges | still waiting | seconds |\n|---|---|---|---|---|---|");
+    for (name, p) in members(parent)? {
+        let mut db = Db::open(base, p.config.id)?;
+        let files = db.entity_tier_paths()?.len();
+        if files == 0 {
+            continue;
+        }
+        let t = Instant::now();
+        match knowledge_model::build_knowledge_model(&binary, &p, &mut db, &today(), &CancelToken::new()) {
+            Ok(_) => {
+                let (ents, edges) = db.list_entities_with_edges()?;
+                let waiting = db.waiting_extractions()?.len();
+                println!("| {name} | {files} | {} | {} | {waiting} | {:.0} |", ents.len(), edges.len(), t.elapsed().as_secs_f64());
+            }
+            Err(e) => println!("| {name} | {files} | failed: {e} | | | {:.0} |", t.elapsed().as_secs_f64()),
+        }
+    }
+    Ok(())
+}
 
 fn phase_extract(base: &Path, parent: &Path, minutes: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);

@@ -207,6 +207,44 @@ pub fn look(
     run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
 }
 
+/// One chat turn run headless, as Ken's chat is set up: its guide, Ken's MCP
+/// server (`mcp_config`) with the tools the chat may use without asking,
+/// the read-only file tools over `dirs`, and nothing that writes or runs.
+/// For measuring the chat's answers; the app's chat streams instead.
+pub fn chat_oneshot(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    mcp_config: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut allowed: Vec<String> = crate::chat::KEN_MCP_ALLOWED
+        .iter()
+        .filter(|t| **t != "open_in_ken")
+        .map(|t| format!("mcp__ken__{t}"))
+        .collect();
+    allowed.push(LOOK_TOOLS.to_string());
+    let mut args: Vec<String> = vec![
+        "--permission-mode".into(),
+        "default".into(),
+        "--append-system-prompt".into(),
+        crate::chat::KEN_GUIDE.replace('\n', " "),
+        "--mcp-config".into(),
+        mcp_config.to_string_lossy().into_owned(),
+        "--allowedTools".into(),
+        allowed.join(","),
+        "--disallowedTools".into(),
+        "Edit,MultiEdit,Write,NotebookEdit,Bash".into(),
+    ];
+    for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
 fn run_oneshot(
     binary: &Path,
     project_root: &Path,
