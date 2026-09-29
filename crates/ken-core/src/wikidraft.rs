@@ -49,11 +49,13 @@ pub const PAGES: &[(&str, &str)] = &[
     ("Current/Who-Does-What.md", "who owns each area and repo, and who to ask, from who commits where and any CODEOWNERS"),
     (
         "Conventions/ARCHITECTURE.md",
-        "the system's layers: what lives where, what may call what, the entry points, with a mermaid diagram",
+        "the system's layers: what lives where, what may call what, the entry points, with a mermaid diagram; \
+         name every pair of folders the code has importing each other",
     ),
     (
         "Work/Releases.md",
-        "a business doc (item 2b): what changed in each release, newest first, in words for someone who never reads code, from changelogs and release tags",
+        "a business doc (item 2b): what changed in each release, newest first, in words for someone who never reads code, from changelogs and release tags; \
+         first an Unreleased section of what landed since the newest tag, grouped by what it does for the user, from the changes since it",
     ),
     (
         "Vocabulary.md",
@@ -119,6 +121,26 @@ fn git_tags(root: &Path) -> Option<String> {
     (out.status.success() && !top.is_empty()).then(|| top.join("\n"))
 }
 
+/// What landed after the newest release tag the checkout contains, as
+/// `date subject` lines, newest first; the recent commits when the repo has
+/// no tag. The label says which. Release notes would otherwise stop at a tag
+/// months old.
+fn git_unreleased(root: &Path) -> Option<(String, String)> {
+    let git = |args: &[&str]| -> Option<String> {
+        let mut cmd = Command::new("git");
+        let out = crate::proc::quiet(&mut cmd).args(args).current_dir(root).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let tag = git(&["describe", "--tags", "--abbrev=0"]).filter(|t| !t.is_empty());
+    let range = tag.as_ref().map_or_else(|| "HEAD".to_string(), |t| format!("{t}..HEAD"));
+    let log = git(&["log", "--no-merges", "--date=short", "--format=%ad %s", "-n", "80", &range]).filter(|l| !l.is_empty())?;
+    let label = match &tag {
+        Some(t) => format!("(changes since {t})"),
+        None => "(recent changes, no tags)".to_string(),
+    };
+    Some((label, log))
+}
+
 fn git_authors(root: &Path) -> Option<String> {
     let mut cmd = Command::new("git");
     let out = crate::proc::quiet(&mut cmd).args(["shortlog", "-sne", "--all", "--no-merges"]).current_dir(root).output().ok()?;
@@ -160,9 +182,22 @@ pub fn folder_imports(root: &Path) -> Option<String> {
     if edges.is_empty() {
         return None;
     }
+    // Pairs that import each other: not a one-way layering, whatever the
+    // docs say.
+    let mut both: Vec<String> = edges
+        .iter()
+        .filter(|((a, b), _)| a < b)
+        .filter_map(|((a, b), n)| edges.get(&(b.clone(), a.clone())).map(|m| format!("{a} <-> {b} ({n} / {m})")))
+        .collect();
+    both.sort();
     let mut rows: Vec<_> = edges.into_iter().collect();
     rows.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
-    Some(rows.into_iter().take(80).map(|((a, b), n)| format!("{a} -> {b} ({n})")).collect::<Vec<_>>().join("\n"))
+    let mut out = rows.into_iter().take(80).map(|((a, b), n)| format!("{a} -> {b} ({n})")).collect::<Vec<_>>().join("\n");
+    if !both.is_empty() {
+        out.push_str("\n\nimport each other (a -> b / b -> a):\n");
+        out.push_str(&both.join("\n"));
+    }
+    Some(out)
 }
 
 //// Characters of source text read from one repo for its Repo Map page, so
@@ -588,6 +623,9 @@ pub fn team_sources(wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)], e
         }
         if let Some(t) = git_tags(root) {
             out.push(Source { label: format!("{name}:(release tags, newest first)"), text: clip(&t, 2_000) });
+        }
+        if let Some((label, log)) = git_unreleased(root) {
+            out.push(Source { label: format!("{name}:{label}"), text: clip(&log, 4_000) });
         }
     }
     let used: usize = out.iter().map(|s| s.text.len()).sum();
@@ -1043,7 +1081,7 @@ mod tests {
             ("app/services/users.py", "from app.db.repo import load\n\ndef find():\n    return load()\n"),
             ("app/services/teams.py", "def list_teams():\n    return []\n"),
             ("app/services/__init__.py", ""),
-            ("app/db/repo.py", "def load():\n    return 1\n"),
+            ("app/db/repo.py", "from app.services.teams import list_teams\n\ndef load():\n    return 1\n"),
             ("README.md", "# App\n"),
         ] {
             fs::create_dir_all(root.join(p).parent().unwrap()).unwrap();
@@ -1053,9 +1091,46 @@ mod tests {
         git(&["init", "-q"]);
         git(&["add", "-A"]);
         let deps = folder_imports(root).expect("imports between folders");
-        assert_eq!(deps, "app/api -> app/services (3)\napp/services -> app/db (1)");
+        assert_eq!(
+            deps,
+            "app/api -> app/services (3)\napp/db -> app/services (1)\napp/services -> app/db (1)\n\n\
+             import each other (a -> b / b -> a):\napp/db <-> app/services (1 / 1)"
+        );
         let labels: Vec<String> = gather_repo("app", root).into_iter().map(|s| s.label).collect();
         assert!(labels.contains(&"app:(imports between folders, from the code)".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn release_notes_read_what_landed_since_the_newest_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        let commit = |msg: &str| {
+            fs::write(root.join("log.txt"), msg).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", msg]);
+        };
+        commit("first cut");
+        let (label, log) = git_unreleased(root).unwrap();
+        assert_eq!(label, "(recent changes, no tags)");
+        assert!(log.ends_with("first cut"));
+
+        git(&["tag", "v1"]);
+        commit("add the Dallas market");
+        commit("fix the brief export");
+        let (label, log) = git_unreleased(root).unwrap();
+        assert_eq!(label, "(changes since v1)");
+        let subjects: Vec<&str> = log.lines().map(|l| l.split_once(' ').unwrap().1).collect();
+        assert_eq!(subjects, vec!["fix the brief export", "add the Dallas market"]);
     }
 
     #[test]

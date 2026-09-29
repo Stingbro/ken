@@ -7164,24 +7164,6 @@ struct LookAnswer {
     sources: Vec<String>,
 }
 
-/// The prompt for [`look_for`]: the question, the folders to search, and how
-/// to cite across them.
-fn look_prompt(query: &str, folders: &[(String, uuid::Uuid, PathBuf)]) -> String {
-    let mut p = format!(
-        "Question: {query}\n\nKen's search index found nothing strong for this, which does not mean it isn't there. \
-Look for the answer yourself with Grep, Glob and Read in these folders:\n"
-    );
-    for (name, id, root) in folders {
-        p.push_str(&format!("- {name}: {} (cite its files as ken://{id}/<path>#L<line>)\n", root.display()));
-    }
-    p.push_str(
-        "\nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
-If after looking it genuinely is not there, say so plainly and say where you looked. End with a final line \
-`SOURCES: ken://…, ken://…` listing the addresses you cited (omit the line if none).\n",
-    );
-    p
-}
-
 /// "Ask Ken to look": when search found nothing, or nothing that answers, a
 /// read-only Claude session searches the workspace's folders itself (Grep,
 /// Glob, Read; nothing that writes or runs) and answers with citations. The
@@ -7212,7 +7194,7 @@ async fn look_for(state: State<'_, SharedState>, query: String) -> CmdResult<Loo
     let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let dirs: Vec<PathBuf> = folders.iter().map(|(_, _, r)| r.clone()).collect();
-        let prompt = look_prompt(&query, &folders);
+        let prompt = assistant::look_prompt(&query, &folders);
         match assistant::look(&binary, &root, &dirs, &prompt, Duration::from_secs(180), &CancelToken::new()).map_err(err)? {
             OneshotOutcome::Completed(text) => {
                 let parsed = digest::parse_digest(&text);

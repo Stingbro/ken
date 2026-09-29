@@ -151,6 +151,24 @@ pub fn oneshot(
 /// or runs.
 pub const LOOK_TOOLS: &str = "Read,Grep,Glob,LS";
 
+/// The prompt for a [`look`]: the question, the folders to search as
+/// (name, id, root), and how to cite across them.
+pub fn look_prompt(query: &str, folders: &[(String, uuid::Uuid, std::path::PathBuf)]) -> String {
+    let mut p = format!(
+        "Question: {query}\n\nKen's search index found nothing strong for this, which does not mean it isn't there. \
+Look for the answer yourself with Grep, Glob and Read in these folders:\n"
+    );
+    for (name, id, root) in folders {
+        p.push_str(&format!("- {name}: {} (cite its files as ken://{id}/<path>#L<line>)\n", root.display()));
+    }
+    p.push_str(
+        "\nAnswer in two to four sentences from what you read. Cite each file you used inline as its ken:// address. \
+If after looking it genuinely is not there, say so plainly and say where you looked. End with a final line \
+`SOURCES: ken://…, ken://…` listing the addresses you cited (omit the line if none).\n",
+    );
+    p
+}
+
 /// A read-only session that searches `dirs` itself: the fallback when Ken's
 /// index found nothing, so "not there" is only said after looking. It may
 /// read and search every folder given and write nothing.

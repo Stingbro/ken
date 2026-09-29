@@ -71,6 +71,7 @@ fn main() {
         "extract" => phase_extract(&base, &parent, args.get(2).and_then(|m| m.parse().ok()).unwrap_or(30)),
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
+        "look" => phase_look(&parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "drift" => phase_drift(&base, &parent),
         "drift-change" => phase_drift_change(&base, &parent, &args[2], &args[3]),
         "ignore" => phase_ignore(&base, &parent, &args[2]),
@@ -428,6 +429,61 @@ fn phase_kg(base: &Path, parent: &Path) -> Result<()> {
 // ---------------------------------------------------------------- ask
 
 /// `questions.tsv`: `question<TAB>expected path fragment[|another]`.
+/// "Ask Ken to look" on each question (or the numbers in `KEN_EVAL_ONLY`,
+/// e.g. `9,10,15`): the read-only fallback searches the members itself.
+/// Found when a source it cites is an expected file.
+fn phase_look(parent: &Path, questions: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(questions).map_err(|e| Error::Other(format!("{}: {e}", questions.display())))?;
+    let only: Vec<usize> =
+        std::env::var("KEN_EVAL_ONLY").unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect();
+    let binary = ken_core::runner::discover_claude().ok_or_else(|| Error::Other("Claude Code not found".into()))?;
+    let folders: Vec<(String, uuid::Uuid, PathBuf)> =
+        members(parent)?.into_iter().map(|(n, p)| (n, p.config.id, p.root.clone())).collect();
+    let dirs: Vec<PathBuf> = folders.iter().map(|(_, _, r)| r.clone()).collect();
+    let (mut asked, mut found, mut not_there) = (0, 0, 0);
+    println!("# Ask Ken to look\n");
+    for (qi, line) in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
+        let n = qi + 1;
+        if !only.is_empty() && !only.contains(&n) {
+            continue;
+        }
+        let (q, expect) = line.split_once('\t').unwrap_or((line, ""));
+        let expects: Vec<String> = expect.split('|').filter(|e| !e.is_empty()).map(|e| e.to_lowercase()).collect();
+        let t = Instant::now();
+        let prompt = assistant::look_prompt(q, &folders);
+        let outcome = assistant::look(&binary, &parent.join(&folders[0].0), &dirs, &prompt, Duration::from_secs(300), &CancelToken::new())?;
+        let answer = match outcome {
+            assistant::OneshotOutcome::Completed(t) => t,
+            other => format!("(no answer: {other:?})"),
+        };
+        let parsed = ken_core::digest::parse_digest(&answer);
+        // A cited ken://<id>/<path> as `member/path`, to match against.
+        let cited: Vec<String> = parsed
+            .sources
+            .iter()
+            .map(|s| {
+                let rest = s.trim_start_matches("ken://");
+                let (id, path) = rest.split_once('/').unwrap_or((rest, ""));
+                let name = folders.iter().find(|(_, fid, _)| fid.to_string() == id).map_or(id, |(n, _, _)| n.as_str());
+                format!("{name}/{}", path.split('#').next().unwrap_or(path))
+            })
+            .collect();
+        let hit = cited.iter().any(|c| expects.iter().any(|e| c.to_lowercase().contains(e)));
+        let says_missing = parsed.body.to_lowercase().contains("not there") || parsed.body.to_lowercase().contains("could not find");
+        asked += 1;
+        found += usize::from(hit);
+        not_there += usize::from(says_missing && !hit);
+        println!(
+            "## Q{n}. {q}\n\n{} · {:.0}s · expected `{expect}`\n\n{}\n\ncited: {cited:?}\n",
+            if hit { "FOUND" } else if says_missing { "SAID NOT THERE" } else { "MISSED" },
+            t.elapsed().as_secs_f64(),
+            short(&parsed.body, 600)
+        );
+    }
+    println!("## Score\n\n{found} of {asked} found an expected file; {not_there} said it was not there.");
+    Ok(())
+}
+
 fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
     let text = std::fs::read_to_string(questions).map_err(|e| Error::Other(format!("{}: {e}", questions.display())))?;
     let mut emb = ken_core::embedder::installed_embedding_model();

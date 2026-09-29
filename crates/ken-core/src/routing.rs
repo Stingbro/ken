@@ -569,11 +569,19 @@ pub const W_BLOB: f64 = 1.5;
 pub const STALE_DAYS: i64 = 180;
 pub const W_STALE: f64 = 0.25;
 
-/// What text that no person wrote, and a page long unchecked, take off.
+/// A page still titled with a `{{placeholder}}` is a template to copy: it
+/// reads like every question and answers none.
+pub const W_TEMPLATE: f64 = 2.0;
+
+/// What text that no person wrote, a template, and a page long unchecked,
+/// take off.
 fn hygiene(hit: &HybridHit, now: i64) -> f64 {
     let mut s = 0.0;
     if machine_written(&hit.snippet) {
         s -= W_BLOB;
+    }
+    if hit.page.as_ref().and_then(|p| p.title.as_deref()).is_some_and(|t| t.contains("{{")) {
+        s -= W_TEMPLATE;
     }
     let stale = hit
         .page
@@ -1097,6 +1105,24 @@ mod tests {
         assert_eq!(paths.first(), Some(&"Change Order.md"), "{paths:?}");
         assert!(paths.contains(&"Permit.md"), "the linked page joins: {paths:?}");
         assert!(!paths.contains(&"Other.md"), "{paths:?}");
+    }
+
+    #[test]
+    fn a_template_page_ranks_under_a_page_that_answers() {
+        use crate::project::Project;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("RULE.md"),
+            "---\ntitle: \"{{the-rule-as-a-sentence}}\"\n---\n# {{The rule}}\n\nWhat the client pays when the rule is broken, and the fee for fixing it.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("SOW.md"), "---\ntitle: SOW\n---\n# SOW\n\nThe client pays a fixed fee of $400,000.\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let hits = search_member(&db, "what fee does the client pay", None, 8).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths.first(), Some(&"SOW.md"), "{paths:?}");
     }
 
     #[test]
