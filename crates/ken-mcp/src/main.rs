@@ -1352,8 +1352,14 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
                 count += 1;
                 out.push_str(&format!("\n{count}. {sha} {date} {author} — {subject} ({project})"));
                 let files: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).take(6).collect();
+                // A path from an older commit may have moved or gone since:
+                // an address only for what is there now.
                 for f in files {
-                    out.push_str(&format!("\n     {}", ken_address(*id, f)));
+                    if root.join(f).exists() {
+                        out.push_str(&format!("\n     {}", ken_address(*id, f)));
+                    } else {
+                        out.push_str(&format!("\n     {f} (its path then; not there now)"));
+                    }
                 }
             }
         }
@@ -4186,8 +4192,9 @@ mod tests {
     #[test]
     fn history_reads_a_files_commits_and_commits_about_words() {
         let fx = fixture(true);
+        let root = fx.root.clone();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git").args(args).current_dir(&fx.root).output().unwrap();
+            let out = std::process::Command::new("git").args(args).current_dir(&root).output().unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         };
         git(&["init", "-q"]);
@@ -4206,6 +4213,13 @@ mod tests {
         assert!(text.contains("harden it") && !text.contains("add the token check"), "by change: {text}");
         let (text, _) = tool(&mut fx.server, "history", json!({"query": "token check", "project": "Atlas"}));
         assert!(text.contains("add the token check"), "by message: {text}");
+        // Moved since: the commit names its old path, not a dead address.
+        std::fs::create_dir_all(fx.root.join("core")).unwrap();
+        git(&["mv", "auth.py", "core/auth.py"]);
+        git(&["commit", "-q", "-m", "move auth under core"]);
+        let (text, _) = tool(&mut fx.server, "history", json!({"query": "token check", "project": "Atlas"}));
+        assert!(text.contains("auth.py (its path then; not there now)"), "{text}");
+        assert!(!text.contains("/auth.py#") && !text.ends_with("/auth.py"), "{text}");
     }
 
     #[test]
