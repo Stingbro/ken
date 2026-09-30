@@ -70,17 +70,6 @@ pub const FLAGS: &[FlagDef] = &[
                       files stay queued and resume when it goes back on.",
     },
     FlagDef {
-        name: "kenMemory",
-        label: "Ken memory",
-        applies: "mine",
-        scope: FlagScope::Workspace,
-        default: false,
-        description: "Ken's own working memory: long-term memory files, a \
-                      daily journal, and an approval-gated promotion pass, \
-                      indexed by a reserved workspace pseudo-member and \
-                      injected into chat context.",
-    },
-    FlagDef {
         name: "kenTasks",
         label: "Task board",
         applies: "the team",
@@ -103,23 +92,12 @@ pub const FLAGS: &[FlagDef] = &[
                       each member's board visible to the team. Uses the \
                       system git CLI; no accounts, no server.",
     },
-    FlagDef {
-        name: "kenPipeline",
-        label: "Pipeline board",
-        applies: "the team",
-        scope: FlagScope::Workspace,
-        default: false,
-        description: "A configurable multi-lane pipeline board layered over \
-                      the task board: custom lanes, agent kickoff per lane, \
-                      run records, blockers, and a digest of what needs \
-                      attention. Requires the task board.",
-    },
 ];
 
 /// What were flags and are now how Ken works: a workspace of several repos,
-/// its knowledge graph, and search routed across it. Always on; a value an
+/// its knowledge graph, search routed across it, and Ken's memory. Always on; a value an
 /// older `settings.json` still holds for one is ignored, and none is shown.
-pub const BUILT_IN: &[&str] = &["workspace", "federatedKg", "kgRouting"];
+pub const BUILT_IN: &[&str] = &["workspace", "federatedKg", "kgRouting", "kenMemory"];
 
 /// Is `name` one of the [`BUILT_IN`] features, always on?
 pub fn built_in(name: &str) -> bool {
@@ -188,7 +166,7 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 7);
+        assert_eq!(FLAGS.len(), 5);
         assert!(flag("semanticIndex").is_some());
         for name in BUILT_IN {
             assert!(flag(name).is_none(), "{name} is how Ken works, not a switch");
@@ -202,18 +180,12 @@ mod tests {
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);
-        let ken_memory = flag("kenMemory").expect("kenMemory flag registered");
-        assert_eq!(ken_memory.scope, FlagScope::Workspace);
-        assert!(!ken_memory.default);
         let ken_tasks = flag("kenTasks").expect("kenTasks flag registered");
         assert_eq!(ken_tasks.scope, FlagScope::Workspace);
         assert!(!ken_tasks.default);
         let ken_families = flag("kenFamilies").expect("kenFamilies flag registered");
         assert_eq!(ken_families.scope, FlagScope::Global);
         assert!(!ken_families.default);
-        let ken_pipeline = flag("kenPipeline").expect("kenPipeline flag registered");
-        assert_eq!(ken_pipeline.scope, FlagScope::Workspace);
-        assert!(!ken_pipeline.default);
     }
 
     #[test]

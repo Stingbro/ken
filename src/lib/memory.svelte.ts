@@ -35,7 +35,7 @@ class MemoryStore {
   async init() {
     if (this.initDone) return;
     this.initDone = true;
-    this.enabled = await this.checkEnabled();
+    this.enabled = true;
     await api.onMemoryState((ev) => {
       this.phase = ev.state;
       if (ev.state === "ready") {
@@ -45,11 +45,6 @@ class MemoryStore {
         this.errorReason = ev.reason;
       }
     });
-  }
-
-  private async checkEnabled(): Promise<boolean> {
-    const features = await api.listFeatures().catch(() => []);
-    return features.find((f) => f.name === "kenMemory")?.effective ?? false;
   }
 
   /** Kick off a distillation pass ("Distill journal" button). Progress

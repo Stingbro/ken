@@ -34,7 +34,6 @@ pub mod memory;
 pub mod model;
 pub mod ocr;
 pub mod pagemeta;
-pub mod pipeline;
 pub mod proc;
 pub mod profiler;
 pub mod project;

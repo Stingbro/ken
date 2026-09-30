@@ -1,6 +1,6 @@
 <script lang="ts">
   // The workspace digest (ken-home-workspace 3.2): every member's already
-  // -stored digest for today, plus the board summary.
+  // -stored digest for today.
   //
   // Renders composed text only. Nothing here can trigger generation —
   // there is deliberately no "write it now" affordance, because that is

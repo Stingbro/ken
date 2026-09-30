@@ -2,7 +2,7 @@
 //!
 //! Home used to read one member's digest and present it as an overview.
 //! This module rolls every member's *already-stored* digest for a given
-//! local day together with the pipeline board summary into one structure.
+//! local day together into one structure.
 //!
 //! It **composes and never generates** (design D4). Per-project digest
 //! generation — the ≥07:00 local gate, the in-flight guard, the quiet-day
@@ -20,7 +20,6 @@
 use uuid::Uuid;
 
 use crate::digest::{parse_digest, ParsedDigest};
-use crate::pipeline::Digest as BoardDigest;
 
 /// One member's stored digest for the requested day, as read by the
 /// caller. `content` is the raw `digests.content` column — `None` when
@@ -62,32 +61,18 @@ pub struct WorkspaceDigest {
     pub members: Vec<MemberDigestEntry>,
     /// Members with no digest stored for `date`, same ordering rule.
     pub awaiting: Vec<MemberAwaitingDigest>,
-    /// The pipeline board summary, passed through unchanged.
-    pub board: BoardDigest,
 }
 
 impl WorkspaceDigest {
-    /// Whether there is anything worth rendering: any member digest, or
-    /// any board group with entries. `awaiting` alone does not count —
-    /// a workspace where nobody has written a digest yet has nothing to
-    /// say, only something to explain.
+    /// Whether there is anything worth rendering: any member digest.
+    /// `awaiting` alone does not count — a workspace where nobody has
+    /// written a digest yet has nothing to say, only something to explain.
     pub fn has_content(&self) -> bool {
-        !self.members.is_empty() || board_has_content(&self.board)
+        !self.members.is_empty()
     }
 }
 
-/// Whether a pipeline digest carries any entry in any of its groups.
-fn board_has_content(board: &BoardDigest) -> bool {
-    !board.awaiting_review.is_empty()
-        || !board.newly_unblocked.is_empty()
-        || !board.blocked.is_empty()
-        || !board.moved_today.is_empty()
-        || !board.new_ideas.is_empty()
-        || !board.stale_runs.is_empty()
-}
-
-/// Compose the workspace digest for `date` from per-member stored rows
-/// and the board summary.
+/// Compose the workspace digest for `date` from per-member stored rows.
 ///
 /// Pure: no I/O, no clock, no AI call. A member whose stored content is
 /// blank (or whitespace) is treated as *awaiting* rather than as an empty
@@ -96,7 +81,6 @@ fn board_has_content(board: &BoardDigest) -> bool {
 pub fn compose_workspace_digest(
     date: &str,
     members: &[MemberDigestInput],
-    board: BoardDigest,
 ) -> WorkspaceDigest {
     let mut entries: Vec<MemberDigestEntry> = Vec::new();
     let mut awaiting: Vec<MemberAwaitingDigest> = Vec::new();
@@ -132,24 +116,12 @@ pub fn compose_workspace_digest(
         date: date.to_string(),
         members: entries,
         awaiting,
-        board,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn empty_board() -> BoardDigest {
-        BoardDigest {
-            awaiting_review: Vec::new(),
-            newly_unblocked: Vec::new(),
-            blocked: Vec::new(),
-            moved_today: Vec::new(),
-            new_ideas: Vec::new(),
-            stale_runs: Vec::new(),
-        }
-    }
 
     fn member(name: &str, content: Option<&str>) -> MemberDigestInput {
         MemberDigestInput {
@@ -166,7 +138,7 @@ mod tests {
             member("ShatteredRealms", None),
             member("ItemSearch", Some("Quiet — one config tweak.")),
         ];
-        let out = compose_workspace_digest("2026-08-05", &members, empty_board());
+        let out = compose_workspace_digest("2026-08-05", &members);
 
         assert_eq!(out.date, "2026-08-05");
         assert_eq!(
@@ -188,19 +160,19 @@ mod tests {
     #[test]
     fn every_member_missing_is_all_awaiting_and_empty() {
         let members = vec![member("a", None), member("b", None)];
-        let out = compose_workspace_digest("2026-08-05", &members, empty_board());
+        let out = compose_workspace_digest("2026-08-05", &members);
 
         assert!(out.members.is_empty());
         assert_eq!(out.awaiting.len(), 2);
         assert!(
             !out.has_content(),
-            "nothing written and an empty board has nothing to render"
+            "nothing written has nothing to render"
         );
     }
 
     #[test]
     fn empty_workspace_composes_to_nothing() {
-        let out = compose_workspace_digest("2026-08-05", &[], empty_board());
+        let out = compose_workspace_digest("2026-08-05", &[]);
         assert!(out.members.is_empty());
         assert!(out.awaiting.is_empty());
         assert!(!out.has_content());
@@ -217,40 +189,9 @@ mod tests {
             member("spaces", Some("   \n  ")),
             member("sources-only", Some("SOURCES: a.rs, b.rs")),
         ];
-        let out = compose_workspace_digest("2026-08-05", &members, empty_board());
+        let out = compose_workspace_digest("2026-08-05", &members);
 
         assert!(out.members.is_empty(), "none of these are digests");
         assert_eq!(out.awaiting.len(), 3);
-    }
-
-    /// A board with entries makes the digest worth rendering even when
-    /// no member has written one.
-    #[test]
-    fn board_alone_is_content() {
-        let mut board = empty_board();
-        board.new_ideas.push(crate::pipeline::IdeaEntry {
-            ticket_id: "T-1".into(),
-            title: "Cache the route plan".into(),
-            spawned_by: None,
-        });
-        let out = compose_workspace_digest("2026-08-05", &[member("a", None)], board);
-        assert!(out.members.is_empty());
-        assert!(out.has_content(), "the board carries the day");
-    }
-
-    /// The board is passed through untouched — this module summarizes
-    /// nothing about it.
-    #[test]
-    fn board_passes_through_unchanged() {
-        let mut board = empty_board();
-        board.awaiting_review.push(crate::pipeline::AwaitingReviewEntry {
-            ticket_id: "T-9".into(),
-            title: "Sign off the migration".into(),
-            updated: "2026-08-05".into(),
-            run_count: 2,
-        });
-        let expected = board.clone();
-        let out = compose_workspace_digest("2026-08-05", &[], board);
-        assert_eq!(out.board, expected);
     }
 }

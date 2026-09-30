@@ -61,9 +61,9 @@ class WorkspaceHomeStore {
       return;
     }
     this.loading = true;
-    // Settled independently, NOT `Promise.all`: the digest command scans
-    // the board and can fail on its own, and there is no reason a board
-    // problem should blank the members strip too. Each block renders from
+    // Settled independently, NOT `Promise.all`: the digest command can
+    // fail on its own, and there is no reason a digest problem should
+    // blank the members strip too. Each block renders from
     // whichever half answered.
     const [digest, members] = await Promise.all([
       api.workspaceDigest().catch((e) => {
