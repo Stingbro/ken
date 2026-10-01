@@ -107,12 +107,26 @@ export interface TeamOverview {
   templates: TeamPage[];
 }
 
+/** What one write from an ingested note was. */
+export type IngestWriteKind = "edit" | "page" | "idea" | "escalation" | "task";
+
 /** One source in the library's Raw/ folder and where it is in the read. */
 export interface RawSource {
   path: string;
   name: string;
-  state: "queued" | "reading" | "in review" | "failed";
+  state: "queued" | "reading" | "read" | "failed";
   detail: string | null;
+  /** meeting | recording | document, or "" when not known yet. */
+  kind: string;
+  /** "48 min", "14 pages" once read; the file's size before. */
+  length: string;
+  present: string[];
+  /** Its card, once read. */
+  cardId: number | null;
+  /** One kind per write from it still in place. */
+  written: IngestWriteKind[];
+  /** What waits from it. */
+  waiting: number;
 }
 
 /** One ingested source: its note, and whether it is still on Review. */
@@ -121,9 +135,13 @@ export interface IngestedSource {
   note: string;
   title: string;
   kind: string;
+  length: string;
+  present: string[];
   at: number;
   open: boolean;
-  /** Proposals from it still waiting. */
+  /** One kind per write from it still in place. */
+  written: IngestWriteKind[];
+  /** What waits from it: rulings, tickets, held edits. */
   waiting: number;
 }
 
@@ -142,14 +160,19 @@ export interface IngestTakeaways {
   title: string;
   kind: string;
   present: string[];
+  length: string;
+  summary: string;
+  keyTakeaways: string[];
   overturns: string;
   contradictions: string[];
   rulings: string[];
   actions: string[];
-  questions: string[];
+  escalations: string[];
+  nextSteps: string[];
 }
 
-/** Something a note proposed, waiting for Apply or Discard. */
+/** What waits from a note: a ruling, a ticket, or an edit staging held
+ *  ("page" a change to one, "new page"). */
 export interface IngestProposal {
   id: number;
   kind: "page" | "new page" | "ruling" | "ticket";
@@ -158,16 +181,51 @@ export interface IngestProposal {
   body: string;
   /** The proposal (page as it is and with the change), for the diff. */
   payload: string | null;
+  /** A ruling's decider, when the note names one. */
+  decider: string | null;
+  /** A ruling only its decider may accept. */
+  canAccept: boolean;
+}
+
+/** One write from a note, with Open and Undo on its card. */
+export interface IngestWrite {
+  index: number;
+  kind: IngestWriteKind;
+  path: string;
+  label: string;
+  to: string | null;
+  undone: boolean;
+  /** The member the file is in; null for a task on Your day. */
+  projectId: string | null;
+}
+
+/** Something a note calls for that stays on the card only. */
+export interface IngestListed {
+  kind: "idea" | "escalation" | "next step" | "ticket";
+  text: string;
+  to?: string | null;
 }
 
 /** One ingested source for its card on the Ingest screen. */
 export interface IngestCard {
   id: number;
   open: boolean;
+  /** Undo all ran; the source waits in Raw until it is read again. */
+  undone: boolean;
   note: string;
   source: string;
   takeaways: IngestTakeaways;
+  writes: IngestWrite[];
   proposals: IngestProposal[];
+  listed: IngestListed[];
+  me: string | null;
+}
+
+/** What Undo all did. */
+export interface IngestUndoReport {
+  noteRemoved: boolean;
+  /** Writes left in place because their file changed since. */
+  kept: string[];
 }
 
 export interface IngestStatus {
@@ -1506,9 +1564,17 @@ export const api = {
     }),
   /** Read what waits in Raw/ now; false when a pass is already running. */
   ingestNow: (team: string | null = null) => invoke<boolean>("ingest_now", { team }),
-  /** Undo an ingest card: source back to Raw/, note removed unless edited. */
-  ingestUndo: (itemId: number, team: string | null = null) => invoke<boolean>("ingest_undo", { itemId, team }),
-  /** Done with an ingest: its source moves beside its note. Returns where. */
+  /** Undo all on an ingest card: every write, last first, then the note
+   *  (unless edited) and the source back to Raw/; what waits is closed. */
+  ingestUndo: (itemId: number, team: string | null = null) =>
+    invoke<IngestUndoReport>("ingest_undo", { itemId, team }),
+  /** Read an undone source again: its card closes and a pass starts. */
+  ingestReadAgain: (itemId: number, team: string | null = null) =>
+    invoke<boolean>("ingest_read_again", { itemId, team }),
+  /** Undo one write on an ingest card; refused when its file changed since. */
+  ingestUndoWrite: (itemId: number, index: number, team: string | null = null) =>
+    invoke<void>("ingest_undo_write", { itemId, index, team }),
+  /** Seen: the source moves beside its note and the card closes. Returns where. */
   ingestFile: (itemId: number, team: string | null = null) => invoke<string>("ingest_file", { itemId, team }),
   /** The last drift sweep (null before the first). */
   /** Run the drift sweep now. */

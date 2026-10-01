@@ -144,26 +144,43 @@ keyword index over sections.
   **whichever repo is focused**: focus a code repo and open Ingest again; it
   still shows the wiki's inbox.
 - [ ] Drag `2026-09-20 standup.txt` from Explorer onto the left column (it
-  highlights), or use **Drop files here or choose them**. It appears under
-  **raw** as *in the queue*, then *reading*; a second file with the same name
-  lands as `… (2).txt`.
+  highlights), or use **Drop a file or choose one**. It appears under
+  **raw** with its size as *in the queue*, then *reading*; a second file with
+  the same name lands as `… (2).txt`. Nobody is asked to confirm anything.
 - [ ] When it is read: `Research/Ingestion/Ingested/Meetings/<month>/<today>-…md`
   exists (`status: evidence`, `kind: meeting`, `source:` where it will be
-  filed), the source is still in Raw (*read · on its card*), and it heads the
-  **ingested** list.
-- [ ] Its card on the right: **key takeaways** with what it overturns (the ship
-  date) and **contradictions** naming the wiki page it disagrees with (or
-  "None"); then the proposals grouped as **Pages it would update**, **New
-  pages it calls for**, **Rulings, for their decider**, **Tickets**. **Show the
-  change** opens the diff. Nothing in the wiki changed yet: **Apply** one and
-  only that page changes; **Discard** another and it leaves the card.
-  **Apply all n** writes every remaining page change, new page and ticket;
-  a ruling stays for its decider.
-- [ ] With a team repo on the team (kind **team**), the save-bug action is a
-  ticket: **Create** writes `tickets/<KEY>-nnn.md` in the team repo.
-- [ ] **Seen, file it** moves the source beside its note and marks it *seen*
-  in the list. On another source, **Undo all** removes the note (unless you
-  edited it), withdraws its open proposals and leaves the source in Raw.
+  filed) with the sections the template keeps for a meeting (Summary, Key
+  Takeaways, What It Overturns, … Next Steps). The source is still in Raw,
+  its row reads *meeting · … present · read · 1 page written · 2 wait* (or
+  similar), and its card opens on the right.
+- [ ] Already written, each citing the note: `Current/Project.md` says the ship
+  date is Friday and links the note (a small edit; it was rewritten in place,
+  not appended to). With a team repo on the team (kind **team**), any idea is
+  `ideas/I-nnn.md` and any escalation `escalations/E-nnn.md` there
+  (`raised_by: ingest of …`, `to:` the person named). A next step for the git
+  user is on **Home › Your day** (`updated_by: ingest`, linked to the note);
+  someone else's stays on the card, under *on this card only*.
+- [ ] The card: **key takeaways · the note is in Ingested** (summary, takeaways,
+  what it overturns with its quote, contradictions); then **written**, one row
+  per write with **Open** and **Undo**, and the line *Every page edit went
+  through staging; none was held.*; then **waits**, only: the ruling ("the
+  region format stays", **Accept as Ana**, greyed unless you are Ana), the
+  save-bug action as a ticket (**Open** shows it, **Accept** writes
+  `tickets/<KEY>-nnn.md` in the team repo), and any edit staging held, shown
+  as its diff with **Apply**. There is no Apply all.
+- [ ] Staging: edit `Current/Project.md` by hand while a second source about
+  the ship date is *reading*. That edit is held (*n held, below.*), shown as
+  its diff against your version; your edit stands until you **Apply**.
+- [ ] **Undo** on the Project row puts the page back. Edit the page, then Undo
+  a row on another source's card: *The page changed since; open it to undo by
+  hand.*, and the page is left alone. **Open** goes to the page (or to Your
+  day for a task).
+- [ ] **Seen** moves the source beside its note and marks it *seen* under
+  **ingested**. On another source, **Undo all** reverses every write (last
+  first), removes the note (unless you edited it), closes what waits and
+  leaves the source in Raw. Its card says *Undone* and the next pass leaves
+  it alone; **Read it again** reads it as if just dropped in. The **Ingest**
+  rail item's count is the number of sources with something waiting.
 - [ ] (Optional) Record a short clip in Ken: the transcript lands in Raw.
 
 ## 10. Drift (step 13)

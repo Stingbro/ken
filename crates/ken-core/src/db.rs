@@ -1941,6 +1941,15 @@ impl Db {
         Ok(())
     }
 
+    /// Open a resolved review item again.
+    pub fn reopen_review_item(&mut self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE review_items SET status = 'open', resolved_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn resolve_review_item(&mut self, id: i64, at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE review_items SET status = 'resolved', resolved_at = ?2

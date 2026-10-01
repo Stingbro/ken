@@ -35,10 +35,10 @@ work is done rather than describing what exists.
 - **A finding is evidence at the time, not current state.**
 - **Open the Repo Map or a how-to before searching files.** Repo Map = *where*,
   how-to = *how*, code = the exact signature.
-- **An ingest proposes; a person confirms.** From a source, Ken shows what it
-  overturns, where it contradicts the library or itself, and each page it would
-  change or add. A change is written when a person applies it, one at a time or
-  all together, and cites the note. A ruling waits for its decider. A change to
+- **An ingest runs as soon as a source is dropped in, and nobody confirms it.**
+  Each source gets a write-up: a summary, the key takeaways, contradictions,
+  escalations and next steps, as that kind of source needs. What follows from it
+  is written and cites the note. A ruling waits for its decider, and a change to
   Ways-of-Working, Conventions or a rule becomes a ticket, because work and
   reviews are read against them.
 - {{project-specific gotcha}}

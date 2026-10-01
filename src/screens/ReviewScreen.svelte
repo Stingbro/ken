@@ -40,9 +40,9 @@
     "keep-copy": "Keep this copy",
     "keep-original": "Keep the original",
     "open-both": "Open in Files",
-    "undo-ingest": "Undo",
+    "undo-ingest": "Undo all",
     "apply-proposal": "Apply the change",
-    "file-ingest": "Seen, file it",
+    "file-ingest": "Seen",
   };
 
   let actError = $state<string | null>(null);

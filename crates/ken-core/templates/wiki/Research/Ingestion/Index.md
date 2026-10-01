@@ -16,9 +16,9 @@ The inbox for material that is not yet source of truth: meeting transcripts, rec
 ## Workflow
 
 1. Drop the source in `Raw/`. A recording made in Ken lands here as its transcript.
-2. It is read and a note is drafted from `Templates/Ingested-note.md`: who was present, what was said with the quotes, what it overturns.
-3. What the note calls for is proposed on the source's card, citing the note: each page it would change or add, as the change to read; each ruling, for its decider; each action, as a ticket. Requests for Intake, ideas for its Ideas tab, escalations and items for someone's day are proposed the same way. Nothing is written yet.
-4. A person reads the card on Ken's Ingest screen: what the source overturns, where it contradicts the library or itself, and each proposed change. Each is applied or discarded, one at a time or all together. A ruling is applied by its decider. A change to Ways-of-Working, Conventions or a rule becomes a ticket. Seen files the source beside its note; Undo all takes the note and its proposals back.
+2. It is read and written up from `Templates/Ingested-note.md`: a summary, the key takeaways, contradictions, escalations and next steps, with the sections that kind of source needs.
+3. What the note calls for is written, citing the note: page edits, requests on Intake, ideas on its Ideas tab, escalations to the people named, and items on someone's day. Nobody confirms it. A ruling waits for its decider; a change to Ways-of-Working, Conventions or a rule becomes a ticket.
+4. The write-up shows on the source's card on Ken's Ingest screen. A person reads it and can undo anything wrong. The source is filed beside its note.
 5. What still matters in six months becomes a real page in its section, with the note as a source. What is now true about the project or the team is rewritten on its page in [[Current]], never appended to. A note is promoted or linked, never copied.
 
 The raw record is never edited down. A copy shorter than its source carries an ABRIDGED banner naming the full record.

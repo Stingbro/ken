@@ -3,6 +3,7 @@
   import { app, type Screen } from "../lib/app.svelte";
   import { review } from "../lib/review.svelte";
   import { families } from "../lib/families.svelte";
+  import { sourcesWaiting } from "../lib/ingestCard";
   import FamilyTray from "../family/FamilyTray.svelte";
   import LayoutGrid from "@lucide/svelte/icons/layout-grid";
   import Files from "@lucide/svelte/icons/files";
@@ -16,6 +17,9 @@
   import Bell from "@lucide/svelte/icons/bell";
 
   let familyTrayOpen = $state(false);
+
+  // Ingest's count: sources with something waiting, the same items Review holds.
+  const ingestWaiting = $derived(sourcesWaiting(review.items));
 
   // The team inbox is always available; its button shows once at least one
   // inbox repo is connected (set up in Settings).
@@ -55,6 +59,9 @@
       {/if}
       {#if item.key === "review" && review.count > 0}
         <span class="count" title="{review.count} things are waiting on you">{review.count}</span>
+      {/if}
+      {#if item.key === "ingests" && ingestWaiting > 0}
+        <span class="count" title="{ingestWaiting} ingested sources have something waiting">{ingestWaiting}</span>
       {/if}
     </button>
   {/each}

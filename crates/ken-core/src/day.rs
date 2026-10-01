@@ -44,6 +44,8 @@ pub const BY_YOU: &str = "you";
 pub const BY_CHAT: &str = "chat";
 /// `updated_by` for a change made through `ken-mcp`.
 pub const BY_MCP: &str = "mcp";
+/// `updated_by` for a next step an ingest put on my day.
+pub const BY_INGEST: &str = "ingest";
 
 /// Where ticket files live in a repo.
 pub const TICKETS_DIR: &str = "tickets";

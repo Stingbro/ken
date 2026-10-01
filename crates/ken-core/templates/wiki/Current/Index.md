@@ -6,7 +6,7 @@ updated: {{date}}
 
 # Current
 
-What is true now about the project and the team. **Maintained**: each page is rewritten in place when something changes, never appended to. An ingest that changes what is true here proposes the rewrite, citing its note; it is written when a person applies it.
+What is true now about the project and the team. **Maintained**: each page is rewritten in place when something changes, never appended to. An ingest that changes what is true here rewrites the page and cites its note.
 
 | page | holds |
 |---|---|

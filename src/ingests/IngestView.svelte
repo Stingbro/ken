@@ -1,23 +1,33 @@
 <script lang="ts">
   // Ingest, the inbox that empties (the Wright white box, frame 8b). Drop a
   // file or choose one: Ken puts it in the team library's
-  // Research/Ingestion/Raw/ and reads it into a dated note in Ingested/.
-  // Each source's card holds what a person reviews: what it overturns, where
-  // it contradicts the wiki or itself, and the changes it proposes (pages to
-  // update, new pages, rulings for their decider, tickets), each applied or
-  // discarded here, or all confirmed at once. "Seen" files the source
-  // beside its note; Undo takes it all back.
+  // Research/Ingestion/Raw/ and reads it at once into a dated note in
+  // Ingested/. What follows from the note is written then and there, each
+  // write citing the note: page edits and new pages, ideas, escalations, my
+  // next steps. The card is read afterwards, not confirmed: each write has
+  // Open and Undo. Only four things wait: a ruling for its decider, a change
+  // to Ways-of-Working as a ticket, an edit staging held, an action as a
+  // ticket. Seen files the source beside its note; Undo all takes it back.
   import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type IngestCard, type IngestOverview, type IngestProposal, type InboxItem } from "../lib/api";
+  import {
+    api,
+    type IngestCard,
+    type IngestOverview,
+    type IngestProposal,
+    type IngestWrite,
+    type InboxItem,
+  } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
   import { renderMarkdown } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
+  import { pageName, stagingLine, writtenLine } from "../lib/ingestCard";
   import ProposalDetail from "../review/ProposalDetail.svelte";
 
   let overview = $state<IngestOverview | null>(null);
   let error = $state<string | null>(null);
+  let notice = $state<string | null>(null);
   let selected = $state<number | null>(null);
   let card = $state<IngestCard | null>(null);
   let busy = $state<string | null>(null);
@@ -27,12 +37,18 @@
 
   const team = $derived(scope.team);
 
+  // Read sources still in Raw have their card; under them, the rest.
+  const rawCards = $derived(new Set((overview?.raw ?? []).map((r) => r.cardId).filter((id) => id !== null)));
+  const ingested = $derived((overview?.ingested ?? []).filter((s) => !rawCards.has(s.id)));
+
   async function refresh() {
     try {
       overview = await api.ingestOverview(team);
       error = null;
-      // The newest note is shown until the person picks another.
-      if (selected === null && overview.ingested.length > 0) selected = overview.ingested[0].id;
+      // The newest read source is shown until the person picks another.
+      if (selected === null) {
+        selected = overview.raw.find((r) => r.cardId !== null)?.cardId ?? overview.ingested[0]?.id ?? null;
+      }
     } catch (e) {
       error = String(e);
     }
@@ -51,6 +67,11 @@
     }
   }
 
+  async function reload() {
+    await refresh();
+    await loadCard(selected);
+  }
+
   $effect(() => {
     void team;
     void refresh();
@@ -63,7 +84,7 @@
     // While anything is being read, the list follows it.
     const t = setInterval(() => {
       if (overview && (overview.running || overview.raw.some((r) => r.state === "queued" || r.state === "reading"))) {
-        void refresh().then(() => loadCard(selected));
+        void reload();
       }
     }, 4000);
     return () => clearInterval(t);
@@ -102,13 +123,43 @@
     await refresh();
   }
 
-  async function inLibrary(path: string) {
-    if (!overview) return;
-    if (app.focused !== overview.projectId) await app.focusMember(overview.projectId);
+  async function openIn(projectId: string, path: string) {
+    if (app.focused !== projectId) await app.focusMember(projectId);
     app.openInFiles(path);
   }
 
-  // A proposal as the Review card type, so the diff reads it the same way.
+  async function inLibrary(path: string) {
+    if (overview) await openIn(overview.projectId, path);
+  }
+
+  async function openWrite(w: IngestWrite) {
+    if (w.kind === "task") {
+      app.screen = "home";
+      return;
+    }
+    if (!w.projectId) {
+      error = `${w.path} is in a repo that is not open in this workspace.`;
+      return;
+    }
+    await openIn(w.projectId, w.path);
+  }
+
+  async function undoWrite(w: IngestWrite) {
+    if (!card) return;
+    busy = `w${w.index}`;
+    notice = null;
+    try {
+      await api.ingestUndoWrite(card.id, w.index, team);
+      error = null;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = null;
+      await reload();
+    }
+  }
+
+  // A waiting item as the Review card type, so the diff reads it the same way.
   const asItem = (p: IngestProposal): InboxItem => ({
     id: `stored-${p.id}`,
     kind: "page-proposal",
@@ -119,17 +170,26 @@
     payload: p.payload,
   });
 
+  /** A ruling's words, from its waiting item. */
+  function rulingOf(p: IngestProposal): string {
+    try {
+      return (JSON.parse(p.payload ?? "{}") as { append?: { ruling?: string } }).append?.ruling ?? p.title;
+    } catch {
+      return p.title;
+    }
+  }
+
   async function apply(p: IngestProposal) {
     if (!overview) return;
     busy = `p${p.id}`;
     try {
       await api.applyPageProposal(p.id, overview.projectId);
+      error = null;
     } catch (e) {
       error = String(e);
     } finally {
       busy = null;
-      await loadCard(selected);
-      await refresh();
+      await reload();
     }
   }
 
@@ -140,31 +200,7 @@
       await api.resolveReviewItem(p.id, overview.projectId);
     } finally {
       busy = null;
-      await loadCard(selected);
-      await refresh();
-    }
-  }
-
-  // Confirming the card: every change it proposes, one after another; a
-  // ruling stays for its decider. Stops at the first that cannot apply (a
-  // page changed since it was proposed) and says which.
-  const confirmable = $derived((card?.proposals ?? []).filter((p) => p.kind !== "ruling"));
-  async function applyAll() {
-    if (!overview) return;
-    busy = "all";
-    try {
-      for (const p of confirmable) {
-        try {
-          await api.applyPageProposal(p.id, overview.projectId);
-        } catch (e) {
-          error = `${p.page || p.title}: ${e}`;
-          break;
-        }
-      }
-    } finally {
-      busy = null;
-      await loadCard(selected);
-      await refresh();
+      await reload();
     }
   }
 
@@ -177,16 +213,32 @@
       error = String(e);
     } finally {
       busy = null;
-      await refresh();
-      await loadCard(selected);
+      await reload();
     }
   }
 
-  async function undo() {
+  async function undoAll() {
     if (!card) return;
     busy = "undo";
     try {
-      await api.ingestUndo(card.id, team);
+      const report = await api.ingestUndo(card.id, team);
+      const kept = report.kept.length > 0 ? ` Kept, changed since: ${report.kept.join(", ")}.` : "";
+      const note = report.noteRemoved ? "" : " The note was edited, so it stays.";
+      notice = `Undone.${kept}${note}`;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = null;
+      await refresh();
+    }
+  }
+
+  async function readAgain() {
+    if (!card) return;
+    busy = "again";
+    try {
+      const started = await api.ingestReadAgain(card.id, team);
+      notice = started ? "Reading it again." : "It is read on the next pass.";
       selected = null;
     } catch (e) {
       error = String(e);
@@ -196,22 +248,33 @@
     }
   }
 
-  const groups = $derived.by(() => {
-    const ps = card?.proposals ?? [];
-    return [
-      { label: "Pages it would update", rows: ps.filter((p) => p.kind === "page"), apply: "Apply" },
-      { label: "New pages it calls for", rows: ps.filter((p) => p.kind === "new page"), apply: "Create" },
-      { label: "Rulings, for their decider", rows: ps.filter((p) => p.kind === "ruling"), apply: "Accept" },
-      { label: "Tickets", rows: ps.filter((p) => p.kind === "ticket"), apply: "Create" },
-    ].filter((g) => g.rows.length > 0);
-  });
+  const written = $derived(card?.writes ?? []);
+  const live = $derived(written.filter((w) => !w.undone));
+  const rulings = $derived((card?.proposals ?? []).filter((p) => p.kind === "ruling"));
+  const tickets = $derived((card?.proposals ?? []).filter((p) => p.kind === "ticket"));
+  const held = $derived((card?.proposals ?? []).filter((p) => p.kind === "page" || p.kind === "new page"));
+  const pageWrites = $derived(written.filter((w) => w.kind === "edit" || w.kind === "page").length);
+
+  const writeTag: Record<IngestWrite["kind"], string> = {
+    edit: "page",
+    page: "new page",
+    idea: "idea",
+    escalation: "escalation",
+    task: "my day",
+  };
 
   const stateLabel: Record<string, string> = {
     queued: "in the queue",
     reading: "reading",
-    "in review": "read · on its card",
+    read: "read",
     failed: "could not read",
   };
+
+  function rawSub(r: IngestOverview["raw"][number]): string {
+    const bits = [r.kind, r.length, r.present.length > 0 ? `${r.present.length} present` : "", stateLabel[r.state] ?? r.state];
+    if (r.state === "read") bits.push(writtenLine(r.written, r.waiting));
+    return bits.filter((b) => b).join(" · ");
+  }
 </script>
 
 <div class="ingest">
@@ -233,11 +296,12 @@
     </div>
 
     <button class="drop" onclick={chooseFiles}>
-      <strong>Drop files here</strong> or choose them
-      <span class="sub">A transcript, a recording, a document or notes. Ken files each in Raw/ and reads it.</span>
+      <strong>Drop a file</strong> or choose one
+      <span class="sub">A transcript, a recording, a document or notes. Ken files it in Raw/ and reads it.</span>
     </button>
     {#if adding > 0}<p class="note">Adding {adding} {adding === 1 ? "file" : "files"}…</p>{/if}
     {#if error}<p class="warn">{error}</p>{/if}
+    {#if notice}<p class="note">{notice}</p>{/if}
     {#if overview && !overview.claudeFound}
       <p class="warn">Reading needs the Claude Code CLI. Install it and run <span class="mono">claude</span> once to log in.</p>
     {/if}
@@ -245,27 +309,31 @@
     {#if overview}
       <div class="divider">raw · {overview.raw.length}</div>
       {#each overview.raw as r (r.path)}
-        <button class="row" title={r.detail ?? r.path} onclick={() => inLibrary(r.path)}>
+        <button
+          class="row"
+          class:current={r.cardId !== null && r.cardId === selected}
+          title={r.detail ?? r.path}
+          onclick={() => (r.cardId !== null ? (selected = r.cardId) : inLibrary(r.path))}
+        >
           <span class="name">{r.name}</span>
-          <span class="sub" class:bad={r.state === "failed"} class:live={r.state === "reading"}>{stateLabel[r.state] ?? r.state}</span>
+          <span class="sub" class:bad={r.state === "failed"} class:live={r.state === "reading"}>{rawSub(r)}</span>
         </button>
       {:else}
-        <p class="note">Nothing waiting. Raw empties as each source is read.</p>
+        <p class="note">Nothing in Raw.</p>
       {/each}
 
-      <div class="divider">ingested · {overview.ingested.length}</div>
-      {#each overview.ingested as s (s.id)}
+      <div class="divider">ingested · {ingested.length}</div>
+      {#each ingested as s (s.id)}
         <button class="row" class:current={s.id === selected} onclick={() => (selected = s.id)}>
           <span class="name">{s.title}</span>
           <span class="sub">
-            {s.kind || "source"} · {timeAgo(s.at)}
-            {#if s.waiting > 0} · {s.waiting} waiting{/if}
-            {#if !s.open} · seen{/if}
+            {s.kind || "source"} · {timeAgo(s.at)} · {writtenLine(s.written, s.waiting)}{#if !s.open} · seen{/if}
           </span>
         </button>
       {:else}
         <p class="note">Nothing ingested yet.</p>
       {/each}
+      <p class="note foot">Raw empties as each source is seen: it moves beside its note in Ingested. Neither folder is in a pack.</p>
     {/if}
   </div>
 
@@ -275,14 +343,33 @@
         <h3>{card.takeaways.title || card.note.split("/").pop()}</h3>
         {#if card.takeaways.kind}<span class="chip">{card.takeaways.kind}</span>{/if}
         {#if card.takeaways.present.length > 0}<span class="chip">{card.takeaways.present.join(" · ")}</span>{/if}
+        {#if card.takeaways.length}<span class="chip dim">{card.takeaways.length}</span>{/if}
         {#if !card.open}<span class="chip dim">seen</span>{/if}
       </div>
 
+      {#if card.undone}
+        <section class="undone">
+          <p>Undone. What was written from this source is taken back, and the source is in Raw. It is not read again until you ask.</p>
+          <div class="footer">
+            <button class="btn btn-primary" disabled={busy !== null} onclick={readAgain}>Read it again</button>
+          </div>
+        </section>
+      {:else}
       <section class="takeaways">
-        <div class="label">key takeaways · the note is in Ingested</div>
-        <div class="md">
-          {@html renderMarkdown(card.takeaways.overturns || "Nothing it overturns.")}
+        <div class="label">
+          key takeaways · the note is in Ingested ·
+          <button class="link" onclick={() => card && inLibrary(card.note)}>open the note</button>
         </div>
+        {#if card.takeaways.summary}
+          <div class="md">{@html renderMarkdown(card.takeaways.summary)}</div>
+        {/if}
+        {#if card.takeaways.keyTakeaways.length > 0}
+          <ul>
+            {#each card.takeaways.keyTakeaways as k (k)}<li>{@html renderMarkdown(k)}</li>{/each}
+          </ul>
+        {/if}
+        <div class="label">what it overturns</div>
+        <div class="md">{@html renderMarkdown(card.takeaways.overturns || "Nothing it overturns.")}</div>
         <div class="label">contradictions</div>
         {#if card.takeaways.contradictions.length > 0}
           <ul>
@@ -293,55 +380,103 @@
         {/if}
       </section>
 
-      {#each groups as g (g.label)}
-        <div class="divider">{g.label} · {g.rows.length}</div>
-        {#each g.rows as p (p.id)}
-          <div class="proposal">
-            <div class="p-head">
-              <span class="p-kind">{p.kind}</span>
-              <span class="p-title">{p.page || p.title}</span>
-              <span class="p-actions">
-                {#if p.kind !== "ticket" && p.payload}
-                  <button class="btn btn-ghost" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>
-                    {openDiff === p.id ? "Hide" : "Show"} the change
-                  </button>
-                {/if}
-                <button class="btn btn-primary" disabled={busy !== null} onclick={() => apply(p)}>{g.apply}</button>
-                <button class="btn btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
-              </span>
-            </div>
-            <div class="p-body">{p.body}</div>
-            {#if openDiff === p.id}<ProposalDetail item={asItem(p)} />{/if}
-          </div>
-        {/each}
+      <div class="divider">written · {live.length} · each cites the note · undo if wrong</div>
+      {#each written as w (w.index)}
+        <div class="wrow" class:undone={w.undone}>
+          <span class="tag">{writeTag[w.kind]}</span>
+          <span class="what">
+            <span class="target">{w.kind === "task" ? w.label : pageName(w.path)}</span>
+            {#if w.kind !== "task" && w.label}<span class="sub"> · {w.label}</span>{/if}
+            {#if w.kind === "escalation" && w.to}<span class="sub"> · to {w.to}</span>{/if}
+            {#if w.kind === "edit" || w.kind === "page"}<span class="sub"> · cites the note</span>{/if}
+            {#if w.undone}<span class="sub"> · undone</span>{/if}
+          </span>
+          <span class="actions">
+            {#if !w.undone}
+              <button class="btn btn-ghost" onclick={() => openWrite(w)}>Open</button>
+              <button class="btn btn-ghost" disabled={busy !== null} onclick={() => undoWrite(w)}>Undo</button>
+            {/if}
+          </span>
+        </div>
+      {:else}
+        <p class="note">Nothing was written from this source.</p>
       {/each}
-      {#if groups.length === 0}
-        <div class="divider">proposed changes</div>
-        <p class="note">Nothing waits: every change from this source is applied or discarded.</p>
+      {#if pageWrites > 0 || held.length > 0}
+        <p class="note">{stagingLine(held.length)}</p>
       {/if}
-
-      {#if card.takeaways.actions.length > 0 || card.takeaways.questions.length > 0}
-        <div class="divider">actions and open questions</div>
+      {#if card.listed.length > 0}
+        <div class="divider">on this card only · nowhere to write it</div>
         <ul>
-          {#each card.takeaways.actions as a (a)}<li>{@html renderMarkdown(a)}</li>{/each}
-          {#each card.takeaways.questions as q (q)}<li class="q">{@html renderMarkdown(q)}</li>{/each}
+          {#each card.listed as l, i (i)}
+            <li><span class="tag">{l.kind}</span> {l.text}{#if l.to} · {l.to}{/if}</li>
+          {/each}
         </ul>
       {/if}
 
+      <div class="divider">waits · {rulings.length + tickets.length + held.length}</div>
+      {#each rulings as p (p.id)}
+        <div class="wrow">
+          <span class="tag">ruling</span>
+          <span class="what">
+            <span class="target">"{rulingOf(p)}"</span>
+            {#if p.decider}<span class="sub"> · {p.decider}</span>{/if}
+          </span>
+          <span class="actions">
+            <button
+              class="btn btn-primary"
+              disabled={busy !== null || !p.canAccept}
+              title={p.canAccept ? "Write it to the decisions log" : `Only ${p.decider} can accept a ruling`}
+              onclick={() => apply(p)}>{p.decider ? `Accept as ${p.decider}` : "Accept"}</button
+            >
+            <button class="btn btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Drop</button>
+          </span>
+        </div>
+      {/each}
+      {#each tickets as p (p.id)}
+        <div class="wait">
+          <div class="wrow">
+            <span class="tag">ticket</span>
+            <span class="what"><span class="target">{p.title}</span></span>
+            <span class="actions">
+              <button class="btn btn-ghost" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>
+                {openDiff === p.id ? "Close" : "Open"}
+              </button>
+              <button class="btn btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Accept</button>
+              <button class="btn btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
+            </span>
+          </div>
+          {#if openDiff === p.id}<ProposalDetail item={asItem(p)} />{/if}
+        </div>
+      {/each}
+      {#each held as p (p.id)}
+        <div class="wait">
+          <div class="wrow">
+            <span class="tag">held</span>
+            <span class="what">
+              <span class="target">{pageName(p.page)}</span>
+              <span class="sub"> · {p.body}</span>
+            </span>
+            <span class="actions">
+              <button class="btn btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Apply</button>
+              <button class="btn btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
+            </span>
+          </div>
+          <ProposalDetail item={asItem(p)} />
+        </div>
+      {/each}
+      {#if rulings.length + tickets.length + held.length === 0}
+        <p class="note">Nothing waits.</p>
+      {/if}
+
       <div class="footer">
-        <button class="btn btn-ghost" onclick={() => card && inLibrary(card.note)}>Open the note</button>
+        <button class="btn btn-ghost" disabled={busy !== null} onclick={undoAll}>Undo all</button>
         {#if card.open}
-          <button class="btn btn-ghost" disabled={busy !== null} onclick={undo}>Undo all</button>
-          {#if confirmable.length > 0}
-            <button class="btn btn-primary" disabled={busy !== null} onclick={applyAll}>
-              {busy === "all" ? "Applying…" : `Apply all ${confirmable.length}`}
-            </button>
-          {/if}
-          <button class="btn btn-primary" disabled={busy !== null} onclick={seen}>Seen, file it</button>
+          <button class="btn btn-primary" disabled={busy !== null} onclick={seen}>Seen</button>
         {/if}
       </div>
+      {/if}
     {:else if overview && overview.ingested.length === 0}
-      <p class="note">When a source is read, its key takeaways and the changes it proposes show here.</p>
+      <p class="note">When a source is read, its key takeaways, what was written from it and what waits show here.</p>
     {/if}
   </div>
 </div>
@@ -349,7 +484,7 @@
 <style>
   .ingest {
     display: grid;
-    grid-template-columns: 320px minmax(0, 1fr);
+    grid-template-columns: 300px minmax(0, 1fr);
     height: 100%;
     min-height: 0;
   }
@@ -466,6 +601,10 @@
     font-size: 12.5px;
     color: var(--ink-tertiary);
   }
+  .note.foot {
+    margin-top: 12px;
+    font-size: 11.5px;
+  }
   .warn {
     margin: 4px 0;
     font-size: 12.5px;
@@ -487,6 +626,16 @@
     text-transform: uppercase;
     color: var(--ink-tertiary);
   }
+  .link {
+    border: none;
+    background: none;
+    padding: 0;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    color: var(--accent);
+    cursor: pointer;
+  }
   .md :global(p) {
     margin: 0 0 6px;
   }
@@ -499,42 +648,50 @@
   li :global(p) {
     margin: 0;
   }
-  li.q {
-    color: var(--ink-secondary, var(--ink));
-  }
-  .proposal {
-    border: 1px solid var(--border);
-    border-radius: 9px;
-    padding: 9px 11px;
+  .wait {
     display: flex;
     flex-direction: column;
-    gap: 6px;
   }
-  .p-head {
+  .wrow {
     display: flex;
     align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
+    gap: 10px;
+    min-height: 34px;
+    padding: 0 4px;
+    border-bottom: 1px solid var(--sunken);
   }
-  .p-kind {
+  .wrow.undone .target {
+    color: var(--ink-tertiary);
+    text-decoration: line-through;
+  }
+  .tag {
+    flex: none;
+    width: 74px;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--ink-tertiary);
   }
-  .p-title {
-    font-size: 13px;
-    font-weight: 600;
+  li .tag {
+    display: inline-block;
+    width: auto;
+    margin-right: 4px;
+  }
+  .what {
     flex: 1;
     min-width: 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .p-actions {
+  .target {
+    font-weight: 600;
+  }
+  .actions {
+    flex: none;
     display: flex;
     gap: 6px;
-  }
-  .p-body {
-    font-size: 12.5px;
-    color: var(--ink-secondary, var(--ink));
   }
   .footer {
     display: flex;

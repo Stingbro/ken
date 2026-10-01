@@ -13,6 +13,16 @@ Evidence, at the time. Cite it; do not read it as current doctrine.
 
 Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends, if it ends early.}}
 
+Keep the sections this kind of source needs and drop the rest. A meeting or session usually needs all of them; a document needs the summary, takeaways, contradictions and what it changes; a short note may need only a summary and next steps.
+
+## Summary
+
+{{What the source is and what it comes to, in a few sentences.}}
+
+## Key Takeaways
+
+- {{A fact, decision or change the team should know.}}
+
 ## What It Overturns
 
 **{{The one thing that changes what we wrote.}}** {{Which page said otherwise.}}
@@ -35,6 +45,10 @@ Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends
 
 - {{Action}} → {{ticket id, "on Intake", or the idea's I-nnn}}.
 
-## Open Questions
+## Escalations
 
-- {{Question}} → {{who}}.
+- {{Question only a person can answer}} → {{who}}.
+
+## Next Steps
+
+- {{Who}} will {{what}} → {{on their day, or the ticket id}}.

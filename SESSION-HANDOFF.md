@@ -333,6 +333,28 @@ PC (dev), not measured anywhere.
   and the `kenTasks`, `kenFamilies`, `kenPipeline` flags are removed; they
   remain on `ken-workspace-home`. `kenMemory` is built in. The team inbox
   stays: Accept puts a task on my family board, which Your day lists.
+- **Ingest runs on its own (2026-10-01).** Per the latest Ways of Working
+  (white box 8b; `templates/wiki` CLAUDE.md, Current/Index,
+  Research/Ingestion/Index and Ingested-note, copied byte for byte): an
+  ingest runs as soon as a source is dropped in and nobody confirms it; a
+  person reads the card afterwards and can undo. The note has Summary, Key
+  Takeaways, What It Overturns, Contradictions, What Was Said, Rulings,
+  Actions and Requests, Escalations, Next Steps (an old note's Open
+  Questions read as escalations). `ingest::follow_ups` writes at once, each
+  citing the note and recorded on the card as a `Written` (edit with its
+  `base`, created file with its hash, task with its id): page edits and new
+  pages, ideas `ideas/I-nnn.md` and escalations `escalations/E-nnn.md` in
+  the team repo, my next steps on Your day (`updated_by: ingest`; me =
+  `day::Me` or my first name). Four things wait, as page-proposal items:
+  a ruling (Accept only as its decider; the team repo's
+  `decisions/DECISIONS.md` when it has one), one ticket for all
+  Ways-of-Working/Conventions changes (no longer dropped), an edit staging
+  held (more than a fifth of the page's lines, or the page changed during
+  the run), and each action as a ticket. Without a team repo, ideas,
+  escalations and tickets stay listed on the card. `ingest_undo_write`
+  undoes one write (refused when its file changed since); `ingest_undo` is
+  Undo all, last write first. Ingest screen rebuilt to 8b (Apply all
+  gone); the rail's Ingest count is sources with something waiting.
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
   ken-core on this PC: 856 pass, 55 fail (all Windows-only: fake bash CLI, CRLF);
@@ -608,10 +630,8 @@ will need their own lines there once decided.
   - Review names what waits in the team's other repos
     (`team_review_counts`); the rail count is the team's.
   - Chat: `history` answers "what changed lately" (`days`), git or not.
-  - Decided (the user, 2026-09-29): an ingest proposes and a person
-    confirms, each change or all at once (Apply all on the card; a ruling
-    waits for its decider). The template's CLAUDE.md, Current/Index and
-    Research/Ingestion/Index say so, in Ken and in Ways-of-Working.
+  - The confirm-first ingest decided here on 2026-09-29 is replaced: see
+    "Ingest runs on its own (2026-10-01)".
 - **Chat streams, with tool cards (as in Headway).** The chat CLI runs
   with `--include-partial-messages`; `chat::parse_events` reads every
   block of a line. Text deltas go out as `chat-delta` (shown, not kept)
