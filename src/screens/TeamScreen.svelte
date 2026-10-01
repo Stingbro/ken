@@ -18,6 +18,9 @@
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
   import { timeAgo } from "../lib/format";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import X from "@lucide/svelte/icons/x";
+  import ChevronDown from "@lucide/svelte/icons/chevron-down";
 
   let overview = $state<TeamOverview | null>(null);
   let moved = $state<SetupMoved[]>([]);
@@ -85,10 +88,17 @@
     void run(`i${r.id}`, () => api.setProjectIndex(r.id, value === "kind" ? null : (value as IndexState)));
   }
 
-  function takeOut(r: TeamRepo) {
-    void run(`o${r.id}`, async () => {
-      await api.workspaceRemoveMember(r.name);
-      await app.refreshWorkspaceOverview();
+  function takeOut(e: MouseEvent, r: TeamRepo) {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openConfirm(rect.left - 220, rect.bottom + 4, {
+      title: `Remove ${memberLeaf(r.name)} from the team?`,
+      body: "Ken stops indexing it. The folder and its files stay on disk.",
+      confirmLabel: "Remove",
+      onConfirm: () =>
+        void run(`o${r.id}`, async () => {
+          await api.workspaceRemoveMember(r.name);
+          await app.refreshWorkspaceOverview();
+        }),
     });
   }
 
@@ -182,27 +192,35 @@
             {#each rows as r (r.id)}
               <tr class:gone={!r.available}>
                 <td>
-                  <select
-                    value={r.index ?? "kind"}
-                    disabled={busy !== null}
-                    onchange={(e) => setIndex(r, e.currentTarget.value)}
-                    title="How deeply Ken reads it"
-                  >
-                    <option value="kind">{r.effectiveIndex} (its kind)</option>
-                    <option value="entities">entities</option>
-                    <option value="search">search</option>
-                    <option value="off">off</option>
-                  </select>
-                </td>
-                <td class="repo">
-                  <span class="rname">{memberLeaf(r.name)}</span>
-                  <span class="sub mono" title={r.path}>{r.description || r.path}</span>
+                  <span class="sel">
+                    <select
+                      value={r.index ?? "kind"}
+                      disabled={busy !== null}
+                      onchange={(e) => setIndex(r, e.currentTarget.value)}
+                      title="How deeply Ken reads it"
+                    >
+                      <option value="kind">{r.effectiveIndex} (its kind)</option>
+                      <option value="entities">entities</option>
+                      <option value="search">search</option>
+                      <option value="off">off</option>
+                    </select>
+                    <ChevronDown size={12} strokeWidth={1.75} />
+                  </span>
                 </td>
                 <td>
-                  <select value={kindValue(r)} disabled={busy !== null} onchange={(e) => setKind(r, e.currentTarget.value)}>
-                    {#if r.kind.length > 1}<option value={kindValue(r)}>{r.kind.join(" + ")}</option>{/if}
-                    {#each KINDS as k (k.v)}<option value={k.v}>{k.label}</option>{/each}
-                  </select>
+                  <div class="repo">
+                    <span class="rname">{memberLeaf(r.name)}</span>
+                    <span class="sub mono" title={r.path}>{r.description || r.path}</span>
+                  </div>
+                </td>
+                <td>
+                  <span class="sel">
+                    <select value={kindValue(r)} disabled={busy !== null} onchange={(e) => setKind(r, e.currentTarget.value)}>
+                      {#if r.kind.length > 1}<option value={kindValue(r)}>{r.kind.join(" + ")}</option>{/if}
+                      {#each KINDS as k (k.v)}<option value={k.v}>{k.label}</option>{/each}
+                    </select>
+                    <ChevronDown size={12} strokeWidth={1.75} />
+                  </span>
                 </td>
                 <td class="mono">{r.branch ?? "—"}</td>
                 <td class="mono">{r.head ?? "—"}</td>
@@ -213,7 +231,15 @@
                 </td>
                 <td>
                   {#if r.id !== overview.wiki?.id}
-                    <button class="link" disabled={busy !== null} onclick={() => takeOut(r)} title="Take it out of the workspace; its folder stays">Take out</button>
+                    <button
+                      class="remove"
+                      disabled={busy !== null}
+                      onclick={(e) => takeOut(e, r)}
+                      title="Remove from the team"
+                      aria-label="Remove {memberLeaf(r.name)} from the team"
+                    >
+                      <X size={14} strokeWidth={1.75} />
+                    </button>
                   {/if}
                 </td>
               </tr>
@@ -409,22 +435,62 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  select {
+  .sel {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    color: var(--ink-tertiary);
+  }
+  .sel :global(svg) {
+    position: absolute;
+    right: 8px;
+    pointer-events: none;
+  }
+  .sel select {
+    appearance: none;
+    -webkit-appearance: none;
+    font: inherit;
     font-size: 12px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 26px 4px 9px;
+    min-width: 120px;
+    cursor: pointer;
+    outline: none;
+  }
+  .sel select:hover:not(:disabled) {
+    border-color: var(--border-strong);
+  }
+  .sel select:focus-visible {
+    border-color: var(--accent);
+  }
+  .sel select:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+  .sel select option {
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .remove {
+    display: inline-grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--ink-tertiary);
+    cursor: pointer;
+  }
+  .remove:hover:not(:disabled) {
+    background: var(--sunken);
+    color: var(--danger);
   }
   .bad {
     color: var(--needs-input);
-  }
-  .link {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--ink-tertiary);
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .link:hover {
-    color: var(--danger);
   }
   .ignores {
     display: flex;
