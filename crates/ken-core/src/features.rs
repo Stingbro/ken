@@ -69,29 +69,6 @@ pub const FLAGS: &[FlagDef] = &[
                       default. Turn it off to leave the GPU alone — queued \
                       files stay queued and resume when it goes back on.",
     },
-    FlagDef {
-        name: "kenTasks",
-        label: "Task board",
-        applies: "the team",
-        scope: FlagScope::Workspace,
-        default: false,
-        description: "A shared task board (Kanban + a daily view) backed by \
-                      markdown files in the workspace and per-project \
-                      homes, with overarching goals, drag-drop status, and \
-                      MCP claim/complete tools for agent handoff.",
-    },
-    FlagDef {
-        name: "kenFamilies",
-        label: "Team inbox",
-        applies: "the team",
-        scope: FlagScope::Global,
-        default: false,
-        description: "Team collaboration over a shared git repo: clone, \
-                      poll, and push a templated family repo that delivers \
-                      tasks and messages to teammates' inboxes and keeps \
-                      each member's board visible to the team. Uses the \
-                      system git CLI; no accounts, no server.",
-    },
 ];
 
 /// What were flags and are now how Ken works: a workspace of several repos,
@@ -166,7 +143,7 @@ mod tests {
 
     #[test]
     fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 5);
+        assert_eq!(FLAGS.len(), 3);
         assert!(flag("semanticIndex").is_some());
         for name in BUILT_IN {
             assert!(flag(name).is_none(), "{name} is how Ken works, not a switch");
@@ -180,12 +157,10 @@ mod tests {
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);
-        let ken_tasks = flag("kenTasks").expect("kenTasks flag registered");
-        assert_eq!(ken_tasks.scope, FlagScope::Workspace);
-        assert!(!ken_tasks.default);
-        let ken_families = flag("kenFamilies").expect("kenFamilies flag registered");
-        assert_eq!(ken_families.scope, FlagScope::Global);
-        assert!(!ken_families.default);
+        // The task board and the team inbox are how Ken works now (Your day,
+        // the inbox once one is set up), not switches.
+        assert!(flag("kenTasks").is_none());
+        assert!(flag("kenFamilies").is_none());
     }
 
     #[test]

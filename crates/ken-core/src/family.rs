@@ -1134,6 +1134,10 @@ pub fn accept_task(
     if !payload.due.trim().is_empty() {
         edits.push(("due", tasks::scalar_lines("due", payload.due.trim())));
     }
+    // Your day shows who sent it ("from dee").
+    if !item.from.trim().is_empty() {
+        edits.push(("from", tasks::scalar_lines("from", item.from.trim())));
+    }
     edits.push(("board", tasks::scalar_lines("board", tasks::BoardKind::Main.as_str())));
     edits.push(("created", tasks::scalar_lines("created", today)));
     edits.push(("updated", tasks::scalar_lines("updated", today)));

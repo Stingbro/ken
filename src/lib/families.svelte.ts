@@ -1,9 +1,9 @@
-// ken-families task 4.1/4.2/4.3 frontend store: the `kenFamilies` flag,
-// the connection list + live sync state (via `family_list` +
-// `family-sync`), and each connection's own inbox (unread badge, tray
-// grouping, accept/dismiss). Mirrors `memory.svelte.ts`/`tasks.svelte.ts`'s
-// shape: flag-gated `init()`, an event subscription that updates `$state`,
-// thin wrappers over `api` calls.
+// The team inbox (family repos) store: the connection list + live sync
+// state (via `family_list` + `family-sync`), and each connection's own inbox
+// (unread badge, tray grouping, accept/dismiss). Always available; the
+// rail button shows once at least one connection exists. `init()` is
+// idempotent, an event subscription updates `$state`, the rest are thin
+// wrappers over `api` calls.
 //
 // LOCKED (design.md D4, spec "Typed inbox items"): nothing arriving from a
 // family repo enters a board, daily board, or agent queue until the user
@@ -20,11 +20,6 @@ import {
 } from "./api";
 
 class FamiliesStore {
-  /** Whether the `kenFamilies` flag resolves on — gates the Settings
-   *  "Families" section and the nav-rail tray entirely (proposal: "off
-   *  means... no Families settings page, no new tools"). */
-  enabled = $state(false);
-
   connections = $state<FamilyConnectionDto[]>([]);
   loading = $state(false);
   loadError = $state<string | null>(null);
@@ -56,19 +51,11 @@ class FamiliesStore {
   async init() {
     if (this.initDone) return;
     this.initDone = true;
-    this.enabled = await this.checkEnabled();
-    if (!this.enabled) return;
     this.unlistenSync = await api.onFamilySync((ev) => this.onSyncEvent(ev));
     await this.refresh();
   }
 
-  private async checkEnabled(): Promise<boolean> {
-    const features = await api.listFeatures().catch(() => []);
-    return features.find((f) => f.name === "kenFamilies")?.effective ?? false;
-  }
-
   async refresh() {
-    if (!this.enabled) return;
     this.loading = true;
     this.loadError = null;
     try {
@@ -96,42 +83,6 @@ class FamiliesStore {
       dto.connection.familyId === ev.familyId ? { ...dto, state: ev.report.state } : dto,
     );
     void this.refreshInbox(ev.familyId);
-  }
-
-  // ── Task 4.3: matching a board task back to its family connection ──────
-
-  /** Every attached connection for the currently open workspace — the
-   *  universe of families the Tasks tab's per-family filter chip can
-   *  possibly show (task_homes_scan only ever merges boards for
-   *  connections attached to the OPEN workspace, so anything else here
-   *  would be a filter option with no matching tasks). */
-  attachedTo(workspaceId: string | null | undefined): FamilyConnectionDto[] {
-    if (!workspaceId) return [];
-    return this.connections.filter((c) => c.connection.attachedWorkspaceId === workspaceId);
-  }
-
-  /** Which family connection produced a given board task, or `null` for an
-   *  ordinary workspace/per-repo task.
-   *
-   *  There is no dedicated field for this on `Task` — `home` is
-   *  `HomeKind::Project` for a family board task exactly like it is for a
-   *  per-repo one (`tasks.rs` has no `Family` variant reachable without
-   *  editing a file outside this build's touch-boundary; see
-   *  `task_homes_scan`'s own comment in `src-tauri/src/lib.rs`). The one
-   *  field that actually differs is `homeDir`, the real directory the task
-   *  file was scanned from: `family::board_dir` builds it as
-   *  `<app data>/ken/families/<family-id>/members/<member-id>/board`,
-   *  never a per-repo `.ken/tasks` or the workspace's own task folder. This
-   *  matches on that real path shape rather than `task.project` (which is
-   *  just the family's display name, cosmetic and not guaranteed unique)
-   *  — the smallest honest marker actually available client-side. */
-  familyForTask(task: { homeDir: string }): FamilyConnectionDto | null {
-    const dir = task.homeDir.replace(/\\/g, "/");
-    return (
-      this.connections.find((dto) =>
-        dir.includes(`families/${dto.connection.familyId}/members/${dto.connection.memberId}/board`),
-      ) ?? null
-    );
   }
 
   // ── Derived: unread badge + tray grouping ───────────────────────────────

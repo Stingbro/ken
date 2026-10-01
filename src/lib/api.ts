@@ -10,24 +10,13 @@ export interface ProjectInfo {
   ingestRunner: "hidden-tui" | "headless";
 }
 
-/** Mirrors `IndexHealthDto`: the index as an instrument. */
+/** The team's index as three figures: repos indexed of all, files queued,
+ *  files failed. */
 export interface IndexHealth {
-  analyzed: number;
-  extractable: number;
-  pending: number;
-  retrying: number;
-  /** Failed three times; not tried again until the file changes. */
+  indexed: number;
+  total: number;
+  queued: number;
   failed: number;
-  /** Searchable only, on purpose (a code or reference repo, a `~` line). */
-  skipped: number;
-  control: {
-    page: string;
-    query: string;
-    top: string | null;
-    ok: boolean;
-    at: number;
-  } | null;
-  llmStatus: "ready" | "notInstalled" | "error";
 }
 
 /** A repo's index state: not indexed, searchable only, read for entities. */
@@ -1326,151 +1315,83 @@ export type RoutedSearchStateEvent =
   | { state: "searching"; done: number; total: number }
   | { state: "done" };
 
-// ---- ken-tasks (ken-tasks change, task 4.1) ----
+// ---- Your day: tasks and tickets ----
 
-export type TaskStatus = "backlog" | "todo" | "doing" | "review" | "done";
-export type TaskKind = "human" | "ai";
-export type BoardKind = "main" | "daily";
-export type GoalStatus = "active" | "done" | "dropped";
-export type TaskHomeKind = "workspace" | "project" | "family";
+/** A task is open or done. Older files with other statuses read as open. */
+export type DayTaskState = "open" | "done";
 
-/** Mirrors the Rust `AssigneeFilter` enum — no explicit `tag`/`content` on
- *  the Rust side, so serde's default *externally tagged* representation
- *  applies: the unit variant `Unassigned` serializes as the bare string
- *  `"unassigned"`; the newtype variant `Named(String)` as `{ named: "..." }`. */
-export type AssigneeFilter = "unassigned" | { named: string };
-
-/** Mirrors `ken_core::tasks::TaskFilter` (camelCase, every field optional —
- *  absent means "don't filter on this"). Shared shape for `task_list` and
- *  the Tasks tab's own client-side filtering (`tasks.svelte.ts`). */
-export interface TaskFilter {
-  status?: TaskStatus;
-  project?: string;
-  tag?: string;
-  assignee?: AssigneeFilter;
-  kind?: TaskKind;
-  goal?: string;
-  board?: BoardKind;
+/** Mirrors the Rust `DayTaskDto`: one task file, as Your day lists it. */
+export interface DayTask {
+  id: string;
+  title: string;
+  state: DayTaskState;
+  /** YYYY-MM-DD; for a recurring task, its next occurrence. */
+  target: string | null;
+  /** `daily` | `weekdays` | `weekly:mon`..`weekly:sun` | `monthly:<1-31>`; null = one-off. */
+  repeat: string | null;
+  /** Ticket ids, ken:// or member-relative file paths, or repo names. */
+  links: string[];
+  /** The sender, for a task accepted from the team inbox. */
+  from: string | null;
+  /** The body, markdown. */
+  description: string;
+  updatedBy: string | null;
+  updated: string | null;
+  created: string | null;
+  /** Relative to the workspace root. */
+  relPath: string;
+  /** Set only for a pending inbox task (not yet accepted). */
+  inbox: { familyId: string; itemId: string } | null;
 }
 
-/** Mirrors `ken_core::tasks::TaskPatch` — every field absent means "leave
- *  alone"; there is no "remove key" variant (clearing a value means setting
- *  it to `""`). Drag-drop sends only `{ status }` (S6 byte-fidelity: a
- *  patch must never touch a key it didn't mean to change). */
-export interface TaskPatch {
+/** Mirrors the Rust `DayTicketDto`: one open ticket file assigned to me. */
+export interface DayTicket {
+  id: string;
+  title: string;
+  /** As the ticket file states it. */
+  state: string;
+  target: string | null;
+  projectId: string;
+  repo: string;
+  /** Inside that repo. */
+  relPath: string;
+  linkedTasks: number;
+  linkedDone: number;
+}
+
+export interface DayState {
+  tickets: DayTicket[];
+  tasks: DayTask[];
+  me: { name: string | null; email: string | null };
+  /** The team has any ticket file at all. */
+  hasTickets: boolean;
+}
+
+export interface DayTaskInput {
+  title: string;
+  target?: string | null;
+  description?: string;
+  repeat?: string | null;
+  links?: string[];
+}
+
+/** Absent = leave alone; `target: null` clears it. */
+export interface DayTaskPatch {
   title?: string;
-  status?: TaskStatus;
-  kind?: TaskKind;
-  assignee?: string;
-  project?: string;
-  tags?: string[];
-  due?: string;
-  goal?: string;
-  board?: BoardKind;
+  target?: string | null;
+  description?: string;
+  repeat?: string | null;
+  links?: string[];
+  state?: DayTaskState;
 }
 
-/** Mirrors `ken_core::tasks::Task` (camelCase). `path`/`homeDir` are
- *  absolute OS paths (Rust `PathBuf`) — never rendered raw in the UI, only
- *  used to derive a project-relative path for opening the file (see
- *  `tasks.svelte.ts`'s `openFile`). `statusRaw`/`kindRaw`/`boardRaw` carry
- *  the on-disk string verbatim even when it's out of vocabulary — what
- *  drives the needs-attention tray. */
-export interface Task {
-  id: string;
-  title: string;
-  status: TaskStatus | null;
-  statusRaw: string;
-  kind: TaskKind;
-  kindRaw: string;
-  assignee: string;
-  project: string;
-  tags: string[];
-  due: string | null;
-  goal: string | null;
-  board: BoardKind;
-  boardRaw: string;
-  created: string;
-  updated: string;
+/** The digest written for the team, across all its repos. `sources` are
+ *  member-relative paths, `repo/path`. */
+export interface TeamDigest {
+  generatedAt: number;
   body: string;
-  path: string;
-  home: TaskHomeKind;
-  homeDir: string;
+  sources: string[];
 }
-
-/** Mirrors the Rust `AttentionReason` enum (`#[serde(tag = "reason",
- *  content = "value", rename_all = "camelCase")]`). */
-export type AttentionReason =
-  | { reason: "invalidStatus"; value: string }
-  | { reason: "invalidKind"; value: string }
-  | { reason: "invalidBoard"; value: string }
-  | { reason: "unknownGoal"; value: string };
-
-/** Mirrors `ken_core::tasks::NeedsAttention`. */
-export interface NeedsAttention {
-  id: string;
-  title: string;
-  path: string;
-  reasons: AttentionReason[];
-}
-
-/** Mirrors `ken_core::tasks::Goal` — no assignee, no claim lifecycle. */
-export interface Goal {
-  id: string;
-  title: string;
-  status: GoalStatus | null;
-  statusRaw: string;
-  created: string;
-  updated: string;
-  body: string;
-  path: string;
-}
-
-/** Mirrors `ken_core::tasks::GoalPatch`. */
-export interface GoalPatch {
-  title?: string;
-  status?: GoalStatus;
-}
-
-/** Mirrors `ken_core::tasks::Progress` — derived goal progress (done/total),
- *  never stored in any file. */
-export interface Progress {
-  done: number;
-  total: number;
-}
-
-/** Mirrors the Rust `BoardStateDto` — `board_get`'s return shape and the
- *  `board-state` event payload. `progress` is keyed by goal id. */
-export interface BoardStateDto {
-  tasks: Task[];
-  goals: Goal[];
-  needsAttention: NeedsAttention[];
-  progress: Record<string, Progress>;
-}
-
-/** Mirrors the Rust `Rollover` enum (`#[serde(rename_all = "camelCase")]`)
- *  — the three per-task daily-rollover resolutions (design D5), never
- *  auto-applied. */
-export type Rollover = "roll" | "promote" | "archive";
-
-/** Mirrors the Rust `DailyCandidate` — one drafted daily-board item awaiting
- *  approval (not yet a file); `key` is a run-local handle for
- *  `resolveDailyCandidate`. */
-export interface DailyCandidate {
-  key: string;
-  title: string;
-  body: string;
-  project: string | null;
-  tags: string[];
-}
-
-/** Mirrors the Rust `DailyPlanStateEvent` internally-tagged enum
- *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape
- *  convention as `MemoryStateEvent`. App-global — a planning run reads the
- *  whole workspace journal, no single owning project. */
-export type DailyPlanStateEvent =
-  | { state: "planning" }
-  | { state: "ready"; candidates: DailyCandidate[] }
-  | { state: "error"; reason: string };
 
 // ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
 
@@ -1594,7 +1515,6 @@ export interface FamilyInboxItem {
 
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
-  indexHealth: () => invoke<IndexHealth>("index_health"),
   /** Draft the first wiki pages into workspace member `wiki` from every
    *  member and an optional folder of documents. Background; a Review card
    *  lists the result. Never touches a page a person wrote. */
@@ -2235,73 +2155,38 @@ export const api = {
   ): Promise<UnlistenFn> =>
     listen<RecordErrorEvent>("record-error", (e) => fn(e.payload)),
 
-  // ---- ken-tasks (ken-tasks change, task 4.1) ----
-  /** Create a task file — workspace home by default, or `projectId`'s
-   *  `<project>/.ken/tasks/` when given. `fields.status` omitted defaults to
-   *  `backlog`, the intake column. Flag-gated on `kenTasks`. */
-  taskCreate: (title: string, body?: string, fields?: TaskPatch, projectId?: string) =>
-    invoke<Task>("task_create", { title, body, fields, projectId }),
-  /** List tasks across every home, optionally filtered — the same
-   *  `TaskFilter` shape the board UI mirrors client-side. */
-  taskList: (filter?: TaskFilter) => invoke<Task[]>("task_list", { filter }),
-  /** Patch a task by id. Drag-drop sends only `{ status }` — the S6
-   *  byte-fidelity contract depends on patches naming only the keys that
-   *  actually changed; never send a whole-task patch. */
-  taskUpdate: (id: string, patch: TaskPatch) => invoke<Task>("task_update", { id, patch }),
-  /** Set `done`, append `report` under `## Log`, and (when `kenMemory` is
-   *  on) write a one-line journal summary. This is the agent/MCP-facing
-   *  completion path; the board's own drag-to-done interaction uses
-   *  `taskUpdate({ status: "done" })` instead, per task 4.3. */
-  taskComplete: (id: string, report: string) =>
-    invoke<Task>("task_complete", { id, report }),
-  /** Move a task file to `<its own home>/archive/YYYY-MM/`. */
-  taskArchive: (id: string) => invoke<Task>("task_archive", { id }),
-  /** The whole board on demand — the Tasks tab's initial load and manual
-   *  refresh; live updates after that arrive via `onBoardState`. */
-  boardGet: () => invoke<BoardStateDto>("board_get"),
-  /** Create a goal (workspace home only — goals have no per-repo home). */
-  goalCreate: (title: string, body?: string, status?: GoalStatus) =>
-    invoke<Goal>("goal_create", { title, body, status }),
-  /** Patch a goal by id — title and/or status only. */
-  goalUpdate: (id: string, patch: GoalPatch) => invoke<Goal>("goal_update", { id, patch }),
-  /** Every goal in the workspace home. */
-  goalList: () => invoke<Goal[]>("goal_list"),
-  /** Draft daily-board candidates from recent journal content + activity
-   *  ("plan my day" — on request only, never autonomous). Returns as soon
-   *  as the background pass starts; progress/outcome arrive via
-   *  `onDailyPlanState`. Rejects if a run is already in progress. */
-  planDailyTasks: () => invoke<void>("plan_daily_tasks"),
-  /** Approve (creates the `board: daily` task file, workspace home unless
-   *  `projectId` names a member) or dismiss a drafted candidate by `key`,
-   *  looked up from the last `planDailyTasks` run's server-side cache. */
-  resolveDailyCandidate: (key: string, approve: boolean, projectId?: string) =>
-    invoke<Task | null>("resolve_daily_candidate", { key, approve, projectId }),
-  /** Daily tasks eligible for the new-day rollover prompt (`board: daily`,
-   *  not done, `updated` before today). Purely derived — safe to call
-   *  repeatedly (e.g. after each per-task resolution). */
-  dailyRolloverCandidates: () => invoke<Task[]>("daily_rollover_candidates"),
-  /** Apply one task's rollover resolution: roll forward (bump `updated`
-   *  only), promote to the main board, or archive. Never auto-called — one
-   *  explicit choice per task. */
-  resolveDailyRollover: (id: string, choice: Rollover) =>
-    invoke<Task>("resolve_daily_rollover", { id, choice }),
-
-  /** `board-state`: the whole board, re-emitted after every mutating
-   *  command and on every watcher-detected external change (agent writes,
-   *  hand edits, `git pull`). App-global — the board aggregates every home,
-   *  with no single owning project. */
-  onBoardState: (fn: (dto: BoardStateDto) => void): Promise<UnlistenFn> =>
-    listen<BoardStateDto>("board-state", (e) => fn(e.payload)),
-  /** `daily-plan-state`: `planning` → `ready` (candidates) | `error`
-   *  (reason), driven by `planDailyTasks`. */
-  onDailyPlanState: (fn: (ev: DailyPlanStateEvent) => void): Promise<UnlistenFn> =>
-    listen<DailyPlanStateEvent>("daily-plan-state", (e) => fn(e.payload)),
+  // ---- Your day ----
+  /** Your day for `team` (a group name; null = every workspace member). */
+  dayState: (team: string | null) => invoke<DayState>("day_state", { team }),
+  /** A new task in the workspace home; updated_by "you". */
+  dayTaskCreate: (input: DayTaskInput) => invoke<DayTask>("day_task_create", { input }),
+  /** Patch a task: only the keys named change; `target: null` clears it. */
+  dayTaskUpdate: (id: string, patch: DayTaskPatch) => invoke<DayTask>("day_task_update", { id, patch }),
+  /** Moves the file to its home's archive folder. */
+  dayTaskDelete: (id: string) => invoke<void>("day_task_delete", { id }),
+  /** Tasks linked to a ticket, done included. */
+  ticketTasks: (projectId: string, ticketId: string) =>
+    invoke<DayTask[]>("ticket_tasks", { projectId, ticketId }),
+  /** The newest stored digest for the team, or null. */
+  teamDigest: (team: string | null) => invoke<TeamDigest | null>("team_digest", { team }),
+  /** Write the team digest now. Outcome arrives on the team-digest events. */
+  refreshTeamDigest: (team: string | null) => invoke<void>("refresh_team_digest", { team }),
+  /** Repos indexed, files queued and failed, across the team. */
+  indexHealth: (team: string | null) => invoke<IndexHealth>("index_health", { team }),
+  /** A task file, ticket file or team inbox changed. */
+  onDayChanged: (fn: () => void): Promise<UnlistenFn> => listen<null>("day-changed", () => fn()),
+  onTeamDigestUpdated: (fn: (digest: TeamDigest) => void): Promise<UnlistenFn> =>
+    listen<TeamDigest>("team-digest-updated", (e) => fn(e.payload)),
+  onTeamDigestGenerating: (fn: () => void): Promise<UnlistenFn> =>
+    listen<null>("team-digest-generating", () => fn()),
+  onTeamDigestError: (fn: (message: string) => void): Promise<UnlistenFn> =>
+    listen<string>("team-digest-error", (e) => fn(e.payload)),
 
   // ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
   /** Scaffold + commit a brand-new family repo whose remote is `remoteUrl`
    *  (an empty repo the user already created on their git host); the
    *  creator becomes the family's first — and owner — member. Rejects with
-   *  a friendly message when `kenFamilies` is off or `git` is unavailable. */
+   *  a friendly message when `git` is unavailable. */
   familyCreate: (name: string, memberName: string, remoteUrl: string) =>
     invoke<FamilyConnectionDto>("family_create", { name, memberName, remoteUrl }),
   /** Clone an existing family. Pass `existingMemberId` when you're already
@@ -2347,7 +2232,7 @@ export const api = {
    *  one commit. The ONLY way an incoming task can ever enter the board —
    *  there is no auto-accept path anywhere in this API. */
   familyAcceptTask: (familyId: string, itemId: string) =>
-    invoke<Task>("family_accept_task", { familyId, itemId }),
+    invoke<unknown>("family_accept_task", { familyId, itemId }),
   /** Push back on an inbox item: creates a new message item in the
    *  SENDER's inbox (lane rule 2) and leaves the original item's status
    *  untouched — call `familySetItemStatus` separately if you also want to
@@ -2364,8 +2249,7 @@ export const api = {
     body: string,
   ) => invoke<void>("family_send", { familyId, to, kind, title, body }),
   /** `family-sync`: emitted after every poll tick and every on-demand
-   *  command that touches a connection's transport. App-global, like
-   *  `board-state` — a family connection has no single owning project. */
+   *  command that touches a connection's transport. App-global — a family connection has no single owning project. */
   onFamilySync: (fn: (ev: FamilySyncEvent) => void): Promise<UnlistenFn> =>
     listen<FamilySyncEvent>("family-sync", (e) => fn(e.payload)),
 };

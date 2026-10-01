@@ -10,6 +10,7 @@ pub mod chunker;
 pub mod codemap;
 pub mod cloud;
 pub mod contenttype;
+pub mod day;
 pub mod db;
 pub mod digest;
 pub mod drawio;

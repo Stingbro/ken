@@ -1,7 +1,8 @@
-//! Ken's task board (`openspec/changes/ken-tasks`): task files
-//! (`.ken-workspace/tasks/`, `<project>/.ken/tasks/`), the overarching
-//! goals that group them (`.ken-workspace/tasks/goals/`), and the pure
-//! transitions the board, the chat tools, and `ken-mcp` all share.
+//! Task files (`.ken-workspace/tasks/`, the older `<project>/.ken/tasks/`
+//! homes, and family boards): the byte-faithful frontmatter core that Your
+//! day (`day.rs`), the team inbox (`family.rs`) and `ken-mcp` share. The
+//! old task board (columns, goals, rollover) is gone; what is left here is
+//! the file format and the patch core it was built on.
 //!
 //! Everything here is path arithmetic, frontmatter parsing, byte-faithful
 //! file patching, and text composition — no `Db`/`IngestEngine`/watcher
@@ -42,7 +43,6 @@
 //!   sequences are replaced as a unit instead of leaving orphaned
 //!   continuation lines behind.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,7 +52,6 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 const TASKS_SUBDIR: &str = "tasks";
-const GOALS_SUBDIR: &str = "goals";
 const ARCHIVE_SUBDIR: &str = "archive";
 
 /// The `## Log` heading `task_complete` reports are appended under (D4).
@@ -79,12 +78,6 @@ pub fn workspace_tasks_dir(workspace_root: &Path) -> PathBuf {
 /// the folder — its existence is the opt-in").
 pub fn project_tasks_dir(project_root: &Path) -> PathBuf {
     project_root.join(crate::project::CONFIG_DIR).join(TASKS_SUBDIR)
-}
-
-/// `.ken-workspace/tasks/goals/` — goals live in the workspace home only
-/// (D7), so per-repo tasks reference them by plain id.
-pub fn goals_dir(workspace_root: &Path) -> PathBuf {
-    workspace_tasks_dir(workspace_root).join(GOALS_SUBDIR)
 }
 
 /// `<tasks-home>/archive/YYYY-MM/` — archiving stays inside the task's own
@@ -275,33 +268,6 @@ impl BoardKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GoalStatus {
-    Active,
-    Done,
-    Dropped,
-}
-
-impl GoalStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            GoalStatus::Active => "active",
-            GoalStatus::Done => "done",
-            GoalStatus::Dropped => "dropped",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "active" => Some(GoalStatus::Active),
-            "done" => Some(GoalStatus::Done),
-            "dropped" => Some(GoalStatus::Dropped),
-            _ => None,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------
 // 1.1 Frontmatter read model
 // ---------------------------------------------------------------------
@@ -402,36 +368,7 @@ impl Task {
     /// Path relative to the member root that owns this task — the tail of
     /// its `ken://` address.
     pub fn address_rel_path(&self) -> String {
-        match self.home {
-            HomeKind::Workspace => format!("{TASKS_SUBDIR}/{}", self.file_name()),
-            HomeKind::Project => format!(
-                "{}/{TASKS_SUBDIR}/{}",
-                crate::project::CONFIG_DIR,
-                self.file_name()
-            ),
-            // `home_dir` for a family task is always exactly the board dir
-            // `family::board_dir(clone_root, member_id)` built
-            // (`TaskHome::Family::tasks_dir()` returns it unmodified, and
-            // `parse_task` sets `home_dir` from the file's own parent), i.e.
-            // `<clone-root>/members/<member-id>/board`. So the member id is
-            // recoverable as `home_dir`'s grandparent-relative directory
-            // name — the same "matched by directory, not by any field the
-            // task carries" posture `ken-mcp`'s own `family_origin`/`host_
-            // for` use, just without that caller's live connection list to
-            // cross-check against. `family::board_rel` then composes the
-            // exact same `members/<id>/board` shape ken-mcp's own override
-            // uses, so a family task's address ends up byte-identical
-            // whichever caller renders it.
-            HomeKind::Family => {
-                let member_id = self
-                    .home_dir
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                format!("{}/{}", crate::family::board_rel(&member_id), self.file_name())
-            }
-        }
+        home_rel_path(self.home, &self.home_dir, &self.file_name())
     }
 
     /// `ken://<host>/<rel-path>` (`routing::ken_address`'s fixed scheme).
@@ -448,6 +385,26 @@ impl Task {
     /// not rewritten").
     pub fn has_invalid_status(&self) -> bool {
         self.status.is_none()
+    }
+}
+
+/// Path of a task file relative to the member root that owns its home —
+/// the tail of its `ken://` address. A family board's `home_dir` is always
+/// `<clone-root>/members/<member-id>/board`, so the member id is the name
+/// of its parent directory, and `family::board_rel` composes the same
+/// `members/<id>/board` shape every caller uses.
+pub fn home_rel_path(home: HomeKind, home_dir: &Path, file_name: &str) -> String {
+    match home {
+        HomeKind::Workspace => format!("{TASKS_SUBDIR}/{file_name}"),
+        HomeKind::Project => format!("{}/{TASKS_SUBDIR}/{file_name}", crate::project::CONFIG_DIR),
+        HomeKind::Family => {
+            let member_id = home_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("{}/{file_name}", crate::family::board_rel(&member_id))
+        }
     }
 }
 
@@ -923,7 +880,7 @@ fn fingerprint(path: &Path) -> Result<(String, Fingerprint)> {
 
 /// A body-append computed from the *current* body, so a retry recomputes
 /// it against whatever the other writer left behind (see
-/// [`complete_task`], which only adds a `## Log` heading if the body
+/// [`compose_log_entry`], which only adds a `## Log` heading if the body
 /// doesn't already have one).
 pub type BodyAppend<'a> = &'a dyn Fn(&str) -> String;
 
@@ -938,13 +895,47 @@ pub fn apply_edits(
     edits: &[(&str, Vec<String>)],
     append_body: Option<BodyAppend>,
 ) -> Result<()> {
-    for _ in 0..PATCH_MAX_ATTEMPTS {
-        let (raw, before) = fingerprint(path)?;
+    apply_text_change(path, &|raw: &str| {
         let appended = append_body.map(|f| {
-            let body = split_raw(&raw).map(|s| s.body.to_string()).unwrap_or_else(|| raw.clone());
+            let body = split_raw(raw).map(|s| s.body.to_string()).unwrap_or_else(|| raw.to_string());
             f(&body)
         });
-        let next = patch_text(&raw, edits, appended.as_deref());
+        patch_text(raw, edits, appended.as_deref())
+    })
+}
+
+/// The frontmatter block and the body of a task file, as `(frontmatter,
+/// body)` — `None` when the file has no (terminated) frontmatter block.
+/// Read-side only; writes go through [`patch_text`] / [`replace_body`].
+pub fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
+    split_raw(raw).map(|s| (s.fm, s.body))
+}
+
+/// `raw` with its body replaced by `body` and every frontmatter byte kept.
+/// The new body follows the closing `---` after one blank line (the shape
+/// new files are written in) and ends with one terminator; an empty `body`
+/// leaves just that blank line. Line endings follow the file's own.
+pub fn replace_body(raw: &str, body: &str) -> String {
+    let eol = detect_eol(raw);
+    let text = body.trim().replace("\r\n", "\n").replace('\n', eol);
+    let tail = if text.is_empty() { eol.to_string() } else { format!("{eol}{text}{eol}") };
+    match split_raw(raw) {
+        Some(s) => {
+            let close = if s.close.ends_with('\n') { s.close.to_string() } else { format!("{}{eol}", s.close) };
+            format!("{}{}{close}{tail}", s.open, s.fm)
+        }
+        None => format!("---{eol}---{eol}{tail}"),
+    }
+}
+
+/// The optimistic-concurrency write loop behind [`apply_edits`], for any
+/// pure text change: read, compute `change(raw)`, check the file did not
+/// move underneath, write. A change that produces the same text writes
+/// nothing.
+pub fn apply_text_change(path: &Path, change: &dyn Fn(&str) -> String) -> Result<()> {
+    for _ in 0..PATCH_MAX_ATTEMPTS {
+        let (raw, before) = fingerprint(path)?;
+        let next = change(&raw);
         if next == raw {
             return Ok(());
         }
@@ -980,7 +971,6 @@ pub struct TaskPatch {
     pub project: Option<String>,
     pub tags: Option<Vec<String>>,
     pub due: Option<String>,
-    pub goal: Option<String>,
     pub board: Option<BoardKind>,
 }
 
@@ -1021,9 +1011,6 @@ impl TaskPatch {
         }
         if let Some(v) = &self.due {
             out.push(("due", scalar_lines("due", v)));
-        }
-        if let Some(v) = &self.goal {
-            out.push(("goal", scalar_lines("goal", v)));
         }
         if let Some(v) = self.board {
             out.push(("board", scalar_lines("board", v.as_str())));
@@ -1198,9 +1185,6 @@ pub fn create_task(home: TaskHome, new: &NewTask, today: &str) -> Result<Task> {
     if let Some(due) = f.due.as_deref().filter(|d| !d.trim().is_empty()) {
         fm.push_str(&format!("due: {}\n", render_scalar(due)));
     }
-    if let Some(goal) = f.goal.as_deref().filter(|g| !g.trim().is_empty()) {
-        fm.push_str(&format!("goal: {}\n", render_scalar(goal)));
-    }
     fm.push_str(&format!(
         "board: {}\n",
         f.board.unwrap_or(BoardKind::Main).as_str()
@@ -1270,172 +1254,6 @@ pub fn find_by_id<'a>(tasks: &'a [Task], id: &str) -> Option<&'a Task> {
 }
 
 // ---------------------------------------------------------------------
-// 1.3 / 1.6 Filter matching
-// ---------------------------------------------------------------------
-
-/// Assignee filtering needs a third state beyond "any"/"this person": D4's
-/// worked example is an agent asking for *unclaimed* `ai` tasks, which is
-/// `assignee` empty. A bare `Option<String>` couldn't express that without
-/// reserving a magic name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AssigneeFilter {
-    /// `assignee` empty — the claimable pool.
-    Unassigned,
-    Named(String),
-}
-
-impl AssigneeFilter {
-    /// Tool-argument convenience: `none`/`unassigned`/empty ⇒
-    /// [`AssigneeFilter::Unassigned`].
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "none" | "unassigned" => AssigneeFilter::Unassigned,
-            _ => AssigneeFilter::Named(s.trim().to_string()),
-        }
-    }
-}
-
-/// The one filter shared by the board UI and `task_list` (tasks.md 1.3).
-/// Every field is AND-ed; `None` means "don't filter on this".
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct TaskFilter {
-    pub status: Option<TaskStatus>,
-    pub project: Option<String>,
-    pub tag: Option<String>,
-    pub assignee: Option<AssigneeFilter>,
-    pub kind: Option<TaskKind>,
-    pub goal: Option<String>,
-    /// Not in tasks.md 1.3's list, but the daily view (D5) is "just a
-    /// filter" over `board: daily`, so it belongs in the same struct rather
-    /// than a parallel one.
-    pub board: Option<BoardKind>,
-}
-
-fn eq_ci(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
-/// Does one task match one filter? Text comparisons are case-insensitive
-/// (a hand-typed `project: itemsearch` should match the board's
-/// `ItemSearch` chip); `tag` matches if any of the task's tags match.
-/// A task with an unrecognized `status` matches no status filter — it is
-/// in the needs-attention tray, not in a column.
-pub fn matches(task: &Task, filter: &TaskFilter) -> bool {
-    if let Some(s) = filter.status {
-        if task.status != Some(s) {
-            return false;
-        }
-    }
-    if let Some(p) = &filter.project {
-        if !eq_ci(&task.project, p) {
-            return false;
-        }
-    }
-    if let Some(t) = &filter.tag {
-        if !task.tags.iter().any(|x| eq_ci(x, t)) {
-            return false;
-        }
-    }
-    match &filter.assignee {
-        Some(AssigneeFilter::Unassigned) => {
-            if !task.assignee.is_empty() {
-                return false;
-            }
-        }
-        Some(AssigneeFilter::Named(name)) => {
-            if !eq_ci(&task.assignee, name) {
-                return false;
-            }
-        }
-        None => {}
-    }
-    if let Some(k) = filter.kind {
-        if task.kind != k {
-            return false;
-        }
-    }
-    if let Some(g) = &filter.goal {
-        match &task.goal {
-            Some(task_goal) if eq_ci(task_goal, g) => {}
-            _ => return false,
-        }
-    }
-    if let Some(b) = filter.board {
-        if task.board != b {
-            return false;
-        }
-    }
-    true
-}
-
-pub fn filter_tasks<'a>(tasks: &'a [Task], filter: &TaskFilter) -> Vec<&'a Task> {
-    tasks.iter().filter(|t| matches(t, filter)).collect()
-}
-
-// ---------------------------------------------------------------------
-// 1.2 / 1.6 Needs-attention tray
-// ---------------------------------------------------------------------
-
-/// Why a task can't be placed on the board as-is. Both cases are hand-edit
-/// or agent-error artifacts that must never crash and must never be
-/// silently rewritten (spec).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase", tag = "reason", content = "value")]
-pub enum AttentionReason {
-    /// `status` present but outside `backlog|todo|doing|review|done`.
-    InvalidStatus(String),
-    /// `kind` present but outside `human|ai`.
-    InvalidKind(String),
-    /// `board` present but outside `main|daily`.
-    InvalidBoard(String),
-    /// `goal` references an id with no goal file (D7).
-    UnknownGoal(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NeedsAttention {
-    pub id: String,
-    pub title: String,
-    pub path: PathBuf,
-    pub reasons: Vec<AttentionReason>,
-}
-
-/// Everything the tray shows. Pure over an already-scanned board, so the
-/// caller can recompute it on every watcher event for free.
-pub fn needs_attention(tasks: &[Task], goals: &[Goal]) -> Vec<NeedsAttention> {
-    let mut out = Vec::new();
-    for task in tasks {
-        let mut reasons = Vec::new();
-        if task.status.is_none() {
-            reasons.push(AttentionReason::InvalidStatus(task.status_raw.clone()));
-        }
-        if !task.kind_raw.is_empty() && TaskKind::parse(&task.kind_raw).is_none() {
-            reasons.push(AttentionReason::InvalidKind(task.kind_raw.clone()));
-        }
-        if !task.board_raw.is_empty() && BoardKind::parse(&task.board_raw).is_none() {
-            reasons.push(AttentionReason::InvalidBoard(task.board_raw.clone()));
-        }
-        if let Some(goal_id) = &task.goal {
-            if !goals.iter().any(|g| eq_ci(&g.id, goal_id)) {
-                reasons.push(AttentionReason::UnknownGoal(goal_id.clone()));
-            }
-        }
-        if !reasons.is_empty() {
-            out.push(NeedsAttention {
-                id: task.id.clone(),
-                title: task.title.clone(),
-                path: task.path.clone(),
-                reasons,
-            });
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------
 // 1.4 Archive, log append, journal line
 // ---------------------------------------------------------------------
 
@@ -1473,18 +1291,26 @@ pub fn archive_target(task: &Task, today: &str) -> Result<PathBuf> {
 /// the target month (same task archived, restored, and archived again)
 /// gets a `-2`, `-3`, … suffix rather than clobbering history.
 pub fn archive_task(task: &Task, today: &str) -> Result<PathBuf> {
-    let mut target = archive_target(task, today)?;
-    let dir = target
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| archive_dir(&task.home_dir, "unknown"));
+    archive_file(&task.path, &task.home_dir, today)
+}
+
+/// [`archive_task`] for any task file: `path` moves into
+/// `<home_dir>/archive/YYYY-MM/`, keeping its name (or `-2`, `-3`, … when
+/// that name is taken).
+pub fn archive_file(path: &Path, home_dir: &Path, today: &str) -> Result<PathBuf> {
+    let month = archive_month(today)?;
+    let dir = archive_dir(home_dir, &month);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "task.md".into());
+    let mut target = dir.join(&name);
     fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
     if target.exists() {
-        let stem = task
-            .path
+        let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| task.id.clone());
+            .unwrap_or_else(|| "task".into());
         for n in 2..1000 {
             let candidate = dir.join(format!("{stem}-{n}.md"));
             if !candidate.exists() {
@@ -1493,7 +1319,7 @@ pub fn archive_task(task: &Task, today: &str) -> Result<PathBuf> {
             }
         }
     }
-    fs::rename(&task.path, &target).map_err(|e| Error::io(&task.path, e))?;
+    fs::rename(path, &target).map_err(|e| Error::io(path, e))?;
     Ok(target)
 }
 
@@ -1513,25 +1339,6 @@ pub fn compose_log_entry(body: &str, report: &str, today: &str, time_hhmm: &str)
     out.push_str(report.trim());
     out.push('\n');
     out
-}
-
-/// `task_complete`'s file half (D4): set `status: done`, bump `updated`,
-/// and append the report under `## Log` — in a single guarded write, so an
-/// agent completing a task can't lose the log to a concurrent claim.
-///
-/// The journal half is the caller's: compose it with
-/// [`journal_summary_line`] and hand it to `memory::append_journal` when
-/// `kenMemory` is on.
-pub fn complete_task(task: &Task, report: &str, today: &str, time_hhmm: &str) -> Result<()> {
-    let edits = vec![
-        ("status", scalar_lines("status", TaskStatus::Done.as_str())),
-        ("updated", scalar_lines("updated", today)),
-    ];
-    let today = today.to_string();
-    let time = time_hhmm.to_string();
-    let report = report.to_string();
-    let append = move |body: &str| compose_log_entry(body, &report, &today, &time);
-    apply_edits(&task.path, &edits, Some(&append))
 }
 
 /// Longest report excerpt carried into the journal — the journal line is a
@@ -1560,286 +1367,6 @@ pub fn journal_summary_line(task: &Task, host: &str, report: &str) -> String {
     } else {
         format!("Completed task \"{}\" — {excerpt} ({address})", task.title)
     }
-}
-
-// ---------------------------------------------------------------------
-// 1.5 Daily rollover
-// ---------------------------------------------------------------------
-
-/// Unfinished daily tasks from before `today` (D5: `board: daily`,
-/// status ≠ done, `updated` before today). ISO dates compare as strings.
-///
-/// Two tolerant calls: a task whose `updated` isn't a valid ISO date is a
-/// candidate (unknown staleness ⇒ ask the user, which is the whole posture
-/// of the rollover prompt), and a task with an unrecognized `status` is
-/// *not* (it belongs to the needs-attention tray, and rolling it would
-/// mean writing to a file we don't understand).
-pub fn rollover_candidates<'a>(tasks: &'a [Task], today: &str) -> Vec<&'a Task> {
-    tasks
-        .iter()
-        .filter(|t| t.board == BoardKind::Daily)
-        .filter(|t| matches!(t.status, Some(s) if s != TaskStatus::Done))
-        .filter(|t| !is_iso_date(&t.updated) || t.updated.as_str() < today)
-        .collect()
-}
-
-/// The three per-task resolutions the rollover prompt offers (D5). Never
-/// auto-applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Rollover {
-    /// Keep it on today's daily board — bump `updated` only.
-    Roll,
-    /// It wasn't a daily-sized item after all — `board: main`.
-    Promote,
-    /// Let it go — move to `archive/YYYY-MM/`.
-    Archive,
-}
-
-/// What a resolution *means*, computed without touching the filesystem —
-/// so the caller can preview, batch, or test the whole prompt before
-/// anything is written.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RolloverAction {
-    /// Apply this patch (plus the usual `updated` bump).
-    Patch(TaskPatch),
-    /// Move the file to this path.
-    Archive(PathBuf),
-}
-
-/// The pure transition. `Roll` is an empty patch on purpose: `updated` is
-/// always rewritten by [`apply_patch`], and bumping it is the entire
-/// meaning of rolling forward.
-pub fn resolve_rollover(task: &Task, choice: Rollover, today: &str) -> Result<RolloverAction> {
-    match choice {
-        Rollover::Roll => Ok(RolloverAction::Patch(TaskPatch::default())),
-        Rollover::Promote => Ok(RolloverAction::Patch(TaskPatch {
-            board: Some(BoardKind::Main),
-            ..TaskPatch::default()
-        })),
-        Rollover::Archive => Ok(RolloverAction::Archive(archive_target(task, today)?)),
-    }
-}
-
-/// Execute one rollover resolution. Returns the task's path afterwards
-/// (unchanged for roll/promote, the archive path for archive).
-pub fn apply_rollover(task: &Task, choice: Rollover, today: &str) -> Result<PathBuf> {
-    match resolve_rollover(task, choice, today)? {
-        RolloverAction::Patch(patch) => {
-            apply_patch(&task.path, &patch, today)?;
-            Ok(task.path.clone())
-        }
-        RolloverAction::Archive(_) => archive_task(task, today),
-    }
-}
-
-// ---------------------------------------------------------------------
-// 1.6 Goals
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct GoalFrontmatter {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    created: String,
-    #[serde(default)]
-    updated: String,
-    #[serde(flatten)]
-    extra: serde_yaml::Mapping,
-}
-
-/// A goal file from `tasks/goals/` (D7). Same tolerant parse and same
-/// patch core as tasks; no assignee, no claim lifecycle.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Goal {
-    pub id: String,
-    pub title: String,
-    /// `None` when `status` is present but outside `active|done|dropped`.
-    /// Absent reads as `Active`.
-    pub status: Option<GoalStatus>,
-    pub status_raw: String,
-    pub created: String,
-    pub updated: String,
-    pub body: String,
-    pub path: PathBuf,
-}
-
-pub fn parse_goal(path: &Path, raw: &str) -> Goal {
-    let (fm, body) = match split_raw(raw) {
-        Some(s) => (
-            serde_yaml::from_str::<GoalFrontmatter>(s.fm).unwrap_or_default(),
-            s.body.to_string(),
-        ),
-        None => (GoalFrontmatter::default(), raw.to_string()),
-    };
-    let _ = &fm.extra; // unknown keys survive on disk via the patch core
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let body = body.trim().to_string();
-    let status = if fm.status.trim().is_empty() {
-        Some(GoalStatus::Active)
-    } else {
-        GoalStatus::parse(&fm.status)
-    };
-    Goal {
-        id: if fm.id.trim().is_empty() {
-            stem
-        } else {
-            fm.id.trim().to_string()
-        },
-        title: if fm.title.trim().is_empty() {
-            first_line(&body)
-        } else {
-            fm.title.trim().to_string()
-        },
-        status,
-        status_raw: fm.status.trim().to_string(),
-        created: fm.created.trim().to_string(),
-        updated: fm.updated.trim().to_string(),
-        body,
-        path: path.to_path_buf(),
-    }
-}
-
-/// Every goal file in the workspace home's `tasks/goals/`, sorted by
-/// filename. Missing folder ⇒ no goals, not an error.
-pub fn list_goals(workspace_root: &Path) -> Result<Vec<Goal>> {
-    let dir = goals_dir(workspace_root);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
-        .map_err(|e| Error::io(&dir, e))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
-        .collect();
-    paths.sort();
-    let mut out = Vec::with_capacity(paths.len());
-    for path in paths {
-        let raw = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
-        out.push(parse_goal(&path, &raw));
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct NewGoal {
-    pub id: Option<String>,
-    pub title: String,
-    pub body: String,
-    pub status: Option<GoalStatus>,
-}
-
-/// Create a goal file in `.ken-workspace/tasks/goals/` (workspace home
-/// only, D7).
-pub fn create_goal(workspace_root: &Path, new: &NewGoal, today: &str) -> Result<Goal> {
-    let title = new.title.trim();
-    if title.is_empty() {
-        return Err(Error::Other("a goal needs a title".into()));
-    }
-    let id = match &new.id {
-        Some(i) if !i.trim().is_empty() => i.trim().to_string(),
-        _ => new_ulid(),
-    };
-    let dir = goals_dir(workspace_root);
-    let path = dir.join(task_file_name(&id, title));
-    if path.exists() {
-        return Err(Error::Other(format!(
-            "a goal file already exists at {}",
-            path.display()
-        )));
-    }
-    let mut text = String::from("---\n");
-    text.push_str(&format!("id: {}\n", render_scalar(&id)));
-    text.push_str(&format!("title: {}\n", render_scalar(title)));
-    text.push_str(&format!(
-        "status: {}\n",
-        new.status.unwrap_or(GoalStatus::Active).as_str()
-    ));
-    text.push_str(&format!("created: {}\n", render_scalar(today)));
-    text.push_str(&format!("updated: {}\n", render_scalar(today)));
-    text.push_str("---\n\n");
-    text.push_str(new.body.trim());
-    if !new.body.trim().is_empty() {
-        text.push('\n');
-    }
-    fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
-    fs::write(&path, &text).map_err(|e| Error::io(&path, e))?;
-    Ok(parse_goal(&path, &text))
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct GoalPatch {
-    pub title: Option<String>,
-    pub status: Option<GoalStatus>,
-}
-
-/// Same rewrite core as tasks (D7: "same patch core, same tolerant
-/// parse"), same never-rewrite-what-we-don't-understand guard.
-pub fn apply_goal_patch(path: &Path, patch: &GoalPatch, updated: &str) -> Result<()> {
-    let raw = fs::read_to_string(path).map_err(|e| Error::io(path, e))?;
-    let current = parse_goal(path, &raw);
-    if current.status.is_none() && patch.status.is_none() {
-        return Err(Error::Other(format!(
-            "goal '{}' has an unrecognized status '{}' — resolve it before patching other keys",
-            current.id, current.status_raw
-        )));
-    }
-    let mut edits: Vec<(&str, Vec<String>)> = Vec::new();
-    if let Some(t) = &patch.title {
-        edits.push(("title", scalar_lines("title", t)));
-    }
-    if let Some(s) = patch.status {
-        edits.push(("status", scalar_lines("status", s.as_str())));
-    }
-    edits.push(("updated", scalar_lines("updated", updated)));
-    apply_edits(path, &edits, None)
-}
-
-/// Derived goal progress — never stored (spec: "no progress value exists
-/// in any file").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Progress {
-    pub done: usize,
-    pub total: usize,
-}
-
-/// done/total among the tasks tagging `goal_id`. Tasks with an
-/// unrecognized `status` count toward `total` but never toward `done` —
-/// they're real work, just not placeable.
-pub fn goal_progress(tasks: &[Task], goal_id: &str) -> Progress {
-    let mut p = Progress { done: 0, total: 0 };
-    for t in tasks {
-        if t.goal.as_deref().is_some_and(|g| eq_ci(g, goal_id)) {
-            p.total += 1;
-            if t.status == Some(TaskStatus::Done) {
-                p.done += 1;
-            }
-        }
-    }
-    p
-}
-
-/// Progress for every known goal, keyed by goal id — what the board's
-/// group-by-goal mode renders. Tasks tagging an unknown goal id are absent
-/// here by construction; they surface via [`needs_attention`] instead.
-pub fn goal_progress_all(tasks: &[Task], goals: &[Goal]) -> BTreeMap<String, Progress> {
-    goals
-        .iter()
-        .map(|g| (g.id.clone(), goal_progress(tasks, &g.id)))
-        .collect()
 }
 
 #[cfg(test)]
@@ -2153,13 +1680,6 @@ mod tests {
         assert!(t.has_invalid_status());
         assert_eq!(t.status_raw, "blocked");
 
-        let tray = needs_attention(&[t.clone()], &[]);
-        assert_eq!(tray.len(), 1);
-        assert_eq!(
-            tray[0].reasons,
-            vec![AttentionReason::InvalidStatus("blocked".into())]
-        );
-
         // A patch that doesn't resolve the status is refused outright.
         let err = apply_patch(
             &path,
@@ -2184,20 +1704,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(task_at(&path).status, Some(TaskStatus::Todo));
-    }
-
-    #[test]
-    fn invalid_kind_and_board_also_reach_the_tray() {
-        let raw = RICH.replace("kind: ai", "kind: robot").replace("board: main", "board: weekly");
-        let t = parse_task(Path::new("/w/tasks/x.md"), HomeKind::Workspace, "", &raw);
-        let tray = needs_attention(&[t], &[]);
-        assert_eq!(
-            tray[0].reasons,
-            vec![
-                AttentionReason::InvalidKind("robot".into()),
-                AttentionReason::InvalidBoard("weekly".into()),
-            ]
-        );
     }
 
     #[test]
@@ -2322,7 +1828,6 @@ mod tests {
                 kind: Some(TaskKind::Ai),
                 project: Some("ItemSearch".into()),
                 tags: Some(vec!["alpha".into()]),
-                goal: Some("01J0GOAL".into()),
                 ..TaskPatch::default()
             },
         );
@@ -2333,7 +1838,6 @@ mod tests {
             TaskPatch {
                 status: Some(TaskStatus::Done),
                 assignee: Some("agent-desktop".into()),
-                goal: Some("01J0GOAL".into()),
                 ..TaskPatch::default()
             },
         );
@@ -2344,7 +1848,6 @@ mod tests {
             TaskPatch {
                 status: Some(TaskStatus::Doing),
                 tags: Some(vec!["Alpha".into(), "beta".into()]),
-                goal: Some("01J0GOAL".into()),
                 ..TaskPatch::default()
             },
         );
@@ -2369,7 +1872,6 @@ mod tests {
     fn missing_home_folder_is_not_an_error() {
         let dir = tempdir().unwrap();
         assert!(list_tasks(ws(&dir)).unwrap().is_empty());
-        assert!(list_goals(dir.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -2382,128 +1884,6 @@ mod tests {
         let tasks = list_tasks(ws(&dir)).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "live");
-    }
-
-    // ---- 1.3 / 1.6 filter table ----
-
-    #[test]
-    fn filter_table() {
-        let dir = tempdir().unwrap();
-        let (tasks, _) = seed_board(&dir);
-        let ids = |f: TaskFilter| {
-            let mut v: Vec<String> = filter_tasks(&tasks, &f).iter().map(|t| t.id.clone()).collect();
-            v.sort();
-            v
-        };
-        let cases: Vec<(TaskFilter, Vec<&str>)> = vec![
-            (TaskFilter::default(), vec!["01J0P1", "01J0W1", "01J0W2"]),
-            (
-                TaskFilter {
-                    status: Some(TaskStatus::Todo),
-                    ..Default::default()
-                },
-                vec!["01J0W1"],
-            ),
-            (
-                TaskFilter {
-                    project: Some("shatteredrealms".into()),
-                    ..Default::default()
-                },
-                vec!["01J0P1"],
-            ),
-            (
-                TaskFilter {
-                    tag: Some("alpha".into()),
-                    ..Default::default()
-                },
-                vec!["01J0P1", "01J0W1"],
-            ),
-            (
-                TaskFilter {
-                    assignee: Some(AssigneeFilter::Unassigned),
-                    ..Default::default()
-                },
-                vec!["01J0P1", "01J0W1"],
-            ),
-            (
-                TaskFilter {
-                    assignee: Some(AssigneeFilter::Named("agent-desktop".into())),
-                    ..Default::default()
-                },
-                vec!["01J0W2"],
-            ),
-            (
-                TaskFilter {
-                    kind: Some(TaskKind::Ai),
-                    ..Default::default()
-                },
-                vec!["01J0W1"],
-            ),
-            (
-                TaskFilter {
-                    goal: Some("01J0GOAL".into()),
-                    ..Default::default()
-                },
-                vec!["01J0P1", "01J0W1", "01J0W2"],
-            ),
-            (
-                TaskFilter {
-                    goal: Some("nope".into()),
-                    ..Default::default()
-                },
-                vec![],
-            ),
-            (
-                TaskFilter {
-                    board: Some(BoardKind::Daily),
-                    ..Default::default()
-                },
-                vec![],
-            ),
-            (
-                // D4's worked example: unclaimed ai tasks for a project.
-                TaskFilter {
-                    kind: Some(TaskKind::Ai),
-                    assignee: Some(AssigneeFilter::Unassigned),
-                    status: Some(TaskStatus::Todo),
-                    project: Some("ItemSearch".into()),
-                    ..Default::default()
-                },
-                vec!["01J0W1"],
-            ),
-        ];
-        for (i, (f, expect)) in cases.into_iter().enumerate() {
-            assert_eq!(ids(f), expect, "case {i}");
-        }
-    }
-
-    #[test]
-    fn assignee_filter_parses_the_unassigned_sentinels() {
-        assert_eq!(AssigneeFilter::parse("none"), AssigneeFilter::Unassigned);
-        assert_eq!(AssigneeFilter::parse("  "), AssigneeFilter::Unassigned);
-        assert_eq!(
-            AssigneeFilter::parse("Ken"),
-            AssigneeFilter::Named("Ken".into())
-        );
-    }
-
-    #[test]
-    fn invalid_status_matches_no_column() {
-        let t = parse_task(
-            Path::new("/w/tasks/x.md"),
-            HomeKind::Workspace,
-            "",
-            &RICH.replace("status: todo", "status: blocked"),
-        );
-        for s in TaskStatus::ALL {
-            assert!(!matches(
-                &t,
-                &TaskFilter {
-                    status: Some(s),
-                    ..Default::default()
-                }
-            ));
-        }
     }
 
     // ---- 1.4 archive / log / journal ----
@@ -2553,27 +1933,11 @@ mod tests {
     }
 
     #[test]
-    fn complete_sets_done_appends_log_and_composes_a_journal_line() {
+    fn journal_line_cites_the_task_address() {
         let dir = tempdir().unwrap();
         let (tasks, _) = seed_board(&dir);
         let t = find_by_id(&tasks, "01J0W1").unwrap();
-        complete_task(t, "Found the spawner in Mob.class.\nDetails follow.", "2026-08-03", "14:05")
-            .unwrap();
-        let after = read(&t.path);
-        assert!(after.contains("status: done"));
-        assert!(after.contains("updated: '2026-08-03'"));
-        assert!(after.contains("## Log"));
-        assert!(after.contains("### 2026-08-03 14:05"));
-        assert!(after.contains("Found the spawner in Mob.class."));
-
-        // A second completion reuses the existing heading.
-        let t2 = task_at(&t.path);
-        complete_task(&t2, "Second pass.", "2026-08-04", "09:00").unwrap();
-        let after = read(&t.path);
-        assert_eq!(after.matches("## Log").count(), 1, "{after}");
-        assert_eq!(after.matches("### ").count(), 2);
-
-        let line = journal_summary_line(&t2, crate::memory::WORKSPACE_ADDRESS_ID, "Found the spawner in Mob.class.\nmore");
+        let line = journal_summary_line(t, crate::memory::WORKSPACE_ADDRESS_ID, "Found the spawner in Mob.class.\nmore");
         assert_eq!(
             line,
             "Completed task \"Workspace todo\" — Found the spawner in Mob.class. (ken://workspace/tasks/01J0W1-workspace-todo.md)"
@@ -2598,262 +1962,6 @@ mod tests {
         assert!(first.starts_with("## Log\n\n"));
         let second = compose_log_entry("Body.\n\n## Log\n\n### x\n", "2026-08-03", "10:00", "hi");
         assert!(!second.contains("## Log"));
-    }
-
-    // ---- 1.5 rollover ----
-
-    fn daily(dir: &TempDir, id: &str, status: TaskStatus, updated: &str) -> Task {
-        let home = ws(dir);
-        let t = create_task(
-            home,
-            &NewTask {
-                id: Some(id.into()),
-                title: format!("Daily {id}"),
-                body: String::new(),
-                fields: TaskPatch {
-                    status: Some(status),
-                    board: Some(BoardKind::Daily),
-                    ..TaskPatch::default()
-                },
-            },
-            "2026-08-01",
-        )
-        .unwrap();
-        apply_patch(&t.path, &TaskPatch::default(), updated).unwrap();
-        task_at(&t.path)
-    }
-
-    #[test]
-    fn rollover_candidates_are_stale_unfinished_daily_tasks() {
-        let dir = tempdir().unwrap();
-        let stale = daily(&dir, "01J0D1", TaskStatus::Todo, "2026-08-02");
-        let today_already = daily(&dir, "01J0D2", TaskStatus::Doing, "2026-08-03");
-        let finished = daily(&dir, "01J0D3", TaskStatus::Done, "2026-08-02");
-        let main_board = create_task(
-            ws(&dir),
-            &NewTask {
-                id: Some("01J0M1".into()),
-                title: "Main board".into(),
-                body: String::new(),
-                fields: TaskPatch {
-                    status: Some(TaskStatus::Todo),
-                    ..TaskPatch::default()
-                },
-            },
-            "2026-08-01",
-        )
-        .unwrap();
-        let broken = parse_task(
-            Path::new("/w/tasks/b.md"),
-            HomeKind::Workspace,
-            "",
-            "---\nid: b\nstatus: blocked\nboard: daily\nupdated: '2026-08-01'\n---\n\nx\n",
-        );
-
-        let all = vec![stale, today_already, finished, main_board, broken];
-        let ids: Vec<&str> = rollover_candidates(&all, "2026-08-03")
-            .iter()
-            .map(|t| t.id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["01J0D1"]);
-    }
-
-    #[test]
-    fn rollover_resolutions_are_pure_transitions() {
-        let dir = tempdir().unwrap();
-        let t = daily(&dir, "01J0D1", TaskStatus::Todo, "2026-08-02");
-        assert_eq!(
-            resolve_rollover(&t, Rollover::Roll, "2026-08-03").unwrap(),
-            RolloverAction::Patch(TaskPatch::default())
-        );
-        assert_eq!(
-            resolve_rollover(&t, Rollover::Promote, "2026-08-03").unwrap(),
-            RolloverAction::Patch(TaskPatch {
-                board: Some(BoardKind::Main),
-                ..TaskPatch::default()
-            })
-        );
-        let RolloverAction::Archive(p) = resolve_rollover(&t, Rollover::Archive, "2026-08-03").unwrap()
-        else {
-            panic!("expected an archive action");
-        };
-        assert!(p.ends_with("tasks/archive/2026-08/01J0D1-daily-01j0d1.md"));
-        // Pure: nothing moved.
-        assert!(t.path.exists());
-    }
-
-    #[test]
-    fn repeated_rollover_keeps_rolling_day_after_day() {
-        let dir = tempdir().unwrap();
-        let t = daily(&dir, "01J0D1", TaskStatus::Todo, "2026-08-02");
-        for day in ["2026-08-03", "2026-08-04", "2026-08-05"] {
-            let current = task_at(&t.path);
-            assert_eq!(
-                rollover_candidates(std::slice::from_ref(&current), day).len(),
-                1,
-                "stale again on {day}"
-            );
-            apply_rollover(&current, Rollover::Roll, day).unwrap();
-            let rolled = task_at(&t.path);
-            assert_eq!(rolled.updated, day);
-            assert_eq!(rolled.board, BoardKind::Daily, "roll never changes the board");
-            assert_eq!(rolled.status, Some(TaskStatus::Todo));
-            assert!(
-                rollover_candidates(std::slice::from_ref(&rolled), day).is_empty(),
-                "no longer stale the same day"
-            );
-        }
-    }
-
-    #[test]
-    fn promote_and_archive_resolutions_apply() {
-        let dir = tempdir().unwrap();
-        let promoted = daily(&dir, "01J0D2", TaskStatus::Todo, "2026-08-02");
-        apply_rollover(&promoted, Rollover::Promote, "2026-08-03").unwrap();
-        let after = task_at(&promoted.path);
-        assert_eq!(after.board, BoardKind::Main);
-        assert_eq!(after.updated, "2026-08-03");
-        assert!(rollover_candidates(&[after], "2026-08-04").is_empty());
-
-        let dropped = daily(&dir, "01J0D3", TaskStatus::Todo, "2026-08-02");
-        let moved = apply_rollover(&dropped, Rollover::Archive, "2026-08-03").unwrap();
-        assert!(!dropped.path.exists());
-        assert!(moved.ends_with("tasks/archive/2026-08/01J0D3-daily-01j0d3.md"));
-    }
-
-    // ---- 1.6 goals ----
-
-    fn seed_goal(root: &Path, id: &str, title: &str) -> Goal {
-        create_goal(
-            root,
-            &NewGoal {
-                id: Some(id.into()),
-                title: title.into(),
-                body: "Why this matters.".into(),
-                status: None,
-            },
-            "2026-08-01",
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn goal_files_live_in_the_workspace_home_and_default_to_active() {
-        let dir = tempdir().unwrap();
-        let g = seed_goal(dir.path(), "01J0GOAL", "Ship multi-project Ken");
-        assert!(g
-            .path
-            .ends_with(".ken-workspace/tasks/goals/01J0GOAL-ship-multi-project-ken.md"));
-        assert_eq!(g.status, Some(GoalStatus::Active));
-        assert_eq!(g.title, "Ship multi-project Ken");
-        assert_eq!(list_goals(dir.path()).unwrap(), vec![g]);
-    }
-
-    #[test]
-    fn goal_patch_uses_the_same_core_and_preserves_unknown_keys() {
-        let dir = tempdir().unwrap();
-        let g = seed_goal(dir.path(), "01J0GOAL", "Ship it");
-        let hand_edited = read(&g.path).replace("status: active", "status: active\nowner: ken");
-        write(&g.path, &hand_edited);
-
-        apply_goal_patch(
-            &g.path,
-            &GoalPatch {
-                status: Some(GoalStatus::Done),
-                ..GoalPatch::default()
-            },
-            "2026-08-09",
-        )
-        .unwrap();
-        let after = read(&g.path);
-        assert!(after.contains("owner: ken"));
-        assert!(after.contains("Why this matters."));
-        let changed = hand_edited.lines().zip(after.lines()).filter(|(a, b)| a != b).count();
-        assert_eq!(changed, 2, "{after}");
-
-        let bad = read(&g.path).replace("status: done", "status: paused");
-        write(&g.path, &bad);
-        let g2 = parse_goal(&g.path, &read(&g.path));
-        assert!(g2.status.is_none());
-        let err = apply_goal_patch(
-            &g.path,
-            &GoalPatch {
-                title: Some("Renamed".into()),
-                ..GoalPatch::default()
-            },
-            "2026-08-10",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("unrecognized status"), "{err}");
-        assert_eq!(read(&g.path), bad, "not rewritten");
-    }
-
-    #[test]
-    fn goal_progress_is_derived_and_never_stored() {
-        let dir = tempdir().unwrap();
-        let (mut tasks, wsroot) = seed_board(&dir);
-        let g = seed_goal(&wsroot, "01J0GOAL", "Ship multi-project Ken");
-        // 3 tasks tag the goal, 1 is done.
-        assert_eq!(goal_progress(&tasks, "01J0GOAL"), Progress { done: 1, total: 3 });
-
-        let t = find_by_id(&tasks, "01J0P1").unwrap().clone();
-        complete_task(&t, "done", "2026-08-03", "10:00").unwrap();
-        tasks = scan_tasks(&[
-            TaskHome::Workspace {
-                workspace_root: &wsroot,
-            },
-            TaskHome::Project {
-                project_root: &wsroot.join("ShatteredRealms"),
-                project: "ShatteredRealms",
-            },
-        ])
-        .unwrap();
-        assert_eq!(goal_progress(&tasks, "01J0GOAL"), Progress { done: 2, total: 3 });
-
-        let all = goal_progress_all(&tasks, &[g.clone()]);
-        assert_eq!(all.get("01J0GOAL"), Some(&Progress { done: 2, total: 3 }));
-        // Nothing about progress is on disk.
-        assert!(!read(&g.path).contains("progress"));
-        assert!(!read(&tasks[0].path).contains("progress"));
-        // Unknown goal id ⇒ no progress bucket, and no panic.
-        assert_eq!(goal_progress(&tasks, "01J0NOPE"), Progress { done: 0, total: 0 });
-    }
-
-    #[test]
-    fn unknown_goal_id_reaches_the_tray_and_the_file_is_not_rewritten() {
-        let dir = tempdir().unwrap();
-        let (tasks, wsroot) = seed_board(&dir);
-        let known = seed_goal(&wsroot, "01J0OTHER", "Some other goal");
-        let before: Vec<String> = tasks.iter().map(|t| read(&t.path)).collect();
-
-        let tray = needs_attention(&tasks, &[known]);
-        let ids: Vec<&str> = tray.iter().map(|n| n.id.as_str()).collect();
-        assert_eq!(ids, vec!["01J0W1", "01J0W2", "01J0P1"]);
-        for entry in &tray {
-            assert_eq!(
-                entry.reasons,
-                vec![AttentionReason::UnknownGoal("01J0GOAL".into())]
-            );
-        }
-        for (t, raw) in tasks.iter().zip(before) {
-            assert_eq!(read(&t.path), raw, "needs-attention never rewrites");
-        }
-    }
-
-    #[test]
-    fn a_per_repo_task_can_tag_a_workspace_goal() {
-        let dir = tempdir().unwrap();
-        let (tasks, wsroot) = seed_board(&dir);
-        let g = seed_goal(&wsroot, "01J0GOAL", "Ship multi-project Ken");
-        let grouped = filter_tasks(
-            &tasks,
-            &TaskFilter {
-                goal: Some(g.id.clone()),
-                ..Default::default()
-            },
-        );
-        assert!(grouped.iter().any(|t| t.home == HomeKind::Project));
-        assert!(needs_attention(&tasks, &[g]).is_empty());
     }
 
     // ---- ken-families follow-up: TaskHome::Family (folds src-tauri's old
@@ -2960,59 +2068,5 @@ mod tests {
         assert_eq!(scanned2.len(), 1);
         assert_eq!(scanned2[0].home, HomeKind::Family);
         assert_eq!(scanned2[0].title, "Family version");
-    }
-
-    #[test]
-    fn family_task_matches_filters_like_any_other_home() {
-        let dir = tempdir().unwrap();
-        let board_dir = dir.path().join("families/FAM1/members/mem-1/board");
-        let home = TaskHome::Family {
-            board_dir: &board_dir,
-            family_name: "The Smiths",
-        };
-        create_task(
-            home,
-            &NewTask {
-                id: Some("01J0FAM3".into()),
-                title: "Renew passports".into(),
-                fields: TaskPatch {
-                    status: Some(TaskStatus::Doing),
-                    tags: Some(vec!["admin".into()]),
-                    ..TaskPatch::default()
-                },
-                ..NewTask::default()
-            },
-            "2026-08-03",
-        )
-        .unwrap();
-        let tasks = list_tasks(home).unwrap();
-
-        let hit = filter_tasks(
-            &tasks,
-            &TaskFilter {
-                project: Some("the smiths".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(hit.len(), 1, "project filter is case-insensitive, same as any other home");
-
-        let hit = filter_tasks(
-            &tasks,
-            &TaskFilter {
-                status: Some(TaskStatus::Doing),
-                tag: Some("admin".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(hit.len(), 1);
-
-        let miss = filter_tasks(
-            &tasks,
-            &TaskFilter {
-                status: Some(TaskStatus::Done),
-                ..Default::default()
-            },
-        );
-        assert!(miss.is_empty());
     }
 }

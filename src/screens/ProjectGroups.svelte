@@ -9,7 +9,6 @@
   import { api, memberGroup, memberLeaf, type ProjectGroup, type WorkspaceCandidate } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
-  import { workspaceHome } from "../lib/workspaceHome.svelte";
 
   // Sibling folders that aren't members yet. Before this existed the only
   // way to add a repo was the creation picker, which means closing the
@@ -50,7 +49,7 @@
     addError = null;
     try {
       await api.workspaceAddMember(folder);
-      await Promise.all([refreshCandidates(), workspaceHome.refresh(), app.refreshWorkspace()]);
+      await Promise.all([refreshCandidates(), app.refreshWorkspace()]);
     } catch (e) {
       addError = String(e);
     } finally {

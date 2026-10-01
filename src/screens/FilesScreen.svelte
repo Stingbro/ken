@@ -22,6 +22,19 @@
   import ImportDialog from "../files/ImportDialog.svelte";
   import FileGlyph from "../files/FileGlyph.svelte";
   import { clampSidebarWidth } from "../lib/sidebar";
+  import TicketColumn from "../files/TicketColumn.svelte";
+  import { ticketIdForPath } from "../lib/day";
+  import { scope } from "../lib/scope.svelte";
+
+  // A ticket file (`tickets/<ID>.md`) in one of the team's repos gets the
+  // column of my tasks for it beside the file.
+  const ticket = $derived.by(() => {
+    const id = ticketIdForPath(app.activeTab);
+    const projectId = app.focused;
+    if (!id || !projectId || !app.workspace) return null;
+    if (!scope.teamProjectIds.includes(projectId)) return null;
+    return { id, projectId };
+  });
 
   let windowWidth = $state(window.innerWidth);
 
@@ -186,9 +199,14 @@
     {/if}
 
     {#if app.activeTab}
-      {#key app.activeTab}
-        <EditorPane relPath={app.activeTab} />
-      {/key}
+      <div class="open">
+        {#key app.activeTab}
+          <EditorPane relPath={app.activeTab} />
+        {/key}
+        {#if ticket}
+          <TicketColumn projectId={ticket.projectId} ticketId={ticket.id} />
+        {/if}
+      </div>
     {:else}
       <div class="empty">
         <p>Select a file to read or edit it.</p>
@@ -228,6 +246,11 @@
     flex-direction: column;
     min-height: 0;
     background: var(--surface);
+  }
+  .open {
+    flex: 1;
+    min-height: 0;
+    display: flex;
   }
   .tabstrip {
     display: flex;

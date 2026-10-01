@@ -319,6 +319,20 @@ PC (dev), not measured anywhere.
   Ways-of-Working/Research/Templates/_meta off-limits); the source waits in
   Raw (`in_review`, `waiting_new`). **Done, file it** (`ingest_file`) moves
   it beside the note.
+- **Your day, memory built in, no pipeline (2026-10-01).** Design:
+  `docs/design/home-whitebox.html` (Y1, Y1b, Y1c). Home is Your day: the team
+  digest (`team_digest`, stored per team in app data `team-digests/`),
+  Tickets (`tickets/<ID>.md` in the team's repos, assigned to the git user,
+  read-only) and Other (task files in `.ken-workspace/tasks/`: `title,
+  status open|done, target, repeat, links, from, done_on, updated_by`, body =
+  description), then recent files and index health. Logic in
+  `ken-core/src/day.rs`; commands `day_state`, `day_task_create|update|delete`,
+  `ticket_tasks`, `index_health(team)`; event `day-changed`. MCP:
+  `task_create`, `task_update`, `task_list`, `ticket_list`. The task board
+  (columns, goals, daily board, rollover, Tasks screen), the pipeline board
+  and the `kenTasks`, `kenFamilies`, `kenPipeline` flags are removed; they
+  remain on `ken-workspace-home`. `kenMemory` is built in. The team inbox
+  stays: Accept puts a task on my family board, which Your day lists.
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
   ken-core on this PC: 856 pass, 55 fail (all Windows-only: fake bash CLI, CRLF);

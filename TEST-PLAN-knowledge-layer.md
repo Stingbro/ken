@@ -99,8 +99,8 @@ There is no "where is your code?" step: you pick the repos themselves.
 
 ## 6. Home health (step 6)
 
-- [ ] Focus `Realms-Docs`. Home's footer has a second row: **N of M read for
-  the graph**, and, if anything waits, **waiting to be read**.
+- [ ] Home's **Index health** shows repos indexed (*n / m*), files queued and
+  failed for the team; **Team** opens the Team tab.
 - [ ] With no on-device model chosen: one line says **No on-device model is
   chosen … Search still works.** The Timeline shows the same notice.
 - [ ] No "index check missed" line (the control page is `START-HERE.md`).
@@ -339,9 +339,8 @@ keyword index over sections.
   workspace switcher in the rail lists the other recent ones.
 - [ ] The title bar shows the **team** (ATT), not a repo; its menu lists each
   team on its own, no "All". Files shows the team's **Repos** above the tree;
-  picking one shows its files. The search box says *Search ATT…*, Home's
-  scope picker offers the team or one of its repos, and Home's digest lists
-  the team's repos only.
+  picking one shows its files. The search box says *Search ATT…*, and Home's
+  digest covers the team's repos only.
 - [ ] Review with a code repo focused lists the wiki as *ATT-Wiki · n waiting*
   when its ingest or drift items wait; the rail count includes them.
 
@@ -364,6 +363,34 @@ keyword index over sections.
   pages to check, unverified for thirty days).
 - [ ] **Add a rule** ("Ship small PRs"): `Ways-of-Working/Rules/ship-small-prs.md`
   opens, made from the wiki's rule template.
+
+## 18. Your day (the Home white box's Y1, Y1b, Y1c)
+
+- [ ] Home's header says **Your day** with the team. The rail has no Tasks.
+  Settings › Features lists no Ken memory, Task board, Team inbox or Pipeline
+  board; Settings shows the Memory section.
+- [ ] The digest is one paragraph for the team, with source chips that open
+  the file in its repo. With none yet: *No digest yet…* and **Write it now**.
+- [ ] Add `tickets/ATT-001.md` to a repo with `id`, `title`, `status: todo`,
+  `assignee:` your git user name, `target:` tomorrow. **Tickets** lists it
+  with its state and *Thu*-style target; the row opens it in Files. Set
+  `status: done`: it leaves the list. A team with no tickets folder shows no
+  Tickets list.
+- [ ] **+ Task**: title, target date, repeat, a link to `ATT-001`, a
+  description; Enter in the title adds it. It is listed under **Other**,
+  ordered by target. The file is in `.ken-workspace/tasks/`.
+- [ ] Open the task: change each field; each saves (reopen Ken to check).
+  The checkbox marks it done; it stays greyed today and is gone tomorrow.
+- [ ] A task with **Repeat: weekdays** shows on weekdays only; marking it done
+  shows it done today and open again the next weekday.
+- [ ] Open `tickets/ATT-001.md` in Files: the right column lists your tasks
+  linked to it and the wiki pages that cite `ATT-001`; **+ Task** there adds
+  one already linked.
+- [ ] In chat: "add a task to check the pilot sites by Friday". It appears
+  under Other with *updated by mcp*. "Mark it done" marks it done.
+- [ ] With a team inbox connected (Settings), a task a teammate sends shows
+  under Other with **Accept ▾**; Accept makes it a normal task with *from*;
+  Not mine removes it.
 
 ## After
 

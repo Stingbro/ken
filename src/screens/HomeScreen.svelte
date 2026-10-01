@@ -1,313 +1,361 @@
 <script lang="ts">
+  // Your day (Y1): the team digest, the team's tickets assigned to me, my
+  // other tasks, then recent files across the team and its index health.
+  // Clicking a task opens its panel (Y1b) beside the list.
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
-  import { digest } from "../lib/digest.svelte";
-  import { ingests } from "../lib/ingests.svelte";
-  import { review } from "../lib/review.svelte";
+  import { scope } from "../lib/scope.svelte";
+  import { day, openInRepo, openMemberPath, repoName } from "../lib/day.svelte";
+  import { isOverdue, shortTarget, taskDetail, ticketDetail } from "../lib/day";
   import { digestMarkdown } from "../lib/assist";
   import { renderMarkdown } from "../lib/markdown";
   import { parseCitation } from "../lib/citation";
-  import { homeRecents, recentlyOpened } from "../lib/recent";
-  import HomeSearch from "./HomeSearch.svelte";
-  import HomeStatus from "./HomeStatus.svelte";
-  import MembersStrip from "./MembersStrip.svelte";
-  import WorkspaceDigestCard from "./WorkspaceDigestCard.svelte";
-  import { workspaceHome } from "../lib/workspaceHome.svelte";
-  import { tasksStore } from "../lib/tasks.svelte";
-  import ScopePicker from "./ScopePicker.svelte";
-  import { scope } from "../lib/scope.svelte";
-  import RecentFiles from "./RecentFiles.svelte";
+  import { loadRecents, mergeTeamRecents, fallbackRecents } from "../lib/recent";
+  import { kindForPath, timeAgo } from "../lib/format";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
+  import type { DayTask } from "../lib/api";
+  import TaskPanel from "../day/TaskPanel.svelte";
+  import FileGlyph from "../files/FileGlyph.svelte";
   import Check from "@lucide/svelte/icons/check";
-  import Copy from "@lucide/svelte/icons/copy";
-  import BellOff from "@lucide/svelte/icons/bell-off";
-  import Eye from "@lucide/svelte/icons/eye";
-
-  // Right-click a "Needs a look" row to ignore that file's issues (per-user,
-  // never synced) or open it in Files.
-  function failedRowMenu(e: MouseEvent, relPath: string) {
-    e.preventDefault();
-    openContextMenu(e.clientX, e.clientY, [
-      { label: "Open in Files", icon: Eye, onSelect: () => app.openInFiles(relPath) },
-      "separator",
-      { label: "Ignore this file", icon: BellOff, onSelect: () => void app.ignoreFile(relPath) },
-    ]);
-  }
+  import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import X from "@lucide/svelte/icons/x";
+  import Reply from "@lucide/svelte/icons/reply";
 
   onMount(() => {
-    void digest.init();
-    // ken-home-workspace: no-ops without a workspace open, so the
-    // single-project path is untouched.
-    void workspaceHome.init();
     void scope.init();
+    void day.init();
   });
+
+  const teamName = $derived(scope.team ?? app.workspace?.name ?? app.project?.name ?? "");
+
+  const todayLong = $derived(
+    new Date(`${day.today}T12:00:00`).toLocaleDateString(undefined, {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+    }),
+  );
+
+  // ── Digest ──────────────────────────────────────────────────────────
 
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function share() {
-    if (!digest.digest) return;
-    await navigator.clipboard.writeText(digestMarkdown(digest.digest));
+    if (!day.digest) return;
+    await navigator.clipboard.writeText(
+      digestMarkdown({ date: todayLong, body: day.digest.body, sources: day.digest.sources }),
+    );
     copied = true;
-    if (copyTimer) clearTimeout(copyTimer);
+    clearTimeout(copyTimer);
     copyTimer = setTimeout(() => (copied = false), 1500);
   }
 
   function digestTime(epoch: number): string {
-    return new Date(epoch * 1000).toLocaleTimeString(undefined, {
-      hour: "numeric",
-      minute: "2-digit",
-    });
+    return new Date(epoch * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
   }
 
-  function chipLabel(relPath: string): string {
-    return relPath.split("/").pop() || relPath;
+  function chipLabel(path: string): string {
+    return path.split("/").pop() || path;
   }
 
-  /** Project-relative links in the digest prose open in Files. */
   function onDigestClick(e: MouseEvent) {
     const a = (e.target as HTMLElement).closest("a");
-    if (a) {
-      e.preventDefault();
-      const c = parseCitation(a.getAttribute("href") ?? "");
-      if (c && !c.projectId) app.openAt(c.path, { line: c.line, anchor: c.anchor });
+    if (!a) return;
+    e.preventDefault();
+    const c = parseCitation(a.getAttribute("href") ?? "");
+    if (!c) return;
+    if (c.projectId) void openInRepo(c.projectId, c.path);
+    else void openMemberPath(c.path);
+  }
+
+  const indexing = $derived((day.health?.queued ?? 0) > 0);
+
+  // ── Tasks ───────────────────────────────────────────────────────────
+
+  let replyFor = $state<string | null>(null);
+  let replyNote = $state("");
+  let actionError = $state<string | null>(null);
+
+  async function run(p: Promise<unknown>) {
+    actionError = null;
+    try {
+      await p;
+    } catch (e) {
+      actionError = String(e);
     }
   }
 
-  const blockedSlugs = $derived(
-    Object.values(ingests.live)
-      .filter((ev) => ev.status === "blocked")
-      .map((ev) => ev.slug),
-  );
-
-  // Open Review items beyond what this screen already shows individually
-  // (approvals and blocked runs above, failed files below).
-  const otherReviewCount = $derived(
-    review.items.filter(
-      (i) => i.kind !== "approval" && i.kind !== "failed-file",
-    ).length,
-  );
-
-  function openIngest(slug: string) {
-    app.screen = "ingests";
-    void ingests.select(slug);
+  function acceptMenu(e: MouseEvent, task: DayTask) {
+    e.stopPropagation();
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openContextMenu(r.left, r.bottom + 4, [
+      { label: "Accept", icon: Check, onSelect: () => void run(day.accept(task)) },
+      { label: "Not mine", icon: X, onSelect: () => void run(day.notMine(task)) },
+      {
+        label: "Reply",
+        icon: Reply,
+        onSelect: () => {
+          replyFor = task.id;
+          replyNote = "";
+        },
+      },
+    ]);
   }
 
-  const today = new Date().toLocaleDateString(undefined, {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
+  async function sendReply(task: DayTask) {
+    const note = replyNote.trim();
+    if (!note) return;
+    await run(day.reply(task, note));
+    replyFor = null;
+    replyNote = "";
+  }
+
+  function openRow(task: DayTask) {
+    // A teammate's task is not a file of mine until accepted.
+    if (task.inbox) return;
+    day.openTask(task.id);
+  }
+
+  const selectedId = $derived(day.panel?.mode === "edit" ? day.panel.id : null);
+
+  // ── Recent files across the team ────────────────────────────────────
+
+  const recents = $derived.by(() => {
+    const ids = scope.teamProjectIds;
+    const focused = app.focused;
+    const lists = ids.map((id) => ({
+      projectId: id,
+      // The focused repo's history is live; the others' are what was saved.
+      entries: id === focused ? app.recents : loadRecents(id),
+      // Only the focused repo's index is loaded here, to drop files it lost.
+      known: id === focused ? new Set(app.files.map((f) => f.relPath)) : null,
+    }));
+    const merged = mergeTeamRecents(lists);
+    if (merged.length > 0) return merged;
+    return focused
+      ? fallbackRecents(app.files).map((f) => ({ projectId: focused, path: f.relPath, at: f.at }))
+      : [];
   });
 
-  // Own history when there is one, most-recently-modified files otherwise;
-  // empty (a project with no files at all) renders no section.
-  const recents = $derived(homeRecents(app.recents, app.files));
-  const recentsFromHistory = $derived(
-    recentlyOpened(app.recents, app.files).length > 0,
-  );
-
-  const hasWaiting = $derived(
-    ingests.pending.length > 0 ||
-      blockedSlugs.length > 0 ||
-      otherReviewCount > 0,
-  );
-  const hasNeedsLook = $derived(app.failedFiles.length > 0);
-
-  // Reading order: the day, then what Ken wrote, then what wants a human, then
-  // the ways in. Three of these sections are conditional, so the entrance
-  // stagger is indexed off the sections actually rendered — a hard-coded --d
-  // would leave a dead beat wherever a section is absent.
-  const sections = $derived([
-    "masthead",
-    "digest",
-    ...(hasWaiting ? ["waiting"] : []),
-    ...(hasNeedsLook ? ["needs-look"] : []),
-    "search",
-    ...(recents.length > 0 ? ["recents"] : []),
-    "status",
-  ]);
-  const delay = (id: string) => sections.indexOf(id);
+  const panelOpen = $derived(day.panel !== null);
 </script>
 
 <div class="wrap">
-  <div class="inner">
-    <!-- Masthead: the day, set like a paper's dateline -->
-    <header class="masthead rise" style="--d: {delay('masthead')}">
-      <h1>{today}</h1>
-      <div class="rule">
-        <span class="rule-label">Today's digest</span>
-        {#if digest.digest}
-          <span class="rule-meta">
-            {digestTime(digest.digest.generatedAt)}
-            <button class="share" onclick={share} title="Copy as markdown">
-              {#if copied}<Check size={12} strokeWidth={2} /> copied
-              {:else}<Copy size={12} strokeWidth={1.75} /> share{/if}
-            </button>
-          </span>
-        {/if}
-      </div>
-    </header>
+  <div class="inner" class:with-panel={panelOpen}>
+    <div class="main">
+      <header class="hd">
+        <h1>Your day</h1>
+        {#if teamName}<span class="chip team">{teamName}</span>{/if}
+        <span class="sp"></span>
+        <button class="btn btn-small" onclick={() => day.openNew()}>+ Task</button>
+        <button class="btn btn-small btn-ghost" onclick={share} disabled={!day.digest} title="Copy the digest as markdown">
+          {#if copied}<Check size={12} strokeWidth={2} /> Copied{:else}Share{/if}
+        </button>
+      </header>
 
-    <!-- The digest is the lead story: open serif prose, no chrome -->
-    <section class="digest rise" style="--d: {delay('digest')}">
-      {#if digest.digest}
-        <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-        <div class="digest-body" onclick={onDigestClick}>
-          {@html renderMarkdown(digest.digest.body)}
+      <!-- The digest, written for the team -->
+      <section class="digest">
+        <div class="dh">
+          <span class="date">{todayLong}</span>
+          {#if day.digest}<span class="chip">{digestTime(day.digest.generatedAt)}</span>{/if}
         </div>
-        {#if digest.digest.sources.length > 0}
-          <div class="sources">
-            <span class="from">From</span>
-            {#each digest.digest.sources as source (source)}
-              <button
-                class="chip mono"
-                title={source}
-                onclick={() => app.openInFiles(source)}
-              >
-                {chipLabel(source)}
-              </button>
-            {/each}
+        {#if day.digest}
+          <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+          <div class="digest-body" onclick={onDigestClick}>
+            {@html renderMarkdown(day.digest.body)}
           </div>
-        {/if}
-      {:else if digest.generating}
-        <p class="digest-quiet pulse">Ken is writing today's digest…</p>
-      {:else if digest.claudeFound}
-        <p class="digest-quiet">
-          Ken writes you a morning digest — what changed, what's waiting —
-          and it will appear here.
-        </p>
-        {#if digest.error}
-          <p class="digest-error">Last try didn't finish — {digest.error}</p>
-        {/if}
-        <div class="digest-actions">
-          <button class="btn" onclick={() => void digest.writeNow()}>Write it now</button>
-        </div>
-      {:else}
-        <p class="digest-quiet">
-          The daily digest needs Claude Code — once it's installed, Ken
-          writes you one each morning.
-        </p>
-      {/if}
-    </section>
-
-    <!-- Workspace layer: renders only with a workspace open, so with the
-         `workspace` flag off Home is byte-identical to before. -->
-    {#if workspaceHome.enabled}
-      <section class="rise" style="--d: {delay('digest')}">
-        <WorkspaceDigestCard />
-      </section>
-    {/if}
-
-    <!-- The daily board, workspace-wide: `needsAttention` already spans
-         every member, so this is the board's own answer rather than the
-         focused member's slice of it. -->
-    {#if workspaceHome.enabled && tasksStore.enabled && tasksStore.board.needsAttention.length > 0}
-      <section class="rise" style="--d: {delay('waiting')}">
-        <div class="overline amber">On your board</div>
-        <div class="group">
-          {#each tasksStore.board.needsAttention.slice(0, 6) as item (item.id)}
-            <button class="row board-row" onclick={() => (app.screen = "tasks")}>
-              <span class="rdot amber"></span>
-              <div class="rtext">
-                <strong>{item.title}</strong>
-                {#if item.reasons.length > 0}
-                  — {item.reasons.map((r) => r.reason).join(", ")}
-                {/if}
-              </div>
-            </button>
-          {/each}
-        </div>
-      </section>
-    {/if}
-
-    {#if hasWaiting}
-      <section class="rise" style="--d: {delay('waiting')}">
-        <div class="overline amber">Waiting on you</div>
-        <div class="group">
-          {#each ingests.pending as run (run.id)}
-            <div class="row">
-              <span class="rdot amber"></span>
-              <div class="rtext">
-                <strong>{run.slug}</strong> finished a big refresh —
-                {run.summary ?? "review it before Ken writes it."}
-              </div>
-              <button class="btn btn-small" onclick={() => openIngest(run.slug)}>Review</button>
-            </div>
-          {/each}
-          {#each blockedSlugs as slug (slug)}
-            <div class="row">
-              <span class="rdot amber"></span>
-              <div class="rtext"><strong>{slug}</strong> is waiting on your input.</div>
-              <button class="btn btn-small" onclick={() => openIngest(slug)}>Open</button>
-            </div>
-          {/each}
-          {#if otherReviewCount > 0}
-            <div class="row">
-              <span class="rdot amber"></span>
-              <div class="rtext">
-                {otherReviewCount === 1
-                  ? "One more thing is"
-                  : `${otherReviewCount} more things are`} waiting in Review — documents
-                going stale or things Ken couldn't handle alone.
-              </div>
-              <button class="btn btn-small" onclick={() => (app.screen = "review")}>Open Review</button>
+          {#if day.digest.sources.length > 0}
+            <div class="sources">
+              {#each day.digest.sources as source (source)}
+                <button class="chip mono src" title={source} onclick={() => void openMemberPath(source)}>
+                  {chipLabel(source)}
+                </button>
+              {/each}
             </div>
           {/if}
-        </div>
+        {:else if day.generating}
+          <p class="quiet">Writing the digest.</p>
+        {:else if !day.claudeFound}
+          <p class="quiet">The digest needs Claude Code.</p>
+        {:else}
+          <p class="quiet">No digest yet. Ken writes one each morning.</p>
+          <div class="digest-actions">
+            <button
+              class="btn btn-small"
+              class:dim={indexing}
+              title={indexing ? "The index is still running; the digest may miss what it has not read." : undefined}
+              onclick={() => void day.writeDigest()}>Write it now</button
+            >
+          </div>
+        {/if}
+        {#if day.digestError}
+          <p class="error">The last try did not finish: {day.digestError}</p>
+        {/if}
       </section>
-    {/if}
 
-    {#if hasNeedsLook}
-      <section class="rise" style="--d: {delay('needs-look')}">
-        <div class="overline">Needs a look</div>
-        <div class="group">
-          {#each app.failedFiles.slice(0, 5) as f (f.relPath)}
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="row" oncontextmenu={(e) => failedRowMenu(e, f.relPath)}>
-              <span class="rdot"></span>
-              <div class="rtext">
-                <strong>{f.relPath.split("/").pop()}</strong> couldn't be indexed —
-                {f.error ?? "unknown reason"}. It's still findable by name.
-              </div>
-              <button
-                class="btn btn-small ghost"
-                title="Ignore this file's issues (only for you)"
-                onclick={() => void app.ignoreFile(f.relPath)}
-              >
-                Ignore
-              </button>
-              <button class="btn btn-small" onclick={() => app.openInFiles(f.relPath)}>View</button>
-            </div>
-          {/each}
-        </div>
-      </section>
-    {/if}
-
-    <!-- The page's primary action: opens the ⌘K palette, which owns search.
-         The scope picker above it sets what questions are about — search
-         AND chat — and defaults to all projects. -->
-    <section class="find rise" style="--d: {delay('search')}">
-      <ScopePicker />
-      <HomeSearch />
-    </section>
-
-    {#if recents.length > 0}
-      <section class="rise" style="--d: {delay('recents')}">
-        <RecentFiles rows={recents} fromHistory={recentsFromHistory} />
-      </section>
-    {/if}
-
-    <!-- Footer: the members strip in a workspace (every manifest member,
-         including the ones that no longer resolve), the single-project
-         stats card otherwise. -->
-    <section class="status rise" style="--d: {delay('status')}">
-      {#if workspaceHome.enabled}
-        <MembersStrip />
-      {:else}
-        <HomeStatus />
+      {#if day.loadError}
+        <p class="error">{day.loadError}</p>
       {/if}
-    </section>
 
+      <!-- Tickets: open ticket files assigned to me -->
+      {#if day.state?.hasTickets}
+        <section>
+          <div class="list-head">
+            <span class="overline">Tickets · {day.tickets.length}</span>
+            <span class="sp"></span>
+            <span class="col-label st-col">state</span>
+            <span class="col-label due-col">target</span>
+          </div>
+          {#if day.tickets.length > 0}
+            <div class="group">
+              {#each day.tickets as t (t.projectId + ":" + t.relPath)}
+                <button class="row ticket" title={`${t.repo}/${t.relPath}`} onclick={() => void openInRepo(t.projectId, t.relPath)}>
+                  <span class="tid mono">{t.id}</span>
+                  <span class="tx">
+                    <span class="tt">{t.title}</span>
+                    <span class="td">{ticketDetail(t)}</span>
+                  </span>
+                  <span class="st-col"><span class="chip state">{t.state}</span></span>
+                  <span class="due-col due" class:late={t.target !== null && t.target < day.today}>
+                    {shortTarget(t.target, day.today)}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="quiet small">No open tickets assigned to you.</p>
+          {/if}
+        </section>
+      {/if}
+
+      <!-- Other: my tasks -->
+      <section>
+        <div class="list-head">
+          <span class="overline">Other · {day.tasks.length}</span>
+          <span class="sp"></span>
+          <span class="col-label due-col">target</span>
+          <span class="act-col"></span>
+        </div>
+        {#if actionError}<p class="error">{actionError}</p>{/if}
+        {#if day.tasks.length > 0}
+          <div class="group">
+            {#each day.tasks as task (task.id)}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="row task"
+                class:done={task.state === "done"}
+                class:selected={selectedId === task.id}
+                class:clickable={!task.inbox}
+                role="button"
+                tabindex="0"
+                onclick={() => openRow(task)}
+                onkeydown={(e) => {
+                  if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+                    e.preventDefault();
+                    openRow(task);
+                  }
+                }}
+              >
+                {#if task.inbox}
+                  <span class="cb ghost" title="Accept it first"></span>
+                {:else}
+                  <button
+                    class="cb"
+                    class:on={task.state === "done"}
+                    aria-label={task.state === "done" ? "Mark open" : "Mark done"}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      void run(day.toggle(task));
+                    }}
+                  >
+                    {#if task.state === "done"}<Check size={11} strokeWidth={2.5} />{/if}
+                  </button>
+                {/if}
+                <span class="tx">
+                  <span class="tt">{task.title}</span>
+                  <span class="td">{taskDetail(task)}</span>
+                </span>
+                <span class="due-col due" class:late={isOverdue(task, day.today)}>{shortTarget(task.target, day.today)}</span>
+                <span class="act-col">
+                  {#if task.inbox}
+                    <button
+                      class="btn btn-small"
+                      disabled={day.busy === task.id}
+                      onclick={(e) => acceptMenu(e, task)}
+                    >
+                      Accept <ChevronDown size={12} strokeWidth={1.75} />
+                    </button>
+                  {/if}
+                </span>
+              </div>
+              {#if replyFor === task.id}
+                <div class="reply">
+                  <textarea bind:value={replyNote} rows="2" placeholder="Reply to {task.from ?? 'the sender'}" aria-label="Reply"></textarea>
+                  <div class="reply-actions">
+                    <button class="btn btn-small btn-primary" disabled={!replyNote.trim() || day.busy === task.id} onclick={() => void sendReply(task)}>Send</button>
+                    <button class="btn btn-small btn-ghost" onclick={() => (replyFor = null)}>Cancel</button>
+                  </div>
+                </div>
+              {/if}
+            {/each}
+          </div>
+        {:else}
+          <p class="quiet small">Nothing for today. + Task adds one.</p>
+        {/if}
+      </section>
+
+      <!-- Recent files across the team | index health -->
+      <div class="halves">
+        <section>
+          <div class="list-head"><span class="overline">Recent files</span></div>
+          {#if recents.length > 0}
+            <div class="group">
+              {#each recents as r (r.projectId + ":" + r.path)}
+                <button class="row file" title={r.path} onclick={() => void openInRepo(r.projectId, r.path)}>
+                  <FileGlyph kind={kindForPath(r.path)} size="sm" />
+                  <span class="fname">{chipLabel(r.path)}</span>
+                  <span class="chip repo">{repoName(r.projectId)}</span>
+                  <span class="ftime">{timeAgo(r.at)}</span>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="quiet small">No files opened yet.</p>
+          {/if}
+        </section>
+        <section>
+          <div class="list-head">
+            <span class="overline">Index health</span>
+            <span class="sp"></span>
+            <button class="link" onclick={() => (app.screen = "team")}>Team</button>
+          </div>
+          {#if day.health}
+            <div class="stats">
+              <div><b>{day.health.indexed} / {day.health.total}</b><span>repos indexed</span></div>
+              <div><b>{day.health.queued}</b><span>files queued</span></div>
+              <div><b class:bad={day.health.failed > 0}>{day.health.failed}</b><span>failed</span></div>
+            </div>
+          {:else}
+            <p class="quiet small">Not available.</p>
+          {/if}
+        </section>
+      </div>
+    </div>
+
+    {#if day.panel}
+      <div class="side">
+        {#key day.panel.mode === "edit" ? day.panel.id : "new"}
+          {#if day.panel.mode === "edit"}
+            {#if day.panelTask}
+              <TaskPanel task={day.panelTask} />
+            {/if}
+          {:else}
+            <TaskPanel task={null} newLinks={day.panel.links} />
+          {/if}
+        {/key}
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -316,97 +364,87 @@
     flex: 1;
     min-width: 0;
     overflow-y: auto;
-    padding: 44px 44px 56px;
+    padding: 36px 44px 56px;
   }
   .inner {
-    max-width: 680px;
+    max-width: 860px;
     margin: 0 auto;
   }
-
-  /* Entrance: one staggered rise, then still. */
-  .rise {
-    animation: rise 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
-    animation-delay: calc(var(--d) * 60ms);
+  .inner.with-panel {
+    max-width: 1280px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 400px;
+    gap: 20px;
+    align-items: start;
   }
-  @keyframes rise {
-    from {
-      opacity: 0;
-      transform: translateY(7px);
-    }
-    to {
-      opacity: 1;
-      transform: none;
-    }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .rise {
-      animation: none;
-    }
+  .side {
+    position: sticky;
+    top: 0;
   }
 
-  /* ── Masthead ─────────────────────────────────────────── */
+  /* ── Header ───────────────────────────────────────────── */
+  .hd {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
   h1 {
     margin: 0;
     font-family: var(--font-serif);
-    font-size: 31px;
+    font-size: 26px;
     font-weight: 500;
     letter-spacing: -0.01em;
   }
-  .rule {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    margin-top: 14px;
-    padding-bottom: 9px;
-    border-bottom: 1px solid var(--border);
+  .sp {
+    flex: 1;
   }
-  .rule-label {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--accent-deep);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-  .rule-meta {
-    margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
-  }
-  .share {
+  .hd .btn {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    border: none;
-    background: transparent;
-    padding: 0;
-    font-size: 11.5px;
-    font-family: inherit;
-    color: var(--accent);
-    cursor: pointer;
-  }
-  .share:hover {
-    color: var(--accent-hover);
   }
 
-  /* ── The lead: digest prose, serif, no box ────────────── */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    color: var(--ink-secondary);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 1px 8px;
+    background: var(--sunken);
+    white-space: nowrap;
+  }
+  .chip.team {
+    font-size: 11.5px;
+  }
+
+  /* ── Digest ───────────────────────────────────────────── */
   .digest {
-    margin-top: 18px;
+    margin-top: 20px;
+  }
+  .dh {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .date {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-secondary);
   }
   .digest-body {
     font-family: var(--font-serif);
     font-size: 16px;
-    line-height: 1.8;
+    line-height: 1.75;
     color: var(--ink);
-    max-width: 62ch;
+    max-width: 70ch;
   }
   .digest-body :global(p) {
-    margin: 0 0 12px;
-  }
-  .digest-body :global(p:first-child) {
-    font-size: 17.5px;
+    margin: 0 0 10px;
   }
   .digest-body :global(p:last-child) {
     margin-bottom: 0;
@@ -416,134 +454,279 @@
     text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
     text-underline-offset: 2px;
   }
-  .digest-quiet {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 15.5px;
-    line-height: 1.75;
-    color: var(--ink-secondary);
-    max-width: 58ch;
+  .sources {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-top: 12px;
   }
-  .digest-error {
-    margin: 8px 0 0;
-    font-size: 12px;
+  .src {
+    cursor: pointer;
+  }
+  .src:hover {
+    border-color: var(--accent);
+  }
+  .quiet {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--ink-secondary);
+  }
+  .quiet.small {
+    font-size: 13px;
     color: var(--ink-tertiary);
   }
   .digest-actions {
-    margin-top: 14px;
+    margin-top: 10px;
   }
-  .pulse {
-    animation: digest-pulse 1.6s ease-in-out infinite;
+  .btn.dim {
+    opacity: 0.55;
   }
-  @keyframes digest-pulse {
-    0%,
-    100% {
-      opacity: 0.45;
-    }
-    50% {
-      opacity: 1;
-    }
-  }
-  .sources {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-top: 18px;
-  }
-  .from {
-    font-size: 10.5px;
-    font-weight: 700;
-    color: var(--ink-tertiary);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-  .chip {
-    font-size: 11px;
-    color: var(--ink-secondary);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    padding: 2px 8px;
-    background: var(--sunken);
-    cursor: pointer;
-  }
-  .chip:hover {
-    border-color: var(--accent);
+  .error {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--danger);
   }
 
-  /* ── Search: the page's one loud thing ────────────────── */
-  .find {
-    margin-top: 40px;
-  }
-
-  /* Footer spacing; the tiles/sync visual language lives in HomeStatus. */
-  .status {
-    margin-top: 36px;
-  }
-
-  /* ── Grouped attention lists ──────────────────────────── */
+  /* ── Lists ────────────────────────────────────────────── */
   section {
-    margin-top: 36px;
+    margin-top: 28px;
   }
-  /* Typography lives on the global `.overline`; only the spacing is local. */
-  .overline {
+  .list-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
     margin-bottom: 8px;
+    padding: 0 16px 0 0;
   }
-  .overline.amber {
-    color: var(--needs-input-text);
+  .col-label {
+    font-size: 10.5px;
+    color: var(--ink-tertiary);
+    text-transform: lowercase;
+  }
+  .st-col {
+    width: 110px;
+    flex: none;
+    text-align: right;
+  }
+  .due-col {
+    width: 64px;
+    flex: none;
+    text-align: right;
+  }
+  .act-col {
+    width: 96px;
+    flex: none;
+    display: flex;
+    justify-content: flex-end;
   }
   .group {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-card);
     box-shadow: var(--shadow-card);
+    overflow: hidden;
   }
   .row {
     display: flex;
+    align-items: center;
     gap: 12px;
-    align-items: flex-start;
-    padding: 13px 16px;
-  }
-  .row + .row {
-    border-top: 1px solid var(--border);
-  }
-  .rdot {
-    width: 7px;
-    height: 7px;
-    border-radius: 4px;
-    background: var(--danger);
-    margin-top: 6px;
-    flex: none;
-  }
-  .rdot.amber {
-    background: var(--needs-input);
-  }
-  .rtext {
-    flex: 1;
-    font-size: 13px;
-    line-height: 1.6;
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
-  /* Board rows are buttons (they open Tasks) but must read as rows. */
-  .board-row {
     width: 100%;
-    background: transparent;
+    min-height: 52px;
+    padding: 8px 16px;
     border: none;
+    background: transparent;
     font: inherit;
     text-align: left;
-    cursor: pointer;
     color: var(--ink);
   }
-  .board-row:hover {
-    background: var(--surface);
+  .row + .row,
+  .reply + .row,
+  .row + .reply {
+    border-top: 1px solid var(--border);
   }
-  /* Secondary "Ignore" action reads quieter than the primary "View". */
-  .btn.ghost {
-    background: transparent;
+  button.row,
+  .row.clickable {
+    cursor: pointer;
+  }
+  button.row:hover,
+  .row.clickable:hover,
+  .row:focus-visible {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+  .row.selected {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .tid {
+    width: 72px;
+    flex: none;
+    font-size: 12px;
+    color: var(--accent-deep);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    text-underline-offset: 2px;
+  }
+  .tx {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .tt {
+    font-size: 13.5px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .td {
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip.state {
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .due {
+    font-size: 12px;
+    color: var(--ink-secondary);
+    font-variant-numeric: tabular-nums;
+  }
+  .due.late {
+    color: var(--danger);
+  }
+  .row.done .tt {
+    font-weight: 400;
+    text-decoration: line-through;
     color: var(--ink-tertiary);
   }
-  .btn.ghost:hover {
+  .row.done .due {
+    color: var(--ink-tertiary);
+  }
+  .cb {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1.5px solid var(--border-strong);
+    background: var(--surface);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    color: var(--surface);
+    cursor: pointer;
+  }
+  .cb:hover {
+    border-color: var(--accent);
+  }
+  .cb.on {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .cb.ghost {
+    border-style: dashed;
+    cursor: default;
+  }
+  .act-col .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 10px;
+  }
+  .reply {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 16px 12px 44px;
+  }
+  .reply textarea {
+    font: inherit;
+    font-size: 12.5px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
     color: var(--ink);
+    resize: vertical;
+  }
+  .reply-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  /* ── Two halves ───────────────────────────────────────── */
+  .halves {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  .row.file {
+    min-height: 40px;
+    gap: 10px;
+  }
+  .fname {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip.repo {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ftime {
+    flex: none;
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
+  }
+  .link {
+    border: none;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+  }
+  .link:hover {
+    color: var(--accent-hover);
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
+  }
+  .stats > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 12px 16px;
+  }
+  .stats > div + div {
+    border-left: 1px solid var(--border);
+  }
+  .stats b {
+    font-size: 18px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats b.bad {
+    color: var(--danger);
+  }
+  .stats span {
+    font-size: 11.5px;
+    color: var(--ink-tertiary);
   }
 </style>

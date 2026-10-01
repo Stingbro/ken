@@ -2,7 +2,6 @@
   import type { Component } from "svelte";
   import { app, type Screen } from "../lib/app.svelte";
   import { review } from "../lib/review.svelte";
-  import { tasksStore } from "../lib/tasks.svelte";
   import { families } from "../lib/families.svelte";
   import FamilyTray from "../family/FamilyTray.svelte";
   import LayoutGrid from "@lucide/svelte/icons/layout-grid";
@@ -10,7 +9,6 @@
   import SquareCheck from "@lucide/svelte/icons/square-check";
   import Layers from "@lucide/svelte/icons/layers";
   import UsersRound from "@lucide/svelte/icons/users-round";
-  import Kanban from "@lucide/svelte/icons/kanban";
   import Network from "@lucide/svelte/icons/network";
   import Clock from "@lucide/svelte/icons/clock";
   import Mic from "@lucide/svelte/icons/mic";
@@ -19,18 +17,8 @@
 
   let familyTrayOpen = $state(false);
 
-  // Resolve the `kenTasks` flag as soon as (and only once) a workspace is
-  // open — the Tasks tab requires both (proposal: "workspace mode + kenTasks
-  // flag on"). `tasksStore.init()` is idempotent, so this just no-ops on
-  // every re-run after the first successful check.
-  $effect(() => {
-    if (app.workspace) void tasksStore.init();
-  });
-
-  // ken-families task 4.2: the notification tray is a standalone
-  // collaboration bus (proposal: "works with no workspace open"), so unlike
-  // `tasksStore` above it resolves its flag once at nav-rail mount rather
-  // than waiting on a workspace.
+  // The team inbox is always available; its button shows once at least one
+  // inbox repo is connected (set up in Settings).
   void families.init();
 
   const items: { key: Screen; icon: Component; label: string }[] = [
@@ -70,21 +58,7 @@
       {/if}
     </button>
   {/each}
-  {#if app.workspace && tasksStore.enabled}
-    <button
-      class:active={app.screen === "tasks"}
-      onclick={() => (app.screen = "tasks")}
-      title="Tasks"
-    >
-      <span class="icon"><Kanban size={16} strokeWidth={1.75} /></span>Tasks
-      {#if tasksStore.board.needsAttention.length > 0}
-        <span class="count" title="{tasksStore.board.needsAttention.length} tasks need attention">
-          {tasksStore.board.needsAttention.length}
-        </span>
-      {/if}
-    </button>
-  {/if}
-  {#if families.enabled}
+  {#if families.connections.length > 0}
     <button
       class:active={familyTrayOpen}
       onclick={() => (familyTrayOpen = !familyTrayOpen)}

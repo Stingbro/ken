@@ -285,7 +285,7 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
 <p class="note">A missing piece takes the digest's place, one row with a 2 border per piece: what is missing, what it stops, and one button. Nothing installs or downloads until a person presses it. Without Claude Code, stale rows open the page instead of offering Update, because Update drafts with it. Index health says the queue is waiting on the model, as in Wright 8c.</p>
 
 <!-- ───────────────────────── Y1 ───────────────────────── -->
-<h2 id="y1">Y1. Home as Your day. Your tasks in two lists, tickets and other; what Ken noticed in one line</h2>
+<h2 id="y1">Y1. Home as Your day. Your tickets and your other tasks, each with its state and target date</h2>
 <div class="page" style="height:880px">
   <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">inbox · 1</span><span class="chip dim">sync</span></div>
   <div class="rail"><div class="on">Home</div><div>Files</div><div>Review · 6</div><div>Ingest · 1</div><div>Team</div><div>Map</div><div>Timeline</div><div>Record</div><div class="bottom">Settings</div></div>
@@ -293,18 +293,17 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
     <div style="width:860px;margin:0 auto">
       <div class="hd"><b>Your day</b><span class="chip dim">ATT</span><span class="sp"></span><span class="btn">+ Task</span><span class="btn dim">Share</span></div>
       <div class="dg"><div class="dh"><b>Tuesday, September 30</b><span class="chip dim">07:30</span></div>
-        <p class="dp">ATT-014 is due tomorrow and still in progress. dee sent you the pilot checklist review, due Thursday. att-opmodel has 4 commits since yesterday in the scheduling service, and the Scheduling page still describes the old retry rule. 4WeekScope.md contradicts the Roadmap page on the pilot date.</p></div>
-      <div class="kn" style="display:flex;gap:8px;align-items:center;height:30px;margin-top:8px;font-size:12px;color:var(--soft)"><span style="font-size:11px;letter-spacing:1px;text-transform:uppercase">Ken noticed</span><span class="chip dim">1 ingest to confirm</span><span class="chip dim">1 page out of date</span><span class="chip dim">2 moved links</span><span class="chip dim">1 file not indexed</span><span class="sp" style="flex:1"></span><a style="color:var(--ink)">Review</a></div>
+        <p class="dp">ATT-014 has a target of tomorrow and is still in progress. dee sent you the pilot checklist review, for Thursday. att-opmodel has 4 commits since yesterday in the scheduling service, and the Scheduling page still describes the old retry rule. 4WeekScope.md contradicts the Roadmap page on the pilot date.</p></div>
 
-      <div class="div">tickets · 3<span class="sp"></span><span class="chip dim">assigned to me</span><span class="chip dim">all open</span></div>
-      <div class="tr"><span class="id">ATT-014</span><span class="tx"><b>Retry rule for the scheduler</b><span>att-opmodel · 2 tasks, 1 done</span></span><span class="st">in progress</span><span class="due">due Wed</span></div>
+      <div class="div">tickets · 3<span class="sp"></span><span>state</span><span style="width:64px;text-align:right">target</span></div>
+      <div class="tr"><span class="id">ATT-014</span><span class="tx"><b>Retry rule for the scheduler</b><span>att-opmodel · 2 tasks, 1 done</span></span><span class="st">in progress</span><span class="due">Wed</span></div>
       <div class="tr"><span class="id">ATT-011</span><span class="tx"><b>Pilot date agreed with the client</b><span>Project Docs · blocked on the client</span></span><span class="st">blocked</span><span class="due">Fri</span></div>
       <div class="tr"><span class="id">ATT-009</span><span class="tx"><b>MGO screen names match the glossary</b><span>mgo-designs</span></span><span class="st">todo</span><span class="due"></span></div>
 
-      <div class="div">other · 4<span class="sp"></span><span class="chip dim">open</span><span class="chip dim">done today</span></div>
+      <div class="div">other · 4<span class="sp"></span><span style="width:64px;text-align:right">target</span><span style="width:96px"></span></div>
       <div class="tk"><span class="cb"></span><span class="tx"><b>Review the pilot checklist</b><span>from dee · Project Docs/Pilot checklist.docx</span></span><span class="due">Thu</span><span class="btn">Accept ▾</span></div>
       <div class="tk"><span class="cb"></span><span class="tx"><b>Update the retry test for the new backoff</b><span>ATT-014 · retry.test.ts</span></span><span class="due">Wed</span><span></span></div>
-      <div class="tk"><span class="cb"></span><span class="tx"><b>Weekly wiki pass</b><span>Tuesdays</span></span><span class="due">today</span><span></span></div>
+      <div class="tk"><span class="cb"></span><span class="tx"><b>Weekly wiki pass</b><span>Tuesdays</span></span><span class="due">Tue</span><span></span></div>
       <div class="tk"><span class="cb"></span><span class="tx"><b>Ask sam which pilot sites go first</b><span>note</span></span><span class="due"></span><span></span></div>
       <div class="tk" style="color:var(--soft)"><span class="cb on"></span><span class="tx"><b style="font-weight:400;text-decoration:line-through">Read the 4-week scope</b><span>done 09:40</span></span><span class="due"></span><span></span></div>
 
@@ -323,12 +322,12 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
   </div>
   <div class="dock"><div class="v">chat · closed</div></div>
 </div>
-<p class="note">Home is renamed Your day. Under the digest, what Ken noticed is one line of counts, each opening Review filtered to that kind, because these are information and not all of them need an action today. Then your tasks, in two lists.</p>
-<p class="note">Tickets: the ticket files in the team's repos, one file per ticket (<code>tickets/ATT-014.md</code>, Wright's format), assigned to you by default, with All open as the other filter. A row is the id, the title over the repo it touches and how many of your tasks link to it, the status as the file states it, and the due date. The whole row opens the ticket in Files. No button: a ticket's status is changed in the ticket, not here. A team with no tickets folder shows no Tickets list.</p>
-<p class="note">Other: everything that is not a ticket. A task, a todo or a note, all the same thing: a title, and optionally a due date, a description, a repeat, and a link to a ticket, a file or a repo. The checkbox marks it done; done items stay greyed until the end of the day. A task sent by a teammate through the team inbox arrives here with Accept ▾ (Accept, Not mine, Reply) in place of the checkbox. Sorted by due date, then undated, then done. A task linked to a ticket shows the ticket id and is counted on the ticket's row above.</p>
+<p class="note">Home is renamed Your day: the digest, then your tasks in two lists. Each row shows what it is, the state it is in, and its target date. No filters, sorting controls or counts beyond the list heading. What Review, Ingest and drift hold stays on their own tabs, with the counts on the rail.</p>
+<p class="note">Tickets: the team's ticket files assigned to you (<code>tickets/ATT-014.md</code>, Wright's format), open ones only. A row is the id, the title over the repo it touches and how many of your tasks link to it, the state as the ticket file states it, and the target date. The row opens the ticket in Files. The state is changed in the ticket. A team with no tickets folder shows no Tickets list.</p>
+<p class="note">Other: tasks, todos and notes, all one thing: a title, and optionally a target date, a description, a repeat, and a link to a ticket, a file or a repo. The state is open or done, set with the checkbox; a done item stays greyed until the end of the day, then leaves the list. A task a teammate sent through the team inbox shows Accept ▾ (Accept, Not mine, Reply) until it is accepted. Ordered by target date, then the ones without one. A task linked to a ticket shows the ticket id.</p>
 
 <!-- ───────────────────────── Y1b ───────────────────────── -->
-<h2 id="y1b">Y1b. A task opened. Title, due, description, link</h2>
+<h2 id="y1b">Y1b. A task opened. Title, target date, description, link</h2>
 <div class="page" style="height:560px">
   <div class="tb"><span class="sw">ATT ▾</span><div class="search">search · Ctrl K</div><span class="chip dim">sync</span></div>
   <div class="rail"><div class="on">Home</div><div>Files</div><div>Review</div><div>Ingest</div><div>Team</div><div class="bottom">Settings</div></div>
@@ -337,12 +336,12 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
       <div>
         <div class="div" style="margin-top:0">other · 4</div>
         <div class="tk" style="background:var(--hi)"><span class="cb"></span><span class="tx"><b>Update the retry test for the new backoff</b><span>ATT-014 · retry.test.ts</span></span><span class="due">Wed</span><span></span></div>
-        <div class="tk"><span class="cb"></span><span class="tx"><b>Weekly wiki pass</b><span>Tuesdays</span></span><span class="due">today</span><span></span></div>
+        <div class="tk"><span class="cb"></span><span class="tx"><b>Weekly wiki pass</b><span>Tuesdays</span></span><span class="due">Tue</span><span></span></div>
         <div class="tk"><span class="cb"></span><span class="tx"><b>Ask sam which pilot sites go first</b><span>note</span></span><span class="due"></span><span></span></div>
       </div>
       <div class="rx" style="border-width:2px;height:470px;display:flex;flex-direction:column;gap:8px">
         <div style="display:flex;align-items:center;gap:8px"><span class="cb"></span><b style="font-size:14px">Update the retry test for the new backoff</b></div>
-        <div class="fl"><span>Due</span><span class="chip">Wed, Oct 1</span><span class="chip dim">clear</span></div>
+        <div class="fl"><span>Target</span><span class="chip">Wed, Oct 1</span><span class="chip dim">clear</span></div>
         <div class="fl"><span>Repeat</span><span class="chip dim">never ▾</span></div>
         <div class="fl"><span>Linked</span><span class="chip">ATT-014 ×</span><span class="chip">att-opmodel/src/retry.test.ts ×</span><span class="chip dim">+ link</span></div>
         <div class="fl"><span>For</span><span class="chip">me</span><span class="chip dim">send to a teammate ▾</span></div>
@@ -353,7 +352,7 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
     </div>
   </div>
 </div>
-<p class="note">A task opens in a panel beside the list. Every field saves as it changes. Linked takes tickets (by id), files and repos; a linked ticket lists the task under its ticket in Files. Send to a teammate moves it into the team inbox, and it leaves your list until they reply or it comes back. The last line says who last changed it, because the chat and other agents can change it too. + Task opens the same panel empty, with the cursor in the title and Enter to add.</p>
+<p class="note">A task opens in a panel beside the list. Every field saves as it changes. Target is a date or empty. Linked takes tickets (by id), files and repos; a linked ticket lists the task under its ticket in Files. Send to a teammate moves it into the team inbox, and it leaves your list until they reply or it comes back. The last line says who last changed it, because the chat and other agents can change it too. + Task opens the same panel empty, with the cursor in the title and Enter to add.</p>
 
 <!-- ───────────────────────── Y1c ───────────────────────── -->
 <h2 id="y1c">Y1c. A ticket opened. The file in Files, with your tasks for it</h2>
@@ -363,7 +362,7 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
   <div class="main">
     <div class="cols" style="grid-template-columns:220px 1fr 260px;gap:14px">
       <div><div class="div" style="margin-top:0">tickets</div><div class="entry" style="background:var(--hi)">ATT-014.md</div><div class="entry">ATT-011.md</div><div class="entry">ATT-009.md</div></div>
-      <div class="rx" style="height:420px"><span class="lb">tickets/ATT-014.md</span><b style="font-size:15px">Retry rule for the scheduler</b><br><span class="note">status: in progress · assignee: chris · due: 2026-10-01</span><br><br><b>What and Why</b><br>The scheduler retries a failed booking every 5 s forever…<br><br><b>How You Would Know It Worked</b><br>…</div>
+      <div class="rx" style="height:420px"><span class="lb">tickets/ATT-014.md</span><b style="font-size:15px">Retry rule for the scheduler</b><br><span class="note">status: in progress · assignee: chris · target: 2026-10-01</span><br><br><b>What and Why</b><br>The scheduler retries a failed booking every 5 s forever…<br><br><b>How You Would Know It Worked</b><br>…</div>
       <div><div class="div" style="margin-top:0">your tasks · 2<span class="sp"></span><a>+ Task</a></div>
         <div class="tk" style="grid-template-columns:18px 1fr 40px"><span class="cb"></span><span class="tx"><b>Update the retry test</b><span>Wed</span></span><span></span></div>
         <div class="tk" style="grid-template-columns:18px 1fr 40px;color:var(--soft)"><span class="cb on"></span><span class="tx"><b style="font-weight:400;text-decoration:line-through">Read retry.ts</b><span>done Mon</span></span><span></span></div>
@@ -379,15 +378,14 @@ table{border-collapse:collapse;font-size:12px;margin-top:8px}td,th{border:1px so
 <table>
 <tr><th>Part</th><th>Stored in</th><th>Shared</th></tr>
 <tr><td>Tickets</td><td>The team's repos, <code>tickets/&lt;ID&gt;.md</code>, read from the index. Ken does not write them</td><td>Yes, through git, as today</td></tr>
-<tr><td>Other</td><td><code>.ken-workspace/tasks/</code>, one markdown file per task: frontmatter <code>title, due, repeat, links, from, status</code> and the description as the body</td><td>No. Local to this machine</td></tr>
+<tr><td>Other</td><td><code>.ken-workspace/tasks/</code>, one markdown file per task: frontmatter <code>title, target, repeat, links, from, status</code> and the description as the body</td><td>No. Local to this machine</td></tr>
 <tr><td>A task from a teammate</td><td>Arrives through the team inbox repo; Accept copies it into <code>.ken-workspace/tasks/</code> with <code>from:</code></td><td>Its accept and done go back to the sender through the inbox</td></tr>
-<tr><td>Ken noticed</td><td>Not stored. Counts from Review, Ingest, drift and the index</td><td>No</td></tr>
 </table>
 <table>
 <tr><th>MCP tool</th><th>Does</th></tr>
-<tr><td><code>task_create</code></td><td>Adds a task: title, and optionally due, description, repeat, links</td></tr>
+<tr><td><code>task_create</code></td><td>Adds a task: title, and optionally target date, description, repeat, links</td></tr>
 <tr><td><code>task_update</code></td><td>Changes any of those fields, or marks it done or open</td></tr>
-<tr><td><code>task_list</code></td><td>Lists your tasks, open by default, with filters for due before, linked to a ticket, and done</td></tr>
+<tr><td><code>task_list</code></td><td>Lists your tasks, open by default, with filters for target before, linked to a ticket, and done</td></tr>
 <tr><td><code>ticket_list</code></td><td>Lists the team's tickets from the index, assigned to you by default. Read-only</td></tr>
 </table>
 <table>

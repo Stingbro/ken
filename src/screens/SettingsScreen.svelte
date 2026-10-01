@@ -780,7 +780,6 @@
       </section>
     {/if}
 
-    {#if families.enabled}
       <section class="group">
         <div class="group-head">Families</div>
         <div class="card">
@@ -1018,7 +1017,6 @@
           </div>
         </div>
       </section>
-    {/if}
 
     <section class="group">
       <div class="group-head">On this Mac</div>
