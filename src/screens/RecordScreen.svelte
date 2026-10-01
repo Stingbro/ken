@@ -33,7 +33,7 @@
       <h1>Record</h1>
       <p class="lead">
         Capture a meeting or a call. Ken keeps a private transcript — nothing
-        you say leaves your Mac.
+        you say leaves this computer.
       </p>
     </header>
 
@@ -91,7 +91,7 @@
       <div class="model-gate">
         <p class="model-gate-lead">
           Recording needs the on-device speech model. Download it once and Ken
-          will transcribe your recordings — nothing leaves your Mac.
+          will transcribe your recordings — nothing leaves this computer.
         </p>
         <ModelDownloadDialog
           status={record.modelStatus}
@@ -136,8 +136,8 @@
         <ProgressBar
           pct={record.transcribePct}
           label={record.transcribePct === null
-            ? "Transcribing on your Mac…"
-            : `Transcribing on your Mac… ${record.transcribePct}%`}
+            ? "Transcribing on this computer…"
+            : `Transcribing on this computer… ${record.transcribePct}%`}
         />
       </div>
     {/if}

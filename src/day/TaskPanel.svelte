@@ -4,9 +4,10 @@
   // task and the panel stays open on it.
   import { onMount, tick } from "svelte";
   import { api, type DayTask, type DayTaskPatch } from "../lib/api";
-  import { day } from "../lib/day.svelte";
+  import { day, memberNames } from "../lib/day.svelte";
   import { families } from "../lib/families.svelte";
-  import { linkLabel, localToday, repeatChoices, stampLabel } from "../lib/day";
+  import { linkLabel, localToday, repeatChoices, sendBody, splitTicketLink, stampLabel } from "../lib/day";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import X from "@lucide/svelte/icons/x";
   import Check from "@lucide/svelte/icons/check";
 
@@ -45,6 +46,7 @@
   });
 
   const links = $derived(task ? task.links : pendingLinks);
+  const repos = $derived(memberNames());
   const target = $derived(task ? (task.target ?? "") : pendingTarget);
   const repeat = $derived(task ? (task.repeat ?? "") : pendingRepeat);
   const anchor = $derived(target || localToday());
@@ -80,7 +82,26 @@
     if (key === "title" && title.trim() && title.trim() !== task.title) void save({ title: title.trim() });
     if (key === "description" && description !== task.description) void save({ description });
   }
-  $effect(() => () => Object.values(timers).forEach(clearTimeout));
+  function clearTimers() {
+    Object.values(timers).forEach(clearTimeout);
+    timers = {};
+  }
+  // Closing the panel or switching task saves what is still waiting. The
+  // prop may already read null by then, so keep the last task seen.
+  let lastTask: DayTask | null = null;
+  $effect(() => {
+    if (task) lastTask = task;
+  });
+  $effect(() => () => {
+    const t = lastTask;
+    const pending = { ...timers };
+    clearTimers();
+    if (!t) return;
+    const patch: DayTaskPatch = {};
+    if (pending.title && title.trim() && title.trim() !== t.title) patch.title = title.trim();
+    if (pending.description && description !== t.description) patch.description = description;
+    if (Object.keys(patch).length > 0) void day.update(t.id, patch).catch(() => {});
+  });
 
   function onTitleInput() {
     editing = "title";
@@ -92,9 +113,12 @@
     if (task) debounce("description", () => description !== task!.description && void save({ description }));
   }
 
+  let creating = $state(false);
+
   async function createFromTitle() {
     const t = title.trim();
-    if (!t) return;
+    if (!t || creating) return;
+    creating = true;
     error = null;
     try {
       const created = await day.create({
@@ -108,6 +132,8 @@
       day.openTask(created.id);
     } catch (e) {
       error = String(e);
+    } finally {
+      creating = false;
     }
   }
 
@@ -171,19 +197,35 @@
     ).then((lists) => (mates = lists.flat()));
   });
 
-  async function send() {
-    const mate = mates.find((m) => m.key === sendTo);
-    if (!task || !mate || sending) return;
+  const mate = $derived(mates.find((m) => m.key === sendTo) ?? null);
+
+  function confirmSend(e: MouseEvent) {
+    const to = mate;
+    if (!task || !to) return;
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openConfirm(r.left, r.bottom + 4, {
+      title: `Send to ${to.label}?`,
+      body: "It goes to their inbox and leaves your list.",
+      confirmLabel: "Send",
+      onConfirm: () => void send(to),
+    });
+  }
+
+  async function send(to: Mate) {
+    const t = task;
+    if (!t || sending) return;
     sending = true;
     error = null;
     try {
-      await api.familySend(mate.familyId, mate.memberId, "task", task.title, task.description);
-      await day.remove(task.id);
+      // The inbox carries a title and a body; the rest goes in the body.
+      await api.familySend(to.familyId, to.memberId, "task", title.trim() || t.title, sendBody({ ...t, description }));
+      clearTimers();
+      await day.remove(t.id);
+      sendTo = "";
     } catch (e) {
       error = String(e);
     } finally {
       sending = false;
-      sendTo = "";
     }
   }
 
@@ -209,6 +251,7 @@
   async function remove() {
     if (!task) return;
     try {
+      clearTimers();
       await day.remove(task.id);
     } catch (e) {
       error = String(e);
@@ -287,8 +330,9 @@
   <div class="field wrap">
     <span class="label">Linked</span>
     {#each links as l (l)}
-      <span class="chip" title={l}>
-        {linkLabel(l)}
+      {@const ticket = splitTicketLink(l, repos)}
+      <span class="chip" title={ticket ? `${ticket.id} in ${ticket.repo}` : l}>
+        {linkLabel(l, repos)}
         <button class="x" aria-label="Remove {l}" onclick={() => removeLink(l)}><X size={11} strokeWidth={2} /></button>
       </span>
     {/each}
@@ -318,16 +362,13 @@
       <span class="label">For</span>
       <span class="chip on">me</span>
       {#if mates.length > 0}
-        <select
-          class="send"
-          bind:value={sendTo}
-          aria-label="Send to a teammate"
-          disabled={sending}
-          onchange={() => void send()}
-        >
+        <select class="send" bind:value={sendTo} aria-label="Send to a teammate" disabled={sending}>
           <option value="">send to a teammate</option>
           {#each mates as m (m.key)}<option value={m.key}>{m.label}</option>{/each}
         </select>
+        {#if mate}
+          <button class="btn btn-small" disabled={sending} onclick={confirmSend}>Send</button>
+        {/if}
       {/if}
     </div>
   {/if}
@@ -357,7 +398,7 @@
   {:else}
     <div class="actions">
       <span class="sp"></span>
-      <button class="btn btn-small btn-primary" disabled={!title.trim()} onclick={() => void createFromTitle()}>Add</button>
+      <button class="btn btn-small btn-primary" disabled={!title.trim() || creating} onclick={() => void createFromTitle()}>Add</button>
     </div>
   {/if}
 </aside>

@@ -821,7 +821,7 @@ pub fn inbox_item_file_name(id: &str, kind: InboxKind, title: &str) -> String {
 
 /// The fields a sender supplies. `id` is caller-supplied-or-generated so
 /// tests stay deterministic (the convention `memory.rs` set for dates and
-/// `tasks::NewTask` for ids).
+/// `day::create_task` follows for ids).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NewInboxItem {
@@ -1073,8 +1073,8 @@ pub struct AcceptedTask {
 /// production) and the clock, keeping this deterministic under test.
 ///
 /// Refuses anything that isn't a live task item. This is the trust
-/// boundary: nothing from a family repo reaches a board, a daily board, or
-/// an agent's claimable queue except through this function, and this
+/// boundary: nothing from a family repo reaches my board (and so Your day)
+/// except through this function, and this
 /// function is only ever called by an explicit user action (D4, locked: no
 /// auto-accept in v1).
 pub fn accept_task(
@@ -1122,9 +1122,8 @@ pub fn accept_task(
     let mut edits: Vec<(&str, Vec<String>)> = vec![
         ("id", tasks::scalar_lines("id", task_id)),
         ("title", tasks::scalar_lines("title", title)),
-        // Accepted work lands in the intake column, not in progress —
-        // acceptance is "this is mine now", not "I started it".
-        ("status", tasks::scalar_lines("status", tasks::TaskStatus::Backlog.as_str())),
+        // Acceptance is "this is mine now": an open task on Your day.
+        ("status", tasks::scalar_lines("status", crate::day::DayTaskState::Open.as_str())),
         ("kind", tasks::scalar_lines("kind", kind.as_str())),
         // D5: family board tasks carry manifest member ids in `assignee`.
         ("assignee", tasks::scalar_lines("assignee", member_id)),
@@ -1138,7 +1137,6 @@ pub fn accept_task(
     if !item.from.trim().is_empty() {
         edits.push(("from", tasks::scalar_lines("from", item.from.trim())));
     }
-    edits.push(("board", tasks::scalar_lines("board", tasks::BoardKind::Main.as_str())));
     edits.push(("created", tasks::scalar_lines("created", today)));
     edits.push(("updated", tasks::scalar_lines("updated", today)));
 
@@ -1790,24 +1788,27 @@ mod tests {
         // The new task is entirely inside the accepting member's own lane.
         assert!(lane_check("owner", &out.board_rel_path, true).is_ok());
 
-        let task = tasks::parse_task(
+        let task = crate::day::parse_task(
             Path::new(&out.board_rel_path),
-            tasks::HomeKind::Project,
-            "ken",
+            tasks::HomeKind::Family,
             &out.board_content,
+            "2026-08-03",
         );
         assert_eq!(task.id, "01TASK");
         assert_eq!(task.title, "Review the sync loop");
-        assert_eq!(task.status, Some(tasks::TaskStatus::Backlog));
-        assert_eq!(task.assignee, "owner");
-        assert_eq!(task.project, "ken");
-        assert_eq!(task.tags, vec!["review".to_string(), "sync".to_string()]);
-        assert_eq!(task.due.as_deref(), Some("2026-08-10"));
-        assert_eq!(task.created, "2026-08-03");
-        assert!(task.body.contains(tasks::LOG_HEADING));
-        assert!(task.body.contains("01ITEM"));
-        assert!(task.body.contains("sarah"));
-        assert!(task.body.contains("Focus on the non-fast-forward retry."));
+        assert_eq!(task.state, crate::day::DayTaskState::Open);
+        assert_eq!(task.status_raw, "open");
+        assert!(out.board_content.contains("assignee: owner\n"));
+        assert!(out.board_content.contains("project: ken\n"));
+        assert!(out.board_content.contains("tags:\n  - review\n  - sync\n"));
+        assert!(!out.board_content.contains("board:"), "no board key: {}", out.board_content);
+        assert_eq!(task.target.as_deref(), Some("2026-08-10"), "due reads as the target");
+        assert_eq!(task.from.as_deref(), Some("sarah"));
+        assert_eq!(task.created.as_deref(), Some("2026-08-03"));
+        assert!(task.description.contains(tasks::LOG_HEADING));
+        assert!(task.description.contains("01ITEM"));
+        assert!(task.description.contains("sarah"));
+        assert!(task.description.contains("Focus on the non-fast-forward retry."));
 
         let item = parse_inbox_item("01ITEM-review-the-sync-loop.md", &out.inbox_content);
         assert_eq!(item.status, Some(InboxStatus::Accepted));

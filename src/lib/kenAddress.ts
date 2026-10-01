@@ -71,7 +71,7 @@ export function unopenableReason(address: string): string | null {
  *   it — activation of the pseudo-member happens once, on workspace open
  *   (task 2.1), not via focus.
  * - Forcing focus onto it while it IS resident (it always is, once a
- *   workspace with `kenMemory` on has been opened) doesn't error — it's a
+ *   workspace has been opened) doesn't error — it's a
  *   `contains_key` hit — but `WorkspaceOverviewDto.members` is built from
  *   `ws.ws.members` alone, which excludes it, so
  *   `AppStore.loadFocusedMemberState` finds no matching roster entry and

@@ -2540,6 +2540,7 @@ dependencies = [
 name = "ken-mcp"
 version = "0.2.1"
 dependencies = [
+ "chrono",
  "ken-core",
  "serde",
  "serde_json",

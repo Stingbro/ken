@@ -139,7 +139,7 @@
     {/each}
 
     {#if review.items.length === 0}
-      <div class="empty-list">Nothing waiting — you're all caught up.</div>
+      <div class="empty-list">Nothing waiting.</div>
     {/if}
 
     {#each review.items as it (it.id)}
@@ -222,11 +222,10 @@
     {:else if review.items.length === 0}
       <div class="empty">
         <div class="empty-card">
-          <h2>Nothing needs you right now</h2>
+          <h2>Nothing waiting</h2>
           <p>
-            When Ken holds a big refresh for approval, notices a document
-            going stale, or hits a file it can't read, it lands here — one
-            place for everything waiting on you.
+            Proposed page changes, stale documents, files Ken could not read
+            and edit conflicts show here.
           </p>
         </div>
       </div>

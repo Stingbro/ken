@@ -22,7 +22,7 @@ use ken_core::family_sync::{self, ConnectionState, GitTransport, PendingWrite, S
 use ken_core::memory;
 use ken_core::profiler::{self, ProjectProfile};
 use ken_core::project::Project;
-use ken_core::registry::{self, Registry, RegistryEntry};
+use ken_core::registry::{self, Registry};
 use ken_core::routing::{self, MemberHits, MemberInfo, MemberStatus, RouteReason};
 use ken_core::search::Source;
 use ken_core::settings::AppSettings;
@@ -467,7 +467,7 @@ name). Returns the new task's id.",
                     "target": { "type": "string", "description": "Target date, YYYY-MM-DD." },
                     "description": { "type": "string", "description": "Markdown description (the file's body)." },
                     "repeat": { "type": "string", "description": "daily, weekdays, weekly:mon … weekly:sun, or monthly:<1-31>. Omit for a one-off." },
-                    "links": { "type": "array", "items": { "type": "string" }, "description": "Ticket ids, file paths or repo names this task is about." }
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "Tickets (<repo>/<ID>, or a bare <ID> for that id in any repo), file paths or repo names this task is about." }
                 },
                 "required": ["title"]
             }
@@ -505,7 +505,7 @@ ticket id.",
                 "properties": {
                     "state": { "type": "string", "enum": ["open", "done", "all"], "description": "Default open." },
                     "target_before": { "type": "string", "description": "Only tasks with a target before this date, YYYY-MM-DD." },
-                    "linked": { "type": "string", "description": "Only tasks linked to this ticket id." }
+                    "linked": { "type": "string", "description": "Only tasks linked to this ticket: <repo>/<ID>, or a bare <ID> for that id in any repo." }
                 }
             }
         }));
@@ -1617,22 +1617,19 @@ impl FamilyBoardHome {
 }
 
 /// The task homes for one call, owned so borrowed `TaskHome`s can be built
-/// from them: the workspace home (where new tasks go), every registered
-/// project's older `.ken/tasks/`, and the family boards.
+/// from them: the workspace home (where new tasks go) and the boards of
+/// the families attached to this workspace. A repo's own `.ken/tasks/` is
+/// not a home (tasks live in your own folder, not in a team repo).
 struct TaskHomes {
     workspace_root: PathBuf,
-    projects: Vec<RegistryEntry>,
     family_boards: Vec<FamilyBoardHome>,
 }
 
 impl TaskHomes {
     fn homes(&self, only_mine: bool) -> Vec<tasks::TaskHome<'_>> {
         let mut out = vec![tasks::TaskHome::Workspace { workspace_root: &self.workspace_root }];
-        for p in &self.projects {
-            out.push(tasks::TaskHome::Project { project_root: &p.path, project: &p.name });
-        }
         for fb in self.family_boards.iter().filter(|fb| !only_mine || fb.is_mine()) {
-            out.push(tasks::TaskHome::Family { board_dir: &fb.board_dir, family_name: &fb.family_name });
+            out.push(tasks::TaskHome::Family { board_dir: &fb.board_dir });
         }
         out
     }
@@ -1645,21 +1642,13 @@ impl TaskHomes {
         self.family_boards.iter().find(|fb| fb.board_dir == task.home_dir)
     }
 
-    /// The `ken://` host for a task: the workspace pseudo-host, the owning
-    /// project's registry id, or the family id.
+    /// The `ken://` host for a task: the family id for a board task, else
+    /// the workspace pseudo-host.
     fn host_for(&self, task: &day::DayTask) -> String {
-        if let Some(fb) = self.family_origin(task) {
-            return fb.family_id.to_string();
+        match self.family_origin(task) {
+            Some(fb) => fb.family_id.to_string(),
+            None => memory::WORKSPACE_ADDRESS_ID.to_string(),
         }
-        if task.home == tasks::HomeKind::Workspace {
-            return memory::WORKSPACE_ADDRESS_ID.to_string();
-        }
-        for p in &self.projects {
-            if tasks::project_tasks_dir(&p.path) == task.home_dir {
-                return p.id.to_string();
-            }
-        }
-        memory::WORKSPACE_ADDRESS_ID.to_string()
     }
 
     fn address_for(&self, task: &day::DayTask) -> String {
@@ -1667,14 +1656,41 @@ impl TaskHomes {
     }
 }
 
+/// Is this family one Your day reads for workspace `workspace_id`? The
+/// app's `day_families` rule: a connection saved in settings
+/// (`familyConnections`) that is attached to this workspace or to none. A
+/// clone on disk with no saved connection is not read.
+fn family_attached_to(settings: &AppSettings, family_id: &str, dir_name: &str, workspace_id: Option<Uuid>) -> bool {
+    let Some(conns) = settings.extra.get("familyConnections").and_then(Value::as_array) else {
+        return false;
+    };
+    conns.iter().filter_map(Value::as_object).any(|c| {
+        let id_matches = c
+            .get("familyId")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.eq_ignore_ascii_case(family_id) || v.eq_ignore_ascii_case(dir_name));
+        let attached = match c.get("attachedWorkspaceId") {
+            None | Some(Value::Null) => true,
+            Some(v) => v
+                .as_str()
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .is_some_and(|id| Some(id) == workspace_id),
+        };
+        id_matches && attached
+    })
+}
+
 fn resolve_task_homes(server: &Server) -> Result<TaskHomes, String> {
     let workspace_root = resolve_workspace_root(server)?;
-    let registry = Registry::load(&server.base_dir)
-        .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let workspace_id = Registry::load(&server.base_dir).ok().and_then(|r| r.last_workspace);
+    let settings = AppSettings::load(&server.base_dir);
     let mut family_boards = Vec::new();
     for conn in discover_family_connections(server) {
         if conn.manifest.check_supported().is_err() {
             continue; // "needs a newer Ken": no sync, ingest, or write (spec)
+        }
+        if !family_attached_to(&settings, &conn.manifest.id.to_string(), &conn.dir_name, workspace_id) {
+            continue; // attached to another workspace, or no longer connected
         }
         for member in &conn.manifest.members {
             let board_dir = family::board_dir(&conn.clone_root, &member.id);
@@ -1691,15 +1707,22 @@ fn resolve_task_homes(server: &Server) -> Result<TaskHomes, String> {
             });
         }
     }
-    Ok(TaskHomes { workspace_root, projects: registry.projects, family_boards })
+    Ok(TaskHomes { workspace_root, family_boards })
 }
 
-/// `(today, now)` for a task write: UTC, like every other date ken-mcp
-/// writes (see `today_and_time_utc`).
+/// `(today, now)` for a task read or write, in local time like the app's
+/// `local_date_today`/`local_stamp_now`: `YYYY-MM-DD` and
+/// `YYYY-MM-DDTHH:MM`. Local, not UTC, because Your day's "today" (done
+/// on, done-today-stays-listed, a recurring task's day) is the user's day.
 fn task_clock() -> (String, String) {
-    let (today, hhmm) = today_and_time_utc();
-    let now = format!("{today}T{hhmm}");
-    (today, now)
+    task_clock_at(chrono::Local::now())
+}
+
+fn task_clock_at<Tz: chrono::TimeZone>(at: chrono::DateTime<Tz>) -> (String, String)
+where
+    Tz::Offset: std::fmt::Display,
+{
+    (at.format("%Y-%m-%d").to_string(), at.format("%Y-%m-%dT%H:%M").to_string())
 }
 
 fn str_list(args: &Value, key: &str) -> Option<Vec<String>> {
@@ -1783,9 +1806,14 @@ fn task_update_tool(server: &Server, args: &Value) -> Result<String, String> {
     let updated = day::parse_task(&task.path, task.home, &raw, &today);
     let address = homes.address_for(&updated);
     let mut msg = format!("Updated task {}", task_line(&updated, &address));
-    if state == Some(day::DayTaskState::Done) {
+    // Journal the change to done only: a repeated "done" on a task that
+    // already was done writes no second entry.
+    if state == Some(day::DayTaskState::Done)
+        && task.state != day::DayTaskState::Done
+        && updated.state == day::DayTaskState::Done
+    {
         let line = day::journal_line(&updated, &homes.host_for(&updated));
-        let (_, time_hhmm) = today_and_time_utc();
+        let time_hhmm = now.get(11..16).unwrap_or("00:00").to_string();
         match memory::append_journal(&homes.workspace_root, &line, None, &[], &today, &time_hhmm) {
             Ok(_) => msg.push_str(" Journal entry recorded."),
             Err(e) => msg.push_str(&format!(" (warning: could not write the journal entry: {e})")),
@@ -1869,7 +1897,7 @@ you. Pass assignee \"all\" to list every ticket."
     found.sort_by(|a, b| day::ticket_order(&a.0, &b.0));
     let mut out = format!("{} ticket{}:\n", found.len(), if found.len() == 1 { "" } else { "s" });
     for (t, repo, pid) in &found {
-        let (n, done) = day::linked_counts(&tasks_all, &t.id);
+        let (n, done) = day::linked_counts(&tasks_all, Some(repo.as_str()), &t.id);
         let mut parts = vec![if t.state.is_empty() { "no status".to_string() } else { t.state.clone() }];
         parts.push(format!("repo {repo}"));
         if let Some(d) = &t.target {
@@ -2088,11 +2116,16 @@ fn find_family_connection(server: &Server, family_arg: &str) -> Result<FamilyCon
         })
 }
 
-/// Which member this call acts as for `conn`: an explicit `as` argument
-/// (validated against the manifest) if given, else the connection's
-/// resolved identity, else a clear error telling the caller how to supply
-/// one (family_list's members list is where to find valid ids).
+/// Which member this call acts as for `conn`: the connection's resolved
+/// identity when there is one; only without one, an explicit `as`
+/// argument (validated against the manifest); else a clear error telling
+/// the caller how to supply one (family_list's members list is where to
+/// find valid ids).
 fn resolve_family_identity(conn: &FamilyConnection, as_arg: Option<&str>) -> Result<String, String> {
+    // A configured identity wins: `as` is only for a device that has none.
+    if let Some(me) = &conn.my_member_id {
+        return Ok(me.clone());
+    }
     if let Some(explicit) = as_arg {
         let explicit = explicit.trim();
         if !conn.manifest.has_member(explicit) {
@@ -2104,22 +2137,21 @@ fn resolve_family_identity(conn: &FamilyConnection, as_arg: Option<&str>) -> Res
         }
         return Ok(explicit.to_string());
     }
-    conn.my_member_id.clone().ok_or_else(|| {
-        format!(
-            "This device's member identity in family \"{}\" is not configured yet. \
+    Err(format!(
+        "This device's member identity in family \"{}\" is not configured yet. \
 Pass \"as\" with one of this family's member ids ({}) to say who you are.",
-            conn.manifest.name,
-            conn.manifest.member_ids().join(", ")
-        )
-    })
+        conn.manifest.name,
+        conn.manifest.member_ids().join(", ")
+    ))
 }
 
 fn opt_str(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
-/// Task 3.4's enforcement point: may this device, acting as `identity` (an
-/// explicit `as` argument if given, else `fb.my_member_id`), write to
+/// Task 3.4's enforcement point: may this device, acting as `identity`
+/// (`fb.my_member_id`, or an explicit `as` argument only when none is
+/// configured), write to
 /// `fb`'s board? Delegates to `family::lane_check` itself — the same
 /// function `commit_paths` runs on every real family commit — so a claim
 /// aimed at a teammate's board is refused by the lane rules, not by a
@@ -2131,7 +2163,9 @@ fn family_authorize_write(
     file_name: &str,
     as_arg: Option<&str>,
 ) -> Result<(String, String), String> {
-    let identity = as_arg.map(str::to_string).or_else(|| fb.my_member_id.clone()).ok_or_else(|| {
+    // A configured identity is who this device is; `as` only fills the gap
+    // when none is configured, so it cannot be used to write as someone else.
+    let identity = fb.my_member_id.clone().or_else(|| as_arg.map(str::to_string)).ok_or_else(|| {
         format!(
             "cannot write to family \"{}\"'s board — this device's member identity for that \
 family isn't configured yet; pass \"as\" with your member id",
@@ -3519,6 +3553,20 @@ mod tests {
             let workspace = ken_core::workspace::Workspace::create(ws_parent.path(), "WS", &[]).unwrap();
             registry.add_workspace(&workspace, None, 0);
             registry.last_workspace = Some(workspace.config.id);
+            // The app's saved connection: this device is "owner", attached
+            // to no workspace (so every workspace reads it).
+            let mut settings = AppSettings::default();
+            settings.extra.insert(
+                "familyConnections".into(),
+                json!([{
+                    "familyId": family_id.to_string(),
+                    "name": "Test Family",
+                    "remoteUrl": bare.to_string_lossy(),
+                    "memberId": "owner",
+                    "attachedWorkspaceId": null,
+                }]),
+            );
+            settings.save(base.path()).unwrap();
         }
         registry.save(base.path()).unwrap();
 
@@ -3690,5 +3738,51 @@ project: ''\ntags: []\nboard: main\ncreated: '2026-08-01'\nupdated: '2026-08-01'
         assert!(owner_raw.contains("status: done"), "{owner_raw}");
         assert!(owner_raw.contains("kind: human"), "{owner_raw}");
         assert!(owner_raw.contains("title: \"Owner's task\"") || owner_raw.contains("title: Owner's task"), "{owner_raw}");
+        assert!(ok_text.contains("Journal entry recorded."), "{ok_text}");
+
+        // Done again: no state change, so no second journal entry.
+        let (again, again_err) = tool(&mut server, "task_update", json!({"id": "01OWNERTASK", "state": "done"}));
+        assert!(!again_err, "{again}");
+        assert!(!again.contains("Journal entry recorded."), "{again}");
+
+        // This device is "owner" (configured): `as` cannot make it sarah.
+        let (as_text, as_err) = tool(
+            &mut server,
+            "task_update",
+            json!({"id": "01SARAHTASK", "state": "done", "as": "sarah"}),
+        );
+        assert!(as_err, "{as_text}");
+        assert!(as_text.contains("refused"), "{as_text}");
+        assert_eq!(before, std::fs::read_to_string(&sarah_path).unwrap());
+
+        // A family attached to another workspace is not read.
+        let mut settings = AppSettings::load(&server.base_dir);
+        settings.extra["familyConnections"][0]["attachedWorkspaceId"] = json!(Uuid::new_v4().to_string());
+        settings.save(&server.base_dir).unwrap();
+        let (list_text, _) = tool(&mut server, "task_list", json!({"state": "all"}));
+        assert!(!list_text.contains("Owner's task"), "{list_text}");
+        let (gone, gone_err) = tool(&mut server, "task_update", json!({"id": "01OWNERTASK", "state": "open"}));
+        assert!(gone_err && gone.contains("no task with id"), "{gone}");
+    }
+
+    #[test]
+    fn task_stamps_are_local_and_parse_as_your_day_dates() {
+        use chrono::TimeZone;
+        // A fixed instant in a zone east of UTC: early morning there is
+        // still yesterday in UTC, and the stamp must say the local day.
+        let tz = chrono::FixedOffset::east_opt(10 * 3600).unwrap();
+        let at = tz.with_ymd_and_hms(2026, 10, 1, 7, 30, 0).unwrap();
+        assert_eq!(task_clock_at(at), ("2026-10-01".to_string(), "2026-10-01T07:30".to_string()));
+        let utc_view = task_clock_at(at.with_timezone(&chrono::Utc));
+        assert_eq!(utc_view, ("2026-09-30".to_string(), "2026-09-30T21:30".to_string()));
+
+        // What the app writes, day.rs reads: `today` is a strict date, and
+        // `now` reads as the same day.
+        let (today, now) = task_clock();
+        assert!(day::is_date(&today), "{today}");
+        assert_eq!(now.len(), 16, "{now}");
+        assert_eq!(&now[10..11], "T");
+        assert_eq!(day::Ymd::parse(&now), day::Ymd::parse(&today));
+        assert_eq!(today, chrono::Local::now().format("%Y-%m-%d").to_string());
     }
 }

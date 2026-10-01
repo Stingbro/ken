@@ -662,17 +662,6 @@ export interface McpInfo {
   llmInstruction: string;
 }
 
-/** One day's digest, parsed for the Home card. */
-export interface DigestDto {
-  /** Local calendar day, yyyy-mm-dd. */
-  date: string;
-  body: string;
-  sources: string[];
-  generatedAt: number;
-  /** Set on member-scoped emits of `digest-updated` (S9 step 5). */
-  project_id?: string;
-}
-
 /** A ⌘K quick answer, tied to the query it answered. */
 export interface QuickAnswer {
   query: string;
@@ -1265,31 +1254,6 @@ export interface ProjectGroup {
   projectIds: string[];
 }
 
-/** One member's stored digest for the day, parsed. Mirrors
- *  `MemberDigestDto`. */
-export interface MemberDigest {
-  projectId: string;
-  name: string;
-  body: string;
-  sources: string[];
-}
-
-/** A member with no digest stored for the day — named rather than
- *  dropped, so Home never silently omits a project. */
-export interface MemberAwaitingDigest {
-  projectId: string;
-  name: string;
-}
-
-/** Mirrors `WorkspaceDigestDto`. `hasContent` is false when nothing has
- *  been written — `awaiting` alone is something to explain, not to render. */
-export interface WorkspaceDigest {
-  date: string;
-  members: MemberDigest[];
-  awaiting: MemberAwaitingDigest[];
-  hasContent: boolean;
-}
-
 /** Mirrors `MemberOverviewDto`. `status` is `ok` | `missing` | `invalid`;
  *  `missing`/`invalid` members carry no project id or counts, and are
  *  surfaced nowhere else in the app. */
@@ -1547,7 +1511,6 @@ export const api = {
   /** Done with an ingest: its source moves beside its note. Returns where. */
   ingestFile: (itemId: number, team: string | null = null) => invoke<string>("ingest_file", { itemId, team }),
   /** The last drift sweep (null before the first). */
-  driftStatus: (projectId: string | null = null) => invoke<DriftRun | null>("drift_status", { projectId }),
   /** Run the drift sweep now. */
   runDriftNow: (projectId: string | null = null) => invoke<DriftRun | null>("run_drift_now", { projectId }),
   /** The Team screen for the chosen team. */
@@ -1697,15 +1660,6 @@ export const api = {
     invoke<string[]>("workspace_ignore_candidate", { folder }),
   workspaceUnignoreCandidate: (folder: string) =>
     invoke<string[]>("workspace_unignore_candidate", { folder }),
-  /** Every manifest member's already-stored digest for the day. Composes
-   *  only — never generates, schedules,
-   *  or refreshes a member's digest. Requires `workspace`. */
-  workspaceDigest: (day?: string) =>
-    invoke<WorkspaceDigest>("workspace_digest", { day: day ?? null }),
-  /** Per-member state for Home's members strip, covering EVERY manifest
-   *  member including unresolvable ones. Requires `workspace`. */
-  workspaceMembersOverview: () =>
-    invoke<MemberOverview[]>("workspace_members_overview"),
   readFile: (relPath: string) => invoke<string>("read_file", { relPath }),
   readFileBytes: (relPath: string) =>
     invoke<ArrayBuffer>("read_file_bytes", { relPath }),
@@ -1878,8 +1832,6 @@ export const api = {
   claudeDoctor: () => invoke<ClaudeDoctor>("claude_doctor"),
   mcpInfo: () => invoke<McpInfo>("mcp_info"),
 
-  currentDigest: () => invoke<DigestDto | null>("current_digest"),
-  refreshDigest: () => invoke<void>("refresh_digest"),
   quickAnswer: (query: string) => invoke<boolean>("quick_answer", { query }),
   /** Search found nothing that answers: a read-only Claude session looks
    *  through the workspace's folders itself and answers with ken:// sources. */
@@ -1915,8 +1867,7 @@ export const api = {
   // ---- Memory (ken-memory task 4.1) ----
   /** Create (`"create"`, slug must not exist) or replace (`"replace"`, slug
    *  must exist) a memory at workspace scope (`.ken-workspace/memory/`) or
-   *  project scope (the focused member's `.ken/memory/`). Flag-gated on
-   *  `kenMemory`; rejects with a friendly message when the flag is off. */
+   *  project scope (the focused member's `.ken/memory/`). */
   memoryWrite: (
     scope: "workspace" | "project",
     slug: string,
@@ -2047,12 +1998,6 @@ export const api = {
     fn: (ev: KenignoreWarning) => void,
   ): Promise<UnlistenFn> =>
     listen<KenignoreWarning>("kenignore-warning", (e) => fn(e.payload)),
-  onDigestUpdated: (fn: (digest: DigestDto) => void): Promise<UnlistenFn> =>
-    listen<DigestDto>("digest-updated", (e) => fn(e.payload)),
-  onDigestGenerating: (fn: () => void): Promise<UnlistenFn> =>
-    listen<null>("digest-generating", () => fn()),
-  onDigestError: (fn: (message: string) => void): Promise<UnlistenFn> =>
-    listen<string>("digest-error", (e) => fn(e.payload)),
   onQuickAnswer: (fn: (answer: QuickAnswer) => void): Promise<UnlistenFn> =>
     listen<QuickAnswer>("quick-answer", (e) => fn(e.payload)),
   onQuickAnswerDelta: (fn: (ev: QuickAnswerDelta) => void): Promise<UnlistenFn> =>
@@ -2232,7 +2177,7 @@ export const api = {
    *  one commit. The ONLY way an incoming task can ever enter the board —
    *  there is no auto-accept path anywhere in this API. */
   familyAcceptTask: (familyId: string, itemId: string) =>
-    invoke<unknown>("family_accept_task", { familyId, itemId }),
+    invoke<DayTask>("family_accept_task", { familyId, itemId }),
   /** Push back on an inbox item: creates a new message item in the
    *  SENDER's inbox (lane rule 2) and leaves the original item's status
    *  untouched — call `familySetItemStatus` separately if you also want to

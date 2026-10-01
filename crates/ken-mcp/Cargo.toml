@@ -11,6 +11,8 @@ ken-core = { path = "../ken-core", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+# Local dates for task stamps: the same `chrono::Local` the app uses.
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

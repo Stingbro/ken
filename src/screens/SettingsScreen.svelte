@@ -685,87 +685,85 @@
       </section>
     {/if}
 
-    {#if memory.enabled}
-      <section class="group">
-        <div class="group-head">Memory</div>
-        <div class="card">
-          <div class="card-title">Journal distillation</div>
-          <p class="note">
-            Ken can review the workspace journal and draft candidate
-            long-term memories from anything that keeps recurring. Nothing
-            is written to <span class="mono small">memory/</span> until you
-            approve a candidate below.
-          </p>
+    <section class="group">
+      <div class="group-head">Memory</div>
+      <div class="card">
+        <div class="card-title">Journal distillation</div>
+        <p class="note">
+          Ken can review the workspace journal and draft candidate
+          long-term memories from anything that keeps recurring. Nothing
+          is written to <span class="mono small">memory/</span> until you
+          approve a candidate below.
+        </p>
 
-          {#if memory.phase === "planning" || memory.phase === "distilling"}
-            <div class="row">
-              <span class="mini-spinner" aria-hidden="true"></span>
-              <span class="soft">
-                {memory.phase === "planning" ? "Reading the journal…" : "Drafting candidates…"}
-              </span>
+        {#if memory.phase === "planning" || memory.phase === "distilling"}
+          <div class="row">
+            <span class="mini-spinner" aria-hidden="true"></span>
+            <span class="soft">
+              {memory.phase === "planning" ? "Reading the journal…" : "Drafting candidates…"}
+            </span>
+          </div>
+        {/if}
+
+        {#if memory.phase === "error" && memory.errorReason}
+          <p class="note warn">Distillation failed: {memory.errorReason}</p>
+        {/if}
+
+        <div class="row">
+          <button
+            class="btn btn-small"
+            onclick={() => void memory.distill()}
+            disabled={memory.phase === "planning" || memory.phase === "distilling"}
+          >
+            {memory.phase === "planning" || memory.phase === "distilling"
+              ? "Distilling…"
+              : "Distill journal"}
+          </button>
+        </div>
+      </div>
+
+      {#each memory.candidates as c (c.slug)}
+        <div class="card">
+          <div class="card-title">{c.slug}</div>
+          <div class="row">
+            <span class="chip mono">.ken-workspace/memory/{c.slug}.md</span>
+          </div>
+          {#if c.description}
+            <p class="note">{c.description}</p>
+          {/if}
+          <pre class="memory-body">{bodyPreview(c.body)}</pre>
+          {#if c.sources.length > 0}
+            <div class="row"><span class="label">Sources</span></div>
+            <div class="folders">
+              {#each c.sources as src (src)}
+                {@const reason = unopenableReason(toWorkspaceAddress(src))}
+                <div class="folder ignored">
+                  <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>
+                    {src}
+                  </span>
+                </div>
+              {/each}
             </div>
           {/if}
-
-          {#if memory.phase === "error" && memory.errorReason}
-            <p class="note warn">Distillation failed: {memory.errorReason}</p>
-          {/if}
-
           <div class="row">
             <button
               class="btn btn-small"
-              onclick={() => void memory.distill()}
-              disabled={memory.phase === "planning" || memory.phase === "distilling"}
+              onclick={() => void memory.resolve(c.slug, true)}
+              disabled={memory.resolvingSlug === c.slug}
             >
-              {memory.phase === "planning" || memory.phase === "distilling"
-                ? "Distilling…"
-                : "Distill journal"}
+              Approve
+            </button>
+            <button
+              class="btn btn-small"
+              onclick={() => void memory.resolve(c.slug, false)}
+              disabled={memory.resolvingSlug === c.slug}
+            >
+              Dismiss
             </button>
           </div>
         </div>
-
-        {#each memory.candidates as c (c.slug)}
-          <div class="card">
-            <div class="card-title">{c.slug}</div>
-            <div class="row">
-              <span class="chip mono">.ken-workspace/memory/{c.slug}.md</span>
-            </div>
-            {#if c.description}
-              <p class="note">{c.description}</p>
-            {/if}
-            <pre class="memory-body">{bodyPreview(c.body)}</pre>
-            {#if c.sources.length > 0}
-              <div class="row"><span class="label">Sources</span></div>
-              <div class="folders">
-                {#each c.sources as src (src)}
-                  {@const reason = unopenableReason(toWorkspaceAddress(src))}
-                  <div class="folder ignored">
-                    <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>
-                      {src}
-                    </span>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-            <div class="row">
-              <button
-                class="btn btn-small"
-                onclick={() => void memory.resolve(c.slug, true)}
-                disabled={memory.resolvingSlug === c.slug}
-              >
-                Approve
-              </button>
-              <button
-                class="btn btn-small"
-                onclick={() => void memory.resolve(c.slug, false)}
-                disabled={memory.resolvingSlug === c.slug}
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        {/each}
-      </section>
-    {/if}
+      {/each}
+    </section>
 
     {#if app.workspace}
       <section class="group">
@@ -1019,7 +1017,7 @@
       </section>
 
     <section class="group">
-      <div class="group-head">On this Mac</div>
+      <div class="group-head">On this computer</div>
 
     <div class="card">
       <div class="card-title">Appearance</div>
@@ -1058,7 +1056,7 @@
 
     <div class="card">
       <div class="card-title">Offline models</div>
-      <p class="note">These run on your Mac — nothing you say or store leaves it.</p>
+      <p class="note">These run on this computer — nothing you say or store leaves it.</p>
       {#if modelsLoading}
         <p class="note">Checking for models…</p>
       {:else}

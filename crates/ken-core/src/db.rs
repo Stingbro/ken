@@ -121,6 +121,15 @@ pub struct SearchHit {
     pub rank: f64,
 }
 
+/// File-level index counts for one project (see [`Db::file_health_counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileHealthCounts {
+    pub total: i64,
+    pub failed: i64,
+    /// Waiting to be indexed.
+    pub queued: i64,
+}
+
 /// Extraction health for one project (see [`Db::index_health`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1678,6 +1687,35 @@ impl Db {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?)
+    }
+
+    /// Index health in counts, for Your day: every file row, the failed
+    /// ones, and the files still waiting to be indexed (a `pending` file
+    /// row, or a file whose OCR text is still queued). Counting queries
+    /// only, so it is cheap on a large index. Extraction backlog is a
+    /// separate number ([`Db::index_health`]).
+    pub fn file_health_counts(&self) -> Result<FileHealthCounts> {
+        let (total, failed, pending): (i64, i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(status = 'failed'), 0),
+                    COALESCE(SUM(status = 'pending'), 0)
+               FROM files",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        // Queued is what waits to be read for entities (the white box's 8c:
+        // "files queued for entities"), the same pending + retrying count the
+        // Map's health line uses, plus anything not yet indexed.
+        let extraction: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM extractions
+                  WHERE status = 'pending' OR (status = 'error' AND attempts < ?1)",
+                params![MAX_EXTRACTION_ATTEMPTS],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(FileHealthCounts { total, failed, queued: pending + extraction })
     }
 
     /// Count of files whose content is actually in the index (status
@@ -4897,6 +4935,20 @@ mod tests {
         db.mark_extraction_done("a.md", "h2", 101).unwrap();
         assert_eq!(db.next_pending_extraction().unwrap(), None);
         assert_eq!(db.extraction_coverage().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn file_health_counts_count_files_failed_and_waiting() {
+        let mut db = Db::open_in_memory().unwrap();
+        assert_eq!(db.file_health_counts().unwrap(), FileHealthCounts::default());
+        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_file("b.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
+        db.upsert_file("c.png", "image", 1, 1, "metadata_only", None, "").unwrap();
+        db.upsert_file("d.md", "md", 1, 1, "pending", None, "").unwrap();
+        // OCR backlog is not counted; the extraction backlog is.
+        assert!(db.enqueue_ocr_if_changed("c.png", "h1").unwrap());
+        assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
+        assert_eq!(db.file_health_counts().unwrap(), FileHealthCounts { total: 4, failed: 1, queued: 2 });
     }
 
     fn seeded() -> Db {

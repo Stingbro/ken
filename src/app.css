@@ -34,6 +34,8 @@
 @import "@fontsource/tinos/latin-ext-700.css";
 
 :root {
+  /* Native controls (date pickers, select popups) follow the theme. */
+  color-scheme: light;
   /* neutrals — paper */
   --paper: #f6f4ef;
   --surface: #fdfcfa;
@@ -89,6 +91,7 @@
 /* Warm dark theme — same "Paper & Ink" character, inverted. All token names
    match :root so components pick these up automatically. */
 :root[data-theme="dark"] {
+  color-scheme: dark;
   /* neutrals — paper (deep warm brown-black ground) */
   --paper: #191713;
   --surface: #221f1a;

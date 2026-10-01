@@ -141,26 +141,44 @@ export function repeatText(repeat: string | null | undefined): string | null {
   return repeat;
 }
 
-/** How a link reads: a ken:// address by its path, anything else as is. */
-export function linkLabel(link: string): string {
+/** A ticket link in a named repo, `<repo>/<ID>`, split; null for anything
+ *  else. `repos`: the workspace's member names, so `repo/file.md` or a
+ *  nested repo name is not mistaken for one. */
+export function splitTicketLink(link: string, repos: readonly string[]): { repo: string; id: string } | null {
+  const lower = link.toLowerCase();
+  const repo = [...repos]
+    .sort((a, b) => b.length - a.length)
+    .find((r) => r && lower.startsWith(r.toLowerCase() + "/"));
+  if (!repo) return null;
+  const id = link.slice(repo.length + 1);
+  if (!id || /[/.\s]/.test(id)) return null;
+  return { repo: link.slice(0, repo.length), id };
+}
+
+/** How a link reads: a ken:// address by its path, `<repo>/<ID>` by its
+ *  id, anything else as is. */
+export function linkLabel(link: string, repos: readonly string[] = []): string {
   if (link.startsWith("ken://")) {
     const rest = link.slice("ken://".length);
     const slash = rest.indexOf("/");
     return slash === -1 ? rest : rest.slice(slash + 1);
   }
-  return link;
+  return splitTicketLink(link, repos)?.id ?? link;
 }
 
 /** The line under a task's title: "from dee · ATT-014 · Tuesdays", or
  *  "note" with nothing else; "done 09:40" once done. */
-export function taskDetail(task: Pick<DayTask, "state" | "from" | "links" | "repeat" | "updated">): string {
+export function taskDetail(
+  task: Pick<DayTask, "state" | "from" | "links" | "repeat" | "updated">,
+  repos: readonly string[] = [],
+): string {
   if (task.state === "done") {
     const at = timePart(task.updated);
     return at ? `done ${at}` : "done";
   }
   const parts: string[] = [];
   if (task.from) parts.push(`from ${task.from}`);
-  if (task.links.length > 0) parts.push(linkLabel(task.links[0]));
+  if (task.links.length > 0) parts.push(linkLabel(task.links[0], repos));
   const rep = repeatText(task.repeat);
   if (rep) parts.push(rep);
   return parts.length > 0 ? parts.join(" · ") : "note";
@@ -209,4 +227,18 @@ export function stampLabel(stamp: string | null | undefined, today: string = loc
       ? (parseIsoDate(day)?.toLocaleDateString("en-US", { weekday: "short" }) ?? day)
       : date;
   return time ? `${label} ${time}` : label;
+}
+
+/** What a task sent to a teammate carries in its body: the description,
+ *  then its target, repeat and links, one per line. The inbox has no
+ *  fields for those. */
+export function sendBody(task: Pick<DayTask, "description" | "target" | "repeat" | "links">): string {
+  const lines: string[] = [];
+  if (task.target) lines.push(`Target: ${task.target}`);
+  const rep = repeatText(task.repeat);
+  if (rep) lines.push(`Repeat: ${rep}`);
+  if (task.links.length > 0) lines.push(`Links: ${task.links.join(", ")}`);
+  const desc = task.description.trim();
+  if (lines.length === 0) return desc;
+  return desc ? `${desc}\n\n${lines.join("\n")}` : lines.join("\n");
 }

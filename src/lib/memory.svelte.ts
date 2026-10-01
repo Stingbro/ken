@@ -1,16 +1,9 @@
-// ken-memory task 4.1/4.2 frontend store: the `kenMemory` flag, live
-// distillation state, and the pending approval-card roster. Mirrors
-// `workspaceKg.svelte.ts`'s shape (flag-gated `init()`, an event
-// subscription that updates `$state`, thin wrappers over `api` calls).
+// Ken memory: live distillation state and the pending approval-card roster.
 import { api, type DistillCandidate } from "./api";
 
 export type MemoryPhase = "idle" | "planning" | "distilling" | "ready" | "error";
 
 class MemoryStore {
-  /** Whether the `kenMemory` flag resolves on — gates the Settings "Memory"
-   *  section (including the "Distill journal" trigger) entirely. */
-  enabled = $state(false);
-
   /** Live distillation lifecycle (design D6: planning → distilling →
    *  ready | error), driven by the `memory-state` event. `"idle"` before
    *  any run this session. */
@@ -29,13 +22,12 @@ class MemoryStore {
 
   private initDone = false;
 
-  /** Call once (Settings screen mount): resolve the flag and subscribe to
-   *  distillation progress. Cheap even if the user never opens Settings'
+  /** Call once (Settings screen mount): subscribe to distillation
+   *  progress. Cheap even if the user never opens Settings'
    *  Memory section — nothing here starts a distillation run on its own. */
   async init() {
     if (this.initDone) return;
     this.initDone = true;
-    this.enabled = true;
     await api.onMemoryState((ev) => {
       this.phase = ev.state;
       if (ev.state === "ready") {
@@ -50,7 +42,6 @@ class MemoryStore {
   /** Kick off a distillation pass ("Distill journal" button). Progress
    *  arrives via the `memory-state` subscription above. */
   async distill() {
-    if (!this.enabled) return;
     await api.distillJournal();
   }
 

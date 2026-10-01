@@ -6,7 +6,9 @@ import {
   orderTasks,
   repeatChoices,
   repeatText,
+  sendBody,
   shortTarget,
+  splitTicketLink,
   taskDetail,
   ticketDetail,
   ticketIdForPath,
@@ -166,5 +168,36 @@ describe("ticketIdForPath", () => {
     expect(ticketIdForPath("docs/tickets/ATT-1.md")).toBeNull();
     expect(ticketIdForPath("tickets/ATT-1.txt")).toBeNull();
     expect(ticketIdForPath(null)).toBeNull();
+  });
+});
+
+describe("ticket links in a repo", () => {
+  const repos = ["att-opmodel", "clients/att-wiki", "att-wiki"];
+
+  it("splits <repo>/<ID> and shows the id", () => {
+    expect(splitTicketLink("att-opmodel/ATT-014", repos)).toEqual({ repo: "att-opmodel", id: "ATT-014" });
+    expect(splitTicketLink("clients/att-wiki/W-2", repos)).toEqual({ repo: "clients/att-wiki", id: "W-2" });
+    expect(linkLabel("att-opmodel/ATT-014", repos)).toBe("ATT-014");
+  });
+
+  it("leaves a bare id, a file path and an unknown repo as they are", () => {
+    expect(linkLabel("ATT-014", repos)).toBe("ATT-014");
+    expect(linkLabel("att-opmodel/docs/plan.md", repos)).toBe("att-opmodel/docs/plan.md");
+    expect(linkLabel("att-opmodel/README.md", repos)).toBe("att-opmodel/README.md");
+    expect(linkLabel("other/ATT-014", repos)).toBe("other/ATT-014");
+    expect(linkLabel("att-opmodel/ATT-014")).toBe("att-opmodel/ATT-014");
+  });
+});
+
+describe("sendBody", () => {
+  it("adds target, repeat and links under the description", () => {
+    expect(
+      sendBody({ description: "Check the totals.", target: "2026-10-02", repeat: "weekly:tue", links: ["ATT-014", "a/b.md"] }),
+    ).toBe("Check the totals.\n\nTarget: 2026-10-02\nRepeat: Tuesdays\nLinks: ATT-014, a/b.md");
+  });
+
+  it("is the description alone when there is nothing else", () => {
+    expect(sendBody({ description: "Hi", target: null, repeat: null, links: [] })).toBe("Hi");
+    expect(sendBody({ description: "", target: "2026-10-02", repeat: null, links: [] })).toBe("Target: 2026-10-02");
   });
 });

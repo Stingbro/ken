@@ -5,7 +5,7 @@
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
-  import { day, openInRepo, openMemberPath, repoName } from "../lib/day.svelte";
+  import { day, memberNames, openInRepo, openMemberPath, repoName } from "../lib/day.svelte";
   import { isOverdue, shortTarget, taskDetail, ticketDetail } from "../lib/day";
   import { digestMarkdown } from "../lib/assist";
   import { renderMarkdown } from "../lib/markdown";
@@ -59,14 +59,19 @@
     return path.split("/").pop() || path;
   }
 
+  // A cited file opens in Files at its line or heading. A web link is left
+  // alone: the opener plugin opens it in the browser.
   function onDigestClick(e: MouseEvent) {
     const a = (e.target as HTMLElement).closest("a");
     if (!a) return;
+    const href = a.getAttribute("href") ?? "";
+    if (/^(https?|mailto):/i.test(href)) return;
     e.preventDefault();
-    const c = parseCitation(a.getAttribute("href") ?? "");
+    const c = parseCitation(href);
     if (!c) return;
-    if (c.projectId) void openInRepo(c.projectId, c.path);
-    else void openMemberPath(c.path);
+    const where = { line: c.line, anchor: c.anchor };
+    if (c.projectId) void openInRepo(c.projectId, c.path, where);
+    else void openMemberPath(c.path, where);
   }
 
   const indexing = $derived((day.health?.queued ?? 0) > 0);
@@ -111,11 +116,7 @@
     replyNote = "";
   }
 
-  function openRow(task: DayTask) {
-    // A teammate's task is not a file of mine until accepted.
-    if (task.inbox) return;
-    day.openTask(task.id);
-  }
+  const repos = $derived(memberNames());
 
   const selectedId = $derived(day.panel?.mode === "edit" ? day.panel.id : null);
 
@@ -138,7 +139,7 @@
       : [];
   });
 
-  const panelOpen = $derived(day.panel !== null);
+  const panelOpen = $derived(day.panel !== null && (day.panel.mode === "new" || day.panelTask !== null));
 </script>
 
 <div class="wrap">
@@ -241,22 +242,7 @@
         {#if day.tasks.length > 0}
           <div class="group">
             {#each day.tasks as task (task.id)}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <div
-                class="row task"
-                class:done={task.state === "done"}
-                class:selected={selectedId === task.id}
-                class:clickable={!task.inbox}
-                role="button"
-                tabindex="0"
-                onclick={() => openRow(task)}
-                onkeydown={(e) => {
-                  if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
-                    e.preventDefault();
-                    openRow(task);
-                  }
-                }}
-              >
+              <div class="row task" class:done={task.state === "done"} class:selected={selectedId === task.id}>
                 {#if task.inbox}
                   <span class="cb ghost" title="Accept it first"></span>
                 {:else}
@@ -264,19 +250,26 @@
                     class="cb"
                     class:on={task.state === "done"}
                     aria-label={task.state === "done" ? "Mark open" : "Mark done"}
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      void run(day.toggle(task));
-                    }}
+                    onclick={() => void run(day.toggle(task))}
                   >
                     {#if task.state === "done"}<Check size={11} strokeWidth={2.5} />{/if}
                   </button>
                 {/if}
-                <span class="tx">
-                  <span class="tt">{task.title}</span>
-                  <span class="td">{taskDetail(task)}</span>
-                </span>
-                <span class="due-col due" class:late={isOverdue(task, day.today)}>{shortTarget(task.target, day.today)}</span>
+                {#snippet body()}
+                  <span class="tx">
+                    <span class="tt">{task.title}</span>
+                    <span class="td">{taskDetail(task, repos)}</span>
+                  </span>
+                  <span class="due-col due" class:late={isOverdue(task, day.today)}>{shortTarget(task.target, day.today)}</span>
+                {/snippet}
+                {#if task.inbox}
+                  <!-- A teammate's task is not a file of mine until accepted. -->
+                  <span class="open">{@render body()}</span>
+                {:else}
+                  <button class="open" onclick={() => day.openTask(task.id)}>
+                    {@render body()}
+                  </button>
+                {/if}
                 <span class="act-col">
                   {#if task.inbox}
                     <button
@@ -343,7 +336,7 @@
       </div>
     </div>
 
-    {#if day.panel}
+    {#if day.panel && (day.panel.mode === "new" || day.panelTask)}
       <div class="side">
         {#key day.panel.mode === "edit" ? day.panel.id : "new"}
           {#if day.panel.mode === "edit"}
@@ -545,14 +538,31 @@
   .row + .reply {
     border-top: 1px solid var(--border);
   }
-  button.row,
-  .row.clickable {
+  button.row {
     cursor: pointer;
   }
   button.row:hover,
-  .row.clickable:hover,
-  .row:focus-visible {
+  .row.task:has(button.open:hover),
+  .row:focus-visible,
+  .row.task:has(button.open:focus-visible) {
     background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+  .open {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    align-self: stretch;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    text-align: left;
+    color: inherit;
+  }
+  button.open {
+    cursor: pointer;
   }
   .row.selected {
     background: color-mix(in srgb, var(--accent) 10%, transparent);

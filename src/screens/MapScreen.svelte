@@ -403,7 +403,7 @@
           <p class="note">{knowledge.llmNotice}</p>
         {:else}
           <p class="pulse">
-            This happens on your Mac, a file at a time — the map fills in as it
+            This happens on this computer, a file at a time — the map fills in as it
             goes.
           </p>
         {/if}

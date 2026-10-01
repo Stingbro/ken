@@ -188,18 +188,17 @@ struct AppState {
     /// ephemeral until approved, per D6 — approval is what makes one durable).
     memory_distill_candidates: Arc<Mutex<Vec<memory::DistillCandidate>>>,
     /// Self-write dedupe registry for Your day's watcher. A mutating command
-    /// inserts `path -> Some(content-hash)` right after writing a task file
-    /// (or `path -> None` when the write makes a path disappear, e.g.
-    /// archiving), then emits `day-changed` itself. The poller's next tick consults this entry-by-entry: a match
-    /// means "already announced" (consumed, no second emit); anything left
-    /// over is a change nobody has announced yet (an agent's write, a hand
-    /// edit, a git pull, or a command whose emit hasn't landed yet) and gets
-    /// exactly one recompute + emit for the whole tick. See
-    /// `spawn_task_board_watch`'s doc comment for the full rationale.
-    task_recent_writes: Arc<Mutex<std::collections::HashMap<PathBuf, Option<u64>>>>,
+    /// (`with_task_writes`) notes each path as `Writing` before it writes,
+    /// then as `Present(hash)` or `Absent` after, and emits `day-changed`
+    /// itself. The poller's next tick consults this entry-by-entry: a match
+    /// means "already announced" (consumed, no second emit); anything else
+    /// is a change nobody has announced (an agent's write, a hand edit, a
+    /// git pull) and gets exactly one emit for the whole tick. Notes expire
+    /// after `TASK_WRITE_NOTE_TTL`, so the map stays small.
+    task_recent_writes: Arc<Mutex<std::collections::HashMap<PathBuf, TaskWriteNote>>>,
     /// The team Your day last asked about (`day_state`, `team_digest`, …):
-    /// the morning schedule writes that team's digest. `None` until asked,
-    /// and then every team's.
+    /// the morning schedule writes that team's digest. Also saved in app
+    /// data (`TeamDigestSchedule`), so it survives a restart.
     last_team: Option<String>,
     /// True while a team-digest thread is running (one at a time).
     team_digest_running: Arc<AtomicBool>,
@@ -1508,29 +1507,11 @@ fn kg_routing_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
     true
 }
 
-/// Effective `kenMemory` flag (ken-memory task 2.4): the global-scope
-/// registry default overridden by `settings.json`'s `features` map, AND-ed
-/// with `workspace_enabled` like `federated_kg_enabled`/`kg_routing_enabled`
-/// (proposal: "Requires workspace"). Same durable-home deviation those two
-/// note: design calls this "workspace-level, requires workspace", but no
-/// workspace-manifest-scoped feature layer exists yet, so `settings.json`'s
-/// global layer is the only home. Gates every ken-memory command, the
-/// pseudo-member spin-up, and the chat injection — off means byte-identical
-/// to pre-feature behavior (spec "flag off is inert").
-fn ken_memory_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
-    true
-}
-
 /// Display label given to the workspace pseudo-member's `Project::name`
 /// (ken-memory task 2.1) — shows up wherever a member's name flows through
 /// unchanged (route_search's `MemberInfo::name`, `search_all_projects`'
 /// hand-added roster entry below).
 const WORKSPACE_MEMORY_LABEL: &str = "Workspace Memory";
-
-/// Friendly error every ken-memory command returns when the flag is off
-/// (task 2.4 — mirrors `WORKSPACE_DISABLED_MSG`'s wording/role).
-const KEN_MEMORY_DISABLED_MSG: &str =
-    "Ken's memory is off — turn on kenMemory in Settings → Features to use it.";
 
 /// Namespace prefix for a dismissed distillation candidate's slug inside the
 /// pseudo-member's `UserState::ignored` set (see `resolve_distill_candidate`'s
@@ -1540,8 +1521,8 @@ const DISMISSED_MEMORY_PREFIX: &str = "distill-dismissed:";
 
 /// The workspace pseudo-member's reserved project id, if a workspace is
 /// currently open (ken-memory task 2.1) — `None` when none is. Pure function
-/// of the open workspace's own id, independent of whether `kenMemory` is on
-/// or the pseudo-member is actually resident in `AppState::members`; callers
+/// of the open workspace's own id, independent of whether the pseudo-member
+/// is actually resident in `AppState::members`; callers
 /// that need residency check `guard.members.contains_key(..)`/`.get(..)`
 /// themselves. Centralizes the `memory::workspace_pseudo_member_id` call so
 /// every exclusion site (search fan-out, federation loops, profiler) derives
@@ -2012,9 +1993,9 @@ fn open_workspace_inner(
     // correctness (the explicit `focus_member_inner` call at the end of this
     // function fixes that regardless of order). Both steps are best-effort —
     // a failure here must never fail `open_workspace`/`create_workspace`.
-    let kenmem_on = { state.lock().unwrap().app_settings.clone() };
-    if ken_memory_enabled(&kenmem_on) {
-        if let Err(e) = activate_memory_pseudo_member(app, state, &ws.root, ws.config.id, &kenmem_on) {
+    let settings_now = { state.lock().unwrap().app_settings.clone() };
+    {
+        if let Err(e) = activate_memory_pseudo_member(app, state, &ws.root, ws.config.id, &settings_now) {
             eprintln!("warning: workspace-memory pseudo-member failed to activate: {e}");
         }
         let roll_root = ws.root.clone();
@@ -2033,7 +2014,7 @@ fn open_workspace_inner(
 
     // ken-families task 2.5: activate every connection attached to this
     // workspace as its own `kind: family` pseudo-member (D6), the same
-    // shape as the `kenMemory` block just above — see `activate_family_
+    // shape as the workspace-memory block just above — see `activate_family_
     // pseudo_member`'s doc comment for why. No ordering dependency on the
     // `Registry::last_project` concern that block's comment describes
     // (family pseudo-members key off the manifest's own family id, not a
@@ -2041,7 +2022,7 @@ fn open_workspace_inner(
     // order relative to it; kept adjacent for readability. Best-effort per
     // connection, matching the memory block's own failure handling.
     {
-        for conn in family_connections(&kenmem_on)
+        for conn in family_connections(&settings_now)
             .into_iter()
             .filter(|c| c.attached_workspace_id == Some(ws.config.id))
         {
@@ -2531,7 +2512,7 @@ async fn search_all_projects(
         // fan-out path that doesn't already reach it for free the way
         // `route_search` does (it iterates `guard.members` directly with no
         // filtering, so needs no change here).
-        if ken_memory_enabled(&guard.app_settings) {
+        {
             if let Some(pseudo_id) = memory_pseudo_member_id(&guard) {
                 if let Some(rt) = guard.members.get(&pseudo_id) {
                     actives.push((pseudo_id, WORKSPACE_MEMORY_LABEL.to_string(), rt.search_db.clone()));
@@ -9638,9 +9619,6 @@ fn memory_write(
     mode: String,
 ) -> CmdResult<memory::Memory> {
     let guard = state.lock().unwrap();
-    if !ken_memory_enabled(&guard.app_settings) {
-        return Err(KEN_MEMORY_DISABLED_MSG.into());
-    }
     let write_mode = match mode.as_str() {
         "create" => memory::WriteMode::Create,
         "replace" => memory::WriteMode::Replace,
@@ -9676,9 +9654,6 @@ fn journal_append(
     tags: Option<Vec<String>>,
 ) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    if !ken_memory_enabled(&guard.app_settings) {
-        return Err(KEN_MEMORY_DISABLED_MSG.into());
-    }
     let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
     memory::append_journal(
         &ws_root,
@@ -9703,9 +9678,6 @@ fn journal_append(
 fn read_journal(state: State<SharedState>, days_back: Option<u32>) -> CmdResult<Vec<JournalDayDto>> {
     let ws_root = {
         let guard = state.lock().unwrap();
-        if !ken_memory_enabled(&guard.app_settings) {
-            return Err(KEN_MEMORY_DISABLED_MSG.into());
-        }
         guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
     };
 
@@ -9766,9 +9738,6 @@ fn journal_window_text(ws_root: &Path) -> String {
 fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let (base_dir, ws_root, pseudo_id, running, candidates_slot) = {
         let guard = state.lock().unwrap();
-        if !ken_memory_enabled(&guard.app_settings) {
-            return Err(KEN_MEMORY_DISABLED_MSG.into());
-        }
         let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
         (
             guard.base_dir.clone(),
@@ -9848,9 +9817,6 @@ fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
 fn resolve_distill_candidate(state: State<SharedState>, slug: String, approve: bool) -> CmdResult<()> {
     let (base_dir, ws_root, pseudo_id, candidate) = {
         let guard = state.lock().unwrap();
-        if !ken_memory_enabled(&guard.app_settings) {
-            return Err(KEN_MEMORY_DISABLED_MSG.into());
-        }
         let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
         let candidate = guard
             .memory_distill_candidates
@@ -9924,33 +9890,29 @@ fn day_families(ws: &ken_core::workspace::Workspace, settings: &ken_core::settin
 }
 
 /// Every task home Your day reads, owned so the borrowed `TaskHome`s can
-/// be built from it: the workspace home (where new tasks go), every
-/// member's older `.ken/tasks/`, and my board in each family.
+/// be built from it: the workspace home (where new tasks go) and my board
+/// in each family. A repo's own `.ken/tasks/` is not read: tasks live in
+/// your own folder, not inside a team repo (Ways of Working).
 struct DayHomes {
     ws_root: PathBuf,
-    projects: Vec<(PathBuf, String)>,
-    boards: Vec<(PathBuf, String)>,
+    boards: Vec<PathBuf>,
 }
 
 impl DayHomes {
     fn new(ws: &ken_core::workspace::Workspace, base_dir: &Path, settings: &ken_core::settings::AppSettings) -> DayHomes {
         DayHomes {
             ws_root: ws.root.clone(),
-            projects: team_repos(ws, None).into_iter().map(|r| (r.root, r.name)).collect(),
             boards: day_families(ws, settings)
                 .into_iter()
-                .map(|c| (family::board_dir(&family_clone_root(base_dir, c.family_id), &c.member_id), c.name))
+                .map(|c| family::board_dir(&family_clone_root(base_dir, c.family_id), &c.member_id))
                 .collect(),
         }
     }
 
     fn homes(&self) -> Vec<tasks::TaskHome<'_>> {
         let mut out = vec![tasks::TaskHome::Workspace { workspace_root: &self.ws_root }];
-        for (root, name) in &self.projects {
-            out.push(tasks::TaskHome::Project { project_root: root, project: name });
-        }
-        for (board_dir, family_name) in &self.boards {
-            out.push(tasks::TaskHome::Family { board_dir, family_name });
+        for board_dir in &self.boards {
+            out.push(tasks::TaskHome::Family { board_dir });
         }
         out
     }
@@ -10119,19 +10081,38 @@ fn cached_git_me() -> ken_core::day::Me {
     me
 }
 
+/// Lock a mutex even when a thread that held it panicked. Your day's
+/// state (the workspace handle, a search index connection) stays usable
+/// after a panic elsewhere, and a background thread must not die on it.
+fn lock_tolerant<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The open workspace, the app data dir and the settings, cloned so no
 /// filesystem work happens under the lock. Remembers `team` as the last
-/// one asked for (the morning digest writes it).
+/// one asked for (the morning digest writes it), in memory and on disk.
 fn day_snapshot(
     state: &SharedState,
     team: Option<&str>,
 ) -> CmdResult<(ken_core::workspace::Workspace, PathBuf, ken_core::settings::AppSettings)> {
-    let mut guard = state.lock().unwrap();
-    if let Some(t) = team.filter(|t| !t.is_empty()) {
-        guard.last_team = Some(t.to_string());
+    let (snapshot, remembered) = {
+        let mut guard = lock_tolerant(state);
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?.ws.clone();
+        let mut remembered = false;
+        if let Some(t) = team.map(str::trim).filter(|t| !t.is_empty()) {
+            if guard.last_team.as_deref() != Some(t) {
+                guard.last_team = Some(t.to_string());
+                remembered = true;
+            }
+        }
+        ((ws, guard.base_dir.clone(), guard.app_settings.clone()), remembered)
+    };
+    if remembered {
+        let (ws, base_dir, _) = &snapshot;
+        let last = team.map(|t| t.trim().to_string());
+        update_digest_schedule(base_dir, ws.config.id, |s| s.last_team = last);
     }
-    let ws = guard.workspace.as_ref().ok_or("no workspace open")?.ws.clone();
-    Ok((ws, guard.base_dir.clone(), guard.app_settings.clone()))
+    Ok(snapshot)
 }
 
 /// My open tickets in the team, with how many of my tasks link to each.
@@ -10155,7 +10136,9 @@ fn my_tickets(
     let out = found
         .into_iter()
         .map(|(t, repo)| {
-            let (linked_tasks, linked_done) = ken_core::day::linked_counts(all_tasks, &t.id);
+            // `<repo>/<ID>` links count for this repo's ticket only; a bare
+            // `<ID>` link counts for any repo's ticket with that id.
+            let (linked_tasks, linked_done) = ken_core::day::linked_counts(all_tasks, Some(&repo.name), &t.id);
             DayTicketDto {
                 id: t.id,
                 title: t.title,
@@ -10238,8 +10221,13 @@ fn day_task_create(app: AppHandle, state: State<SharedState>, input: ken_core::d
     let (ws, base_dir, settings) = day_snapshot(state.inner(), None)?;
     let (today, now) = (local_date_today(), local_stamp_now());
     let stamp = ken_core::day::Stamp { today: &today, now: &now, by: ken_core::day::BY_YOU };
-    let task = ken_core::day::create_task(&ws.root, &input, &stamp, None).map_err(err)?;
-    note_task_write_and_emit(&app, state.inner(), task.path.clone(), true);
+    // The id, and so the path, is known before the write: the watcher is
+    // told about the file before it appears.
+    let id = tasks::new_ulid();
+    let path = tasks::workspace_tasks_dir(&ws.root).join(tasks::task_file_name(&id, input.title.trim()));
+    let task = with_task_writes(&app, state.inner(), &[path], || {
+        ken_core::day::create_task(&ws.root, &input, &stamp, Some(&id)).map_err(err)
+    })?;
     let names = family_member_names(&base_dir, &day_families(&ws, &settings));
     Ok(day_task_dto(&ws.root, &task, &names, None))
 }
@@ -10256,9 +10244,10 @@ fn day_task_update(
     let (today, now) = (local_date_today(), local_stamp_now());
     let task = find_day_task(&ws, &base_dir, &settings, &id, &today)?;
     let stamp = ken_core::day::Stamp { today: &today, now: &now, by: ken_core::day::BY_YOU };
-    ken_core::day::update_task(&task, &patch, &stamp).map_err(err)?;
+    with_task_writes(&app, state.inner(), &[task.path.clone()], || {
+        ken_core::day::update_task(&task, &patch, &stamp).map_err(err)
+    })?;
     let updated = reread_day_task(&task, &today)?;
-    note_task_write_and_emit(&app, state.inner(), task.path.clone(), true);
     let names = family_member_names(&base_dir, &day_families(&ws, &settings));
     Ok(day_task_dto(&ws.root, &updated, &names, None))
 }
@@ -10269,20 +10258,29 @@ fn day_task_delete(app: AppHandle, state: State<SharedState>, id: String) -> Cmd
     let (ws, base_dir, settings) = day_snapshot(state.inner(), None)?;
     let today = local_date_today();
     let task = find_day_task(&ws, &base_dir, &settings, &id, &today)?;
-    ken_core::day::archive_task(&task, &today).map_err(err)?;
-    note_task_write_and_emit(&app, state.inner(), task.path.clone(), false);
-    Ok(())
+    with_task_writes(&app, state.inner(), &[task.path.clone()], || {
+        ken_core::day::archive_task(&task, &today).map(|_| ()).map_err(err)
+    })
 }
 
-/// My tasks linked to a ticket (frame Y1c), done ones included. Tasks link
-/// to a ticket by its id, so `project_id` only names where the ticket is.
+/// My tasks linked to a ticket (frame Y1c), done ones included: those
+/// linked by `<repo>/<ID>` (`repo` = the member `project_id` names) and
+/// those linked by the bare `<ID>` (older links, any repo).
 #[tauri::command]
 fn ticket_tasks(state: State<SharedState>, project_id: String, ticket_id: String) -> CmdResult<Vec<DayTaskDto>> {
-    let _ = &project_id;
     let (ws, base_dir, settings) = day_snapshot(state.inner(), None)?;
+    let repo = team_repos(&ws, None)
+        .into_iter()
+        .find(|r| r.id.to_string().eq_ignore_ascii_case(project_id.trim()))
+        .map(|r| r.name);
     let today = local_date_today();
     let all = DayHomes::new(&ws, &base_dir, &settings).scan(&today);
-    let q = ken_core::day::TaskQuery { linked: Some(ticket_id), ..Default::default() };
+    let id = ticket_id.trim();
+    let linked = match &repo {
+        Some(name) => format!("{name}/{id}"),
+        None => id.to_string(),
+    };
+    let q = ken_core::day::TaskQuery { linked: Some(linked), ..Default::default() };
     let names = family_member_names(&base_dir, &day_families(&ws, &settings));
     Ok(ken_core::day::query(&all, &q).into_iter().map(|t| day_task_dto(&ws.root, t, &names, None)).collect())
 }
@@ -10346,43 +10344,113 @@ fn team_digest(state: State<SharedState>, team: Option<String>) -> CmdResult<Opt
 /// Write the team digest now ("Write it now").
 #[tauri::command]
 fn refresh_team_digest(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<()> {
-    {
-        let mut guard = state.lock().unwrap();
-        if let Some(t) = team.as_deref().filter(|t| !t.is_empty()) {
-            guard.last_team = Some(t.to_string());
-        }
-    }
+    day_snapshot(state.inner(), team.as_deref())?;
     generate_team_digests(&app, state.inner(), vec![team], true)
 }
 
+/// The morning schedule's memory, per workspace, in app data
+/// (`team-digests/<workspace id>/schedule.json`): the team Your day last
+/// asked about (so a fresh launch writes that team's digest, not every
+/// group's), and each team's last attempt (so a failure is not retried on
+/// every window focus).
+#[derive(Serialize, serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct TeamDigestSchedule {
+    last_team: Option<String>,
+    /// Keyed by team name; `""` is the whole workspace.
+    attempts: std::collections::HashMap<String, TeamDigestAttempt>,
+}
+
+#[derive(Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamDigestAttempt {
+    /// Epoch seconds.
+    at: i64,
+    /// The local day it was for.
+    date: String,
+    ok: bool,
+}
+
+/// After a failed attempt, the schedule waits this long before trying again.
+const TEAM_DIGEST_RETRY_AFTER_SECS: i64 = 30 * 60;
+
+fn digest_schedule_key(team: Option<&str>) -> String {
+    team.map(str::trim).unwrap_or("").to_string()
+}
+
+fn digest_schedule_path(base_dir: &Path, workspace_id: uuid::Uuid) -> PathBuf {
+    base_dir.join("team-digests").join(workspace_id.to_string()).join("schedule.json")
+}
+
+fn load_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid) -> TeamDigestSchedule {
+    std::fs::read_to_string(digest_schedule_path(base_dir, workspace_id))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Read, change and write the schedule (best effort: a failed write only
+/// means the schedule forgets). One writer at a time.
+fn update_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid, change: impl FnOnce(&mut TeamDigestSchedule)) {
+    static WRITE: Mutex<()> = Mutex::new(());
+    let _one = lock_tolerant(&WRITE);
+    let mut s = load_digest_schedule(base_dir, workspace_id);
+    change(&mut s);
+    let path = digest_schedule_path(base_dir, workspace_id);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&s) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// Should the schedule try `team` now? Not when today's digest is stored,
+/// not when an attempt already succeeded today, and not within
+/// `TEAM_DIGEST_RETRY_AFTER_SECS` of a failed one.
+fn digest_due(schedule: &TeamDigestSchedule, team: Option<&str>, stored_today: bool, today: &str, now: i64) -> bool {
+    if stored_today {
+        return false;
+    }
+    match schedule.attempts.get(&digest_schedule_key(team)) {
+        Some(a) if a.ok => a.date != today,
+        Some(a) => now - a.at >= TEAM_DIGEST_RETRY_AFTER_SECS,
+        None => true,
+    }
+}
+
 /// The morning schedule (workspace open, window focus): past 07:00, write
-/// today's digest for the last team asked for, or for every team when
-/// none has been yet (the whole workspace when it has no teams). A team
-/// already written today is skipped.
+/// today's digest for the last team asked about (remembered across
+/// launches), else the first team, else the whole workspace when it has no
+/// teams. One team per run; see `digest_due` for when it is skipped.
 fn maybe_generate_team_digest(app: &AppHandle, state: &SharedState) {
     if local_hour() < 7 {
         return;
     }
-    let (teams, ws_id, base_dir) = {
-        let guard = state.lock().unwrap();
+    let (last_team, first_team, ws_id, base_dir) = {
+        let guard = lock_tolerant(state);
         let Some(ws) = guard.workspace.as_ref() else { return };
-        let teams: Vec<Option<String>> = match &guard.last_team {
-            Some(t) => vec![Some(t.clone())],
-            None => {
-                let groups: Vec<Option<String>> =
-                    ws.ws.config.effective_groups().into_iter().map(|g| Some(g.name)).collect();
-                if groups.is_empty() { vec![None] } else { groups }
+        let first = ws.ws.config.effective_groups().into_iter().next().map(|g| g.name);
+        (guard.last_team.clone(), first, ws.ws.config.id, guard.base_dir.clone())
+    };
+    let schedule = load_digest_schedule(&base_dir, ws_id);
+    let team = match last_team {
+        Some(t) => Some(t),
+        None => {
+            let remembered = schedule.last_team.clone().filter(|t| !t.trim().is_empty());
+            if let Some(t) = &remembered {
+                let mut guard = lock_tolerant(state);
+                if guard.last_team.is_none() {
+                    guard.last_team = Some(t.clone());
+                }
             }
-        };
-        (teams, ws.ws.config.id, guard.base_dir.clone())
+            remembered.or(first_team)
+        }
     };
     let today = local_date_today();
-    let due: Vec<Option<String>> = teams
-        .into_iter()
-        .filter(|t| load_team_digest(&base_dir, ws_id, t.as_deref()).is_none_or(|s| s.date != today))
-        .collect();
-    if !due.is_empty() {
-        let _ = generate_team_digests(app, state, due, false);
+    let stored_today = load_team_digest(&base_dir, ws_id, team.as_deref()).is_some_and(|s| s.date == today);
+    if digest_due(&schedule, team.as_deref(), stored_today, &today, engine::now_epoch()) {
+        let _ = generate_team_digests(app, state, vec![team], false);
     }
 }
 
@@ -10399,7 +10467,7 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
     let (ws, base_dir, settings) = day_snapshot(state, None)?;
     let repos = team_repos(&ws, team.as_deref());
     let live: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = {
-        let guard = state.lock().unwrap();
+        let guard = lock_tolerant(state);
         repos
             .iter()
             .filter_map(|r| guard.members.get(&r.id).map(|m| (r.id, m.search_db.clone())))
@@ -10409,7 +10477,7 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
     let mut out = Vec::new();
     for r in &repos {
         let sources = match live.get(&r.id) {
-            Some(db) => ken_core::digest::gather(&db.lock().unwrap(), since).ok(),
+            Some(db) => ken_core::digest::gather(&lock_tolerant(db), since).ok(),
             None if db_path(&base_dir, r.id).exists() => {
                 Db::open_read_only(&base_dir, r.id).ok().and_then(|db| ken_core::digest::gather(&db, since).ok())
             }
@@ -10457,7 +10525,7 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
 /// or `team-digest-error` (a string) per team.
 fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option<String>>, force: bool) -> CmdResult<()> {
     let (running, ws_root, ws_id, base_dir) = {
-        let guard = state.lock().unwrap();
+        let guard = lock_tolerant(state);
         let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
         (guard.team_digest_running.clone(), ws.ws.root.clone(), ws.ws.config.id, guard.base_dir.clone())
     };
@@ -10468,10 +10536,30 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
     if running.swap(true, Ordering::SeqCst) {
         return if force { Err("The digest is already being written.".into()) } else { Ok(()) };
     }
+    // Cleared however the thread ends: done, an early return, or a panic.
+    struct ClearOnDrop(Arc<AtomicBool>);
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let running = ClearOnDrop(running);
     let thread_app = app.clone();
     let thread_state = state.clone();
     std::thread::spawn(move || {
+        let _running = running;
         for team in teams {
+            let today = local_date_today();
+            let key = digest_schedule_key(team.as_deref());
+            // Recorded as failed until it is stored, so a failure (or a
+            // crash) backs the schedule off instead of retrying each focus.
+            let attempt = |ok: bool| {
+                let (key, date) = (key.clone(), today.clone());
+                update_digest_schedule(&base_dir, ws_id, move |s| {
+                    s.attempts.insert(key, TeamDigestAttempt { at: engine::now_epoch(), date, ok });
+                });
+            };
+            attempt(false);
             let job = match team_digest_job(&thread_state, team) {
                 Ok(j) => j,
                 Err(e) => {
@@ -10479,7 +10567,6 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
                     continue;
                 }
             };
-            let today = local_date_today();
             let store = |body: String, sources: Vec<String>| {
                 let stored = StoredTeamDigest {
                     date: today.clone(),
@@ -10487,6 +10574,7 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
                 };
                 match save_team_digest(&base_dir, ws_id, job.team.as_deref(), &stored) {
                     Ok(()) => {
+                        attempt(true);
                         let _ = thread_app.emit("team-digest-updated", stored.digest);
                     }
                     Err(e) => {
@@ -10524,7 +10612,6 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
                 Ok(OneshotOutcome::Cancelled) => {}
             }
         }
-        running.store(false, Ordering::SeqCst);
     });
     Ok(())
 }
@@ -10532,8 +10619,9 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
 // ---------- index health for a team ----------
 
 /// Index health for Your day: how many of the team's repos have an index
-/// with files in it, how many files wait to be read (`pending` plus
-/// `retrying` extractions), and how many files failed to index.
+/// with files in it, how many files wait to be indexed, and how many files
+/// failed to index (`Db::file_health_counts`: counting queries only). The
+/// extraction backlog is not part of it.
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct TeamIndexHealthDto {
@@ -10548,7 +10636,7 @@ fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<Te
     let (ws, base_dir, _) = day_snapshot(state.inner(), team.as_deref())?;
     let repos = team_repos(&ws, team.as_deref());
     let live: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = {
-        let guard = state.lock().unwrap();
+        let guard = lock_tolerant(state.inner());
         repos
             .iter()
             .filter_map(|r| guard.members.get(&r.id).map(|m| (r.id, m.search_db.clone())))
@@ -10556,23 +10644,20 @@ fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<Te
     };
     let mut out = TeamIndexHealthDto { total: repos.len(), ..Default::default() };
     for r in &repos {
-        let read = |db: &Db| -> (usize, usize, i64) {
-            let files = db.list_files().unwrap_or_default();
-            let failed = files.iter().filter(|f| f.status == "failed").count();
-            let queued = db.index_health().map(|h| h.pending + h.retrying).unwrap_or(0);
-            (files.len(), failed, queued)
-        };
         let counts = match live.get(&r.id) {
-            Some(db) => Some(read(&db.lock().unwrap())),
-            None if db_path(&base_dir, r.id).exists() => Db::open_read_only(&base_dir, r.id).ok().map(|db| read(&db)),
+            // The index lock is held for the counting query only.
+            Some(db) => lock_tolerant(db).file_health_counts().ok(),
+            None if db_path(&base_dir, r.id).exists() => {
+                Db::open_read_only(&base_dir, r.id).ok().and_then(|db| db.file_health_counts().ok())
+            }
             None => None,
         };
-        if let Some((files, failed, queued)) = counts {
-            if files > 0 {
+        if let Some(c) = counts {
+            if c.total > 0 {
                 out.indexed += 1;
             }
-            out.failed += failed;
-            out.queued += queued;
+            out.failed += c.failed.max(0) as usize;
+            out.queued += c.queued;
         }
     }
     Ok(out)
@@ -10582,7 +10667,7 @@ fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<Te
 
 /// Cheap non-cryptographic content hash (std `DefaultHasher`/SipHash), for
 /// the watcher's tick-to-tick snapshot and `AppState::task_recent_writes`.
-/// Runtime-only, never persisted.
+/// Runtime-only, never persisted (except in a digest file's name).
 fn content_hash(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -10594,129 +10679,223 @@ fn hash_file(path: &Path) -> Option<u64> {
     std::fs::read(path).ok().map(|b| content_hash(&b))
 }
 
-/// A content-hash snapshot of every file Your day reads: the `.md` files
-/// directly in each task home (archives are subfolders, so archiving reads
-/// as a removal), each member's ticket files (`tickets/` and one folder
-/// deeper), and my inbox in each family. A folder that does not exist
-/// contributes nothing.
-fn task_board_file_snapshot(
-    ws: &ken_core::workspace::Workspace,
-    base_dir: &Path,
-    settings: &ken_core::settings::AppSettings,
-) -> std::collections::BTreeMap<PathBuf, u64> {
-    let mut dirs: Vec<PathBuf> = vec![tasks::workspace_tasks_dir(&ws.root)];
-    for r in team_repos(ws, None) {
-        dirs.push(tasks::project_tasks_dir(&r.root));
-        let tickets = r.root.join(ken_core::day::TICKETS_DIR);
+/// One file in the watcher's snapshot. The content hash decides whether
+/// it changed; size and mtime only decide whether it has to be read again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WatchedFile {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    hash: u64,
+}
+
+type DaySnapshot = std::collections::BTreeMap<PathBuf, WatchedFile>;
+
+/// What a command said about a path it writes (`AppState::task_recent_writes`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TaskWriteExpect {
+    /// The command is writing it now and will emit `day-changed` itself.
+    Writing,
+    /// Written, with this content.
+    Present(u64),
+    /// Removed (archived, moved).
+    Absent,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TaskWriteNote {
+    expect: TaskWriteExpect,
+    at: Instant,
+}
+
+/// A note the watcher has not consumed is dropped after this long, so the
+/// registry cannot grow (a write the watcher never saw change, a command
+/// that died mid-write).
+const TASK_WRITE_NOTE_TTL: Duration = Duration::from_secs(30);
+
+/// The folders Your day reads: the workspace home, each member's ticket
+/// files (`tickets/` and one folder deeper), and my board and inbox in
+/// each family. Only paths are taken under the lock; the folder listing
+/// happens after. `None` when no workspace is open.
+fn day_watch_dirs(state: &SharedState) -> Option<Vec<PathBuf>> {
+    let (mut dirs, repo_roots) = {
+        let guard = lock_tolerant(state);
+        let w = guard.workspace.as_ref()?;
+        let mut dirs = vec![tasks::workspace_tasks_dir(&w.ws.root)];
+        for c in day_families(&w.ws, &guard.app_settings) {
+            let clone_root = family_clone_root(&guard.base_dir, c.family_id);
+            dirs.push(family::board_dir(&clone_root, &c.member_id));
+            dirs.push(family::inbox_dir(&clone_root, &c.member_id));
+        }
+        let roots: Vec<PathBuf> = team_repos(&w.ws, None).into_iter().map(|r| r.root).collect();
+        (dirs, roots)
+    };
+    for root in repo_roots {
+        let tickets = root.join(ken_core::day::TICKETS_DIR);
         if let Ok(entries) = std::fs::read_dir(&tickets) {
             for e in entries.flatten() {
-                if e.path().is_dir() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
                     dirs.push(e.path());
                 }
             }
         }
         dirs.push(tickets);
     }
-    for c in day_families(ws, settings) {
-        let clone_root = family_clone_root(base_dir, c.family_id);
-        dirs.push(family::board_dir(&clone_root, &c.member_id));
-        dirs.push(family::inbox_dir(&clone_root, &c.member_id));
-    }
-    let mut out = std::collections::BTreeMap::new();
-    for dir in &dirs {
+    Some(dirs)
+}
+
+/// A snapshot of every `.md` file directly in `dirs` (archives are
+/// subfolders, so archiving reads as a removal). A file whose size and
+/// mtime match `prev` keeps its hash without being read; only a file whose
+/// metadata moved is read and hashed. A folder that does not exist
+/// contributes nothing.
+fn task_board_file_snapshot(dirs: &[PathBuf], prev: &DaySnapshot) -> DaySnapshot {
+    let mut out = DaySnapshot::new();
+    for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|x| x.eq_ignore_ascii_case("md")) {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    out.insert(path, content_hash(&bytes));
-                }
+            if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("md")) {
+                continue;
             }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let (len, mtime) = (meta.len(), meta.modified().ok());
+            let hash = match prev.get(&path) {
+                Some(p) if p.len == len && p.mtime == mtime && mtime.is_some() => p.hash,
+                _ => match hash_file(&path) {
+                    Some(h) => h,
+                    None => continue,
+                },
+            };
+            out.insert(path, WatchedFile { len, mtime, hash });
         }
     }
     out
 }
 
+/// Did anything change between two snapshots that no command has
+/// announced? Consumes the notes a change matches, keeps `Writing` notes
+/// (their command emits), and drops notes older than the TTL.
+fn day_change_unexplained(
+    last: &DaySnapshot,
+    current: &DaySnapshot,
+    writes: &mut std::collections::HashMap<PathBuf, TaskWriteNote>,
+) -> bool {
+    writes.retain(|_, n| n.at.elapsed() < TASK_WRITE_NOTE_TTL);
+    let mut unexplained = false;
+    for (path, f) in current {
+        if last.get(path).map(|l| l.hash) == Some(f.hash) {
+            continue;
+        }
+        match writes.get(path).map(|n| n.expect) {
+            Some(TaskWriteExpect::Writing) => {}
+            Some(TaskWriteExpect::Present(h)) if h == f.hash => {
+                writes.remove(path);
+            }
+            _ => unexplained = true,
+        }
+    }
+    for path in last.keys().filter(|p| !current.contains_key(*p)) {
+        match writes.get(path).map(|n| n.expect) {
+            Some(TaskWriteExpect::Writing) => {}
+            Some(TaskWriteExpect::Absent) => {
+                writes.remove(path);
+            }
+            _ => unexplained = true,
+        }
+    }
+    unexplained
+}
+
 /// Tell the frontend Your day changed (no payload: it asks `day_state`
 /// again). App-global, like the inbox: it spans every repo.
 fn emit_day_changed(app: &AppHandle, state: &SharedState) {
-    if state.lock().unwrap().workspace.is_none() {
+    if lock_tolerant(state).workspace.is_none() {
         return;
     }
     let _ = app.emit("day-changed", ());
 }
 
-/// Record that a command just wrote (`expect_present`) or removed `path`,
-/// then emit `day-changed` at once, so the watcher's next tick does not
-/// announce the same change a second time.
-fn note_task_write_and_emit(app: &AppHandle, state: &SharedState, path: PathBuf, expect_present: bool) {
-    let recent_writes = { state.lock().unwrap().task_recent_writes.clone() };
-    let expect = if expect_present { hash_file(&path) } else { None };
-    recent_writes.lock().unwrap().insert(path, expect);
+/// Run `op`, which writes or removes `paths`, so Your day hears about it
+/// exactly once: each path is noted as being written *before* `op` runs
+/// (a watcher tick in the middle stays quiet), then noted with what is on
+/// disk afterwards (so the next tick consumes it), and `day-changed` is
+/// emitted once. The after-note and the emit happen whether `op`
+/// succeeded or not: a failed write may still have changed a file.
+fn with_task_writes<T>(app: &AppHandle, state: &SharedState, paths: &[PathBuf], op: impl FnOnce() -> CmdResult<T>) -> CmdResult<T> {
+    let registry = { lock_tolerant(state).task_recent_writes.clone() };
+    {
+        let mut writes = lock_tolerant(&registry);
+        for p in paths {
+            writes.insert(p.clone(), TaskWriteNote { expect: TaskWriteExpect::Writing, at: Instant::now() });
+        }
+    }
+    let out = op();
+    {
+        let after: Vec<(PathBuf, TaskWriteExpect)> = paths
+            .iter()
+            .map(|p| {
+                let expect = match hash_file(p) {
+                    Some(h) => TaskWriteExpect::Present(h),
+                    None => TaskWriteExpect::Absent,
+                };
+                (p.clone(), expect)
+            })
+            .collect();
+        let mut writes = lock_tolerant(&registry);
+        for (p, expect) in after {
+            writes.insert(p, TaskWriteNote { expect, at: Instant::now() });
+        }
+    }
     emit_day_changed(app, state);
+    out
 }
 
 /// How often the watcher re-snapshots (1.2 s: an agent's write, a hand
-/// edit or a pull feels live, and hashing a few folders is free).
+/// edit or a pull feels live; a tick lists a few folders and reads only
+/// the files whose size or mtime moved).
 const TASK_BOARD_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 
-/// Your day's file watcher: a sleep loop over a content-hash snapshot
-/// (`task_board_file_snapshot`), the same polling discipline the
+/// Your day's file watcher: a sleep loop over a metadata-plus-hash
+/// snapshot (`task_board_file_snapshot`), the same polling discipline the
 /// `.kenignore` watcher uses (`notify` is a ken-core-only dependency).
 /// Runs for the open workspace's lifetime; `WorkspaceState::task_watch`
 /// stops it on close or switch.
 ///
-/// Self-write dedupe: a command that writes a task registers the new
-/// content hash (or `None` for a path it removed) in
-/// `AppState::task_recent_writes` and emits `day-changed` itself. A tick
-/// that sees only changes registered there consumes them silently; any
-/// other change (an agent, a hand edit, a pull, a teammate's inbox item)
-/// emits one `day-changed` for the whole tick.
+/// Self-write dedupe: a command that writes a task goes through
+/// `with_task_writes`, which notes each path in
+/// `AppState::task_recent_writes` before and after the write and emits
+/// `day-changed` itself. A tick that sees only noted changes stays quiet;
+/// any other change (an agent, a hand edit, a pull, a teammate's inbox
+/// item) emits one `day-changed` for the whole tick.
 fn spawn_task_board_watch(app: AppHandle, state: SharedState) -> StopOnDrop {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     std::thread::spawn(move || {
-        let snapshot_now = |state: &SharedState| {
-            let (ws, base_dir, settings) = {
-                let guard = state.lock().unwrap();
-                (guard.workspace.as_ref().map(|w| w.ws.clone()), guard.base_dir.clone(), guard.app_settings.clone())
-            };
-            ws.map(|ws| task_board_file_snapshot(&ws, &base_dir, &settings))
-        };
-        let mut last = snapshot_now(&state).unwrap_or_default();
+        let mut last = day_watch_dirs(&state)
+            .map(|dirs| task_board_file_snapshot(&dirs, &DaySnapshot::new()))
+            .unwrap_or_default();
         while !stop_thread.load(Ordering::SeqCst) {
             std::thread::sleep(TASK_BOARD_POLL_INTERVAL);
             if stop_thread.load(Ordering::SeqCst) {
                 break;
             }
-            let Some(current) = snapshot_now(&state) else {
+            let Some(dirs) = day_watch_dirs(&state) else {
                 continue; // no workspace open this tick (closing/switching)
             };
-            if current == last {
-                continue;
-            }
-            let recent_writes = { state.lock().unwrap().task_recent_writes.clone() };
-            let mut unexplained = false;
-            {
-                let mut writes = recent_writes.lock().unwrap();
-                for (path, hash) in &current {
-                    if last.get(path) != Some(hash) {
-                        if writes.get(path) == Some(&Some(*hash)) {
-                            writes.remove(path);
-                        } else {
-                            unexplained = true;
-                        }
-                    }
+            let current = task_board_file_snapshot(&dirs, &last);
+            let registry = { lock_tolerant(&state).task_recent_writes.clone() };
+            let unexplained = {
+                let mut writes = lock_tolerant(&registry);
+                if current == last {
+                    writes.retain(|_, n| n.at.elapsed() < TASK_WRITE_NOTE_TTL);
+                    false
+                } else {
+                    day_change_unexplained(&last, &current, &mut writes)
                 }
-                for path in last.keys() {
-                    if !current.contains_key(path) && writes.get(path) != Some(&None) {
-                        unexplained = true;
-                    }
-                    if !current.contains_key(path) {
-                        writes.remove(path);
-                    }
-                }
-            }
+            };
             last = current;
             if unexplained {
                 emit_day_changed(&app, &state);
@@ -11833,12 +12012,10 @@ fn send_chat_message(
     // still held — `active`/`guard` don't outlive this block — then do the
     // actual file reads after dropping it (lock-audit discipline: never do
     // filesystem IO across the global lock).
-    let kenmem_ctx = ken_memory_enabled(&guard.app_settings).then(|| {
-        (
-            active.project.root.clone(),
-            guard.workspace.as_ref().map(|w| w.ws.root.clone()),
-        )
-    });
+    let kenmem_ctx = Some((
+        active.project.root.clone(),
+        guard.workspace.as_ref().map(|w| w.ws.root.clone()),
+    ));
 
     // Cross-project scope: collect the sibling roots this session may read,
     // under the same lock, and trust them after dropping it (trusting
@@ -12514,8 +12691,8 @@ fn refresh_ken_mcp() {
 
 // ---------------------------------------------------------------------
 // ken-families tasks 2.1-2.6: connection store, clone/create/join, poll
-// scheduler, accept/dismiss, attach-to-workspace. Always available (the
-// `kenFamilies` flag is gone); the inbox shows once a connection exists.
+// scheduler, accept/dismiss, attach-to-workspace. Always available; the
+// inbox shows once a connection exists.
 // ---------------------------------------------------------------------
 
 /// One family connection (task 2.1): remote URL, which manifest member this
@@ -12546,7 +12723,7 @@ fn refresh_ken_mcp() {
 struct FamilyConnection {
     family_id: uuid::Uuid,
     /// The manifest's own `name`, cached here so the settings page and the
-    /// Tasks-tab filter chip don't need a manifest read just to label a
+    /// inbox don't need a manifest read just to label a
     /// connection; `family_manifest_get` is still the source of truth for
     /// the member roster.
     name: String,
@@ -13341,15 +13518,16 @@ fn family_set_item_status(
 /// board task in `members/<me>/board/` and marks the inbox item `accepted`,
 /// both in one commit (`family::accept_task` returns both file contents for
 /// exactly this reason) — so the repo never has a half-accepted state
-/// where one file changed and the other didn't. Emits `day-changed` at once
-/// (the accepted task joins Your day's list), the same instant feedback
-/// `note_task_write_and_emit` gives an ordinary task write.
+/// where one file changed and the other didn't. Emits `day-changed` once
+/// (the accepted task joins Your day's list) through `with_task_writes`,
+/// like an ordinary task write. Returns the accepted task as Your day
+/// shows it (the shape `day_task_create` returns).
 #[tauri::command]
-fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: String, item_id: String) -> CmdResult<tasks::Task> {
+fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: String, item_id: String) -> CmdResult<DayTaskDto> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
-    let (base_dir, settings) = {
+    let (base_dir, settings, ws_root) = {
         let guard = state.lock().unwrap();
-        (guard.base_dir.clone(), guard.app_settings.clone())
+        (guard.base_dir.clone(), guard.app_settings.clone(), guard.workspace.as_ref().map(|w| w.ws.root.clone()))
     };
     let conn = find_family_connection(&settings, id)?;
     let clone_root = family_clone_root(&base_dir, id);
@@ -13371,9 +13549,10 @@ fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: Stri
         PendingWrite::new(accepted.board_rel_path.clone(), accepted.board_content.clone()),
         PendingWrite::new(inbox_rel_path, accepted.inbox_content),
     ];
+    let board_path = clone_root.join(&accepted.board_rel_path);
     let mut transport = SystemGit::open(&clone_root).map_err(err)?;
     let engine = family_engine_handle(&state, id, &clone_root);
-    {
+    with_task_writes(&app, state.inner(), &[board_path.clone(), item_path.clone()], || {
         let mut eng = engine.lock().unwrap();
         eng.commit(
             &mut transport,
@@ -13381,18 +13560,18 @@ fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: Stri
             &writes,
             &format!("Accept task from inbox item {}", accepted.item_id),
         )
-        .map_err(err)?;
-    }
+        .map(|_| ())
+        .map_err(err)
+    })?;
     let report = { engine.lock().unwrap().poll(&mut transport) };
     emit_family_sync(&app, id, &report, &clone_root, &conn.member_id);
 
-    let board_path = clone_root.join(&accepted.board_rel_path);
-    // `HomeKind::Family`, not `Project` — this file lives at `<clone>/
-    // members/<id>/board/…`, exactly the shape Your day's scan tags
-    // `Family` when it reads the same board a moment later.
-    let task = tasks::parse_task(&board_path, tasks::HomeKind::Family, &conn.name, &accepted.board_content);
-    emit_day_changed(&app, state.inner());
-    Ok(task)
+    // The file lives at `<clone>/members/<id>/board/…`: a family-home task,
+    // as Your day's scan reads the same board a moment later.
+    let task = ken_core::day::parse_task(&board_path, tasks::HomeKind::Family, &accepted.board_content, &today);
+    let names = family_member_names(&base_dir, std::slice::from_ref(&conn));
+    let root = ws_root.unwrap_or_default();
+    Ok(day_task_dto(&root, &task, &names, None))
 }
 
 /// Push back on an inbox item (D4): creates a new message item in the
@@ -13998,5 +14177,100 @@ mod ken_mcp_refresh_tests {
         std::fs::write(&dest, b"v1 binary").unwrap();
         assert!(refresh_ken_mcp_from(&bundled, &dest).unwrap());
         assert_eq!(std::fs::read(&dest).unwrap(), b"v2 binary");
+    }
+}
+
+#[cfg(test)]
+mod your_day_tests {
+    use super::*;
+
+    fn attempt(at: i64, date: &str, ok: bool) -> TeamDigestAttempt {
+        TeamDigestAttempt { at, date: date.into(), ok }
+    }
+
+    #[test]
+    fn the_schedule_backs_off_after_a_failure_and_runs_once_a_day_after_success() {
+        let mut s = TeamDigestSchedule::default();
+        let today = "2026-10-01";
+        assert!(digest_due(&s, Some("Ops"), false, today, 10_000), "never tried");
+        assert!(!digest_due(&s, Some("Ops"), true, today, 10_000), "stored today");
+
+        s.attempts.insert("Ops".into(), attempt(10_000, today, false));
+        assert!(!digest_due(&s, Some("Ops"), false, today, 10_000 + 60), "a minute after a failure");
+        assert!(digest_due(&s, Some("Ops"), false, today, 10_000 + TEAM_DIGEST_RETRY_AFTER_SECS), "30 minutes on");
+
+        s.attempts.insert("Ops".into(), attempt(10_000, today, true));
+        assert!(!digest_due(&s, Some("Ops"), false, today, 90_000), "succeeded today");
+        assert!(digest_due(&s, Some("Ops"), false, "2026-10-02", 90_000), "a new day");
+        assert!(digest_due(&s, None, false, today, 10_000), "the whole workspace is its own key");
+    }
+
+    #[test]
+    fn the_schedule_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = uuid::Uuid::new_v4();
+        assert!(load_digest_schedule(dir.path(), ws).last_team.is_none());
+        update_digest_schedule(dir.path(), ws, |s| s.last_team = Some("Ops".into()));
+        update_digest_schedule(dir.path(), ws, |s| {
+            s.attempts.insert(digest_schedule_key(None), attempt(5, "2026-10-01", true));
+        });
+        let s = load_digest_schedule(dir.path(), ws);
+        assert_eq!(s.last_team.as_deref(), Some("Ops"));
+        assert!(s.attempts[""].ok);
+    }
+
+    #[test]
+    fn the_snapshot_rereads_only_files_whose_metadata_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        std::fs::write(&a, "one").unwrap();
+        std::fs::write(dir.path().join("note.txt"), "x").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        let first = task_board_file_snapshot(&dirs, &DaySnapshot::new());
+        assert_eq!(first.len(), 1, "only .md files");
+        assert_eq!(first[&a].hash, content_hash(b"one"));
+
+        // A recorded hash is trusted while size and mtime hold.
+        let mut seeded = first.clone();
+        seeded.get_mut(&a).unwrap().hash = 42;
+        assert_eq!(task_board_file_snapshot(&dirs, &seeded)[&a].hash, 42);
+
+        // A changed size is read again.
+        std::fs::write(&a, "one two").unwrap();
+        assert_eq!(task_board_file_snapshot(&dirs, &seeded)[&a].hash, content_hash(b"one two"));
+    }
+
+    #[test]
+    fn noted_writes_are_quiet_and_others_are_not() {
+        let file = |hash: u64| WatchedFile { len: 1, mtime: None, hash };
+        let note = |expect| TaskWriteNote { expect, at: Instant::now() };
+        let (a, b) = (PathBuf::from("/t/a.md"), PathBuf::from("/t/b.md"));
+        let last: DaySnapshot = [(a.clone(), file(1))].into_iter().collect();
+        let current: DaySnapshot = [(a.clone(), file(2)), (b.clone(), file(3))].into_iter().collect();
+
+        let mut writes = std::collections::HashMap::new();
+        writes.insert(a.clone(), note(TaskWriteExpect::Present(2)));
+        writes.insert(b.clone(), note(TaskWriteExpect::Writing));
+        assert!(!day_change_unexplained(&last, &current, &mut writes));
+        assert!(!writes.contains_key(&a), "a matched note is consumed");
+        assert!(writes.contains_key(&b), "a write in progress stays noted");
+
+        let mut writes = std::collections::HashMap::new();
+        assert!(day_change_unexplained(&last, &current, &mut writes), "nobody announced these");
+
+        // A removal: explained only by an `Absent` note.
+        let mut writes = std::collections::HashMap::new();
+        writes.insert(a.clone(), note(TaskWriteExpect::Absent));
+        assert!(!day_change_unexplained(&last, &DaySnapshot::new(), &mut writes));
+        assert!(writes.is_empty());
+
+        // Old notes expire.
+        let mut writes = std::collections::HashMap::new();
+        writes.insert(
+            b.clone(),
+            TaskWriteNote { expect: TaskWriteExpect::Writing, at: Instant::now() - TASK_WRITE_NOTE_TTL - Duration::from_secs(1) },
+        );
+        assert!(day_change_unexplained(&last, &current, &mut writes));
+        assert!(writes.is_empty());
     }
 }

@@ -2,9 +2,10 @@
 //! and the team's ticket files, read and written the same way by the app
 //! and `ken-mcp`.
 //!
-//! A **task** is one markdown file in a task home. New tasks go in the
-//! workspace home (`.ken-workspace/tasks/`); the older per-repo homes and
-//! the family boards are still read, so nothing on disk vanishes. Writes go
+//! A **task** is one markdown file in a task home: the workspace home
+//! (`.ken-workspace/tasks/`, where new tasks go) or my board in a family
+//! (where an accepted inbox task lands). Tasks live in your own folder,
+//! never inside a team repo, so a repo's `.ken/tasks/` is not read. Writes go
 //! through `tasks.rs`'s byte-faithful patch core: only the keys a change
 //! names are rewritten, and unknown keys, comments and line endings survive.
 //!
@@ -16,10 +17,14 @@
 //!
 //! A recurring task shows on its days only. It is done when `done_on` is
 //! today, and marking it done sets `done_on` (its `status` stays open). Its
-//! target is the next occurrence, computed, never stored.
+//! target is the next occurrence, computed, never stored. A recurring task
+//! whose `status` is `done` has ended: it reads as done and leaves the list
+//! after the day it was ended, like a done one-off.
 //!
 //! A **ticket** is `tickets/<ID>.md` (or one folder deeper) at the root of a
-//! team repo. Ken never writes one.
+//! team repo. Ken never writes one. A task links to it by `<repo>/<ID>`
+//! (that repo's ticket only) or by a bare `<ID>` (any repo's ticket with
+//! that id; older links).
 //!
 //! Dates are caller-supplied `YYYY-MM-DD` strings (`today`) and timestamps
 //! (`now`), the same convention `memory.rs` and `tasks.rs` use: no clock is
@@ -283,6 +288,16 @@ impl DayTask {
         self.repeat.as_deref().and_then(Repeat::parse)
     }
 
+    /// The file says `status: done`: for a recurring task, it has ended.
+    pub fn status_done(&self) -> bool {
+        self.status_raw.eq_ignore_ascii_case("done")
+    }
+
+    /// Recurring and not ended: shows on its days, done for a day at a time.
+    pub fn recurring(&self) -> Option<Repeat> {
+        self.recurrence().filter(|_| !self.status_done())
+    }
+
     pub fn file_name(&self) -> String {
         self.path
             .file_name()
@@ -296,27 +311,67 @@ impl DayTask {
         tasks::home_rel_path(self.home, &self.home_dir, &self.file_name())
     }
 
-    /// Does this task link to ticket `id`? A link is the id itself, or a
-    /// path to the ticket file (`tickets/ATT-014.md`), compared
-    /// case-insensitively.
-    pub fn links_ticket(&self, id: &str) -> bool {
+    /// Does this task link to ticket `id` of repo `repo` (a member name)?
+    /// A link `<repo>/<ID>` (or `<repo>/tickets/<ID>.md`) names that repo's
+    /// ticket only; a bare `<ID>` (or `tickets/<ID>.md`) names a ticket
+    /// with that id in any repo. `repo: None` asks about the id in any
+    /// repo. All compared case-insensitively.
+    pub fn links_ticket(&self, repo: Option<&str>, id: &str) -> bool {
         let id = id.trim();
-        !id.is_empty() && self.links.iter().any(|l| link_names_ticket(l, id))
+        let repo = repo.map(str::trim).filter(|r| !r.is_empty());
+        !id.is_empty()
+            && self.links.iter().any(|l| match link_ticket(l) {
+                Some((link_repo, link_id)) => {
+                    link_id.eq_ignore_ascii_case(id)
+                        && match (link_repo, repo) {
+                            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                            _ => true,
+                        }
+                }
+                None => false,
+            })
     }
 }
 
-fn link_names_ticket(link: &str, id: &str) -> bool {
-    let link = link.trim();
-    if link.eq_ignore_ascii_case(id) {
-        return true;
+/// Split a ticket reference: `<repo>/<ID>` names one repo's ticket, a
+/// bare `<ID>` has no repo.
+pub fn split_ticket_ref(s: &str) -> (Option<&str>, &str) {
+    let s = s.trim();
+    match s.split_once('/') {
+        Some((repo, id)) if !repo.trim().is_empty() && !id.contains('/') => (Some(repo.trim()), id.trim()),
+        _ => (None, s),
     }
-    let norm = link.replace('\\', "/");
-    let lower = norm.to_ascii_lowercase();
-    if !lower.ends_with(".md") || !(lower.starts_with("tickets/") || lower.contains("/tickets/")) {
-        return false;
+}
+
+/// The ticket a link could name, as `(repo, id)`: `ATT-014`,
+/// `att-opmodel/ATT-014`, `tickets/ATT-014.md`, `tickets/q4/ATT-014.md`,
+/// `att-opmodel/tickets/ATT-014.md`. A longer path to a ticket file
+/// (`ken://<id>/tickets/ATT-014.md`) names the id in any repo. `None` for
+/// a link that is no ticket reference at all.
+fn link_ticket(link: &str) -> Option<(Option<&str>, &str)> {
+    let link = link.trim().trim_end_matches('/');
+    if link.is_empty() {
+        return None;
     }
-    let stem = norm.rsplit('/').next().unwrap_or("");
-    stem[..stem.len() - 3].eq_ignore_ascii_case(id)
+    let parts: Vec<&str> = link.split(['/', '\\']).collect();
+    let last = parts[parts.len() - 1];
+    if let Some(stem) = last.strip_suffix(".md").or_else(|| last.strip_suffix(".MD")) {
+        let at = parts.iter().position(|p| p.eq_ignore_ascii_case(TICKETS_DIR))?;
+        let depth = parts.len() - at - 1;
+        if !(depth == 1 || depth == 2) || stem.is_empty() {
+            return None;
+        }
+        let repo = match at {
+            1 if !parts[0].contains(':') && !parts[0].is_empty() => Some(parts[0]),
+            _ => None,
+        };
+        return Some((repo, stem));
+    }
+    match parts.as_slice() {
+        [id] => Some((None, id)),
+        [repo, id] if !repo.is_empty() && !id.is_empty() => Some((Some(repo), id)),
+        _ => None,
+    }
 }
 
 fn opt(s: String) -> Option<String> {
@@ -358,16 +413,17 @@ pub fn parse_task(path: &Path, home: HomeKind, raw: &str, today: &str) -> DayTas
     let done_on = opt(get("done_on"));
 
     let recurrence = repeat.as_deref().and_then(Repeat::parse);
+    let status_done = status_raw.eq_ignore_ascii_case("done");
     let (state, target) = match recurrence {
+        // A recurring task with `status: done` has ended: done, and listed
+        // like a done one-off.
+        Some(_) if status_done => (DayTaskState::Done, target),
         Some(r) => {
             let done = done_on.as_deref().is_some_and(|d| d.get(..10) == today.get(..10));
             let next = Ymd::parse(today).map(|t| r.next_on_or_after(t).to_string());
             (if done { DayTaskState::Done } else { DayTaskState::Open }, next.or(target))
         }
-        None => {
-            let done = status_raw.eq_ignore_ascii_case("done");
-            (if done { DayTaskState::Done } else { DayTaskState::Open }, target)
-        }
+        None => (if status_done { DayTaskState::Done } else { DayTaskState::Open }, target),
     };
 
     DayTask {
@@ -432,8 +488,9 @@ pub fn find<'a>(tasks: &'a [DayTask], id: &str) -> Option<&'a DayTask> {
 /// Is this task on today's list? A recurring task, only on its days. A
 /// one-off, while it is open, and on the day it was done (until midnight):
 /// a done task whose `updated` is before today stays on disk, off the list.
+/// An ended recurring task (`status: done`) is listed like a done one-off.
 pub fn listed_today(task: &DayTask, today: &str) -> bool {
-    if let Some(r) = task.recurrence() {
+    if let Some(r) = task.recurring() {
         return Ymd::parse(today).is_some_and(|t| r.occurs_on(t));
     }
     match task.state {
@@ -478,7 +535,8 @@ pub struct TaskQuery {
     pub state: Option<DayTaskState>,
     /// Only tasks with a target strictly before this date.
     pub target_before: Option<String>,
-    /// Only tasks linked to this ticket id.
+    /// Only tasks linked to this ticket: `<repo>/<ID>` (that repo's
+    /// ticket), or a bare `<ID>` (that id in any repo).
     pub linked: Option<String>,
 }
 
@@ -490,7 +548,12 @@ pub fn query<'a>(all: &'a [DayTask], q: &TaskQuery) -> Vec<&'a DayTask> {
             Some(before) => t.target.as_deref().is_some_and(|d| d < before),
             None => true,
         })
-        .filter(|t| q.linked.as_deref().is_none_or(|id| t.links_ticket(id)))
+        .filter(|t| {
+            q.linked.as_deref().is_none_or(|r| {
+                let (repo, id) = split_ticket_ref(r);
+                t.links_ticket(repo, id)
+            })
+        })
         .collect();
     out.sort_by(|a, b| {
         let key = |t: &DayTask| (t.state == DayTaskState::Done, t.target.is_none(), t.target.clone(), t.title.to_lowercase());
@@ -632,21 +695,31 @@ pub fn update_task(task: &DayTask, patch: &DayTaskPatch, stamp: &Stamp) -> Resul
             edits.push(("due", tasks::scalar_lines("due", "")));
         }
     }
-    let mut recurring = task.recurrence().is_some();
+    // Recurring and not ended. Setting a repeat (re)starts the rule, so
+    // the status goes back to open.
+    let mut recurring = task.recurring().is_some();
     if let Some(r) = &patch.repeat {
         let r = clean_repeat(r.as_deref())?;
-        recurring = r.is_some();
         edits.push(("repeat", tasks::scalar_lines("repeat", r.as_deref().unwrap_or(""))));
+        recurring = r.is_some();
+        if recurring {
+            edits.push(("status", tasks::scalar_lines("status", DayTaskState::Open.as_str())));
+        }
     }
     if let Some(l) = &patch.links {
         edits.push(("links", tasks::seq_lines("links", &clean_links(l))));
     }
     if let Some(s) = patch.state {
         if recurring {
+            // Done for today only; `status` stays open.
             let on = if s == DayTaskState::Done { stamp.today } else { "" };
             edits.push(("done_on", tasks::scalar_lines("done_on", on)));
         } else {
             edits.push(("status", tasks::scalar_lines("status", s.as_str())));
+            if s == DayTaskState::Open && task.recurrence().is_some() && task.done_on.is_some() {
+                // Reopening an ended recurring task: not done today either.
+                edits.push(("done_on", tasks::scalar_lines("done_on", "")));
+            }
         }
     }
     edits.push(("updated", tasks::scalar_lines("updated", stamp.now)));
@@ -716,7 +789,8 @@ pub fn parse_ticket(rel_path: &str, raw: &str) -> Ticket {
         title,
         open: !closed,
         state,
-        assignees: tasks::map_list(&map, "assignee"),
+        // Only a YAML sequence is several assignees: `Staud, Chris` is one.
+        assignees: tasks::map_values(&map, "assignee"),
         target: opt(get("target")).or_else(|| opt(get("due"))),
         rel_path: rel,
     }
@@ -773,9 +847,10 @@ pub fn ticket_order(a: &Ticket, b: &Ticket) -> std::cmp::Ordering {
     (a.target.is_none(), &a.target, a.id.to_lowercase()).cmp(&(b.target.is_none(), &b.target, b.id.to_lowercase()))
 }
 
-/// How many tasks link to ticket `id`, and how many of those are done.
-pub fn linked_counts(tasks: &[DayTask], id: &str) -> (usize, usize) {
-    let linked: Vec<&DayTask> = tasks.iter().filter(|t| t.links_ticket(id)).collect();
+/// How many tasks link to ticket `id` of repo `repo` (see
+/// [`DayTask::links_ticket`]), and how many of those are done.
+pub fn linked_counts(tasks: &[DayTask], repo: Option<&str>, id: &str) -> (usize, usize) {
+    let linked: Vec<&DayTask> = tasks.iter().filter(|t| t.links_ticket(repo, id)).collect();
     let done = linked.iter().filter(|t| t.state == DayTaskState::Done).count();
     (linked.len(), done)
 }
@@ -793,8 +868,26 @@ impl Me {
     }
 
     /// Does one assignee value name me? Case-insensitive against my name,
-    /// my email, or my email's local part; a leading `@` is ignored.
+    /// my email, or my email's local part; a leading `@` is ignored. A
+    /// `Name <email>` value matches on either half.
     pub fn matches(&self, assignee: &str) -> bool {
+        let a = assignee.trim();
+        if let Some((name, rest)) = a.split_once('<') {
+            if let Some(email) = rest.trim().strip_suffix('>') {
+                let name = name.trim().trim_matches('"').trim();
+                return (!name.is_empty() && self.matches_one(name)) || self.matches_one(email);
+            }
+        }
+        // `Staud, Chris` is one person, written last name first.
+        if let Some((last, first)) = a.split_once(',') {
+            if !first.contains(',') && self.matches_one(&format!("{} {}", first.trim(), last.trim())) {
+                return true;
+            }
+        }
+        self.matches_one(a)
+    }
+
+    fn matches_one(&self, assignee: &str) -> bool {
         let a = assignee.trim().trim_start_matches('@').trim().to_lowercase();
         if a.is_empty() {
             return false;
@@ -1098,6 +1191,53 @@ mod tests {
     }
 
     #[test]
+    fn a_recurring_task_with_status_done_has_ended() {
+        let raw = |updated: &str| {
+            format!("---\nid: r1\ntitle: Standup notes\nstatus: done\nrepeat: daily\nupdated: '{updated}'\n---\n")
+        };
+        let t = task(&raw("2026-10-01T08:00"));
+        assert_eq!(t.state, DayTaskState::Done, "ended, not open again today");
+        assert!(t.recurring().is_none());
+        assert!(listed_today(&t, TODAY), "shown, greyed, on the day it ended");
+        assert!(!listed_today(&task(&raw("2026-09-30T17:00")), TODAY), "hidden after its day");
+
+        // Setting a repeat on it starts it again: status back to open.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("r1.md");
+        fs::write(&path, raw("2026-09-30T17:00")).unwrap();
+        let t = reread(&parse_task(&path, HomeKind::Workspace, &raw("2026-09-30T17:00"), TODAY));
+        update_task(&t, &DayTaskPatch { repeat: Some(Some("weekdays".into())), ..Default::default() }, &stamp(BY_YOU)).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("status: open\n"), "{after}");
+        assert!(after.contains("repeat: weekdays\n"));
+        let t = reread(&t);
+        assert_eq!(t.state, DayTaskState::Open);
+        assert!(listed_today(&t, TODAY), "a Thursday is a weekday");
+
+        // Marking it done again is done for today only.
+        update_task(&t, &DayTaskPatch { state: Some(DayTaskState::Done), ..Default::default() }, &stamp(BY_YOU)).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("status: open\n"), "{after}");
+        assert!(after.contains("done_on: '2026-10-01'\n"));
+        assert_eq!(reread(&t).state, DayTaskState::Done);
+    }
+
+    #[test]
+    fn reopening_an_ended_recurring_task_reopens_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("r2.md");
+        let raw = "---\nid: r2\ntitle: Wiki pass\nstatus: done\nrepeat: daily\ndone_on: '2026-10-01'\n---\n";
+        fs::write(&path, raw).unwrap();
+        let t = parse_task(&path, HomeKind::Workspace, raw, TODAY);
+        update_task(&t, &DayTaskPatch { state: Some(DayTaskState::Open), ..Default::default() }, &stamp(BY_YOU)).unwrap();
+        let t = reread(&t);
+        assert_eq!(t.status_raw, "open");
+        assert_eq!(t.done_on, None);
+        assert_eq!(t.state, DayTaskState::Open);
+        assert!(t.recurring().is_some());
+    }
+
+    #[test]
     fn patch_json_distinguishes_absent_from_null() {
         let p: DayTaskPatch = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
         assert_eq!(p.target, None);
@@ -1118,20 +1258,37 @@ mod tests {
     }
 
     #[test]
-    fn scan_reads_old_homes_too_and_dedupes() {
+    fn scan_reads_the_workspace_home_and_my_board_and_dedupes() {
         let dir = tempdir().unwrap();
-        let ws = dir.path();
-        let proj = dir.path().join("repo");
-        fs::create_dir_all(tasks::project_tasks_dir(&proj)).unwrap();
-        fs::write(tasks::project_tasks_dir(&proj).join("a.md"), "---\nid: a\ntitle: Old board task\nstatus: todo\n---\n").unwrap();
-        fs::write(tasks::project_tasks_dir(&proj).join("b.md"), "---\nid: dup\ntitle: Project copy\n---\n").unwrap();
-        create_task(ws, &DayTaskInput { title: "New".into(), ..Default::default() }, &stamp(BY_YOU), Some("dup")).unwrap();
-        let homes = [TaskHome::Workspace { workspace_root: ws }, TaskHome::Project { project_root: &proj, project: "repo" }];
+        let ws = dir.path().join("ws");
+        let board = dir.path().join("families/FAM1/members/mem-1/board");
+        fs::create_dir_all(&board).unwrap();
+        fs::write(board.join("a.md"), "---\nid: a\ntitle: Accepted\nstatus: backlog\nfrom: dee\n---\n").unwrap();
+        fs::write(board.join("b.md"), "---\nid: dup\ntitle: Board copy\n---\n").unwrap();
+        fs::create_dir_all(board.join("archive/2026-09")).unwrap();
+        fs::write(board.join("archive/2026-09/c.md"), "---\nid: c\ntitle: Archived\n---\n").unwrap();
+        create_task(&ws, &DayTaskInput { title: "New".into(), ..Default::default() }, &stamp(BY_YOU), Some("dup")).unwrap();
+        let homes = [TaskHome::Workspace { workspace_root: &ws }, TaskHome::Family { board_dir: &board }];
         let all = scan(&homes, TODAY);
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 2, "archive is a subfolder, not read");
         assert_eq!(find(&all, "dup").unwrap().title, "New", "first home wins");
-        assert_eq!(find(&all, "a").unwrap().state, DayTaskState::Open);
-        assert_eq!(find(&all, "a").unwrap().address_rel_path(), ".ken/tasks/a.md");
+        let a = find(&all, "a").unwrap();
+        assert_eq!(a.state, DayTaskState::Open);
+        assert_eq!(a.from.as_deref(), Some("dee"));
+        assert_eq!(a.address_rel_path(), "members/mem-1/board/a.md");
+        let moved = archive_task(a, TODAY).unwrap();
+        assert!(moved.ends_with("members/mem-1/board/archive/2026-10/a.md"), "{}", moved.display());
+    }
+
+    #[test]
+    fn a_repos_own_task_folder_is_not_a_home() {
+        // Ways of Working: tasks live in your own folder, never in a
+        // team repo. A `.ken/tasks/` file inside a repo is not read.
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".ken/tasks")).unwrap();
+        fs::write(repo.join(".ken/tasks/a.md"), "---\nid: a\ntitle: Old board task\n---\n").unwrap();
+        assert!(scan(&[TaskHome::Workspace { workspace_root: dir.path() }], TODAY).is_empty());
     }
 
     #[test]
@@ -1220,6 +1377,19 @@ mod tests {
         assert!(me.assigned(&t));
         let t = parse_ticket("tickets/A.md", "---\nassignee: dee, sam\n---\n");
         assert!(!me.assigned(&t));
+        assert_eq!(t.assignees, vec!["dee, sam"], "a scalar is one value, not split on commas");
+
+        // `Name <email>`, either half.
+        assert!(me.matches("Chris Staud <someone@else.example>"));
+        assert!(me.matches("C. S. <chris.staud@example.com>"));
+        assert!(me.matches("\"Chris Staud\" <x@y.z>"));
+        assert!(!me.matches("Dee Ray <dee@example.com>"));
+        // Last name first is one person.
+        let t = parse_ticket("tickets/A.md", "---\nassignee: Staud, Chris\n---\n");
+        assert_eq!(t.assignees, vec!["Staud, Chris"]);
+        assert!(me.assigned(&t));
+        let t = parse_ticket("tickets/A.md", "---\nassignee:\n  - Dee Ray <dee@example.com>\n  - Chris Staud <chris.staud@example.com>\n---\n");
+        assert!(me.assigned(&t));
         let nobody = Me::default();
         assert!(!nobody.is_known());
         assert!(!nobody.matches("chris"));
@@ -1236,9 +1406,44 @@ mod tests {
             mk("c", "links: [ATT-0140]\n"),
             mk("d", ""),
         ];
-        assert_eq!(linked_counts(&all, "ATT-014"), (2, 1));
-        assert_eq!(linked_counts(&all, "ATT-999"), (0, 0));
-        assert_eq!(linked_counts(&all, ""), (0, 0));
+        assert_eq!(linked_counts(&all, None, "ATT-014"), (2, 1));
+        assert_eq!(linked_counts(&all, Some("att-opmodel"), "ATT-014"), (2, 1), "bare links match any repo");
+        assert_eq!(linked_counts(&all, None, "ATT-999"), (0, 0));
+        assert_eq!(linked_counts(&all, None, ""), (0, 0));
+    }
+
+    #[test]
+    fn a_repo_qualified_link_names_only_that_repos_ticket() {
+        let mk = |id: &str, extra: &str| {
+            parse_task(Path::new(&format!("/w/tasks/{id}.md")), HomeKind::Workspace, &format!("---\nid: {id}\ntitle: {id}\n{extra}---\n"), TODAY)
+        };
+        let all = vec![
+            mk("ops", "links: [att-opmodel/ATT-014]\n"),
+            mk("web", "status: done\nlinks: [ATT-Web/att-014]\n"),
+            mk("bare", "links: [ATT-014]\n"),
+            mk("path", "links: [att-opmodel/tickets/ATT-014.md]\n"),
+            mk("deep", "links: ['tickets/q4/ATT-014.md']\n"),
+            mk("addr", "links: ['ken://0b1c/tickets/ATT-014.md']\n"),
+            mk("file", "links: [att-opmodel/src/retry.ts]\n"),
+        ];
+        let linked = |repo: Option<&str>, id: &str| {
+            all.iter().filter(|t| t.links_ticket(repo, id)).map(|t| t.id.as_str()).collect::<Vec<_>>()
+        };
+        assert_eq!(linked(Some("att-opmodel"), "ATT-014"), vec!["ops", "bare", "path", "deep", "addr"]);
+        assert_eq!(linked(Some("att-web"), "ATT-014"), vec!["web", "bare", "deep", "addr"]);
+        assert_eq!(linked(Some("other"), "ATT-014"), vec!["bare", "deep", "addr"]);
+        assert_eq!(linked(None, "att-014").len(), 6, "no repo: the id in any repo");
+        assert_eq!(linked_counts(&all, Some("att-web"), "ATT-014"), (4, 1));
+
+        // ticket_tasks / task_list's `linked` takes the same forms.
+        let ids = |r: &str| {
+            query(&all, &TaskQuery { linked: Some(r.into()), ..Default::default() }).iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+        };
+        assert!(!ids("att-opmodel/ATT-014").contains(&"web".to_string()));
+        assert!(ids("att-opmodel/ATT-014").contains(&"bare".to_string()));
+        assert_eq!(ids("ATT-014").len(), 6);
+        assert_eq!(split_ticket_ref("att-web/ATT-1"), (Some("att-web"), "ATT-1"));
+        assert_eq!(split_ticket_ref(" ATT-1 "), (None, "ATT-1"));
     }
 
     #[test]

@@ -1,10 +1,11 @@
 <script lang="ts">
   // A ticket opened in Files (Y1c): my tasks linked to it, with + Task to
   // add one already linked, and the wiki pages that cite the ticket id.
-  import { api, type DayTask } from "../lib/api";
+  import { api, type DayTask, type RoutedHit } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
-  import { day, openInRepo } from "../lib/day.svelte";
+  import { onMount } from "svelte";
+  import { day, openInRepo, ticketLink } from "../lib/day.svelte";
   import { shortTarget, stampLabel } from "../lib/day";
   import Check from "@lucide/svelte/icons/check";
 
@@ -14,19 +15,43 @@
   let pages = $state<{ projectId: string; path: string; name: string }[]>([]);
   let pagesLoaded = $state(false);
 
+  // Tasks follow `day-changed`, which needs the day store listening even
+  // when Home has not been opened.
+  onMount(() => void day.init());
+
+  // A reply for a ticket we have since left is dropped.
+  let taskSeq = 0;
+  let pageSeq = 0;
+  let tasksFor = "";
+
   async function loadTasks() {
-    tasks = await api.ticketTasks(projectId, ticketId).catch(() => []);
+    const n = ++taskSeq;
+    const key = `${projectId}:${ticketId}`;
+    if (key !== tasksFor) {
+      tasksFor = key;
+      tasks = [];
+    }
+    const next = await api.ticketTasks(projectId, ticketId).catch(() => []);
+    if (n === taskSeq) tasks = next;
   }
 
   async function loadPages() {
+    const n = ++pageSeq;
+    pages = [];
     pagesLoaded = false;
-    const res = await api.routeSearch(ticketId, 30, null, scope.team).catch(() => null);
+    const id = ticketId;
+    const res = await api.routeSearch(id, 30, null, scope.team).catch(() => null);
+    if (n !== pageSeq) return;
+    const needle = id.toLowerCase();
     const seen = new Set<string>();
     const out: typeof pages = [];
     for (const h of res?.results ?? []) {
       if (!h.page) continue;
       // The ticket itself, and other tickets, are not wiki pages.
       if (/^tickets\//i.test(h.path)) continue;
+      // Search ranks near misses too; a page cites the ticket only when the
+      // id is in what it found.
+      if (!citesId(h, needle)) continue;
       const key = `${h.projectId}:${h.path}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -34,6 +59,12 @@
     }
     pages = out;
     pagesLoaded = true;
+  }
+
+  function citesId(h: RoutedHit, needle: string): boolean {
+    // Snippets may mark the match up; read the text without the tags.
+    const text = `${h.snippet} ${h.page?.title ?? ""}`.replace(/<[^>]*>/g, "");
+    return text.toLowerCase().includes(needle);
   }
 
   // Tasks change from Your day, the chat and agents (day.state follows
@@ -52,7 +83,7 @@
   });
 
   async function toggle(t: DayTask) {
-    await api.dayTaskUpdate(t.id, { state: t.state === "done" ? "open" : "done" }).catch(() => null);
+    await day.toggle(t).catch(() => null);
     await loadTasks();
   }
 
@@ -65,11 +96,12 @@
   }
 
   function addTask() {
-    day.openNew([ticketId]);
+    day.openNew([ticketLink(projectId, ticketId)]);
   }
 
   function openTask(t: DayTask) {
-    day.openTask(t.id);
+    // It may be done earlier or due another day, so not in today's list.
+    day.openTask(t.id, { task: t, ticket: { projectId, ticketId } });
     app.screen = "home";
   }
 </script>
