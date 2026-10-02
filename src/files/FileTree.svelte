@@ -25,12 +25,13 @@
 
   let { width }: { width: number } = $props();
 
-  // The team's repos, one to a row: Files shows one repo at a time, chosen
-  // here (the team itself is chosen in the title bar).
-  const teamRepos = $derived(
-    app.workspace
-      ? app.members.filter((m) => m.id && scope.teamProjectIds.includes(m.id) && m.status !== "missing" && m.status !== "invalid")
-      : [],
+  // Files is the team's wiki. A file opened from another repo (a search hit,
+  // a citation) shows that repo here, with one line back to the wiki.
+  const wiki = $derived(scope.wikiId ? app.members.find((m) => m.id === scope.wikiId) : undefined);
+  const elsewhere = $derived(
+    !!app.workspace && !!wiki && !!app.focused && app.focused !== wiki.id
+      ? app.members.find((m) => m.id === app.focused)
+      : undefined,
   );
 
   const unreadOnly = $derived(app.filesFilter === "unread");
@@ -125,21 +126,12 @@
 </script>
 
 <div class="tree" style:width="{width}px">
-  {#if teamRepos.length > 1}
-    <div class="tree-head repos-head"><span class="ttl">Repos</span></div>
-    <div class="repos" role="listbox" aria-label="The team's repos">
-      {#each teamRepos as repo (repo.id)}
-        <button
-          class="row repo"
-          class:current={repo.id === app.focused}
-          role="option"
-          aria-selected={repo.id === app.focused}
-          onclick={() => repo.id && repo.id !== app.focused && void app.focusMember(repo.id)}
-        >
-          <span class="repo-badge">{memberLeaf(repo.name).charAt(0).toUpperCase()}</span>
-          <span class="name">{memberLeaf(repo.name)}</span>
-        </button>
-      {/each}
+  {#if elsewhere && wiki}
+    <div class="elsewhere">
+      <span class="where" title={elsewhere.name}>{memberLeaf(elsewhere.name)}</span>
+      <button class="back" onclick={() => wiki.id && void app.focusMember(wiki.id)}>
+        Back to {memberLeaf(wiki.name)}
+      </button>
     </div>
   {/if}
   {#if app.favorites.length > 0}
@@ -449,27 +441,35 @@
     padding: 2px;
     flex: none;
   }
-  .repos {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    padding: 0 8px 8px;
-  }
-  .row.repo.current {
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
-    font-weight: 600;
-  }
-  .repo-badge {
-    width: 16px;
-    height: 16px;
-    border-radius: 4px;
-    background: var(--ink);
-    color: var(--paper);
+  .elsewhere {
     display: flex;
     align-items: center;
-    justify-content: center;
-    font-family: var(--font-serif);
-    font-size: 9.5px;
-    flex: none;
+    gap: 8px;
+    margin: 0 8px 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+  }
+  .where {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .back {
+    border: none;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .back:hover {
+    color: var(--accent-hover);
   }
 </style>

@@ -1581,6 +1581,8 @@ export const api = {
   runDriftNow: (projectId: string | null = null) => invoke<DriftRun | null>("run_drift_now", { projectId }),
   /** The Team screen for the chosen team. */
   teamOverview: (team: string | null) => invoke<TeamOverview>("team_overview", { team }),
+  /** The team's wiki (the repo with the inbox), or null. */
+  teamWiki: (team: string | null) => invoke<string | null>("team_wiki", { team }),
   teamSaveIgnores: (lines: string[]) => invoke<void>("team_save_ignores", { lines }),
   /** Stored Review items waiting in each open repo of the team, as [id, name, count]. */
   teamReviewCounts: (team: string | null) => invoke<[string, string, number][]>("team_review_counts", { team }),

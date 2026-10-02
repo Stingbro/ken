@@ -23,6 +23,8 @@ class ScopeStore {
    *  it. Teams are the workspace's groups, each chosen on its own; there is
    *  no "all teams". Null only in a workspace with no team. */
   team = $state<string | null>(null);
+  /** The chosen team's wiki (the repo with the inbox): what Files opens on. */
+  wikiId = $state<string | null>(null);
 
   get enabled(): boolean {
     return !!app.workspace;
@@ -78,6 +80,7 @@ class ScopeStore {
     const remembered = readTeam(app.workspace?.id);
     const team = [remembered, this.team].find((t) => t && this.groups.some((g) => g.name === t)) ?? this.groups[0]?.name ?? null;
     this.team = team;
+    void this.refreshWiki();
     if (this.kind === "all" || (this.kind === "group" && !this.groups.some((g) => g.name === this.value))) {
       this.set(team ? "group" : "all", team);
     }
@@ -89,11 +92,17 @@ class ScopeStore {
     this.team = name;
     writeTeam(app.workspace?.id, name);
     this.set("group", name);
+    await this.refreshWiki();
     const ids = this.teamProjectIds;
     if (app.focused && ids.includes(app.focused)) return;
-    const wiki = app.registry.find((e) => ids.includes(e.id) && e.kind?.includes("wiki"));
-    const next = wiki?.id ?? ids[0];
+    const next = this.wikiId ?? ids[0];
     if (next) await app.focusMember(next);
+  }
+
+  async refreshWiki() {
+    const team = this.team;
+    const id = this.enabled ? await api.teamWiki(team).catch(() => null) : null;
+    if (team === this.team) this.wikiId = id;
   }
 
   /** The broad scope: the chosen team, or the workspace when it has none. */

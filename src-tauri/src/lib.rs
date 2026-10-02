@@ -7625,6 +7625,14 @@ fn inbox_project(guard: &AppState, team: Option<&str>) -> Option<Project> {
     best.map(|(_, p)| p)
 }
 
+/// The team's wiki: the repo with the inbox, the one Files opens on. None
+/// when no repo of the team has one.
+#[tauri::command]
+fn team_wiki(state: State<SharedState>, team: Option<String>) -> CmdResult<Option<String>> {
+    let guard = state.lock().unwrap();
+    Ok(inbox_project(&guard, team.as_deref()).map(|p| p.config.id.to_string()))
+}
+
 /// [`inbox_project`], opened if it was dormant, focus left where it was.
 fn inbox_member(app: &AppHandle, state: &SharedState, team: Option<&str>) -> CmdResult<uuid::Uuid> {
     let (project, open, focused) = {
@@ -14145,6 +14153,7 @@ pub fn run() {
             set_project_description,
             ingest_status,
             ingest_overview,
+            team_wiki,
             ingest_card,
             ingest_add,
             ingest_add_bytes,
