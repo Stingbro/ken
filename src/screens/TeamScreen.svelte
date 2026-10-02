@@ -47,6 +47,7 @@
       overview = await api.teamOverview(team);
       rail.setFindings(overview.findings?.length ?? 0);
       error = null;
+      if (overview.wiki) drafting = await api.wikiDrafting(overview.wiki.name).catch(() => false);
     } catch (e) {
       error = String(e);
     }
@@ -54,6 +55,21 @@
   $effect(() => {
     void team;
     void refresh();
+  });
+
+  /** Claude is writing the wiki's pages now. */
+  let drafting = $state(false);
+  $effect(() => {
+    let off: (() => void) | undefined;
+    void api
+      .onWikiDrafted((wiki) => {
+        if (wiki !== overview?.wiki?.name) return;
+        drafting = false;
+        toast.show("The wiki's pages are written. They are marked draft in Files, with their sources.");
+        void refresh();
+      })
+      .then((fn) => (off = fn));
+    return () => off?.();
   });
 
   /** An action on Team: `what` names it in the notice when it fails. */
@@ -162,7 +178,8 @@
     if (!name) return;
     void run("draft", "Could not start writing the wiki's pages", async () => {
       await api.draftWiki(name, null);
-      toast.show("Claude is writing the wiki's missing pages. They show in Files, marked draft, in a few minutes.");
+      drafting = true;
+      toast.show("Claude is writing the wiki's missing pages. It takes a few minutes; you can keep using Ken.");
     });
   }
 
@@ -423,7 +440,9 @@
         {#if overview.wiki}
           <div class="actions">
             <button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button>
-            <button class="btn btn-ghost" disabled={busy !== null} onclick={draftPages}>{busy === "draft" ? "Starting…" : "Write the missing pages with Claude"}</button>
+            <button class="btn btn-ghost" disabled={busy !== null || drafting} onclick={draftPages}>
+              {busy === "draft" ? "Starting…" : drafting ? "Claude is writing the pages…" : "Write the missing pages with Claude"}
+            </button>
           </div>
         {/if}
 

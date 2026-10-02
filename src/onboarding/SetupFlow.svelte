@@ -239,16 +239,16 @@
   }
 
   const STATES: { value: IndexState; label: string }[] = [
-    { value: "entities", label: "read for entities" },
-    { value: "search", label: "searchable only" },
-    { value: "off", label: "not indexed" },
+    { value: "entities", label: "read in full" },
+    { value: "search", label: "search only" },
+    { value: "off", label: "left out" },
   ];
 </script>
 
 <div class="setup">
   <ol class="steps" aria-label="Set-up steps">
-    {#each ["repos", "team", "index"] as s, i}
-      <li class:current={step === s}>{i + 1} · {s[0].toUpperCase() + s.slice(1)}</li>
+    {#each [["repos", "Repos"], ["team", "Team"], ["index", "Read"]] as [s, label], i}
+      <li class:current={step === s}>{i + 1} · {label}</li>
     {/each}
   </ol>
 
@@ -307,8 +307,9 @@
         {/each}
       </div>
       <p class="note">
-        Team and wiki repos are read for entities; code and reference repos are searchable only, and
-        Ken never commits into them. Secrets (<span class="mono">.env</span>, keys,
+        Team and wiki repos are read in full: Ken maps the people, decisions and tickets in them. Code
+        and reference repos are search only: found by search and read by Claude when asked, and Ken never
+        commits into them. Secrets (<span class="mono">.env</span>, keys,
         <span class="mono">credentials.json</span>) are never read.
       </p>
     {/if}
@@ -374,14 +375,14 @@
       <button class="btn btn-ghost" onclick={() => (step = "repos")}>Back</button>
     </div>
   {:else}
-    <h2>Index</h2>
+    <h2>Ready to read</h2>
     <p class="note">
-      Confirm writes the workspace in Ken's own data, and each repo's kind, team, index state and
-      description. Then Ken starts reading, in the background; you can use it while it runs.
+      Confirm saves the workspace on this computer and starts reading the repos in the background; you
+      can use Ken while it runs. A wiki or team repo made in step 2 is created first.
     </p>
     <p class="counts">
-      <strong>{summary.entities}</strong> read for entities · <strong>{summary.search}</strong>
-      searchable only · <strong>{summary.off}</strong> not indexed
+      <strong>{summary.entities}</strong> read in full · <strong>{summary.search}</strong>
+      search only · <strong>{summary.off}</strong> left out
     </p>
     <label class="field">
       <span class="field-label">Workspace name</span>

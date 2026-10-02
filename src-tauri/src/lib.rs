@@ -831,22 +831,25 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         let _ = app.asset_protocol_scope().allow_directory(&project.root, true);
     }
 
-    let mut guard = state.lock().unwrap();
+    // The registry, this repo's index and its one-time backfills read and
+    // write only this repo's files: done before the lock, which every other
+    // command needs, while a workspace opens its repos one after another.
+    let base_dir = lock_tolerant(state).base_dir.clone();
 
     // A workspace's own `.ken-workspace` (its memory) is not a repo: it is
     // never registered, and an entry an earlier version wrote goes.
-    let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
+    let mut registry = Registry::load(&base_dir).map_err(err)?;
     let forgot = registry.forget_workspace_folders();
     if !ken_core::registry::is_workspace_folder(&project.root) {
         registry.add(&project);
         registry.last_project = Some(project.config.id);
-        registry.save(&guard.base_dir).map_err(err)?;
+        registry.save(&base_dir).map_err(err)?;
     } else if forgot {
-        registry.save(&guard.base_dir).map_err(err)?;
+        registry.save(&base_dir).map_err(err)?;
     }
 
-    let mut db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
-    let watch_db_path = db_path(&guard.base_dir, project.config.id);
+    let mut db = Db::open(&base_dir, project.config.id).map_err(err)?;
+    let watch_db_path = db_path(&base_dir, project.config.id);
 
     // One-time kind refresh: `files.kind` is STORED at index time, and the
     // scanner never re-classifies an unchanged file — so a file whose kind
@@ -898,6 +901,8 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         }
         Err(e) => eprintln!("warning: extraction backfill failed: {e}"),
     }
+
+    let mut guard = state.lock().unwrap();
 
     // One-time unread baseline: snapshot the already-indexed files (this DB
     // persists across sessions, so an existing project has them here) as "seen"
@@ -3472,11 +3477,24 @@ async fn hydrate_file(
 /// Post-write bookkeeping shared by `save_file` and `save_file_bytes`: reindex
 /// the file, mark the version as seen, notify the frontend, return the mtime.
 /// Assumes the bytes are already on disk at `rel_path`.
-fn finish_save(app: &AppHandle, guard: &mut AppState, rel_path: &str) -> CmdResult<i64> {
-    let active = member_mut(guard, None)?;
-    let abs = active.project.resolve(rel_path).map_err(err)?;
-    // Index immediately — no need to wait for the watcher debounce.
-    scan::refresh_path(&active.project, &mut active.db, rel_path).map_err(err)?;
+fn finish_save(app: &AppHandle, project: &Project, base: &Path, rel_path: &str) -> CmdResult<i64> {
+    let abs = project.resolve(rel_path).map_err(err)?;
+    let project_id = project.config.id;
+    // Index it now, on its own connection: no wait for the watcher, and no
+    // other command waits on the lock meanwhile. The file is written; an
+    // index error is the watcher's to retry, not a failed save.
+    let seen_version = match Db::open(base, project_id) {
+        Ok(mut db) => {
+            if let Err(e) = scan::refresh_path(project, &mut db, rel_path) {
+                eprintln!("warning: indexing {rel_path} after a save failed: {e}");
+            }
+            db.get_file(rel_path).ok().flatten().map(|r| (r.size, r.mtime))
+        }
+        Err(e) => {
+            eprintln!("warning: could not open the index after saving {rel_path}: {e}");
+            None
+        }
+    };
     let mtime = abs
         .metadata()
         .and_then(|m| m.modified())
@@ -3486,27 +3504,27 @@ fn finish_save(app: &AppHandle, guard: &mut AppState, rel_path: &str) -> CmdResu
         .unwrap_or(0);
     // Record the just-written version as seen so the user's OWN edit never
     // counts as unread — the whole point of unread being "changed by someone
-    // else". Read the post-refresh row so size/mtime match what the index (and
-    // the unread check) now hold. Capture from `active` first, then touch
-    // `guard.base_dir` (its mutable borrow through `active` must end first).
-    let seen_version = active
-        .db
-        .get_file(rel_path)
-        .map_err(err)?
-        .map(|r| (r.size, r.mtime));
-    let project_id = active.project.config.id;
+    // else".
     if let Some(version) = seen_version {
-        let base = guard.base_dir.clone();
         let _us = user_state_lock();
-        let mut us = UserState::load(&base, project_id);
+        let mut us = UserState::load(base, project_id);
         if us.mark_seen(rel_path, version) {
-            let _ = us.save(&base, project_id);
+            let _ = us.save(base, project_id);
         }
     }
     let _ = app.emit("file-saved", rel_path);
     Ok(mtime)
 }
 
+/// The focused member's project and the app data dir, cloned under the lock
+/// for a save that writes and indexes after releasing it.
+fn save_target(state: &SharedState) -> CmdResult<(Project, PathBuf)> {
+    let guard = lock_tolerant(state);
+    let active = member(&guard, None)?;
+    Ok((active.project.clone(), guard.base_dir.clone()))
+}
+
+// Saves stay on the main thread, so they run in the order they were made.
 #[tauri::command]
 fn save_file(
     app: AppHandle,
@@ -3514,11 +3532,10 @@ fn save_file(
     rel_path: String,
     content: String,
 ) -> CmdResult<i64> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    let (project, base) = save_target(state.inner())?;
+    let abs = project.resolve(&rel_path).map_err(err)?;
     std::fs::write(&abs, &content).map_err(err)?;
-    finish_save(&app, &mut guard, &rel_path)
+    finish_save(&app, &project, &base, &rel_path)
 }
 
 /// Overwrite a file with raw bytes. Used by the PDF form filler: `bytes` is the
@@ -3531,11 +3548,10 @@ fn save_file_bytes(
     rel_path: String,
     bytes: Vec<u8>,
 ) -> CmdResult<i64> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    let abs = active.project.resolve(&rel_path).map_err(err)?;
+    let (project, base) = save_target(state.inner())?;
+    let abs = project.resolve(&rel_path).map_err(err)?;
     std::fs::write(&abs, &bytes).map_err(err)?;
-    finish_save(&app, &mut guard, &rel_path)
+    finish_save(&app, &project, &base, &rel_path)
 }
 
 #[tauri::command(async)]
@@ -7106,6 +7122,18 @@ fn claude_generate(
     }
 }
 
+/// The wikis whose first pages are being drafted, by member name.
+fn drafting() -> &'static Mutex<std::collections::HashSet<String>> {
+    static D: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    D.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether Claude is drafting `wiki`'s pages now (Team shows it).
+#[tauri::command(async)]
+fn wiki_drafting(wiki: String) -> bool {
+    lock_tolerant(drafting()).contains(&wiki)
+}
+
 /// Draft the first wiki pages (item 4b) into the workspace member `wiki`,
 /// from its team's repos plus an optional folder of documents: a Repo Map
 /// page per repo, each from that repo alone, then the team pages from those
@@ -7113,7 +7141,7 @@ fn claude_generate(
 /// on the Team screen (`team_overview`'s findings). Never touches a page a
 /// person wrote.
 #[tauri::command(async)]
-fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
+fn draft_wiki(app: AppHandle, state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
     let (base, wiki_root, wiki_id, repos) = {
         let guard = state.lock().unwrap();
         let members = wiki_team_members(&guard)?;
@@ -7124,7 +7152,20 @@ fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) ->
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     };
     let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
+    if !lock_tolerant(drafting()).insert(wiki.clone()) {
+        return Err("Claude is already writing this wiki's pages.".into());
+    }
     std::thread::spawn(move || {
+        // Cleared however the draft ends, and the screens told.
+        struct Done(AppHandle, String);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                lock_tolerant(drafting()).remove(&self.1);
+                let _ = self.0.emit("review-changed", ());
+                let _ = self.0.emit("wiki-drafted", self.1.clone());
+            }
+        }
+        let _done = Done(app, wiki.clone());
         let Ok(mut db) = Db::open(&base, wiki_id) else { return };
         let dirs = repos.iter().map(|(_, root)| root.clone()).collect();
         let generate = claude_generate(binary, wiki_root.clone(), dirs);
@@ -8462,6 +8503,27 @@ async fn run_drift_now(state: State<'_, SharedState>, project_id: Option<String>
 
 /// A page's links both ways, resolved now: the pages it reaches and the
 /// pages that reach it (the Map's page neighbours).
+/// The page a `[[link]]` in `from` names, by file name or by an alias in a
+/// page's frontmatter; the one in `from`'s folder when two pages claim it.
+#[tauri::command(async)]
+fn resolve_page_link(state: State<SharedState>, from: String, target: String) -> CmdResult<Option<String>> {
+    let search_db = {
+        let guard = lock_tolerant(&state);
+        member(&guard, None)?.search_db.clone()
+    };
+    let db = lock_tolerant(&search_db);
+    let resolver = ken_core::links::Resolver::from_db(&db).map_err(err)?;
+    let name = target.split('|').next().unwrap_or(&target).split('#').next().unwrap_or("").trim().to_string();
+    let link = ken_core::links::Link {
+        kind: if name.contains('/') { ken_core::links::LinkKind::Path } else { ken_core::links::LinkKind::Name },
+        target: name,
+    };
+    let found = resolver.resolve(&link);
+    let dir = from.rsplit_once('/').map(|(d, _)| d.to_lowercase()).unwrap_or_default();
+    let near = found.iter().find(|p| p.rsplit_once('/').map(|(d, _)| d.to_lowercase()).unwrap_or_default() == dir);
+    Ok(near.or(found.first()).cloned())
+}
+
 #[tauri::command(async)]
 fn page_links(state: State<SharedState>, path: String) -> CmdResult<ken_core::links::PageLinks> {
     let guard = state.lock().unwrap();
@@ -14308,6 +14370,8 @@ pub fn run() {
             team_digest,
             refresh_team_digest,
             team_digest_writing,
+            resolve_page_link,
+            wiki_drafting,
             escalation_reply,
             workspace_groups,
             workspace_set_group,

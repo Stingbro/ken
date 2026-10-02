@@ -458,6 +458,12 @@
     }
   }
 
+  // The note is written before the pages are: while Claude still writes
+  // them, the card says so and nothing on it can be undone or filed yet (an
+  // Undo then would be overwritten by the read's own record of the card).
+  const cardWriting = $derived(
+    !!card && !!overview && overview.raw.some((r) => r.cardId === card?.id && (r.state === "reading" || r.state === "transcribing")),
+  );
   const written = $derived(card?.writes ?? []);
   const live = $derived(written.filter((w) => !w.undone));
   const rulings = $derived((card?.proposals ?? []).filter((p) => p.kind === "ruling"));
@@ -628,7 +634,7 @@
             <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => card && openSource(card.source)}>Open source</button>
             <button class="btn" onclick={() => card && inLibrary(card.note)}>Open the note</button>
             {#if card.open}
-              <button class="btn btn-primary" disabled={busy !== null} onclick={seen}>Mark as seen</button>
+              <button class="btn btn-primary" disabled={busy !== null || cardWriting} onclick={seen}>Mark as seen</button>
             {/if}
           </div>
         {/if}
@@ -642,8 +648,13 @@
         </div>
       {:else}
         <div class="progress-card">
-          <div class="pline"><b>Read and filed</b><span class="grow"></span><span class="t-small">Done</span></div>
-          <div class="k-progress fat"><span style="width: 100%" class="okbar"></span></div>
+          {#if cardWriting}
+            <div class="pline"><b>Writing the pages</b><span class="grow"></span><span class="t-small">The note is written; Claude is updating the pages it changes</span></div>
+            <div class="k-progress fat"><span style="width: 80%"></span></div>
+          {:else}
+            <div class="pline"><b>Read and filed</b><span class="grow"></span><span class="t-small">Done</span></div>
+            <div class="k-progress fat"><span style="width: 100%" class="okbar"></span></div>
+          {/if}
           <div class="steps">
             {#each isRecording(card.source, card.takeaways.kind) ? RECORDING_STEPS : DOCUMENT_STEPS as s (s)}<span class="step done"><CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{s}</span>{/each}
           </div>
@@ -745,7 +756,7 @@
                   {#if !w.undone}
                     <span class="wacts">
                       <button class="btn btn-small" onclick={() => openWrite(w)}>Open</button>
-                      <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => undoWrite(w)}>Undo</button>
+                      <button class="btn btn-small btn-ghost" disabled={busy !== null || cardWriting} onclick={() => undoWrite(w)}>Undo</button>
                     </span>
                   {/if}
                 </div>
@@ -769,7 +780,7 @@
 
         <div class="foot">
           <span class="t-small grow">Undo all takes back every page edit and puts the source back in Raw.</span>
-          <button class="btn btn-danger" disabled={busy !== null} onclick={undoAll}>Undo all</button>
+          <button class="btn btn-danger" disabled={busy !== null || cardWriting} onclick={undoAll}>Undo all</button>
         </div>
       {/if}
     {:else if rawSelected}

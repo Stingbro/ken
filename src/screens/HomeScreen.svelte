@@ -321,7 +321,7 @@
           <span class="k-progress"><span style="width: {reading.pct ?? 8}%"></span></span>
         {/if}
         <span class="t-small">
-          {indexLine}{inbox.queued > 0 ? ` · ${inbox.queued} to read` : ""}{#if (day.health?.failed ?? 0) > 0} · <span class="bad">{day.health?.failed} couldn't be read</span>{/if}
+          {indexLine}{inbox.queued > 0 ? ` · ${inbox.queued} to read` : ""}{#if app.failedFiles.length > 0} · <span class="bad">{app.failedFiles.length} couldn't be read</span>{/if}
         </span>
       </button>
     {/if}

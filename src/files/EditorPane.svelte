@@ -257,10 +257,16 @@
   // once focus moves (the Files menu, a citation) this pane saves nothing:
   // two repos can hold the same path (every wiki has START-HERE.md).
   const owner = app.focused;
+  /** Saves so far: the links panel reads the page's links again after each. */
+  let savedCount = $state(0);
 
   /** A `[[link]]` in the page: open the page it names, in this repo. */
-  function openWikiLink(target: string) {
-    const page = resolveWikiLink(target, relPath, app.files.map((f) => f.relPath));
+  async function openWikiLink(target: string) {
+    // The index knows aliases (a page's frontmatter names it too); the file
+    // list covers a page indexed a moment ago.
+    const page =
+      (await api.resolvePageLink(relPath, target).catch(() => null)) ??
+      resolveWikiLink(target, relPath, app.files.map((f) => f.relPath));
     if (page) app.openTab(page, true);
     else toast.show(`No page named "${target.split("|")[0]}" in this repo.`);
   }
@@ -273,6 +279,7 @@
       dirty = false;
       savedAt = Date.now();
       saveError = null;
+      savedCount += 1;
     } catch (e) {
       saveError = `Couldn't save: ${e}`;
     }
@@ -487,7 +494,7 @@
     />
   {/if}
   {#if meta?.kind === "md"}
-    <PageLinks {relPath} refresh={reloadKey} />
+    <PageLinks {relPath} refresh={reloadKey + savedCount} />
   {:else if /\.(rs|py|pyi|jsx?|mjs|cjs|tsx?|mts|cts|go|java|cs)$/i.test(relPath)}
     <CodeMap {relPath} refresh={reloadKey} />
   {/if}

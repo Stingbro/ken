@@ -839,10 +839,19 @@ impl ChatEngine {
 
     /// Stop a chat's conversation process (mode switch, archive, shutdown).
     pub fn stop(&self, chat_id: &str) {
-        if let Some(mut conv) = self.live.lock().unwrap().remove(chat_id) {
+        let stopped = self.live.lock().unwrap().remove(chat_id);
+        if let Some(mut conv) = stopped {
             crate::proc::kill_tree(&mut conv.child);
             let _ = conv.child.wait();
+            self.stopped(chat_id);
         }
+    }
+
+    /// A chat whose process Ken ended: removed from `live` first, so its
+    /// reader sees no death to report, and a reply cut off mid-turn would
+    /// otherwise show "working" for good.
+    fn stopped(&self, chat_id: &str) {
+        (self.on_update)(ChatUpdate::Status { chat_id: chat_id.to_string(), status: "done".into(), detail: None });
     }
 
     pub fn stop_all(&self) {
@@ -872,6 +881,7 @@ impl ChatEngine {
                 if let Some(mut conv) = live.remove(&oldest) {
                     crate::proc::kill_tree(&mut conv.child);
                     let _ = conv.child.wait();
+                    self.stopped(&oldest);
                 }
             }
         }

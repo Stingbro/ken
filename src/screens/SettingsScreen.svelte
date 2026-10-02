@@ -5,7 +5,7 @@
   // Settings: what is yours (You), what is this computer's (This machine),
   // Ken's features, the connector for agents, and About. Each repo's own
   // settings open from its row on Team.
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { app } from "../lib/app.svelte";
   import { memory } from "../lib/memory.svelte";
   import { toWorkspaceAddress, unopenableReason } from "../lib/kenAddress";
@@ -78,6 +78,20 @@
       clearTimeout(copyTimer);
       off?.();
     };
+  });
+
+  // Settings stays mounted: a change of repo reads that repo's features and
+  // its agent command.
+  let seenFocus: string | null | undefined;
+  $effect(() => {
+    const f = app.focused;
+    if (seenFocus !== undefined && f !== seenFocus) {
+      untrack(() => {
+        void loadFeatures();
+        void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
+      });
+    }
+    seenFocus = f;
   });
 
   async function loadFeatures() {
