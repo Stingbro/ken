@@ -123,7 +123,7 @@
       const proposal = await api.setupProposeRepos(paths);
       const rows = proposal.rows.map((r) => ({ ...r, include: true, team: team ?? r.team }));
       await app.confirmSetupRepos(name, rows, true);
-      app.screen = "team";
+      app.openTeam();
       await scope.refreshGroups();
       // The wiki drafts each new repo's page and proposes the rest.
       await api.wikiAddRepos(rows.map((r) => r.member)).catch((e) => toast.error("Could not update the wiki", e));

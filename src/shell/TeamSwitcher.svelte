@@ -31,9 +31,18 @@
       </button>
     {/each}
   {/if}
+  <div class="sep"></div>
+  <button class="row foot" role="menuitem" onclick={() => { close(); app.openTeam(); }}>
+    <span class="info"><span class="name">Team library</span><span class="sub">Folders, rules and the weekly check</span></span>
+  </button>
 </div>
 
 <style>
+  .sep {
+    height: 1px;
+    background: var(--line-soft);
+    margin: 4px 2px;
+  }
   .scrim {
     position: fixed;
     inset: 0;
@@ -43,8 +52,8 @@
   }
   .menu {
     position: fixed;
-    top: 50px;
-    left: 110px;
+    top: 64px;
+    left: 10px;
     width: 280px;
     background: var(--surface);
     border: 1px solid var(--border);

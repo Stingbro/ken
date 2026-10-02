@@ -1,17 +1,17 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
   import TitleBar from "./TitleBar.svelte";
-  import NavRail from "./NavRail.svelte";
+  import Sidebar from "./Sidebar.svelte";
   import SearchOverlay from "../search/SearchOverlay.svelte";
   import ChatDrawer from "../chat/ChatDrawer.svelte";
   import { chats } from "../lib/chats.svelte";
   import HomeScreen from "../screens/HomeScreen.svelte";
   import FilesScreen from "../screens/FilesScreen.svelte";
   import IngestsScreen from "../screens/IngestsScreen.svelte";
-  import TeamScreen from "../screens/TeamScreen.svelte";
-  import MapScreen from "../screens/MapScreen.svelte";
-  import TimelineScreen from "../screens/TimelineScreen.svelte";
+  import InboxScreen from "../screens/InboxScreen.svelte";
+  import ExploreScreen from "../screens/ExploreScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
+  import { inbox } from "../lib/inbox.svelte";
   import WhatsNewDialog from "../whats-new/WhatsNewDialog.svelte";
   import { whatsNew } from "../whats-new/whatsNew.svelte";
   import Toasts from "../lib/ui/Toasts.svelte";
@@ -38,6 +38,7 @@
     void record.listen();
     void conflicts.subscribe();
     void rail.subscribe();
+    void inbox.subscribe();
   });
 
   // The person asked Claude in chat to open something: focus its workspace
@@ -69,28 +70,26 @@
 <svelte:window onkeydown={onKeydown} />
 
 <div class="frame">
+  <Sidebar />
+  <div class="column">
   <TitleBar />
   <div class="body">
-    <NavRail />
     <main class="screen">
       <!-- Screens mount on first visit and then stay mounted, so open file /
            query survive switching — without paying for every screen (and the
            restored editor tab) at boot. -->
       <div class="pane" hidden={app.screen !== "home"}><HomeScreen /></div>
+      {#if visited.has("inbox")}
+        <div class="pane" hidden={app.screen !== "inbox"}><InboxScreen /></div>
+      {/if}
       {#if visited.has("files")}
         <div class="pane" hidden={app.screen !== "files"}><FilesScreen /></div>
       {/if}
       {#if visited.has("ingests")}
         <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
       {/if}
-      {#if visited.has("team")}
-        <div class="pane" hidden={app.screen !== "team"}><TeamScreen /></div>
-      {/if}
-      {#if visited.has("map")}
-        <div class="pane" hidden={app.screen !== "map"}><MapScreen /></div>
-      {/if}
-      {#if visited.has("timeline")}
-        <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
+      {#if visited.has("explore")}
+        <div class="pane" hidden={app.screen !== "explore"}><ExploreScreen /></div>
       {/if}
       {#if visited.has("settings")}
         <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>
@@ -99,6 +98,7 @@
     {#if chats.open}
       <ChatDrawer />
     {/if}
+  </div>
   </div>
   {#if app.searchOpen}
     <SearchOverlay />
@@ -111,10 +111,15 @@
   .frame {
     height: 100vh;
     display: flex;
-    flex-direction: column;
-    background: var(--paper);
+    background: var(--bg);
     position: relative;
     overflow: hidden;
+  }
+  .column {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
   }
   .body {
     display: flex;

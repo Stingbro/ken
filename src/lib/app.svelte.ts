@@ -62,12 +62,18 @@ export interface Reveal {
 
 export type Screen =
   | "home"
+  | "inbox"
   | "files"
   | "ingests"
-  | "team"
-  | "map"
-  | "timeline"
+  | "explore"
   | "settings";
+
+/** Settings' sections (the Briefing design's sub-nav). Team library holds what
+ *  the Team screen did: the team's folders, ignore list, checks and rules. */
+export type SettingsSection = "general" | "team" | "sync" | "ai" | "agents" | "rules";
+
+/** Explore's two views of the same knowledge. */
+export type ExploreView = "timeline" | "map";
 
 /** One entry in `app.members` (workspace task 4.3). In Single mode (no
  *  workspace open) this is just the one open project, `status: "active"`
@@ -88,6 +94,8 @@ class AppStore {
   project = $state<ProjectInfo | null>(null);
   registry = $state<RegistryEntryStatus[]>([]);
   screen = $state<Screen>("home");
+  settingsSection = $state<SettingsSection>("general");
+  exploreView = $state<ExploreView>("timeline");
 
   files = $state<FileRow[]>([]);
   folders = $state<FolderInfo[]>([]);
@@ -792,8 +800,20 @@ class AppStore {
     this.revealAt = where.line || where.anchor ? { path: relPath, ...where, nonce: Date.now() } : null;
   }
 
-  openSettings() {
+  openSettings(section?: SettingsSection) {
+    if (section) this.settingsSection = section;
     this.screen = "settings";
+    this.searchOpen = false;
+  }
+
+  /** The team's folders, rules and checks (was the Team screen). */
+  openTeam() {
+    this.openSettings("team");
+  }
+
+  openExplore(view?: ExploreView) {
+    if (view) this.exploreView = view;
+    this.screen = "explore";
     this.searchOpen = false;
   }
 

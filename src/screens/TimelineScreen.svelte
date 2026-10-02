@@ -85,10 +85,6 @@
 
 <div class="screen">
   <div class="inner">
-    <div class="head">
-      <h1>Timeline</h1>
-    </div>
-
     {#if knowledge.error}
       <div class="error">Last refresh didn't finish — {knowledge.error}</div>
     {/if}
@@ -229,7 +225,7 @@
     flex: 1;
     min-width: 0;
     overflow-y: auto;
-    padding: 36px 44px;
+    padding: 8px clamp(24px, 4vw, 56px) 48px;
   }
   .inner {
     max-width: 760px;
