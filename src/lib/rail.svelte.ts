@@ -5,6 +5,7 @@
 import { api } from "./api";
 import { app } from "./app.svelte";
 import { scope } from "./scope.svelte";
+import { coalesce, singleFlight } from "./refresh";
 
 /** Scans fire in bursts; read the counts once, after this quiet spell. */
 const DEBOUNCE_MS = 1500;
@@ -17,7 +18,6 @@ class RailStore {
   findings = $state(0);
 
   private subscribed = false;
-  private timer: ReturnType<typeof setTimeout> | null = null;
   private pendingFindings = false;
 
   async subscribe() {
@@ -38,29 +38,30 @@ class RailStore {
 
   private queue(findings: boolean) {
     this.pendingFindings ||= findings;
-    if (this.timer !== null) clearTimeout(this.timer);
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.refreshIngest();
-      if (this.pendingFindings) void this.refreshFindings();
-      this.pendingFindings = false;
-    }, DEBOUNCE_MS);
+    this.queueRead();
   }
 
-  /** Optional reads: a failure keeps the last count. */
-  async refreshIngest() {
+  private readonly queueRead = coalesce(() => {
+    void this.refreshIngest();
+    if (this.pendingFindings) void this.refreshFindings();
+    this.pendingFindings = false;
+  }, DEBOUNCE_MS);
+
+  /** Optional reads: a failure keeps the last count. One of each at a time
+   *  (see `singleFlight`). */
+  readonly refreshIngest = singleFlight(async () => {
     if (!app.workspace) return;
     const team = scope.team;
     const o = await api.ingestOverview(team).catch(() => null);
     if (o && team === scope.team) this.setIngest(o.waiting ?? 0);
-  }
+  });
 
-  async refreshFindings() {
+  readonly refreshFindings = singleFlight(async () => {
     if (!app.workspace) return;
     const team = scope.team;
     const o = await api.teamOverview(team).catch(() => null);
     if (o && team === scope.team) this.setFindings(o.findings?.length ?? 0);
-  }
+  });
 
   setIngest(n: number) {
     this.ingestWaiting = n;

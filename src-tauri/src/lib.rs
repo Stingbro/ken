@@ -892,6 +892,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     // every file. Only files that change or are added AFTER this point count as
     // unread. No-op once the project has been baselined before.
     {
+        let _us = user_state_lock();
         let mut us = UserState::load(&guard.base_dir, project.config.id);
         if !us.baselined {
             if let Ok(files) = db.list_files() {
@@ -1233,12 +1234,13 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     // previous single-assignment drop timing. Skipped when `clear_others` is
     // false so a workspace member joins the others already open.
     let focus_id = runtime.project.config.id;
-    if clear_others {
-        guard.members.clear();
-    }
+    let replaced = if clear_others { std::mem::take(&mut guard.members) } else { Default::default() };
     guard.members.insert(focus_id, runtime);
     guard.focused = Some(focus_id);
     drop(guard);
+    // Dropped with the lock released: dropping a runtime waits for its
+    // watcher and sync threads, and those can be waiting for the lock.
+    drop(replaced);
 
     // semantic-index task 2.1: resume the semantic index on open if the
     // project already had `semanticIndex` turned on in a previous session
@@ -1493,7 +1495,7 @@ fn list_projects(state: State<SharedState>) -> CmdResult<Vec<RegistryEntryStatus
     Ok(Registry::load(&guard.base_dir).map_err(err)?.statuses())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_project(
     app: AppHandle,
     state: State<SharedState>,
@@ -1504,7 +1506,7 @@ fn create_project(
     activate(&app, &state, project, true)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_project(app: AppHandle, state: State<SharedState>, path: String) -> CmdResult<ProjectInfo> {
     let project = Project::open(std::path::Path::new(&path)).map_err(err)?;
     activate(&app, &state, project, true)
@@ -1559,7 +1561,7 @@ fn memory_pseudo_member_id(state: &AppState) -> Option<uuid::Uuid> {
 /// `state.members` past one entry outside workspace mode. The asset-protocol
 /// scope grant for the member's root happens inside `activate`, same as
 /// `open_project` — nothing to duplicate here.
-#[tauri::command]
+#[tauri::command(async)]
 fn open_member(app: AppHandle, state: State<SharedState>, path: String) -> CmdResult<ProjectInfo> {
     {
         let guard = state.lock().unwrap();
@@ -1576,7 +1578,7 @@ fn open_member(app: AppHandle, state: State<SharedState>, path: String) -> CmdRe
 /// was focused, focus falls to an arbitrary remaining member (or `None` if
 /// it was the last one) — `MemberRuntime`'s `Drop`/`StopOnDrop` fields stop
 /// its watcher and background workers.
-#[tauri::command]
+#[tauri::command(async)]
 fn close_member(state: State<SharedState>, project_id: String) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
     if !workspace_enabled(&guard.app_settings) {
@@ -1978,13 +1980,15 @@ fn open_workspace_inner(
                 .and_then(|w| w.last_focused)
         })
     };
-    // Tear down any currently-open project or workspace.
-    {
+    // Tear down any currently-open project or workspace. The runtimes drop
+    // with the lock released (see `activate`).
+    let closed = {
         let mut guard = state.lock().unwrap();
-        guard.members.clear();
         guard.focused = None;
         guard.workspace = None;
-    }
+        std::mem::take(&mut guard.members)
+    };
+    drop(closed);
     let _ = app.emit(
         "workspace-state",
         WorkspaceStateEvent::Opening { name: ws.config.name.clone() },
@@ -2150,7 +2154,7 @@ fn open_workspace_inner(
 
 /// Open an existing workspace (`<parent>/.ken-workspace/workspace.json`) and
 /// bring its members online (task 3.1). Flag-gated (task 3.4).
-#[tauri::command]
+#[tauri::command(async)]
 fn open_workspace(
     app: AppHandle,
     state: State<SharedState>,
@@ -2168,7 +2172,7 @@ fn open_workspace(
 
 /// Create a new workspace over `parent` from the selected member folder names,
 /// then open it (task 3.1). Flag-gated (task 3.4).
-#[tauri::command]
+#[tauri::command(async)]
 fn create_workspace(
     app: AppHandle,
     state: State<SharedState>,
@@ -2202,7 +2206,7 @@ fn workspace_overview(state: State<SharedState>) -> CmdResult<WorkspaceOverviewD
 
 /// Focus a member, activating a dormant one and LRU-evicting past the cap
 /// (task 3.2). Flag-gated (task 3.4).
-#[tauri::command]
+#[tauri::command(async)]
 fn focus_project(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
     {
         let guard = state.lock().unwrap();
@@ -2229,7 +2233,7 @@ async fn setup_propose(parent: String) -> CmdResult<ken_core::setup::Proposal> {
 /// Set-up, Confirm: write the manifest, the registry's kinds, teams and
 /// index states, and the ticked ignore lines, then open the workspace so
 /// indexing starts. The only set-up step that writes.
-#[tauri::command]
+#[tauri::command(async)]
 fn setup_confirm(
     app: AppHandle,
     state: State<SharedState>,
@@ -2262,7 +2266,7 @@ async fn setup_propose_repos(state: State<'_, SharedState>, paths: Vec<String>) 
 /// Confirm picked repos. With `add` false, a new workspace in Ken's app
 /// data (`workspaces/<id>`), switching the workspace feature on; with `add`
 /// true, into the open workspace. Then opens it so indexing starts.
-#[tauri::command]
+#[tauri::command(async)]
 fn setup_confirm_repos(
     app: AppHandle,
     state: State<SharedState>,
@@ -2324,18 +2328,21 @@ fn discover_workspace_candidates(
 /// Close the open workspace, tearing down every member handle (task 3.2).
 /// `members.clear()` drops all runtimes; recents get the last focus + now.
 /// Flag-gated (task 3.4).
-#[tauri::command]
+#[tauri::command(async)]
 fn close_workspace(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
-    let (base, ws_core, focused) = {
+    let (base, ws_core, focused, closed) = {
         let mut guard = state.lock().unwrap();
         if !workspace_enabled(&guard.app_settings) {
             return Err(WORKSPACE_DISABLED_MSG.into());
         }
         let ws = guard.workspace.take().ok_or("no workspace open")?;
         let focused = guard.focused.take();
-        guard.members.clear(); // drop every runtime = full teardown
-        (guard.base_dir.clone(), ws.ws, focused)
+        // Every runtime goes (full teardown); they drop below, with the lock
+        // released (see `activate`).
+        let closed = std::mem::take(&mut guard.members);
+        (guard.base_dir.clone(), ws.ws, focused, closed)
     };
+    drop(closed);
     if let Ok(mut reg) = Registry::load(&base) {
         reg.add_workspace(&ws_core, focused, engine::now_epoch());
         reg.last_workspace = Some(ws_core.config.id);
@@ -2668,7 +2675,7 @@ fn set_project_index(
     Ok(registry.statuses())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let uuid: uuid::Uuid = id.parse().map_err(err)?;
@@ -2691,7 +2698,7 @@ fn list_recent_workspaces(state: State<SharedState>) -> CmdResult<Vec<ken_core::
 }
 
 /// Take a workspace off the recent list. Its folders and files stay.
-#[tauri::command]
+#[tauri::command(async)]
 fn forget_workspace(state: State<SharedState>, id: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let uuid: uuid::Uuid = id.parse().map_err(err)?;
@@ -2761,7 +2768,7 @@ fn current_project(state: State<SharedState>) -> CmdResult<Option<ProjectInfo>> 
     Ok(member(&guard, None).ok().map(|a| ProjectInfo::of(&a.project)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_folder_selection(
     app: AppHandle,
     state: State<SharedState>,
@@ -2782,13 +2789,19 @@ fn set_folder_selection(
 
 #[tauri::command(async)]
 fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    let files = active.db.list_files().map_err(err)?;
+    // What the read needs, cloned under the lock; the listing and the walk
+    // happen after it is released. Indexing asks for the tree again and
+    // again, and every other command waits on this lock.
+    let (project, search_db) = {
+        let mut guard = lock_tolerant(&state);
+        let active = member_mut(&mut guard, None)?;
+        (active.project.clone(), active.search_db.clone())
+    };
+    let files = lock_tolerant(&search_db).list_files().map_err(err)?;
 
     // Folders straight from disk so excluded/empty ones still show.
     let mut folders = Vec::new();
-    let walker = ignore::WalkBuilder::new(&active.project.root)
+    let walker = ignore::WalkBuilder::new(&project.root)
         .hidden(true)
         .git_ignore(false)
         .git_global(false)
@@ -2799,11 +2812,11 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
         })
         .build();
     for entry in walker.flatten() {
-        if entry.path().is_dir() && entry.path() != active.project.root {
-            if let Ok(rel) = entry.path().strip_prefix(&active.project.root) {
+        if entry.path().is_dir() && entry.path() != project.root {
+            if let Ok(rel) = entry.path().strip_prefix(&project.root) {
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 folders.push(FolderInfo {
-                    excluded: active.project.is_excluded(&rel),
+                    excluded: project.is_excluded(&rel),
                     rel_path: rel,
                 });
             }
@@ -2812,7 +2825,7 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
     folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     let files = files
         .into_iter()
-        .map(|row| FileRowDto::new(row, &active.project))
+        .map(|row| FileRowDto::new(row, &project))
         .collect();
     Ok(TreeData { files, folders })
 }
@@ -3058,7 +3071,7 @@ async fn hybrid_search(
 /// `extra` key is removed in the same save, so first write migrates old files.
 /// Per-flag side effects run after persisting (semanticIndex resumes/stops the
 /// index build).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_project_feature(
     app: AppHandle,
     state: State<SharedState>,
@@ -3113,7 +3126,7 @@ fn set_project_feature(
 /// override is set. The durable write happens first; the in-memory
 /// `AppSettings` in `AppState` is updated only after it succeeds, so a failed
 /// save leaves state and disk consistent.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_global_feature(_app: AppHandle, state: State<SharedState>, flag: String, value: bool) -> CmdResult<()> {
     if ken_core::features::flag(&flag).is_none() {
         return Err(format!("unknown feature flag: {flag}"));
@@ -3450,6 +3463,7 @@ fn finish_save(app: &AppHandle, guard: &mut AppState, rel_path: &str) -> CmdResu
     let project_id = active.project.config.id;
     if let Some(version) = seen_version {
         let base = guard.base_dir.clone();
+        let _us = user_state_lock();
         let mut us = UserState::load(&base, project_id);
         if us.mark_seen(rel_path, version) {
             let _ = us.save(&base, project_id);
@@ -3548,7 +3562,7 @@ fn get_ocr_regions(state: State<SharedState>, rel_path: String) -> CmdResult<Vec
         .collect())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
     // Reindex is a full `db.clear()` + recursive rescan — far too heavy to run
     // inline on the IPC thread while holding the global state mutex (that froze
@@ -3820,7 +3834,7 @@ fn maybe_rebuild_semantic_index_for_profile(
 /// `profile-state` events scoped to `project_id` (`emit_member`). See
 /// `scan_and_profile`'s doc comment for the hand-edit and refinement-gating
 /// deviations.
-#[tauri::command]
+#[tauri::command(async)]
 fn profile_project(
     app: AppHandle,
     state: State<SharedState>,
@@ -4705,7 +4719,7 @@ fn reindex_moved(db: &mut Db, from_rel: &str, to_rel: &str) -> ken_core::Result<
 /// state mutex) and discarded every extraction, OCR result and transcript in the
 /// project just to rename a directory. The rewrite is pure SQL, so it is safe to
 /// keep synchronous; `index-updated` still fires so the UI refreshes.
-#[tauri::command]
+#[tauri::command(async)]
 fn move_file(
     app: AppHandle,
     state: State<SharedState>,
@@ -4872,7 +4886,7 @@ async fn delete_file(
 /// validates sibling names first; this is the race-safety backstop). Folders
 /// aren't index rows — the tree walks them off disk — so no refresh is needed;
 /// the caller's tree refresh picks it up.
-#[tauri::command]
+#[tauri::command(async)]
 fn create_folder(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -4894,7 +4908,7 @@ fn create_folder(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 /// path is returned so the UI opens the tab it actually created. The new file
 /// is indexed immediately so search and the tree stay correct before the
 /// watcher fires.
-#[tauri::command]
+#[tauri::command(async)]
 fn create_document(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
@@ -4997,7 +5011,7 @@ fn project_folders(root: &std::path::Path) -> Vec<String> {
 /// Copy an external file into a private staging area inside the project so it's
 /// previewable before it's placed, without indexing it. The original is only
 /// read; the copy runs OFF the lock (a large file must not freeze other IPC).
-#[tauri::command]
+#[tauri::command(async)]
 fn import_begin(state: State<SharedState>, src_path: String) -> CmdResult<ImportDto> {
     let root = {
         let guard = state.lock().unwrap();
@@ -5089,7 +5103,7 @@ async fn import_classify(
 /// whatever folder is selected. Validates the folder stays inside the project,
 /// creates it when asked, disambiguates the name so nothing is overwritten,
 /// then fires the SAME downstream notifications `hydrate_file` does.
-#[tauri::command]
+#[tauri::command(async)]
 fn import_commit(
     app: AppHandle,
     state: State<SharedState>,
@@ -5324,7 +5338,7 @@ fn encode_uri_component(s: &str) -> String {
 /// Resolve a project-relative video to a streamable asset URL. The file is
 /// already local by the time media plays (EditorPane hydrates first), so this
 /// only validates the path and confirms the bytes are here.
-#[tauri::command]
+#[tauri::command(async)]
 fn media_src(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     let abs = resolve_path(&state, &rel_path)?;
     if !abs.is_file() {
@@ -5395,7 +5409,7 @@ struct TranscriptDto {
 /// A video's transcript, resolved in the contract's order: adjacent `.vtt`,
 /// then a fuzzy-matched adjacent `.docx`, then a previously generated file;
 /// failing all three, `generating` if a Whisper job is in flight, else `none`.
-#[tauri::command]
+#[tauri::command(async)]
 fn video_transcript(state: State<SharedState>, rel_path: String) -> CmdResult<TranscriptDto> {
     let (abs, root, generating) = {
         let guard = state.lock().unwrap();
@@ -5423,7 +5437,7 @@ fn video_transcript(state: State<SharedState>, rel_path: String) -> CmdResult<Tr
 /// invocation surfaces a clear error when ffmpeg or the model is missing; the
 /// finished `.vtt` re-indexes the video so `index-updated` fires and the
 /// frontend re-fetches the transcript.
-#[tauri::command]
+#[tauri::command(async)]
 fn generate_transcript(app: AppHandle, state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let (root, base, project_id, jobs) = {
         let guard = state.lock().unwrap();
@@ -5551,15 +5565,21 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
         match result {
             Ok(_) => {
                 // Re-index the video so the fresh transcript is searchable.
-                let mut guard = job.state.lock().unwrap();
                 // The job carries the project it belongs to, so ask for it.
                 // Taking an arbitrary member and then checking the id matched
                 // meant that in a workspace the re-index silently never ran,
-                // and a finished transcript stayed unsearchable.
-                if let Some(active) = guard.members.get_mut(&job.project_id) {
-                    let _ = scan::refresh_path(&active.project, &mut active.db, &job.rel_path);
+                // and a finished transcript stayed unsearchable. The re-index
+                // runs on its own connection, with the lock released: it
+                // extracts and hashes the file.
+                let target = {
+                    let guard = lock_tolerant(&job.state);
+                    guard.members.get(&job.project_id).map(|a| (a.project.clone(), guard.base_dir.clone()))
+                };
+                if let Some((project, base)) = target {
+                    if let Ok(mut db) = Db::open(&base, job.project_id) {
+                        let _ = scan::refresh_path(&project, &mut db, &job.rel_path);
+                    }
                 }
-                drop(guard);
                 emit_member(&app, job.project_id, "index-updated", ScanStats::default());
             }
             Err(e) => {
@@ -5684,7 +5704,7 @@ fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
 /// download of the same id is refused. The download itself streams to a temp
 /// file, verifies, and atomically installs — all off the global lock, on its
 /// own thread (like `spawn_transcription`).
-#[tauri::command]
+#[tauri::command(async)]
 fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
     let (base, downloads) = {
         let guard = state.lock().unwrap();
@@ -5772,7 +5792,7 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
 }
 
 /// Delete an installed model file. Missing is a no-op.
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_model(state: State<SharedState>, id: String) -> CmdResult<()> {
     let base = { state.lock().unwrap().base_dir.clone() };
     // Prefer the catalog spec; fall back to a minimal one so an unknown id (e.g.
@@ -5906,11 +5926,29 @@ fn load_user_state(guard: &AppState) -> CmdResult<(std::path::PathBuf, uuid::Uui
     Ok((base, id, us))
 }
 
+/// Held from loading the user's state file to saving it, so two commands
+/// changing it at once do not lose one change. Taken after the global lock
+/// when both are held, never before it.
+fn user_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    lock_tolerant(LOCK.get_or_init(|| Mutex::new(())))
+}
+
+/// The focused member's app data dir, id and read connection, for the unread
+/// commands: they read the index and the user's state off the global lock,
+/// because the tree and the unread set are read again on every index update.
+fn unread_snapshot(state: &SharedState) -> CmdResult<(std::path::PathBuf, uuid::Uuid, Arc<Mutex<Db>>)> {
+    let guard = lock_tolerant(state);
+    let active = member(&guard, None)?;
+    Ok((guard.base_dir.clone(), active.project.config.id, active.search_db.clone()))
+}
+
 /// Silence a file's review issues for THIS user only (stored in app-data, never
 /// written to the synced `.ken/` config). The file stays indexed and findable.
 #[tauri::command(async)]
 fn ignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
+    let _us = user_state_lock();
     let (base, id, mut us) = load_user_state(&guard)?;
     if us.ignore(rel_path) {
         us.save(&base, id).map_err(err)?;
@@ -5922,6 +5960,7 @@ fn ignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 #[tauri::command(async)]
 fn unignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
+    let _us = user_state_lock();
     let (base, id, mut us) = load_user_state(&guard)?;
     if us.unignore(&rel_path) {
         us.save(&base, id).map_err(err)?;
@@ -5952,10 +5991,10 @@ fn index_versions(files: &[FileRow]) -> Vec<(String, (i64, i64))> {
 /// what remains is external edits, syncs, and cloud hydrates.
 #[tauri::command(async)]
 fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let files = active.db.list_files().map_err(err)?;
-    let (base, id, mut us) = load_user_state(&guard)?;
+    let (base, id, search_db) = unread_snapshot(state.inner())?;
+    let files = lock_tolerant(&search_db).list_files().map_err(err)?;
+    let _us = user_state_lock();
+    let mut us = UserState::load(&base, id);
     let index = index_versions(&files);
     // Defensive baseline: activate() normally does this, but guarantee it so a
     // never-baselined project reports empty rather than its entire tree.
@@ -5969,12 +6008,12 @@ fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
 /// open, and it backs the "Mark as viewed" context-menu item).
 #[tauri::command(async)]
 fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let Some(row) = active.db.get_file(&rel_path).map_err(err)? else {
+    let (base, id, search_db) = unread_snapshot(state.inner())?;
+    let Some(row) = lock_tolerant(&search_db).get_file(&rel_path).map_err(err)? else {
         return Ok(()); // not indexed (yet) — nothing to mark
     };
-    let (base, id, mut us) = load_user_state(&guard)?;
+    let _us = user_state_lock();
+    let mut us = UserState::load(&base, id);
     if us.mark_seen(rel_path, (row.size, row.mtime)) {
         us.save(&base, id).map_err(err)?;
     }
@@ -5985,10 +6024,10 @@ fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 /// `rel_path` is the folder; files directly at that path or beneath it count.
 #[tauri::command(async)]
 fn mark_seen_under(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let files = active.db.list_files().map_err(err)?;
-    let (base, id, mut us) = load_user_state(&guard)?;
+    let (base, id, search_db) = unread_snapshot(state.inner())?;
+    let files = lock_tolerant(&search_db).list_files().map_err(err)?;
+    let _us = user_state_lock();
+    let mut us = UserState::load(&base, id);
     if us.mark_seen_under(&rel_path, &index_versions(&files)) {
         us.save(&base, id).map_err(err)?;
     }
@@ -5998,10 +6037,10 @@ fn mark_seen_under(state: State<SharedState>, rel_path: String) -> CmdResult<()>
 /// Mark every currently-unread file seen ("Mark all as viewed").
 #[tauri::command(async)]
 fn mark_all_seen(state: State<SharedState>) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let files = active.db.list_files().map_err(err)?;
-    let (base, id, mut us) = load_user_state(&guard)?;
+    let (base, id, search_db) = unread_snapshot(state.inner())?;
+    let files = lock_tolerant(&search_db).list_files().map_err(err)?;
+    let _us = user_state_lock();
+    let mut us = UserState::load(&base, id);
     if us.mark_all_seen(&index_versions(&files)) {
         us.save(&base, id).map_err(err)?;
     }
@@ -6041,9 +6080,12 @@ fn sync_status_of(project: &Project) -> SyncStatus {
 
 #[tauri::command(async)]
 fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    Ok(sync_status_of(&active.project))
+    // git runs twice: with the lock released.
+    let project = {
+        let guard = lock_tolerant(&state);
+        member(&guard, None)?.project.clone()
+    };
+    Ok(sync_status_of(&project))
 }
 
 #[tauri::command]
@@ -6259,16 +6301,25 @@ struct FilesBannerDto {
 /// less those on files I ignore.
 #[tauri::command(async)]
 fn files_banner(state: State<SharedState>, team: Option<String>) -> CmdResult<FilesBannerDto> {
-    let guard = state.lock().unwrap();
-    let repos: Vec<(uuid::Uuid, String)> = match guard.workspace.as_ref() {
-        Some(ws) => team_repos(&ws.ws, team.as_deref()).into_iter().map(|r| (r.id, r.name)).collect(),
-        None => guard.members.values().map(|m| (m.project.config.id, m.project.config.name.clone())).collect(),
+    // Cloned under the lock, read after it is released: this is read again
+    // on every index update.
+    let (base_dir, repos) = {
+        let guard = lock_tolerant(&state);
+        let ids: Vec<(uuid::Uuid, String)> = match guard.workspace.as_ref() {
+            Some(ws) => team_repos(&ws.ws, team.as_deref()).into_iter().map(|r| (r.id, r.name)).collect(),
+            None => guard.members.values().map(|m| (m.project.config.id, m.project.config.name.clone())).collect(),
+        };
+        let repos: Vec<(uuid::Uuid, String, Arc<Mutex<Db>>)> = ids
+            .into_iter()
+            .filter_map(|(id, name)| guard.members.get(&id).map(|m| (id, name, m.search_db.clone())))
+            .collect();
+        (guard.base_dir.clone(), repos)
     };
     let mut conflicts = Vec::new();
-    for (id, name) in repos {
-        let Some(m) = guard.members.get(&id) else { continue };
-        let ignored = UserState::load(&guard.base_dir, id).ignored;
-        for it in m.db.list_open_review_items().map_err(err)? {
+    for (id, name, search_db) in repos {
+        let ignored = UserState::load(&base_dir, id).ignored;
+        let items = lock_tolerant(&search_db).list_open_review_items().map_err(err)?;
+        for it in items {
             if it.kind != "conflict" && it.kind != "conflict-copy" {
                 continue;
             }
@@ -6276,7 +6327,9 @@ fn files_banner(state: State<SharedState>, team: Option<String>) -> CmdResult<Fi
                 continue;
             }
             conflicts.push(ConflictItemDto {
-                id: format!("item-{}", it.id),
+                // Row ids restart in each repo's index: the repo keeps two
+                // repos' conflicts apart in the list.
+                id: format!("item-{}@{id}", it.id),
                 item_id: it.id,
                 kind: it.kind,
                 title: it.title,
@@ -6681,7 +6734,7 @@ fn generator_status() -> &'static str {
 /// Only meaningful when the local model is the active backend, so skip the
 /// warm-up entirely when no usable model is installed (nothing to load, and the
 /// Claude path never warms).
-#[tauri::command]
+#[tauri::command(async)]
 fn warm_llm() {
     if LOCAL_GENERATION && matches!(
         ken_core::local_llm::llm_status(),
@@ -6733,7 +6786,7 @@ struct KnowledgeModelState {
 
 /// The whole stored knowledge model in one call — it's small by
 /// construction (extraction caps), so no pagination.
-#[tauri::command]
+#[tauri::command(async)]
 fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -7020,7 +7073,7 @@ fn claude_generate(binary: std::path::PathBuf, root: std::path::PathBuf) -> impl
 /// pages. Runs in the background through the Claude CLI; the result shows
 /// on the Team screen (`team_overview`'s findings). Never touches a page a
 /// person wrote.
-#[tauri::command]
+#[tauri::command(async)]
 fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
     let (base, wiki_root, wiki_id, repos) = {
         let guard = state.lock().unwrap();
@@ -7328,11 +7381,16 @@ struct IngestOverviewDto {
 #[tauri::command(async)]
 fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestOverviewDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
-    let guard = state.lock().unwrap();
-    let base = guard.base_dir.clone();
-    let active = member(&guard, Some(id))?;
-    let root = &active.project.root;
-    let db = &active.db;
+    // Cloned under the lock, read after it is released: Home, Inbox and the
+    // sidebar ask for this on every index update.
+    let (base, root, library, search_db) = {
+        let guard = lock_tolerant(&state);
+        let active = member(&guard, Some(id))?;
+        (guard.base_dir.clone(), active.project.root.clone(), active.project.config.name.clone(), active.search_db.clone())
+    };
+    let root = &root;
+    let db_guard = lock_tolerant(&search_db);
+    let db: &Db = &db_guard;
     let reading = INGEST_READING.lock().unwrap().get(&id).cloned();
     let open = db.list_open_review_items().map_err(err)?;
     // The open cards of sources still in Raw: read, not yet seen.
@@ -7342,7 +7400,8 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
         .filter_map(|it| ken_core::ingest::card_of(it.payload.as_deref()).map(|c| (it.id, c)))
         .filter(|(_, c)| !c.filed)
         .collect();
-    let waits = |note: &str| ken_core::ingest::proposals_from(db, note).map(|p| p.len()).unwrap_or(0);
+    let counts = ken_core::ingest::proposal_counts(&open);
+    let waits = |note: &str| counts.get(note).copied().unwrap_or(0);
     // What a recording with no transcript waits for, if anything.
     let has_model = transcription_model(&base).is_some();
     let has_ffmpeg = std::cell::OnceCell::new();
@@ -7420,10 +7479,11 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
             }
         })
         .collect();
+    drop(db_guard);
     let waiting = raw.iter().filter(|r| r.state == "failed" || r.state == "waiting" || r.waiting > 0).count() + filed_waiting;
     Ok(IngestOverviewDto {
         project_id: id.to_string(),
-        library: active.project.config.name.clone(),
+        library,
         raw,
         ingested,
         running: INGEST_RUNNING.lock().unwrap().contains(&id),
@@ -7494,14 +7554,6 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
-/// The workspace member whose folder is `root`.
-fn member_at(guard: &AppState, root: &Path) -> Option<String> {
-    guard.workspace.as_ref()?.ws.members.iter().find_map(|m| match &m.status {
-        ken_core::workspace::MemberStatus::Ok(p) if same_dir(&p.root, root) => Some(p.config.id.to_string()),
-        _ => None,
-    })
-}
-
 /// One ingested source for the Ingest screen: its key takeaways, what was
 /// written from it (each with Undo), what waits (rulings, tickets, held
 /// edits) and what stays on the card only.
@@ -7509,12 +7561,31 @@ fn member_at(guard: &AppState, root: &Path) -> Option<String> {
 fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<IngestCardDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let me = cached_git_me();
-    let guard = state.lock().unwrap();
-    let active = member(&guard, Some(id))?;
-    let item = active.db.get_review_item(item_id).map_err(err)?.ok_or("no ingest card with that id")?;
+    // Cloned under the lock, read after it is released (the Inbox reads
+    // every card that has something waiting).
+    let (root, search_db, members) = {
+        let guard = lock_tolerant(&state);
+        let active = member(&guard, Some(id))?;
+        let members: Vec<(PathBuf, String)> = guard
+            .workspace
+            .as_ref()
+            .map(|w| {
+                w.ws.members
+                    .iter()
+                    .filter_map(|m| match &m.status {
+                        ken_core::workspace::MemberStatus::Ok(p) => Some((p.root.clone(), p.config.id.to_string())),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (active.project.root.clone(), active.search_db.clone(), members)
+    };
+    let db = lock_tolerant(&search_db);
+    let item = db.get_review_item(item_id).map_err(err)?.ok_or("no ingest card with that id")?;
     let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
-    let text = std::fs::read_to_string(active.project.root.join(&card.placement.note)).unwrap_or_default();
-    let proposals = ken_core::ingest::proposals_from(&active.db, &card.placement.note)
+    let text = std::fs::read_to_string(root.join(&card.placement.note)).unwrap_or_default();
+    let proposals = ken_core::ingest::proposals_from(&db, &card.placement.note)
         .map_err(err)?
         .into_iter()
         .map(|it| {
@@ -7540,6 +7611,8 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
             }
         })
         .collect();
+    drop(db);
+    let member_at = |root: &Path| members.iter().find(|(r, _)| same_dir(r, root)).map(|(_, id)| id.clone());
     let library = id.to_string();
     let writes = card
         .writes
@@ -7555,7 +7628,7 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
             project_id: match (&w.kind, &w.root) {
                 (ken_core::ingest::WriteKind::Task, _) => None,
                 (_, None) => Some(library.clone()),
-                (_, Some(root)) => member_at(&guard, Path::new(root)),
+                (_, Some(root)) => member_at(Path::new(root)),
             },
         })
         .collect();
@@ -7649,7 +7722,7 @@ fn percent_decode(s: &str) -> String {
 /// carries no path): the request body is the file, the `x-name` header its
 /// name and `x-team` the team, both URI-encoded. Written into the library's
 /// Raw/ and the read starts. Returns its path in Raw.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_add_bytes(app: AppHandle, state: State<SharedState>, request: tauri::ipc::Request<'_>) -> CmdResult<String> {
     let header = |key: &str| -> Option<String> {
         request
@@ -8112,12 +8185,20 @@ fn pages_in(root: &std::path::Path, dir: &str) -> Vec<TeamPageDto> {
 /// the wiki's last drift sweep, and its rules and templates.
 #[tauri::command(async)]
 fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<TeamOverviewDto> {
-    let guard = state.lock().unwrap();
-    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-    let registry = Registry::load(&guard.base_dir).map_err(err)?;
-    let in_team: Option<Vec<String>> = team.as_deref().map(|t| ws.ws.config.effective_group_members(t));
+    // Cloned under the lock; the registry, the file counts, the wiki's
+    // findings and git are read after it is released. Home, Inbox and the
+    // sidebar ask for this while indexing runs.
+    let (ws, base_dir, dbs) = {
+        let guard = lock_tolerant(&state);
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?.ws.clone();
+        let dbs: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> =
+            guard.members.iter().map(|(id, m)| (*id, m.search_db.clone())).collect();
+        (ws, guard.base_dir.clone(), dbs)
+    };
+    let registry = Registry::load(&base_dir).map_err(err)?;
+    let in_team: Option<Vec<String>> = team.as_deref().map(|t| ws.config.effective_group_members(t));
     let mut repos: Vec<TeamRepoDto> = Vec::new();
-    for m in &ws.ws.members {
+    for m in &ws.members {
         if in_team.as_ref().is_some_and(|names| !names.contains(&m.name)) {
             continue;
         }
@@ -8126,7 +8207,7 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         let kind = entry.map(|e| e.kind.clone()).unwrap_or_default();
         let index = entry.and_then(|e| e.index);
         let git = p.root.join(".git").exists();
-        let files = guard.members.get(&p.config.id).and_then(|r| r.db.file_count().ok()).unwrap_or(-1);
+        let files = dbs.get(&p.config.id).and_then(|d| lock_tolerant(d).file_count().ok()).unwrap_or(-1);
         repos.push(TeamRepoDto {
             id: p.config.id.to_string(),
             name: m.name.clone(),
@@ -8136,8 +8217,8 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             index,
             description: entry.and_then(|e| e.description.clone()).unwrap_or_default(),
             available: p.root.is_dir(),
-            // Filled in after the lock is released (see below): a git call
-            // per repo, three per repo, is too slow to hold everyone up for.
+            // Filled in below, the repos side by side: three git calls per
+            // repo.
             branch: git.then(String::new),
             head: None,
             behind: None,
@@ -8193,23 +8274,23 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             }
         }
         if let Ok(id) = w.id.parse::<uuid::Uuid>() {
-            if let Some(m) = guard.members.get(&id) {
-                sweep = m.db.last_drift_run().ok().flatten();
-                findings = team_findings(&w.id, root, &m.db, sweep.as_ref());
+            if let Some(d) = dbs.get(&id) {
+                let db = lock_tolerant(d);
+                sweep = db.last_drift_run().ok().flatten();
+                findings = team_findings(&w.id, root, &db, sweep.as_ref());
             }
         }
         rules = pages_in(root, "Ways-of-Working/Rules");
         templates = pages_in(root, "Templates");
     }
-    let ignores = std::fs::read_to_string(ws.ws.root.join(".kenignore"))
+    let ignores = std::fs::read_to_string(ws.root.join(".kenignore"))
         .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
         .unwrap_or_default();
-    let workspace = ws.ws.config.name.clone();
-    let ws_root = ws.ws.root.display().to_string();
-    drop(guard);
+    let workspace = ws.config.name.clone();
+    let ws_root = ws.root.display().to_string();
 
-    // Each repo's branch, commit and how far behind its upstream, read with
-    // the lock released and the repos side by side.
+    // Each repo's branch, commit and how far behind its upstream, the repos
+    // side by side.
     let mut repos = repos;
     let mut wiki = wiki;
     std::thread::scope(|s| {
@@ -8428,7 +8509,7 @@ async fn code_usages(state: State<'_, SharedState>, name: String) -> CmdResult<C
 /// `knowledge-model-state` events: building → ready | error {detail}.
 /// Unlike the automatic build this ignores every threshold — "rebuild it
 /// now" is exactly what it says.
-#[tauri::command]
+#[tauri::command(async)]
 fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -8805,7 +8886,7 @@ fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
 /// 2.1). Mirrors `refresh_knowledge_model`: returns as soon as the build
 /// thread is spawned; progress and outcome arrive via `workspace-kg-state`
 /// events (`building` → `ready` | `unavailable`).
-#[tauri::command]
+#[tauri::command(async)]
 fn rebuild_workspace_kg(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let enabled = {
         let guard = state.lock().unwrap();
@@ -9676,7 +9757,7 @@ struct JournalDayDto {
 /// `ken://` search-resolved address. Only the workspace-scope tier is
 /// actually indexed (via the pseudo-member's own engine, rooted at
 /// `.ken-workspace` itself, which isn't nested under anything excluded).
-#[tauri::command]
+#[tauri::command(async)]
 fn memory_write(
     state: State<SharedState>,
     scope: String,
@@ -9712,7 +9793,7 @@ fn memory_write(
 /// (ken-memory task 2.2 / design D5) — the write MCP's `journal_append`
 /// delegates to the same `memory::append_journal` core once ken-mcp task 3.1
 /// lands (parallel session; not this file).
-#[tauri::command]
+#[tauri::command(async)]
 fn journal_append(
     state: State<SharedState>,
     text: String,
@@ -9800,7 +9881,7 @@ fn journal_window_text(ws_root: &Path) -> String {
 /// are cached server-side (`AppState::memory_distill_candidates`) so
 /// `resolve_distill_candidate(slug, approve)` can look one up by slug alone,
 /// matching that command's own two-argument contract.
-#[tauri::command]
+#[tauri::command(async)]
 fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let (base_dir, ws_root, pseudo_id, running, candidates_slot) = {
         let guard = state.lock().unwrap();
@@ -9879,7 +9960,7 @@ fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
 /// field with a `distill-dismissed:` prefix so a dismissed candidate slug
 /// can never collide with an ignored file path (the pseudo-member has no
 /// review-issue concept of its own to ignore in the first place).
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_distill_candidate(state: State<SharedState>, slug: String, approve: bool) -> CmdResult<()> {
     let (base_dir, ws_root, pseudo_id, candidate) = {
         let guard = state.lock().unwrap();
@@ -9907,6 +9988,7 @@ fn resolve_distill_candidate(state: State<SharedState>, slug: String, approve: b
         memory::write_memory(mscope, &slug, &candidate.body, memory::WriteMode::Create, &local_date_today())
             .map_err(err)?;
     } else {
+        let _us = user_state_lock();
         let mut us = UserState::load(&base_dir, pseudo_id);
         us.ignore(format!("{DISMISSED_MEMORY_PREFIX}{slug}"));
         us.save(&base_dir, pseudo_id).map_err(err)?;
@@ -10182,17 +10264,30 @@ fn pending_inbox_tasks(base_dir: &Path, conns: &[FamilyConnection]) -> Vec<(ken_
 /// git's global identity, read at most once a minute (every `day-changed`
 /// recomputes Your day, and the identity rarely moves).
 fn cached_git_me() -> ken_core::day::Me {
+    // Who I am changes rarely, and asking git spawns two processes: the
+    // first call waits for them; after that the cached answer comes back at
+    // once, and one older than ten minutes is read again in the background.
     static CACHE: OnceLock<Mutex<Option<(Instant, ken_core::day::Me)>>> = OnceLock::new();
+    static REFRESHING: AtomicBool = AtomicBool::new(false);
     let slot = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().unwrap();
-    if let Some((at, me)) = guard.as_ref() {
-        if at.elapsed() < Duration::from_secs(60) {
-            return me.clone();
+    let cached = lock_tolerant(slot).clone();
+    match cached {
+        Some((at, me)) => {
+            if at.elapsed() >= Duration::from_secs(600) && !REFRESHING.swap(true, Ordering::SeqCst) {
+                std::thread::spawn(move || {
+                    let fresh = ken_core::day::git_me();
+                    *lock_tolerant(slot) = Some((Instant::now(), fresh));
+                    REFRESHING.store(false, Ordering::SeqCst);
+                });
+            }
+            me
+        }
+        None => {
+            let me = ken_core::day::git_me();
+            *lock_tolerant(slot) = Some((Instant::now(), me.clone()));
+            me
         }
     }
-    let me = ken_core::day::git_me();
-    *guard = Some((Instant::now(), me.clone()));
-    me
 }
 
 /// Lock a mutex even when a thread that held it panicked. Your day's
@@ -10459,7 +10554,7 @@ fn team_digest(state: State<SharedState>, team: Option<String>) -> CmdResult<Opt
 }
 
 /// Write the team digest now ("Write it now").
-#[tauri::command]
+#[tauri::command(async)]
 fn refresh_team_digest(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<()> {
     day_snapshot(state.inner(), team.as_deref())?;
     generate_team_digests(&app, state.inner(), vec![team], true)
@@ -11182,7 +11277,7 @@ fn workspace_unignore_candidate(state: State<SharedState>, folder: String) -> Cm
 /// The new member is registered but deliberately NOT activated: it lands
 /// dormant and opens on first focus, exactly like a member past the
 /// resident cap. Joining a repo should not evict a resident one.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<Vec<MemberOverviewDto>> {
     // D6: a member is a folder in the workspace or one inside a single
     // group folder — `validate_member_name` normalizes to forward slashes
@@ -11231,7 +11326,7 @@ struct RemovedMemberDto {
 /// groups, its runtime closed. The folder, its files and its index stay; the
 /// repo stays in Ken's list. When the team it was on has a wiki, the Team
 /// screen lists the wiki's pages that still cite it.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult<RemovedMemberDto> {
     let (wiki, citing_pages) = {
         let mut guard = state.lock().unwrap();
@@ -11328,7 +11423,7 @@ fn group_dtos(ws: &ken_core::workspace::Workspace) -> Vec<ProjectGroupDto> {
 }
 
 /// Create or replace a group, then persist the manifest.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_set_group(
     state: State<SharedState>,
     name: String,
@@ -11344,7 +11439,7 @@ fn workspace_set_group(
     Ok(group_dtos(&ws.ws))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_remove_group(state: State<SharedState>, name: String) -> CmdResult<Vec<ProjectGroupDto>> {
     let mut guard = state.lock().unwrap();
     if !workspace_enabled(&guard.app_settings) {
@@ -11566,8 +11661,8 @@ const MAP_CHECK: Duration = Duration::from_secs(15);
 /// `knowledge_model::should_auto_build`). True while a Claude build of this
 /// project runs, started here or by hand, so the caller holds off.
 fn map_by_claude(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) -> bool {
-    let job = {
-        let guard = state.lock().unwrap();
+    let (base, project, running, tracker) = {
+        let guard = lock_tolerant(state);
         let Some(active) = guard.members.get(&project_id) else {
             return false;
         };
@@ -11577,19 +11672,14 @@ fn map_by_claude(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) -
         if !ken_core::features::effective_flag(&guard.app_settings, &active.project, "backgroundExtraction") {
             return false;
         }
-        let Some(binary) = ken_core::runner::discover_claude() else {
-            return false;
-        };
-        KnowledgeBuild {
-            base: guard.base_dir.clone(),
-            project: active.project.clone(),
-            binary,
-            running: active.knowledge_running.clone(),
-            tracker: active.auto_knowledge.clone(),
-            quiet_failure: true,
-            state: state.clone(),
-        }
+        (guard.base_dir.clone(), active.project.clone(), active.knowledge_running.clone(), active.auto_knowledge.clone())
     };
+    // Looking for Claude reads the disk: with the lock released, since this
+    // runs every few seconds for every repo.
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return false;
+    };
+    let job = KnowledgeBuild { base, project, binary, running, tracker, quiet_failure: true, state: state.clone() };
     let Ok(db) = Db::open_read_only(&job.base, project_id) else {
         return false;
     };
@@ -11922,7 +12012,7 @@ fn chat_transcript(state: State<SharedState>, chat_id: String) -> CmdResult<Vec<
     result
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_chat(app: AppHandle, state: State<SharedState>) -> CmdResult<ChatRow> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -11962,7 +12052,7 @@ fn create_chat(app: AppHandle, state: State<SharedState>) -> CmdResult<ChatRow> 
 /// that has none yet (its first message). Changing the Home picker later
 /// therefore cannot silently re-scope a conversation that is already
 /// under way, and an "all projects" chat is still one after a restart.
-#[tauri::command]
+#[tauri::command(async)]
 fn send_chat_message(
     app: AppHandle,
     state: State<SharedState>,
@@ -12142,7 +12232,7 @@ fn send_chat_message(
 /// the accepted changes) itself, and Claude is told which changes, listed in
 /// `declined_changes`, were left out. A partial write refuses a file that
 /// changed since the proposal.
-#[tauri::command]
+#[tauri::command(async)]
 fn answer_edit_proposal(
     app: AppHandle,
     state: State<SharedState>,
@@ -12227,7 +12317,7 @@ fn answer_edit_proposal(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn answer_chat_question(
     app: AppHandle,
     state: State<SharedState>,
@@ -12495,7 +12585,7 @@ fn chat_pty_resize(state: State<SharedState>, chat_id: String, rows: u16, cols: 
 /// drawer can watch (it doubles as the runner session id). The finished
 /// report lands in the project folder, so the existing watcher indexes it —
 /// no extra wiring.
-#[tauri::command]
+#[tauri::command(async)]
 fn start_research(
     app: AppHandle,
     state: State<SharedState>,
@@ -12628,7 +12718,7 @@ fn cancel_research(state: State<SharedState>, chat_id: String) -> CmdResult<()> 
 
 /// Where can a report go? `research` first — always, even before the
 /// folder exists — then the project's existing top-level folders.
-#[tauri::command]
+#[tauri::command(async)]
 fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -13126,7 +13216,7 @@ fn activate_family_pseudo_member(
 /// push; design.md draws the hosting line at "whatever remote the team
 /// already uses works"). The creating user becomes the family's first —
 /// and therefore owner (D3: "the manifest's first member") — member.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_create(
     state: State<SharedState>,
     name: String,
@@ -13194,7 +13284,7 @@ fn family_create(
 /// lands in a temp folder first — the target path is keyed by the manifest's
 /// own family id (D1: one clone per device), which isn't known until after
 /// the clone completes and `family.json` is read — then moves into place.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_join(
     state: State<SharedState>,
     remote_url: String,
@@ -13338,7 +13428,7 @@ fn family_manifest_get(state: State<SharedState>, family_id: String) -> CmdResul
 /// treats an existing directory as "already joined" rather than adopting
 /// it — a known rough edge, not addressed by this task). Stops the poller,
 /// drops the cached engine, and detaches the pseudo-member if it's resident.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_remove(app: AppHandle, state: State<SharedState>, family_id: String) -> CmdResult<()> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let settings = { state.lock().unwrap().app_settings.clone() };
@@ -13414,7 +13504,7 @@ fn family_sync_now(app: AppHandle, state: State<SharedState>, family_id: String)
 /// Clear a conflict after the user has resolved the clone by hand (D1:
 /// "never auto-resolve... require manual resolution"). Only ever clears
 /// `ConnectionState::Conflict`; a no-op on any other state.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_resolve_conflict(state: State<SharedState>, family_id: String) -> CmdResult<()> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let base_dir = state.lock().unwrap().base_dir.clone();
@@ -13430,7 +13520,7 @@ fn family_resolve_conflict(state: State<SharedState>, family_id: String) -> CmdR
 /// site) so the UI reflects it without a reopen. Otherwise it takes effect
 /// the next time that workspace opens (`open_workspace_inner`'s own
 /// attached-connections loop).
-#[tauri::command]
+#[tauri::command(async)]
 fn family_attach_workspace(
     app: AppHandle,
     state: State<SharedState>,
@@ -13463,7 +13553,7 @@ fn family_attach_workspace(
 /// now — removing it from `AppState::members` runs every `Drop` impl the
 /// runtime holds (extraction/OCR/kenignore workers, watcher), the same
 /// teardown any other member close relies on.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_detach_workspace(state: State<SharedState>, family_id: String) -> CmdResult<()> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let settings = { state.lock().unwrap().app_settings.clone() };

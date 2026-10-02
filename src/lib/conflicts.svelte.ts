@@ -12,6 +12,7 @@ import {
 import { app } from "./app.svelte";
 import { scope } from "./scope.svelte";
 import { numericId } from "./conflicts";
+import { coalesce, singleFlight } from "./refresh";
 
 /** Bursts of sync and scan events are read once, after this quiet spell. */
 const REFRESH_DEBOUNCE_MS = 400;
@@ -24,7 +25,6 @@ class ConflictsStore {
 
   private subscribed = false;
   private unlisteners: UnlistenFn[] = [];
-  private timer: ReturnType<typeof setTimeout> | null = null;
 
   get items(): ConflictItem[] {
     return this.banner?.conflicts ?? [];
@@ -51,15 +51,10 @@ class ConflictsStore {
     });
   }
 
-  private queue() {
-    if (this.timer !== null) clearTimeout(this.timer);
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.refresh();
-    }, REFRESH_DEBOUNCE_MS);
-  }
+  private readonly queue = coalesce(() => void this.refresh(), REFRESH_DEBOUNCE_MS);
 
-  async refresh() {
+  /** One read at a time (see `singleFlight`). */
+  readonly refresh = singleFlight(async () => {
     if (!app.project) return;
     const team = scope.team;
     // An optional read: a failure leaves the last banner in place.
@@ -68,7 +63,7 @@ class ConflictsStore {
     this.banner = next;
     if (this.items.length === 0) this.open = false;
     if (this.selected && !this.items.some((c) => c.id === this.selected)) this.selected = null;
-  }
+  });
 
   /** Open the conflict view in Files, on one conflict or the first. */
   async show(id: string | null = null) {

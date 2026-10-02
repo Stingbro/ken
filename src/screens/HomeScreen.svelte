@@ -178,7 +178,7 @@
         <div class="digest" onclick={onDigestClick}>{@html renderMarkdown(day.digest.body)}</div>
         {#if day.digest.sources.length > 0}
           <div class="sources">
-            {#each day.digest.sources as source (source)}
+            {#each day.digest.sources as source}
               <button class="filechip" title={source} onclick={() => void openMemberPath(source)}>{leaf(source)}</button>
             {/each}
           </div>
@@ -221,7 +221,7 @@
             <span class="due {dueClass(t.target)}">{dueLabel(t.target)}</span>
           </button>
         {/each}
-        {#each day.tasks as task (task.id)}
+        {#each day.tasks as task (task.relPath + ":" + task.id)}
           {@const done = task.state === "done"}
           <div class="row" class:sel={selectedId === task.id} class:done>
             {#if task.inbox}

@@ -15,6 +15,7 @@ import {
 import { app } from "./app.svelte";
 import { scope } from "./scope.svelte";
 import { localToday, orderTasks } from "./day";
+import { coalesce, singleFlight } from "./refresh";
 import { toast } from "./toast.svelte";
 
 /** What the task panel shows: a new task (optionally pre-linked) or one
@@ -57,8 +58,6 @@ class DayStore {
 
   private initDone = false;
   private midnightTimer: ReturnType<typeof setTimeout> | undefined;
-  private seq = 0;
-  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingState = false;
   private pendingHealth = false;
 
@@ -146,39 +145,43 @@ class DayStore {
   private queueRefresh(what: { state?: boolean; health?: boolean }) {
     if (what.state) this.pendingState = true;
     if (what.health) this.pendingHealth = true;
-    clearTimeout(this.refreshTimer);
-    this.refreshTimer = setTimeout(() => {
-      const state = this.pendingState;
-      const health = this.pendingHealth;
-      this.pendingState = this.pendingHealth = false;
-      if (state) void this.refreshState();
-      if (health) void this.refreshHealth();
-    }, REFRESH_DEBOUNCE_MS);
+    this.queueRead();
   }
+
+  private readonly queueRead = coalesce(() => {
+    const state = this.pendingState;
+    const health = this.pendingHealth;
+    this.pendingState = this.pendingHealth = false;
+    if (state) void this.refreshState();
+    if (health) void this.refreshHealth();
+  }, REFRESH_DEBOUNCE_MS);
 
   async refresh() {
     await Promise.all([this.refreshState(), this.refreshDigest(), this.refreshHealth()]);
   }
 
-  async refreshState() {
+  /** Read Your day again; see `singleFlight` for how calls during a read
+   *  are handled. */
+  readonly refreshState = singleFlight(async () => {
     if (!app.workspace) {
       this.state = null;
       return;
     }
-    const n = ++this.seq;
+    const team = this.team;
+    const ws = app.workspace.id;
     try {
-      const next = await api.dayState(this.team);
-      if (n !== this.seq) return;
+      const next = await api.dayState(team);
+      if (team !== this.team || ws !== app.workspace?.id) return;
       this.state = next;
       this.loadError = null;
       this.today = localToday();
       void this.resolvePanel();
     } catch (e) {
-      if (n === this.seq) this.loadError = String(e);
+      if (team === this.team && ws === app.workspace?.id) this.loadError = String(e);
     }
-  }
+  });
 
-  async refreshDigest() {
+  readonly refreshDigest = singleFlight(async () => {
     if (!app.workspace) {
       this.digest = null;
       return;
@@ -187,9 +190,9 @@ class DayStore {
     const ws = app.workspace.id;
     const d = await api.teamDigest(team).catch(() => null);
     if (team === this.team && ws === app.workspace?.id) this.digest = d;
-  }
+  });
 
-  async refreshHealth() {
+  readonly refreshHealth = singleFlight(async () => {
     if (!app.workspace) {
       this.health = null;
       return;
@@ -198,7 +201,7 @@ class DayStore {
     const ws = app.workspace.id;
     const h = await api.indexHealth(team).catch(() => null);
     if (team === this.team && ws === app.workspace?.id) this.health = h;
-  }
+  });
 
   /** "Write it now". */
   async writeDigest() {

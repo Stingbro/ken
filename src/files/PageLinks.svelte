@@ -34,7 +34,7 @@
     {#if incoming.length > 0}
       <div class="group">
         <span class="label">Linked from</span>
-        {#each incoming as p (p)}
+        {#each incoming as p}
           <button class="page" title={p} onclick={() => app.openInFiles(p)}>{name(p)}</button>
         {/each}
       </div>
@@ -42,7 +42,7 @@
     {#if outgoing.length > 0}
       <div class="group">
         <span class="label">Links to</span>
-        {#each outgoing as p (p)}
+        {#each outgoing as p}
           <button class="page" title={p} onclick={() => app.openInFiles(p)}>{name(p)}</button>
         {/each}
       </div>

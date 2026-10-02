@@ -58,20 +58,20 @@
       </button>
       {#if file.related.imports.length > 0}
         <span class="label">Imports</span>
-        {#each file.related.imports as p (p)}
+        {#each file.related.imports as p}
           <button class="link" title={p} onclick={() => app.openInFiles(p)}>{base(p)}</button>
         {/each}
       {/if}
       {#if file.related.importedBy.length > 0}
         <span class="label">Imported by</span>
-        {#each file.related.importedBy as p (p)}
+        {#each file.related.importedBy as p}
           <button class="link" title={p} onclick={() => app.openInFiles(p)}>{base(p)}</button>
         {/each}
       {/if}
     </div>
     {#if open}
       <ul class="outline">
-        {#each file.outline as s (s.name + s.line)}
+        {#each file.outline as s}
           <li style:padding-left="{s.depth * 14}px">
             <button class="def" title={s.docs ?? `${s.kind} at line ${s.line}`} onclick={() => app.openAt(relPath, { line: s.line })}>
               <span class="kind">{s.kind}</span>

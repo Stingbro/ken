@@ -231,7 +231,7 @@
               <button class="btn btn-primary" disabled={busy || !reply.trim()} onclick={() => sel && void sendReply(sel)}>Send reply</button>
               <button class="btn btn-ghost" onclick={() => (replying = false)}>Cancel</button>
             {:else}
-              {#each actions(sel) as a, i (a.label)}
+              {#each actions(sel) as a, i}
                 <button class="btn" class:btn-primary={a.primary && i === 0} disabled={busy} onclick={a.run}>{a.label}</button>
               {/each}
             {/if}

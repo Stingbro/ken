@@ -126,12 +126,14 @@ describe("a new day", () => {
   it("is noticed on focus when the midnight timer ran late", async () => {
     vi.setSystemTime(new Date(2026, 9, 1, 23, 0));
     day.checkDay();
+    await flush();
     expect(day.today).toBe("2026-10-01");
     const states = vi.mocked(api.dayState).mock.calls.length;
     // Asleep through midnight: the timer has not fired.
     vi.setSystemTime(new Date(2026, 9, 2, 8, 0));
     window.dispatchEvent(new Event("focus"));
     expect(day.today).toBe("2026-10-02");
+    await flush();
     expect(vi.mocked(api.dayState).mock.calls.length).toBe(states + 1);
   });
 

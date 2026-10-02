@@ -21,6 +21,8 @@ import { families } from "./families.svelte";
 import { conflicts } from "./conflicts.svelte";
 import { chats } from "./chats.svelte";
 import { day } from "./day.svelte";
+import { coalesce, singleFlight } from "./refresh";
+import { uniqueIds } from "./uniqueIds";
 
 export type InboxGroup = "people" | "ken" | "sync";
 /** The colour a kind is drawn in: amber for decisions, red for failures. */
@@ -56,6 +58,7 @@ export interface InboxItem {
 
 const GROUP_ORDER: Record<InboxGroup, number> = { people: 0, ken: 1, sync: 2 };
 const DEBOUNCE_MS = 400;
+const INDEX_DEBOUNCE_MS = 3000;
 
 function epoch(s: string | null | undefined): number | null {
   if (!s) return null;
@@ -130,7 +133,7 @@ export function findingItem(f: TeamFinding & { itemId?: number | null }, i: numb
   const kind =
     k === "broken-link" || k === "links" ? "Broken link" : k === "aged" ? "Not checked lately" : k === "draft" || k === "wiki-draft" ? "First draft" : k === "proposal" ? "Proposal" : "Out of date";
   return {
-    id: `finding:${f.itemId ?? `${k}:${f.path ?? i}`}`,
+    id: `finding:${f.itemId ?? `${k}:${f.projectId ?? ""}:${f.path ?? i}:${f.title}`}`,
     group: "ken",
     kind,
     tone: k === "draft" ? "accent" : "attn",
@@ -177,7 +180,6 @@ export function failedItem(relPath: string, error: string | null): InboxItem {
 export function sortInbox(items: InboxItem[]): InboxItem[] {
   return [...items].sort((a, b) => GROUP_ORDER[a.group] - GROUP_ORDER[b.group] || (b.when ?? 0) - (a.when ?? 0));
 }
-
 class InboxStore {
   /** Waiting items from the backend reads (ingest waits, findings). */
   private ken = $state<InboxItem[]>([]);
@@ -189,8 +191,6 @@ class InboxStore {
   selected = $state<string | null>(null);
 
   private subscribed = false;
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private seq = 0;
 
   /** Everything waiting on you, in Inbox order. */
   get items(): InboxItem[] {
@@ -216,7 +216,7 @@ class InboxStore {
           source: { type: "chat", chatId: r.id, title: r.title },
         }),
       );
-    return sortInbox([...people, ...this.ken, ...asks, ...sync]).filter((i) => !doneIds.has(i.id));
+    return uniqueIds(sortInbox([...people, ...this.ken, ...asks, ...sync])).filter((i) => !doneIds.has(i.id));
   }
 
   get count(): number {
@@ -238,7 +238,9 @@ class InboxStore {
     this.subscribed = true;
     void families.init();
     await api.onReviewChanged(() => this.queue());
-    await api.onIndexUpdated(() => this.queue());
+    // Indexing moves little here (a source's state), and the read runs git
+    // in each repo: read at most every few seconds while it goes on.
+    await api.onIndexUpdated(() => this.queue(INDEX_DEBOUNCE_MS));
     $effect.root(() => {
       $effect(() => {
         void scope.team;
@@ -248,23 +250,18 @@ class InboxStore {
     });
   }
 
-  queue(ms = DEBOUNCE_MS) {
-    if (this.timer !== null) clearTimeout(this.timer);
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.refresh();
-    }, ms);
-  }
+  readonly queue = coalesce(() => void this.refresh(), DEBOUNCE_MS);
 
   /** Read Ken's waiting items: every ingest card's waits, and the wiki's
-   *  findings. Optional reads: a failure keeps what was there. */
-  async refresh() {
+   *  findings. Optional reads: a failure keeps what was there. One read at
+   *  a time (see `singleFlight`). */
+  readonly refresh = singleFlight(async () => {
     if (!app.workspace) {
       this.ken = [];
       return;
     }
-    const seq = ++this.seq;
     const team = scope.team;
+    const ws = app.workspace.id;
     this.loading = true;
     try {
       const out: InboxItem[] = [];
@@ -284,11 +281,11 @@ class InboxStore {
       }
       const team_ = await api.teamOverview(team).catch(() => null);
       if (team_?.findings) team_.findings.forEach((f, i) => out.push(findingItem(f, i)));
-      if (seq === this.seq && team === scope.team) this.ken = out;
+      if (team === scope.team && ws === app.workspace?.id) this.ken = out;
     } finally {
-      if (seq === this.seq) this.loading = false;
+      this.loading = false;
     }
-  }
+  });
 
   /** Mark an item dealt with: it leaves the list and shows under Done. */
   resolved(item: InboxItem) {

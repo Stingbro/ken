@@ -1441,6 +1441,24 @@ pub fn proposals_from(db: &Db, note: &str) -> Result<Vec<crate::db::ReviewItemRo
         .collect())
 }
 
+/// How many proposals wait from each note, counted from open items already
+/// listed: one pass, where calling [`proposals_from`] for every note lists
+/// all the open items again each time.
+pub fn proposal_counts(open: &[crate::db::ReviewItemRow]) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    for it in open.iter().filter(|it| it.kind == crate::wikidraft::PROPOSAL_KIND) {
+        let from = it
+            .payload
+            .as_deref()
+            .and_then(|p| serde_json::from_str::<crate::wikidraft::Proposal>(p).ok())
+            .and_then(|p| p.from);
+        if let Some(from) = from {
+            *out.entry(from).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
 /// Close what an undone ingest left waiting: every open item from its note
 /// is resolved. Returns how many.
 pub fn withdraw(db: &mut Db, note: &str, now: i64) -> Result<usize> {
@@ -2279,6 +2297,8 @@ mod tests {
             .map(|i| serde_json::from_str(i.payload.as_deref().unwrap()).unwrap())
             .collect();
         assert_eq!(waits.len(), 4);
+        let counts = proposal_counts(&r.db.list_open_review_items().unwrap());
+        assert_eq!(counts.get(&r.placement.note), Some(&4), "one pass counts what proposals_from lists");
         let held = waits.iter().find(|p| p.page == "Design/Card.md").unwrap();
         assert_eq!(held.base, CARD);
         let method = waits.iter().find(|p| p.page == "tickets/RT-005.md").unwrap();

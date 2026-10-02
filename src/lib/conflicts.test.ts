@@ -59,6 +59,7 @@ describe("numericId", () => {
   it("parses the row id out of kind-prefixed ids", () => {
     expect(numericId("item-12")).toBe(12);
     expect(numericId("stored-3")).toBe(3);
+    expect(numericId("item-12@6f1c2a9e-0000-4000-8000-000000000000")).toBe(12);
   });
 });
 

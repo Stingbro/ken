@@ -50,6 +50,10 @@ import {
   type FileTab,
   type TabState,
 } from "../files/tabs";
+import { coalesce, singleFlight } from "./refresh";
+
+/** How long the tree and the unread set wait after an `index-updated`. */
+const TREE_READ_MS = 500;
 
 /** Where to scroll an opened file to: a source line or a heading slug. A new
  *  `nonce` asks again for the same place. */
@@ -244,9 +248,14 @@ class AppStore {
     this.ignored = await api.listIgnored().catch(() => []);
   }
 
-  private async loadUnread() {
+  private readonly loadUnread = singleFlight(async () => {
     this.unread = await api.unreadFiles().catch(() => []);
-  }
+  });
+
+  private readonly queueTreeRead = coalesce(() => {
+    void this.refreshTree();
+    void this.loadUnread();
+  }, TREE_READ_MS);
 
   /** Record a file as seen (viewing it clears its unread state). The backend
    *  no-ops when the seen version already matches, so calling on every open is
@@ -282,10 +291,11 @@ class AppStore {
       this.scanning = false;
       this.lastScan = stats;
       this.lastScanAt = Date.now();
-      void this.refreshTree();
       // The index changing is exactly when files become (un)read — a synced or
       // externally-edited file lands here — so recompute the unread set live.
-      void this.loadUnread();
+      // Indexing sends this many times a second: read the tree and the
+      // unread set once per burst (see `coalesce`).
+      this.queueTreeRead();
     });
     await api.onScanError((message) => {
       this.scanning = false;
@@ -351,7 +361,8 @@ class AppStore {
    *  mode, where there is nothing to merge. */
   treeShowsAllProjects = $state(false);
 
-  async refreshTree() {
+  /** One tree read at a time (see `singleFlight`). */
+  readonly refreshTree = singleFlight(async () => {
     if (!this.project) return;
     const merged = this.treeShowsAllProjects && !!this.workspace;
     // A failed merged read must not blank the tree — fall back to the
@@ -363,7 +374,7 @@ class AppStore {
     this.files = resolved.files;
     this.folders = resolved.folders;
     this.pruneFavorites();
-  }
+  });
 
   /** Switch Files between the merged workspace tree and the focused
    *  member's own. */

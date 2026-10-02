@@ -42,9 +42,11 @@ export function proposalPayload(payload: string | null): PageProposalPayload | n
   }
 }
 
-/** The row id inside a kind-prefixed id ("item-12" → 12). */
+/** The row id inside a kind-prefixed id ("item-12" → 12; "item-12@<repo>",
+ *  as the banner names it so two repos' rows never share an id → 12). */
 export function numericId(id: string): number {
-  return Number(id.slice(id.indexOf("-") + 1));
+  const m = /-(\d+)/.exec(id);
+  return m ? Number(m[1]) : NaN;
 }
 
 /** One rendered row of a collapsed unified diff. */

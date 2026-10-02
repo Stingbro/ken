@@ -36,6 +36,35 @@ on `%APPDATA%\ken\index\<id>.db`. The before figures (from `d8ed403`):
 draining at the pace, and every member moving. Status: built on this
 PC (dev), not measured anywhere.
 
+## Keeping Ken responsive
+
+Indexing sends `index-updated` many times a second across a workspace's
+repos. Home stuck on "Reading your list…" came from four things at once;
+each now has a rule.
+
+- **No slow work under the global lock.** A command clones what it needs
+  (the project, `search_db`, the base dir), drops the guard, then reads.
+  `get_tree`, `unread_files` and the mark-seen commands, `ingest_overview`,
+  `ingest_card`, `team_overview`, `files_banner`, `sync_status` and the
+  transcription re-index work this way. `activate` still runs its
+  backfills under the lock (open is slow while it does); the save and
+  file-move commands still refresh the index under it.
+- **Runtimes drop with the lock released.** Dropping one joins its watcher
+  and sync threads, which can be waiting for the lock: `activate`,
+  `open_workspace` and `close_workspace` take the map out and drop it after.
+- **Slow commands are `#[tauri::command(async)]`.** A plain command runs on
+  the window's thread. The ones left plain are quick or must stay in order
+  (`save_file`, terminal input, recording start and stop).
+- **Stores read with `singleFlight` and `coalesce`** (`src/lib/refresh.ts`):
+  one read at a time with one more after a burst, never a newer read
+  throwing away an older one, and a burst of events never pushing the read
+  back. Day, Inbox, the sidebar counts, conflicts, the tree, unread and
+  Ingest use them.
+- **Keyed lists have unique keys.** A repeated key throws and stops the
+  screen updating. Inbox ids go through `uniqueIds`; lists that only show
+  text (sources, takeaways, breadcrumbs) are not keyed; the conflict banner's
+  ids carry the repo.
+
 ## Done on this branch
 
 - **Steps 1 and 2, kind and sync (first part of 2).** `RepoKind`

@@ -495,7 +495,7 @@
       <div class="qa-head">Quick answer</div>
       <div class="qa-body">{@html renderMarkdown(answer.body)}</div>
       <div class="qa-foot">
-        {#each answer.sources as source (source)}
+        {#each answer.sources as source}
           <button
             class="qa-chip mono"
             title={source}
@@ -539,7 +539,7 @@
         <span class="progress">searching {routedProgress.done}/{routedProgress.total}…</span>
       {/if}
     </div>
-    {#each coverageNotes as note (note)}
+    {#each coverageNotes as note}
       <div class="coverage-note">{note}</div>
     {/each}
   {/if}
@@ -575,7 +575,7 @@
                   title="Kept searchable by .kenignore but excluded from AI answers and the knowledge map"
                 >search-only</span>
               {/if}
-              {#each hit.kgBreadcrumbs as crumb (crumb)}
+              {#each hit.kgBreadcrumbs as crumb}
                 <span class="tag tag-kg" title="Routed via this knowledge-graph entity">{crumb}</span>
               {/each}
             </span>
@@ -597,7 +597,7 @@
         <div class="qa-body">{@html renderMarkdown(look.body)}</div>
         {#if look.sources.length}
           <div class="qa-foot">
-            {#each look.sources as source (source)}
+            {#each look.sources as source}
               <button class="qa-chip mono" title={source} onclick={() => openCited(source)}>
                 {source.split("/").pop()?.split("#")[0] || source}
               </button>

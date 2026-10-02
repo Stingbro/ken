@@ -43,6 +43,7 @@
   import ProposalDetail from "./ProposalDetail.svelte";
   import RecordPanel from "./RecordPanel.svelte";
   import ChatSource from "./ChatSource.svelte";
+  import { singleFlight } from "../lib/refresh";
 
   let overview = $state<IngestOverview | null>(null);
   let error = $state<string | null>(null);
@@ -164,19 +165,24 @@
   const rawCards = $derived(new Set((overview?.raw ?? []).map((r) => r.cardId).filter((id) => id !== null)));
   const ingested = $derived((overview?.ingested ?? []).filter((s) => !rawCards.has(s.id)));
 
-  async function refresh() {
+  // One read at a time: the 4-second follow and the events would otherwise
+  // stack reads up behind a slow one (see `singleFlight`).
+  const refresh = singleFlight(async () => {
+    const t = team;
     try {
-      overview = await api.ingestOverview(team);
-      rail.setIngest(overview.waiting ?? 0);
+      const next = await api.ingestOverview(t);
+      if (t !== team) return;
+      overview = next;
+      rail.setIngest(next.waiting ?? 0);
       error = null;
       // The newest read source is shown until the person picks another.
       if (selected === null) {
-        selected = overview.raw.find((r) => r.cardId !== null)?.cardId ?? overview.ingested[0]?.id ?? null;
+        selected = next.raw.find((r) => r.cardId !== null)?.cardId ?? next.ingested[0]?.id ?? null;
       }
     } catch (e) {
       error = String(e);
     }
-  }
+  });
 
   async function loadCard(id: number | null) {
     if (id === null) {
@@ -191,10 +197,10 @@
     }
   }
 
-  async function reload() {
+  const reload = singleFlight(async () => {
     await refresh();
     await loadCard(selected);
-  }
+  });
 
   $effect(() => {
     void team;
@@ -679,7 +685,7 @@
             {/if}
             {#if card.takeaways.keyTakeaways.length > 0}
               <ul class="takeaways">
-                {#each card.takeaways.keyTakeaways as k (k)}<li>{@html renderMarkdown(k)}</li>{/each}
+                {#each card.takeaways.keyTakeaways as k}<li>{@html renderMarkdown(k)}</li>{/each}
               </ul>
             {/if}
             {#if !saysNothing(card.takeaways.overturns)}
@@ -692,7 +698,7 @@
               <div class="well danger">
                 <span class="t-label">Contradictions</span>
                 <ul>
-                  {#each contradictions as c (c)}<li>{@html renderMarkdown(c)}</li>{/each}
+                  {#each contradictions as c}<li>{@html renderMarkdown(c)}</li>{/each}
                 </ul>
               </div>
             {/if}
@@ -702,7 +708,7 @@
             {#if card.takeaways.nextSteps.length > 0}
               <section>
                 <div class="shead"><h3>Next steps</h3><span class="t-small">{card.takeaways.nextSteps.length}</span></div>
-                {#each card.takeaways.nextSteps as n (n)}
+                {#each card.takeaways.nextSteps as n}
                   <div class="nrow">{@html renderMarkdown(n)}</div>
                 {/each}
               </section>

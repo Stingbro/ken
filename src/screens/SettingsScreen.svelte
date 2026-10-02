@@ -459,7 +459,7 @@
           <pre class="memory-body">{bodyPreview(c.body)}</pre>
           {#if c.sources.length > 0}
             <div class="list">
-              {#each c.sources as src (src)}
+              {#each c.sources as src}
                 {@const reason = unopenableReason(toWorkspaceAddress(src))}
                 <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>{src}</span>
               {/each}

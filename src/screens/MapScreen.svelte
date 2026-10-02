@@ -632,7 +632,7 @@
           {/if}
           {#if selectedEntity.sources && selectedEntity.sources.length > 0}
             <div class="detail-sources">
-              {#each selectedEntity.sources as source (source)}
+              {#each selectedEntity.sources as source}
                 <button
                   class="src-chip mono"
                   title={source}
