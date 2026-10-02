@@ -280,13 +280,26 @@ pub fn has_inbox(root: &Path) -> bool {
 /// Files in `Raw/`, oldest name first: every file there except dotfiles and
 /// an index page. Includes sources being reviewed; see [`waiting_new`].
 pub fn waiting(root: &Path) -> Vec<String> {
-    let mut out: Vec<String> = fs::read_dir(root.join(RAW))
+    let names: Vec<String> = fs::read_dir(root.join(RAW))
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.path().is_file())
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
         .filter(|n| !n.starts_with('.') && !n.eq_ignore_ascii_case("index.md") && !n.eq_ignore_ascii_case("readme.md"))
+        .collect();
+    let split = |n: &str| n.rsplit_once('.').map(|(s, e)| (s.to_lowercase(), e.to_lowercase())).unwrap_or((n.to_lowercase(), String::new()));
+    const MEDIA: [&str; 15] = ["mp4", "mov", "m4v", "avi", "m4a", "aac", "mp3", "wav", "flac", "ogg", "oga", "opus", "webm", "mkv", "wma"];
+    // A transcript named like a recording beside it is that recording's
+    // transcript: one source, read once, not two notes of one meeting.
+    let media: std::collections::HashSet<String> =
+        names.iter().map(|n| split(n)).filter(|(_, e)| MEDIA.contains(&e.as_str())).map(|(s, _)| s).collect();
+    let mut out: Vec<String> = names
+        .into_iter()
+        .filter(|n| {
+            let (stem, ext) = split(n);
+            !((ext == "vtt" || ext == "srt") && media.contains(&stem))
+        })
         .map(|n| format!("{RAW}/{n}"))
         .collect();
     out.sort();

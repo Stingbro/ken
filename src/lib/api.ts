@@ -2034,6 +2034,9 @@ export const api = {
   teamDigest: (team: string | null) => invoke<TeamDigest | null>("team_digest", { team }),
   /** Write the team digest now. Outcome arrives on the team-digest events. */
   refreshTeamDigest: (team: string | null) => invoke<void>("refresh_team_digest", { team }),
+  /** Reply in an escalation's thread; `resolve` also closes it. */
+  escalationReply: (projectId: string, relPath: string, text: string, resolve: boolean) =>
+    invoke<void>("escalation_reply", { projectId, relPath, text, resolve }),
   /** Whether the team's digest is being written or waits its turn. */
   teamDigestWriting: (team: string | null) => invoke<boolean>("team_digest_writing", { team }),
   /** Repos indexed, files queued and failed, across the team. */

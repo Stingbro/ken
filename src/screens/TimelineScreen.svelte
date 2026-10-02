@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { app } from "../lib/app.svelte";
   import { knowledge } from "../lib/knowledge.svelte";
   import { highlightMatches } from "../lib/knowledge";
@@ -8,6 +8,13 @@
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
 
   onMount(() => void knowledge.visit());
+  // Explore stays mounted: a change of repo reads that repo's map.
+  let seenFocus: string | null | undefined;
+  $effect(() => {
+    const f = app.focused;
+    if (seenFocus !== undefined && f !== seenFocus) untrack(() => void knowledge.load());
+    seenFocus = f;
+  });
 
   let query = $state("");
   let category = $state<string | null>(null);

@@ -25,6 +25,7 @@
   import { isHtmlPath } from "./previews/html";
   import { shortcut } from "../lib/platform";
   import { toast } from "../lib/toast.svelte";
+  import { resolveWikiLink } from "./markdown/wikiLinks";
 
   let { relPath }: { relPath: string } = $props();
 
@@ -257,6 +258,13 @@
   // two repos can hold the same path (every wiki has START-HERE.md).
   const owner = app.focused;
 
+  /** A `[[link]]` in the page: open the page it names, in this repo. */
+  function openWikiLink(target: string) {
+    const page = resolveWikiLink(target, relPath, app.files.map((f) => f.relPath));
+    if (page) app.openTab(page, true);
+    else toast.show(`No page named "${target.split("|")[0]}" in this repo.`);
+  }
+
   async function doSave() {
     if (!dirty || diskChanged) return;
     if (app.focused !== owner) return;
@@ -454,7 +462,7 @@
           onchange={onEdit}
         />
       {:else if mode === "wysiwyg" && meta?.kind === "md"}
-        <MarkdownEditor initial={content} onchange={onEdit} reveal={revealHere} />
+        <MarkdownEditor initial={content} onchange={onEdit} reveal={revealHere} onwikilink={openWikiLink} />
       {:else}
         <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} />
       {/if}

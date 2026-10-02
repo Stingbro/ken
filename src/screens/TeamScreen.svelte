@@ -154,6 +154,18 @@
     void run("sweep", "Could not run the sweep", () => api.runDriftNow(id));
   }
 
+  // Claude writes the wiki's missing pages from the team's repos: a Repo
+  // Map page for each, Current, Team and the architecture page. A page a
+  // person wrote is left alone.
+  function draftPages() {
+    const name = overview?.wiki?.name;
+    if (!name) return;
+    void run("draft", "Could not start writing the wiki's pages", async () => {
+      await api.draftWiki(name, null);
+      toast.show("Claude is writing the wiki's missing pages. They show in Files, marked draft, in a few minutes.");
+    });
+  }
+
   function addRule() {
     const id = overview?.wiki?.id;
     const rule = newRule.trim();
@@ -409,7 +421,10 @@
           <p class="note">The sweep has not run yet.</p>
         {/if}
         {#if overview.wiki}
-          <div class="actions"><button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button></div>
+          <div class="actions">
+            <button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button>
+            <button class="btn btn-ghost" disabled={busy !== null} onclick={draftPages}>{busy === "draft" ? "Starting…" : "Write the missing pages with Claude"}</button>
+          </div>
         {/if}
 
         <div class="divider">findings · drift, links, the first draft · {findings.length}</div>

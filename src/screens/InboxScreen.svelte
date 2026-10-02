@@ -35,6 +35,9 @@
   let busy = $state(false);
   let reply = $state("");
   let replying = $state(false);
+  /** Answering an escalation: a reply in its thread, or the answer that
+   *  resolves it. */
+  let escMode = $state<"reply" | "resolve" | null>(null);
   let doneNote = $state<Record<string, string>>({});
 
   function when(item: InboxItem): string {
@@ -82,15 +85,27 @@
       case "finding": {
         const f = s.finding;
         const out: { label: string; run: () => void; primary?: boolean }[] = [];
-        if (f.path && f.projectId) out.push({ label: "Open the page", primary: true, run: () => void openInRepo(f.projectId as string, f.path as string) });
-        if (f.itemId && f.projectId) out.push({ label: "Mark as done", run: () => void act(item, () => api.resolveReviewItem(f.itemId as number, f.projectId), "Marked as done.") });
+        // A proposed page change applies, or is discarded; any other finding
+        // is marked done once seen to.
+        if (f.kind === "proposal" && f.itemId && f.projectId) {
+          out.push({ label: "Apply", primary: true, run: () => void act(item, () => api.applyPageProposal(f.itemId as number, f.projectId), "Applied.") });
+        }
+        if (f.path && f.projectId) out.push({ label: "Open the page", primary: out.length === 0, run: () => void openInRepo(f.projectId as string, f.path as string) });
+        if (f.itemId && f.projectId) {
+          const label = f.kind === "proposal" ? "Discard" : "Mark as done";
+          out.push({ label, run: () => void act(item, () => api.resolveReviewItem(f.itemId as number, f.projectId), f.kind === "proposal" ? "Discarded." : "Marked as done.") });
+        }
         return out;
       }
       case "conflict":
         return [];
       case "escalation": {
         const e = s.escalation;
-        return [{ label: "Open it", primary: true, run: () => void openInRepo(e.projectId, e.relPath) }];
+        return [
+          { label: "Resolve", primary: true, run: () => ((escMode = "resolve"), (reply = "")) },
+          { label: "Reply", run: () => ((escMode = "reply"), (reply = "")) },
+          { label: "Open it", run: () => void openInRepo(e.projectId, e.relPath) },
+        ];
       }
       case "failed":
         return [{ label: "Open in Files", primary: true, run: () => app.openInFiles(s.relPath) }];
@@ -114,6 +129,30 @@
     await act(item, () => families.pushBack(s.familyId, s.item.id, reply.trim()), "Your reply was sent.");
   }
 
+  async function sendEscalation(item: InboxItem) {
+    const s = item.source;
+    if (s.type !== "escalation" || !reply.trim() || !escMode) return;
+    const e = s.escalation;
+    const text = reply.trim();
+    if (escMode === "resolve") {
+      await act(item, () => api.escalationReply(e.projectId, e.relPath, text, true), "Resolved. Your answer is in its thread.");
+      escMode = null;
+      return;
+    }
+    // A reply keeps it open: it stays in the list.
+    busy = true;
+    try {
+      await api.escalationReply(e.projectId, e.relPath, text, false);
+      toast.show("Your reply is in its thread.");
+      reply = "";
+      escMode = null;
+    } catch (err) {
+      toast.error("That did not go through", err);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function ignoreFile(item: InboxItem) {
     if (item.source.type !== "failed") return;
     const rel = item.source.relPath;
@@ -123,6 +162,7 @@
   function selectItem(id: string) {
     inbox.select(id);
     replying = false;
+    escMode = null;
     reply = "";
   }
 
@@ -211,7 +251,8 @@
         {:else if sel.source.type === "escalation"}
           <p class="body">
             {sel.source.escalation.raisedBy || "A teammate"} raised this decision to you{sel.source.escalation.ticket ? ` on ${sel.source.escalation.ticket}` : ""}.{sel.source.escalation.blocks ? ` It blocks ${sel.source.escalation.blocks}.` : ""}
-            Answer in its thread, in the file.
+            Resolve it with your answer, or reply in its thread to ask something first. Both are written to
+            the file in {sel.source.escalation.repo}.
           </p>
         {:else if sel.source.type === "chat"}
           <p class="body">Ken stopped in “{sel.source.title || "a chat"}” to ask you something. Answer it in Ask Ken and it carries on.</p>
@@ -226,10 +267,23 @@
           {#if replying && sel.source.type === "family"}
             <textarea class="textarea" bind:value={reply} rows="3" placeholder="Reply to {sel.from}…"></textarea>
           {/if}
+          {#if escMode && sel.source.type === "escalation"}
+            <textarea
+              class="textarea"
+              bind:value={reply}
+              rows="3"
+              placeholder={escMode === "resolve" ? "Your answer, as the decision…" : `Reply to ${sel.source.escalation.raisedBy || "them"}…`}
+            ></textarea>
+          {/if}
           <div class="acts">
             {#if replying && sel.source.type === "family"}
               <button class="btn btn-primary" disabled={busy || !reply.trim()} onclick={() => sel && void sendReply(sel)}>Send reply</button>
               <button class="btn btn-ghost" onclick={() => (replying = false)}>Cancel</button>
+            {:else if escMode && sel.source.type === "escalation"}
+              <button class="btn btn-primary" disabled={busy || !reply.trim()} onclick={() => sel && void sendEscalation(sel)}>
+                {escMode === "resolve" ? "Resolve" : "Send reply"}
+              </button>
+              <button class="btn btn-ghost" onclick={() => (escMode = null)}>Cancel</button>
             {:else}
               {#each actions(sel) as a, i}
                 <button class="btn" class:btn-primary={a.primary && i === 0} disabled={busy} onclick={a.run}>{a.label}</button>

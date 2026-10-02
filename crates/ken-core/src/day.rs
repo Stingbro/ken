@@ -915,6 +915,69 @@ pub fn parse_escalation(rel_path: &str, raw: &str) -> Escalation {
 
 /// Every escalation file in a repo's `escalations/`, sorted by id. The
 /// folder's own template and index are left out.
+/// An escalation's text with a reply added at the end of its `## Thread`
+/// (the section is made when it has none), in the method's form:
+/// `- **Name, date:** words`. `resolve` also sets `status: resolved` and a
+/// `resolved:` date in the frontmatter, and marks the entry as the answer.
+pub fn escalation_reply(text: &str, who: &str, today: &str, reply: &str, resolve: bool) -> String {
+    let crlf = text.contains("\r\n");
+    let text = text.replace("\r\n", "\n");
+    let words = reply.split_whitespace().collect::<Vec<_>>().join(" ");
+    let entry = if resolve {
+        format!("- **{who}, {today}, resolved:** {words}")
+    } else {
+        format!("- **{who}, {today}:** {words}")
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    if resolve {
+        // The frontmatter: between the first two `---` lines.
+        if lines.first().is_some_and(|l| l.trim() == "---") {
+            if let Some(end) = lines.iter().skip(1).position(|l| l.trim() == "---").map(|i| i + 1) {
+                match lines[1..end].iter().position(|l| l.trim_start().starts_with("status:")) {
+                    Some(i) => lines[i + 1] = "status: resolved".into(),
+                    None => lines.insert(end, "status: resolved".into()),
+                }
+                let end = lines.iter().skip(1).position(|l| l.trim() == "---").map(|i| i + 1).unwrap_or(end);
+                if !lines[1..end].iter().any(|l| l.trim_start().starts_with("resolved:")) {
+                    lines.insert(end, format!("resolved: {today}"));
+                }
+            }
+        }
+    }
+
+    let thread = lines.iter().position(|l| l.trim().eq_ignore_ascii_case("## thread"));
+    match thread {
+        Some(at) => {
+            // The end of the section: the next heading of its level or above.
+            let mut end = lines[at + 1..]
+                .iter()
+                .position(|l| l.starts_with("# ") || l.starts_with("## "))
+                .map(|i| at + 1 + i)
+                .unwrap_or(lines.len());
+            while end > at + 1 && lines[end - 1].trim().is_empty() {
+                end -= 1;
+            }
+            lines.insert(end, entry);
+        }
+        None => {
+            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                lines.pop();
+            }
+            lines.push(String::new());
+            lines.push("## Thread".into());
+            lines.push(String::new());
+            lines.push(entry);
+        }
+    }
+    let out = lines.join("\n") + "\n";
+    if crlf {
+        out.replace('\n', "\r\n")
+    } else {
+        out
+    }
+}
+
 pub fn scan_escalations(repo_root: &Path) -> Vec<Escalation> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(repo_root.join(ESCALATIONS_DIR)) else { return out };
@@ -1024,6 +1087,31 @@ pub fn git_me() -> Me {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const E001: &str = "---\nid: E-001\nraised_by: Dana Reyes\nto: Chris Staud\nstatus: open\n---\n\n# Path or source?\n\n## Thread\n\n- **Dana Reyes, 2026-10-01:** Raising this.\n\n## Notes\n\nx\n";
+
+    #[test]
+    fn a_reply_goes_at_the_end_of_the_thread() {
+        let t = escalation_reply(E001, "Chris Staud", "2026-10-02", "Looking at it  today.", false);
+        assert!(t.contains("- **Dana Reyes, 2026-10-01:** Raising this.\n- **Chris Staud, 2026-10-02:** Looking at it today.\n\n## Notes"));
+        assert!(t.contains("status: open"));
+        let e = parse_escalation("escalations/E-001.md", &t);
+        assert!(e.open);
+    }
+
+    #[test]
+    fn resolving_closes_it_and_marks_the_answer() {
+        let t = escalation_reply(E001, "Chris Staud", "2026-10-02", "Path only.", true);
+        assert!(t.contains("status: resolved\nresolved: 2026-10-02\n---"));
+        assert!(t.contains("- **Chris Staud, 2026-10-02, resolved:** Path only."));
+        assert!(!parse_escalation("escalations/E-001.md", &t).open);
+    }
+
+    #[test]
+    fn a_file_with_no_thread_gets_one_and_keeps_crlf() {
+        let t = escalation_reply("---\r\nstatus: open\r\n---\r\n# Q\r\n", "Chris", "2026-10-02", "Yes.", false);
+        assert!(t.ends_with("# Q\r\n\r\n## Thread\r\n\r\n- **Chris, 2026-10-02:** Yes.\r\n"), "{t:?}");
+    }
 
     const TODAY: &str = "2026-10-01"; // a Thursday
 

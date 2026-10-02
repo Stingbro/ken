@@ -33,6 +33,7 @@
   import { lineTarget } from "../lib/citation";
   import type { Reveal } from "../lib/app.svelte";
   import { headingLinkPlugin } from "./markdown/headingLink";
+  import { wikiLinkPlugin } from "./markdown/wikiLinks";
   import { tableContextMenu } from "./markdown/tableMenu";
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
   import { addTocMenuItem, tocPlugins } from "./markdown/toc";
@@ -51,7 +52,14 @@
     initial,
     onchange,
     reveal = null,
-  }: { initial: string; onchange: (markdown: string) => void; reveal?: Reveal | null } = $props();
+    onwikilink,
+  }: {
+    initial: string;
+    onchange: (markdown: string) => void;
+    reveal?: Reveal | null;
+    /** A `[[wiki link]]` was clicked: its target, as written. */
+    onwikilink?: (target: string) => void;
+  } = $props();
 
   // A clicked citation: scroll to its heading, or to the block its source
   // line became, and flash it so the eye lands there.
@@ -329,6 +337,7 @@
     crepe.editor.use(slashShortcutKeys);
     crepe.editor.use(anchorLinkPlugin);
     crepe.editor.use(headingLinkPlugin);
+    crepe.editor.use(wikiLinkPlugin((target) => onwikilink?.(target)));
     // After the GFM preset: the table schema extension replaces the preset's
     // own `table` node, so it has to be registered last.
     crepe.editor.use(tableFullWidthPlugins);

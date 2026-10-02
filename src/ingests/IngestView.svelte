@@ -223,7 +223,15 @@
     const t = setInterval(() => {
       if (ingestBusy(overview)) void reload();
     }, 4000);
-    return () => clearInterval(t);
+    // A file dropped outside the drop area would make the window open it.
+    const stop = (e: DragEvent) => e.preventDefault();
+    window.addEventListener("dragover", stop);
+    window.addEventListener("drop", stop);
+    return () => {
+      clearInterval(t);
+      window.removeEventListener("dragover", stop);
+      window.removeEventListener("drop", stop);
+    };
   });
 
   async function chooseFiles() {

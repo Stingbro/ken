@@ -747,7 +747,17 @@ semantic_search is more forgiving). {LOOK_YOURSELF}",
         }
         "read_document" => {
             let path = require_str(args, "path")?;
-            let (project, note) = resolve_project(server, args)?;
+            // A ken://<project id>/<path>#L12 address, as search returns it,
+            // names its repo and its file.
+            let mut named = args.clone();
+            let path = match path.strip_prefix("ken://").and_then(|r| r.split_once('/')) {
+                Some((id, rel)) => {
+                    named["project"] = json!(id);
+                    rel.split('#').next().unwrap_or(rel).replace("%20", " ")
+                }
+                None => path,
+            };
+            let (project, note) = resolve_project(server, &named)?;
             // Validate before anything else so `..`/absolute paths are
             // refused outright, whatever the index says.
             let abs = project
@@ -2458,6 +2468,25 @@ fn resolve_project(server: &Server, args: &Value) -> Result<(Project, Option<Str
     let requested = args.get("project").and_then(|p| p.as_str()).map(str::trim);
 
     if let Some(root) = &server.scoped {
+        // Another repo of the open workspace, when one is named (by name,
+        // folder, id or a ken://<id>/ address): a route_query hit in a code
+        // repo is read where it lives, not looked for in this one.
+        if let Some(req) = requested.filter(|r| !r.is_empty()) {
+            if let Ok(registry) = Registry::load(&server.base_dir) {
+                let inside = in_open_workspace(server, &registry);
+                let req_id = req.strip_prefix("ken://").unwrap_or(req).split('/').next().and_then(|s| s.parse::<Uuid>().ok());
+                let found = registry.projects.iter().find(|p| {
+                    p.name.eq_ignore_ascii_case(req) || Some(p.id) == req_id || same_canonical(&p.path, Path::new(req))
+                });
+                if let Some(entry) = found {
+                    if !same_canonical(&entry.path, root) && inside(&entry.path) {
+                        if let Ok(p) = Project::open(&entry.path) {
+                            return Ok((p, None));
+                        }
+                    }
+                }
+            }
+        }
         let project = Project::open(root).map_err(|e| {
             format!("could not open the project this server is locked to ({}): {e}", root.display())
         })?;

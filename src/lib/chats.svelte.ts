@@ -57,7 +57,7 @@ class ChatsStore {
     if (this.listening) return this.refresh();
     this.listening = true;
     await api.onChatUpdated((row) => {
-      if (!forFocused(row.project_id)) return;
+      if (!this.ours(row.project_id)) return;
       const i = this.rows.findIndex((r) => r.id === row.id);
       if (row.archived) {
         if (i >= 0) this.rows = this.rows.toSpliced(i, 1);
@@ -75,11 +75,11 @@ class ChatsStore {
       if (row.id === this.activeId && row.status !== "working") this.draft = "";
     });
     await api.onChatDelta((d) => {
-      if (!forFocused(d.project_id)) return;
+      if (!this.ours(d.project_id)) return;
       if (d.chatId === this.activeId) this.draft += d.text;
     });
     await api.onChatMessage((msg) => {
-      if (!forFocused(msg.project_id)) return;
+      if (!this.ours(msg.project_id)) return;
       if (msg.chatId === this.activeId) {
         this.transcript = reconcile(this.transcript, msg);
         // The whole reply replaces what streamed of it.
@@ -96,8 +96,18 @@ class ChatsStore {
     });
   }
 
+  /** The repo the listed chats belong to. Opening a citation in another
+   *  repo moves the focus; the chat open here goes on in its own repo. */
+  private projectId: string | null = null;
+
+  private ours(projectId: string | null | undefined): boolean {
+    const mine = this.projectId ?? app.focused;
+    return !projectId || !mine || projectId === mine || forFocused(projectId);
+  }
+
   async refresh() {
     if (!(await api.currentProject().catch(() => null))) return;
+    this.projectId = app.focused;
     this.rows = await api.listChats();
     if (this.activeId && !this.rows.some((r) => r.id === this.activeId)) {
       this.activeId = this.rows[0]?.id ?? null;

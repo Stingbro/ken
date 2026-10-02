@@ -666,6 +666,15 @@ option {
   border-color: var(--accent);
 }
 
+/* A [[wiki link]] in the Markdown editor (a decoration, so global). */
+.ken-wikilink {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--accent) 45%, transparent);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
 .kbd {
   font-family: var(--font-mono);
   font-size: 11px;

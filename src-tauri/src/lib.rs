@@ -324,6 +324,19 @@ impl WorkspaceState {
 /// Look up the runtime for a member project. `None` means "the sole open
 /// project" - today's single-project semantics. Callers migrate to passing
 /// real ids as multi-project lands (S9 step list / workspace design).
+/// The open member that holds chat `chat_id`: the focused one when it
+/// does, else whichever does. Opening a citation in another repo moves the
+/// focus while the chat in the first one goes on.
+fn chat_owner(state: &AppState, chat_id: &str) -> Option<uuid::Uuid> {
+    let has = |rt: &MemberRuntime| lock_tolerant(&rt.chat_db).get_chat(chat_id).ok().flatten().is_some();
+    if let Some(f) = state.focused {
+        if state.members.get(&f).is_some_and(has) {
+            return Some(f);
+        }
+    }
+    state.members.iter().find(|(_, rt)| has(rt)).map(|(id, _)| *id)
+}
+
 fn member<'a>(state: &'a AppState, id: Option<uuid::Uuid>) -> Result<&'a MemberRuntime, &'static str> {
     match id.or(state.focused) {
         None => Err("no project open"),
@@ -7733,7 +7746,15 @@ fn raw_target(root: &std::path::Path, name: &str) -> CmdResult<std::path::PathBu
         Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
         _ => (name.to_string(), String::new()),
     };
-    let mut target = raw_dir.join(name);
+    // Raw's own README and Index are not sources, so a source by that name
+    // gets another.
+    let (name, stem) = if name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("index.md") {
+        let s = format!("{stem} (source)");
+        (format!("{s}{ext}"), s)
+    } else {
+        (name.to_string(), stem)
+    };
+    let mut target = raw_dir.join(&name);
     let mut n = 2;
     while target.exists() {
         target = raw_dir.join(format!("{stem} ({n}){ext}"));
@@ -8077,6 +8098,10 @@ fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, 
         .ok_or("no open ingest card with that id")?;
     let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
     let filed = ken_core::ingest::file(&active.project.root, &card).map_err(err)?;
+    // The card records where the source went, so Open source and Undo all
+    // find it there.
+    let payload = serde_json::to_string(&filed).map_err(err)?;
+    active.db.set_review_item_payload(item_id, &payload).map_err(err)?;
     active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
     Ok(filed.placement.source)
 }
@@ -10476,6 +10501,49 @@ fn reread_day_task(t: &ken_core::day::DayTask, today: &str) -> CmdResult<ken_cor
     Ok(ken_core::day::parse_task(&t.path, t.home, &raw, today))
 }
 
+/// Reply to an escalation raised to me, in its file's thread; `resolve`
+/// also closes it (`status: resolved`). The team repo's sync carries it to
+/// whoever raised it.
+#[tauri::command(async)]
+fn escalation_reply(
+    app: AppHandle,
+    state: State<SharedState>,
+    project_id: String,
+    rel_path: String,
+    text: String,
+    resolve: bool,
+) -> CmdResult<()> {
+    if text.trim().is_empty() {
+        return Err("Write the reply first.".into());
+    }
+    let rel = rel_path.replace('\\', "/");
+    if !rel.starts_with("escalations/") || rel.split('/').any(|p| p == "..") || !rel.ends_with(".md") {
+        return Err(format!("{rel_path} is not an escalation"));
+    }
+    let id: uuid::Uuid = project_id.parse().map_err(err)?;
+    let root = {
+        let guard = lock_tolerant(&state);
+        guard
+            .workspace
+            .as_ref()
+            .and_then(|w| {
+                w.ws.members.iter().find_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) if p.config.id == id => Some(p.root.clone()),
+                    _ => None,
+                })
+            })
+            .ok_or("that repo is not open")?
+    };
+    let path = root.join(&rel);
+    let raw = std::fs::read_to_string(&path).map_err(err)?;
+    let me = cached_git_me();
+    let who = me.name.clone().or(me.email.clone()).unwrap_or_else(|| "me".into());
+    let next = ken_core::day::escalation_reply(&raw, &who, &local_date_today(), &text, resolve);
+    std::fs::write(&path, next).map_err(err)?;
+    let _ = app.emit("day-changed", ());
+    Ok(())
+}
+
 /// Add a task to the workspace home (`updated_by: you`).
 #[tauri::command(async)]
 fn day_task_create(app: AppHandle, state: State<SharedState>, input: ken_core::day::DayTaskInput) -> CmdResult<DayTaskDto> {
@@ -12182,7 +12250,8 @@ fn send_chat_message(
     scope: Option<String>,
 ) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
+    let owner = chat_owner(&guard, &chat_id);
+    let active = member(&guard, owner)?;
     let engine_arc = active
         .chat_engine
         .as_ref()
@@ -12362,7 +12431,8 @@ fn answer_edit_proposal(
     declined_changes: Vec<String>,
 ) -> CmdResult<()> {
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let owner = chat_owner(&guard, &chat_id);
+    let active = member_mut(&mut guard, owner)?;
     let engine_arc = active.chat_engine.as_ref().ok_or(ken_core::runner::MISSING_CLAUDE_HELP)?.clone();
     let msg = active
         .chat_db
@@ -12425,7 +12495,8 @@ fn answer_edit_proposal(
         content,
         created_at: msg.created_at,
     });
-    let _ = db.set_chat_field(&chat_id, ChatField::Status, "working");
+    // The engine said "working" before it wrote the answer; setting it again
+    // here could land after the turn's "done" and leave it stuck.
     let _ = db.touch_chat(&chat_id, now);
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
         let _ = app.emit("chat-updated", row);
@@ -12445,7 +12516,8 @@ fn answer_chat_question(
     answers: std::collections::HashMap<String, String>,
 ) -> CmdResult<()> {
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
+    let owner = chat_owner(&guard, &chat_id);
+    let active = member(&guard, owner)?;
     let engine_arc = active
         .chat_engine
         .as_ref()
@@ -12491,7 +12563,8 @@ fn answer_chat_question(
         content,
         created_at: msg.created_at,
     });
-    let _ = db.set_chat_field(&chat_id, ChatField::Status, "working");
+    // The engine said "working" before it wrote the answer; setting it again
+    // here could land after the turn's "done" and leave it stuck.
     let _ = db.touch_chat(&chat_id, now);
     if let Ok(Some(row)) = db.get_chat(&chat_id) {
         let _ = app.emit("chat-updated", row);
@@ -14235,6 +14308,7 @@ pub fn run() {
             team_digest,
             refresh_team_digest,
             team_digest_writing,
+            escalation_reply,
             workspace_groups,
             workspace_set_group,
             workspace_remove_group,
