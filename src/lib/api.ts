@@ -2040,6 +2040,9 @@ export const api = {
   teamDigest: (team: string | null) => invoke<TeamDigest | null>("team_digest", { team }),
   /** Write the team digest now. Outcome arrives on the team-digest events. */
   refreshTeamDigest: (team: string | null) => invoke<void>("refresh_team_digest", { team }),
+  /** Move a ticket to a status (todo, in-progress, blocked, in-review, testing, done, cancelled). */
+  ticketSetStatus: (projectId: string, relPath: string, status: string) =>
+    invoke<void>("ticket_set_status", { projectId, relPath, status }),
   /** Reply in an escalation's thread; `resolve` also closes it. */
   escalationReply: (projectId: string, relPath: string, text: string, resolve: boolean) =>
     invoke<void>("escalation_reply", { projectId, relPath, text, resolve }),

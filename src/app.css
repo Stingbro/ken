@@ -190,6 +190,13 @@ button {
   font-family: inherit;
   cursor: pointer;
 }
+/* A button a component leaves unstyled reads as part of the page, not the
+   operating system's grey box. Zero specificity: a component's rule wins. */
+:where(button) {
+  background: none;
+  border: none;
+  color: inherit;
+}
 
 /* ── Native controls in the design system ─────────────────────
    Checkboxes, radio buttons and dropdowns are drawn here, not by the

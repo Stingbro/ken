@@ -10,6 +10,7 @@
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import X from "@lucide/svelte/icons/x";
   import Check from "@lucide/svelte/icons/check";
+  import DatePicker from "../lib/ui/DatePicker.svelte";
 
   let { task, newLinks = [] }: { task: DayTask | null; newLinks?: string[] } = $props();
 
@@ -309,15 +310,7 @@
 
   <div class="field">
     <span class="label">Target</span>
-    <input
-      type="date"
-      value={target}
-      aria-label="Target date"
-      onchange={(e) => setTarget(e.currentTarget.value)}
-    />
-    {#if target}
-      <button class="chip ghost" onclick={() => setTarget("")}>clear</button>
-    {/if}
+    <DatePicker value={target ?? ""} label="Target date" onchange={(v) => setTarget(v)} />
   </div>
 
   <div class="field">
@@ -493,7 +486,6 @@
     color: var(--ink-tertiary);
     font-size: 11.5px;
   }
-  .field input[type="date"],
   .field select,
   .link-input {
     font: inherit;

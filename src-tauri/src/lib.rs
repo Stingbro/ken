@@ -10563,6 +10563,42 @@ fn reread_day_task(t: &ken_core::day::DayTask, today: &str) -> CmdResult<ken_cor
     Ok(ken_core::day::parse_task(&t.path, t.home, &raw, today))
 }
 
+/// The folder of the workspace member `project_id`.
+fn member_root(state: &SharedState, project_id: &str) -> CmdResult<PathBuf> {
+    let id: uuid::Uuid = project_id.parse().map_err(err)?;
+    let guard = lock_tolerant(state);
+    guard
+        .workspace
+        .as_ref()
+        .and_then(|w| {
+            w.ws.members.iter().find_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) if p.config.id == id => Some(p.root.clone()),
+                _ => None,
+            })
+        })
+        .ok_or_else(|| "that repo is not open".to_string())
+}
+
+/// Move one of my tickets to `status` (todo, in-progress, blocked,
+/// in-review, testing, done, cancelled) in its file. The team repo's sync
+/// carries it to the team; done and cancelled leave Your day.
+#[tauri::command(async)]
+fn ticket_set_status(app: AppHandle, state: State<SharedState>, project_id: String, rel_path: String, status: String) -> CmdResult<()> {
+    let status = status.trim().to_lowercase();
+    if !ken_core::day::TICKET_STATUSES.contains(&status.as_str()) {
+        return Err(format!("\"{status}\" is not a ticket status"));
+    }
+    let rel = rel_path.replace('\\', "/");
+    if !rel.starts_with("tickets/") || rel.split('/').any(|p| p == "..") || !rel.ends_with(".md") {
+        return Err(format!("{rel_path} is not a ticket"));
+    }
+    let path = member_root(state.inner(), &project_id)?.join(&rel);
+    let raw = std::fs::read_to_string(&path).map_err(err)?;
+    std::fs::write(&path, ken_core::day::set_frontmatter(&raw, "status", &status)).map_err(err)?;
+    let _ = app.emit("day-changed", ());
+    Ok(())
+}
+
 /// Reply to an escalation raised to me, in its file's thread; `resolve`
 /// also closes it (`status: resolved`). The team repo's sync carries it to
 /// whoever raised it.
@@ -14373,6 +14409,7 @@ pub fn run() {
             resolve_page_link,
             wiki_drafting,
             escalation_reply,
+            ticket_set_status,
             workspace_groups,
             workspace_set_group,
             workspace_remove_group,

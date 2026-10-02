@@ -141,6 +141,18 @@
     return focused ? fallbackRecents(app.files).slice(0, 8).map((f) => ({ projectId: focused, path: f.relPath, at: f.at })) : [];
   });
 
+  // ── A ticket's status, set from Your day ──────────────────────────
+  /** The method's ticket statuses; done and cancelled leave the list. */
+  const TICKET_STATUSES = ["todo", "in-progress", "blocked", "in-review", "testing", "done", "cancelled"];
+  async function setTicketStatus(projectId: string, relPath: string, status: string) {
+    try {
+      await api.ticketSetStatus(projectId, relPath, status);
+      await day.refreshState();
+    } catch (e) {
+      toast.error("Could not change the ticket's status", e);
+    }
+  }
+
   // ── Needs you: the top of the Inbox ───────────────────────────────
 
   const needs = $derived(inbox.items.slice(0, 4));
@@ -214,16 +226,23 @@
           <p class="t-small err">Your list could not be read: {day.loadError}</p>
         {/if}
         {#each day.tickets as t (t.projectId + ":" + t.relPath)}
-          <button class="row" title="{t.repo}/{t.relPath}" onclick={() => void openInRepo(t.projectId, t.relPath)}>
-            <span class="k-check square" aria-hidden="true"></span>
-            <span class="rmain">
+          <div class="row">
+            <button class="rmain plain" title="{t.repo}/{t.relPath}" onclick={() => void openInRepo(t.projectId, t.relPath)}>
               <span class="tid">{t.id}</span>
               <span class="rtitle">{t.title}</span>
               <span class="rdetail">{ticketDetail(t)}</span>
-            </span>
-            <span class="chip">{t.state}</span>
+            </button>
+            <select
+              class="status-pick"
+              aria-label="Status of {t.id}"
+              value={t.state}
+              onchange={(e) => void setTicketStatus(t.projectId, t.relPath, (e.currentTarget as HTMLSelectElement).value)}
+            >
+              {#if !TICKET_STATUSES.includes(t.state)}<option value={t.state}>{t.state || "no status"}</option>{/if}
+              {#each TICKET_STATUSES as st (st)}<option value={st}>{st.replace("-", " ")}</option>{/each}
+            </select>
             <span class="due {dueClass(t.target)}">{dueLabel(t.target)}</span>
-          </button>
+          </div>
         {/each}
         {#each day.tasks as task (task.relPath + ":" + task.id)}
           {@const done = task.state === "done"}
@@ -483,6 +502,17 @@
   }
   .rdetail.from {
     color: var(--attn-ink);
+  }
+  .status-pick {
+    flex: none;
+    font-size: 12px;
+    padding: 3px 24px 3px 9px;
+    border-radius: 999px;
+    border-color: var(--line);
+    background-color: var(--line-soft);
+    background-position: right 7px center;
+    background-size: 11px;
+    color: var(--ink-2);
   }
   .due {
     width: 62px;

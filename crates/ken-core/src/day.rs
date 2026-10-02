@@ -915,6 +915,52 @@ pub fn parse_escalation(rel_path: &str, raw: &str) -> Escalation {
 
 /// Every escalation file in a repo's `escalations/`, sorted by id. The
 /// folder's own template and index are left out.
+/// The statuses a ticket moves through (the method's ticket template).
+pub const TICKET_STATUSES: [&str; 7] = ["todo", "in-progress", "blocked", "in-review", "testing", "done", "cancelled"];
+
+/// `text` with frontmatter `key` set to `value`: the line replaced where it
+/// is, or added at the end of the frontmatter. A file with no frontmatter
+/// gets one. Line endings are kept.
+pub fn set_frontmatter(text: &str, key: &str, value: &str) -> String {
+    let crlf = text.contains("\r\n");
+    let t = text.replace("\r\n", "\n");
+    let mut lines: Vec<String> = t.lines().map(str::to_string).collect();
+    let line = format!("{key}: {value}");
+    let head_end = if lines.first().is_some_and(|l| l.trim() == "---") {
+        lines.iter().skip(1).position(|l| l.trim() == "---").map(|i| i + 1)
+    } else {
+        None
+    };
+    match head_end {
+        Some(end) => {
+            let prefix = format!("{key}:");
+            match lines[1..end].iter().position(|l| l.trim_start().starts_with(&prefix)) {
+                Some(i) => {
+                    // Keep a trailing `# comment` the template carries.
+                    let old = &lines[i + 1];
+                    let comment = old
+                        .find(" #")
+                        .map(|h| old[old[..h + 1].trim_end().len()..].to_string())
+                        .unwrap_or_default();
+                    lines[i + 1] = format!("{line}{comment}");
+                }
+                None => lines.insert(end, line),
+            }
+        }
+        None => {
+            lines.insert(0, "---".into());
+            lines.insert(1, line);
+            lines.insert(2, "---".into());
+        }
+    }
+    let out = lines.join("\n") + "\n";
+    if crlf {
+        out.replace('\n', "\r\n")
+    } else {
+        out
+    }
+}
+
 /// An escalation's text with a reply added at the end of its `## Thread`
 /// (the section is made when it has none), in the method's form:
 /// `- **Name, date:** words`. `resolve` also sets `status: resolved` and a
@@ -1089,6 +1135,15 @@ mod tests {
     use tempfile::tempdir;
 
     const E001: &str = "---\nid: E-001\nraised_by: Dana Reyes\nto: Chris Staud\nstatus: open\n---\n\n# Path or source?\n\n## Thread\n\n- **Dana Reyes, 2026-10-01:** Raising this.\n\n## Notes\n\nx\n";
+
+    #[test]
+    fn a_ticket_status_is_set_in_its_frontmatter_and_keeps_its_comment() {
+        let t = "---\nid: AUR-101\nstatus: todo          # todo | in-progress\nassignee: Chris\n---\n# T\n";
+        let got = set_frontmatter(t, "status", "in-progress");
+        assert_eq!(got, "---\nid: AUR-101\nstatus: in-progress          # todo | in-progress\nassignee: Chris\n---\n# T\n");
+        assert!(set_frontmatter("---\nid: X\n---\n", "status", "done").contains("id: X\nstatus: done\n---"));
+        assert_eq!(set_frontmatter("# T\r\n", "status", "done"), "---\r\nstatus: done\r\n---\r\n# T\r\n");
+    }
 
     #[test]
     fn a_reply_goes_at_the_end_of_the_thread() {
