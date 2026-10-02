@@ -246,7 +246,8 @@
   .tree {
     /* Width comes from the resizable, persisted sidebar preference. */
     flex: none;
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--line-soft);
+    background: var(--rail);
     display: flex;
     flex-direction: column;
     /* No top padding: sticky offsets resolve against this scroll container's

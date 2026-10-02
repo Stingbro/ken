@@ -383,8 +383,8 @@
      defers to it so the drawer holds that fixed width beside the main content. */
   .drawer {
     flex: 0 0 auto;
-    border-left: 1px solid var(--border);
-    background: var(--sunken-2);
+    border-left: 1px solid var(--line-soft);
+    background: var(--rail);
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -392,7 +392,7 @@
   }
   .drawer.overlay {
     position: absolute;
-    top: 52px;
+    top: 56px;
     right: 0;
     bottom: 0;
     z-index: 40;

@@ -212,7 +212,7 @@ pub const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
 /// What every chat session is told about working inside Ken, appended to
 /// Claude Code's own system prompt.
 pub const KEN_GUIDE: &str = "You are working inside Ken, a desktop app where a person reads and edits their team's \
-wiki, docs and code. Two rules for this app:\n\
+wiki, docs and code. Rules for this app:\n\
 1. Edits are reviewed. Every Edit, MultiEdit or Write you make is shown to the person as a diff, and they accept or \
 decline each change. If they decline some, the tool result says which; read the file again before editing it further, \
 and do not retry a declined change unless they ask.\n\
@@ -223,14 +223,15 @@ by that address, with #L<line> when it has a line. A file in another of the work
 repo's ken:// address (each turn lists them), never a project-relative path; write a space in a path as %20. \
 Never open files or switch the person's screen yourself; a link \
 is how they go there.\n\
-3. Search with Ken first. Ken's tools (route_query across the workspace, semantic_search in one project, kg_search \
-over the knowledge graph, search_knowledge, read_document) search the team's wiki, docs and code with Ken's own \
-ranking and return ken:// addresses to cite. For code, navigate like an IDE: find_definition to go to a symbol, \
-find_usages for every use and its callers, file_outline to drill into a file, related_files for what it imports and \
-what imports it; then read the lines they point to. history tells when and why something changed (a file's \
-commits, commits about some words, or with neither, what changed in the last `days` across every repo, git or \
-not). Ken's tools and Grep, Glob and Read cover every question about the files; do not run shell commands to look \
-at them. open_in_ken opens a file for the person: use it only when they explicitly ask you to open or show \
+3. Search with Ken first. Ken's tools (mcp__ken__route_query across the workspace, mcp__ken__semantic_search in one \
+project, mcp__ken__kg_search over the knowledge graph, mcp__ken__search_knowledge, mcp__ken__read_document) search \
+the team's wiki, docs and code with Ken's own ranking and return ken:// addresses to cite. For code, navigate like an \
+IDE: mcp__ken__find_definition to go to a symbol, mcp__ken__find_usages for every use and its callers, \
+mcp__ken__file_outline to drill into a file, mcp__ken__related_files for what it imports and what imports it; then \
+read the lines they point to. mcp__ken__history tells when and why something changed (a file's commits, commits \
+about some words, or with neither, what changed in the last `days` across every repo, git or not). Ken's tools and \
+Grep, Glob and Read cover every question about the files; do not run shell commands to look at them. \
+mcp__ken__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or show \
 something.\n\
 4. Never say something isn't there because Ken's search did not find it. Its index can miss a file, a new change or \
 different wording. When Ken finds nothing, or nothing that answers, look yourself with Grep, Glob and Read, in this \
@@ -240,12 +241,19 @@ as the path. Only after looking may you say it isn't there, and say where you lo
 5. On what the system does, the code wins: a ticket, plan or doc says what was intended, not what was built. When \
 asked how something works, open the code that does it and cite that file; where the code and a doc disagree, say so. \
 Several repos can hold the same product (a prototype and the build that replaced it): before saying the code does \
-not do something, look in every repo of the workspace, and say which repo each finding is from.";
+not do something, look in every repo of the workspace, and say which repo each finding is from.\n\
+6. The person's list is Ken's, not yours. Their tasks are read with mcp__ken__task_list and their tickets with \
+mcp__ken__ticket_list; add or change a task with mcp__ken__task_create and mcp__ken__task_update when they ask, and \
+say what you added. Your own task or todo tools are not their list. A ## Memories block at the top of a turn holds \
+the team's standing notes: follow them, and add one with mcp__ken__memory_write only when the person asks you to \
+remember something.";
 
 /// Ken's own MCP tools the chat may use without asking: they read Ken's
-/// index, or open a file for the person when they asked. Its tools that
-/// write (memories, tasks, messages to teammates) are declined in chat.
-pub const KEN_MCP_ALLOWED: [&str; 15] = [
+/// index, open a file for the person when they asked, or keep the person's
+/// own list and Ken's memory when they ask (each write is dated and says who
+/// made it). Sending to a teammate through the team inbox is declined in
+/// chat: the person does that in Ken.
+pub const KEN_MCP_ALLOWED: [&str; 21] = [
     "history",
     "find_definition",
     "find_usages",
@@ -259,8 +267,31 @@ pub const KEN_MCP_ALLOWED: [&str; 15] = [
     "semantic_search",
     "route_query",
     "task_list",
+    "task_create",
+    "task_update",
+    "ticket_list",
+    "memory_write",
+    "journal_append",
+    "family_list",
     "family_inbox",
     "open_in_ken",
+];
+
+/// Tools of Claude Code's own that the chat process does not get: no shell
+/// (Ken's tools and Read, Grep and Glob cover the files), no web, and no task
+/// lists of its own (the person's list is Ken's). Notebook edits are not
+/// reviewed as diffs, so they are off too.
+pub const CHAT_DISALLOWED: [&str; 10] = [
+    "Bash",
+    "PowerShell",
+    "WebFetch",
+    "WebSearch",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskList",
+    "TaskGet",
+    "TodoWrite",
+    "NotebookEdit",
 ];
 
 /// The name Claude Code gives a tool of Ken's MCP server (`ken`).
@@ -311,26 +342,34 @@ pub fn propose_edit(project_root: &Path, tool: &str, input: &Value) -> std::resu
     let abs = if Path::new(path).is_absolute() { PathBuf::from(path) } else { project_root.join(path) };
     let rel = abs.strip_prefix(project_root).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
     let base = std::fs::read_to_string(&abs).unwrap_or_default();
+    // Claude Code reads and edits text with LF line ends. A file saved with
+    // CRLF (most of a Windows checkout with core.autocrlf) would never match
+    // a multi-line edit, so the edit is worked out on LF text and the result
+    // is put back in the file's own line ends.
+    let crlf = base.contains("\r\n");
+    let lf = |s: &str| if crlf { s.replace("\r\n", "\n") } else { s.to_string() };
+    let text = lf(&base);
     let proposed = match tool {
-        "Write" => input.get("content").and_then(Value::as_str).unwrap_or_default().to_string(),
+        "Write" => lf(input.get("content").and_then(Value::as_str).unwrap_or_default()),
         "Edit" => {
-            let old = input.get("old_string").and_then(Value::as_str).unwrap_or_default();
-            let new = input.get("new_string").and_then(Value::as_str).unwrap_or_default();
+            let old = lf(input.get("old_string").and_then(Value::as_str).unwrap_or_default());
+            let new = lf(input.get("new_string").and_then(Value::as_str).unwrap_or_default());
             let all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-            replace_once(&base, old, new, all)?
+            replace_once(&text, &old, &new, all)?
         }
         "MultiEdit" => {
-            let mut text = base.clone();
+            let mut text = text.clone();
             for e in input.get("edits").and_then(Value::as_array).cloned().unwrap_or_default() {
-                let old = e.get("old_string").and_then(Value::as_str).unwrap_or_default();
-                let new = e.get("new_string").and_then(Value::as_str).unwrap_or_default();
+                let old = lf(e.get("old_string").and_then(Value::as_str).unwrap_or_default());
+                let new = lf(e.get("new_string").and_then(Value::as_str).unwrap_or_default());
                 let all = e.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
-                text = replace_once(&text, old, new, all)?;
+                text = replace_once(&text, &old, &new, all)?;
             }
             text
         }
         other => return Err(format!("{other} is not an edit")),
     };
+    let proposed = if crlf { proposed.replace("\n", "\r\n") } else { proposed };
     Ok((abs.to_string_lossy().to_string(), rel, base, proposed))
 }
 
@@ -847,6 +886,7 @@ impl ChatEngine {
         // One line: on Windows the CLI is a `.cmd` launcher, and a line break
         // in any argument to one fails the spawn.
         cmd.arg("--append-system-prompt").arg(KEN_GUIDE.replace('\n', " "));
+        cmd.arg("--disallowedTools").arg(CHAT_DISALLOWED.join(","));
         if let Some(cfg) = self.mcp_config.lock().unwrap().clone() {
             cmd.arg("--mcp-config").arg(cfg);
         }
@@ -947,7 +987,7 @@ impl ChatEngine {
                             let response = if KEN_MCP_ALLOWED.contains(&tool) {
                                 serde_json::json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id })
                             } else {
-                                serde_json::json!({ "behavior": "deny", "message": format!("{tool} changes Ken's data; in this chat you may read and cite, and the person does this in Ken.") })
+                                serde_json::json!({ "behavior": "deny", "message": format!("{tool} sends something to a teammate; the person does that in Ken.") })
                             };
                             let reply = control_reply(&request_id, response);
                             let mut w = pump_stdin.lock().unwrap();
@@ -1230,6 +1270,39 @@ mod tests {
         let p = build_cite_preamble(&[("wiki".into(), a), ("Project Documents".into(), b)]).unwrap();
         assert!(p.contains(&format!("- Project Documents: ken://{b}/<path>#L<line>")), "{p}");
         assert!(KEN_GUIDE.contains("%20") && KEN_GUIDE.contains("never a project-relative path"));
+    }
+
+    #[test]
+    fn every_ken_tool_the_guide_names_is_one_the_chat_may_use() {
+        let named: Vec<&str> = KEN_GUIDE
+            .split("mcp__ken__")
+            .skip(1)
+            .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or(""))
+            .collect();
+        assert!(named.len() > 8, "the guide names Ken's tools in full: {named:?}");
+        for tool in named {
+            assert!(KEN_MCP_ALLOWED.contains(&tool), "{tool} is named in the guide but not allowed");
+        }
+        assert!(!KEN_MCP_ALLOWED.contains(&"family_send"), "sending to a teammate stays with the person");
+    }
+
+    #[test]
+    fn a_multi_line_edit_on_a_crlf_file_matches_and_keeps_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.md");
+        std::fs::write(&file, "# Title\r\n\r\nFirst line.\r\nSecond line.\r\n").unwrap();
+        let input = serde_json::json!({
+            "file_path": file.to_string_lossy(),
+            "old_string": "First line.\nSecond line.",
+            "new_string": "First line.\nA new second line.",
+        });
+        let (_, _, base, proposed) = propose_edit(dir.path(), "Edit", &input).expect("the LF edit matches the CRLF file");
+        assert!(base.contains("\r\n"));
+        assert_eq!(proposed, "# Title\r\n\r\nFirst line.\r\nA new second line.\r\n");
+        // An LF file is left as it is.
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let input = serde_json::json!({ "file_path": file.to_string_lossy(), "old_string": "two", "new_string": "three" });
+        assert_eq!(propose_edit(dir.path(), "Edit", &input).unwrap().3, "one\nthree\n");
     }
 
     #[test]

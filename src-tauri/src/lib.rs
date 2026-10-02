@@ -5252,13 +5252,18 @@ fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
     let llm_instruction = format!(
         "Set up the Ken MCP server so you can search this team's knowledge base.\n\n\
 Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
-server binary, ken-mcp, exposes read-only tools over that index: search_knowledge \
-(full-text search), read_document, list_documents, and list_projects. It runs on \
-demand over stdio and never modifies any files.\n\n\
+server binary, ken-mcp, runs on demand over stdio. Its tools: search (route_query \
+across the workspace, semantic_search, search_knowledge, kg_search), reading \
+(read_document, list_documents, list_projects), code navigation (find_definition, \
+find_usages, file_outline, related_files), history, the person's Your day tasks and \
+tickets (task_list, ticket_list), and the team inbox (family_list, family_inbox). It \
+never edits the person's files. Five tools write: task_create and task_update (Your \
+day tasks), memory_write and journal_append (Ken's memory and journal), and \
+family_send, which commits and pushes an item to the team's inbox repo.\n\n\
 If you are Claude Code, register it by running:\n\n  {add_command}\n\n\
 Otherwise, add this to your MCP configuration:\n\n{json_config}\n\n\
-Once connected, use search_knowledge to find relevant documents and read_document \
-to read them."
+Once connected, start with route_query to find what answers a question, and \
+read_document to read it."
     );
     Ok(McpInfo {
         binary_path,

@@ -1,7 +1,9 @@
 //! ken-mcp — stdio MCP server over ken-core. Hand-rolled JSON-RPC 2.0:
 //! one JSON object per line on stdout, stdin read line-by-line, nothing
 //! but protocol on stdout (diagnostics go to stderr). Read-only on the
-//! SQLite index by construction — the server never writes anything.
+//! SQLite index. It writes only through ken-core and only these: Your day
+//! tasks, Ken's memories, the workspace journal, and a team inbox item
+//! (which commits and pushes to the team's inbox repo).
 //!
 //! Scoping: `ken-mcp --project <path>` locks every tool to that project;
 //! unscoped, the project tools take a required `project` argument matched
@@ -78,8 +80,15 @@ fn main() {
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    let mut input = stdin.lock();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match input.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = clean_line(&buf);
         if let Some(reply) = handle_line(&mut server, &line) {
             let mut out = stdout.lock();
             if writeln!(out, "{reply}").and_then(|_| out.flush()).is_err() {
@@ -87,6 +96,14 @@ fn main() {
             }
         }
     }
+}
+
+/// A request line as text: invalid UTF-8 replaced (then answered as a parse
+/// error rather than ending the loop), a leading byte-order mark (Windows
+/// PowerShell adds one when it pipes) and the trailing CR/LF dropped.
+fn clean_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.trim_start_matches('\u{feff}').trim_end_matches(['\r', '\n']).to_string()
 }
 
 /// One line in, at most one line out. Malformed input is answered (it has
@@ -127,17 +144,17 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match name {
-                "search_knowledge" | "read_document" | "list_documents" | "list_projects"
-                | "kg_search" | "semantic_search" | "route_query"
-                | "find_definition" | "find_usages" | "file_outline" | "related_files" | "history"
-                | "memory_write" | "journal_append"
-                | "task_create" | "task_list" | "task_update" | "ticket_list"
-                | "family_list" | "family_inbox" | "family_send" => {
-                    let outcome = call_tool(server, name, &args);
-                    rpc_result(&id, tool_content(outcome))
-                }
-                _ => rpc_error(&id, -32602, &format!("unknown tool: {name:?}")),
+            // Any tool the server lists is dispatched: the list and the
+            // dispatch cannot drift apart (open_in_ken once was listed and
+            // refused).
+            let listed = tool_definitions(server)
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)));
+            if listed {
+                let outcome = call_tool(server, name, &args);
+                rpc_result(&id, tool_content(outcome))
+            } else {
+                rpc_error(&id, -32602, &format!("unknown tool: {name:?}"))
             }
         }
         _ => {
@@ -431,8 +448,8 @@ update an existing memory's body instead.",
         tools.push(json!({
             "name": "journal_append",
             "description": "Append a timestamped entry to today's Ken \
-workspace journal — this is where agent tasks report their findings back \
-as they happen, creating the day's file if it doesn't exist yet. Cite \
+workspace journal, for a finding the person wants kept, creating the \
+day's file if it doesn't exist yet. Cite \
 ken:// addresses for anything referenced so the entry stays traceable \
 after Ken reindexes it. Optionally tag the entry with the Ken project it \
 concerns and free-form tags.",
@@ -557,12 +574,10 @@ Read-only: calling this never changes an item's status.",
 a teammate's inbox in a Ken family repo: creates exactly one new file \
 under their members/<id>/inbox/ and pushes it — the only cross-member \
 write Ken's write lanes allow (never an edit of anything the recipient \
-already owns). IMPORTANT: delivery is not assignment or acceptance. \
-Nothing sent by this tool enters the recipient's board, daily board, or \
-any agent-claimable queue by itself — for a task item, the recipient (or \
-their Ken) must explicitly accept it first; for a message or notification, \
-it just waits, unread, until they read or dismiss it. There is no \
-auto-accept in this system.",
+already owns). Delivery is not assignment or acceptance, and there is no \
+auto-accept: a task item becomes a Your \
+day task only when the recipient accepts it in their Inbox; a message \
+waits, unread, until they read it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -842,7 +857,8 @@ fn require_str(args: &Value, key: &str) -> Result<String, String> {
 fn list_projects(server: &Server) -> Result<String, String> {
     let registry = Registry::load(&server.base_dir)
         .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
-    let statuses = registry.statuses();
+    let inside = in_open_workspace(server, &registry);
+    let statuses: Vec<_> = registry.statuses().into_iter().filter(|s| inside(&s.entry.path)).collect();
     if statuses.is_empty() {
         return Ok("No Ken projects registered on this machine yet — open a \
 folder in the Ken app first."
@@ -868,7 +884,7 @@ folder in the Ken app first."
         ));
         if enrich && s.available {
             let readiness = match Db::open_read_only(&server.base_dir, s.entry.id) {
-                Ok(db) if db.vec_available() => "keyword + semantic search ready",
+                Ok(db) if db.vector_count().unwrap_or(0) > 0 => "keyword and meaning search ready",
                 Ok(_) => "keyword search ready",
                 Err(_) => "no index yet",
             };
@@ -1031,10 +1047,11 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
         }
         None => {
             let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+            let inside = in_open_workspace(server, &registry);
             registry
                 .projects
                 .iter()
-                .filter(|e| e.path.is_dir())
+                .filter(|e| e.path.is_dir() && inside(&e.path))
                 // A folder without git still has recent changes, from the index.
                 .filter(|e| recent || e.path.join(".git").exists())
                 .filter(|e| path.as_ref().is_none_or(|p| e.path.join(p).exists()))
@@ -1156,10 +1173,11 @@ fn code_indexes(server: &Server, args: &Value) -> Result<Vec<(Uuid, String, Db)>
         return Ok(vec![(id, pname, db)]);
     }
     let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let inside = in_open_workspace(server, &registry);
     Ok(registry
         .projects
         .iter()
-        .filter(|e| e.path.is_dir())
+        .filter(|e| e.path.is_dir() && inside(&e.path))
         .filter_map(|e| Db::open_read_only(&server.base_dir, e.id).ok().map(|db| (e.id, e.name.clone(), db)))
         .collect())
 }
@@ -1348,8 +1366,9 @@ folder in the Ken app first."
     // Missing folders are excluded outright: not real routing candidates.
     let mut members: Vec<MemberInfo> = Vec::new();
     let mut dbs: HashMap<Uuid, Db> = HashMap::new();
+    let inside = in_open_workspace(server, &registry);
     for entry in &registry.projects {
-        if !entry.path.is_dir() {
+        if !entry.path.is_dir() || !inside(&entry.path) {
             continue;
         }
         let (index_ready, last_activity) = match Db::open_read_only(&server.base_dir, entry.id) {
@@ -1536,7 +1555,7 @@ fn memory_write_tool(server: &Server, args: &Value) -> Result<String, String> {
             return Err(format!("invalid \"mode\" {other:?} — use \"create\" or \"replace\""))
         }
     };
-    let (today, _) = today_and_time_utc();
+    let (today, _) = local_today_and_time();
 
     if scope_arg.eq_ignore_ascii_case("workspace") {
         let workspace_root = resolve_workspace_root(server)?;
@@ -1579,7 +1598,7 @@ fn journal_append_tool(server: &Server, args: &Value) -> Result<String, String> 
         .unwrap_or_default();
 
     let workspace_root = resolve_workspace_root(server)?;
-    let (today, time_hhmm) = today_and_time_utc();
+    let (today, time_hhmm) = local_today_and_time();
     let path = memory::append_journal(&workspace_root, &text, project, &tags, &today, &time_hhmm)
         .map_err(|e| format!("could not append to the journal: {e}"))?;
     Ok(format!(
@@ -2419,9 +2438,8 @@ fn family_send_tool(server: &Server, args: &Value) -> Result<String, String> {
     let mut msg = format!(
         "Delivered a new {} item to \"{to}\"'s inbox in family \"{}\" ({rel_path}). This only \
 places the item in {to}'s inbox — delivery is not assignment or acceptance. {to} (or their Ken) \
-must explicitly accept a task item before it becomes a task on their board; a message or \
-notification just waits, unread, until {to} reads or dismisses it. Nothing here enters {to}'s \
-board, daily board, or any claimable queue automatically — there is no auto-accept.",
+must accept a task item in their Inbox (there is no auto-accept) before it becomes a task on their list; a message just \
+waits, unread, until {to} reads it.",
         kind.as_str(),
         conn.manifest.name
     );
@@ -2495,6 +2513,37 @@ argument is required (a name or folder path). {available}"
 /// `workspace_kg_root`.
 fn kg_root(server: &Server) -> PathBuf {
     resolve_workspace_root(server).unwrap_or_else(|_| server.base_dir.clone())
+}
+
+/// Whether a registered project belongs to the workspace open in Ken: its
+/// folder is inside the workspace's. With no workspace open, every project
+/// does. A search with no project named stays inside the workspace the person
+/// has open, so another client's files are never found or cited.
+fn in_open_workspace(server: &Server, registry: &Registry) -> impl Fn(&std::path::Path) -> bool {
+    let root = registry
+        .last_workspace
+        .and_then(|id| registry.workspaces.iter().find(|w| w.id == id))
+        .map(|w| norm_path(&w.path));
+    let _ = server;
+    move |path: &std::path::Path| match &root {
+        Some(r) => {
+            let p = norm_path(path);
+            p == *r || p.starts_with(&format!("{r}/"))
+        }
+        None => true,
+    }
+}
+
+/// A path for comparing: forward slashes, no trailing slash, no `\\?\`
+/// prefix, and lower case on Windows (its paths ignore case).
+fn norm_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let s = s.strip_prefix("//?/").unwrap_or(&s).trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
 }
 
 fn resolve_workspace_root(server: &Server) -> Result<PathBuf, String> {
@@ -2590,6 +2639,15 @@ fn floor_char_boundary_at(bytes: &[u8], at: usize) -> usize {
 /// only the human-facing date/time label can be a day off from "local
 /// today" — so this is acceptable for an MCP sidecar with no UI of its
 /// own, not a correctness bug.
+/// Today and the time of day on this computer's clock (`YYYY-MM-DD`,
+/// `HH:MM`): what the journal and memories are dated with, the same day the
+/// app calls today. A team inbox item's `created` stays in UTC
+/// ([`today_and_time_utc`]), because teammates read it in other zones.
+fn local_today_and_time() -> (String, String) {
+    let now = chrono::Local::now();
+    (now.format("%Y-%m-%d").to_string(), now.format("%H:%M").to_string())
+}
+
 fn today_and_time_utc() -> (String, String) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
