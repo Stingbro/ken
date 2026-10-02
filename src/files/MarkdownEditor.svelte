@@ -33,7 +33,7 @@
   import { lineTarget } from "../lib/citation";
   import type { Reveal } from "../lib/app.svelte";
   import { headingLinkPlugin } from "./markdown/headingLink";
-  import { wikiLinkPlugin } from "./markdown/wikiLinks";
+  import { wikiLinkPlugin, type LinkClick } from "./markdown/wikiLinks";
   import { tableContextMenu } from "./markdown/tableMenu";
   import { tableFullWidthPlugins } from "./markdown/tableFullWidth";
   import { addTocMenuItem, tocPlugins } from "./markdown/toc";
@@ -52,13 +52,16 @@
     initial,
     onchange,
     reveal = null,
-    onwikilink,
+    onlink,
+    isRepo = () => false,
   }: {
     initial: string;
     onchange: (markdown: string) => void;
     reveal?: Reveal | null;
-    /** A `[[wiki link]]` was clicked: its target, as written. */
-    onwikilink?: (target: string) => void;
+    /** A link was clicked: follow it and say whether it was followed. */
+    onlink?: (link: LinkClick) => boolean;
+    /** Whether a name in code is one of the workspace's repos. */
+    isRepo?: (name: string) => boolean;
   } = $props();
 
   // A clicked citation: scroll to its heading, or to the block its source
@@ -337,7 +340,7 @@
     crepe.editor.use(slashShortcutKeys);
     crepe.editor.use(anchorLinkPlugin);
     crepe.editor.use(headingLinkPlugin);
-    crepe.editor.use(wikiLinkPlugin((target) => onwikilink?.(target)));
+    crepe.editor.use(wikiLinkPlugin((link) => onlink?.(link) ?? false, (name) => isRepo(name)));
     // After the GFM preset: the table schema extension replaces the preset's
     // own `table` node, so it has to be registered last.
     crepe.editor.use(tableFullWidthPlugins);
@@ -411,7 +414,8 @@
     --crepe-color-on-secondary: var(--ink);
     --crepe-color-inverse: var(--ink);
     --crepe-color-on-inverse: var(--paper);
-    --crepe-color-inline-code: var(--accent-deep);
+    /* Code in ink, links in the accent: the two never look alike. */
+    --crepe-color-inline-code: var(--ink-2);
     --crepe-color-error: var(--danger);
     --crepe-color-hover: var(--sunken);
     --crepe-color-selected: var(--selection-bg);

@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { linkAt, resolveWikiLink } from "./wikiLinks";
+import { linkAt, resolveRelativeHref, resolveWikiLink } from "./wikiLinks";
+
+describe("relative links", () => {
+  it("resolve from the linking page's folder", () => {
+    expect(resolveRelativeHref("../Current/Team.md#roles", "Ways-of-Working/Lifecycle.md")).toBe("Current/Team.md");
+    expect(resolveRelativeHref("Team.md", "Current/Index.md")).toBe("Current/Team.md");
+    expect(resolveRelativeHref("./Who%20Does%20What.md", "Current/Index.md")).toBe("Current/Who Does What.md");
+    expect(resolveRelativeHref("/START-HERE.md", "Current/Index.md")).toBe("START-HERE.md");
+    expect(resolveRelativeHref("https://example.com/x", "a.md")).toBeNull();
+    expect(resolveRelativeHref("mailto:a@b.c", "a.md")).toBeNull();
+  });
+});
 
 const files = [
   "START-HERE.md",

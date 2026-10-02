@@ -1,7 +1,9 @@
 /**
- * `[[Wiki links]]` in the Markdown editor: shown as links, and a click opens
- * the page. The editor keeps them as text (Milkdown has no wiki-link node),
- * so a decoration marks each one and a click on it is resolved to a file.
+ * Links in the Markdown editor that Milkdown leaves inert: `[[wiki links]]`
+ * (text to it), ordinary links to other pages or the web, and a repo's name
+ * in code (`AUR-Team`) in a page that lists the team's repos. Each is shown
+ * as a link and a click follows it. Clicks are taken on the DOM event, as
+ * the heading links are, before the editor places its cursor.
  */
 import { Plugin, PluginKey } from "@milkdown/kit/prose/state";
 import { Decoration, DecorationSet } from "@milkdown/kit/prose/view";
@@ -39,6 +41,21 @@ export function resolveWikiLink(target: string, fromPath: string, files: string[
   );
 }
 
+/** A relative link (`../Current/Team.md#roles`, `Team.md`) as a path in
+ *  the repo, from the linking page's folder; null for a web or mail link. */
+export function resolveRelativeHref(href: string, fromPath: string): string | null {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
+  const path = decodeURIComponent(href.split("#")[0].split("?")[0]).replace(/\\/g, "/");
+  if (!path) return null;
+  const parts = path.startsWith("/") ? [] : fromPath.split("/").slice(0, -1);
+  for (const p of path.replace(/^\//, "").split("/")) {
+    if (p === "" || p === ".") continue;
+    if (p === "..") parts.pop();
+    else parts.push(p);
+  }
+  return parts.join("/") || null;
+}
+
 /** The link at offset `at` of `text`, if one covers it. */
 export function linkAt(text: string, at: number): string | null {
   for (const m of text.matchAll(LINK)) {
@@ -48,10 +65,16 @@ export function linkAt(text: string, at: number): string | null {
   return null;
 }
 
+export type LinkClick =
+  | { kind: "wiki"; target: string }
+  | { kind: "href"; href: string }
+  | { kind: "repo"; name: string };
+
 const key = new PluginKey("ken-wiki-links");
 
-/** The plugin: `open` gets the link's target when one is clicked. */
-export function wikiLinkPlugin(open: (target: string) => void) {
+/** The plugin. `open` follows a link and says whether it did; `isRepo`
+ *  says whether a name in code is one of the workspace's repos. */
+export function wikiLinkPlugin(open: (link: LinkClick) => boolean, isRepo: (name: string) => boolean) {
   return $prose(
     () =>
       new Plugin({
@@ -65,22 +88,40 @@ export function wikiLinkPlugin(open: (target: string) => void) {
                 const from = pos + (m.index ?? 0);
                 decos.push(Decoration.inline(from, from + m[0].length, { class: "ken-wikilink", "data-target": m[1] }));
               }
+              const inCode = node.marks.some((mk) => /code/i.test(mk.type.name));
+              if (inCode && isRepo(node.text.trim())) {
+                decos.push(Decoration.inline(pos, pos + node.text.length, { class: "ken-repolink", "data-repo": node.text.trim() }));
+              }
             });
             return DecorationSet.create(state.doc, decos);
           },
-          handleClick(view, pos, event) {
-            const el = event.target as HTMLElement | null;
-            const marked = el?.closest?.(".ken-wikilink") as HTMLElement | null;
-            let target = marked?.dataset.target ?? null;
-            if (!target) {
-              const $pos = view.state.doc.resolve(pos);
-              const node = $pos.parent.child($pos.index());
-              if (node?.isText && node.text) target = linkAt(node.text, $pos.textOffset);
-            }
-            if (!target) return false;
-            event.preventDefault();
-            open(target);
-            return true;
+          handleDOMEvents: {
+            click: (view, event) => {
+              if (event.button !== 0) return false;
+              const el = event.target as HTMLElement | null;
+              let link: LinkClick | null = null;
+              const wiki = el?.closest?.(".ken-wikilink") as HTMLElement | null;
+              const repo = el?.closest?.(".ken-repolink") as HTMLElement | null;
+              const anchor = el?.closest?.("a") as HTMLAnchorElement | null;
+              const href = anchor?.getAttribute("href") ?? "";
+              if (wiki?.dataset.target) link = { kind: "wiki", target: wiki.dataset.target };
+              else if (repo?.dataset.repo) link = { kind: "repo", name: repo.dataset.repo };
+              else if (anchor && href && !href.startsWith("#")) link = { kind: "href", href };
+              else {
+                // The text under the pointer, should the decoration's own
+                // element not be the click's target.
+                const at = view.posAtCoords({ left: event.clientX, top: event.clientY });
+                if (at) {
+                  const $pos = view.state.doc.resolve(at.pos);
+                  const node = $pos.parent.maybeChild($pos.index());
+                  const target = node?.isText && node.text ? linkAt(node.text, $pos.textOffset) : null;
+                  if (target) link = { kind: "wiki", target };
+                }
+              }
+              if (!link || !open(link)) return false;
+              event.preventDefault();
+              return true;
+            },
           },
         },
       }),

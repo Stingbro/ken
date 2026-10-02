@@ -25,7 +25,8 @@
   import { isHtmlPath } from "./previews/html";
   import { shortcut } from "../lib/platform";
   import { toast } from "../lib/toast.svelte";
-  import { resolveWikiLink } from "./markdown/wikiLinks";
+  import { resolveRelativeHref, resolveWikiLink, type LinkClick } from "./markdown/wikiLinks";
+  import { memberLeaf } from "../lib/api";
 
   let { relPath }: { relPath: string } = $props();
 
@@ -261,6 +262,38 @@
   let savedCount = $state(0);
 
   /** A `[[link]]` in the page: open the page it names, in this repo. */
+  /** The workspace's repos by folder name, for repo names in code. */
+  function repoNamed(name: string) {
+    const n = name.toLowerCase();
+    return app.members.find((m) => !!m.id && memberLeaf(m.name).toLowerCase() === n) ?? null;
+  }
+
+  /** Follow a link in the page: a [[page]], a page or web address, or a
+   *  repo's name (opens that repo in Files). */
+  function openLink(link: LinkClick): boolean {
+    if (link.kind === "wiki") {
+      void openWikiLink(link.target);
+      return true;
+    }
+    if (link.kind === "repo") {
+      const m = repoNamed(link.name);
+      if (!m?.id) return false;
+      void app.focusMember(m.id, { stay: true });
+      return true;
+    }
+    const href = link.href;
+    if (/^(https?:|mailto:)/i.test(href)) {
+      void api.openWebUrl(href).catch((e) => toast.error("Could not open the link", e));
+      return true;
+    }
+    if (href.startsWith("ken://")) return false;
+    const page = resolveRelativeHref(href, relPath);
+    if (!page) return false;
+    if (app.files.some((f) => f.relPath === page)) app.openTab(page, true);
+    else toast.show(`No file at ${page} in this repo.`);
+    return true;
+  }
+
   async function openWikiLink(target: string) {
     // The index knows aliases (a page's frontmatter names it too); the file
     // list covers a page indexed a moment ago.
@@ -469,7 +502,13 @@
           onchange={onEdit}
         />
       {:else if mode === "wysiwyg" && meta?.kind === "md"}
-        <MarkdownEditor initial={content} onchange={onEdit} reveal={revealHere} onwikilink={openWikiLink} />
+        <MarkdownEditor
+          initial={content}
+          onchange={onEdit}
+          reveal={revealHere}
+          onlink={openLink}
+          isRepo={(name) => !!repoNamed(name)}
+        />
       {:else}
         <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} />
       {/if}

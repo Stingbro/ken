@@ -691,7 +691,9 @@ option {
   height: 0;
 }
 
-/* A [[wiki link]] in the Markdown editor (a decoration, so global). */
+/* A [[wiki link]], or a repo's name in code, in the Markdown editor
+   (decorations, so global). Only links take the accent; code is ink. */
+.ken-repolink,
 .ken-wikilink {
   color: var(--accent-ink);
   text-decoration: underline;
