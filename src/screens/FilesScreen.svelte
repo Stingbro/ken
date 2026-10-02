@@ -224,7 +224,7 @@
 
     {#if app.activeTab}
       <div class="open">
-        {#key app.activeTab}
+        {#key `${app.focused}:${app.activeTab}`}
           <EditorPane relPath={app.activeTab} />
         {/key}
         {#if ticket}

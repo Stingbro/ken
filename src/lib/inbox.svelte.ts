@@ -131,7 +131,23 @@ export function proposalItem(p: IngestProposal, cardId: number, note: string, pr
 export function findingItem(f: TeamFinding & { itemId?: number | null }, i: number): InboxItem {
   const k = f.kind;
   const kind =
-    k === "broken-link" || k === "links" ? "Broken link" : k === "aged" ? "Not checked lately" : k === "draft" || k === "wiki-draft" ? "First draft" : k === "proposal" ? "Proposal" : "Out of date";
+    k === "broken-link" || k === "links"
+      ? "Broken link"
+      : k === "missing-page"
+        ? "Missing page"
+        : k === "ambiguous-name"
+          ? "Unclear link"
+          : k === "aged"
+            ? "Not checked lately"
+            : k === "draft" || k === "wiki-draft"
+              ? "First draft"
+              : k === "proposal"
+                ? "Proposal"
+                : k === "draft-failed"
+                  ? "Couldn't draft"
+                  : k === "repo-removed"
+                    ? "Repo left the team"
+                    : "Out of date";
   return {
     id: `finding:${f.itemId ?? `${k}:${f.projectId ?? ""}:${f.path ?? i}:${f.title}`}`,
     group: "ken",
@@ -183,6 +199,8 @@ export function sortInbox(items: InboxItem[]): InboxItem[] {
 class InboxStore {
   /** Waiting items from the backend reads (ingest waits, findings). */
   private ken = $state<InboxItem[]>([]);
+  /** The wiki's findings, read apart: the read runs git in every repo. */
+  private findings = $state<InboxItem[]>([]);
   /** The library's Raw sources from the last read: what Ingest is doing. */
   raw = $state<RawSource[]>([]);
   loading = $state(false);
@@ -216,7 +234,7 @@ class InboxStore {
           source: { type: "chat", chatId: r.id, title: r.title },
         }),
       );
-    return uniqueIds(sortInbox([...people, ...this.ken, ...asks, ...sync])).filter((i) => !doneIds.has(i.id));
+    return uniqueIds(sortInbox([...people, ...this.ken, ...this.findings, ...asks, ...sync])).filter((i) => !doneIds.has(i.id));
   }
 
   get count(): number {
@@ -237,18 +255,35 @@ class InboxStore {
     if (this.subscribed) return;
     this.subscribed = true;
     void families.init();
-    await api.onReviewChanged(() => this.queue());
-    // Indexing moves little here (a source's state), and the read runs git
-    // in each repo: read at most every few seconds while it goes on.
+    await api.onReviewChanged(() => {
+      this.queue();
+      void this.refreshFindings();
+    });
+    // Indexing moves a source's state here, at most every few seconds; the
+    // findings (git in every repo) are not read for it.
     await api.onIndexUpdated(() => this.queue(INDEX_DEBOUNCE_MS));
     $effect.root(() => {
       $effect(() => {
         void scope.team;
         void app.workspace?.id;
         this.queue(0);
+        void this.refreshFindings();
       });
     });
   }
+
+  /** The wiki's findings (broken links, drafts, proposals). */
+  readonly refreshFindings = singleFlight(async () => {
+    if (!app.workspace) {
+      this.findings = [];
+      return;
+    }
+    const team = scope.team;
+    const ws = app.workspace.id;
+    const o = await api.teamOverview(team).catch(() => null);
+    if (!o || team !== scope.team || ws !== app.workspace?.id) return;
+    this.findings = (o.findings ?? []).map((f, i) => findingItem(f, i));
+  });
 
   readonly queue = coalesce(() => void this.refresh(), DEBOUNCE_MS);
 
@@ -279,8 +314,6 @@ class InboxStore {
           for (const p of card.proposals) out.push(proposalItem(p, card.id, card.note, overview.projectId));
         }
       }
-      const team_ = await api.teamOverview(team).catch(() => null);
-      if (team_?.findings) team_.findings.forEach((f, i) => out.push(findingItem(f, i)));
       if (team === scope.team && ws === app.workspace?.id) this.ken = out;
     } finally {
       this.loading = false;
@@ -291,6 +324,7 @@ class InboxStore {
   resolved(item: InboxItem) {
     this.done = [item, ...this.done.filter((d) => d.id !== item.id)].slice(0, 30);
     this.ken = this.ken.filter((k) => k.id !== item.id);
+    this.findings = this.findings.filter((k) => k.id !== item.id);
   }
 
   select(id: string | null) {

@@ -174,6 +174,8 @@ export interface IngestOverview {
   claudeFound: boolean;
   /** Sources with something waiting: the Ingest tab's count. */
   waiting: number;
+  /** Why the last read stopped before the end, until the next starts. */
+  stopped: string | null;
 }
 
 /** A note's key takeaways. */
@@ -1451,6 +1453,9 @@ export const api = {
   /** A team wiki from the bundled template, in a new or empty folder. */
   setupCreateWiki: (dir: string, team: string, repos: { name: string; description: string }[], taken: string[]) =>
     invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken }),
+  /** Set-up's "Create a team repo": the method's team template at `dir`. */
+  setupCreateTeamRepo: (dir: string, team: string, wiki: string | null, taken: string[]) =>
+    invoke<SetupRepoRow>("setup_create_team_repo", { dir, team, wiki, taken }),
   /** Apply a proposed page change; returns the page written. */
   applyPageProposal: (itemId: number, projectId: string | null = null) =>
     invoke<string>("apply_page_proposal", { itemId, projectId }),
@@ -2029,16 +2034,21 @@ export const api = {
   teamDigest: (team: string | null) => invoke<TeamDigest | null>("team_digest", { team }),
   /** Write the team digest now. Outcome arrives on the team-digest events. */
   refreshTeamDigest: (team: string | null) => invoke<void>("refresh_team_digest", { team }),
+  /** Whether the team's digest is being written or waits its turn. */
+  teamDigestWriting: (team: string | null) => invoke<boolean>("team_digest_writing", { team }),
   /** Repos indexed, files queued and failed, across the team. */
   indexHealth: (team: string | null) => invoke<IndexHealth>("index_health", { team }),
   /** A task file, ticket file or team inbox changed. */
   onDayChanged: (fn: () => void): Promise<UnlistenFn> => listen<null>("day-changed", () => fn()),
   onTeamDigestUpdated: (fn: (digest: TeamDigest) => void): Promise<UnlistenFn> =>
     listen<TeamDigest>("team-digest-updated", (e) => fn(e.payload)),
-  onTeamDigestGenerating: (fn: () => void): Promise<UnlistenFn> =>
-    listen<null>("team-digest-generating", () => fn()),
-  onTeamDigestError: (fn: (message: string) => void): Promise<UnlistenFn> =>
-    listen<string>("team-digest-error", (e) => fn(e.payload)),
+  /** A team's digest was asked for: it is being written or waits its turn. */
+  onTeamDigestGenerating: (fn: (team: string | null) => void): Promise<UnlistenFn> =>
+    listen<{ team: string | null }>("team-digest-generating", (e) => fn(e.payload?.team ?? null)),
+  onTeamDigestError: (fn: (team: string | null, message: string) => void): Promise<UnlistenFn> =>
+    listen<{ team: string | null; message: string | null }>("team-digest-error", (e) =>
+      fn(e.payload?.team ?? null, e.payload?.message ?? ""),
+    ),
 
   // ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
   /** Scaffold + commit a brand-new family repo whose remote is `remoteUrl`

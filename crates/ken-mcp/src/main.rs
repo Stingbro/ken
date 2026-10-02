@@ -2520,15 +2520,27 @@ fn kg_root(server: &Server) -> PathBuf {
 /// does. A search with no project named stays inside the workspace the person
 /// has open, so another client's files are never found or cited.
 fn in_open_workspace(server: &Server, registry: &Registry) -> impl Fn(&std::path::Path) -> bool {
-    let root = registry
-        .last_workspace
-        .and_then(|id| registry.workspaces.iter().find(|w| w.id == id))
-        .map(|w| norm_path(&w.path));
+    let ws = registry.last_workspace.and_then(|id| registry.workspaces.iter().find(|w| w.id == id));
+    let root = ws.map(|w| norm_path(&w.path));
+    // A workspace set up from picked repos lives in Ken's app data and its
+    // repos anywhere: its members count as inside it.
+    let members: Vec<String> = ws
+        .and_then(|w| ken_core::workspace::Workspace::open(&w.path).ok())
+        .map(|o| {
+            o.members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some(norm_path(&p.root)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let _ = server;
     move |path: &std::path::Path| match &root {
         Some(r) => {
             let p = norm_path(path);
-            p == *r || p.starts_with(&format!("{r}/"))
+            p == *r || p.starts_with(&format!("{r}/")) || members.iter().any(|m| p == *m || p.starts_with(&format!("{m}/")))
         }
         None => true,
     }

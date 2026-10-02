@@ -159,13 +159,17 @@ pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<
         let text = text.replace("\r\n", "\n");
         fs::write(&dest, fill(path, &text, team, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
     }
+    git_commit_all(dir, &format!("Start the {team} wiki from the Ways-of-Working template"))
+}
+
+/// `git init` in `dir` and one commit of everything in it. The person's own
+/// git identity when they have one; Ken's otherwise, so a machine with no
+/// identity set can still make the first commit.
+pub(crate) fn git_commit_all(dir: &Path, msg: &str) -> Result<()> {
     git(dir, &["init", "-q"])?;
     git(dir, &["add", "-A"])?;
-    // The person's own git identity when they have one; Ken's otherwise, so
-    // a machine with no identity set can still make the first commit.
-    let msg = format!("Start the {team} wiki from the Ways-of-Working template");
-    if git(dir, &["commit", "-q", "-m", &msg]).is_err() {
-        git(dir, &["-c", "user.name=Ken", "-c", "user.email=ken@localhost", "commit", "-q", "-m", &msg])?;
+    if git(dir, &["commit", "-q", "-m", msg]).is_err() {
+        git(dir, &["-c", "user.name=Ken", "-c", "user.email=ken@localhost", "commit", "-q", "-m", msg])?;
     }
     Ok(())
 }

@@ -12,12 +12,14 @@ vi.mock("./api", () => ({
     onTeamDigestGenerating: vi.fn(async () => {}),
     onTeamDigestUpdated: vi.fn(async () => {}),
     onTeamDigestError: vi.fn(async () => {}),
+    onKnowledgeModelState: vi.fn(async () => {}),
     onIndexUpdated: vi.fn(async (cb: () => void) => {
       listeners.indexUpdated = cb;
     }),
     claudeDoctor: vi.fn(async () => ({ found: true })),
     dayState: vi.fn(async () => ({ tickets: [], tasks: [], me: { name: null, email: null }, hasTickets: false })),
     teamDigest: vi.fn(async () => null),
+    teamDigestWriting: vi.fn(async () => false),
     indexHealth: vi.fn(async () => ({ indexed: 0, total: 0, queued: 0, failed: 0 })),
     dayTaskUpdate: vi.fn(),
     ticketTasks: vi.fn(async () => []),

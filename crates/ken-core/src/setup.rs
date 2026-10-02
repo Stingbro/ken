@@ -675,6 +675,25 @@ pub fn create_wiki(dir: &Path, team: &str, repos: &[crate::wikinew::Covered], ta
     Ok(row)
 }
 
+/// Create a team's team repo at `dir` from the bundled template (see
+/// [`crate::teamnew`]) and return its set-up row: a team repo on `team`,
+/// read for entities. `wiki` is the team wiki's name, when it has one.
+pub fn create_team_repo(dir: &Path, team: &str, wiki: Option<&str>, taken: &[String]) -> Result<RepoRow> {
+    crate::teamnew::create(dir, team, wiki)?;
+    let mut row = propose_repos(&[dir.to_path_buf()], taken)?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
+    row.include = true;
+    row.kind = vec![RepoKind::Team];
+    row.team = Some(team.to_string());
+    row.index = IndexState::Entities;
+    row.description = format!("The {team} team's tickets, decisions, ideas and people.");
+    row.evidence.insert(0, "created at set-up from the Ways-of-Working template".into());
+    Ok(row)
+}
+
 /// Where a workspace of picked repos lives: Ken's app data.
 pub fn workspaces_dir(base: &Path) -> PathBuf {
     base.join("workspaces")

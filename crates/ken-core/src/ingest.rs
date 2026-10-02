@@ -532,6 +532,29 @@ pub fn card_body(note: &str, placement: &Placement) -> String {
     s
 }
 
+/// The most of a source's text one read sends (about 100k tokens). Claude
+/// Code refuses a prompt past its window outright, so a longer source is
+/// read from its start, and the note says so.
+pub const MAX_SOURCE_CHARS: usize = 400_000;
+
+/// `text` within [`MAX_SOURCE_CHARS`], cut at a line where it can be.
+pub fn cap_source(text: String) -> String {
+    if text.len() <= MAX_SOURCE_CHARS {
+        return text;
+    }
+    let mut end = MAX_SOURCE_CHARS;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = text[..end].rfind('\n').filter(|n| *n > end / 2).unwrap_or(end);
+    format!(
+        "{}\n\n[Ken sent the first {} of {} characters of this source. Say in the note's Summary that it covers the start of the source only.]",
+        &text[..cut],
+        cut,
+        text.len()
+    )
+}
+
 /// Part one: read one new source, write its note into its organized home and
 /// file the Review card. The source stays in `Raw/` until [`file`].
 /// `generate` turns the prompt into the note.
@@ -548,6 +571,7 @@ pub fn ingest_one(
     if text.trim().is_empty() {
         return Err(Error::Other(format!("{raw} has no text Ken can read (a recording needs its transcript first)")));
     }
+    let text = cap_source(text);
     let template = note_template(root);
     let declared = declared_kind(&text);
     let mut ask = prompt_against(&template, raw, &text, date, &wiki_context(db, &text));
@@ -1925,6 +1949,18 @@ pub fn card_of(payload: Option<&str>) -> Option<Card> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_source_is_cut_at_a_line_and_says_so() {
+        let short = "one line\n".to_string();
+        assert_eq!(cap_source(short.clone()), short);
+        let long = "ä line of words\n".repeat(MAX_SOURCE_CHARS / 8);
+        let got = cap_source(long.clone());
+        assert!(got.len() < MAX_SOURCE_CHARS + 300);
+        assert!(got.contains("covers the start of the source only"));
+        let body = got.split("\n\n[Ken sent").next().unwrap();
+        assert!(body.ends_with("ä line of words"), "cut at a line");
+    }
 
     fn library() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();

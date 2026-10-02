@@ -47,6 +47,8 @@
 
   let overview = $state<IngestOverview | null>(null);
   let error = $state<string | null>(null);
+  /** Why the list could not be read; kept apart from an action's error. */
+  let loadError = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let selected = $state<number | null>(null);
   let card = $state<IngestCard | null>(null);
@@ -174,13 +176,19 @@
       if (t !== team) return;
       overview = next;
       rail.setIngest(next.waiting ?? 0);
-      error = null;
-      // The newest read source is shown until the person picks another.
-      if (selected === null) {
+      loadError = null;
+      if (selectedRaw) {
+        // A source picked while it is read stays picked; once it has its
+        // card, the card is shown.
+        const r = next.raw.find((x) => x.path === selectedRaw);
+        if (r?.cardId != null) selectCard(r.cardId);
+        else if (!r) selectedRaw = null;
+      } else if (selected === null) {
+        // The newest read source is shown until the person picks another.
         selected = next.raw.find((r) => r.cardId !== null)?.cardId ?? next.ingested[0]?.id ?? null;
       }
     } catch (e) {
-      error = String(e);
+      loadError = String(e);
     }
   });
 
@@ -421,7 +429,7 @@
       error = String(e);
     } finally {
       busy = null;
-      await refresh();
+      await reload();
     }
   }
 
@@ -431,7 +439,9 @@
     try {
       const started = await api.ingestReadAgain(card.id, team);
       notice = started ? "Reading it again." : "It is read on the next pass.";
+      const source = card.source;
       selected = null;
+      selectedRaw = source;
     } catch (e) {
       error = String(e);
     } finally {
@@ -516,6 +526,8 @@
     {#if adding > 0}<p class="note">Adding {adding} {adding === 1 ? "file" : "files"}…</p>{/if}
     {#if error}<p class="warn">{error}</p>{/if}
     {#if notice}<p class="note">{notice}</p>{/if}
+    {#if loadError}<p class="warn">{loadError}</p>{/if}
+    {#if overview?.stopped}<p class="warn">The last read stopped: {overview.stopped}</p>{/if}
     {#if overview && !overview.claudeFound}
       <p class="warn">Reading needs Claude Code. {claudeInstallHelp()}</p>
     {/if}

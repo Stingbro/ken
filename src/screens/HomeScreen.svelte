@@ -82,7 +82,9 @@
     if (c.projectId) void openInRepo(c.projectId, c.path, where);
     else void openMemberPath(c.path, where);
   }
-  const indexing = $derived((day.health?.queued ?? 0) > 0);
+  // Files still being indexed. `queued` is the files the knowledge map has
+  // not read yet: Claude's map build reads them, so they are not indexing.
+  const indexing = $derived(app.scanning);
 
   // ── Your list ─────────────────────────────────────────────────────
 
@@ -151,7 +153,7 @@
     const h = day.health;
     if (!h) return "";
     const parts = [h.indexed >= h.total ? `All ${h.total} ${h.total === 1 ? "folder" : "folders"} indexed` : `${h.indexed} of ${h.total} folders indexed`];
-    if (h.queued > 0) parts.push(`${h.queued} queued`);
+    if (h.queued > 0) parts.push(`${h.queued} not in the map yet`);
     return parts.join(" · ");
   });
 </script>
@@ -208,6 +210,8 @@
       <div class="rows">
         {#if !day.state && !day.loadError}
           <Loading label="Reading your list…" lines={3} />
+        {:else if !day.state && day.loadError}
+          <p class="t-small err">Your list could not be read: {day.loadError}</p>
         {/if}
         {#each day.tickets as t (t.projectId + ":" + t.relPath)}
           <button class="row" title="{t.repo}/{t.relPath}" onclick={() => void openInRepo(t.projectId, t.relPath)}>

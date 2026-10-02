@@ -252,14 +252,21 @@
     saveTimer = setTimeout(() => void doSave(), 800);
   }
 
+  // The repo this file was opened in. A save goes to the focused repo, so
+  // once focus moves (the Files menu, a citation) this pane saves nothing:
+  // two repos can hold the same path (every wiki has START-HERE.md).
+  const owner = app.focused;
+
   async function doSave() {
     if (!dirty || diskChanged) return;
+    if (app.focused !== owner) return;
     try {
       knownMtime = await api.saveFile(relPath, latest);
       dirty = false;
       savedAt = Date.now();
+      saveError = null;
     } catch (e) {
-      loadError = `Couldn't save: ${e}`;
+      saveError = `Couldn't save: ${e}`;
     }
   }
 

@@ -286,9 +286,16 @@ pub fn report(db: &Db) -> Result<LinkReport> {
     let resolver = Resolver::from_db(db)?;
     let mut r = LinkReport::default();
     let mut missing: HashMap<String, Vec<String>> = HashMap::new();
+    // The names links use: two pages sharing a file name (every section's
+    // Index.md) only matter when a link names it.
+    let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (from, link) in db.all_page_links()? {
         match link.kind {
-            LinkKind::Name => r.name_links += 1,
+            LinkKind::Name => {
+                r.name_links += 1;
+                let key = link.target.trim().to_lowercase();
+                named.insert(key.strip_suffix(".md").unwrap_or(&key).to_string());
+            }
             LinkKind::Path => r.path_links += 1,
         }
         if !resolver.resolve(&link).is_empty() {
@@ -305,7 +312,7 @@ pub fn report(db: &Db) -> Result<LinkReport> {
     let mut missing: Vec<(String, Vec<String>)> = missing.into_iter().collect();
     missing.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
     r.missing_names = missing;
-    r.duplicate_names = resolver.duplicate_names();
+    r.duplicate_names = resolver.duplicate_names().into_iter().filter(|(n, _)| named.contains(n)).collect();
     Ok(r)
 }
 

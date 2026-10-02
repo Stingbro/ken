@@ -91,21 +91,29 @@ class DayStore {
     if (this.initDone) return;
     this.initDone = true;
     await api.onDayChanged(() => this.queueRefresh({ state: true }));
-    // The event does not say which team it is for, so it does not set
-    // `generating`; `writeDigest` does, for the run it starts.
-    await api.onTeamDigestGenerating(() => {});
+    // Whoever started it (the morning schedule, opening the workspace, the
+    // button), a digest for this team shows as being written.
+    await api.onTeamDigestGenerating((team) => {
+      if (team === this.team) {
+        this.generating = true;
+        this.digestError = null;
+      }
+    });
     await api.onTeamDigestUpdated(() => {
-      this.generating = false;
-      this.digestError = null;
       // The event carries a digest but not which team it was for; read
       // ours back rather than show another team's.
       void this.refreshDigest();
     });
-    await api.onTeamDigestError((message) => {
+    await api.onTeamDigestError((team, message) => {
+      if (team !== this.team) return;
       this.generating = false;
       this.digestError = message;
     });
     await api.onIndexUpdated(() => this.queueRefresh({ state: true, health: true }));
+    // A map build reads the files waiting for it: the count on Home drops.
+    await api.onKnowledgeModelState((ev) => {
+      if (ev.state !== "building") this.queueRefresh({ health: true });
+    });
     // A change of team (or workspace) reads everything again.
     $effect.root(() => {
       $effect(() => {
@@ -188,8 +196,13 @@ class DayStore {
     }
     const team = this.team;
     const ws = app.workspace.id;
-    const d = await api.teamDigest(team).catch(() => null);
-    if (team === this.team && ws === app.workspace?.id) this.digest = d;
+    const [d, writing] = await Promise.all([
+      api.teamDigest(team).catch(() => null),
+      api.teamDigestWriting(team).catch(() => false),
+    ]);
+    if (team !== this.team || ws !== app.workspace?.id) return;
+    this.digest = d;
+    this.generating = writing;
   });
 
   readonly refreshHealth = singleFlight(async () => {

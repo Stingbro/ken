@@ -147,6 +147,25 @@ pub fn oneshot(
     run_oneshot(binary, project_root, prompt, timeout, cancel, &["--permission-mode".into(), "acceptEdits".into()])
 }
 
+/// [`oneshot`] that may also read `dirs`. Claude Code reads nothing outside
+/// the folder it runs from unless told, and a workspace's repos can sit
+/// anywhere (set-up keeps the workspace itself in Ken's app data).
+pub fn oneshot_in(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut args: Vec<String> = vec!["--permission-mode".into(), "acceptEdits".into()];
+    for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
+        args.push("--add-dir".into());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
 /// The tools a [`look`] may use: reading and searching, nothing that writes
 /// or runs.
 pub const LOOK_TOOLS: &str = "Read,Grep,Glob,LS";

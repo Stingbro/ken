@@ -25,14 +25,20 @@
 
   let { width }: { width: number } = $props();
 
-  // Files is the team's wiki. A file opened from another repo (a search hit,
-  // a citation) shows that repo here, with one line back to the wiki.
-  const wiki = $derived(scope.wikiId ? app.members.find((m) => m.id === scope.wikiId) : undefined);
-  const elsewhere = $derived(
-    !!app.workspace && !!wiki && !!app.focused && app.focused !== wiki.id
-      ? app.members.find((m) => m.id === app.focused)
-      : undefined,
-  );
+  // Files opens on the team's wiki; the menu above the tree shows any of
+  // the team's repos. A file opened from another repo (a search hit, a
+  // citation) shows that repo here. Choosing one stays on Files.
+  const teamRepos = $derived.by(() => {
+    const ids = scope.groups.find((g) => g.name === scope.team)?.projectIds ?? null;
+    return app.members
+      .filter((m): m is typeof m & { id: string } => !!m.id && (m.status === "active" || m.status === "dormant"))
+      .filter((m) => ids === null || ids.includes(m.id))
+      .sort((a, b) => (a.id === scope.wikiId ? -1 : b.id === scope.wikiId ? 1 : a.name.localeCompare(b.name)));
+  });
+
+  function showRepo(id: string) {
+    if (id && id !== app.focused) void app.focusMember(id, { stay: true });
+  }
 
   const unreadOnly = $derived(app.filesFilter === "unread");
   const markAllEnabled = $derived(isMarkAllEnabled(app.unread.length));
@@ -126,12 +132,17 @@
 </script>
 
 <div class="tree" style:width="{width}px">
-  {#if elsewhere && wiki}
-    <div class="elsewhere">
-      <span class="where" title={elsewhere.name}>{memberLeaf(elsewhere.name)}</span>
-      <button class="back" onclick={() => wiki.id && void app.focusMember(wiki.id)}>
-        Back to {memberLeaf(wiki.name)}
-      </button>
+  {#if app.workspace && teamRepos.length > 1}
+    <div class="repo-pick">
+      <select
+        aria-label="Repo shown in Files"
+        value={app.focused ?? ""}
+        onchange={(e) => showRepo((e.currentTarget as HTMLSelectElement).value)}
+      >
+        {#each teamRepos as m (m.id)}
+          <option value={m.id}>{memberLeaf(m.name)}{m.id === scope.wikiId ? " · wiki" : ""}</option>
+        {/each}
+      </select>
     </div>
   {/if}
   {#if app.favorites.length > 0}
@@ -442,35 +453,11 @@
     padding: 2px;
     flex: none;
   }
-  .elsewhere {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+  .repo-pick {
     margin: 0 8px 8px;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    font-size: 12px;
   }
-  .where {
-    flex: 1;
-    min-width: 0;
+  .repo-pick select {
+    width: 100%;
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .back {
-    border: none;
-    background: transparent;
-    padding: 0;
-    font: inherit;
-    font-size: 12px;
-    color: var(--accent);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .back:hover {
-    color: var(--accent-hover);
   }
 </style>

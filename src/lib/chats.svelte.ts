@@ -49,7 +49,13 @@ class ChatsStore {
     return this.rows;
   }
 
+  private listening = false;
+
+  /** The drawer calls this each time it opens: the listeners are added
+   *  once (twice would stream every reply twice), the list read each time. */
   async init() {
+    if (this.listening) return this.refresh();
+    this.listening = true;
     await api.onChatUpdated((row) => {
       if (!forFocused(row.project_id)) return;
       const i = this.rows.findIndex((r) => r.id === row.id);

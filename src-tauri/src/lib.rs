@@ -2115,6 +2115,27 @@ fn open_workspace_inner(
             task_watch: None,
         });
         guard.focused = resident_lru.last().copied();
+        // The members were activated before the workspace was installed, so
+        // their chats could not be given the other repos then: every repo
+        // of the workspace is readable from any of its chats.
+        let roots: Vec<PathBuf> = guard
+            .workspace
+            .as_ref()
+            .map(|w| {
+                w.ws.members
+                    .iter()
+                    .filter_map(|m| match &m.status {
+                        ken_core::workspace::MemberStatus::Ok(p) => Some(p.root.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for rt in guard.members.values() {
+            if let Some(engine) = rt.chat_engine.as_ref() {
+                engine.set_read_dirs(roots.clone());
+            }
+        }
     }
 
     // Your day's watcher: task files, ticket files and family inboxes, now
@@ -7055,11 +7076,16 @@ const LOCAL_GENERATION: bool = false;
 /// One prompt through Claude, from `root`; the error is for a person.
 fn claude_text(root: &Path, prompt: &str) -> Result<String, String> {
     let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
-    claude_generate(binary, root.to_path_buf())(prompt).map_err(|e| e.to_string())
+    claude_generate(binary, root.to_path_buf(), Vec::new())(prompt).map_err(|e| e.to_string())
 }
 
-fn claude_generate(binary: std::path::PathBuf, root: std::path::PathBuf) -> impl FnMut(&str) -> ken_core::Result<String> {
-    move |prompt: &str| match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
+/// Claude from `root`, also reading `dirs` (the team's repos a draft reads).
+fn claude_generate(
+    binary: std::path::PathBuf,
+    root: std::path::PathBuf,
+    dirs: Vec<std::path::PathBuf>,
+) -> impl FnMut(&str) -> ken_core::Result<String> {
+    move |prompt: &str| match ken_core::assistant::oneshot_in(&binary, &root, &dirs, prompt, Duration::from_secs(600), &CancelToken::new())? {
         ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
         ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
         ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
@@ -7087,7 +7113,8 @@ fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) ->
     let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
     std::thread::spawn(move || {
         let Ok(mut db) = Db::open(&base, wiki_id) else { return };
-        let generate = claude_generate(binary, wiki_root.clone());
+        let dirs = repos.iter().map(|(_, root)| root.clone()).collect();
+        let generate = claude_generate(binary, wiki_root.clone(), dirs);
         let extra = extra.as_deref().map(Path::new);
         if let Err(e) = ken_core::wikidraft::draft_team(
             &wiki_root,
@@ -7138,7 +7165,8 @@ fn wiki_add_repos(state: State<SharedState>, members: Vec<String>) -> CmdResult<
         let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
         std::thread::spawn(move || {
             let Ok(mut db) = Db::open(&base, id) else { return };
-            let generate = claude_generate(binary, root.clone());
+            let dirs = team.iter().map(|(_, root)| root.clone()).chain(added.iter().map(|(_, root)| root.clone())).collect();
+            let generate = claude_generate(binary, root.clone(), dirs);
             if let Err(e) = ken_core::wikidraft::draft_added(
                 &root,
                 &wiki_name,
@@ -7168,6 +7196,21 @@ async fn setup_create_wiki(
 ) -> CmdResult<ken_core::setup::RepoRow> {
     tauri::async_runtime::spawn_blocking(move || {
         ken_core::setup::create_wiki(Path::new(&dir), &team, &repos, &taken, &local_date_today()).map_err(err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Set-up's "Create a team repo": the method's team template at `dir`.
+#[tauri::command]
+async fn setup_create_team_repo(
+    dir: String,
+    team: String,
+    wiki: Option<String>,
+    taken: Vec<String>,
+) -> CmdResult<ken_core::setup::RepoRow> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ken_core::setup::create_team_repo(Path::new(&dir), &team, wiki.as_deref(), &taken).map_err(err)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -10290,6 +10333,12 @@ fn cached_git_me() -> ken_core::day::Me {
     }
 }
 
+/// The folder every one of `roots` sits directly in, when they share one.
+fn shared_parent(roots: &[PathBuf]) -> Option<PathBuf> {
+    let first = roots.first()?.parent()?.to_path_buf();
+    roots.iter().all(|r| r.parent() == Some(first.as_path())).then_some(first)
+}
+
 /// Lock a mutex even when a thread that held it panicked. Your day's
 /// state (the workspace handle, a search index connection) stays usable
 /// after a panic elsewhere, and a background thread must not die on it.
@@ -10560,6 +10609,14 @@ fn refresh_team_digest(app: AppHandle, state: State<SharedState>, team: Option<S
     generate_team_digests(&app, state.inner(), vec![team], true)
 }
 
+/// Whether `team`'s digest is being written, or waits its turn: Your day
+/// shows "Writing…" for one it did not start itself.
+#[tauri::command(async)]
+fn team_digest_writing(state: State<SharedState>, team: Option<String>) -> CmdResult<bool> {
+    let ws = lock_tolerant(&state).workspace.as_ref().map(|w| w.ws.config.id);
+    Ok(ws.is_some_and(|id| digest_writing(id, &team)))
+}
+
 /// The morning schedule's memory, per workspace, in app data
 /// (`team-digests/<workspace id>/schedule.json`): the team Your day last
 /// asked about (so a fresh launch writes that team's digest, not every
@@ -10672,6 +10729,8 @@ fn maybe_generate_team_digest(app: &AppHandle, state: &SharedState) {
 struct TeamDigestJob {
     team: Option<String>,
     repos: Vec<(String, ken_core::digest::DigestSources)>,
+    /// The repos' folders, for Claude to read.
+    roots: Vec<PathBuf>,
     mine: Vec<String>,
 }
 
@@ -10727,7 +10786,8 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
     for (t, _) in pending_inbox_tasks(&base_dir, &day_families(&ws, &settings)).iter().take(5) {
         mine.push(format!("{} sent a task: \"{}\"", t.from.as_deref().unwrap_or("a teammate"), t.title));
     }
-    Ok(TeamDigestJob { team, repos: out, mine })
+    let roots = repos.iter().map(|r| r.root.clone()).collect();
+    Ok(TeamDigestJob { team, repos: out, roots, mine })
 }
 
 /// Write the digest for each team, one after another, on one background
@@ -10735,6 +10795,26 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
 /// read across them. A quiet day stores the quiet line without calling it.
 /// Emits `team-digest-generating`, then `team-digest-updated` (the digest)
 /// or `team-digest-error` (a string) per team.
+/// The teams whose digest is being written or waits its turn, by
+/// workspace. The writer takes them in order; asking while it runs adds to
+/// the queue, and Your day reads it to show "Writing…" for its team.
+fn digest_queue() -> &'static Mutex<std::collections::HashMap<uuid::Uuid, std::collections::VecDeque<Option<String>>>> {
+    static Q: OnceLock<Mutex<std::collections::HashMap<uuid::Uuid, std::collections::VecDeque<Option<String>>>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Is `team`'s digest being written, or waiting to be, in workspace `ws`?
+fn digest_writing(ws: uuid::Uuid, team: &Option<String>) -> bool {
+    lock_tolerant(digest_queue()).get(&ws).is_some_and(|q| q.contains(team))
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TeamDigestEvent {
+    team: Option<String>,
+    message: Option<String>,
+}
+
 fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option<String>>, force: bool) -> CmdResult<()> {
     let (running, ws_root, ws_id, base_dir) = {
         let guard = lock_tolerant(state);
@@ -10745,8 +10825,19 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
     if binary.is_none() && force {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     }
+    {
+        let mut q = lock_tolerant(digest_queue());
+        let queue = q.entry(ws_id).or_default();
+        for t in teams {
+            if !queue.contains(&t) {
+                queue.push_back(t.clone());
+                let _ = app.emit("team-digest-generating", TeamDigestEvent { team: t, message: None });
+            }
+        }
+    }
     if running.swap(true, Ordering::SeqCst) {
-        return if force { Err("The digest is already being written.".into()) } else { Ok(()) };
+        // The writer that is running takes the new teams too.
+        return Ok(());
     }
     // Cleared however the thread ends: done, an early return, or a panic.
     struct ClearOnDrop(Arc<AtomicBool>);
@@ -10759,8 +10850,44 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
     let thread_app = app.clone();
     let thread_state = state.clone();
     std::thread::spawn(move || {
-        let _running = running;
-        for team in teams {
+        let next = || lock_tolerant(digest_queue()).get(&ws_id).and_then(|q| q.front().cloned());
+        let done = |team: &Option<String>| {
+            if let Some(q) = lock_tolerant(digest_queue()).get_mut(&ws_id) {
+                if let Some(i) = q.iter().position(|t| t == team) {
+                    q.remove(i);
+                }
+            }
+        };
+        loop {
+            while let Some(team) = next() {
+                write_team_digest(&thread_app, &thread_state, &base_dir, &ws_root, ws_id, binary.as_ref(), team.clone());
+                done(&team);
+            }
+            running.0.store(false, Ordering::SeqCst);
+            // A team asked for between the last look and the flag falling.
+            if next().is_none() || running.0.swap(true, Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// One team's digest: stored, or an error event saying why not.
+fn write_team_digest(
+    thread_app: &AppHandle,
+    thread_state: &SharedState,
+    base_dir: &Path,
+    ws_root: &Path,
+    ws_id: uuid::Uuid,
+    binary: Option<&PathBuf>,
+    team: Option<String>,
+) {
+    let fail = |message: String| {
+        let _ = thread_app.emit("team-digest-error", TeamDigestEvent { team: team.clone(), message: Some(message) });
+    };
+    {
+        {
             let today = local_date_today();
             let key = digest_schedule_key(team.as_deref());
             // Recorded as failed until it is stored, so a failure (or a
@@ -10772,11 +10899,11 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
                 });
             };
             attempt(false);
-            let job = match team_digest_job(&thread_state, team) {
+            let job = match team_digest_job(thread_state, team.clone()) {
                 Ok(j) => j,
                 Err(e) => {
-                    let _ = thread_app.emit("team-digest-error", e);
-                    continue;
+                    fail(e);
+                    return;
                 }
             };
             let store = |body: String, sources: Vec<String>| {
@@ -10784,48 +10911,40 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
                     date: today.clone(),
                     digest: TeamDigestDto { generated_at: engine::now_epoch(), body, sources },
                 };
-                match save_team_digest(&base_dir, ws_id, job.team.as_deref(), &stored) {
+                match save_team_digest(base_dir, ws_id, job.team.as_deref(), &stored) {
                     Ok(()) => {
                         attempt(true);
                         let _ = thread_app.emit("team-digest-updated", stored.digest);
                     }
-                    Err(e) => {
-                        let _ = thread_app.emit("team-digest-error", e);
-                    }
+                    Err(e) => fail(e),
                 }
             };
             if ken_core::digest::team_is_quiet(&job.repos, &job.mine) {
                 store(ken_core::digest::QUIET_TEAM_DIGEST.to_string(), Vec::new());
-                continue;
+                return;
             }
-            let Some(binary) = binary.as_ref() else {
-                continue; // the schedule without Claude Code: nothing to write with
+            let Some(binary) = binary else {
+                return; // the schedule without Claude Code: nothing to write with
             };
-            let _ = thread_app.emit("team-digest-generating", ());
             let name = job.team.clone().unwrap_or_else(|| "this workspace".into());
             let prompt = ken_core::digest::compose_team_digest_prompt(&name, &job.repos, &job.mine);
-            match assistant::oneshot(binary, &ws_root, &prompt, Duration::from_secs(240), &CancelToken::new()) {
+            // From the folder that holds the repos, when they share one, so
+            // a repo's name is its folder; each repo is readable either way.
+            let cwd = shared_parent(&job.roots).unwrap_or_else(|| ws_root.to_path_buf());
+            match assistant::oneshot_in(binary, &cwd, &job.roots, &prompt, Duration::from_secs(240), &CancelToken::new()) {
                 Ok(OneshotOutcome::Completed(text)) => {
                     let parsed = digest::parse_digest(&text);
                     store(parsed.body, parsed.sources);
                 }
                 Ok(OneshotOutcome::TimedOut) => {
-                    let _ = thread_app.emit(
-                        "team-digest-error",
-                        "Writing the digest took too long and was stopped. It will try again later.",
-                    );
+                    fail("Writing the digest took too long and was stopped. It will try again later.".into())
                 }
-                Ok(OneshotOutcome::Failed(detail)) => {
-                    let _ = thread_app.emit("team-digest-error", detail);
-                }
-                Err(e) => {
-                    let _ = thread_app.emit("team-digest-error", e.to_string());
-                }
+                Ok(OneshotOutcome::Failed(detail)) => fail(detail),
+                Err(e) => fail(e.to_string()),
                 Ok(OneshotOutcome::Cancelled) => {}
             }
         }
-    });
-    Ok(())
+    }
 }
 
 // ---------- index health for a team ----------
@@ -14054,6 +14173,7 @@ pub fn run() {
             draft_wiki,
             wiki_add_repos,
             setup_create_wiki,
+            setup_create_team_repo,
             apply_page_proposal,
             sync_now,
             resolve_conflict,
@@ -14114,6 +14234,7 @@ pub fn run() {
             ticket_tasks,
             team_digest,
             refresh_team_digest,
+            team_digest_writing,
             workspace_groups,
             workspace_set_group,
             workspace_remove_group,

@@ -279,10 +279,18 @@
     }
   }
 
+  // Frontmatter is not Markdown the editor knows: it showed as a rule and a
+  // heading and saved back mangled, losing a page's aliases. It is set aside
+  // here and put back on every save.
+  const front = initial.match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/)?.[0] ?? "";
+  // The serializer escapes `[` in text, which turns every [[wiki link]] into
+  // \[\[text]]: put them back.
+  const unescapeWikiLinks = (md: string) => md.replace(/\\\[\\\[([^\n]+?)\\?\]\\?\]/g, "[[$1]]");
+
   onMount(async () => {
     crepe = new Crepe({
       root: host,
-      defaultValue: initial,
+      defaultValue: initial.slice(front.length),
       // Disable LaTeX/math so `$…$` (e.g. two dollar amounts in one sentence)
       // stays literal text instead of being parsed as an inline math node.
       features: {
@@ -311,7 +319,7 @@
     });
     crepe.on((listener) => {
       listener.markdownUpdated((_ctx, markdown, prev) => {
-        if (markdown !== prev) onchange(markdown);
+        if (markdown !== prev) onchange(front + unescapeWikiLinks(markdown));
       });
     });
     crepe.editor.use(findPlugin);

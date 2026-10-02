@@ -129,7 +129,7 @@
         repeat: pendingRepeat || null,
       });
       editing = null;
-      day.openTask(created.id);
+      day.openTask(created.id, { task: created });
     } catch (e) {
       error = String(e);
     } finally {
