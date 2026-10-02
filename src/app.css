@@ -666,6 +666,31 @@ option {
   border-color: var(--accent);
 }
 
+/* Scrollbars in the theme, not the operating system's. WebView2 (Windows)
+   and WebKit (macOS) both take the ::-webkit-scrollbar rules. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklch, var(--ink-3) 35%, transparent);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklch, var(--ink-3) 60%, transparent);
+}
+::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 /* A [[wiki link]] in the Markdown editor (a decoration, so global). */
 .ken-wikilink {
   color: var(--accent-ink);
