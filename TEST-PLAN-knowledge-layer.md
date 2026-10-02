@@ -409,6 +409,38 @@ keyword index over sections.
   under Other with **Accept ▾**; Accept makes it a normal task with *from*;
   Not mine removes it.
 
+## 19. The Briefing design (docs/design/briefing)
+
+- [ ] The sidebar: the team with its sync state at the top (its menu lists
+  the teams and Team library), Home, Inbox (amber count), Files (teal dot when
+  files changed), Ingest, Explore, then Settings and Collapse. Collapse keeps
+  the icons and survives a restart. Light and dark both follow the system.
+- [ ] Home: *Good morning, <name>*, the date and digest time, the digest,
+  **Your list** (tickets square, tasks round, a teammate's task dashed with
+  **Accept**), **Picked up where you left off**, and on the right **Needs
+  you** (the top of the Inbox) and what Ken is reading.
+- [ ] Inbox: All / People / Ken / Sync & files with counts. A teammate's task
+  (Accept, Not mine, Reply), an ingest's ruling or ticket or held edit (Accept
+  or Apply, Discard, Open the note), a conflict (its two sides), a file Ken
+  could not read (Open in Files, Ignore this file), a question in a chat
+  (Answer in Ask Ken). Dealt-with items move to Done with what happened.
+- [ ] Ingest: **Add a file** (or drop one), **Record a meeting**, **Write a
+  note**, **From a chat**. In progress shows a bar per source; a source shows
+  its steps, **Needs your decision** cards, Summary, Next steps, Pages Ken
+  updated (Open, Undo) and **Undo all**.
+- [ ] Explore: Timeline and Map switch with one control; each keeps its place.
+- [ ] Settings: General, Team library (the folders table, ignore list, checks,
+  rules, templates), Sync (the team inbox), AI (Claude Code, models, the
+  graphics card, memory, features), Agents (the connector), Ingest rules.
+- [ ] Models (Settings › AI): download Nomic; search by meaning reads the
+  team (progress shown); switch to Qwen3 Embedding: every folder is read again
+  while keyword search keeps working. Turn the graphics card off: *Runs on:
+  CPU*.
+- [ ] Windows: no console window opens during an ingest, a chat or the
+  digest. Opening Ken from the Start menu while it is in the tray brings the
+  window back instead of a second copy. A screenshot in a repo is found by its
+  text (OCR). Record a meeting captures you and the other side.
+
 ## After
 
 - [ ] Close Ken; delete the test folder and `Realms-Game-u7`/`u8` beside it.

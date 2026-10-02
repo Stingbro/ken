@@ -355,6 +355,37 @@ PC (dev), not measured anywhere.
   undoes one write (refused when its file changed since); `ingest_undo` is
   Undo all, last write first. Ingest screen rebuilt to 8b (Apply all
   gone); the rail's Ingest count is sources with something waiting.
+- **Cleanup: Ingest works, Windows parity, the right models (2026-10-01).**
+  A failing source no longer stops the pass; recordings and audio are
+  transcribed first (symphonia in-process, ffmpeg.exe found on Windows as a
+  fallback); any repo with an inbox is the library and the watcher starts a
+  pass. Record lives in Ingest (cpal mic, WASAPI loopback on Windows). Review
+  is removed; recipes and automations are removed. Windows: no console
+  windows (`proc::quiet` in `spawn_with_input`), single instance,
+  Windows.Media.Ocr (`ocr/win.rs`), vulkan-1.dll delay-loaded with a CPU
+  fallback (`src-tauri/src/vulkan.rs`), static CRT, OneDrive error codes,
+  Claude Code's trust and session folder encoding. Models: `compute.rs`
+  (graphics card setting, CPU fallback, threads); embedding profiles
+  (`embedder::NOMIC`, `QWEN3`), a model switch drops the vectors and re-reads
+  (`engine::needs_reembed`, `Db::reset_vectors`), one shared embedder locked
+  per batch (`shared_embedder`, `SlotEmbedder`); Whisper Base, Small, Large v3
+  Turbo q5_0 with language detection for the multilingual one. The local
+  language models are not offered: Claude builds the map. Chat and MCP:
+  every listed tool dispatches, CRLF-safe edit proposals, the guide names
+  `mcp__ken__*` tools, the chat may write tasks and memories, MCP searches
+  stay in the open workspace.
+- **The Briefing design system (2026-10-02).** `docs/design/briefing/` (from
+  Claude Design). `src/app.css` holds the tokens (old names are aliases) and
+  the component set (`.btn` sizes, `.count`, `.k-pill`, `.k-segmented`,
+  `.k-tabs`, `.k-action`, `.k-check`, `.k-empty`, `.k-progress`). Shell:
+  `Sidebar.svelte` (team and sync, Home, Inbox, Files, Ingest, Explore,
+  Settings, Collapse) and `TitleBar.svelte` (search, update, Ask Ken). New
+  screens: `InboxScreen` (store `lib/inbox.svelte.ts`: people, Ken, sync and
+  files), `ExploreScreen` (Timeline and Map). Home is the briefing; Settings
+  has sections (General, Team library = the old Team screen, Sync with the
+  team inbox, AI, Agents, Ingest rules). Not yet to the design: the Files
+  document view's contradiction pill, the search overlay's "Ken's answer"
+  card, Ask Ken's chat tabs.
 - **Testing:** `TEST-PLAN-knowledge-layer.md` (one pass by hand) over
   `node scripts/knowledge-layer-fixture.mjs <folder>`.
   ken-core on this PC: 856 pass, 55 fail (all Windows-only: fake bash CLI, CRLF);
