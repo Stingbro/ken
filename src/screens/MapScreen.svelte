@@ -562,7 +562,8 @@
             {knowledge.coverage.analyzed} of {knowledge.coverage.total} files analyzed{#if knowledge.coverage.failed > 0}<span class="muted"> · {knowledge.coverage.failed} failed</span>{/if}
           </div>
         {:else if knowledge.building}
-          <div class="status-overlay pulse">Deep rebuild in progress…</div>
+          <!-- Ken builds the map on its own when files wait for it, and on Deep rebuild. -->
+          <div class="status-overlay pulse">Claude is building the map…</div>
         {:else if knowledge.error}
           <div class="status-overlay error">Last rebuild didn't finish — {knowledge.error}</div>
         {/if}
