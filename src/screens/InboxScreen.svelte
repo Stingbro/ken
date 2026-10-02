@@ -15,6 +15,7 @@
   import ProposalDetail from "../ingests/ProposalDetail.svelte";
   import ConflictDetail from "../files/ConflictDetail.svelte";
   import InboxKindIcon from "./InboxKindIcon.svelte";
+  import Loading from "../lib/ui/Loading.svelte";
   import CircleCheck from "@lucide/svelte/icons/circle-check";
   import BellOff from "@lucide/svelte/icons/bell-off";
 
@@ -153,7 +154,9 @@
           </span>
         </button>
       {/each}
-      {#if list.length === 0}
+      {#if list.length === 0 && inbox.loading}
+        <Loading label="Gathering what waits on you…" lines={3} />
+      {:else if list.length === 0}
         <p class="none">
           {inbox.done.length > 0 ? "Nothing here. What you dealt with is under Done." : "Nothing here."}
         </p>

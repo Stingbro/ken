@@ -1,7 +1,7 @@
 //! Where the on-device models run: the graphics card or the CPU, and how
 //! many CPU threads they get.
 //!
-//! The person can turn the graphics card off (Settings › This machine, saved
+//! The person can turn the graphics card off (Settings › AI, saved
 //! as `useGpu` in settings.json and handed in with [`set_use_gpu`]); `KEN_GPU=off`
 //! does the same from the environment, and the app sets it when Windows has
 //! no Vulkan loader. A model that fails to load on the graphics card is loaded

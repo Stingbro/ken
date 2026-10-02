@@ -306,7 +306,7 @@ pub fn transcription_blocker(
 /// decode itself.
 pub fn waiting_reason(path: &Path, ffmpeg_present: bool, model_present: bool) -> Option<String> {
     if !model_present {
-        return Some("Install a transcription model in Settings to read this recording.".into());
+        return Some("Install a transcription model in Settings › AI to read this recording.".into());
     }
     if !ffmpeg_present && !decodes_in_process(path) {
         return Some(ffmpeg_help().to_string());
@@ -315,7 +315,7 @@ pub fn waiting_reason(path: &Path, ffmpeg_present: bool, model_present: bool) ->
 }
 
 const MODEL_HELP: &str =
-    "No transcription model is installed. Install one in Settings › This machine › Offline models, then try again.";
+    "No transcription model is installed. Install one in Settings › AI, then try again.";
 
 /// How to install ffmpeg here. Ken decodes WAV, MP3, M4A, FLAC, Ogg and the
 /// audio of MP4 and MOV itself; ffmpeg is only for the rest.

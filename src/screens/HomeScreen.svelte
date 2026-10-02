@@ -19,6 +19,9 @@
   import TaskPanel from "../day/TaskPanel.svelte";
   import FileGlyph from "../files/FileGlyph.svelte";
   import InboxKindIcon from "./InboxKindIcon.svelte";
+  import Loading from "../lib/ui/Loading.svelte";
+  import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
+  import { api, type ModelStatus } from "../lib/api";
   import Check from "@lucide/svelte/icons/check";
   import Copy from "@lucide/svelte/icons/copy";
   import Plus from "@lucide/svelte/icons/plus";
@@ -26,7 +29,17 @@
   onMount(() => {
     void scope.init();
     void day.init();
+    void checkMeaning();
   });
+
+  // Search by meaning needs a model on this computer; until one is
+  // installed, search is by keyword only. Offer the default once, here.
+  let meaningModel = $state<ModelStatus | null>(null);
+  async function checkMeaning() {
+    const models = await api.listModels().catch(() => [] as ModelStatus[]);
+    const embedding = models.filter((m) => m.category === "embedding");
+    meaningModel = embedding.some((m) => m.installed) ? null : (embedding.find((m) => m.recommended) ?? null);
+  }
 
   // ── The greeting and the digest ───────────────────────────────────
 
@@ -193,6 +206,9 @@
         <button class="btn btn-link btn-small" onclick={() => day.openNew()}><Plus size={14} strokeWidth={2} /> Add task</button>
       </div>
       <div class="rows">
+        {#if !day.state && !day.loadError}
+          <Loading label="Reading your list…" lines={3} />
+        {/if}
         {#each day.tickets as t (t.projectId + ":" + t.relPath)}
           <button class="row" title="{t.repo}/{t.relPath}" onclick={() => void openInRepo(t.projectId, t.relPath)}>
             <span class="k-check square" aria-hidden="true"></span>
@@ -230,7 +246,7 @@
             <span class="due {dueClass(task.target, done)}">{dueLabel(task.target)}</span>
           </div>
         {/each}
-        {#if day.tickets.length === 0 && day.tasks.length === 0}
+        {#if day.state && day.tickets.length === 0 && day.tasks.length === 0}
           <p class="none">Nothing on your list. Add task puts one here, and so does Ken when you ask it to.</p>
         {/if}
       </div>
@@ -286,6 +302,13 @@
         <div class="k-empty card-empty">
           <span class="head">Nothing waiting on you</span>
           <span class="body">When a teammate sends you something, or Ken needs a decision, it shows up here.</span>
+        </div>
+      {/if}
+      {#if meaningModel}
+        <div class="k-action meaning">
+          <div class="kind accent">Search by meaning is off</div>
+          <div class="short">Search finds exact words only until a model that reads for meaning is on this computer. It runs here; nothing leaves it.</div>
+          <ModelDownloadDialog status={meaningModel} compact onInstalled={() => void checkMeaning()} />
         </div>
       {/if}
       <button class="reading" onclick={() => (app.screen = "ingests")}>

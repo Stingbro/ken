@@ -1,10 +1,12 @@
 <script lang="ts">
+  import Loading from "../lib/ui/Loading.svelte";
   import FilePlus from "@lucide/svelte/icons/file-plus";
   import NotebookPen from "@lucide/svelte/icons/notebook-pen";
   import MessagesSquare from "@lucide/svelte/icons/messages-square";
   import FileText from "@lucide/svelte/icons/file-text";
   import CircleCheck from "@lucide/svelte/icons/circle-check";
   import Circle from "@lucide/svelte/icons/circle";
+  import CircleX from "@lucide/svelte/icons/circle-x";
   import Gavel from "@lucide/svelte/icons/gavel";
   import Ticket from "@lucide/svelte/icons/ticket";
   import FilePen from "@lucide/svelte/icons/file-pen";
@@ -74,19 +76,49 @@
     selected = null;
     selectedRaw = r.path;
   }
-  /** The steps a source goes through, as the progress card names them. */
-  const STEPS = ["Filed in Raw", "Transcribed", "Read", "Pages written", "Ready"];
+  /** The steps a source goes through, as the progress card names them. A
+   *  recording is transcribed first; a document is not. */
+  const RECORDING_STEPS = ["Filed in Raw", "Transcribed", "Read", "Pages written", "Ready"];
+  const DOCUMENT_STEPS = ["Filed in Raw", "Read", "Pages written", "Ready"];
+  const RECORDING_EXT = /\.(mp4|mov|m4v|webm|mkv|avi|wav|mp3|m4a|aac|flac|ogg|opus)$/i;
+  function isRecording(name: string, kind: string): boolean {
+    return RECORDING_EXT.test(name) || kind === "recording";
+  }
+  function stepsFor(r: IngestOverview["raw"][number]): string[] {
+    return isRecording(r.name, r.kind) ? RECORDING_STEPS : DOCUMENT_STEPS;
+  }
+  /** The step a source is on (or stopped at, when it failed). */
   function stepAt(r: IngestOverview["raw"][number]): number {
+    const steps = stepsFor(r);
+    const transcribed = steps.indexOf("Transcribed");
+    const read = steps.indexOf("Read");
     switch (r.state) {
       case "queued":
+        return 1;
       case "waiting":
       case "transcribing":
-        return 1;
+        return transcribed >= 0 ? transcribed : read;
       case "reading":
+        return read;
       case "failed":
-        return 2;
+        // A recording that has no text yet stopped at its transcript.
+        return transcribed >= 0 && /transcri/i.test(r.detail ?? "") ? transcribed : read;
       default:
-        return STEPS.length;
+        return steps.length;
+    }
+  }
+  /** A note's line that only says there is nothing ("Nothing overturns",
+   *  "There are none") is not shown: an empty section is left out. */
+  function saysNothing(s: string | null | undefined): boolean {
+    const text = (s ?? "").replace(/[*_`#>]/g, "").trim().toLowerCase();
+    return !text || /^(nothing\b|none\b|no (contradictions|change|overturn)|there (are|is|were|was) (none|no)\b|n\/a\b)/.test(text);
+  }
+  async function openSource(path: string) {
+    if (!overview) return;
+    try {
+      await api.revealInFolder(path, overview.projectId);
+    } catch (e) {
+      error = errorText(e);
     }
   }
   function rawPct(r: IngestOverview["raw"][number]): number {
@@ -408,6 +440,7 @@
   const tickets = $derived((card?.proposals ?? []).filter((p) => p.kind === "ticket"));
   const held = $derived((card?.proposals ?? []).filter((p) => p.kind === "page" || p.kind === "new page"));
   const pageWrites = $derived(written.filter((w) => w.kind === "edit" || w.kind === "page").length);
+  const contradictions = $derived((card?.takeaways.contradictions ?? []).filter((c) => !saysNothing(c)));
   const decisionsTotal = $derived(rulings.length + tickets.length + held.length);
   const decisionsLeft = $derived(decisionsTotal);
 
@@ -481,6 +514,9 @@
       <p class="warn">Reading needs Claude Code. {claudeInstallHelp()}</p>
     {/if}
 
+    {#if !overview && !error}
+      <Loading label="Reading the inbox…" lines={3} />
+    {/if}
     {#if overview}
       {@const inProgress = overview.raw.filter((r) => r.state !== "read")}
       <div class="t-label lhead">
@@ -563,6 +599,7 @@
         </div>
         {#if !card.undone}
           <div class="cacts">
+            <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => card && openSource(card.source)}>Open source</button>
             <button class="btn" onclick={() => card && inLibrary(card.note)}>Open the note</button>
             {#if card.open}
               <button class="btn btn-primary" disabled={busy !== null} onclick={seen}>Mark as seen</button>
@@ -582,7 +619,7 @@
           <div class="pline"><b>Read and filed</b><span class="grow"></span><span class="t-small">Done</span></div>
           <div class="k-progress fat"><span style="width: 100%" class="okbar"></span></div>
           <div class="steps">
-            {#each STEPS as s (s)}<span class="step done"><CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{s}</span>{/each}
+            {#each isRecording(card.source, card.takeaways.kind) ? RECORDING_STEPS : DOCUMENT_STEPS as s (s)}<span class="step done"><CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{s}</span>{/each}
           </div>
         </div>
 
@@ -645,15 +682,17 @@
                 {#each card.takeaways.keyTakeaways as k (k)}<li>{@html renderMarkdown(k)}</li>{/each}
               </ul>
             {/if}
-            <div class="well">
-              <span class="t-label">What it overturns</span>
-              <div class="md">{@html renderMarkdown(card.takeaways.overturns || "Nothing it overturns.")}</div>
-            </div>
-            {#if card.takeaways.contradictions.length > 0}
+            {#if !saysNothing(card.takeaways.overturns)}
+              <div class="well">
+                <span class="t-label">What it overturns</span>
+                <div class="md">{@html renderMarkdown(card.takeaways.overturns)}</div>
+              </div>
+            {/if}
+            {#if contradictions.length > 0}
               <div class="well danger">
                 <span class="t-label">Contradictions</span>
                 <ul>
-                  {#each card.takeaways.contradictions as c (c)}<li>{@html renderMarkdown(c)}</li>{/each}
+                  {#each contradictions as c (c)}<li>{@html renderMarkdown(c)}</li>{/each}
                 </ul>
               </div>
             {/if}
@@ -709,6 +748,7 @@
       {/if}
     {:else if rawSelected}
       {@const pct = rawPct(rawSelected)}
+      {@const acts = rawActions(rawSelected.state)}
       <div class="chead">
         <div class="ctitle">
           <div class="chips">
@@ -718,15 +758,25 @@
           <h2>{rawSelected.name}</h2>
           <div class="t-small">{rawSelected.path}</div>
         </div>
+        <div class="cacts">
+          <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => rawSelected && openSource(rawSelected.path)}>Open source</button>
+          {#if acts.includes("remove")}
+            <button class="btn" disabled={busy !== null} onclick={(e) => rawSelected && askRemove(e, rawSelected)}>Remove</button>
+          {/if}
+          {#if acts.includes("retry")}
+            <button class="btn btn-primary" disabled={busy !== null} onclick={() => rawSelected && retry(rawSelected)}>Try again</button>
+          {/if}
+        </div>
       </div>
       <div class="progress-card">
         <div class="pline"><b>{rawStatus(rawSelected)}</b><span class="grow"></span>{#if pct > 0 && pct < 100}<span class="t-small">{pct}%</span>{/if}</div>
         <div class="k-progress fat"><span style="width: {pct}%" class:bad={rawSelected.state === "failed"}></span></div>
         <div class="steps">
-          {#each STEPS as s, i (s)}
+          {#each stepsFor(rawSelected) as s, i (s)}
             {@const at = stepAt(rawSelected)}
-            <span class="step" class:done={i < at} class:now={i === at}>
-              {#if i < at}<CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{:else}<Circle size={14} strokeWidth={1.75} aria-hidden="true" />{/if}{s}
+            {@const failed = rawSelected.state === "failed" && i === at}
+            <span class="step" class:done={i < at} class:now={i === at && !failed} class:failed>
+              {#if i < at}<CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{:else if failed}<CircleX size={14} strokeWidth={1.75} aria-hidden="true" />{:else}<Circle size={14} strokeWidth={1.75} aria-hidden="true" />{/if}{s}
             </span>
           {/each}
         </div>
@@ -1087,6 +1137,10 @@
   }
   .step.now {
     color: var(--accent-ink);
+    font-weight: 600;
+  }
+  .step.failed {
+    color: var(--danger);
     font-weight: 600;
   }
   h3 {

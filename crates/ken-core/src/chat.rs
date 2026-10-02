@@ -728,17 +728,27 @@ impl ChatEngine {
                 .stdin
                 .clone()
         };
-        {
-            let mut stdin = stdin.lock().unwrap();
-            writeln!(stdin, "{payload}")
-                .and_then(|_| stdin.flush())
-                .map_err(|e| Error::Other(format!("chat send failed: {e}")))?;
-        }
+        // Working before the write, never after: on Windows the write can
+        // wait until the CLI reads its stdin, and a short turn can finish in
+        // that time, so a "working" sent afterwards would land after "done"
+        // and leave the chat looking busy for good.
         (self.on_update)(ChatUpdate::Status {
             chat_id: chat_id.to_string(),
             status: "working".into(),
             detail: None,
         });
+        let written = {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}").and_then(|_| stdin.flush())
+        };
+        if let Err(e) = written {
+            (self.on_update)(ChatUpdate::Status {
+                chat_id: chat_id.to_string(),
+                status: "error".into(),
+                detail: None,
+            });
+            return Err(Error::Other(format!("chat send failed: {e}")));
+        }
         Ok(())
     }
 
@@ -774,17 +784,24 @@ impl ChatEngine {
                 .stdin
                 .clone()
         };
-        {
-            let mut stdin = stdin.lock().unwrap();
-            writeln!(stdin, "{payload}")
-                .and_then(|_| stdin.flush())
-                .map_err(|e| Error::Other(format!("answer failed: {e}")))?;
-        }
+        // Working first, as in `send`.
         (self.on_update)(ChatUpdate::Status {
             chat_id: chat_id.to_string(),
             status: "working".into(),
             detail: None,
         });
+        let written = {
+            let mut stdin = stdin.lock().unwrap();
+            writeln!(stdin, "{payload}").and_then(|_| stdin.flush())
+        };
+        if let Err(e) = written {
+            (self.on_update)(ChatUpdate::Status {
+                chat_id: chat_id.to_string(),
+                status: "error".into(),
+                detail: None,
+            });
+            return Err(Error::Other(format!("answer failed: {e}")));
+        }
         Ok(())
     }
 
@@ -805,17 +822,18 @@ impl ChatEngine {
                 .stdin
                 .clone()
         };
+        // Working first, as in `send`.
+        (self.on_update)(ChatUpdate::Status {
+            chat_id: chat_id.to_string(),
+            status: "working".into(),
+            detail: None,
+        });
         {
             let mut stdin = stdin.lock().unwrap();
             writeln!(stdin, "{payload}")
                 .and_then(|_| stdin.flush())
                 .map_err(|e| Error::Other(format!("answer failed: {e}")))?;
         }
-        (self.on_update)(ChatUpdate::Status {
-            chat_id: chat_id.to_string(),
-            status: "working".into(),
-            detail: None,
-        });
         Ok(())
     }
 

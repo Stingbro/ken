@@ -45,7 +45,7 @@ pub const FLAGS: &[FlagDef] = &[
         default: true,
         description: "Finds passages by meaning as well as by keyword, \
                       with a model that runs on this computer. It needs a \
-                      search-by-meaning model from Settings › This machine; \
+                      search-by-meaning model from Settings › AI; \
                       until one is installed, search is by keyword.",
     },
     FlagDef {

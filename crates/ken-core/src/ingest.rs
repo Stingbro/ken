@@ -397,10 +397,11 @@ pub fn prompt_against(template: &str, raw: &str, text: &str, date: &str, wiki: &
          - This is evidence at the time, not current doctrine. Do not state anything the source does not.\n\
          - \"Summary\": what the source is and what it comes to, in a few sentences. \"Key Takeaways\": one line \
            per fact, decision or change the team should know.\n\
-         - Lead \"What It Overturns\" with the one thing that changes what the team wrote, or say nothing overturns.\n\
+         - Lead \"What It Overturns\" with the one thing that changes what the team wrote.\n\
          - Under \"Contradictions\", list each place the source disagrees with what the wiki says (name the page) or \
-           with itself (name both places); write that there are none if there are none. Only what the source and the \
-           passages below show.\n\
+           with itself (name both places). Only what the source and the passages below show.\n\
+         - A section with nothing in it is left out, heading and all. Never write that something is absent, that \
+           there are none, or what the source does not touch.\n\
          - \"Rulings Said in the Room\": one line per ruling, `- the ruling, in the decider's words — decider`.\n\
          - \"Actions and Requests\": one line per piece of work someone asked for, `- the action → who it is for`; \
            a rough idea nobody has asked to be done is `- the idea → idea, from who raised it`.\n\

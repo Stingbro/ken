@@ -26,6 +26,7 @@
   import { findingLabel, kindlessRepos, orderFindings, proposedKinds } from "../lib/team";
   import type { TeamFinding } from "../lib/api";
   import RepoDrawer from "../team/RepoDrawer.svelte";
+  import Loading from "../lib/ui/Loading.svelte";
   import X from "@lucide/svelte/icons/x";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import SlidersHorizontal from "@lucide/svelte/icons/sliders-horizontal";
@@ -229,6 +230,9 @@
     <button class="btn btn-primary" disabled={busy !== null} onclick={scanAgain}>{busy === "scan" ? "Scanning…" : "Scan again"}</button>
   </div>
   {#if error}<p class="warn-text">{error}</p>{/if}
+  {#if !overview && !error}
+    <Loading label="Reading the team's folders…" lines={4} />
+  {/if}
 
   {#if overview && kindless.length > 0}
     <div class="kinds">

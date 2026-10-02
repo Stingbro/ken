@@ -716,7 +716,7 @@ fn apply_semantic_index_flag(
             project_id,
             "semantic-index-state",
             SemanticIndexStateEvent::Unavailable {
-                reason: "No search-by-meaning model is installed. Download one in Settings › This machine.".into(),
+                reason: "No search-by-meaning model is installed. Download one in Settings › AI.".into(),
             },
         );
         return Ok(());
@@ -2189,7 +2189,7 @@ fn create_workspace(
 
 /// Members + per-member status + counts for the open workspace (task 3.2).
 /// Flag-gated (task 3.4).
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_overview(state: State<SharedState>) -> CmdResult<WorkspaceOverviewDto> {
     {
         let guard = state.lock().unwrap();
@@ -2307,7 +2307,7 @@ async fn setup_rescan(parent: String) -> CmdResult<Vec<ken_core::setup::Moved>> 
 
 /// Immediate subfolder candidates for the workspace-creation UI (task 3.2) —
 /// a thin flag-gated wrapper over `ken_core::workspace::discover_candidates`.
-#[tauri::command]
+#[tauri::command(async)]
 fn discover_workspace_candidates(
     state: State<SharedState>,
     parent: String,
@@ -2682,7 +2682,7 @@ fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
 
 /// The workspaces opened recently, newest first, each with whether its folder
 /// is still there: the start screen's "Recent workspaces".
-#[tauri::command]
+#[tauri::command(async)]
 fn list_recent_workspaces(state: State<SharedState>) -> CmdResult<Vec<ken_core::registry::RecentWorkspaceStatus>> {
     let guard = state.lock().unwrap();
     let mut recent = Registry::load(&guard.base_dir).map_err(err)?.workspace_statuses();
@@ -2780,7 +2780,7 @@ fn set_folder_selection(
     Ok(info)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
@@ -2831,7 +2831,7 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
 ///
 /// Dormant members are read the same way `route_search` reads them: their
 /// index opens by project id without activating anything.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
     let (base_dir, members) = {
         let guard = state.lock().unwrap();
@@ -3189,7 +3189,7 @@ fn project_layer_value(project: &Project, name: &str) -> Option<bool> {
 /// overrides absent). With one, project-scoped flags also report that project's
 /// override and full effective value; the project is read from the active copy
 /// when it's open, otherwise loaded from disk via the registry.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_features(
     state: State<SharedState>,
     project_id: Option<String>,
@@ -3289,7 +3289,7 @@ fn resolve_path(state: &State<SharedState>, rel_path: &str) -> CmdResult<PathBuf
     active.project.resolve(rel_path).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     let abs = resolve_path(&state, &rel_path)?;
     if cloud::is_placeholder(&abs) {
@@ -3298,7 +3298,7 @@ fn read_file(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     std::fs::read_to_string(&abs).map_err(err)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn read_file_bytes(state: State<SharedState>, rel_path: String) -> CmdResult<tauri::ipc::Response> {
     let abs = resolve_path(&state, &rel_path)?;
     if cloud::is_placeholder(&abs) {
@@ -3490,7 +3490,7 @@ fn save_file_bytes(
     finish_save(&app, &mut guard, &rel_path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRowDto>> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -3509,7 +3509,7 @@ fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<Fi
     Ok(row.map(|r| FileRowDto::new(r, &active.project)))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn extracted_text(state: State<SharedState>, rel_path: String) -> CmdResult<String> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -3537,7 +3537,7 @@ struct OcrRegionDto {
 /// highlight overlay. Empty when the file was never OCR'd (or held no text);
 /// the OCR pass is asynchronous, so an image just added may return `[]` until
 /// the background worker finishes it.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_ocr_regions(state: State<SharedState>, rel_path: String) -> CmdResult<Vec<OcrRegionDto>> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -3897,7 +3897,7 @@ fn profile_project(
 /// to read an override from. The (future) workspace-creation UI is expected
 /// to check the *global* `profiler` default (`list_features` with no
 /// `project_id`) before calling this at all.
-#[tauri::command]
+#[tauri::command(async)]
 fn profile_candidates(app: AppHandle, paths: Vec<String>) -> CmdResult<()> {
     if paths.is_empty() {
         return Ok(());
@@ -3938,9 +3938,10 @@ fn open_external(state: State<SharedState>, app: AppHandle, rel_path: String) ->
 /// `open_external`: the path is resolved against the project root here so the
 /// frontend never handles an absolute path.
 #[tauri::command]
-fn reveal_in_folder(state: State<SharedState>, app: AppHandle, rel_path: String) -> CmdResult<()> {
+fn reveal_in_folder(state: State<SharedState>, app: AppHandle, rel_path: String, project_id: Option<String>) -> CmdResult<()> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
+    let active = member(&guard, pid)?;
     let abs = active.project.resolve(&rel_path).map_err(err)?;
     tauri_plugin_opener::OpenerExt::opener(&app)
         .reveal_item_in_dir(abs)
@@ -5229,7 +5230,7 @@ fn shell_word(s: &str) -> String {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -5640,7 +5641,7 @@ fn status_dto(
 /// Status of the recommended model only — cheap and offline (just a file
 /// check), so the transcript feature can gate on it without a network round
 /// trip.
-#[tauri::command]
+#[tauri::command(async)]
 fn model_status(state: State<SharedState>) -> CmdResult<ModelStatusDto> {
     let base = { state.lock().unwrap().base_dir.clone() };
     let rec = model::catalog()
@@ -5654,7 +5655,7 @@ fn model_status(state: State<SharedState>) -> CmdResult<ModelStatusDto> {
 /// All curated models available to download, in catalog order. Fully offline
 /// (just file checks): each entry carries its category, tier, blurb, and whether
 /// it is the selected model for its category.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
     let base = { state.lock().unwrap().base_dir.clone() };
     let sel_trans = model::selected(&base, model::ModelCategory::Transcription).id;
@@ -5789,7 +5790,7 @@ fn remove_model(state: State<SharedState>, id: String) -> CmdResult<()> {
 
 /// Persist the user's chosen model for a category
 /// ("transcription" | "language" | "embedding").
-#[tauri::command]
+#[tauri::command(async)]
 fn set_model_selection(app: AppHandle, state: State<SharedState>, category: String, id: String) -> CmdResult<()> {
     let base = { state.lock().unwrap().base_dir.clone() };
     let cat = match category.as_str() {
@@ -5809,8 +5810,8 @@ fn set_model_selection(app: AppHandle, state: State<SharedState>, category: Stri
     Ok(())
 }
 
-/// The search-by-meaning index now (Settings › This machine).
-#[tauri::command]
+/// The search-by-meaning index now (Settings › AI).
+#[tauri::command(async)]
 fn embedding_state(state: State<SharedState>) -> CmdResult<EmbeddingStateDto> {
     let dbs: Vec<Arc<Mutex<Db>>> = {
         let guard = state.lock().unwrap();
@@ -5844,7 +5845,7 @@ struct GpuInfoDto {
 }
 
 /// The device the on-device models run on, and the graphics card setting.
-#[tauri::command]
+#[tauri::command(async)]
 fn gpu_info(state: State<SharedState>) -> CmdResult<GpuInfoDto> {
     let use_gpu = use_gpu_setting(&state.lock().unwrap().app_settings);
     let d = ken_core::compute::device();
@@ -5858,7 +5859,7 @@ fn gpu_info(state: State<SharedState>) -> CmdResult<GpuInfoDto> {
 
 /// Turn the graphics card on or off for the on-device models. The models
 /// are loaded again where they now run.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_use_gpu(app: AppHandle, state: State<SharedState>, on: bool) -> CmdResult<()> {
     {
         let mut guard = state.lock().unwrap();
@@ -5882,7 +5883,7 @@ fn use_gpu_setting(app_settings: &ken_core::settings::AppSettings) -> bool {
 
 // ---------- the Review store ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_review_item(state: State<SharedState>, id: i64, project_id: Option<String>) -> CmdResult<()> {
     let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
@@ -5907,7 +5908,7 @@ fn load_user_state(guard: &AppState) -> CmdResult<(std::path::PathBuf, uuid::Uui
 
 /// Silence a file's review issues for THIS user only (stored in app-data, never
 /// written to the synced `.ken/` config). The file stays indexed and findable.
-#[tauri::command]
+#[tauri::command(async)]
 fn ignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let (base, id, mut us) = load_user_state(&guard)?;
@@ -5918,7 +5919,7 @@ fn ignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 }
 
 /// Reverse an ignore, so the file's issues can surface again.
-#[tauri::command]
+#[tauri::command(async)]
 fn unignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let (base, id, mut us) = load_user_state(&guard)?;
@@ -5930,7 +5931,7 @@ fn unignore_file(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 
 /// The current project's ignored files, for the Settings undo list and the
 /// home "Needs a look" filter.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_ignored(state: State<SharedState>) -> CmdResult<Vec<String>> {
     let guard = state.lock().unwrap();
     let (_, _, us) = load_user_state(&guard)?;
@@ -5949,7 +5950,7 @@ fn index_versions(files: &[FileRow]) -> Vec<(String, (i64, i64))> {
 /// Files changed by someone/something ELSE since the user last looked (the nav
 /// dot + the Files "unread" filter). Self-saves and opens keep files seen, so
 /// what remains is external edits, syncs, and cloud hydrates.
-#[tauri::command]
+#[tauri::command(async)]
 fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -5966,7 +5967,7 @@ fn unread_files(state: State<SharedState>) -> CmdResult<Vec<String>> {
 
 /// Record a file as seen at its current version (the frontend calls this on
 /// open, and it backs the "Mark as viewed" context-menu item).
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -5982,7 +5983,7 @@ fn mark_seen(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
 
 /// Mark every indexed file under one folder seen ("Mark folder as viewed").
 /// `rel_path` is the folder; files directly at that path or beneath it count.
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_seen_under(state: State<SharedState>, rel_path: String) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -5995,7 +5996,7 @@ fn mark_seen_under(state: State<SharedState>, rel_path: String) -> CmdResult<()>
 }
 
 /// Mark every currently-unread file seen ("Mark all as viewed").
-#[tauri::command]
+#[tauri::command(async)]
 fn mark_all_seen(state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -6038,7 +6039,7 @@ fn sync_status_of(project: &Project) -> SyncStatus {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -6076,7 +6077,7 @@ fn set_sync_auto(app: AppHandle, state: State<SharedState>, auto: bool) -> CmdRe
     Ok(status)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn sync_now(state: State<SharedState>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -6095,7 +6096,7 @@ fn conflict_payload(item: &ken_core::db::ReviewItemRow) -> CmdResult<serde_json:
 /// Resolve a merge-conflict review item: write the chosen content to the
 /// project file, resolve the item, reindex — the normal sync path pushes
 /// it out. Returns the project-relative path that was written.
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_conflict(
     app: AppHandle,
     state: State<SharedState>,
@@ -6152,7 +6153,7 @@ fn resolve_conflict(
 /// Resolve a shared-drive conflicted-copy item: `keep-copy` promotes the
 /// copy's content to the original name, `keep-original` deletes the copy.
 /// Returns the path of the surviving file.
-#[tauri::command]
+#[tauri::command(async)]
 fn resolve_conflict_copy(
     app: AppHandle,
     state: State<SharedState>,
@@ -6256,7 +6257,7 @@ struct FilesBannerDto {
 /// The banner at the top of Files: the sync conflicts and conflicted copies
 /// waiting in the chosen team's open repos (every open repo with no team),
 /// less those on files I ignore.
-#[tauri::command]
+#[tauri::command(async)]
 fn files_banner(state: State<SharedState>, team: Option<String>) -> CmdResult<FilesBannerDto> {
     let guard = state.lock().unwrap();
     let repos: Vec<(uuid::Uuid, String)> = match guard.workspace.as_ref() {
@@ -6352,7 +6353,7 @@ struct ClaudeDoctor {
 /// Where Claude Code is and its version. `help` is the per-OS install help
 /// when it is not found, plus a line for each half-updated npm install that
 /// was skipped; it can be non-empty when Claude Code is found.
-#[tauri::command]
+#[tauri::command(async)]
 fn claude_doctor() -> CmdResult<ClaudeDoctor> {
     match ken_core::runner::discover_claude() {
         Some(path) => {
@@ -6652,7 +6653,7 @@ fn run_claude_quick_answer(
 }
 
 /// The on-device language model's state, for the ⌘K "not installed" hint.
-#[tauri::command]
+#[tauri::command(async)]
 fn llm_status() -> &'static str {
     generator_status()
 }
@@ -7054,7 +7055,7 @@ fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) ->
 /// Repos joined the workspace: for each team wiki that covers any of them,
 /// draft their Repo Map pages and propose changes to the pages its people
 /// keep, in the background. Returns the wikis being updated.
-#[tauri::command]
+#[tauri::command(async)]
 fn wiki_add_repos(state: State<SharedState>, members: Vec<String>) -> CmdResult<Vec<String>> {
     let (base, all) = {
         let guard = state.lock().unwrap();
@@ -7128,7 +7129,7 @@ fn ruling_is_mine(decider: &str) -> bool {
 
 /// Apply a proposed change to a page a person keeps, only while the page
 /// still reads as it did when Ken proposed it.
-#[tauri::command]
+#[tauri::command(async)]
 fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Option<String>) -> CmdResult<String> {
     let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
@@ -7207,7 +7208,7 @@ fn inbox_project(guard: &AppState, team: Option<&str>) -> Option<Project> {
 
 /// The team's wiki: the repo with the inbox, the one Files opens on. None
 /// when no repo of the team has one.
-#[tauri::command]
+#[tauri::command(async)]
 fn team_wiki(state: State<SharedState>, team: Option<String>) -> CmdResult<Option<String>> {
     let guard = state.lock().unwrap();
     Ok(inbox_project(&guard, team.as_deref()).map(|p| p.config.id.to_string()))
@@ -7324,7 +7325,7 @@ struct IngestOverviewDto {
 /// The Ingest screen: the library's inbox for the chosen team, every source
 /// in Raw with where it is in the read, and what has been ingested, newest
 /// first.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestOverviewDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let guard = state.lock().unwrap();
@@ -7504,7 +7505,7 @@ fn member_at(guard: &AppState, root: &Path) -> Option<String> {
 /// One ingested source for the Ingest screen: its key takeaways, what was
 /// written from it (each with Undo), what waits (rulings, tickets, held
 /// edits) and what stays on the card only.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<IngestCardDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let me = cached_git_me();
@@ -7575,7 +7576,7 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
 /// Files dropped on the Ingest screen: each is copied into the library's
 /// `Research/Ingestion/Raw/` (a name already there gets a number) and the
 /// read starts. Returns the paths in Raw.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_add(app: AppHandle, state: State<SharedState>, team: Option<String>, paths: Vec<String>) -> CmdResult<Vec<String>> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let (project, base) = {
@@ -7702,7 +7703,7 @@ fn add_source(app: &AppHandle, state: &SharedState, team: Option<&str>, name: &s
 /// Write a note on the Ingest screen: it lands in the library's Raw/ as
 /// `YYYY-MM-DD HH.MM Note - <title>.md` (`kind: note`, by me) and is read
 /// at once. Returns its path in Raw.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_add_text(app: AppHandle, state: State<SharedState>, team: Option<String>, title: Option<String>, text: String) -> CmdResult<String> {
     if text.trim().is_empty() {
         return Err("Write the note first.".into());
@@ -7717,7 +7718,7 @@ fn ingest_add_text(app: AppHandle, state: State<SharedState>, team: Option<Strin
 /// `YYYY-MM-DD HH.MM Chat - <chat title>.md` (`kind: session`), read at
 /// once. `project_id` is the repo the chat is kept in. Returns its path in
 /// Raw.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_add_chat(
     app: AppHandle,
     state: State<SharedState>,
@@ -7763,7 +7764,7 @@ fn raw_source(root: &Path, path: &str) -> CmdResult<String> {
 
 /// Try a source that could not be read again: its failure is cleared and a
 /// read starts. Returns whether one started.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_retry(app: AppHandle, state: State<SharedState>, team: Option<String>, path: String) -> CmdResult<bool> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let (project, base, ws_root) = {
@@ -7833,7 +7834,7 @@ struct IngestStatusDto {
 }
 
 /// What waits in the focused project's library inbox.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_status(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestStatusDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let guard = state.lock().unwrap();
@@ -7849,7 +7850,7 @@ fn ingest_status(app: AppHandle, state: State<SharedState>, team: Option<String>
 }
 
 /// Read what waits in Raw/ now, whatever the repo's kind.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_now(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<bool> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let guard = state.lock().unwrap();
@@ -7865,7 +7866,7 @@ fn ingest_now(app: AppHandle, state: State<SharedState>, team: Option<String>) -
 /// last first (one whose file changed since is kept and named), then the
 /// note unless a person edited it, and the source back to Raw/. What waits
 /// is closed, and so is the card.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_undo(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<ken_core::ingest::UndoReport> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let report = {
@@ -7893,7 +7894,7 @@ fn ingest_undo(app: AppHandle, state: State<SharedState>, team: Option<String>, 
 
 /// Read an undone source again: its card closes and the next pass, started
 /// now, reads it from Raw/ as if it had just been dropped in.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_read_again(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<bool> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let mut guard = state.lock().unwrap();
@@ -7920,7 +7921,7 @@ fn ingest_read_again(app: AppHandle, state: State<SharedState>, team: Option<Str
 /// Undo one write on an ingest card (by its place on the card): an edit's
 /// page back as it was, a created page, idea or escalation removed, a task
 /// archived. Refused when the file changed since it was written.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_undo_write(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64, index: usize) -> CmdResult<()> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let task = {
@@ -7946,7 +7947,7 @@ fn ingest_undo_write(app: AppHandle, state: State<SharedState>, team: Option<Str
 
 /// Done with an ingest: its source moves from Raw/ beside its note, in its
 /// kind's folder and month, and the card is resolved.
-#[tauri::command]
+#[tauri::command(async)]
 fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<String> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let mut guard = state.lock().unwrap();
@@ -8109,7 +8110,7 @@ fn pages_in(root: &std::path::Path, dir: &str) -> Vec<TeamPageDto> {
 /// as set-up wrote them (kind, index, branch, commit, how far behind its
 /// upstream), what each lacks for its kind, the workspace's ignore lines,
 /// the wiki's last drift sweep, and its rules and templates.
-#[tauri::command]
+#[tauri::command(async)]
 fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<TeamOverviewDto> {
     let guard = state.lock().unwrap();
     let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
@@ -8135,12 +8136,11 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             index,
             description: entry.and_then(|e| e.description.clone()).unwrap_or_default(),
             available: p.root.is_dir(),
-            branch: git.then(|| git_line(&p.root, &["rev-parse", "--abbrev-ref", "HEAD"])).flatten(),
-            head: git.then(|| git_line(&p.root, &["rev-parse", "--short=8", "HEAD"])).flatten(),
-            behind: git
-                .then(|| git_line(&p.root, &["rev-list", "--count", "HEAD..@{u}"]))
-                .flatten()
-                .and_then(|n| n.parse().ok()),
+            // Filled in after the lock is released (see below): a git call
+            // per repo, three per repo, is too slow to hold everyone up for.
+            branch: git.then(String::new),
+            head: None,
+            behind: None,
             files,
         });
     }
@@ -8156,13 +8156,6 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         if !r.available {
             gaps.push(TeamGapDto { repo: Some(r.name.clone()), text: format!("{}'s folder is not there any more.", r.name), open: None });
             continue;
-        }
-        if let Some(n) = r.behind.filter(|n| *n > 0) {
-            gaps.push(TeamGapDto {
-                repo: Some(r.name.clone()),
-                text: format!("{} is {n} commit{} behind its upstream: pull it so Ken reads what is merged.", r.name, if n == 1 { "" } else { "s" }),
-                open: None,
-            });
         }
         if r.kind.contains(&ken_core::registry::RepoKind::Code) && !["CLAUDE.md", "AGENTS.md"].iter().any(|f| root.join(f).exists()) {
             gaps.push(TeamGapDto {
@@ -8211,10 +8204,40 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     let ignores = std::fs::read_to_string(ws.ws.root.join(".kenignore"))
         .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
         .unwrap_or_default();
+    let workspace = ws.ws.config.name.clone();
+    let ws_root = ws.ws.root.display().to_string();
+    drop(guard);
+
+    // Each repo's branch, commit and how far behind its upstream, read with
+    // the lock released and the repos side by side.
+    let mut repos = repos;
+    let mut wiki = wiki;
+    std::thread::scope(|s| {
+        for r in repos.iter_mut().chain(wiki.iter_mut()) {
+            if r.branch.is_none() {
+                continue;
+            }
+            s.spawn(move || {
+                let root = std::path::PathBuf::from(&r.path);
+                r.branch = git_line(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+                r.head = git_line(&root, &["rev-parse", "--short=8", "HEAD"]);
+                r.behind = git_line(&root, &["rev-list", "--count", "HEAD..@{u}"]).and_then(|n| n.parse().ok());
+            });
+        }
+    });
+    for r in repos.iter().chain(wiki.iter()) {
+        if let Some(n) = r.behind.filter(|n| *n > 0) {
+            gaps.push(TeamGapDto {
+                repo: Some(r.name.clone()),
+                text: format!("{} is {n} commit{} behind its upstream: pull it so Ken reads what is merged.", r.name, if n == 1 { "" } else { "s" }),
+                open: None,
+            });
+        }
+    }
     Ok(TeamOverviewDto {
         team,
-        workspace: ws.ws.config.name.clone(),
-        root: ws.ws.root.display().to_string(),
+        workspace,
+        root: ws_root,
         repos,
         wiki,
         gaps,
@@ -8228,7 +8251,7 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
 
 /// Write the workspace's ignore lines (`.kenignore` beside its repos). The
 /// next scan of each repo reads them.
-#[tauri::command]
+#[tauri::command(async)]
 fn team_save_ignores(state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
     let guard = state.lock().unwrap();
     let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
@@ -8238,7 +8261,7 @@ fn team_save_ignores(state: State<SharedState>, lines: Vec<String>) -> CmdResult
 
 /// A new rule in the team wiki's Ways-of-Working/Rules/, from the wiki's own
 /// rule template, named as the rule. Returns its path, to open and write.
-#[tauri::command]
+#[tauri::command(async)]
 fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> CmdResult<String> {
     let guard = state.lock().unwrap();
     let id: uuid::Uuid = wiki_id.parse().map_err(err)?;
@@ -8290,7 +8313,7 @@ async fn run_drift_now(state: State<'_, SharedState>, project_id: Option<String>
 
 /// A page's links both ways, resolved now: the pages it reaches and the
 /// pages that reach it (the Map's page neighbours).
-#[tauri::command]
+#[tauri::command(async)]
 fn page_links(state: State<SharedState>, path: String) -> CmdResult<ken_core::links::PageLinks> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -8314,7 +8337,7 @@ struct CodeOutlineItem {
     symbol: ken_core::codemap::Symbol,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn code_file(state: State<SharedState>, path: String) -> CmdResult<CodeFileDto> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -8832,7 +8855,7 @@ struct WorkspaceKgOverviewDto {
 /// With `team`, the team's graph: a view of the merged one (never a
 /// second build) keeping entities linked into the team's repos, their links
 /// into those repos, the edges between them, and the team's members.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_kg_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<WorkspaceKgOverviewDto> {
     let guard = state.lock().unwrap();
     if !federated_kg_enabled(&guard.app_settings) {
@@ -8948,7 +8971,7 @@ struct WorkspaceKgEntityDto {
 /// (federated-kg task 2.2 / spec "Every global entity is a wiki page" +
 /// design D4: "the frontend never joins") — summary, both edge directions,
 /// and per-project doc pointers. Flag-gated (task 2.3).
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_kg_entity(state: State<SharedState>, id: i64) -> CmdResult<WorkspaceKgEntityDto> {
     let guard = state.lock().unwrap();
     if !federated_kg_enabled(&guard.app_settings) {
@@ -9050,7 +9073,7 @@ const WORKSPACE_KG_SEARCH_LIMIT: usize = 50;
 /// floor the proposal's "FTS over global entity names + summaries" degrades
 /// to until a schema migration adds one. Fine at workspace scale. Flag-gated
 /// (task 2.3).
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_kg_search(
     state: State<SharedState>,
     query: String,
@@ -9717,7 +9740,7 @@ fn journal_append(
 /// `journal/archive/` for each date (spec: "archived journal stays
 /// findable") — a day with no file on either side is skipped, not an error.
 /// Most-recent-first.
-#[tauri::command]
+#[tauri::command(async)]
 fn read_journal(state: State<SharedState>, days_back: Option<u32>) -> CmdResult<Vec<JournalDayDto>> {
     let ws_root = {
         let guard = state.lock().unwrap();
@@ -10248,7 +10271,7 @@ fn my_tickets(
 
 /// Your day (frame Y1): my open tickets in the team, and my tasks for
 /// today (pending inbox tasks included, with `inbox` set).
-#[tauri::command]
+#[tauri::command(async)]
 fn day_state(state: State<SharedState>, team: Option<String>) -> CmdResult<DayStateDto> {
     let (ws, base_dir, settings) = day_snapshot(state.inner(), team.as_deref())?;
     let today = local_date_today();
@@ -10310,7 +10333,7 @@ fn reread_day_task(t: &ken_core::day::DayTask, today: &str) -> CmdResult<ken_cor
 }
 
 /// Add a task to the workspace home (`updated_by: you`).
-#[tauri::command]
+#[tauri::command(async)]
 fn day_task_create(app: AppHandle, state: State<SharedState>, input: ken_core::day::DayTaskInput) -> CmdResult<DayTaskDto> {
     let (ws, base_dir, settings) = day_snapshot(state.inner(), None)?;
     let (today, now) = (local_date_today(), local_stamp_now());
@@ -10327,7 +10350,7 @@ fn day_task_create(app: AppHandle, state: State<SharedState>, input: ken_core::d
 }
 
 /// Change a task (`updated_by: you`): only the fields given are written.
-#[tauri::command]
+#[tauri::command(async)]
 fn day_task_update(
     app: AppHandle,
     state: State<SharedState>,
@@ -10347,7 +10370,7 @@ fn day_task_update(
 }
 
 /// Delete a task: the file moves to its home's `archive/YYYY-MM/`.
-#[tauri::command]
+#[tauri::command(async)]
 fn day_task_delete(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
     let (ws, base_dir, settings) = day_snapshot(state.inner(), None)?;
     let today = local_date_today();
@@ -10360,7 +10383,7 @@ fn day_task_delete(app: AppHandle, state: State<SharedState>, id: String) -> Cmd
 /// My tasks linked to a ticket (frame Y1c), done ones included: those
 /// linked by `<repo>/<ID>` (`repo` = the member `project_id` names) and
 /// those linked by the bare `<ID>` (older links, any repo).
-#[tauri::command]
+#[tauri::command(async)]
 fn ticket_tasks(state: State<SharedState>, project_id: String, ticket_id: String) -> CmdResult<Vec<DayTaskDto>> {
     let (ws, base_dir, settings) = day_snapshot(state.inner(), None)?;
     let repo = team_repos(&ws, None)
@@ -10429,7 +10452,7 @@ fn save_team_digest(base_dir: &Path, workspace_id: uuid::Uuid, team: Option<&str
 }
 
 /// The team's newest digest, whatever day it was written.
-#[tauri::command]
+#[tauri::command(async)]
 fn team_digest(state: State<SharedState>, team: Option<String>) -> CmdResult<Option<TeamDigestDto>> {
     let (ws, base_dir, _) = day_snapshot(state.inner(), team.as_deref())?;
     Ok(load_team_digest(&base_dir, ws.config.id, team.as_deref()).map(|s| s.digest))
@@ -10725,7 +10748,7 @@ struct TeamIndexHealthDto {
     failed: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<TeamIndexHealthDto> {
     let (ws, base_dir, _) = day_snapshot(state.inner(), team.as_deref())?;
     let repos = team_repos(&ws, team.as_deref());
@@ -11008,7 +11031,7 @@ fn spawn_task_board_watch(app: AppHandle, state: SharedState) -> StopOnDrop {
 /// Sibling folders under the workspace root that are NOT yet members —
 /// the "add this repo too" list. Mirrors `discover_candidates`' filtering
 /// (no dot-folders, no junk dirs) minus everything already joined.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_candidates(state: State<SharedState>) -> CmdResult<Vec<CandidateDto>> {
     let guard = state.lock().unwrap();
     if !workspace_enabled(&guard.app_settings) {
@@ -11055,7 +11078,7 @@ struct CandidateDto {
 /// for the UI's "not projects" list. Derived by testing each sibling
 /// folder against the rules rather than by parsing lines back out, so a
 /// hand-written glob (`sr-universe-*/`) reports every folder it hides.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_ignored(state: State<SharedState>) -> CmdResult<Vec<String>> {
     let guard = state.lock().unwrap();
     if !workspace_enabled(&guard.app_settings) {
@@ -11261,7 +11284,7 @@ struct ProjectGroupDto {
 
 /// Named groups of members (e.g. a game and its tools). Stored in the
 /// workspace manifest so the grouping travels with the folder.
-#[tauri::command]
+#[tauri::command(async)]
 fn workspace_groups(state: State<SharedState>) -> CmdResult<Vec<ProjectGroupDto>> {
     let guard = state.lock().unwrap();
     if !workspace_enabled(&guard.app_settings) {
@@ -11883,7 +11906,7 @@ fn is_pdf(rel: &str) -> bool {
 
 // ---------- chat commands ----------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_chats(state: State<SharedState>) -> CmdResult<Vec<ChatRow>> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -11891,7 +11914,7 @@ fn list_chats(state: State<SharedState>) -> CmdResult<Vec<ChatRow>> {
     result
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn chat_transcript(state: State<SharedState>, chat_id: String) -> CmdResult<Vec<ChatMessage>> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
@@ -13278,7 +13301,7 @@ fn family_join(
 /// Every saved connection with its live sync state (task 2.1/2.3). The
 /// on-disk clone is never touched here — connection settings plus whatever
 /// `family_engine_handle` already has cached.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_list(state: State<SharedState>) -> CmdResult<Vec<FamilyConnectionDto>> {
     let (base_dir, settings) = {
         let guard = state.lock().unwrap();
@@ -13298,7 +13321,7 @@ fn family_list(state: State<SharedState>) -> CmdResult<Vec<FamilyConnectionDto>>
 /// The full manifest for one connection (member roster, owner, template
 /// version) — a settings-page convenience read, not part of the connection
 /// store itself.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_manifest_get(state: State<SharedState>, family_id: String) -> CmdResult<FamilyManifest> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let (base_dir, settings) = {
@@ -13371,7 +13394,7 @@ fn family_set_poll_interval(app: AppHandle, state: State<SharedState>, family_id
 /// "Sync now" (task 2.3): the same fetch -> rebase-integrate -> push cycle
 /// the poller runs, on demand, against the SAME cached engine (so a manual
 /// sync and the poller can't disagree about connection state).
-#[tauri::command]
+#[tauri::command(async)]
 fn family_sync_now(app: AppHandle, state: State<SharedState>, family_id: String) -> CmdResult<family_sync::SyncReport> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let (base_dir, settings) = {
@@ -13459,7 +13482,7 @@ fn family_detach_workspace(state: State<SharedState>, family_id: String) -> CmdR
 /// inbox/`, never a teammate's (lanes make a teammate's inbox unreadable to
 /// us in the git-write sense; nothing stops a local read, but there is no
 /// reason for one, and this command doesn't offer it).
-#[tauri::command]
+#[tauri::command(async)]
 fn family_inbox_list(state: State<SharedState>, family_id: String) -> CmdResult<Vec<family::InboxItem>> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let (base_dir, settings) = {
@@ -13483,7 +13506,7 @@ fn family_inbox_list(state: State<SharedState>, family_id: String) -> CmdResult<
 /// leave the change uncommitted until some later commit happened to
 /// re-stage the same path — this way every write is commit-then-push in one
 /// step, consistent with every other mutation in this file.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_set_item_status(
     app: AppHandle,
     state: State<SharedState>,
@@ -13539,7 +13562,7 @@ fn family_set_item_status(
 /// (the accepted task joins Your day's list) through `with_task_writes`,
 /// like an ordinary task write. Returns the accepted task as Your day
 /// shows it (the shape `day_task_create` returns).
-#[tauri::command]
+#[tauri::command(async)]
 fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: String, item_id: String) -> CmdResult<DayTaskDto> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let (base_dir, settings, ws_root) = {
@@ -13598,7 +13621,7 @@ fn family_accept_task(app: AppHandle, state: State<SharedState>, family_id: Stri
 /// action (`family_set_item_status`), not bundled into this one — push-back
 /// is "reply", not "reply and also change my own status", so this command
 /// does exactly the one lane-2 write it claims to.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_push_back(app: AppHandle, state: State<SharedState>, family_id: String, item_id: String, note: String) -> CmdResult<()> {
     let id: uuid::Uuid = family_id.parse().map_err(err)?;
     let (base_dir, settings) = {
@@ -13643,7 +13666,7 @@ fn family_push_back(app: AppHandle, state: State<SharedState>, family_id: String
 /// Send a task, message or notification to a teammate's inbox from the app,
 /// the same lane-2 write the MCP `family_send` tool makes. Delivery is not
 /// assignment: the item waits in their inbox until they accept or read it.
-#[tauri::command]
+#[tauri::command(async)]
 fn family_send(
     app: AppHandle,
     state: State<SharedState>,

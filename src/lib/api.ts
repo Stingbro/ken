@@ -1653,8 +1653,8 @@ export const api = {
     invoke<string>("create_document", { relPath }),
   openExternal: (relPath: string) => invoke<void>("open_external", { relPath }),
   /// Show a file in Finder/Explorer rather than opening it.
-  revealInFolder: (relPath: string) =>
-    invoke<void>("reveal_in_folder", { relPath }),
+  revealInFolder: (relPath: string, projectId: string | null = null) =>
+    invoke<void>("reveal_in_folder", { relPath, projectId }),
   /// Open an http(s) link in the system browser (anything else is refused by
   /// the backend).
   openWebUrl: (url: string) => invoke<void>("open_web_url", { url }),

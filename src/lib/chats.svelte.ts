@@ -135,6 +135,9 @@ class ChatsStore {
     // plus which one is focused.
     const openFiles = app.fileTabs.map((t) => t.path);
     const focusedFile = app.openFile;
+    // Working from the moment it is sent: the backend's own status follows,
+    // and its "done" or "error" ends it.
+    this.setStatus(chatId, "working");
     try {
       await api.sendChatMessage(chatId, text, openFiles, focusedFile, scope.chatScope);
     } catch (e) {
@@ -142,7 +145,13 @@ class ChatsStore {
       // doesn't sit there looking sent.
       this.transcript = dropPending(this.transcript, tempId);
       this.sendError = String(e);
+      this.setStatus(chatId, "error");
     }
+  }
+
+  private setStatus(chatId: string, status: ChatRow["status"]) {
+    const i = this.rows.findIndex((r) => r.id === chatId);
+    if (i >= 0) this.rows = this.rows.toSpliced(i, 1, { ...this.rows[i], status });
   }
 
   /** Answer a pending AskUserQuestion card. Merges the answers into the local
