@@ -1,7 +1,6 @@
 <script lang="ts">
   // Ingest: the one place sources come in (the Wright white box, frame
-  // 8b). Recipes and automations are gone; what they did (keep a page
-  // current from what comes in) is the ingest's own proposals now.
+  // 8b): files, a recording, a note or a chat, each read into the wiki.
   import IngestView from "../ingests/IngestView.svelte";
 </script>
 

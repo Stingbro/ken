@@ -1,6 +1,6 @@
 // Your day, the pure part: dates, ordering, and the short labels a task row
 // shows. No runes and no IPC, so it tests on its own.
-import type { DayTask } from "./api";
+import type { DayEscalation, DayTask } from "./api";
 
 /** A local calendar date as YYYY-MM-DD. */
 export function isoDate(d: Date): string {
@@ -190,6 +190,19 @@ export function ticketDetail(t: { repo: string; linkedTasks: number; linkedDone:
   if (t.linkedTasks === 0) return t.repo;
   const n = `${t.linkedTasks} task${t.linkedTasks === 1 ? "" : "s"}`;
   return `${t.repo} · ${n}, ${t.linkedDone} done`;
+}
+
+/** An escalation row's detail: "from dee · ATT-014 · blocks the release ·
+ *  att-wiki", each part left out when the file does not say it. */
+export function escalationDetail(e: Pick<DayEscalation, "raisedBy" | "ticket" | "blocks" | "raised" | "repo">): string {
+  const parts: string[] = [];
+  if (e.raisedBy) parts.push(`from ${e.raisedBy}`);
+  if (e.ticket) parts.push(e.ticket);
+  if (e.blocks) parts.push(`blocks ${e.blocks}`);
+  const raised = datePart(e.raised);
+  if (raised) parts.push(`raised ${raised}`);
+  if (e.repo) parts.push(e.repo);
+  return parts.join(" · ");
 }
 
 /** The ticket id of a path in a repo, when it is a ticket file:

@@ -1,12 +1,13 @@
 <script lang="ts">
-  // Your day (Y1): the team digest, the team's tickets assigned to me, my
-  // other tasks, then recent files across the team and its index health.
+  // Your day (Y1): the team digest, the team's tickets assigned to me, the
+  // escalations addressed to me (only when there are any), my other tasks,
+  // then recent files across the team and its index health.
   // Clicking a task opens its panel (Y1b) beside the list.
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
   import { day, memberNames, openInRepo, openMemberPath, repoName } from "../lib/day.svelte";
-  import { isOverdue, shortTarget, taskDetail, ticketDetail } from "../lib/day";
+  import { escalationDetail, isOverdue, shortTarget, taskDetail, ticketDetail } from "../lib/day";
   import { digestMarkdown } from "../lib/assist";
   import { renderMarkdown } from "../lib/markdown";
   import { parseCitation } from "../lib/citation";
@@ -227,6 +228,29 @@
           {:else}
             <p class="quiet small">No open tickets assigned to you.</p>
           {/if}
+        </section>
+      {/if}
+
+      <!-- Escalations addressed to me: read only; a row opens its file -->
+      {#if day.escalations.length > 0}
+        <section>
+          <div class="list-head">
+            <span class="overline">Escalations · {day.escalations.length}</span>
+            <span class="sp"></span>
+            <span class="col-label st-col">status</span>
+          </div>
+          <div class="group">
+            {#each day.escalations as e (e.projectId + ":" + e.relPath)}
+              <button class="row ticket" title={`${e.repo}/${e.relPath}`} onclick={() => void openInRepo(e.projectId, e.relPath)}>
+                <span class="tid mono">{e.id}</span>
+                <span class="tx">
+                  <span class="tt">{e.title}</span>
+                  <span class="td">{escalationDetail(e)}</span>
+                </span>
+                <span class="st-col"><span class="chip state">{e.status}</span></span>
+              </button>
+            {/each}
+          </div>
         </section>
       {/if}
 

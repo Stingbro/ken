@@ -27,8 +27,9 @@ use crate::{Error, Result};
 pub const COMMIT_MESSAGE: &str = "Ken: update knowledge";
 
 /// Ken's transient files, kept out of the user's repository via
-/// `.git/info/exclude` (non-invasive: no tracked file is touched).
-const EXCLUDE_ENTRIES: &[&str] = &[".ken/.staging/", ".claude/settings.local.json"];
+/// `.git/info/exclude` (non-invasive: no tracked file is touched). Generated
+/// transcripts are this machine's cache (`transcript::cache_dir`).
+const EXCLUDE_ENTRIES: &[&str] = &[".ken/.staging/", ".ken/transcripts/", ".claude/settings.local.json"];
 
 // ---------- git primitives ----------
 

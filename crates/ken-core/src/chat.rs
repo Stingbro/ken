@@ -463,29 +463,109 @@ pub fn build_scope_preamble(
 /// the folder is one the user already chose as a Ken project, pre-accepting the
 /// trust is honest consent — and it is scoped to exactly this project's path(s)
 /// so it never affects the user's other Claude usage. Best-effort: any IO/parse
-/// failure is swallowed so a chat still spawns (it just may hit the prompt).
+/// failure is swallowed so a session still spawns (it just may hit the prompt).
+///
+/// Only the interactive TUI needs this (`attach_terminal`, the runner's hidden
+/// TUI); print mode (`-p`) never shows the dialog. The file is shared with
+/// every running Claude Code, so it is written only when a flag is missing,
+/// through a temp file and a rename, and never when it cannot be parsed (a
+/// half-written file must not be replaced by one holding only our keys).
 pub fn ensure_folder_trusted(project_root: &Path) {
-    let Some(cfg_path) = claude_config_path() else { return };
+    if let Some(cfg_path) = claude_config_path() {
+        trust_folder_in(&cfg_path, project_root);
+    }
+}
 
-    // The CLI keys the map by the process cwd. Register both the path we pass
-    // and its canonical (symlink-resolved) form, so we match whichever the
-    // spawned process ends up reporting as its cwd.
-    let mut keys = vec![project_root.to_string_lossy().into_owned()];
-    if let Ok(canon) = std::fs::canonicalize(project_root) {
-        let canon = canon.to_string_lossy().into_owned();
-        if !keys.contains(&canon) {
-            keys.push(canon);
+/// [`ensure_folder_trusted`] against the config file at `cfg_path`.
+fn trust_folder_in(cfg_path: &Path, project_root: &Path) {
+    let (keys, stale) = trust_keys(project_root);
+    let existing = match std::fs::read(cfg_path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(_) => return,
+    };
+    if !needs_trust_write(&existing, &keys, &stale) {
+        return;
+    }
+    let updated = apply_folder_trust(existing, &keys, &stale);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&updated) {
+        let _ = write_atomically(cfg_path, &bytes);
+    }
+}
+
+/// The keys Claude Code reads for `project_root` (the path as given and its
+/// canonical form, in Claude Code's own spelling), and the keys older Ken
+/// versions wrote on Windows that Claude Code never reads (backslashes, the
+/// `\\?\` prefix), to be dropped when they hold nothing but Ken's flags.
+fn trust_keys(project_root: &Path) -> (Vec<String>, Vec<String>) {
+    let raw = project_root.to_string_lossy().into_owned();
+    let canonical = crate::setup::plain_canonical(project_root).to_string_lossy().into_owned();
+    let mut keys = Vec::new();
+    for p in [&raw, &canonical] {
+        let k = claude_config_key(p, cfg!(windows));
+        if !keys.contains(&k) {
+            keys.push(k);
         }
     }
-
-    let existing = std::fs::read(&cfg_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .unwrap_or(Value::Null);
-    let updated = apply_folder_trust(existing, &keys);
-    if let Ok(bytes) = serde_json::to_vec_pretty(&updated) {
-        let _ = std::fs::write(&cfg_path, bytes);
+    let mut stale = Vec::new();
+    if cfg!(windows) {
+        let verbatim = std::fs::canonicalize(project_root)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for p in [raw, canonical, verbatim] {
+            if !p.is_empty() && !keys.contains(&p) && !stale.contains(&p) {
+                stale.push(p);
+            }
+        }
     }
+    (keys, stale)
+}
+
+/// A folder's key in `~/.claude.json` as Claude Code writes it: the path its
+/// process sees as the cwd. On Windows that has no `\\?\` prefix and uses
+/// forward slashes (`C:/Code/ken`); elsewhere it is the path unchanged.
+pub(crate) fn claude_config_key(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_string();
+    }
+    let plain = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    };
+    plain.replace('\\', "/")
+}
+
+const TRUST_FLAGS: [&str; 2] = ["hasTrustDialogAccepted", "hasCompletedProjectOnboarding"];
+
+/// Whether `cfg` lacks a trust flag for any of `keys`, or still holds one of
+/// Ken's own `stale` entries.
+fn needs_trust_write(cfg: &Value, keys: &[String], stale: &[String]) -> bool {
+    let projects = cfg.get("projects");
+    let missing = keys.iter().any(|k| {
+        let entry = projects.and_then(|p| p.get(k));
+        TRUST_FLAGS.iter().any(|f| entry.and_then(|e| e.get(*f)) != Some(&Value::Bool(true)))
+    });
+    missing || stale.iter().any(|k| projects.and_then(|p| p.get(k)).is_some_and(is_only_ken_flags))
+}
+
+/// An entry holding nothing but the flags Ken writes (so Ken wrote it).
+fn is_only_ken_flags(entry: &Value) -> bool {
+    entry.as_object().is_some_and(|o| o.keys().all(|k| TRUST_FLAGS.contains(&k.as_str())))
+}
+
+/// Replace `path` with `bytes` through a temp file in the same folder and a
+/// rename, so a reader never sees a half-written file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.ken-{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Locate Claude Code's `.claude.json`. Honors `CLAUDE_CONFIG_DIR` (which the
@@ -495,14 +575,20 @@ fn claude_config_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join(".claude.json"));
     }
+    // Unit tests that start a hidden TUI (runner, research, ingest) never
+    // write into the developer's own ~/.claude.json.
+    if cfg!(test) {
+        return None;
+    }
     dirs::home_dir().map(|h| h.join(".claude.json"))
 }
 
 /// Set the trust/onboarding flags for exactly `path_keys` in a parsed
-/// `~/.claude.json` value, creating the `projects` map and entries as needed
-/// and leaving every other key (and every other project) untouched. Pure so it
-/// is unit-tested without a real home directory.
-fn apply_folder_trust(mut cfg: Value, path_keys: &[String]) -> Value {
+/// `~/.claude.json` value, creating the `projects` map and entries as needed,
+/// drop the `stale` entries that hold only Ken's flags, and leave every other
+/// key (and every other project) untouched. Pure so it is unit-tested without
+/// a real home directory.
+fn apply_folder_trust(mut cfg: Value, path_keys: &[String], stale: &[String]) -> Value {
     if !cfg.is_object() {
         cfg = Value::Object(serde_json::Map::new());
     }
@@ -514,6 +600,8 @@ fn apply_folder_trust(mut cfg: Value, path_keys: &[String]) -> Value {
         *projects = Value::Object(serde_json::Map::new());
     }
     let projects = projects.as_object_mut().unwrap();
+    // `retain` keeps the order of the person's other entries.
+    projects.retain(|k, v| !(stale.contains(k) && is_only_ken_flags(v)));
     for key in path_keys {
         let entry = projects
             .entry(key.clone())
@@ -731,11 +819,12 @@ impl ChatEngine {
             }
         }
 
-        // Pre-accept folder trust so a first run in a fresh project doesn't hit
-        // the blocking onboarding gate (scoped to this project's path only).
-        ensure_folder_trusted(&self.project_root);
-
+        // Print mode (`-p`) never shows the trust dialog, so no folder trust
+        // is written here; only the interactive TUI needs it (attach_terminal,
+        // the runner's hidden TUI).
         let mut cmd = Command::new(&self.binary);
+        // No console window for the chat process (see `proc::quiet`).
+        crate::proc::quiet(&mut cmd);
         cmd.args([
             "-p",
             "--input-format",
@@ -1226,7 +1315,7 @@ mod tests {
                 "/other/proj": { "hasTrustDialogAccepted": true, "lastCost": 1.5 }
             }
         });
-        let out = apply_folder_trust(existing, &["/ken/proj".to_string()]);
+        let out = apply_folder_trust(existing, &["/ken/proj".to_string()], &[]);
         // Our project is now trusted.
         assert_eq!(out["projects"]["/ken/proj"]["hasTrustDialogAccepted"], true);
         assert_eq!(out["projects"]["/ken/proj"]["hasCompletedProjectOnboarding"], true);
@@ -1237,10 +1326,79 @@ mod tests {
 
     #[test]
     fn folder_trust_from_empty_config_is_idempotent() {
-        let a = apply_folder_trust(Value::Null, &["/p".to_string()]);
-        let b = apply_folder_trust(a.clone(), &["/p".to_string()]);
+        let a = apply_folder_trust(Value::Null, &["/p".to_string()], &[]);
+        let b = apply_folder_trust(a.clone(), &["/p".to_string()], &[]);
         assert_eq!(a, b);
         assert_eq!(b["projects"]["/p"]["hasTrustDialogAccepted"], true);
+    }
+
+    /// Claude Code on Windows keys a folder by its plain path with forward
+    /// slashes; on macOS and Linux by the path as it is.
+    #[test]
+    fn trust_keys_are_written_in_claude_codes_form() {
+        assert_eq!(claude_config_key(r"C:\ken-eval\ATT\ATT-Wiki", true), "C:/ken-eval/ATT/ATT-Wiki");
+        assert_eq!(claude_config_key(r"\\?\C:\Code\ken", true), "C:/Code/ken");
+        assert_eq!(claude_config_key(r"\\?\UNC\server\share\repo", true), "//server/share/repo");
+        assert_eq!(claude_config_key("/Users/a/My Repo", false), "/Users/a/My Repo");
+    }
+
+    /// Nothing is written when every flag is already set, and the entries old
+    /// Ken versions wrote under keys Claude Code never reads are dropped, but
+    /// only when they hold nothing besides Ken's flags.
+    #[test]
+    fn trust_write_is_skipped_when_set_and_drops_only_kens_stale_entries() {
+        let keys = vec!["C:/Code/ken".to_string()];
+        let stale = vec![r"C:\Code\ken".to_string(), r"\\?\C:\Code\ken".to_string()];
+        let set = serde_json::json!({ "projects": { "C:/Code/ken": {
+            "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true, "lastCost": 2.0 } } });
+        assert!(!needs_trust_write(&set, &keys, &stale));
+        assert!(needs_trust_write(&Value::Null, &keys, &stale));
+        let half = serde_json::json!({ "projects": { "C:/Code/ken": { "hasTrustDialogAccepted": false } } });
+        assert!(needs_trust_write(&half, &keys, &stale));
+
+        let mut with_stale = set.clone();
+        with_stale["projects"][r"C:\Code\ken"] =
+            serde_json::json!({ "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true });
+        with_stale["projects"][r"\\?\C:\Code\ken"] =
+            serde_json::json!({ "hasTrustDialogAccepted": true, "allowedTools": ["Read"] });
+        assert!(needs_trust_write(&with_stale, &keys, &stale));
+        let out = apply_folder_trust(with_stale, &keys, &stale);
+        assert!(out["projects"].get(r"C:\Code\ken").is_none(), "Ken's own stale entry is dropped");
+        assert_eq!(out["projects"][r"\\?\C:\Code\ken"]["allowedTools"][0], "Read", "an entry with more in it stays");
+        assert_eq!(out["projects"]["C:/Code/ken"]["lastCost"], 2.0);
+    }
+
+    /// The write goes through a temp file and leaves no temp file behind; a
+    /// config that does not parse is never replaced.
+    #[test]
+    fn trust_is_written_atomically_and_never_over_an_unparsable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = dir.path().join(".claude.json");
+
+        // No config yet: one is written, and no temp file is left behind.
+        trust_folder_in(&path, &repo);
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let key = claude_config_key(&crate::setup::plain_canonical(&repo).to_string_lossy(), cfg!(windows));
+        assert_eq!(cfg["projects"][&key]["hasTrustDialogAccepted"], true, "got {cfg}");
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "repo")
+            .collect();
+        assert_eq!(names, vec![".claude.json".to_string()], "no temp file left behind");
+
+        // Already trusted: the file is not rewritten.
+        std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        trust_folder_in(&path, &repo);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A half-written config is left alone.
+        std::fs::write(&path, b"{\"projects\": {").unwrap();
+        trust_folder_in(&path, &repo);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"projects\": {");
     }
 
     #[test]

@@ -403,8 +403,7 @@
           <p class="note">{knowledge.llmNotice}</p>
         {:else}
           <p class="pulse">
-            This happens on this computer, a file at a time — the map fills in as it
-            goes.
+            Ken reads a file at a time; the map fills in as it goes.
           </p>
         {/if}
       </div>

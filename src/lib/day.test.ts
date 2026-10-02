@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   datePart,
+  escalationDetail,
   isOverdue,
   linkLabel,
   orderTasks,
@@ -186,6 +187,17 @@ describe("ticket links in a repo", () => {
     expect(linkLabel("att-opmodel/README.md", repos)).toBe("att-opmodel/README.md");
     expect(linkLabel("other/ATT-014", repos)).toBe("other/ATT-014");
     expect(linkLabel("att-opmodel/ATT-014")).toBe("att-opmodel/ATT-014");
+  });
+});
+
+describe("escalationDetail", () => {
+  it("names who raised it, its ticket, what it blocks, when and where", () => {
+    expect(
+      escalationDetail({ raisedBy: "dee", ticket: "ATT-014", blocks: "the release", raised: "2026-09-30T10:00", repo: "att-team" }),
+    ).toBe("from dee · ATT-014 · blocks the release · raised 2026-09-30 · att-team");
+  });
+  it("leaves out what the file does not say", () => {
+    expect(escalationDetail({ raisedBy: "", ticket: null, blocks: null, raised: null, repo: "att-team" })).toBe("att-team");
   });
 });
 

@@ -67,7 +67,7 @@ impl FileKind {
             // transcript is editable in the UI and indexes its own words. (An
             // adjacent-to-video `.vtt` is still pulled in as that video's
             // transcript by `crate::transcript`; see the note in `extract`.)
-            "txt" | "text" | "log" | "vtt" => FileKind::Txt,
+            "txt" | "text" | "log" | "vtt" | "srt" => FileKind::Txt,
             "rs" | "ts" | "js" | "jsx" | "tsx" | "svelte" | "py" | "rb" | "go" | "java"
             | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "swift" | "kt" | "sh" | "bash"
             | "zsh" | "sql" | "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "html"
@@ -79,7 +79,11 @@ impl FileKind {
             "ipynb" => FileKind::Ipynb,
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" | "tif"
             | "svg" => FileKind::Image,
-            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => FileKind::Video,
+            // A recording, with or without pictures: its content is its
+            // transcript (`crate::transcript`), so audio files are this kind
+            // too.
+            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "wav" | "mp3" | "m4a" | "aac" | "flac" | "ogg"
+            | "oga" | "opus" | "wma" => FileKind::Video,
             "url" => FileKind::Url,
             "drawio" => FileKind::Drawio,
             _ => FileKind::Binary,
@@ -357,11 +361,12 @@ mod tests {
         assert!(FileKind::Ipynb.has_content());
         assert_eq!(FileKind::from_path(Path::new("x.unknown")), FileKind::Binary);
         assert_eq!(FileKind::from_path(Path::new("noext")), FileKind::Binary);
+        assert_eq!(FileKind::from_path(Path::new("call.srt")), FileKind::Txt);
     }
 
     #[test]
     fn video_kind_mapping() {
-        for ext in ["mp4", "mov", "m4v", "webm", "mkv", "avi", "MP4", "MoV"] {
+        for ext in ["mp4", "mov", "m4v", "webm", "mkv", "avi", "MP4", "MoV", "wav", "mp3", "m4a", "flac", "ogg"] {
             let name = format!("clips/demo.{ext}");
             assert_eq!(
                 FileKind::from_path(Path::new(&name)),

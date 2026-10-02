@@ -43,10 +43,10 @@ pub const FLAGS: &[FlagDef] = &[
         applies: "this repo",
         scope: FlagScope::Project,
         default: true,
-        description: "Meaning-based search using a local embedding model. \
-                      On by default; it needs Nomic Embed v1.5 (~140 MB, \
-                      Settings → Models), and until that is downloaded \
-                      search is by keyword.",
+        description: "Finds passages by meaning as well as by keyword, \
+                      with a model that runs on this computer. It needs a \
+                      search-by-meaning model from Settings › This machine; \
+                      until one is installed, search is by keyword.",
     },
     FlagDef {
         name: "profiler",

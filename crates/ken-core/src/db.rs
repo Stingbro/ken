@@ -743,6 +743,26 @@ impl Db {
         self.meta_set("drift_cache", json)
     }
 
+    /// The last wiki draft's result (first draft or a repo added), as JSON
+    /// (see `wikidraft::Drafted`).
+    pub fn wiki_draft(&self) -> Result<Option<String>> {
+        self.meta_get("wiki_draft")
+    }
+
+    pub fn store_wiki_draft(&self, json: &str) -> Result<()> {
+        self.meta_set("wiki_draft", json)
+    }
+
+    /// Repos that left the team while the wiki still cited them, as JSON
+    /// (see `wikidraft::removed_repos`).
+    pub fn removed_repos(&self) -> Result<Option<String>> {
+        self.meta_get("removed_repos")
+    }
+
+    pub fn store_removed_repos(&self, json: &str) -> Result<()> {
+        self.meta_set("removed_repos", json)
+    }
+
     /// Start a batch: the writes that follow, until [`Db::commit_batch`],
     /// land as one transaction. Each write method's own savepoint nests
     /// inside it, so a scan pays one commit per batch, not several per file.
@@ -1085,6 +1105,37 @@ impl Db {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?)
+    }
+
+    /// Chunks that have a meaning vector (0 before the first build, or
+    /// without the vector extension).
+    pub fn vector_count(&self) -> Result<i64> {
+        if !self.vec_available {
+            return Ok(0);
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'vec_chunks')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(0);
+        }
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?)
+    }
+
+    /// Forget every meaning vector and the model they came from, so the next
+    /// build re-reads every chunk with a different model. The chunks and the
+    /// keyword index stay: keyword search keeps working meanwhile.
+    pub fn reset_vectors(&self) -> Result<()> {
+        if self.vec_available {
+            self.conn.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
+        }
+        self.conn.execute(
+            "DELETE FROM meta WHERE key IN ('embed_model', 'embed_dim', 'semantic_built_at')",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Insert or update a file's index entry. `text` is the extracted
@@ -3148,6 +3199,30 @@ impl Db {
         Ok(n)
     }
 
+    /// Queue again the OCR rows marked `done` with no regions once `engine` is
+    /// the one reading them: before Windows had a backend, every queued image
+    /// and scanned PDF there was marked done without being read. The engine is
+    /// stamped in `meta` (`ocr_engine`), so this runs once per engine change.
+    /// `unset_as` names the engine an index without a stamp was read by (on
+    /// macOS, Vision, so nothing is read twice there). Returns the row count.
+    pub fn requeue_ocr_for_engine(&mut self, engine: &str, unset_as: Option<&str>) -> Result<usize> {
+        let stamped = self.meta_get("ocr_engine")?;
+        if stamped.as_deref().or(unset_as) == Some(engine) {
+            if stamped.is_none() {
+                self.meta_set("ocr_engine", engine)?;
+            }
+            return Ok(0);
+        }
+        let n = self.conn.execute(
+            "UPDATE ocr_pending SET status = 'pending', error = NULL, attempts = 0
+             WHERE status = 'done'
+               AND rel_path NOT IN (SELECT DISTINCT rel_path FROM ocr_regions)",
+            [],
+        )?;
+        self.meta_set("ocr_engine", engine)?;
+        Ok(n)
+    }
+
     /// All stored OCR regions for a file, page-then-insertion order — the input
     /// to the Cmd+F highlight overlay (Phase 3). Empty when the file was never
     /// OCR'd (or had no text).
@@ -4603,6 +4678,34 @@ mod tests {
         db.remove_file("gone.png").unwrap();
         assert!(db.get_ocr_regions("gone.png").unwrap().is_empty());
         assert!(db.next_pending_ocr().unwrap().is_none());
+    }
+
+    /// Files marked done with nothing read (Windows before it had an OCR
+    /// backend) are read again once, when an engine is first stamped; files
+    /// with regions stay done, and the same engine never re-queues twice.
+    #[test]
+    fn a_new_ocr_engine_rereads_files_marked_done_without_regions() {
+        let mut db = Db::open_in_memory().unwrap();
+        for f in ["empty.png", "read.png"] {
+            db.upsert_file(f, "image", 1, 1, "metadata_only", None, "").unwrap();
+            db.enqueue_ocr_if_changed(f, "h1").unwrap();
+        }
+        db.mark_ocr_done("empty.png", "h1", &[]).unwrap();
+        db.mark_ocr_done("read.png", "h1", &[OcrRegionRow { page: 0, text: "x".into(), bbox: [0.0, 0.0, 1.0, 1.0] }])
+            .unwrap();
+        assert_eq!(db.requeue_ocr_for_engine("winrt", None).unwrap(), 1);
+        assert_eq!(db.next_pending_ocr().unwrap(), Some(("empty.png".into(), "h1".into())));
+        db.mark_ocr_done("empty.png", "h1", &[]).unwrap();
+        assert_eq!(db.requeue_ocr_for_engine("winrt", None).unwrap(), 0, "once per engine");
+        assert!(db.next_pending_ocr().unwrap().is_none());
+
+        // An unstamped index read by the same engine (macOS) is only stamped.
+        let mut mac = Db::open_in_memory().unwrap();
+        mac.upsert_file("blank.png", "image", 1, 1, "metadata_only", None, "").unwrap();
+        mac.enqueue_ocr_if_changed("blank.png", "h1").unwrap();
+        mac.mark_ocr_done("blank.png", "h1", &[]).unwrap();
+        assert_eq!(mac.requeue_ocr_for_engine("vision", Some("vision")).unwrap(), 0);
+        assert_eq!(mac.meta_get("ocr_engine").unwrap().as_deref(), Some("vision"));
     }
 
     #[test]

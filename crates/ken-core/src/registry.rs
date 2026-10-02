@@ -203,6 +203,18 @@ pub fn kind_of(root: &Path) -> Vec<RepoKind> {
         .unwrap_or_default()
 }
 
+/// Whether the repo at `root` is a team's library: said to be a team or wiki
+/// repo, or holding the inbox (`Research/Ingestion/Raw/`) whatever its kind.
+pub fn is_library(root: &Path) -> bool {
+    crate::ingest::has_inbox(root) || kind_of(root).iter().any(|k| matches!(k, RepoKind::Team | RepoKind::Wiki))
+}
+
+/// Whether a project folder is a workspace's own `.ken-workspace` (its
+/// memory), which is not a repo and is never registered as one.
+pub fn is_workspace_folder(path: &Path) -> bool {
+    path.file_name().is_some_and(|n| n == crate::workspace::CONFIG_DIR)
+}
+
 impl Registry {
     pub fn load(base: &Path) -> Result<Registry> {
         let path = registry_path(base);
@@ -241,6 +253,34 @@ impl Registry {
                 description: None,
             }),
         }
+    }
+
+    /// A repo with an inbox and no kind said is the team's wiki: give it the
+    /// wiki kind, and `team` when it has none. Returns whether it changed.
+    pub fn infer_library(&mut self, root: &Path, team: Option<&str>) -> bool {
+        if !crate::ingest::has_inbox(root) {
+            return false;
+        }
+        let want = canonical(root);
+        let Some(entry) = self.projects.iter_mut().find(|e| canonical(&e.path) == want) else {
+            return false;
+        };
+        if !entry.kind.is_empty() {
+            return false;
+        }
+        entry.kind = vec![RepoKind::Wiki];
+        if entry.team.is_none() {
+            entry.team = team.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        }
+        true
+    }
+
+    /// Drop entries for a workspace's own `.ken-workspace` folder, which
+    /// earlier versions registered. Returns whether any were there.
+    pub fn forget_workspace_folders(&mut self) -> bool {
+        let before = self.projects.len();
+        self.projects.retain(|e| !is_workspace_folder(&e.path));
+        self.projects.len() != before
     }
 
     /// Set a project's kind and team. Returns false for an unknown id.
@@ -474,6 +514,39 @@ mod tests {
         assert_eq!(loaded.projects[0].team, None);
         let raw = serde_json::to_string(&loaded).unwrap();
         assert!(!raw.contains("kind") && !raw.contains("team"), "unset fields are not written");
+    }
+
+    #[test]
+    fn a_repo_with_an_inbox_and_no_kind_is_the_wiki() {
+        let wiki_dir = tempdir().unwrap();
+        fs::create_dir_all(wiki_dir.path().join(crate::ingest::RAW)).unwrap();
+        let wiki = Project::create(wiki_dir.path(), "ATT-Wiki").unwrap();
+        let code_dir = tempdir().unwrap();
+        let code = Project::create(code_dir.path(), "att-web").unwrap();
+        let mut reg = Registry::default();
+        reg.add(&wiki);
+        reg.add(&code);
+        assert!(reg.infer_library(wiki_dir.path(), Some("ATT")));
+        assert_eq!(reg.kind_of(wiki_dir.path()), vec![RepoKind::Wiki]);
+        assert_eq!(reg.entry_at(wiki_dir.path()).unwrap().team.as_deref(), Some("ATT"));
+        assert!(!reg.infer_library(wiki_dir.path(), Some("Other")), "said once, kept");
+        assert!(!reg.infer_library(code_dir.path(), Some("ATT")), "no inbox, no kind");
+        reg.set_kind(wiki.config.id, vec![RepoKind::Team], None);
+        assert!(!reg.infer_library(wiki_dir.path(), Some("ATT")), "a kind a person said stands");
+    }
+
+    #[test]
+    fn a_workspace_folder_is_not_kept_as_a_repo() {
+        let ws_dir = tempdir().unwrap();
+        let folder = ws_dir.path().join(crate::workspace::CONFIG_DIR);
+        fs::create_dir_all(&folder).unwrap();
+        let memory = Project::create(&folder, "Workspace Memory").unwrap();
+        let mut reg = Registry::default();
+        reg.add(&memory);
+        assert!(is_workspace_folder(&folder));
+        assert!(reg.forget_workspace_folders());
+        assert!(reg.projects.is_empty());
+        assert!(!reg.forget_workspace_folders());
     }
 
     #[test]

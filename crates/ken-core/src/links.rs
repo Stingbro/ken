@@ -253,7 +253,7 @@ impl LinkReport {
         self.broken_paths.is_empty() && self.missing_names.is_empty() && self.duplicate_names.is_empty()
     }
 
-    /// The Review item body: short, grouped, most useful first.
+    /// The report as text: short, grouped, most useful first.
     pub fn to_markdown(&self) -> String {
         let mut s = format!("{} name links and {} path links checked.\n", self.name_links, self.path_links);
         if !self.missing_names.is_empty() {
@@ -338,35 +338,58 @@ pub fn page_links(db: &Db, path: &str) -> Result<PageLinks> {
     Ok(out)
 }
 
-/// Keep one open Review item for the link report: replaced when what it says
-/// changes, resolved when the library is clean. Returns whether it changed.
-pub fn file_review_item(db: &mut Db, report: &LinkReport, now: i64) -> Result<bool> {
-    let body = report.to_markdown();
-    let open = db.open_review_item_of_kind(REVIEW_KIND)?;
-    if report.is_clean() {
-        if let Some((id, _)) = open {
-            db.resolve_review_item(id, now)?;
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-    if let Some((id, old_body)) = &open {
-        if *old_body == body {
-            return Ok(false);
-        }
-        db.resolve_review_item(*id, now)?;
-    }
-    let title = format!(
-        "Links: {} missing, {} broken, {} ambiguous",
-        report.missing_names.len(),
-        report.broken_paths.values().map(Vec::len).sum::<usize>(),
-        report.duplicate_names.len()
-    );
-    db.insert_review_item(REVIEW_KIND, &title, &body, "", None, now)?;
-    Ok(true)
+/// One entry of the link report for the Team screen: a page to write, a
+/// broken link, or a name two pages claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Finding {
+    /// `missing-page` · `broken-link` · `ambiguous-name`
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    /// The page to open: the first one asking, the linking page, or the
+    /// first claimant.
+    pub path: String,
 }
 
-pub const REVIEW_KIND: &str = "links";
+/// The report as findings, the most asked-for missing page first, at most
+/// `limit` of each kind.
+pub fn findings(report: &LinkReport, limit: usize) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (name, askers) in report.missing_names.iter().take(limit) {
+        out.push(Finding {
+            kind: "missing-page".into(),
+            title: format!("[[{name}]] has no page"),
+            detail: format!(
+                "Asked for by {} page{}: {}.",
+                askers.len(),
+                if askers.len() == 1 { "" } else { "s" },
+                askers.join(", ")
+            ),
+            path: askers.first().cloned().unwrap_or_default(),
+        });
+    }
+    for (section, links) in &report.broken_paths {
+        for (from, to) in links.iter().take(limit) {
+            out.push(Finding {
+                kind: "broken-link".into(),
+                title: format!("{from} links to {to}, which is not there"),
+                detail: format!("In {section}."),
+                path: from.clone(),
+            });
+        }
+    }
+    for (name, owners) in report.duplicate_names.iter().take(limit) {
+        out.push(Finding {
+            kind: "ambiguous-name".into(),
+            title: format!("Two pages claim the name {name}"),
+            detail: format!("A link to [[{name}]] is ambiguous: {}.", owners.join(", ")),
+            path: owners.first().cloned().unwrap_or_default(),
+        });
+    }
+    out
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -416,9 +439,9 @@ mod tests {
 
     /// End to end over a scanned library: the report counts both kinds,
     /// ranks the missing name asked for most, groups the broken path by
-    /// section, gives page neighbours both ways, and keeps one Review item.
+    /// section, gives page neighbours both ways, and reads as findings.
     #[test]
-    fn a_scanned_library_reports_its_links_and_files_one_review_item() {
+    fn a_scanned_library_reports_its_links_as_findings() {
         use crate::project::Project;
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
@@ -449,11 +472,11 @@ mod tests {
         assert_eq!(n.outgoing, vec!["Ways-of-Working/Rules.md"], "reached through an alias");
         assert_eq!(n.incoming, vec!["Ways-of-Working/Rules.md"]);
 
-        assert!(file_review_item(&mut db, &r, 100).unwrap());
-        assert!(!file_review_item(&mut db, &r, 101).unwrap(), "same report: left alone");
-        assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_some());
-        assert!(file_review_item(&mut db, &LinkReport::default(), 102).unwrap());
-        assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none(), "clean: resolved");
+        let found = findings(&r, 20);
+        assert_eq!(found[0].kind, "missing-page");
+        assert!(found[0].title.contains("[[Ghost]]") && found[0].path == "Current/Team.md", "{found:?}");
+        assert!(found.iter().any(|f| f.kind == "broken-link" && f.path == "Ways-of-Working/Rules.md"));
+        assert!(findings(&LinkReport::default(), 20).is_empty(), "clean: nothing found");
     }
 
     #[test]

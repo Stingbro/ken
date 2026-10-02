@@ -515,42 +515,111 @@ fn draft_pages(
     Ok(())
 }
 
+/// A draft's result as the wiki keeps it, for the Team screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Drafted {
+    pub title: String,
+    pub at: i64,
+    pub report: DraftReport,
+}
+
+/// Keep the draft's result (the latest one replaces the one before).
 fn file_card(db: &mut Db, report: &DraftReport, title: &str, now: i64) -> Result<()> {
-    let mut body = String::new();
-    if !report.drafted.is_empty() {
-        body.push_str("**Drafted for you to read against their sources** (each is `status: draft`, not verified):\n");
-        for p in &report.drafted {
-            body.push_str(&format!("- {p}\n"));
+    let d = Drafted { title: title.to_string(), at: now, report: report.clone() };
+    db.store_wiki_draft(&serde_json::to_string(&d).map_err(|e| Error::Other(e.to_string()))?)
+}
+
+/// The last draft's result, if there was one.
+pub fn last_draft(db: &Db) -> Option<Drafted> {
+    db.wiki_draft().ok().flatten().and_then(|j| serde_json::from_str(&j).ok())
+}
+
+/// One thing a draft left for a person, for the Team screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Finding {
+    /// `draft` (a page drafted, still to read) · `draft-failed` · `proposal`
+    /// (a change to a kept page, to apply or discard) · `repo-removed`
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub path: String,
+    /// A proposal's Review-store id, for Apply and Discard.
+    pub item_id: Option<i64>,
+}
+
+/// Whether a page still says `status: draft`.
+fn still_draft(wiki: &Path, page: &str) -> bool {
+    let Ok(text) = fs::read_to_string(wiki.join(page)) else { return false };
+    let mut lines = text.lines();
+    lines.next().is_some_and(|l| l.trim_end() == "---")
+        && lines
+            .take_while(|l| l.trim_end() != "---")
+            .any(|l| l.trim().strip_prefix("status:").is_some_and(|v| v.trim().trim_matches('"') == "draft"))
+}
+
+/// What the wiki's drafts left for a person: the pages drafted and not yet
+/// read (still `status: draft`), the pages Ken could not draft and that are
+/// still missing, the open proposals to pages a person keeps, and repos that
+/// left the team while pages still cite them.
+pub fn findings(wiki: &Path, db: &Db) -> Result<Vec<Finding>> {
+    let mut out = Vec::new();
+    if let Some(d) = last_draft(db) {
+        for page in d.report.drafted.iter().filter(|p| still_draft(wiki, p)) {
+            out.push(Finding {
+                kind: "draft".into(),
+                title: format!("{page} is a draft to read"),
+                detail: "Ken drafted it from the team's repos. Read it against its sources, then set its status.".into(),
+                path: page.clone(),
+                item_id: None,
+            });
+        }
+        for (page, why) in &d.report.failed {
+            if may_draft(fs::read_to_string(wiki.join(page)).ok().as_deref()) {
+                out.push(Finding {
+                    kind: "draft-failed".into(),
+                    title: format!("Ken could not draft {page}"),
+                    detail: why.clone(),
+                    path: page.clone(),
+                    item_id: None,
+                });
+            }
         }
     }
-    if !report.proposed.is_empty() {
-        body.push_str("\n**Changes proposed** to pages a person keeps, each on its own card to apply or discard:\n");
-        for p in &report.proposed {
-            body.push_str(&format!("- {p}\n"));
+    for it in db.list_open_review_items()? {
+        if it.kind != PROPOSAL_KIND {
+            continue;
         }
-    }
-    if !report.kept.is_empty() {
-        body.push_str("\n**Left alone** (a person already wrote them):\n");
-        for p in &report.kept {
-            body.push_str(&format!("- {p}\n"));
+        let Some(p) = it.payload.as_deref().and_then(|j| serde_json::from_str::<Proposal>(j).ok()) else { continue };
+        // A proposal from an ingest waits on its card on the Ingest screen.
+        if p.from.is_some() {
+            continue;
         }
+        out.push(Finding { kind: "proposal".into(), title: it.title, detail: it.body, path: p.page, item_id: Some(it.id) });
     }
-    if !report.failed.is_empty() {
-        body.push_str("\n**Could not draft:**\n");
-        for (p, e) in &report.failed {
-            body.push_str(&format!("- {p}: {e}\n"));
+    for repo in removed_repos(db) {
+        let pages = citing_pages(db, &repo)?;
+        if pages.is_empty() {
+            continue;
         }
+        out.push(Finding {
+            kind: "repo-removed".into(),
+            title: format!("{repo} left the team: {} page{} cite it", pages.len(), if pages.len() == 1 { "" } else { "s" }),
+            detail: format!(
+                "Rewrite each without it, or retire it (`status: retired` with what replaced it): {}.",
+                pages.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+            path: pages[0].0.clone(),
+            item_id: None,
+        });
     }
-    if !report.to_fill.is_empty() {
-        body.push_str("\n**Still to fill by a person** (the sources could not say):\n");
-        for p in &report.to_fill {
-            body.push_str(&format!("- {p}\n"));
-        }
-    }
-    body.push_str(&format!("\nRead from {} sources: {}\n", report.sources.len(), report.sources.join(", ")));
-    let first = report.drafted.first().cloned().unwrap_or_default();
-    db.insert_review_item(REVIEW_KIND, title, &body, &first, None, now)?;
-    Ok(())
+    Ok(out)
+}
+
+/// Repos recorded as having left the team ([`record_removed_repo`]).
+pub fn removed_repos(db: &Db) -> Vec<String> {
+    db.removed_repos().ok().flatten().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
 }
 
 fn team_pages() -> Vec<(String, String)> {
@@ -558,7 +627,7 @@ fn team_pages() -> Vec<(String, String)> {
 }
 
 /// Draft every page of [`PAGES`] the wiki does not already have, then file
-/// one Review card listing what was drafted and kept.
+/// keep the result (what was drafted and kept) for the Team screen.
 pub fn draft(
     wiki: &Path,
     db: &mut Db,
@@ -672,7 +741,7 @@ fn draft_repo_pages(
 /// Draft a team's wiki: a Repo Map page per repo (each from that repo
 /// alone), the Repo Map index, then the team pages of [`PAGES`] from the
 /// repo pages and descriptions. `repos` are the team's repos, the wiki
-/// itself left out. One Review card lists it all.
+/// itself left out. The result is kept for the Team screen.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_team(
     wiki: &Path,
@@ -805,7 +874,8 @@ fn file_proposal(db: &mut Db, p: &Proposal, added: &[String], now: i64) -> Resul
     file_page_proposal(db, p, &title, &body, now)
 }
 
-/// File one proposed page change as a Review card, to apply or discard.
+/// Store one proposed page change, to apply or discard (on Team, or on its
+/// ingest card when an ingest proposed it).
 pub fn file_page_proposal(db: &mut Db, p: &Proposal, title: &str, body: &str, now: i64) -> Result<()> {
     let payload = serde_json::to_string(p).map_err(|e| Error::Other(e.to_string()))?;
     db.insert_review_item(PROPOSAL_KIND, title, body, &p.page, Some(&payload), now)?;
@@ -952,29 +1022,19 @@ pub fn citing_pages(db: &Db, repo: &str) -> Result<Vec<(String, Vec<String>)>> {
     Ok(out)
 }
 
-/// File one Review card on the wiki listing the pages that still cite a repo
-/// that left the team, so a person rewrites or retires them. Nothing is
-/// edited. `None` when no page cites it.
-pub fn file_removed_card(db: &mut Db, repo: &str, now: i64) -> Result<Option<usize>> {
+/// Record that a repo left the team, when pages still cite it, so the Team
+/// screen lists them for a person to rewrite or retire ([`findings`]).
+/// Nothing is edited. Returns how many pages cite it; `None` when none do.
+pub fn record_removed_repo(db: &mut Db, repo: &str) -> Result<Option<usize>> {
     let pages = citing_pages(db, repo)?;
     if pages.is_empty() {
         return Ok(None);
     }
-    let own = repo_page(repo);
-    let mut body = format!(
-        "**{repo}** was removed from the team. These pages still cite it; each needs rewriting without it, or retiring \
-         (`status: retired` with what replaced it). Nothing was changed.\n\n"
-    );
-    for (page, cites) in &pages {
-        if page.eq_ignore_ascii_case(&own) {
-            body.push_str(&format!("- {page} — its Repo Map page\n"));
-        } else {
-            body.push_str(&format!("- {page} — cites {}\n", cites.join(", ")));
-        }
+    let mut repos = removed_repos(db);
+    if !repos.iter().any(|r| r == repo) {
+        repos.push(repo.to_string());
+        db.store_removed_repos(&serde_json::to_string(&repos).map_err(|e| Error::Other(e.to_string()))?)?;
     }
-    let title = format!("{repo} left the team: {} pages cite it", pages.len());
-    let first = pages.first().map(|(p, _)| p.clone()).unwrap_or_default();
-    db.insert_review_item(REVIEW_KIND, &title, &body, &first, None, now)?;
     Ok(Some(pages.len()))
 }
 
@@ -1079,8 +1139,11 @@ mod tests {
         assert!(prompts.iter().all(|p| p.contains("=== game:README.md ===")));
         assert_eq!(fs::read_to_string(wiki.path().join("Current/Team.md")).unwrap(), "---\ntitle: Team\n---\nAna leads; Ben reviews.\n");
         assert!(fs::read_to_string(wiki.path().join("Conventions/ARCHITECTURE.md")).unwrap().contains("status: draft"));
-        let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
-        assert!(body.contains("Left alone") && body.contains("Current/Team.md"));
+        let kept = last_draft(&db).unwrap();
+        assert!(kept.title.starts_with("First wiki drafted") && kept.report.kept == vec!["Current/Team.md"]);
+        assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none(), "no Review item");
+        let found = findings(wiki.path(), &db).unwrap();
+        assert!(found.iter().any(|f| f.kind == "draft" && f.path == "Conventions/ARCHITECTURE.md"), "{found:?}");
     }
 
     #[test]
@@ -1284,10 +1347,13 @@ mod tests {
                 ("Repo-Map/Tools.md".to_string(), vec![]),
             ]
         );
-        assert_eq!(file_removed_card(&mut db, "Tools", 7).unwrap(), Some(2));
-        let (_, body) = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
-        assert!(body.contains("Platform/Save.md — cites Tools:src/save.rs:3") && body.contains("its Repo Map page"));
-        assert_eq!(file_removed_card(&mut db, "Nobody", 7).unwrap(), None);
+        assert_eq!(record_removed_repo(&mut db, "Tools").unwrap(), Some(2));
+        assert_eq!(record_removed_repo(&mut db, "Tools").unwrap(), Some(2));
+        assert_eq!(removed_repos(&db), vec!["Tools"]);
+        let found = findings(&wiki, &db).unwrap();
+        let gone = found.iter().find(|f| f.kind == "repo-removed").unwrap();
+        assert!(gone.title.starts_with("Tools left the team: 2 pages") && gone.detail.contains("Platform/Save.md"), "{gone:?}");
+        assert_eq!(record_removed_repo(&mut db, "Nobody").unwrap(), None);
     }
 
     #[test]

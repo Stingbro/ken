@@ -78,32 +78,55 @@ const CLAUDE_NAMES: &[&str] = &["claude"];
 /// Find the claude CLI: PATH first, then the usual install locations that
 /// GUI apps' skinny PATH misses.
 pub fn discover_claude() -> Option<PathBuf> {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            if let Some(found) = first_runnable(&dir) {
-                return Some(found);
-            }
-        }
+    candidate_dirs().iter().find_map(|dir| first_runnable(dir))
+}
+
+/// The folders [`discover_claude`] looks in, in order: PATH, then where each
+/// installer puts the CLI.
+fn candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    if let Some(home) = dirs::home_dir() {
+        // Claude Code's own installer (`~/.local/bin`, on Windows too) and
+        // its older local install.
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".claude").join("local"));
     }
-    let home = dirs::home_dir()?;
-    let mut fallbacks = vec![
-        home.join(".local/bin"),
-        home.join(".claude/local"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-    ];
+    #[cfg(not(windows))]
+    dirs.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
     // Ken launches as a GUI app, whose PATH routinely misses npm's global
     // bin — the very place the CLI lands on Windows.
     #[cfg(windows)]
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        fallbacks.push(PathBuf::from(appdata).join("npm"));
+        dirs.push(PathBuf::from(appdata).join("npm"));
     }
-    // `winget install Anthropic.ClaudeCode` links the exe here.
+    // `winget install Anthropic.ClaudeCode` links the exe into Links when it
+    // can, and always leaves it in its package folder.
     #[cfg(windows)]
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        fallbacks.push(PathBuf::from(local).join("Microsoft").join("WinGet").join("Links"));
+        let winget = PathBuf::from(local).join("Microsoft").join("WinGet");
+        dirs.push(winget.join("Links"));
+        dirs.extend(winget_package_dirs(&winget.join("Packages")));
     }
-    fallbacks.iter().find_map(|dir| first_runnable(dir))
+    dirs
+}
+
+/// WinGet's package folders for Claude Code (`Anthropic.ClaudeCode_<source>`)
+/// under `packages`, sorted so the result does not depend on the disk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn winget_package_dirs(packages: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(packages)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("Anthropic.ClaudeCode_"))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found
 }
 
 /// The first [`CLAUDE_NAMES`] entry in `dir` that exists and looks runnable.
@@ -162,24 +185,76 @@ pub(crate) fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// Claude Code stores sessions under `~/.claude/projects/<path-with-slashes-
-/// as-dashes>/<session-id>.jsonl`; existence means the session got past its
-/// startup gates.
+/// Claude Code stores sessions under `~/.claude/projects/<encoded cwd>/
+/// <session-id>.jsonl`; existence means the session got past its startup
+/// gates. The folder is looked up under the path as given and its plain
+/// canonical form, then, since session ids are unique, in any project folder
+/// (Claude Code shortens very long names with a hash).
 pub fn session_file_exists(project_root: &Path, session_id: &str) -> bool {
     let Some(home) = dirs::home_dir() else {
         return true; // can't check — assume fine rather than false-alarm
     };
-    let canonical = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let encoded = canonical.to_string_lossy().replace(['/', '\\'], "-");
-    home.join(".claude/projects")
-        .join(encoded)
-        .join(format!("{session_id}.jsonl"))
-        .is_file()
+    let projects = home.join(".claude").join("projects");
+    let file = format!("{session_id}.jsonl");
+    let raw = project_root.to_string_lossy().into_owned();
+    let canonical = crate::setup::plain_canonical(project_root).to_string_lossy().into_owned();
+    if [raw, canonical].iter().any(|p| projects.join(claude_project_dir_name(p)).join(&file).is_file()) {
+        return true;
+    }
+    std::fs::read_dir(&projects)
+        .map(|entries| entries.flatten().any(|e| e.path().join(&file).is_file()))
+        .unwrap_or(false)
 }
 
-pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with:  npm install -g @anthropic-ai/claude-code  — then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+/// The folder name Claude Code gives a project under `~/.claude/projects`:
+/// the cwd with every character outside `[A-Za-z0-9]` replaced by `-`, taken
+/// from the plain path (no Windows `\\?\` prefix). `C:\Code\ken` becomes
+/// `C--Code-ken`; `/Users/a/My.Repo` becomes `-Users-a-My-Repo`.
+pub fn claude_project_dir_name(path: &str) -> String {
+    let plain = path.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\\{r}"));
+    let plain = plain.as_deref().unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(path));
+    plain.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// What to do when Claude Code is not found, for this OS.
+#[cfg(windows)]
+pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with:  winget install Anthropic.ClaudeCode  or Claude Code's installer in PowerShell:  irm https://claude.ai/install.ps1 | iex  (with Node.js, npm install -g @anthropic-ai/claude-code also works). Then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+#[cfg(target_os = "macos")]
+pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with Claude Code's installer:  curl -fsSL https://claude.ai/install.sh | bash  or with Homebrew:  brew install --cask claude-code  (with Node.js, npm install -g @anthropic-ai/claude-code also works). Then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const MISSING_CLAUDE_HELP: &str = "Claude Code isn't installed. Install it with Claude Code's installer:  curl -fsSL https://claude.ai/install.sh | bash  (with Node.js, npm install -g @anthropic-ai/claude-code also works). Then run `claude` once to log in. Everything else in Ken keeps working meanwhile.";
+
+/// npm installs of Claude Code that discovery passed over because the
+/// launcher points at an exe that is gone (an update that stopped halfway).
+pub fn broken_claude_launchers() -> Vec<PathBuf> {
+    candidate_dirs()
+        .into_iter()
+        .map(|d| d.join("claude.cmd"))
+        .filter(|cmd| cfg!(windows) && cmd.is_file() && !launcher_target_exists(cmd))
+        .fold(Vec::new(), |mut v, p| {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+            v
+        })
+}
+
+/// The help to show about Claude Code: [`MISSING_CLAUDE_HELP`] when it is not
+/// found, plus a line for each broken npm install that was skipped. Empty when
+/// Claude Code is found and nothing was skipped.
+pub fn claude_help(found: bool) -> String {
+    let mut lines = Vec::new();
+    if !found {
+        lines.push(MISSING_CLAUDE_HELP.to_string());
+    }
+    for launcher in broken_claude_launchers() {
+        lines.push(format!(
+            "Skipped {}: Claude Code's npm install there is half-updated (its claude.exe is missing). Reinstall it with npm install -g @anthropic-ai/claude-code, or uninstall it.",
+            launcher.display()
+        ));
+    }
+    lines.join("\n")
+}
 
 /// Run one agent session to completion. Synchronous — call from a worker
 /// thread. `on_blocked` fires (once per event) when the agent signals it is
@@ -248,6 +323,8 @@ fn run_hidden_tui(
     cancel: &CancelToken,
     on_blocked: &mut impl FnMut(),
 ) -> Result<RunOutcome> {
+    // A hidden PTY cannot answer Claude Code's "trust this folder?" dialog.
+    crate::chat::ensure_folder_trusted(project_root);
     let rx = hooks.subscribe(session_id);
     let result = (|| {
         let pty = native_pty_system();
@@ -895,6 +972,47 @@ mod tests {
     fn discovery_skips_a_directory_with_no_launcher() {
         let dir = tempfile::tempdir().unwrap();
         assert!(first_runnable(dir.path()).is_none());
+    }
+
+    /// `winget install Anthropic.ClaudeCode` leaves claude.exe in its package
+    /// folder even when it could not link it into WinGet\Links.
+    #[test]
+    fn winget_package_folders_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(dir.path().join("Git.Git_Microsoft.Winget.Source_8wekyb3d8bbwe")).unwrap();
+        std::fs::write(pkg.join("claude.exe"), "x").unwrap();
+        assert_eq!(winget_package_dirs(dir.path()), vec![pkg.clone()]);
+        if cfg!(windows) {
+            assert_eq!(first_runnable(&pkg), Some(pkg.join("claude.exe")));
+        }
+        assert!(winget_package_dirs(&dir.path().join("missing")).is_empty());
+    }
+
+    /// Claude Code names a project's session folder after its cwd with every
+    /// character outside [A-Za-z0-9] made a '-', from the plain path.
+    #[test]
+    fn session_folders_are_named_like_claude_code_names_them() {
+        assert_eq!(claude_project_dir_name(r"C:\ken-eval\ATT\Project Documents"), "C--ken-eval-ATT-Project-Documents");
+        assert_eq!(claude_project_dir_name(r"C:\ken-eval\ATT\.ken-workspace"), "C--ken-eval-ATT--ken-workspace");
+        assert_eq!(claude_project_dir_name(r"\\?\C:\Code\ken"), "C--Code-ken");
+        assert_eq!(claude_project_dir_name("/Users/a/My.Repo"), "-Users-a-My-Repo");
+        assert_eq!(claude_project_dir_name("/Users/a/repo_2"), "-Users-a-repo-2");
+    }
+
+    /// The help names how to install Claude Code on this OS, and npm only as
+    /// the alternative.
+    #[test]
+    fn install_help_is_per_os() {
+        let help = claude_help(false);
+        assert!(help.starts_with(MISSING_CLAUDE_HELP), "{help}");
+        if cfg!(windows) {
+            assert!(MISSING_CLAUDE_HELP.contains("winget install Anthropic.ClaudeCode"));
+        } else {
+            assert!(MISSING_CLAUDE_HELP.contains("claude.ai/install.sh"));
+        }
+        assert!(MISSING_CLAUDE_HELP.contains("npm install -g @anthropic-ai/claude-code"));
     }
 
     fn setup(behavior: &str) -> (tempfile::TempDir, PathBuf, HookListener) {

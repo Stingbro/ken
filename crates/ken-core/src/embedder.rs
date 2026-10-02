@@ -64,6 +64,56 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// How one embedding model wants its text and its vectors: the model id
+/// stored with the index (a change forces a re-read), how token vectors are
+/// pooled, and the text put before a query or a document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedProfile {
+    pub model_id: &'static str,
+    pub pooling: Pooling,
+    pub query_prefix: &'static str,
+    pub doc_prefix: &'static str,
+    /// Whether the end-of-text token must close every input (last-token
+    /// pooling reads the vector there).
+    pub add_eos: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    Mean,
+    Last,
+}
+
+/// Nomic Embed v1.5: mean pooling and its two task prefixes.
+pub const NOMIC: EmbedProfile = EmbedProfile {
+    model_id: "nomic-embed-text-v1.5",
+    pooling: Pooling::Mean,
+    query_prefix: "search_query: ",
+    doc_prefix: "search_document: ",
+    add_eos: false,
+};
+
+/// Qwen3 Embedding 0.6B: last-token pooling, an instruction on queries
+/// only, documents as they are.
+pub const QWEN3: EmbedProfile = EmbedProfile {
+    model_id: "qwen3-embedding-0.6b",
+    pooling: Pooling::Last,
+    query_prefix: "Instruct: Given a question, retrieve passages from a team's documents and code that answer it\nQuery:",
+    doc_prefix: "",
+    add_eos: true,
+};
+
+/// The profile for an embedding model file, by its name. Unknown files are
+/// read as Nomic, the model Ken shipped first.
+pub fn profile_for_file(file: &str) -> EmbedProfile {
+    let f = file.to_ascii_lowercase();
+    if f.contains("qwen3-embedding") {
+        QWEN3
+    } else {
+        NOMIC
+    }
+}
+
 /// Deterministic, model-free embedder used by tests and as a safe fallback.
 ///
 /// Each of the [`DIM`](FakeEmbedder::DIM) components is an independent
@@ -116,7 +166,7 @@ impl Embedder for FakeEmbedder {
 
 #[cfg(feature = "local-llm")]
 mod llama {
-    use super::{l2_normalize, Embedder};
+    use super::{l2_normalize, EmbedProfile, Embedder, Pooling};
     use crate::{Error, Result};
     use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
     use llama_cpp_2::context::LlamaContext;
@@ -138,7 +188,7 @@ mod llama {
     pub struct LlamaEmbedder {
         backend: &'static LlamaBackend,
         model: LlamaModel,
-        model_id: String,
+        profile: EmbedProfile,
         dim: usize,
     }
 
@@ -146,22 +196,25 @@ mod llama {
         /// Load a GGUF embedding model from `path`, sharing the single
         /// process-wide [`LlamaBackend`]. `model_id` is a stable label stored
         /// alongside the index so a model swap can be detected.
-        pub fn load(path: &Path, model_id: impl Into<String>) -> Result<Self> {
+        pub fn load(path: &Path, profile: EmbedProfile) -> Result<Self> {
             let backend = crate::local_llm::shared_backend()?;
-            let params = LlamaModelParams::default().with_n_gpu_layers(1000);
-            let model = LlamaModel::load_from_file(backend, path, &params).map_err(|e| {
-                Error::Other(format!(
-                    "couldn't load embedding model {}: {e}",
-                    path.display()
-                ))
-            })?;
+            let layers = crate::compute::gpu_layers();
+            let load = |layers: u32| {
+                LlamaModel::load_from_file(backend, path, &LlamaModelParams::default().with_n_gpu_layers(layers))
+            };
+            // A graphics card that cannot take the model (no memory, a driver
+            // fault) must not turn meaning search off: load it on the CPU.
+            let model = match load(layers) {
+                Ok(m) => Ok(m),
+                Err(gpu_err) if layers > 0 => {
+                    eprintln!("embedding model on the graphics card failed ({gpu_err}); loading it on the CPU");
+                    load(0)
+                }
+                Err(e) => Err(e),
+            }
+            .map_err(|e| Error::Other(format!("couldn't load embedding model {}: {e}", path.display())))?;
             let dim = usize::try_from(model.n_embd()).unwrap_or(0);
-            Ok(Self {
-                backend,
-                model,
-                model_id: model_id.into(),
-                dim,
-            })
+            Ok(Self { backend, model, profile, dim })
         }
 
         /// An embedding context: pooled output, no generation. n_batch and
@@ -169,12 +222,18 @@ mod llama {
         /// sequence is embedded in a single pooled pass. Making one allocates
         /// the compute buffers on the GPU, so a batch of texts shares one.
         fn context(&self) -> Result<LlamaContext<'_>> {
+            let threads = crate::compute::threads();
             let ctx_params = LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(N_CTX))
                 .with_n_batch(N_CTX)
                 .with_n_ubatch(N_CTX)
+                .with_n_threads(threads)
+                .with_n_threads_batch(threads)
                 .with_embeddings(true)
-                .with_pooling_type(LlamaPoolingType::Mean);
+                .with_pooling_type(match self.profile.pooling {
+                    Pooling::Mean => LlamaPoolingType::Mean,
+                    Pooling::Last => LlamaPoolingType::Last,
+                });
             self.model
                 .new_context(self.backend, ctx_params)
                 .map_err(|e| Error::Other(format!("couldn't create embedding context: {e}")))
@@ -198,6 +257,17 @@ mod llama {
             // result; failing instead stopped the whole meaning index at
             // the first such chunk. Keyword search still sees all of it.
             tokens.truncate(N_CTX as usize);
+            // Last-token pooling reads the vector at the end-of-text token;
+            // add it when the tokenizer did not (or truncation cut it off).
+            if self.profile.add_eos {
+                let eos = self.model.token_eos();
+                if tokens.last() != Some(&eos) {
+                    if tokens.len() >= N_CTX as usize {
+                        tokens.pop();
+                    }
+                    tokens.push(eos);
+                }
+            }
 
             ctx.clear_kv_cache();
             let mut batch = LlamaBatch::new(tokens.len(), 1);
@@ -217,10 +287,10 @@ mod llama {
             Ok(v)
         }
 
-        /// Embed a query (the `search_query:` side of nomic-embed-text).
+        /// Embed a query, with the model's query prefix.
         pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
             let mut ctx = self.context()?;
-            self.embed_prefixed(&mut ctx, &format!("search_query: {text}"))
+            self.embed_prefixed(&mut ctx, &format!("{}{text}", self.profile.query_prefix))
         }
     }
 
@@ -229,7 +299,7 @@ mod llama {
             let mut ctx = self.context()?;
             texts
                 .iter()
-                .map(|t| self.embed_prefixed(&mut ctx, &format!("search_document: {t}")))
+                .map(|t| self.embed_prefixed(&mut ctx, &format!("{}{t}", self.profile.doc_prefix)))
                 .collect()
         }
 
@@ -238,7 +308,7 @@ mod llama {
         }
 
         fn model_id(&self) -> String {
-            self.model_id.clone()
+            self.profile.model_id.to_string()
         }
 
         fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -261,13 +331,23 @@ pub use llama::LlamaEmbedder;
 pub fn installed_embedding_model() -> Option<Box<dyn Embedder + Send>> {
     let base = crate::local_llm::base_dir()?;
     let path = crate::model::selected_model_path(&base, crate::model::ModelCategory::Embedding)?;
-    match LlamaEmbedder::load(&path, "nomic-embed-text-v1.5") {
+    let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    match LlamaEmbedder::load(&path, profile_for_file(&file)) {
         Ok(e) => Some(Box::new(e)),
         Err(e) => {
             eprintln!("semantic search disabled: {e}");
             None
         }
     }
+}
+
+/// The profile of the embedding model [`installed_embedding_model`] would
+/// load (the selected one if installed, else any installed one), or `None`.
+pub fn selected_profile() -> Option<EmbedProfile> {
+    let base = crate::local_llm::base_dir()?;
+    let path = crate::model::selected_model_path(&base, crate::model::ModelCategory::Embedding)?;
+    let file = path.file_name()?.to_string_lossy().into_owned();
+    Some(profile_for_file(&file))
 }
 
 /// Feature-off stub: this build has no on-device embedding model, so semantic
@@ -311,6 +391,34 @@ mod tests {
         assert_eq!(e.model_id(), "fake-hash-8");
     }
 
+    #[test]
+    fn each_model_file_gets_its_own_profile() {
+        assert_eq!(profile_for_file("nomic-embed-text-v1.5.Q8_0.gguf"), NOMIC);
+        assert_eq!(profile_for_file("Qwen3-Embedding-0.6B-Q8_0.gguf"), QWEN3);
+        assert_eq!(QWEN3.pooling, Pooling::Last);
+        assert!(QWEN3.add_eos && QWEN3.doc_prefix.is_empty() && QWEN3.query_prefix.ends_with("Query:"));
+        assert_ne!(NOMIC.model_id, QWEN3.model_id, "a switch must be seen as a different model");
+    }
+
+    // The model ranks a matching passage above an unrelated one. Runs when
+    // KEN_EMBED_MODEL names a GGUF (any catalog embedding model).
+    #[cfg(feature = "local-llm")]
+    #[test]
+    fn llama_embedder_ranks_the_matching_passage_first() {
+        let Ok(path) = std::env::var("KEN_EMBED_MODEL") else { return };
+        let file = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+        let mut e = LlamaEmbedder::load(std::path::Path::new(&path), profile_for_file(&file)).expect("load");
+        let docs = e
+            .embed(&[
+                "Payments are retried three times with exponential backoff before the booking fails.".to_string(),
+                "The design review moved to Thursday because the projector was broken.".to_string(),
+            ])
+            .unwrap();
+        let q = e.embed_query("how often does a failed payment get retried").unwrap();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        assert!(dot(&q, &docs[0]) > dot(&q, &docs[1]), "the retry passage should score higher");
+    }
+
     // Real-model smoke test. Requires a nomic-embed-text GGUF; the path comes
     // from KEN_EMBED_MODEL. Skipped (passes trivially) when the env var is
     // unset so plain `cargo test` stays green without the model on disk.
@@ -324,7 +432,8 @@ mod tests {
                 return;
             }
         };
-        let mut e = LlamaEmbedder::load(std::path::Path::new(&path), "nomic-embed-text-v1.5")
+        let file = std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+        let mut e = LlamaEmbedder::load(std::path::Path::new(&path), profile_for_file(&file))
             .expect("load embedding model");
         let dim = e.dim();
         eprintln!("embedding model dim = {dim}");

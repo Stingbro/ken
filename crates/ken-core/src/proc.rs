@@ -1,10 +1,11 @@
 //! Child-process spawn hygiene.
 //!
-//! Ken shells out to `git` from several places (`sync`, `family_sync`, and
-//! `src-tauri`'s family create/join helper). On Windows every one of those
-//! spawns pops a console window for as long as the child lives — roughly a
-//! second for `git remote`, which reads as flickering terminals when the
-//! sync engine is doing its job. `CREATE_NO_WINDOW` suppresses it.
+//! Ken shells out to `git`, `claude` and `ffmpeg` from several places. On
+//! Windows every one of those spawns pops a console window for as long as the
+//! child lives (the release app is a GUI-subsystem exe, the children are
+//! console exes), and closing that window kills the child. `CREATE_NO_WINDOW`
+//! gives the child a hidden console instead, which its own children (node,
+//! ken-mcp) inherit. PTY spawns (ConPTY) need none of this.
 //!
 //! This lives in its own module rather than in `sync.rs` because
 //! `family_sync.rs` and the two downstream crates need it too, and none of
@@ -36,9 +37,13 @@ pub fn quiet(cmd: &mut Command) -> &mut Command {
 /// launcher npm installs, and std refuses any argument to a batch file that
 /// holds a line break ("batch file arguments are invalid"), so a prompt
 /// passed as an argument fails to spawn at all. Written on its own thread so
-/// a child that reads slowly can never deadlock the caller.
+/// a child that reads slowly can never deadlock the caller. The child gets no
+/// console window ([`quiet`]): Ken's release build is a GUI app, so a console
+/// child would otherwise open a window of its own, and closing that window
+/// kills the run.
 pub fn spawn_with_input(cmd: &mut Command, input: &str) -> std::io::Result<std::process::Child> {
     use std::io::Write;
+    quiet(cmd);
     cmd.stdin(std::process::Stdio::piped());
     let mut child = cmd.spawn()?;
     track(&child);

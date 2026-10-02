@@ -2,9 +2,10 @@
   // Team (the Wright white box, frame 9): the chosen team's repos as set-up
   // wrote them, one row each (kind, how deep Ken reads it, branch, commit,
   // how far behind its upstream), the workspace's ignore lines, what a scan
-  // found and what a repo lacks for its kind, the wiki's weekly sweep, and
-  // the team's rules and templates. Ken's per-repo settings are these rows,
-  // not a page of their own. Add a repo (9b) and Scan again sit at the top.
+  // found and what a repo lacks for its kind, the wiki's weekly sweep and what
+  // its checks found, the team's rules and templates, and the team inbox.
+  // Each row opens that repo's own settings in a drawer. Add a repo (9b) and
+  // Scan again sit at the top.
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     api,
@@ -19,8 +20,15 @@
   import { scope } from "../lib/scope.svelte";
   import { timeAgo } from "../lib/format";
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import { toast } from "../lib/toast.svelte";
+  import { rail } from "../lib/rail.svelte";
+  import { findingLabel, kindlessRepos, orderFindings, proposedKinds } from "../lib/team";
+  import type { TeamFinding } from "../lib/api";
+  import RepoDrawer from "../team/RepoDrawer.svelte";
+  import TeamInbox from "../team/TeamInbox.svelte";
   import X from "@lucide/svelte/icons/x";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
+  import SlidersHorizontal from "@lucide/svelte/icons/sliders-horizontal";
 
   let overview = $state<TeamOverview | null>(null);
   let moved = $state<SetupMoved[]>([]);
@@ -36,6 +44,7 @@
   async function refresh() {
     try {
       overview = await api.teamOverview(team);
+      rail.setFindings(overview.findings?.length ?? 0);
       error = null;
     } catch (e) {
       error = String(e);
@@ -46,13 +55,13 @@
     void refresh();
   });
 
-  async function run(label: string, f: () => Promise<unknown>) {
+  /** An action on Team: `what` names it in the notice when it fails. */
+  async function run(label: string, what: string, f: () => Promise<unknown>) {
     busy = label;
-    error = null;
     try {
       await f();
     } catch (e) {
-      error = String(e);
+      toast.error(what, e);
     } finally {
       busy = null;
       await refresh();
@@ -62,7 +71,7 @@
   async function scanAgain() {
     if (!overview) return;
     const root = overview.root;
-    await run("scan", async () => {
+    await run("scan", "Could not scan the folders", async () => {
       moved = await api.setupRescan(root);
       scanned = Math.floor(Date.now() / 1000);
     });
@@ -81,11 +90,13 @@
 
   function setKind(r: TeamRepo, value: string) {
     const kind = value === "" ? [] : (value.split("+") as RepoKind[]);
-    void run(`k${r.id}`, () => api.setProjectKind(r.id, kind, team));
+    void run(`k${r.id}`, "Could not set the kind", () => api.setProjectKind(r.id, kind, team));
   }
 
   function setIndex(r: TeamRepo, value: string) {
-    void run(`i${r.id}`, () => api.setProjectIndex(r.id, value === "kind" ? null : (value as IndexState)));
+    void run(`i${r.id}`, "Could not change how Ken reads it", () =>
+      api.setProjectIndex(r.id, value === "kind" ? null : (value as IndexState)),
+    );
   }
 
   function takeOut(e: MouseEvent, r: TeamRepo) {
@@ -95,7 +106,7 @@
       body: "Ken stops indexing it. The folder and its files stay on disk.",
       confirmLabel: "Remove",
       onConfirm: () =>
-        void run(`o${r.id}`, async () => {
+        void run(`o${r.id}`, "Could not remove the repo", async () => {
           await api.workspaceRemoveMember(r.name);
           await app.refreshWorkspaceOverview();
         }),
@@ -108,18 +119,19 @@
     const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
     if (paths.length === 0) return;
     const name = overview.workspace;
-    await run("add", async () => {
+    await run("add", "Could not add the repo", async () => {
       const proposal = await api.setupProposeRepos(paths);
       const rows = proposal.rows.map((r) => ({ ...r, include: true, team: team ?? r.team }));
       await app.confirmSetupRepos(name, rows, true);
+      app.screen = "team";
       await scope.refreshGroups();
       // The wiki drafts each new repo's page and proposes the rest.
-      await api.wikiAddRepos(rows.map((r) => r.member)).catch(() => []);
+      await api.wikiAddRepos(rows.map((r) => r.member)).catch((e) => toast.error("Could not update the wiki", e));
     });
   }
 
   function addFolder(member: string) {
-    void run(`m${member}`, async () => {
+    void run(`m${member}`, "Could not add the folder", async () => {
       await api.workspaceAddMember(member);
       moved = moved.filter((m) => !("member" in m) || m.member !== member);
       await app.refreshWorkspaceOverview();
@@ -129,7 +141,7 @@
 
   function saveIgnores() {
     const lines = ignoresDraft.split("\n");
-    void run("ignores", async () => {
+    void run("ignores", "Could not save the ignore list", async () => {
       await api.teamSaveIgnores(lines);
       editingIgnores = false;
     });
@@ -138,14 +150,14 @@
   function runSweep() {
     const id = overview?.wiki?.id;
     if (!id) return;
-    void run("sweep", () => api.runDriftNow(id));
+    void run("sweep", "Could not run the sweep", () => api.runDriftNow(id));
   }
 
   function addRule() {
     const id = overview?.wiki?.id;
     const rule = newRule.trim();
     if (!id || !rule) return;
-    void run("rule", async () => {
+    void run("rule", "Could not add the rule", async () => {
       const path = await api.teamAddRule(id, rule);
       newRule = "";
       await openInWiki(path);
@@ -159,9 +171,49 @@
     app.openInFiles(path);
   }
 
+  async function openFinding(f: TeamFinding) {
+    if (!f.path) return;
+    const id = f.projectId ?? overview?.wiki?.id;
+    if (id && app.focused !== id) await app.focusMember(id);
+    app.openInFiles(f.path);
+  }
+
+  // ── A repo's own settings, in a drawer from its row ─────────────────
+  let drawer = $state<TeamRepo | null>(null);
+  async function openDrawer(r: TeamRepo) {
+    drawer = r;
+    try {
+      await app.focusMember(r.id, { stay: true });
+    } catch (e) {
+      drawer = null;
+      toast.error(`Could not open ${memberLeaf(r.name)}`, e);
+    }
+  }
+
+  // ── Repos no one has said the kind of ───────────────────────────────
+  let kindsOpen = $state(false);
+  let kindDraft = $state<Record<string, string>>({});
+  async function openKinds() {
+    const list = kindlessRepos(rows);
+    kindsOpen = true;
+    // Set-up's proposal, from what is in each repo, fills the choices in.
+    const proposal = await api.setupProposeRepos(list.map((r) => r.path)).catch(() => null);
+    const kinds = proposal ? proposedKinds(list, proposal.rows) : {};
+    kindDraft = Object.fromEntries(list.map((r) => [r.id, (kinds[r.id] ?? []).join("+")]));
+  }
+  function saveKinds() {
+    const chosen = Object.entries(kindDraft).filter(([, v]) => v !== "");
+    if (chosen.length === 0) return;
+    void run("kinds", "Could not set the kinds", async () => {
+      for (const [id, v] of chosen) await api.setProjectKind(id, v.split("+") as RepoKind[], team);
+      kindsOpen = false;
+    });
+  }
+
   const rows = $derived(overview ? [...(overview.wiki ? [overview.wiki] : []), ...overview.repos] : []);
   const driftCount = $derived(moved.length + rows.filter((r) => (r.behind ?? 0) > 0).length);
-  const sweepFindings = $derived(overview?.sweep?.mismatches.filter((m) => m.severity !== "autoRecleared").length ?? 0);
+  const findings = $derived(orderFindings(overview?.findings ?? []));
+  const kindless = $derived(kindlessRepos(rows));
 </script>
 
 <div class="team">
@@ -172,11 +224,47 @@
     {#if overview}
       <span class="chip" class:warn={driftCount > 0}>drifted · {driftCount}</span>
       <span class="chip" class:warn={overview.gaps.length > 0}>gaps · {overview.gaps.length}</span>
+      <span class="chip" class:warn={findings.length > 0}>findings · {findings.length}</span>
     {/if}
     <button class="btn btn-ghost" disabled={busy !== null} onclick={addRepos}>+ Add a repo</button>
     <button class="btn btn-primary" disabled={busy !== null} onclick={scanAgain}>{busy === "scan" ? "Scanning…" : "Scan again"}</button>
   </div>
   {#if error}<p class="warn-text">{error}</p>{/if}
+
+  {#if overview && kindless.length > 0}
+    <div class="kinds">
+      <div class="kinds-head">
+        <span>
+          <strong>Set what each repo is.</strong>
+          {kindless.length} {kindless.length === 1 ? "repo has" : "repos have"} no kind, so Ken does not know how deep to read
+          {kindless.length === 1 ? "it" : "them"} or where the team's tickets and escalations go.
+        </span>
+        {#if !kindsOpen}
+          <button class="btn btn-small btn-primary" onclick={() => void openKinds()}>Set kinds</button>
+        {/if}
+      </div>
+      {#if kindsOpen}
+        {#each kindless as r (r.id)}
+          <div class="kind-row">
+            <span class="rname">{memberLeaf(r.name)}</span>
+            <span class="sel">
+              <select bind:value={kindDraft[r.id]} disabled={busy !== null} aria-label="Kind of {memberLeaf(r.name)}">
+                <option value="">not said</option>
+                {#if (kindDraft[r.id] ?? "").includes("+")}<option value={kindDraft[r.id]}>{kindDraft[r.id].split("+").join(" + ")}</option>{/if}
+                {#each KINDS.filter((k) => k.v !== "") as k (k.v)}<option value={k.v}>{k.label}</option>{/each}
+              </select>
+              <ChevronDown size={12} strokeWidth={1.75} />
+            </span>
+          </div>
+        {/each}
+        <p class="note">Filled in from what is in each repo. A wiki is the repo with the Research/Ingestion inbox.</p>
+        <div class="actions">
+          <button class="btn btn-ghost btn-small" onclick={() => (kindsOpen = false)}>Cancel</button>
+          <button class="btn btn-primary btn-small" disabled={busy !== null} onclick={saveKinds}>Save</button>
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   {#if overview}
     <div class="cols">
@@ -208,10 +296,10 @@
                   </span>
                 </td>
                 <td>
-                  <div class="repo">
+                  <button class="repo" title="{memberLeaf(r.name)}: its settings" onclick={() => void openDrawer(r)}>
                     <span class="rname">{memberLeaf(r.name)}</span>
                     <span class="sub mono" title={r.path}>{r.description || r.path}</span>
-                  </div>
+                  </button>
                 </td>
                 <td>
                   <span class="sel">
@@ -229,7 +317,16 @@
                   {:else if (r.behind ?? 0) > 0}<span class="bad">{r.behind} newer upstream</span>
                   {:else}—{/if}
                 </td>
-                <td>
+                <td class="row-actions">
+                  <button
+                    class="remove"
+                    disabled={!r.available}
+                    onclick={() => void openDrawer(r)}
+                    title="Its settings"
+                    aria-label="{memberLeaf(r.name)} settings"
+                  >
+                    <SlidersHorizontal size={14} strokeWidth={1.75} />
+                  </button>
                   {#if r.id !== overview.wiki?.id}
                     <button
                       class="remove"
@@ -305,16 +402,28 @@
               {overview.sweep.voidReason ? `void: ${overview.sweep.voidReason}` : overview.sweep.uncontrolled ? "no controls set" : "both controls held"}
             </span>
           </div>
-          <div class="entry">
-            <span>{sweepFindings} {sweepFindings === 1 ? "page" : "pages"} to check against their sources · {overview.sweep.aged.length} unverified for thirty days</span>
-            <span class="e-actions"><button class="btn btn-ghost" onclick={() => (app.screen = "review")}>Open Review</button></span>
-          </div>
         {:else}
           <p class="note">The sweep has not run yet.</p>
         {/if}
         {#if overview.wiki}
           <div class="actions"><button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button></div>
         {/if}
+
+        <div class="divider">findings · drift, links, the first draft · {findings.length}</div>
+        {#each findings as f, i (i)}
+          <div class="entry">
+            <span class="tag">{findingLabel(f.kind)}</span>
+            <span class="finding">
+              <span class="ftitle">{f.title}</span>
+              {#if f.detail}<span class="sub">{f.detail}</span>{/if}
+            </span>
+            {#if f.path}
+              <span class="e-actions"><button class="btn btn-ghost" onclick={() => void openFinding(f)}>Open</button></span>
+            {/if}
+          </div>
+        {:else}
+          <p class="note">{overview.wiki ? "Nothing found." : "No wiki, so nothing to check."}</p>
+        {/each}
 
         <div class="divider">rules · Ways-of-Working/Rules · {overview.rules.length}</div>
         {#each overview.rules as r (r.path)}
@@ -337,8 +446,16 @@
         {/each}
       </div>
     </div>
+
+    <TeamInbox />
   {/if}
 </div>
+
+{#if drawer}
+  {#key drawer.id}
+    <RepoDrawer repo={drawer} close={() => (drawer = null)} changed={() => void refresh()} />
+  {/key}
+{/if}
 
 <style>
   .team {
@@ -423,6 +540,68 @@
     flex-direction: column;
     gap: 2px;
     max-width: 320px;
+    border: none;
+    background: transparent;
+    padding: 0;
+    font: inherit;
+    text-align: left;
+    color: inherit;
+    cursor: pointer;
+  }
+  .repo:hover .rname {
+    color: var(--accent-deep);
+  }
+  .row-actions {
+    white-space: nowrap;
+  }
+  .kinds {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 14px;
+    border: 1px solid color-mix(in srgb, var(--needs-input) 35%, var(--border));
+    border-radius: var(--radius-card);
+    background: color-mix(in srgb, var(--needs-input) 6%, var(--surface));
+    font-size: 12.5px;
+  }
+  .kinds-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .kinds-head > span {
+    flex: 1;
+    line-height: 1.5;
+  }
+  .kind-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .kind-row .rname {
+    width: 180px;
+    flex: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tag {
+    flex: none;
+    width: 70px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-tertiary);
+  }
+  .entry > span.finding {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .ftitle {
+    font-weight: 600;
   }
   .rname {
     font-weight: 600;
@@ -519,7 +698,7 @@
     padding: 6px 0;
     border-bottom: 1px dashed var(--border);
   }
-  .entry > span:first-child {
+  .entry > span:first-child:not(.tag) {
     flex: 1;
   }
   .e-actions {

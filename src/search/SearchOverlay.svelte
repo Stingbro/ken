@@ -21,6 +21,8 @@
   import { inMember, parseCitation } from "../lib/citation";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
+  import { claudeInstallHelp, shortcut } from "../lib/platform";
+  import { errorText } from "../lib/toast.svelte";
 
   let query = $state("");
   let selected = $state(0);
@@ -77,6 +79,8 @@
   }
 
   let results = $state<DisplayHit[]>([]);
+  /** Why the last search failed, shown in place of its results. */
+  let searchError = $state<string | null>(null);
   // "Ask Ken to look": a read-only Claude pass over the workspace when the
   // index found nothing that answers, so Ken never says "not there" on the
   // index's word alone.
@@ -240,8 +244,22 @@
       coverageNotes = [];
       routedPlan = null;
       searched = false;
+      searchError = null;
       return;
     }
+    try {
+      await search(q);
+    } catch (e) {
+      if (q !== query.trim()) return; // a newer query took over
+      searchError = errorText(e);
+      results = [];
+      coverageNotes = [];
+      routedPlan = null;
+      searched = true;
+    }
+  }
+
+  async function search(q: string) {
 
     if (scope === "all" && app.workspace) {
       routedProgress = null;
@@ -249,10 +267,16 @@
         // The shared scope store wins when it is narrowing (a group, or a
         // project chosen on Home); `pinnedMember` is the overlay's own
         // in-place narrowing for a single query.
-        const res = await api
-          .routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, audience, kinds)
-          .catch(() => null);
-        if (q !== query.trim() || !res) return; // stale or failed
+        const res = await api.routeSearch(
+          q,
+          30,
+          pinnedMember ?? sharedScope.projectId,
+          sharedScope.groupName,
+          audience,
+          kinds,
+        );
+        if (q !== query.trim()) return; // stale
+        searchError = null;
         routedPlan = res.plan;
         coverageNotes = res.memberStatus
           .filter((s) => s.status !== "searched")
@@ -273,8 +297,9 @@
         }));
       } else {
         routedPlan = null;
-        const res = await api.searchAllProjects(q, 30, audience, kinds).catch(() => null);
-        if (q !== query.trim() || !res) return;
+        const res = await api.searchAllProjects(q, 30, audience, kinds);
+        if (q !== query.trim()) return;
+        searchError = null;
         coverageNotes = res.memberStatus
           .filter((s) => s.status !== "searched")
           .map((s) => `${s.memberName}: ${s.status}`);
@@ -302,6 +327,7 @@
     const found = await api.hybridSearch(q, 30, audience, kinds);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
+    searchError = null;
     results = fromHybrid(found);
     searched = true;
     selected = 0;
@@ -363,7 +389,7 @@
     app.openInFiles(hit.path);
   }
 
-  /** ⌘↵ — hand the query to a fresh chat in the drawer. */
+  /** Mod+Enter — hand the query to a fresh chat in the drawer. */
   async function continueInChat() {
     const q = query.trim();
     if (!q) return;
@@ -479,7 +505,7 @@
           </button>
         {/each}
         <button class="qa-dig" onclick={continueInChat}>
-          ⌘↵ dig deeper in chat
+          {shortcut("mod+enter")} dig deeper in chat
         </button>
       </div>
     </div>
@@ -496,8 +522,7 @@
   {:else if !modelInstalled && isQuestionQuery(query.trim())}
     <div class="qa qa-hint">
       <div class="qa-body">
-        Answers come from Claude Code. Install it (npm install -g @anthropic-ai/claude-code)
-        and run <code>claude</code> once to sign in.
+        Answers come from Claude Code. {claudeInstallHelp()}
       </div>
     </div>
   {/if}
@@ -581,14 +606,16 @@
         {/if}
       {/if}
     </div>
-  {:else if searched && results.length < 3 && query.trim().length >= 3}
+  {:else if searched && !searchError && results.length < 3 && query.trim().length >= 3}
     <div class="look-row">
       <span>Not much in the index for this.</span>
       <button class="qa-dig" onclick={askKenToLook}>Ask Ken to look</button>
     </div>
   {/if}
 
-  {#if results.length === 0 && searched}
+  {#if searchError}
+    <div class="empty error">Search failed: {searchError}</div>
+  {:else if results.length === 0 && searched}
     <div class="empty">
       {#if scope === "all"}
         Nothing in {teamName} matches “{query}”.
@@ -596,7 +623,7 @@
         Nothing matches “{query}” <em>yet</em> — Ken is still reading your folder.
         Search lights up as files are indexed.
       {:else}
-        Nothing in this project matches “{query}”. Ken searches file contents and
+        Nothing in this repo matches “{query}”. Ken searches file contents and
         names — try fewer or different words.
       {/if}
     </div>
@@ -605,7 +632,7 @@
   <div class="foot">
     <span><span class="kbd">↵</span> open</span>
     <span><span class="kbd">esc</span> close</span>
-    <span class="continue"><span class="kbd">⌘↵</span> continue in chat</span>
+    <span class="continue"><span class="kbd">{shortcut("mod+enter")}</span> continue in chat</span>
   </div>
 </div>
 
@@ -834,6 +861,9 @@
     font-size: 13px;
     color: var(--ink-secondary);
     line-height: 1.6;
+  }
+  .empty.error {
+    color: var(--danger);
   }
   .foot {
     display: flex;

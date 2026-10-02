@@ -27,7 +27,6 @@ import {
   saveRecents,
   type RecentEntry,
 } from "./recent";
-import { review } from "./review.svelte";
 import {
   clampChatWidth,
   loadChatWidth,
@@ -64,11 +63,9 @@ export interface Reveal {
 export type Screen =
   | "home"
   | "files"
-  | "review"
   | "ingests"
   | "team"
   | "map"
-  | "record"
   | "timeline"
   | "settings";
 
@@ -222,19 +219,17 @@ class AppStore {
     );
   }
 
-  /** Hide a file's issues everywhere (Review inbox, badge, Home) for this user. */
+  /** Stop flagging a file that could not be read (the Files dot, its mark
+   *  in the tree, the reason in its preview), for this user only. */
   async ignoreFile(relPath: string) {
     await api.ignoreFile(relPath);
     if (!this.ignored.includes(relPath)) this.ignored = [...this.ignored, relPath];
-    // The badge/inbox recompute on the backend; refresh so they reflect it now.
-    await review.refresh();
   }
 
   /** Stop ignoring a file so its issues can surface again. */
   async unignoreFile(relPath: string) {
     await api.unignoreFile(relPath);
     this.ignored = this.ignored.filter((p) => p !== relPath);
-    await review.refresh();
   }
 
   private async loadIgnored() {
@@ -324,9 +319,6 @@ class AppStore {
       if (!this.workspace) return;
       void this.refreshWorkspaceOverview();
     });
-    // Wire the review inbox to its events here (app start), not on Review-tab
-    // mount, so the nav badge stays live wherever the user is.
-    void review.subscribe();
     if (this.project) {
       this.loadProjectLocalState();
       void this.loadBackgroundIndex();
@@ -403,9 +395,6 @@ class AppStore {
     this.screen = "home";
     await this.refreshRegistry();
     await this.refreshTree();
-    // Repopulate the badge for the newly-active project immediately, ahead of
-    // the first scan/sync event that would otherwise refresh it.
-    void review.refresh();
   }
 
   /** Read the persisted background-index preference for the open project. */
@@ -667,11 +656,21 @@ class AppStore {
    *  `refreshWorkspaceOverview`); awaiting the direct refresh here just
    *  means the caller doesn't wait an extra event round-trip to see the
    *  switch land. */
-  async focusMember(id: string) {
+  async focusMember(id: string, opts: { stay?: boolean } = {}) {
     if (!this.workspace || this.workspace.focused === id) return;
-    await api.focusProject(id);
-    await this.refreshWorkspaceOverview();
+    // A change of focus lands on Home; `stay` keeps the screen the person
+    // is on (a Team repo's settings, a conflict in Files).
+    this.keepScreen = !!opts.stay;
+    try {
+      await api.focusProject(id);
+      await this.refreshWorkspaceOverview();
+    } finally {
+      this.keepScreen = false;
+    }
   }
+
+  /** Set while a focus change should leave the screen as it is. */
+  private keepScreen = false;
 
   /** Cycle focus to the next resolvable member, roster order (`Ctrl+P` —
    *  workspace task 4.3). No-ops outside Workspace mode or with fewer than
@@ -720,7 +719,7 @@ class AppStore {
   /** Reload every per-project cache for the workspace's currently focused
    *  member — the workspace-mode counterpart of `activated()` (same
    *  refresh list: tabs/favorites/recents, background/transcribe/semantic
-   *  index settings, ignored/unread, the file tree, the review badge).
+   *  index settings, ignored/unread, the file tree).
    *  Kept as a separate method rather than folded into `activated()` so the
    *  Single-mode path (`openProject`/`createProject`) stays byte-identical.
    *
@@ -729,12 +728,11 @@ class AppStore {
    *  `workspace_overview` only carry `name`/`projectId`/`status`. `root` is
    *  still reconstructed exactly (`workspace.root + "/" + member.name` —
    *  members are stored as parent-relative folder names, workspace design
-   *  D1), but `excluded`/`ingestRunner` have no per-member read path, so
-   *  they default (`[]`/`"headless"`, `ProjectInfo::of`'s own fallback)
-   *  rather than carrying over the PREVIOUS member's values, which would be
-   *  actively wrong. Settings' exclude-folder list and ingest-runner toggle
-   *  may show these defaults instead of a non-initial focused member's real
-   *  values until a per-member info command exists — the backend truth
+   *  D1), but `excluded` has no per-member read path, so it defaults to
+   *  `[]` (`ProjectInfo::of`'s own fallback) rather than carrying over the
+   *  PREVIOUS member's value, which would be actively wrong. A repo's
+   *  watched-folders card may show that default instead of the member's real
+   *  value until a per-member info command exists — the backend truth
    *  itself is unaffected (every mutating command resolves "the project"
    *  via `state.focused` regardless of what the frontend has cached). See
    *  final report. */
@@ -749,7 +747,6 @@ class AppStore {
       name: member.name,
       root: `${overview.root}/${member.name}`,
       excluded: [],
-      ingestRunner: "headless",
     };
     this.scanning = false;
     this.scanError = null;
@@ -762,9 +759,8 @@ class AppStore {
     void this.loadSemanticIndex();
     void this.loadIgnored();
     void this.loadUnread();
-    this.screen = "home";
+    if (!this.keepScreen) this.screen = "home";
     await this.refreshTree();
-    void review.refresh();
   }
 
   async setExcluded(excluded: string[]) {

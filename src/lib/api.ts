@@ -7,7 +7,8 @@ export interface ProjectInfo {
   name: string;
   root: string;
   excluded: string[];
-  ingestRunner: "hidden-tui" | "headless";
+  /** Left over from the recipe runner; nothing reads it. */
+  ingestRunner?: "hidden-tui" | "headless";
 }
 
 /** The team's index as three figures: repos indexed of all, files queued,
@@ -93,6 +94,18 @@ export interface TeamPage {
   title: string;
 }
 
+/** Something the wiki's own checks found: a page drifted from its source
+ *  or unverified for thirty days, the link report, the first draft. */
+export interface TeamFinding {
+  /** drift · aged · links · draft, as the backend names it. */
+  kind: string;
+  title: string;
+  detail: string;
+  /** The page to open, inside `projectId`'s repo. */
+  path: string | null;
+  projectId: string | null;
+}
+
 /** The Team screen: the chosen team's repos and configuration. */
 export interface TeamOverview {
   team: string | null;
@@ -105,16 +118,22 @@ export interface TeamOverview {
   sweep: DriftRun | null;
   rules: TeamPage[];
   templates: TeamPage[];
+  findings: TeamFinding[];
 }
 
 /** What one write from an ingested note was. */
 export type IngestWriteKind = "edit" | "page" | "idea" | "escalation" | "task";
 
+/** Where a source in Raw/ is. `transcribing`: a recording being turned into
+ *  text; `waiting`: it needs a transcript Ken cannot make yet (`detail` says
+ *  why); `failed`: Ken could not read it (`detail` says why). */
+export type RawState = "queued" | "transcribing" | "waiting" | "reading" | "read" | "failed";
+
 /** One source in the library's Raw/ folder and where it is in the read. */
 export interface RawSource {
   path: string;
   name: string;
-  state: "queued" | "reading" | "read" | "failed";
+  state: RawState;
   detail: string | null;
   /** meeting | recording | document, or "" when not known yet. */
   kind: string;
@@ -129,7 +148,7 @@ export interface RawSource {
   waiting: number;
 }
 
-/** One ingested source: its note, and whether it is still on Review. */
+/** One ingested source: its note, and whether its card is still open. */
 export interface IngestedSource {
   id: number;
   note: string;
@@ -153,6 +172,8 @@ export interface IngestOverview {
   ingested: IngestedSource[];
   running: boolean;
   claudeFound: boolean;
+  /** Sources with something waiting: the Ingest tab's count. */
+  waiting: number;
 }
 
 /** A note's key takeaways. */
@@ -226,16 +247,6 @@ export interface IngestUndoReport {
   noteRemoved: boolean;
   /** Writes left in place because their file changed since. */
   kept: string[];
-}
-
-export interface IngestStatus {
-  hasInbox: boolean;
-  /** New sources in Raw, not yet processed. */
-  waiting: string[];
-  /** Sources in Raw whose note is written and waiting to be filed. */
-  inReview: string[];
-  running: boolean;
-  claudeFound: boolean;
 }
 
 /** Mirrors `drift::DriftRun`: one standing sweep. */
@@ -438,133 +449,6 @@ export interface TreeData {
   folders: FolderInfo[];
 }
 
-export type IngestMode = "single" | "collection";
-export type IngestRefresh = "on-change" | "manual";
-
-export interface RulesOverride {
-  reviewThresholdPct?: number;
-  staleDays?: number;
-}
-
-export interface ResolvedRules {
-  reviewThresholdPct: number;
-  staleDays: number;
-}
-
-export interface Recipe {
-  slug: string;
-  name: string;
-  description: string;
-  sources: string[];
-  output: string;
-  mode: IngestMode;
-  refresh: IngestRefresh;
-  rules: RulesOverride | null;
-  instruction: string;
-}
-
-export type RecipeEntry =
-  | { kind: "ok"; recipe: Recipe }
-  | { kind: "broken"; error: { slug: string; reason: string } };
-
-export type RunStatus =
-  | "running"
-  | "fresh"
-  | "blocked"
-  | "pending_approval"
-  | "failed"
-  | "discarded"
-  | "cancelled";
-
-/** Persisted statuses plus transient live-only ones (never in the DB set). */
-export type LiveStatus = RunStatus | "queued" | "waiting";
-
-export interface RunRow {
-  id: number;
-  slug: string;
-  kind: "ingest" | "automation";
-  sessionId: string | null;
-  startedAt: number;
-  finishedAt: number | null;
-  status: RunStatus;
-  summary: string | null;
-  error: string | null;
-  changeRatio: number | null;
-}
-
-export interface IngestSummary {
-  entry: RecipeEntry;
-  lastRun: RunRow | null;
-  resolvedRules: ResolvedRules | null;
-  stale: boolean;
-}
-
-export interface IngestDetail {
-  recipe: Recipe;
-  runs: RunRow[];
-  resolvedRules: ResolvedRules;
-}
-
-export interface IngestEvent {
-  kind: "ingest" | "automation";
-  slug: string;
-  runId: number;
-  status: LiveStatus;
-  detail: string | null;
-  activity?: string | null;
-  elapsedSecs?: number | null;
-  etaSecs?: number | null;
-  /** Set on member-scoped emits of `ingest-run-changed` (S9 step 5). */
-  project_id?: string;
-}
-
-export interface Automation {
-  slug: string;
-  name: string;
-  globs: string[];
-  prompt: string;
-  autoApply: boolean;
-  enabled: boolean;
-}
-
-export interface AutomationForm {
-  slug?: string;
-  name: string;
-  globs: string[];
-  prompt: string;
-  autoApply: boolean;
-  enabled: boolean;
-}
-
-export interface AutomationDetail {
-  automation: Automation;
-  runs: RunRow[];
-}
-
-export interface IngestForm {
-  slug?: string;
-  name: string;
-  description?: string;
-  instruction: string;
-  sources: string[];
-  output: string;
-  mode: IngestMode;
-  refresh: IngestRefresh;
-  rules?: RulesOverride | null;
-}
-
-export type InboxKind =
-  | "approval"
-  | "stale"
-  | "failed-file"
-  | "broken-recipe"
-  | "stored"
-  | "conflict"
-  | "conflict-copy"
-  | "automation-proposal"
-  | "ingest"
-  | "page-proposal";
-
 /** A proposed change to one wiki page a person keeps (a repo was added). */
 export interface PageProposalPayload {
   page: string;
@@ -572,24 +456,31 @@ export interface PageProposalPayload {
   proposed: string;
 }
 
-export interface InboxItem {
-  /** Kind-prefixed, stable across refreshes: "run-12", "stale-people", … */
+/** A sync conflict (two edits to one file) or a conflicted copy (a shared
+ *  drive saved a second file beside the original), for the banner at the
+ *  top of Files. `payload` is the kind's JSON: `ConflictPayload` or
+ *  `ConflictCopyPayload`. */
+export interface ConflictItem {
+  /** Kind-prefixed and stable across reads: "item-12". */
   id: string;
-  kind: InboxKind;
+  kind: "conflict" | "conflict-copy";
   title: string;
   body: string;
   when: number;
+  /** The file, inside its repo. */
   sourceRef: string;
-  /** Kind-specific JSON for stored items (conflict versions, copy paths). */
   payload: string | null;
+  /** The repo it is in; absent or null for the focused one. */
+  projectId?: string | null;
 }
 
-export interface ReviewInbox {
-  items: InboxItem[];
-  done: InboxItem[];
+/** What the banner at the top of Files says. */
+export interface FilesBanner {
+  conflicts: ConflictItem[];
+  conflictedCopies: number;
 }
 
-/** Parsed payload of a `conflict` inbox item. */
+/** Parsed payload of a `conflict` item. */
 export interface ConflictPayload {
   path: string;
   ours: string;
@@ -598,7 +489,7 @@ export interface ConflictPayload {
   draftStatus: "pending" | "ready" | "failed";
 }
 
-/** Parsed payload of a `conflict-copy` inbox item. */
+/** Parsed payload of a `conflict-copy` item. */
 export interface ConflictCopyPayload {
   copyPath: string;
   originalPath: string | null;
@@ -915,26 +806,6 @@ export type WorkspaceKgState =
     }
   | { state: "unavailable"; reason: string };
 
-/** Mirrors ken-core's `Memory` (ken-memory task 1.1/2.2) — no `rename_all`
- *  on the Rust struct, so field names pass through unchanged. `extra`
- *  (unknown frontmatter keys, preserved on rewrite) is `#[serde(skip)]` on
- *  the Rust side, so it never reaches the frontend. */
-export interface Memory {
-  slug: string;
-  description: string;
-  projects: string[];
-  created: string;
-  updated: string;
-  body: string;
-}
-
-/** Mirrors `JournalDayDto` — one day's journal content as returned by
- *  `read_journal`, most-recent-first. */
-export interface JournalDay {
-  date: string;
-  content: string;
-}
-
 /** Mirrors ken-core's `DistillCandidate` (design D6) — one proposed
  *  long-term memory awaiting approval. Always workspace-scope (the journal
  *  has no per-project home); `sources` are journal-relative paths (e.g.
@@ -965,6 +836,10 @@ export interface ClaudeDoctor {
   help: string;
 }
 
+/** What an on-device model is for: speech to text, search by meaning, or
+ *  building the map on this computer instead of with Claude. */
+export type ModelCategory = "transcription" | "embedding";
+
 /** A downloadable on-device model and whether it's installed. */
 export interface ModelStatus {
   id: string;
@@ -976,14 +851,35 @@ export interface ModelStatus {
   expectedBytes: number;
   /** The recommended default, pre-selected in the UI. */
   recommended: boolean;
-  /** "transcription" | "language" */
-  category: "transcription" | "language";
-  /** "recommended" | "advanced" */
-  tier: "recommended" | "advanced";
+  category: ModelCategory;
+  tier: "light" | "recommended" | "best" | "advanced";
+  /** Plain: "Search by meaning, English, 146 MB". */
   blurb: string;
+  /** The languages it handles, as a person says them. */
+  languages?: string;
   /** Whether this is the selected model for its category. */
   selected: boolean;
 }
+
+/** The search-by-meaning index: which model filled it, how far it is, and
+ *  whether a re-read after a model switch is running. Also the payload of
+ *  `semantic-progress`. */
+export interface EmbeddingState {
+  model: string | null;
+  dims: number | null;
+  embedded: number;
+  total: number;
+  rebuilding: boolean;
+  device: string;
+}
+
+/** The graphics card the on-device models can use. */
+export interface GpuInfo {
+  device: string | null;
+  backend: "vulkan" | "metal" | "cpu";
+  useGpu: boolean;
+}
+
 
 /** Payload of the `model-download-progress` event. */
 export interface ModelProgress {
@@ -1039,6 +935,14 @@ export interface RecordPermissions {
   screen: PermissionStatus;
   micSettingsUrl: string;
   screenSettingsUrl: string;
+}
+
+/** What this machine can record: the microphone, the system audio (the
+ *  other side of a call), and why not when one is missing. */
+export interface RecordSupport {
+  mic: boolean;
+  system: boolean;
+  reason: string | null;
 }
 
 export interface RecordLevelEvent {
@@ -1115,16 +1019,6 @@ export interface KenignoreWarning {
 }
 
 // ---- Workspace (workspace change, task 4.1) ----
-
-/** Mirrors the Rust `Candidate` (`ken_core::workspace`, camelCase) — one
- *  immediate subfolder of a prospective workspace parent, as surfaced by
- *  `discover_workspace_candidates` for the creation checklist. */
-export interface Candidate {
-  name: string;
-  existing: boolean;
-  fileCount: number;
-  markers: string[];
-}
 
 export type WorkspaceMemberStatus = "active" | "dormant" | "missing" | "invalid";
 
@@ -1292,16 +1186,6 @@ export interface RouteSearchResult {
   memberStatus: RouteMemberStatusEntry[];
 }
 
-/** Mirrors `CandidateDto` — a sibling folder not yet in the workspace.
- *  `existing` means it already has `.ken/project.json` and will be
- *  adopted rather than created fresh. */
-export interface WorkspaceCandidate {
-  name: string;
-  existing: boolean;
-  fileCount: number;
-  markers: string[];
-}
-
 /** Mirrors `ProjectGroupDto` — a named set of members that belong
  *  together despite being separate repos. `members` are parent-relative
  *  folder names; `projectIds` are the resolvable ones a scoped search
@@ -1381,8 +1265,28 @@ export interface DayTicket {
   linkedDone: number;
 }
 
+/** Mirrors the Rust `DayEscalation`: an open `escalations/*.md` in a team
+ *  repo, addressed to me. Read only; the row opens the file. */
+export interface DayEscalation {
+  id: string;
+  title: string;
+  raisedBy: string;
+  status: string;
+  ticket: string | null;
+  /** When it was raised, as the file states it. */
+  raised: string | null;
+  /** What it blocks, as the file states it. */
+  blocks: string | null;
+  projectId: string;
+  repo: string;
+  /** Inside that repo. */
+  relPath: string;
+}
+
 export interface DayState {
   tickets: DayTicket[];
+  /** Escalations addressed to me, from every team repo. */
+  escalations?: DayEscalation[];
   tasks: DayTask[];
   me: { name: string | null; email: string | null };
   /** The team has any ticket file at all. */
@@ -1538,8 +1442,8 @@ export interface FamilyInboxItem {
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   /** Draft the first wiki pages into workspace member `wiki` from every
-   *  member and an optional folder of documents. Background; a Review card
-   *  lists the result. Never touches a page a person wrote. */
+   *  member and an optional folder of documents. Background; Team lists the
+   *  result among its findings. Never touches a page a person wrote. */
   draftWiki: (wiki: string, extra: string | null) => invoke<void>("draft_wiki", { wiki, extra }),
   /** Repos joined: each team wiki covering them drafts their Repo Map pages
    *  and proposes changes to kept pages. Returns the wikis being updated. */
@@ -1550,8 +1454,6 @@ export const api = {
   /** Apply a proposed page change; returns the page written. */
   applyPageProposal: (itemId: number, projectId: string | null = null) =>
     invoke<string>("apply_page_proposal", { itemId, projectId }),
-  /** What waits in the library inbox (Research/Ingestion/Raw/). */
-  ingestStatus: (team: string | null = null) => invoke<IngestStatus>("ingest_status", { team }),
   /** The Ingest screen for the team's library (its wiki's inbox). */
   ingestOverview: (team: string | null) => invoke<IngestOverview>("ingest_overview", { team }),
   ingestCard: (team: string | null, itemId: number) => invoke<IngestCard>("ingest_card", { team, itemId }),
@@ -1564,6 +1466,19 @@ export const api = {
     }),
   /** Read what waits in Raw/ now; false when a pass is already running. */
   ingestNow: (team: string | null = null) => invoke<boolean>("ingest_now", { team }),
+  /** A note written in Ken, into Raw/ as `<date> Note - <title>.md`, then
+   *  read at once. Returns its path. */
+  ingestAddText: (team: string | null, title: string | null, text: string) =>
+    invoke<string>("ingest_add_text", { team, title, text }),
+  /** A chat, whole or a few of its messages (only the person's and Ken's
+   *  turns), into Raw/ as `<date> Chat - <title>.md`, then read at once.
+   *  `messageIds` null is the whole chat. Returns its path. */
+  ingestAddChat: (team: string | null, projectId: string, chatId: string, messageIds: number[] | null) =>
+    invoke<string>("ingest_add_chat", { team, projectId, chatId, messageIds }),
+  /** Try a source that failed again: its failure is cleared and a pass starts. */
+  ingestRetry: (team: string | null, path: string) => invoke<boolean>("ingest_retry", { team, path }),
+  /** Move a source out of Raw/ to the system trash. */
+  ingestRemove: (team: string | null, path: string) => invoke<void>("ingest_remove", { team, path }),
   /** Undo all on an ingest card: every write, last first, then the note
    *  (unless edited) and the source back to Raw/; what waits is closed. */
   ingestUndo: (itemId: number, team: string | null = null) =>
@@ -1584,8 +1499,9 @@ export const api = {
   /** The team's wiki (the repo with the inbox), or null. */
   teamWiki: (team: string | null) => invoke<string | null>("team_wiki", { team }),
   teamSaveIgnores: (lines: string[]) => invoke<void>("team_save_ignores", { lines }),
-  /** Stored Review items waiting in each open repo of the team, as [id, name, count]. */
-  teamReviewCounts: (team: string | null) => invoke<[string, string, number][]>("team_review_counts", { team }),
+  /** Sync conflicts and conflicted copies across the team's repos: the
+   *  banner at the top of Files. */
+  filesBanner: (team: string | null) => invoke<FilesBanner>("files_banner", { team }),
   /** A new rule page in the wiki, from its rule template; returns its path. */
   teamAddRule: (wikiId: string, rule: string) => invoke<string>("team_add_rule", { wikiId, rule }),
   /** A page's links both ways: pages it reaches, pages that reach it. */
@@ -1603,14 +1519,6 @@ export const api = {
   createProject: (path: string, name: string) =>
     invoke<ProjectInfo>("create_project", { path, name }),
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
-  /** Open an additional project alongside whatever is already open, without
-   *  closing it. Requires the `workspace` feature flag — rejects with
-   *  `"workspace disabled"` when it's off. */
-  openMember: (path: string) => invoke<ProjectInfo>("open_member", { path }),
-  /** Close one workspace member, leaving the others open. Same `workspace`
-   *  flag gate as `openMember`. */
-  closeMember: (projectId: string) =>
-    invoke<void>("close_member", { projectId }),
 
   // ---- Workspace (workspace change, task 4.1) ----
   /** Open an existing `.ken-workspace/` manifest at `parent`. Flag-gated on
@@ -1623,8 +1531,6 @@ export const api = {
    *  folder names, then open it (same activation path as `openWorkspace`). */
   createWorkspace: (parent: string, name: string, members: string[]) =>
     invoke<WorkspaceOverview>("create_workspace", { parent, name, members }),
-  /** Set-up: scan a code folder and propose repos and ignore lines. Reads only. */
-  setupPropose: (parent: string) => invoke<SetupProposal>("setup_propose", { parent }),
   /** Set-up Confirm: writes the manifest, kinds, teams, index states and
    *  ignore lines, then opens the workspace. */
   setupConfirm: (parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) =>
@@ -1636,6 +1542,7 @@ export const api = {
    *  the open one. Opens it. */
   setupConfirmRepos: (name: string, rows: SetupRepoRow[], add = false) =>
     invoke<WorkspaceOverview>("setup_confirm_repos", { name, rows, add }),
+  /** What a repo is for, in a person's words. */
   setProjectDescription: (id: string, description: string) =>
     invoke<RegistryEntryStatus[]>("set_project_description", { id, description }),
   /** Scan again: what moved since set-up. Never changes anything. */
@@ -1646,11 +1553,6 @@ export const api = {
    *  the resident cap) without closing any other member. Emits
    *  `workspace-state`'s `focus` variant. */
   focusProject: (id: string) => invoke<void>("focus_project", { id }),
-  /** Immediate subfolder candidates under `parent` for the workspace-creation
-   *  checklist — one level deep, tagged `existing`/`new` + file count +
-   *  repo markers. */
-  discoverWorkspaceCandidates: (parent: string) =>
-    invoke<Candidate[]>("discover_workspace_candidates", { parent }),
   /** Close the open workspace, tearing down every member's runtime. */
   closeWorkspace: () => invoke<void>("close_workspace"),
   /** Keyword FTS fan-out over every ACTIVE workspace member, merged by
@@ -1666,7 +1568,6 @@ export const api = {
   forgetWorkspace: (id: string) => invoke<void>("forget_workspace", { id }),
   renameProject: (id: string, name: string) =>
     invoke<ProjectInfo>("rename_project", { id, name }),
-  lastProjectId: () => invoke<string | null>("last_project_id"),
   currentProject: () => invoke<ProjectInfo | null>("current_project"),
   setFolderSelection: (excluded: string[]) =>
     invoke<ProjectInfo>("set_folder_selection", { excluded }),
@@ -1675,11 +1576,9 @@ export const api = {
    *  each path prefixed with the member's folder name. Same shape as
    *  getTree, so FileTree renders it unchanged. */
   getTreeAll: () => invoke<TreeData>("get_tree_all"),
-  search: (query: string, limit = 30) =>
-    invoke<SearchHit[]>("search", { query, limit }),
   /** Keyword FTS merged with semantic (when the `semanticIndex` feature is
    *  on for the project); transparently degrades to FTS-only results when
-   *  it's off, so callers can always route through this instead of `search`. */
+   *  it's off. */
   /** `audience` "business" keeps only pages written for readers who never
    *  see code (Current, Design, Work, or `audience: business`); "dev" keeps
    *  everything else but the method pages, code included; null is any. */
@@ -1712,22 +1611,14 @@ export const api = {
     invoke<ProjectGroup[]>("workspace_set_group", { name, members }),
   workspaceRemoveGroup: (name: string) =>
     invoke<ProjectGroup[]>("workspace_remove_group", { name }),
-  /** Sibling folders under the workspace root that aren't members yet. */
-  workspaceCandidates: () => invoke<WorkspaceCandidate[]>("workspace_candidates"),
-  /** Join an existing sibling folder to the open workspace. It lands
-   *  dormant and opens on first focus. */
   /** Take a repo out of the workspace (its folder and files stay). Its
-   *  team wiki gets a Review card listing the pages that still cite it. */
+   *  team wiki's link report names the pages that still cite it. */
   workspaceRemoveMember: (name: string) =>
     invoke<{ members: MemberOverview[]; wiki: string | null; citingPages: number }>("workspace_remove_member", { name }),
+  /** Join an existing sibling folder to the open workspace. It lands
+   *  dormant and opens on first focus. */
   workspaceAddMember: (folder: string) =>
     invoke<MemberOverview[]>("workspace_add_member", { folder }),
-  /** Folders dismissed as "not a project" (world data, vendored source). */
-  workspaceIgnored: () => invoke<string[]>("workspace_ignored"),
-  workspaceIgnoreCandidate: (folder: string) =>
-    invoke<string[]>("workspace_ignore_candidate", { folder }),
-  workspaceUnignoreCandidate: (folder: string) =>
-    invoke<string[]>("workspace_unignore_candidate", { folder }),
   readFile: (relPath: string) => invoke<string>("read_file", { relPath }),
   readFileBytes: (relPath: string) =>
     invoke<ArrayBuffer>("read_file_bytes", { relPath }),
@@ -1797,34 +1688,17 @@ export const api = {
   /// Starts a download; progress/completion arrive via `model-download-progress`.
   downloadModel: (id: string) => invoke<void>("download_model", { id }),
   removeModel: (id: string) => invoke<void>("remove_model", { id }),
-  setModelSelection: (category: "transcription" | "language", id: string) =>
+  setModelSelection: (category: ModelCategory, id: string) =>
     invoke<void>("set_model_selection", { category, id }),
+  /** The search-by-meaning index now; `semantic-progress` follows it. */
+  embeddingState: () => invoke<EmbeddingState>("embedding_state"),
+  onSemanticProgress: (fn: (ev: EmbeddingState) => void): Promise<UnlistenFn> =>
+    listen<EmbeddingState>("semantic-progress", (e) => fn(e.payload)),
+  /** The graphics card the on-device models can use, and whether they do. */
+  gpuInfo: () => invoke<GpuInfo>("gpu_info"),
+  setUseGpu: (on: boolean) => invoke<void>("set_use_gpu", { on }),
 
-  listIngests: () => invoke<IngestSummary[]>("list_ingests"),
-  getIngest: (slug: string) => invoke<IngestDetail>("get_ingest", { slug }),
-  saveIngest: (form: IngestForm) => invoke<Recipe>("save_ingest", { form }),
-  deleteIngest: (slug: string) => invoke<void>("delete_ingest", { slug }),
-  runIngest: (slug: string, full = true) =>
-    invoke<void>("run_ingest", { slug, full }),
-  cancelRun: (slug: string, kind: "ingest" | "automation" = "ingest") =>
-    invoke<void>("cancel_run", { slug, kind }),
-  approveRun: (runId: number) => invoke<void>("approve_run", { runId }),
-  discardRun: (runId: number) => invoke<void>("discard_run", { runId }),
-
-  listAutomations: () => invoke<Automation[]>("list_automations"),
-  getAutomation: (slug: string) =>
-    invoke<AutomationDetail>("get_automation", { slug }),
-  saveAutomation: (form: AutomationForm) =>
-    invoke<Automation>("save_automation", { form }),
-  deleteAutomation: (slug: string) =>
-    invoke<void>("delete_automation", { slug }),
-  runAutomation: (slug: string) => invoke<void>("run_automation", { slug }),
-  approveAutomationProposal: (itemId: number) =>
-    invoke<void>("approve_automation_proposal", { itemId }),
-  discardAutomationProposal: (itemId: number) =>
-    invoke<void>("discard_automation_proposal", { itemId }),
-  pendingApprovals: () => invoke<RunRow[]>("pending_approvals"),
-  reviewInbox: () => invoke<ReviewInbox>("review_inbox"),
+  /** Close a page proposal or another stored item without applying it. */
   resolveReviewItem: (id: number, projectId: string | null = null) =>
     invoke<void>("resolve_review_item", { id, projectId }),
   /// Silence a file's issues for this user only (app-data, never synced).
@@ -1854,8 +1728,6 @@ export const api = {
   ) => invoke<string>("resolve_conflict", { itemId, resolution, content }),
   resolveConflictCopy: (itemId: number, resolution: ConflictCopyResolution) =>
     invoke<string>("resolve_conflict_copy", { itemId, resolution }),
-  setIngestRunnerMode: (mode: "hidden-tui" | "headless") =>
-    invoke<void>("set_ingest_runner_mode", { mode }),
   /// Whether cloud-offline documents are downloaded + indexed in the background.
   getBackgroundIndex: () => invoke<boolean>("get_background_index"),
   setBackgroundIndex: (enabled: boolean) =>
@@ -1887,12 +1759,6 @@ export const api = {
    *  2.1). */
   profileProject: (projectId?: string) =>
     invoke<void>("profile_project", { projectId }),
-  /** Profile workspace-creation candidate folders that aren't projects yet
-   *  (concurrency 2, per-candidate failures never block the others) —
-   *  project-profiler task 2.2. Progress arrives via `onProfileState`
-   *  events keyed by `path` instead of `project_id`. */
-  profileCandidates: (paths: string[]) =>
-    invoke<void>("profile_candidates", { paths }),
   /// Whether videos are auto-transcribed on-device (Whisper) during indexing.
   getTranscribeOnIndex: () => invoke<boolean>("get_transcribe_on_index"),
   setTranscribeOnIndex: (enabled: boolean) =>
@@ -1933,25 +1799,6 @@ export const api = {
     invoke<WorkspaceKgSearchHit[]>("workspace_kg_search", { query, team }),
 
   // ---- Memory (ken-memory task 4.1) ----
-  /** Create (`"create"`, slug must not exist) or replace (`"replace"`, slug
-   *  must exist) a memory at workspace scope (`.ken-workspace/memory/`) or
-   *  project scope (the focused member's `.ken/memory/`). */
-  memoryWrite: (
-    scope: "workspace" | "project",
-    slug: string,
-    content: string,
-    mode: "create" | "replace",
-  ) => invoke<Memory>("memory_write", { scope, slug, content, mode }),
-  /** Append a `## HH:MM` entry to today's journal file, creating it (and
-   *  `journal/`) if absent — how agent-desktop reports task findings back
-   *  via `ken-mcp`'s twin tool. */
-  journalAppend: (text: string, project?: string, tags?: string[]) =>
-    invoke<void>("journal_append", { text, project, tags }),
-  /** Recent journal days, most-recent-first, checking `journal/archive/` too
-   *  (spec: "archived journal stays findable"). `daysBack` omitted = today
-   *  only; a day with no file on either side is skipped, not an error. */
-  readJournal: (daysBack?: number) =>
-    invoke<JournalDay[]>("read_journal", { daysBack }),
   /** Kick off a distillation pass over the current journal window. Returns
    *  as soon as the background thread starts; progress/outcome arrive via
    *  `onMemoryState` (`planning` → `distilling` → `ready`/`error`).
@@ -2003,8 +1850,6 @@ export const api = {
     messageId: number,
     answers: Record<string, string>,
   ) => invoke<void>("answer_chat_question", { chatId, messageId, answers }),
-  renameChat: (chatId: string, title: string) =>
-    invoke<void>("rename_chat", { chatId, title }),
   setChatPinned: (chatId: string, pinned: boolean) =>
     invoke<void>("set_chat_pinned", { chatId, pinned }),
   setChatModel: (chatId: string, model: string | null) =>
@@ -2034,8 +1879,6 @@ export const api = {
   onChatPtyData: (fn: (chunk: PtyChunk) => void): Promise<UnlistenFn> =>
     listen<PtyChunk>("chat-pty-data", (e) => fn(e.payload)),
 
-  onIngestRunChanged: (fn: (ev: IngestEvent) => void): Promise<UnlistenFn> =>
-    listen<IngestEvent>("ingest-run-changed", (e) => fn(e.payload)),
   onIndexUpdated: (fn: (stats: ScanStats) => void): Promise<UnlistenFn> =>
     listen<ScanStats>("index-updated", (e) => fn(e.payload)),
   /** Claude, asked by the person, opens a file in Ken (ken-mcp open_in_ken). */
@@ -2045,8 +1888,6 @@ export const api = {
     listen<{ projectId: string | null; path: string; line: number | null; anchor: string | null }>("ken-open", (e) =>
       fn(e.payload),
     ),
-  onFileSaved: (fn: (relPath: string) => void): Promise<UnlistenFn> =>
-    listen<string>("file-saved", (e) => fn(e.payload)),
   onSyncState: (fn: (ev: SyncStateEvent) => void): Promise<UnlistenFn> =>
     listen<SyncStateEvent>("sync-state", (e) => fn(e.payload)),
   onReviewChanged: (fn: () => void): Promise<UnlistenFn> =>
@@ -2134,17 +1975,21 @@ export const api = {
     await invoke<void>("record_request_permission", { kind });
     return invoke<RecordPermissions>("record_permissions");
   },
-  recordStart: (mic: boolean, system: boolean, deviceId: string | null) =>
-    invoke<void>("record_start", { mic, system, deviceId }),
+  /** What this machine can capture: the mic, the system audio, and why not. */
+  recordSupport: () => invoke<RecordSupport>("record_support"),
+  /** Start a take for `team`: the transcript goes to that team wiki's Raw/
+   *  and is read at once. Errors when nothing could start capturing. */
+  recordStart: (mic: boolean, system: boolean, deviceId: string | null, team: string | null = null) =>
+    invoke<void>("record_start", { mic, system, deviceId, team }),
   recordPause: () => invoke<void>("record_pause"),
   recordResume: () => invoke<void>("record_resume"),
   recordStop: (storage: RecordStorage) =>
     invoke<void>("record_stop", { storage }),
   recordCancel: () => invoke<void>("record_cancel"),
   /**
-   * Open a macOS System Settings privacy deep link. Routed through Rust because
-   * the frontend opener capability scope forbids the `x-apple.systempreferences:`
-   * scheme.
+   * Open the OS's privacy settings for a permission (an `x-apple.systempreferences:`
+   * link on macOS, `ms-settings:privacy-microphone` on Windows). Routed through
+   * Rust because the frontend opener capability scope forbids those schemes.
    */
   openSettingsUrl: (url: string) =>
     invoke<void>("record_open_settings", { url }),

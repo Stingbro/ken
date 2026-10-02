@@ -21,7 +21,7 @@
 //! their own bucket. Every run can carry two controls (a page known to have
 //! moved, one known clean) and a minimum page count; a wrong control or too
 //! few pages voids the run, and a run with no controls says so. Nothing is
-//! edited: results go to one Review item per run, and a record of the run.
+//! edited: each run is recorded, and the Team screen lists what it found.
 //!
 //! The Scope and Answer checks read a ticket's diff and its escalations, so
 //! they arrive with Wright, not here.
@@ -147,7 +147,7 @@ impl DriftRun {
         };
     }
 
-    /// The Review item: a Finding first, then judgments and aged pages as
+    /// The run as text: a Finding first, then judgments and aged pages as
     /// one line each, Research apart. Auto-recleared diffs are only counted.
     pub fn to_markdown(&self) -> String {
         let mut s = String::new();
@@ -760,34 +760,64 @@ pub fn due(db: &Db, project: &Project, now: i64) -> Result<bool> {
     Ok(db.last_drift_run_at()?.is_none_or(|at| now - at >= interval))
 }
 
+/// The kind of the Review items earlier versions filed for a run.
 pub const REVIEW_KIND: &str = "drift";
 
-/// Record the run and keep one open Review item for it: replaced when what
-/// it says changes, resolved when a run comes back clean.
+/// Record the run. What it found is read from the record (the Team screen's
+/// findings); an item an earlier version filed for a run is resolved.
 pub fn file_run(db: &mut Db, run: &DriftRun) -> Result<()> {
     db.insert_drift_run(run)?;
-    let open = db.open_review_item_of_kind(REVIEW_KIND)?;
-    if run.exit_code == 0 {
-        if let Some((id, _)) = open {
-            db.resolve_review_item(id, run.at)?;
-        }
-        return Ok(());
+    while let Some((id, _)) = db.open_review_item_of_kind(REVIEW_KIND)? {
+        db.resolve_review_item(id, run.at)?;
     }
-    let body = run.to_markdown();
-    if let Some((id, old)) = &open {
-        if *old == body {
-            return Ok(());
-        }
-        db.resolve_review_item(*id, run.at)?;
-    }
-    let findings = run.mismatches.iter().filter(|m| m.severity == Severity::Finding && !m.research).count();
-    let judgments = run.mismatches.iter().filter(|m| m.severity == Severity::Judgment && !m.research).count();
-    let title = match &run.void_reason {
-        Some(_) => "Drift: the last sweep is void".to_string(),
-        None => format!("Drift: {findings} gone, {judgments} to re-read, {} not verified in {AGE_DAYS} days", run.aged.len()),
-    };
-    db.insert_review_item(REVIEW_KIND, &title, &body, "", None, run.at)?;
     Ok(())
+}
+
+/// One thing a run found, for the Team screen: what it is about, what is
+/// wrong, and the page to open (empty when it is about the run itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Finding {
+    /// `void` · `gone` (a cited source is gone) · `changed` (to re-read) ·
+    /// `aged` (not verified in [`AGE_DAYS`] days).
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub path: String,
+}
+
+/// What a run found, live pages first: a void run is one finding; else each
+/// mismatch on a live page and each page past the age rule. Research is
+/// evidence and left out.
+pub fn findings(run: &DriftRun) -> Vec<Finding> {
+    if let Some(why) = &run.void_reason {
+        return vec![Finding { kind: "void".into(), title: "The last sweep is void".into(), detail: why.clone(), path: String::new() }];
+    }
+    let page_of = |subject: &str| subject.split('#').next().unwrap_or(subject).to_string();
+    let mut out: Vec<Finding> = run
+        .mismatches
+        .iter()
+        .filter(|m| !m.research)
+        .map(|m| Finding {
+            kind: if m.severity == Severity::Finding { "gone" } else { "changed" }.into(),
+            title: format!("{} cites {}", m.subject, m.citation),
+            detail: m.detail.clone(),
+            path: page_of(&m.subject),
+        })
+        .collect();
+    out.sort_by_key(|f| f.kind != "gone");
+    for (page, verified) in &run.aged {
+        out.push(Finding {
+            kind: "aged".into(),
+            title: page.clone(),
+            detail: match verified {
+                Some(d) => format!("Last verified {d}, more than {AGE_DAYS} days ago."),
+                None => "Never verified.".into(),
+            },
+            path: page.clone(),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1080,14 +1110,19 @@ updated: {{date}}
         let void = sweep(&project, &db, now).unwrap();
         assert!(void.void_reason.as_deref().unwrap().contains("known-clean"));
 
-        // No controls: says so. Filing keeps one Review item and a record.
+        // No controls: says so. Filing keeps a record, and no Review item.
         project.config.extra.remove("drift");
         let plain = sweep(&project, &db, now).unwrap();
         assert!(plain.uncontrolled);
+        db.insert_review_item(REVIEW_KIND, "Drift: from before", "body", "", None, now - 1).unwrap();
         file_run(&mut db, &plain).unwrap();
         file_run(&mut db, &plain).unwrap();
-        let open = db.open_review_item_of_kind(REVIEW_KIND).unwrap().unwrap();
-        assert!(open.1.contains("Findings: a cited source is gone"));
+        assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none(), "an old item is resolved");
+        let found = findings(&plain);
+        assert!(found.iter().any(|f| f.kind == "gone" && !f.path.contains('#')), "{found:?}");
+        assert_eq!(found.first().map(|f| f.kind.as_str()), Some("gone"), "what is gone comes first");
+        assert_eq!(findings(&void).len(), 1);
+        assert_eq!(findings(&void)[0].kind, "void");
         assert_eq!(db.last_drift_run_at().unwrap(), Some(now));
         assert!(!due(&db, &project, now + 86_400).unwrap());
         assert!(due(&db, &project, now + 8 * 86_400).unwrap());

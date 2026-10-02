@@ -929,7 +929,8 @@ ws     ::= | " " | "\n" [ \t]{0,20}
             // Share the one process-wide backend with the embedder rather than
             // calling `LlamaBackend::init()` a second time (which would error).
             let backend = super::shared_backend()?;
-            let params = LlamaModelParams::default().with_n_gpu_layers(1000); // Metal: offload all
+            // All layers to the graphics card unless it is off (`compute`).
+            let params = LlamaModelParams::default().with_n_gpu_layers(crate::compute::gpu_layers());
             let model = LlamaModel::load_from_file(backend, path, &params)
                 .map_err(|e| Error::Other(format!("couldn't load the answers model: {e}")))?;
             Ok(LlamaEngine { backend, model, n_ctx: 8192 })

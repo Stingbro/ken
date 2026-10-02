@@ -1,5 +1,5 @@
-// Your day: the team's tickets assigned to me, my tasks, the team digest and
-// the team's index health. Refreshes on `day-changed`, the team-digest
+// Your day: the team's tickets assigned to me, escalations addressed to me,
+// my tasks, the team digest and the team's index health. Refreshes on `day-changed`, the team-digest
 // events, `index-updated` (those two coalesced), a change of team, and a new
 // local day: at midnight, or on wake or focus when the timer ran late.
 import {
@@ -15,6 +15,7 @@ import {
 import { app } from "./app.svelte";
 import { scope } from "./scope.svelte";
 import { localToday, orderTasks } from "./day";
+import { toast } from "./toast.svelte";
 
 /** What the task panel shows: a new task (optionally pre-linked) or one
  *  existing task by id. */
@@ -68,6 +69,11 @@ class DayStore {
 
   get tickets() {
     return this.state?.tickets ?? [];
+  }
+
+  /** Open escalations addressed to me, from every team repo. */
+  get escalations() {
+    return this.state?.escalations ?? [];
   }
 
   /** The task open in the panel, when editing: today's copy, else the one
@@ -203,6 +209,7 @@ class DayStore {
     } catch (e) {
       this.generating = false;
       this.digestError = String(e);
+      toast.error("Could not write the digest", e);
     }
   }
 

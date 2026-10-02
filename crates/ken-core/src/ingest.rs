@@ -17,13 +17,14 @@
 //!
 //! **Filing.** When the person has read the card ([`file`]), the source
 //! moves beside its note, under `Research/Ingestion/Ingested/<Meetings|
-//! Recordings|Documents>/<YYYY-MM>/`. [`undo_write`] reverses one write;
-//! [`undo_all`] reverses every one, then the note and the move.
+//! Recordings|Documents|Notes|Sessions>/<YYYY-MM>/`. [`undo_write`]
+//! reverses one write; [`undo_all`] reverses every one, then the note and
+//! the move.
 //!
-//! This is the Ingest half of what Ken called ingests; the other half, a
-//! stored rule that keeps an output page fresh from its sources, is a
-//! recipe (`recipe.rs`), and stays one. The model call is passed in
-//! (`generate`), so the app runs Claude headless and a test a stand-in.
+//! [`run_pass`] reads every new source in turn (a recording is transcribed
+//! first); one that fails is recorded and passed over. The model call is
+//! passed in (`generate`), so the app runs Claude headless and a test a
+//! stand-in.
 
 use std::collections::HashMap;
 use std::fs;
@@ -43,6 +44,61 @@ pub const REVIEW_KIND: &str = "ingest";
 /// the library has none of its own.
 const DEFAULT_TEMPLATE: &str = include_str!("../templates/wiki/Templates/Ingested-note.md");
 
+/// The template a note is written from: the library's own, unless it is
+/// missing or older than the sections the card and the follow-ups read (a
+/// wiki made before `## Summary` was in it), then the bundled one.
+pub fn note_template(root: &Path) -> String {
+    match fs::read_to_string(root.join(TEMPLATE)) {
+        Ok(own) if own.contains("## Summary") => own,
+        _ => DEFAULT_TEMPLATE.to_string(),
+    }
+}
+
+/// The Review-store kind of a source that could not be read: one open item
+/// per source in `Raw/`, its body the reason. Resolved when the source is
+/// read, retried or removed.
+pub const FAILED_KIND: &str = "ingest-failed";
+
+/// The open failure recorded for `raw`, if any.
+pub fn failure_of(db: &Db, raw: &str) -> Result<Option<crate::db::ReviewItemRow>> {
+    Ok(db.list_open_review_items()?.into_iter().find(|it| it.kind == FAILED_KIND && it.source_ref == raw))
+}
+
+/// Every source with an open failure, and why.
+pub fn failures(db: &Db) -> Result<Vec<(String, String)>> {
+    Ok(db
+        .list_open_review_items()?
+        .into_iter()
+        .filter(|it| it.kind == FAILED_KIND)
+        .map(|it| (it.source_ref, it.body))
+        .collect())
+}
+
+/// Record that `raw` could not be read, unless that is already recorded.
+pub fn record_failure(db: &mut Db, raw: &str, reason: &str, now: i64) -> Result<()> {
+    if failure_of(db, raw)?.is_some() {
+        return Ok(());
+    }
+    let name = raw.rsplit('/').next().unwrap_or(raw);
+    db.insert_review_item(FAILED_KIND, &format!("Could not ingest {name}"), &format!("It stays in Raw/. {reason}"), raw, None, now)?;
+    Ok(())
+}
+
+/// Clear `raw`'s failures: it was read, is to be tried again, or left Raw.
+/// Returns how many were open.
+pub fn resolve_failure(db: &mut Db, raw: &str, now: i64) -> Result<usize> {
+    let open: Vec<i64> = db
+        .list_open_review_items()?
+        .into_iter()
+        .filter(|it| it.kind == FAILED_KIND && it.source_ref == raw)
+        .map(|it| it.id)
+        .collect();
+    for id in &open {
+        db.resolve_review_item(*id, now)?;
+    }
+    Ok(open.len())
+}
+
 /// What a source was, which decides its folder once filed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +106,10 @@ pub enum SourceKind {
     Meeting,
     Recording,
     Document,
+    /// Written in Ken's Ingest screen (Write a note).
+    Note,
+    /// A chat with Ken, sent to Ingest.
+    Session,
 }
 
 impl SourceKind {
@@ -58,8 +118,45 @@ impl SourceKind {
             SourceKind::Meeting => "Meetings",
             SourceKind::Recording => "Recordings",
             SourceKind::Document => "Documents",
+            SourceKind::Note => "Notes",
+            SourceKind::Session => "Sessions",
         }
     }
+
+    fn parse(k: &str) -> Option<SourceKind> {
+        let k = k.trim().trim_matches('"').to_lowercase();
+        Some(match k.as_str() {
+            k if k.starts_with("meeting") => SourceKind::Meeting,
+            k if k.starts_with("recording") => SourceKind::Recording,
+            k if k.starts_with("document") => SourceKind::Document,
+            k if k.starts_with("note") => SourceKind::Note,
+            k if k.starts_with("session") => SourceKind::Session,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Meeting => "meeting",
+            SourceKind::Recording => "recording",
+            SourceKind::Document => "document",
+            SourceKind::Note => "note",
+            SourceKind::Session => "session",
+        }
+    }
+}
+
+/// The kind a source says it is in its own frontmatter (`kind: note`, as
+/// Ken writes a note, a chat or a recording into the inbox).
+pub fn declared_kind(source_text: &str) -> Option<SourceKind> {
+    let mut lines = source_text.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    lines
+        .take_while(|l| l.trim_end() != "---")
+        .find_map(|l| l.trim().strip_prefix("kind:"))
+        .and_then(SourceKind::parse)
 }
 
 /// Where one ingested source ends up.
@@ -255,11 +352,8 @@ pub fn kind_of(note: &str, raw: &str) -> SourceKind {
             .take_while(|l| l.trim_end() != "---")
             .find_map(|l| l.trim().strip_prefix(key).map(|v| v.trim().trim_matches('"').to_lowercase()))
     };
-    match field("kind:").as_deref() {
-        Some(k) if k.starts_with("meeting") => return SourceKind::Meeting,
-        Some(k) if k.starts_with("recording") => return SourceKind::Recording,
-        Some(k) if k.starts_with("document") => return SourceKind::Document,
-        _ => {}
+    if let Some(k) = field("kind:").as_deref().and_then(SourceKind::parse) {
+        return k;
     }
     let ext = raw.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
     if matches!(ext.as_str(), "vtt" | "srt") {
@@ -453,9 +547,14 @@ pub fn ingest_one(
     if text.trim().is_empty() {
         return Err(Error::Other(format!("{raw} has no text Ken can read (a recording needs its transcript first)")));
     }
-    let template = fs::read_to_string(root.join(TEMPLATE)).unwrap_or_else(|_| DEFAULT_TEMPLATE.to_string());
-    let reply = generate(&prompt_against(&template, raw, &text, date, &wiki_context(db, &text)))?;
-    let kind = kind_of(strip_fences(&reply), raw);
+    let template = note_template(root);
+    let declared = declared_kind(&text);
+    let mut ask = prompt_against(&template, raw, &text, date, &wiki_context(db, &text));
+    if let Some(k) = declared {
+        ask.push_str(&format!("\nThe source says it is a {0}: set `kind: {0}` in the note's frontmatter.\n", k.as_str()));
+    }
+    let reply = generate(&ask)?;
+    let kind = declared.unwrap_or_else(|| kind_of(strip_fences(&reply), raw));
     let placement = place(root, raw, date, kind);
     let note = finish_note(&reply, &placement)?;
 
@@ -487,7 +586,264 @@ pub fn file(root: &Path, card: &Card) -> Result<Card> {
         fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
     }
     fs::rename(&raw, &dest).map_err(|e| Error::io(&raw, e))?;
+    // A recording's generated transcript is keyed by its path: it moves too.
+    crate::transcript::move_cached(root, &card.placement.raw, &card.placement.source);
     Ok(Card { filed: true, ..card.clone() })
+}
+
+// --- One pass over the inbox: what the app runs when a source lands, and
+// what the evaluation harness runs headless. ----------------------------
+
+/// Why a model call failed: for every source alike (Claude Code missing,
+/// not logged in, timed out), which stops the pass, or for this source
+/// only, which the pass records and moves past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+    Stop(String),
+    Source(String),
+}
+
+/// A Claude one-shot's outcome as a pass reads it.
+pub fn call_result(out: Result<crate::assistant::OneshotOutcome>) -> std::result::Result<String, CallError> {
+    use crate::assistant::OneshotOutcome as O;
+    match out {
+        // The CLI could not be started at all.
+        Err(e) => Err(CallError::Stop(e.to_string())),
+        Ok(O::Completed(text)) => Ok(text),
+        Ok(O::TimedOut) => Err(CallError::Stop("Claude Code did not answer within ten minutes.".into())),
+        Ok(O::Cancelled) => Err(CallError::Stop("The read was cancelled.".into())),
+        Ok(O::Failed(d)) if cli_failed(&d) => Err(CallError::Stop(d)),
+        Ok(O::Failed(d)) => Err(CallError::Source(d)),
+    }
+}
+
+/// Whether a failed run's detail says the CLI itself cannot work (not
+/// installed, not logged in, out of credit), so every source would fail.
+pub fn cli_failed(detail: &str) -> bool {
+    if detail == crate::runner::MISSING_CLAUDE_HELP {
+        return true;
+    }
+    let d = detail.to_lowercase();
+    ["not logged in", "/login", "invalid api key", "authentication_error", "oauth token", "credit balance is too low"]
+        .iter()
+        .any(|p| d.contains(p))
+}
+
+/// Where a pass is with the source it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassPhase {
+    /// Making the transcript of a recording (Whisper's percent).
+    Transcribing(u8),
+    /// The model is reading it.
+    Reading,
+}
+
+/// What one pass did.
+#[derive(Debug, Clone, Default)]
+pub struct PassReport {
+    pub read: Vec<Placement>,
+    /// Sources that could not be read, and why. Each stays in `Raw/` with a
+    /// failure recorded ([`FAILED_KIND`]).
+    pub failed: Vec<(String, String)>,
+    /// Recordings that wait for something Ken cannot make here (a model,
+    /// ffmpeg), and what.
+    pub waiting: Vec<(String, String)>,
+    /// Why the pass stopped before the end, when the CLI itself failed.
+    pub stopped: Option<String>,
+}
+
+/// What a pass transcribes recordings with: the Whisper model and ffmpeg,
+/// each when there is one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Transcriber<'a> {
+    pub model: Option<&'a Path>,
+    pub ffmpeg: Option<&'a Path>,
+}
+
+/// Whether a source in the inbox is a recording with no transcript yet.
+pub fn needs_transcript(root: &Path, raw: &str) -> bool {
+    crate::extract::FileKind::from_path(Path::new(raw)) == crate::extract::FileKind::Video
+        && !crate::transcript::has_transcript(root, raw)
+}
+
+/// Read every new source in `Raw/`, one at a time: a recording is
+/// transcribed first; each source becomes its note and what follows from it
+/// is written ([`ingest_one`], [`follow_ups`]). A source that fails is
+/// recorded and passed over, and a recording that needs a model or ffmpeg
+/// waits; the pass stops only when the CLI itself fails
+/// ([`CallError::Stop`]). Sources with a failure recorded are left until
+/// someone tries them again ([`resolve_failure`]).
+#[allow(clippy::too_many_arguments)]
+pub fn run_pass(
+    root: &Path,
+    db: &mut Db,
+    targets: &Targets,
+    today: &str,
+    now: impl Fn() -> i64,
+    transcriber: Transcriber,
+    mut call: impl FnMut(&str) -> std::result::Result<String, CallError>,
+    on_phase: &std::sync::Arc<dyn Fn(&str, PassPhase) + Send + Sync>,
+) -> Result<PassReport> {
+    // Failed sources are left alone until tried again, or until the file
+    // changes after it failed (a fixed copy dropped over it).
+    let failed_before: Vec<(String, i64, i64)> = db
+        .list_open_review_items()?
+        .into_iter()
+        .filter(|it| it.kind == FAILED_KIND)
+        .map(|it| (it.source_ref, it.id, it.created_at))
+        .collect();
+    let mut report = PassReport::default();
+    for raw in waiting_new(root, db)? {
+        if let Some((_, id, at)) = failed_before.iter().find(|(r, _, _)| *r == raw) {
+            let changed = fs::metadata(root.join(&raw))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|d| d.as_secs() as i64 > *at);
+            if !changed {
+                continue;
+            }
+            db.resolve_review_item(*id, now())?;
+        }
+        if needs_transcript(root, &raw) {
+            let abs = root.join(&raw);
+            if let Some(why) = crate::transcript::waiting_reason(&abs, transcriber.ffmpeg.is_some(), transcriber.model.is_some()) {
+                report.waiting.push((raw, why));
+                continue;
+            }
+            on_phase(&raw, PassPhase::Transcribing(0));
+            let progress: crate::transcript::ProgressFn = {
+                let (f, raw) = (on_phase.clone(), raw.clone());
+                std::sync::Arc::new(move |p| {
+                    if let crate::transcript::TranscriptPhase::Transcribing(pct) = p {
+                        f(&raw, PassPhase::Transcribing(pct));
+                    }
+                })
+            };
+            let model = transcriber.model.unwrap_or(Path::new(""));
+            if let Err(e) = crate::transcript::generate_and_cache_with_progress(transcriber.ffmpeg, model, root, &raw, progress) {
+                let why = format!("Could not transcribe it: {e}");
+                record_failure(db, &raw, &why, now())?;
+                report.failed.push((raw, why));
+                continue;
+            }
+        }
+        on_phase(&raw, PassPhase::Reading);
+        let mut stop: Option<String> = None;
+        let done = ingest_one(root, db, &raw, today, now(), |p| match call(p) {
+            Ok(text) => Ok(text),
+            Err(CallError::Stop(m)) => {
+                stop = Some(m.clone());
+                Err(Error::Other(m))
+            }
+            Err(CallError::Source(m)) => Err(Error::Other(m)),
+        });
+        match done {
+            Ok(placement) => {
+                resolve_failure(db, &raw, now())?;
+                let note = fs::read_to_string(root.join(&placement.note)).unwrap_or_default();
+                let followed = follow_ups(root, db, &placement, &note, today, now(), targets, |p| match call(p) {
+                    Ok(text) => Ok(text),
+                    Err(CallError::Stop(m)) => {
+                        stop = Some(m.clone());
+                        Err(Error::Other(m))
+                    }
+                    Err(CallError::Source(m)) => Err(Error::Other(m)),
+                });
+                if let Err(e) = followed {
+                    eprintln!("warning: ingest follow-ups for {raw} failed: {e}");
+                }
+                report.read.push(placement);
+                if let Some(m) = stop {
+                    report.stopped = Some(m);
+                    break;
+                }
+            }
+            Err(_) if stop.is_some() => {
+                report.stopped = stop;
+                break;
+            }
+            Err(e) => {
+                record_failure(db, &raw, &e.to_string(), now())?;
+                report.failed.push((raw, e.to_string()));
+            }
+        }
+    }
+    Ok(report)
+}
+
+// --- Sources Ken writes into the inbox itself: a note written on the
+// Ingest screen, and a chat sent to it. -----------------------------------
+
+/// A name made safe for a file: no path separators or characters Windows
+/// refuses, trimmed, at most 80 characters.
+pub fn file_safe(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { ' ' } else { c })
+        .collect();
+    let one = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let short: String = one.chars().take(80).collect();
+    short.trim().trim_end_matches('.').trim().to_string()
+}
+
+/// A note written on the Ingest screen, as its source file:
+/// `YYYY-MM-DD HH.MM Note - <title>.md` (`stamp` is `YYYY-MM-DD HH.MM`) and
+/// its text, with `kind: note` and who wrote it.
+pub fn note_source(stamp: &str, title: Option<&str>, text: &str, by: Option<&str>) -> (String, String) {
+    let heading = title.map(str::trim).filter(|t| !t.is_empty());
+    let name = match heading.map(file_safe).filter(|t| !t.is_empty()) {
+        Some(t) => format!("{stamp} Note - {t}.md"),
+        None => format!("{stamp} Note.md"),
+    };
+    let mut doc = String::from("---\nkind: note\n");
+    if let Some(by) = by.map(str::trim).filter(|b| !b.is_empty()) {
+        doc.push_str(&format!("by: {}\n", yaml_str(by)));
+    }
+    doc.push_str(&format!("written: {}\n---\n\n", stamp.replacen('.', ":", 1)));
+    if let Some(t) = heading {
+        doc.push_str(&format!("# {t}\n\n"));
+    }
+    doc.push_str(text.trim());
+    doc.push('\n');
+    (name, doc)
+}
+
+/// One turn of a chat sent to Ingest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTurn {
+    /// `user` or `assistant`; anything else is left out.
+    pub role: String,
+    pub content: String,
+}
+
+/// A chat sent to Ingest, as its source file:
+/// `YYYY-MM-DD HH.MM Chat - <chat title>.md` with `kind: session`, the chat's
+/// id and who was present, and only the person's and Ken's turns, as
+/// **Me** and **Ken**. `None` when no turn is left.
+pub fn chat_source(stamp: &str, title: &str, chat_id: &str, me: Option<&str>, turns: &[ChatTurn]) -> Option<(String, String)> {
+    let kept: Vec<&ChatTurn> = turns
+        .iter()
+        .filter(|t| (t.role == "user" || t.role == "assistant") && !t.content.trim().is_empty())
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let heading = Some(title.trim()).filter(|t| !t.is_empty()).unwrap_or("Chat");
+    let name = format!("{stamp} Chat - {}.md", Some(file_safe(heading)).filter(|t| !t.is_empty()).unwrap_or_else(|| "Chat".into()));
+    let me = me.map(str::trim).filter(|m| !m.is_empty()).unwrap_or("Me");
+    let mut doc = format!(
+        "---\nkind: session\nchat: {}\npresent: [{}, Ken]\nheld: {}\n---\n\n# {heading}\n\nA chat with Ken. **Me** is {}; **Ken** is Ken's answers.\n\n",
+        yaml_str(chat_id),
+        yaml_str(me),
+        stamp.replacen('.', ":", 1),
+        me
+    );
+    for t in kept {
+        let who = if t.role == "user" { "Me" } else { "Ken" };
+        doc.push_str(&format!("**{who}:** {}\n\n", t.content.trim()));
+    }
+    Some((name, doc))
 }
 
 // --- What follows from a note. Written at once, each citing the note and
@@ -2102,5 +2458,167 @@ mod tests {
         assert_eq!(next_ticket(&repo), ("SRX".to_string(), 13));
         let t = ticket_text("SRX-013", "Fix the save bug.", Some("Ben"), "n");
         assert!(t.contains("\n## What and Why\n\nFix the save bug. Asked for in [[n]].") && t.contains("\n## thread\n"), "{t}");
+    }
+
+    fn quiet() -> std::sync::Arc<dyn Fn(&str, PassPhase) + Send + Sync> {
+        std::sync::Arc::new(|_, _| {})
+    }
+
+    /// A pass's model: the source named `bad` gets a reply with no
+    /// frontmatter, every other source the standup note, follow-ups nothing.
+    fn pass_model(p: &str) -> std::result::Result<String, CallError> {
+        if p.contains("SOURCE (") {
+            if p.contains("SOURCE (0-bad.txt)") {
+                return Ok("Sorry, I cannot do that.".into());
+            }
+            return Ok(REPLY.into());
+        }
+        Ok("NO CHANGE".into())
+    }
+
+    #[test]
+    fn a_bad_first_source_does_not_stop_the_ones_after_it() {
+        let d = library();
+        let root = d.path();
+        fs::write(root.join(RAW).join("0-bad.txt"), "Something Ken will fail on.\n").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let me = me();
+        let targets = Targets { team_repo: None, workspace: None, me: &me, stamp: "2026-09-24T10:00" };
+        let report = run_pass(root, &mut db, &targets, "2026-09-24", crate::engine::now_epoch, Transcriber::default(), pass_model, &quiet()).unwrap();
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, format!("{RAW}/0-bad.txt"));
+        assert_eq!(report.read.len(), 1, "the good source after it is read");
+        assert!(report.stopped.is_none());
+        assert!(failure_of(&db, &format!("{RAW}/0-bad.txt")).unwrap().is_some());
+        // The next pass leaves the failed source alone until it is tried again.
+        let mut asked = 0;
+        let again = run_pass(root, &mut db, &targets, "2026-09-24", crate::engine::now_epoch, Transcriber::default(), |p| {
+            asked += 1;
+            pass_model(p)
+        }, &quiet())
+        .unwrap();
+        assert!(again.read.is_empty() && again.failed.is_empty() && asked == 0);
+        // Try again: the failure is cleared and the source read once more.
+        assert_eq!(resolve_failure(&mut db, &format!("{RAW}/0-bad.txt"), 7).unwrap(), 1);
+        let retried = run_pass(root, &mut db, &targets, "2026-09-24", crate::engine::now_epoch, Transcriber::default(), pass_model, &quiet()).unwrap();
+        assert_eq!(retried.failed.len(), 1);
+        // A file changed since it failed is read again without asking.
+        let f = fs::File::options().write(true).open(root.join(RAW).join("0-bad.txt")).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(30)).unwrap();
+        drop(f);
+        let changed = run_pass(root, &mut db, &targets, "2026-09-24", crate::engine::now_epoch, Transcriber::default(), pass_model, &quiet()).unwrap();
+        assert_eq!(changed.failed.len(), 1, "tried again");
+        assert_eq!(failures(&db).unwrap().len(), 1, "one failure open, not two");
+    }
+
+    #[test]
+    fn a_cli_failure_stops_the_pass_and_marks_nothing_failed() {
+        let d = library();
+        let root = d.path();
+        fs::write(root.join(RAW).join("b-second.txt"), "More.\n").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let me = me();
+        let targets = Targets { team_repo: None, workspace: None, me: &me, stamp: "2026-09-24T10:00" };
+        let mut calls = 0;
+        let report = run_pass(root, &mut db, &targets, "2026-09-24", || 5, Transcriber::default(), |_| {
+            calls += 1;
+            Err(CallError::Stop("Not logged in · Please run /login".into()))
+        }, &quiet())
+        .unwrap();
+        assert_eq!(calls, 1, "one call, then the pass stops");
+        assert!(report.stopped.unwrap().contains("/login"));
+        assert!(report.failed.is_empty() && failures(&db).unwrap().is_empty());
+        assert!(cli_failed("Not logged in · Please run /login"));
+        assert!(!cli_failed("Prompt is too long"));
+        assert_eq!(call_result(Ok(crate::assistant::OneshotOutcome::Failed("Prompt is too long".into()))), Err(CallError::Source("Prompt is too long".into())));
+        assert!(matches!(call_result(Ok(crate::assistant::OneshotOutcome::TimedOut)), Err(CallError::Stop(_))));
+    }
+
+    #[test]
+    fn a_recording_with_no_model_waits_and_the_rest_are_read() {
+        let d = library();
+        let root = d.path();
+        fs::write(root.join(RAW).join("0 call.m4a"), b"not really audio").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let me = me();
+        let targets = Targets { team_repo: None, workspace: None, me: &me, stamp: "2026-09-24T10:00" };
+        let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = phases.clone();
+        let on_phase: std::sync::Arc<dyn Fn(&str, PassPhase) + Send + Sync> =
+            std::sync::Arc::new(move |raw, p| seen.lock().unwrap().push((raw.to_string(), p)));
+        let report = run_pass(root, &mut db, &targets, "2026-09-24", || 5, Transcriber::default(), pass_model, &on_phase).unwrap();
+        assert_eq!(report.waiting.len(), 1);
+        assert!(report.waiting[0].1.contains("Install a transcription model in Settings"));
+        assert_eq!(report.read.len(), 1);
+        assert!(report.failed.is_empty(), "waiting is not failing");
+        assert_eq!(phases.lock().unwrap().as_slice(), &[(format!("{RAW}/Standup notes.txt"), PassPhase::Reading)]);
+        // A recording that cannot be decoded, with a model there, fails.
+        let model = root.join("model.bin");
+        fs::write(&model, b"x").unwrap();
+        let t = Transcriber { model: Some(&model), ffmpeg: None };
+        let report = run_pass(root, &mut db, &targets, "2026-09-24", || 6, t, pass_model, &quiet()).unwrap();
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].1.starts_with("Could not transcribe it"), "{:?}", report.failed);
+    }
+
+    #[test]
+    fn a_wiki_template_without_a_summary_gives_way_to_the_bundled_one() {
+        let d = library();
+        let root = d.path();
+        assert!(note_template(root).contains("## Summary"), "no template: the bundled one");
+        fs::create_dir_all(root.join("Templates")).unwrap();
+        fs::write(root.join(TEMPLATE), "---\ntitle: x\n---\n# {{What}}\n\n## What It Overturns\n").unwrap();
+        assert_eq!(note_template(root), DEFAULT_TEMPLATE, "an old template: the bundled one");
+        fs::write(root.join(TEMPLATE), "---\ntitle: x\n---\n# Ours\n\n## Summary\n\n{{it}}\n").unwrap();
+        assert!(note_template(root).contains("# Ours"), "a current template is the wiki's own");
+    }
+
+    #[test]
+    fn notes_and_chats_land_in_their_own_folders() {
+        let (name, doc) = note_source("2026-10-01 14.02", Some("Pricing: what we heard?"), "  Ana thinks the tier is too high.\n", Some("Chris Staud"));
+        assert_eq!(name, "2026-10-01 14.02 Note - Pricing what we heard.md");
+        assert!(doc.starts_with("---\nkind: note\nby: \"Chris Staud\"\nwritten: 2026-10-01 14:02\n---\n"), "{doc}");
+        assert!(doc.contains("# Pricing: what we heard?\n\nAna thinks the tier is too high.\n"));
+        assert_eq!(declared_kind(&doc), Some(SourceKind::Note));
+        assert_eq!(note_source("2026-10-01 14.02", Some("  "), "x", None).0, "2026-10-01 14.02 Note.md");
+
+        let turns = vec![
+            ChatTurn { role: "user".into(), content: "What did we decide on saves?".into() },
+            ChatTurn { role: "tool".into(), content: "{\"name\":\"route_query\"}".into() },
+            ChatTurn { role: "assistant".into(), content: "Regions, per D-001.".into() },
+            ChatTurn { role: "activity".into(), content: "Reading".into() },
+        ];
+        let (name, doc) = chat_source("2026-10-01 14.05", "Saves / regions", "c-123", Some("Chris Staud"), &turns).unwrap();
+        assert_eq!(name, "2026-10-01 14.05 Chat - Saves regions.md");
+        assert!(doc.starts_with("---\nkind: session\nchat: \"c-123\"\npresent: [\"Chris Staud\", Ken]\n"), "{doc}");
+        assert!(doc.contains("**Me:** What did we decide on saves?\n\n**Ken:** Regions, per D-001.\n"));
+        assert!(!doc.contains("route_query") && !doc.contains("Reading"));
+        assert_eq!(declared_kind(&doc), Some(SourceKind::Session));
+        assert!(chat_source("s", "t", "c", None, &turns[1..2]).is_none(), "no turn left, no file");
+
+        let d = library();
+        let root = d.path();
+        fs::write(root.join(RAW).join(&name), &doc).unwrap();
+        let p = place(root, &format!("{RAW}/{name}"), "2026-10-01", SourceKind::Session);
+        assert!(p.note.starts_with(&format!("{INGESTED}/Sessions/2026-10/")), "{}", p.note);
+        assert_eq!(SourceKind::Note.folder(), "Notes");
+    }
+
+    #[test]
+    fn a_declared_kind_decides_the_folder() {
+        let d = library();
+        let root = d.path();
+        let (name, doc) = note_source("2026-10-01 14.02", Some("Idea"), "Ana: \"we ship on Friday\".", None);
+        fs::remove_file(root.join(RAW).join("Standup notes.txt")).unwrap();
+        fs::write(root.join(RAW).join(&name), doc).unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let mut asked = String::new();
+        let p = ingest_one(root, &mut db, &format!("{RAW}/{name}"), "2026-10-01", 3, |prompt| {
+            asked = prompt.to_string();
+            Ok(REPLY.to_string())
+        })
+        .unwrap();
+        assert!(asked.contains("set `kind: note`"));
+        assert!(p.note.starts_with(&format!("{INGESTED}/Notes/2026-10/")), "the reply said meeting; the source says note: {}", p.note);
     }
 }

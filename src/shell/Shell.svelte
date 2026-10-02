@@ -7,15 +7,17 @@
   import { chats } from "../lib/chats.svelte";
   import HomeScreen from "../screens/HomeScreen.svelte";
   import FilesScreen from "../screens/FilesScreen.svelte";
-  import ReviewScreen from "../screens/ReviewScreen.svelte";
   import IngestsScreen from "../screens/IngestsScreen.svelte";
   import TeamScreen from "../screens/TeamScreen.svelte";
   import MapScreen from "../screens/MapScreen.svelte";
   import TimelineScreen from "../screens/TimelineScreen.svelte";
-  import RecordScreen from "../screens/RecordScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
   import WhatsNewDialog from "../whats-new/WhatsNewDialog.svelte";
   import { whatsNew } from "../whats-new/whatsNew.svelte";
+  import Toasts from "../lib/ui/Toasts.svelte";
+  import { record } from "../lib/record.svelte";
+  import { conflicts } from "../lib/conflicts.svelte";
+  import { rail } from "../lib/rail.svelte";
   import { onMount } from "svelte";
   import { api } from "../lib/api";
   import { SvelteSet } from "svelte/reactivity";
@@ -29,6 +31,14 @@
   // The shell only renders with a project open, so the release notes never
   // interrupt onboarding.
   onMount(() => whatsNew.init());
+
+  // App-wide state the shell shows from any screen: a take that is running
+  // (the title-bar pill), the conflict banner in Files, the rail's counts.
+  onMount(() => {
+    void record.listen();
+    void conflicts.subscribe();
+    void rail.subscribe();
+  });
 
   // The person asked Claude in chat to open something: focus its workspace
   // member if it is another one, then open it at the line or heading.
@@ -70,9 +80,6 @@
       {#if visited.has("files")}
         <div class="pane" hidden={app.screen !== "files"}><FilesScreen /></div>
       {/if}
-      {#if visited.has("review")}
-        <div class="pane" hidden={app.screen !== "review"}><ReviewScreen /></div>
-      {/if}
       {#if visited.has("ingests")}
         <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
       {/if}
@@ -84,9 +91,6 @@
       {/if}
       {#if visited.has("timeline")}
         <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
-      {/if}
-      {#if visited.has("record")}
-        <div class="pane" hidden={app.screen !== "record"}><RecordScreen /></div>
       {/if}
       {#if visited.has("settings")}
         <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>
@@ -100,6 +104,7 @@
     <SearchOverlay />
   {/if}
   <WhatsNewDialog />
+  <Toasts />
 </div>
 
 <style>

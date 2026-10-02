@@ -12,9 +12,9 @@
 //! ```
 //!
 //! Phases: setup · index · embed · wiki · extract [minutes] · kg · ask
-//! <questions.tsv> · drift · drift-change <member> <file> · ignore <member>
-//! · model <member> · sql <member> <query> · status. Each prints a Markdown
-//! report on stdout.
+//! <questions.tsv> · ingest <file> · pass · transcribe <file> · drift ·
+//! drift-change <member> <file> · ignore <member> · model <member> · sql
+//! <member> <query> · status. Each prints a Markdown report on stdout.
 //!
 //! It refuses to run without `KEN_DATA_DIR`, so it can never write into the
 //! app's own data.
@@ -73,6 +73,8 @@ fn main() {
         "add-repo" => phase_add_repo(&base, &parent, &args[2]),
         "sync" => phase_sync(&base, &parent, &args[2]),
         "ingest" => phase_ingest(&base, &parent, &args[2]),
+        "pass" => phase_pass(&base, &parent),
+        "transcribe" => phase_transcribe(&base, &args[2]),
         "chat" => phase_chat(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
@@ -411,10 +413,95 @@ fn phase_ingest(base: &Path, parent: &Path, file: &str) -> Result<()> {
         tk.rulings.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"),
         tk.actions.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"));
     let t = Instant::now();
-    let fu = ken_core::ingest::follow_ups(&wiki.root, &mut db, &placement, &note, &today(), engine::now_epoch(), None, claude(&wiki.root)?)?;
-    println!("## Proposed ({:.0}s)\n\nupdated: {:?}\ncreated: {:?}\nrulings: {}\n", t.elapsed().as_secs_f64(), fu.updated, fu.created, fu.rulings);
+    let me = ken_core::day::git_me();
+    let ws = parent.join(ken_core::workspace::CONFIG_DIR);
+    let targets = ken_core::ingest::Targets { team_repo: None, workspace: Some(&ws), me: &me, stamp: "" };
+    let fu = ken_core::ingest::follow_ups(&wiki.root, &mut db, &placement, &note, &today(), engine::now_epoch(), &targets, claude(&wiki.root)?)?;
+    println!("## Written ({:.0}s)\n", t.elapsed().as_secs_f64());
+    for w in &fu.written {
+        println!("- {:?} `{}`: {}", w.kind, w.path, short(&w.label, 120));
+    }
+    println!("\nheld: {:?}\nrulings waiting: {}\ntickets: {:?}\nlisted on the card: {}\n", fu.held, fu.rulings, fu.tickets, fu.listed.len());
     for p in ken_core::ingest::proposals_from(&db, &placement.note)? {
         println!("- **{}**: {}", p.title, short(&p.body, 200));
+    }
+    Ok(())
+}
+
+/// The ingest pass as the app runs it (`ingest::run_pass`), over whatever
+/// waits in the team wiki's Raw/: a recording transcribed first with the
+/// installed Whisper model, a source that fails recorded and passed over,
+/// and a CLI failure stopping the pass. Prints what each source came to, so
+/// a bad first file that blocks the rest shows here.
+fn phase_pass(base: &Path, parent: &Path) -> Result<()> {
+    let wiki = Project::open(&parent.join(wiki_name()))?;
+    let mut db = Db::open(base, wiki.config.id)?;
+    scan::scan(&wiki, &mut db)?;
+    let waiting = ken_core::ingest::waiting_new(&wiki.root, &db)?;
+    println!("# Ingest pass over {}\n\n{} waiting: {:?}\n", wiki_name(), waiting.len(), waiting);
+    let me = ken_core::day::git_me();
+    let ws = parent.join(ken_core::workspace::CONFIG_DIR);
+    let targets = ken_core::ingest::Targets { team_repo: None, workspace: Some(&ws), me: &me, stamp: "" };
+    let model = ken_core::model::selected_model_path(base, ken_core::model::ModelCategory::Transcription);
+    let ffmpeg = ken_core::transcript::discover_ffmpeg();
+    let transcriber = ken_core::ingest::Transcriber { model: model.as_deref(), ffmpeg: ffmpeg.as_deref() };
+    let bin = ken_core::runner::discover_claude().ok_or_else(|| Error::Other("claude CLI not found".into()))?;
+    let root = wiki.root.clone();
+    let call = |prompt: &str| {
+        let t = Instant::now();
+        let out = ken_core::ingest::call_result(assistant::oneshot(&bin, &root, prompt, Duration::from_secs(600), &CancelToken::new()));
+        eprintln!("  claude: {} chars in, {:.0}s, {}", prompt.len(), t.elapsed().as_secs_f64(), if out.is_ok() { "ok" } else { "failed" });
+        out
+    };
+    let on_phase: std::sync::Arc<dyn Fn(&str, ken_core::ingest::PassPhase) + Send + Sync> =
+        std::sync::Arc::new(|raw, phase| eprintln!("  {raw}: {phase:?}"));
+    let t = Instant::now();
+    let report = ken_core::ingest::run_pass(&wiki.root, &mut db, &targets, &today(), engine::now_epoch, transcriber, call, &on_phase)?;
+    println!("| source | came to |\n|---|---|");
+    for p in &report.read {
+        println!("| {} | read: `{}` |", p.raw, p.note);
+    }
+    for (raw, why) in &report.failed {
+        println!("| {raw} | failed: {} |", short(why, 160));
+    }
+    for (raw, why) in &report.waiting {
+        println!("| {raw} | waiting: {} |", short(why, 160));
+    }
+    if let Some(why) = &report.stopped {
+        println!("\n**Stopped**: {}", short(why, 300));
+    }
+    println!(
+        "\n{} read, {} failed, {} waiting in {:.0}s",
+        report.read.len(),
+        report.failed.len(),
+        report.waiting.len(),
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Transcription on this machine: decode one recording's audio (in-process,
+/// else ffmpeg) and run the installed Whisper model on it. Prints how long
+/// each step took and the first lines heard.
+fn phase_transcribe(base: &Path, file: &str) -> Result<()> {
+    let path = Path::new(file);
+    let model = ken_core::model::selected_model_path(base, ken_core::model::ModelCategory::Transcription)
+        .ok_or_else(|| Error::Other("no transcription model under KEN_DATA_DIR/whisper".into()))?;
+    let ffmpeg = ken_core::transcript::discover_ffmpeg();
+    println!(
+        "# Transcribe `{file}`\n\nmodel `{}`, ffmpeg {}, decoded in process: {}\n",
+        model.display(),
+        ffmpeg.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not found".into()),
+        ken_core::transcript::decodes_in_process(path)
+    );
+    let t = Instant::now();
+    let samples = ken_core::transcript::decode_audio(path, ffmpeg.as_deref())?;
+    println!("- audio: {:.1} s of 16 kHz samples, decoded in {:.1}s", samples.len() as f64 / 16_000.0, t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    let cues = ken_core::transcript::transcribe(&model, &samples)?;
+    println!("- transcript: {} cues in {:.1}s\n", cues.len(), t.elapsed().as_secs_f64());
+    for c in cues.iter().take(12) {
+        println!("    [{}] {}", ken_core::transcript::format_timestamp(c.start), short(&c.text, 120));
     }
     Ok(())
 }

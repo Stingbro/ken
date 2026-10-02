@@ -362,14 +362,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         crate::vocab::Vocabulary::rebuild(db)?;
     }
 
-    // The link report is a writing queue for a library, so it is filed for
-    // team and wiki repos only: a code repo's READMEs are not its pages.
-    let kind = crate::registry::kind_of(&project.root);
-    if kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)) {
-        let report = crate::links::report(db)?;
-        let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        crate::links::file_review_item(db, &report, now)?;
-    }
+    // The link report is read live, on the Team screen (`links::findings`).
 
     Ok(stats)
 }
@@ -556,8 +549,10 @@ fn index_one(
     // would stall the scan. Keyed by a cheap per-version hash so an unchanged
     // rescan (which never re-runs `index_one`) never re-OCRs, and a real change
     // (new size/mtime → new hash) re-queues. Only reached when the file was read
-    // (not a cloud placeholder, which returned early above).
-    if status != STATUS_FAILED {
+    // (not a cloud placeholder, which returned early above). Nothing is queued
+    // where the OS has no OCR engine: marking such files done unread would keep
+    // them unread once one exists.
+    if status != STATUS_FAILED && crate::ocr::available() {
         let ocr_hash = crate::knowledge_model::content_hash(&format!("{size}:{mtime}"));
         match kind {
             FileKind::Image if !is_vector_image(rel) && size <= MAX_OCR_IMAGE_BYTES => {
@@ -811,14 +806,6 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
     if pages_moved || db.stored_vocabulary()?.is_none() {
         crate::vocab::Vocabulary::rebuild(db)?;
     }
-    if pages_moved {
-        let kind = crate::registry::kind_of(&project.root);
-        if kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)) {
-            let report = crate::links::report(db)?;
-            let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-            crate::links::file_review_item(db, &report, now)?;
-        }
-    }
     Ok(Some(stats))
 }
 
@@ -949,6 +936,18 @@ mod tests {
             Some("vendor/contract.pdf".to_string()),
             "a sparse (scanned-style) PDF should be queued for OCR"
         );
+        drop(dir);
+    }
+
+    #[test]
+    fn nothing_is_queued_for_ocr_without_an_engine() {
+        crate::ocr::tests::force(false);
+        let (dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+        fs::write(project.root.join("photo.png"), b"not really a png").unwrap();
+        let meta = project.root.join("photo.png").metadata().unwrap();
+        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
+        assert!(db.next_pending_ocr().unwrap().is_none());
         drop(dir);
     }
 

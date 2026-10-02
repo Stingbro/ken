@@ -75,10 +75,31 @@ enum Attempt {
 /// pulling the file in the background, so that errno means "come back later".
 /// Anything else — gone, forbidden, corrupt — will not fix itself.
 fn classify(e: std::io::Error) -> Attempt {
-    if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error() == Some(60) {
+    if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error().is_some_and(still_downloading) {
         Attempt::Downloading
     } else {
         Attempt::Fatal(e)
+    }
+}
+
+/// OS error codes that mean the provider is still fetching the file. macOS:
+/// `ETIMEDOUT` (60). Windows (the Cloud Files API OneDrive uses):
+/// `ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING` (362), `_NETWORK_UNAVAILABLE`
+/// (388), `_IN_USE` (391), `_REQUEST_ABORTED` (393) and `_REQUEST_TIMEOUT`
+/// (426). On Windows 60 is an unrelated network error, so it is fatal there.
+fn still_downloading(code: i32) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(code, 362 | 388 | 391 | 393 | 426)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        code == 60
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = code;
+        false
     }
 }
 
@@ -371,6 +392,7 @@ mod tests {
             Attempt::Downloading
         ));
         // What macOS actually hands back: ETIMEDOUT from the File Provider.
+        #[cfg(target_os = "macos")]
         assert!(matches!(
             classify(std::io::Error::from_raw_os_error(60)),
             Attempt::Downloading
@@ -379,6 +401,22 @@ mod tests {
             classify(std::io::Error::from(std::io::ErrorKind::NotFound)),
             Attempt::Fatal(_)
         ));
+    }
+
+    /// OneDrive on Windows reports a slow or interrupted fetch through the
+    /// Cloud Files errors; 60 is not one of them there.
+    #[test]
+    #[cfg(windows)]
+    fn onedrives_cloud_file_errors_are_retryable_on_windows() {
+        for code in [362, 388, 391, 393, 426] {
+            assert!(
+                matches!(classify(std::io::Error::from_raw_os_error(code)), Attempt::Downloading),
+                "{code} should mean still downloading"
+            );
+        }
+        assert!(matches!(classify(std::io::Error::from_raw_os_error(60)), Attempt::Fatal(_)));
+        // ERROR_FILE_NOT_FOUND stays fatal.
+        assert!(matches!(classify(std::io::Error::from_raw_os_error(2)), Attempt::Fatal(_)));
     }
 
     #[test]

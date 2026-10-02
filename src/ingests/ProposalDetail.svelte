@@ -1,13 +1,12 @@
 <script lang="ts">
-  // A proposed change to a wiki page a person keeps, filed when a repo
-  // joined the team: the page as it is against the page with the change,
-  // as a line diff. Applying writes it; the card's own buttons do that.
-  import { buildDiffRows, proposalPayload, type DiffRow } from "../lib/review.svelte";
-  import type { InboxItem } from "../lib/api";
+  // A proposed change to a wiki page a person keeps (a held edit, a ticket):
+  // the page as it is against the page with the change, as a line diff.
+  // Applying writes it; the card's own buttons do that.
+  import { buildDiffRows, proposalPayload, type DiffRow } from "../lib/conflicts";
 
-  let { item }: { item: InboxItem } = $props();
+  let { payload }: { payload: string | null } = $props();
 
-  const p = $derived(proposalPayload(item));
+  const p = $derived(proposalPayload(payload));
   const rows = $derived<DiffRow[]>(p ? buildDiffRows(p.base, p.proposed) : []);
 </script>
 

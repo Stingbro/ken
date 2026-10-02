@@ -1,7 +1,7 @@
-// The team inbox (family repos) store: the connection list + live sync
-// state (via `family_list` + `family-sync`), and each connection's own inbox
-// (unread badge, tray grouping, accept/dismiss). Always available; the
-// rail button shows once at least one connection exists. `init()` is
+// The team inbox store (stored as "family" repos): the connection list +
+// live sync state (via `family_list` + `family-sync`), and each connection's
+// own inbox (unread count on Team's rail item, the messages on Team,
+// accept/dismiss). Always available. `init()` is
 // idempotent, an event subscription updates `$state`, the rest are thin
 // wrappers over `api` calls.
 //
@@ -44,7 +44,7 @@ class FamiliesStore {
   private initDone = false;
   private unlistenSync: (() => void) | null = null;
 
-  /** Call once (Settings screen mount, or nav-rail tray's first render).
+  /** Call once (the rail and Team both do; the second call is a no-op).
    *  Cheap even if the user never opens either surface this session —
    *  nothing here starts a sync loop on its own (that's the backend
    *  poller, gated by each connection's own `liveSync`). */

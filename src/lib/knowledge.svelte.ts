@@ -3,6 +3,7 @@
 // whether the local model is available to keep extracting.
 import { api, type KnowledgeModel } from "./api";
 import { forFocused } from "./app.svelte";
+import { claudeInstallHelp } from "./platform";
 
 class KnowledgeStore {
   model = $state<KnowledgeModel | null>(null);
@@ -48,7 +49,7 @@ class KnowledgeStore {
       return "Mapping hit a snag with Claude Code. Try Deep rebuild, or run `claude` once to check it signs in.";
     }
     // notInstalled
-    return "Ken maps your project with Claude Code. Install it (npm install -g @anthropic-ai/claude-code) and run `claude` once to sign in.";
+    return `Ken builds the map with Claude Code. ${claudeInstallHelp()}`;
   }
 
   /** Call on screen mount: subscribe once, re-read every visit. */

@@ -857,6 +857,83 @@ pub fn linked_counts(tasks: &[DayTask], repo: Option<&str>, id: &str) -> (usize,
     (linked.len(), done)
 }
 
+// ---------------------------------------------------------------------
+// Escalations
+// ---------------------------------------------------------------------
+
+/// A team repo's folder of questions only a named person can answer.
+pub const ESCALATIONS_DIR: &str = "escalations";
+
+/// An escalation file (`escalations/E-nnn.md`), read-only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Escalation {
+    pub id: String,
+    /// The question: `title`, else the first `# ` heading, else the id.
+    pub title: String,
+    pub raised_by: Option<String>,
+    /// Who it is for (`to:`; a sequence is several people).
+    pub to: Vec<String>,
+    pub status: String,
+    /// Open unless the status says it was answered or closed.
+    pub open: bool,
+    pub ticket: Option<String>,
+    pub raised: Option<String>,
+    pub blocks: Option<String>,
+    /// Inside its repo, with forward slashes.
+    pub rel_path: String,
+}
+
+/// Parse an escalation file. `id` falls back to the file stem.
+pub fn parse_escalation(rel_path: &str, raw: &str) -> Escalation {
+    let (map, body) = frontmatter_map(raw);
+    let get = |k: &str| tasks::map_str(&map, k);
+    let rel = rel_path.replace('\\', "/");
+    let stem = rel.rsplit('/').next().map(|n| n.strip_suffix(".md").unwrap_or(n)).unwrap_or("").to_string();
+    let id = opt(get("id")).unwrap_or(stem);
+    let title = opt(get("title"))
+        .or_else(|| body.lines().find_map(|l| l.trim().strip_prefix("# ").map(|t| t.trim().to_string())))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| id.clone());
+    let status = get("status").trim().to_string();
+    let closed = ["answered", "closed", "resolved", "done", "cancelled", "canceled", "withdrawn"]
+        .iter()
+        .any(|s| status.eq_ignore_ascii_case(s));
+    Escalation {
+        id,
+        title,
+        raised_by: opt(get("raised_by")),
+        to: tasks::map_values(&map, "to"),
+        open: !closed,
+        status,
+        ticket: opt(get("ticket")),
+        raised: opt(get("raised")),
+        blocks: opt(get("blocks")).filter(|b| !b.eq_ignore_ascii_case("nothing")),
+        rel_path: rel,
+    }
+}
+
+/// Every escalation file in a repo's `escalations/`, sorted by id. The
+/// folder's own template and index are left out.
+pub fn scan_escalations(repo_root: &Path) -> Vec<Escalation> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(repo_root.join(ESCALATIONS_DIR)) else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        let Some(stem) = lower.strip_suffix(".md") else { continue };
+        if !path.is_file() || matches!(stem, "readme" | "index" | "escalation" | "template" | "_template") {
+            continue;
+        }
+        if let Ok(raw) = fs::read_to_string(&path) {
+            out.push(parse_escalation(&format!("{ESCALATIONS_DIR}/{name}"), &raw));
+        }
+    }
+    out.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()).then(a.rel_path.cmp(&b.rel_path)));
+    out
+}
+
 /// Who "me" is on this machine: git's global `user.name` and `user.email`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Me {
@@ -913,6 +990,16 @@ impl Me {
 
     pub fn assigned(&self, ticket: &Ticket) -> bool {
         ticket.assignees.iter().any(|a| self.matches(a))
+    }
+
+    /// Whether an escalation is for me: a `to:` value names me, or my first
+    /// name alone, as an ingest writes who a question is for.
+    pub fn addressed(&self, e: &Escalation) -> bool {
+        let first = self.name.as_deref().and_then(|n| n.split_whitespace().next());
+        e.to.iter().any(|t| {
+            let t = t.trim().trim_start_matches('@').trim();
+            self.matches(t) || (!t.contains(' ') && first.is_some_and(|f| f.eq_ignore_ascii_case(t)))
+        })
     }
 }
 
@@ -1452,5 +1539,29 @@ mod tests {
     fn journal_line_cites_the_address() {
         let t = task("---\nid: t1\ntitle: Ship it\n---\n");
         assert_eq!(journal_line(&t, "workspace"), "Completed task \"Ship it\" (ken://workspace/tasks/t1-x.md)");
+    }
+
+    #[test]
+    fn escalations_for_me_are_read_from_the_team_repo() {
+        let dir = tempdir().unwrap();
+        let esc = dir.path().join(ESCALATIONS_DIR);
+        fs::create_dir_all(&esc).unwrap();
+        let ingest = crate::ingest::escalation_text("E-002", "Which Jira types map to tune?", Some("chris"), "2026-09-24", "2026-09-24-standup");
+        fs::write(esc.join("E-002.md"), ingest).unwrap();
+        fs::write(esc.join("E-001.md"), "---\nid: E-001\nto: Kate\nstatus: open\n---\n\n# Who owns saves?\n").unwrap();
+        fs::write(esc.join("E-003.md"), "---\nid: E-003\nto: [Chris Staud, Kate]\nstatus: answered\nticket: SR-012\nblocks: SR-012\n---\n\n# Old one\n").unwrap();
+        fs::write(esc.join("ESCALATION.md"), "---\nid: E-nnn\n---\n").unwrap();
+        let all = scan_escalations(dir.path());
+        assert_eq!(all.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["E-001", "E-002", "E-003"]);
+        let e2 = &all[1];
+        assert_eq!(e2.title, "Which Jira types map to tune?");
+        assert_eq!(e2.raised_by.as_deref(), Some("ingest of 2026-09-24-standup"));
+        assert_eq!((e2.raised.as_deref(), e2.blocks.as_deref(), e2.ticket.as_deref()), (Some("2026-09-24"), None, None));
+        assert!(e2.open && !all[2].open);
+        assert_eq!(all[2].blocks.as_deref(), Some("SR-012"));
+        let me = Me { name: Some("Chris Staud".into()), email: Some("chris.staud@example.com".into()) };
+        let mine: Vec<&str> = all.iter().filter(|e| e.open && me.addressed(e)).map(|e| e.id.as_str()).collect();
+        assert_eq!(mine, vec!["E-002"], "first name alone is me; Kate's is not; an answered one is not open");
+        assert!(scan_escalations(&dir.path().join("nowhere")).is_empty());
     }
 }

@@ -3,11 +3,11 @@
 //! and the `ken-mcp` sidecar so both operate on the same data the same way.
 
 pub mod assistant;
-pub mod automation;
 pub mod bg_hydrate;
 pub mod chat;
 pub mod chunker;
 pub mod codemap;
+pub mod compute;
 pub mod cloud;
 pub mod contenttype;
 pub mod day;
@@ -40,8 +40,6 @@ pub mod profiler;
 pub mod project;
 pub mod record;
 pub mod pty_registry;
-pub mod recipe;
-pub mod refresh;
 pub mod research;
 pub mod runner;
 pub mod registry;
@@ -59,7 +57,6 @@ pub mod watch;
 pub mod wikidraft;
 pub mod wikinew;
 pub mod workspace;
-pub mod workspace_digest;
 pub mod workspace_kg_db;
 
 pub use error::{Error, Result};

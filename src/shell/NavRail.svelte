@@ -1,39 +1,36 @@
 <script lang="ts">
   import type { Component } from "svelte";
   import { app, type Screen } from "../lib/app.svelte";
-  import { review } from "../lib/review.svelte";
   import { families } from "../lib/families.svelte";
-  import { sourcesWaiting } from "../lib/ingestCard";
-  import FamilyTray from "../family/FamilyTray.svelte";
+  import { rail } from "../lib/rail.svelte";
   import LayoutGrid from "@lucide/svelte/icons/layout-grid";
   import Files from "@lucide/svelte/icons/files";
-  import SquareCheck from "@lucide/svelte/icons/square-check";
   import Layers from "@lucide/svelte/icons/layers";
   import UsersRound from "@lucide/svelte/icons/users-round";
   import Network from "@lucide/svelte/icons/network";
   import Clock from "@lucide/svelte/icons/clock";
-  import Mic from "@lucide/svelte/icons/mic";
   import Settings from "@lucide/svelte/icons/settings";
-  import Bell from "@lucide/svelte/icons/bell";
 
-  let familyTrayOpen = $state(false);
-
-  // Ingest's count: sources with something waiting, the same items Review holds.
-  const ingestWaiting = $derived(sourcesWaiting(review.items));
-
-  // The team inbox is always available; its button shows once at least one
-  // inbox repo is connected (set up in Settings).
+  // The team inbox lives on Team; its unread messages count on Team's item,
+  // with what the wiki's checks found.
   void families.init();
+  const teamCount = $derived(families.totalUnread + rail.findings);
+  const teamTitle = $derived(
+    [
+      families.totalUnread > 0 ? `${families.totalUnread} unread in the team inbox` : "",
+      rail.findings > 0 ? `${rail.findings} ${rail.findings === 1 ? "finding" : "findings"} from the wiki's checks` : "",
+    ]
+      .filter((s) => s)
+      .join(" · "),
+  );
 
   const items: { key: Screen; icon: Component; label: string }[] = [
     { key: "home", icon: LayoutGrid, label: "Home" },
     { key: "files", icon: Files, label: "Files" },
-    { key: "review", icon: SquareCheck, label: "Review" },
     { key: "ingests", icon: Layers, label: "Ingest" },
     { key: "team", icon: UsersRound, label: "Team" },
     { key: "map", icon: Network, label: "Map" },
     { key: "timeline", icon: Clock, label: "Timeline" },
-    { key: "record", icon: Mic, label: "Record" },
   ];
 </script>
 
@@ -53,35 +50,18 @@
     >
       <span class="icon"><Icon size={16} strokeWidth={1.75} /></span>{item.label}
       {#if item.key === "files" && app.failedFiles.length > 0}
-        <span class="dot" title="{app.failedFiles.length} files could not be indexed"></span>
+        <span class="dot" title="{app.failedFiles.length} {app.failedFiles.length === 1 ? 'file' : 'files'} Ken could not read"></span>
       {:else if item.key === "files" && app.unread.length > 0}
         <span class="dot unread" title="{app.unread.length} files changed since you last looked"></span>
       {/if}
-      {#if item.key === "review" && review.count > 0}
-        <span class="count" title="{review.count} things are waiting on you">{review.count}</span>
+      {#if item.key === "ingests" && rail.ingestWaiting > 0}
+        <span class="count" title="{rail.ingestWaiting} {rail.ingestWaiting === 1 ? 'source has' : 'sources have'} something waiting">{rail.ingestWaiting}</span>
       {/if}
-      {#if item.key === "ingests" && ingestWaiting > 0}
-        <span class="count" title="{ingestWaiting} ingested sources have something waiting">{ingestWaiting}</span>
+      {#if item.key === "team" && teamCount > 0}
+        <span class="count" title={teamTitle}>{teamCount}</span>
       {/if}
     </button>
   {/each}
-  {#if families.connections.length > 0}
-    <button
-      class:active={familyTrayOpen}
-      onclick={() => (familyTrayOpen = !familyTrayOpen)}
-      title="Family inbox"
-    >
-      <span class="icon"><Bell size={16} strokeWidth={1.75} /></span>Families
-      {#if families.totalUnread > 0}
-        <span class="count" title="{families.totalUnread} unread family inbox items">
-          {families.totalUnread}
-        </span>
-      {/if}
-    </button>
-    {#if familyTrayOpen}
-      <FamilyTray close={() => (familyTrayOpen = false)} />
-    {/if}
-  {/if}
   <button
     class="settings"
     class:active={app.screen === "settings"}

@@ -342,8 +342,8 @@
             that repo alone: its description, READMEs, docs, layout, release tags and who commits
             where. Then it drafts Current/Project, Team, Who-Does-What, the architecture page and the
             release notes from those pages, so a team of twenty repos is read in full. Each page is
-            marked draft and names its sources; a page someone already wrote is left alone. A card
-            on Review lists what was drafted.
+            marked draft and names its sources; a page someone already wrote is left alone. Team
+            lists what was drafted.
           </p>
           <button class="btn btn-ghost" onclick={chooseExtra}>
             {draftExtra ? `Also reading ${draftExtra.split(/[\\/]/).pop()}` : "Also read a folder of documents…"}

@@ -1,7 +1,7 @@
 // Pure helpers for the Ingest screen (the library inbox, white box 8b): the
 // one-line count of what a source wrote and what waits, page names as a row
-// says them, staging's line, and the rail count.
-import type { InboxItem, IngestWriteKind } from "./api";
+// says them, staging's line, and what a Raw/ row says and offers.
+import type { IngestOverview, IngestWriteKind, RawState } from "./api";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -38,18 +38,48 @@ export function stagingLine(held: number): string {
   return held === 0 ? "Every page edit went through staging; none was held." : `${held} held, below.`;
 }
 
-/** Sources with something waiting on Review: distinct notes behind the open
- *  page-proposal items (rulings, tickets, held edits). The Ingest tab's count. */
-export function sourcesWaiting(items: InboxItem[]): number {
-  const notes = new Set<string>();
-  for (const it of items) {
-    if (it.kind !== "page-proposal" || !it.payload) continue;
-    try {
-      const from = (JSON.parse(it.payload) as { from?: string }).from;
-      if (from) notes.add(from);
-    } catch {
-      // A malformed payload names no source.
-    }
+/** How a source in Raw/ reads in its row. */
+export function rawStateLabel(state: RawState): string {
+  switch (state) {
+    case "queued":
+      return "in the queue";
+    case "transcribing":
+      return "transcribing";
+    case "waiting":
+      return "waiting for a transcript";
+    case "reading":
+      return "reading";
+    case "read":
+      return "read";
+    case "failed":
+      return "could not read";
   }
-  return notes.size;
+}
+
+/** What a Raw/ row offers: Try again after a failure or a wait, Remove
+ *  (to the system trash) whenever Ken is not on it. A read source has its
+ *  card instead. */
+export function rawActions(state: RawState): ("retry" | "remove")[] {
+  switch (state) {
+    case "failed":
+    case "waiting":
+      return ["retry", "remove"];
+    case "queued":
+      return ["remove"];
+    default:
+      return [];
+  }
+}
+
+/** Read now: something is queued and no pass is running. */
+export function canReadNow(overview: Pick<IngestOverview, "raw" | "running"> | null): boolean {
+  return !!overview && !overview.running && overview.raw.some((r) => r.state === "queued");
+}
+
+/** A pass is on, or something in Raw/ is moving: the screen keeps reading. */
+export function ingestBusy(overview: Pick<IngestOverview, "raw" | "running"> | null): boolean {
+  return (
+    !!overview &&
+    (overview.running || overview.raw.some((r) => r.state === "queued" || r.state === "reading" || r.state === "transcribing"))
+  );
 }

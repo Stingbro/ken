@@ -25,6 +25,13 @@
   import TicketColumn from "../files/TicketColumn.svelte";
   import { ticketIdForPath } from "../lib/day";
   import { scope } from "../lib/scope.svelte";
+  import { conflicts } from "../lib/conflicts.svelte";
+  import { bannerLine } from "../lib/conflicts";
+  import ConflictsPanel from "../files/ConflictsPanel.svelte";
+
+  // Sync conflicts and conflicted copies in the team's repos: a line at the
+  // top of Files that opens the conflict view in place of the open file.
+  const banner = $derived(bannerLine(conflicts.banner));
 
   // A ticket file (`tickets/<ID>.md`) in one of the team's repos gets the
   // column of my tasks for it beside the file.
@@ -142,6 +149,23 @@
   <FileTree width={sidebarWidth} />
   <SidebarResizer width={sidebarWidth} {windowWidth} />
   <div class="content">
+    {#if banner}
+      <div class="banner" role="status">
+        <span class="bdot"></span>
+        <span class="btext">{banner}</span>
+        {#if conflicts.open}
+          <button class="btn btn-small btn-ghost" onclick={() => conflicts.close()}>Back to the file</button>
+        {:else}
+          <button class="btn btn-small" onclick={() => void conflicts.show()}>Resolve</button>
+        {/if}
+      </div>
+    {/if}
+    {#if conflicts.open}
+      <ConflictsPanel />
+    {/if}
+    <!-- Kept mounted under the conflict view, so the open file and its
+         unsaved edits are there on the way back. -->
+    <div class="body" class:gone={conflicts.open}>
     {#if app.fileTabs.length > 0}
       <div class="tabstrip" onwheel={onWheel} onscroll={hideTip}>
         {#each app.fileTabs as tab (tab.path)}
@@ -213,6 +237,7 @@
         <p class="hint">Markdown and text open in the editor; Word, Excel, PDF and images preview right here.</p>
       </div>
     {/if}
+    </div>
   </div>
 </div>
 
@@ -251,6 +276,37 @@
     flex: 1;
     min-height: 0;
     display: flex;
+  }
+  .body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .body.gone {
+    display: none;
+  }
+  .banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: none;
+    padding: 7px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--danger) 25%, var(--border));
+    background: color-mix(in srgb, var(--danger) 6%, var(--paper));
+    font-size: 12.5px;
+  }
+  .bdot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--danger);
+    flex: none;
+  }
+  .btext {
+    flex: 1;
+    min-width: 0;
+    color: var(--ink);
   }
   .tabstrip {
     display: flex;

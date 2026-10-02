@@ -5,17 +5,13 @@
   //  • conflicted copy ("conflict-copy") — a shared drive saved a second file
   //    next to the original; shows a line diff of the two versions and lets the
   //    human keep one. No git vocabulary anywhere.
-  import { app } from "../lib/app.svelte";
-  import {
-    review,
-    conflictPayload,
-    conflictCopyPayload,
-    buildDiffRows,
-    type DiffRow,
-  } from "../lib/review.svelte";
-  import { api, type InboxItem } from "../lib/api";
+  // Opened from the banner at the top of Files.
+  import { conflicts } from "../lib/conflicts.svelte";
+  import { conflictPayload, conflictCopyPayload, buildDiffRows, type DiffRow } from "../lib/conflicts";
+  import { toast } from "../lib/toast.svelte";
+  import { api, type ConflictItem } from "../lib/api";
 
-  let { item }: { item: InboxItem } = $props();
+  let { item }: { item: ConflictItem } = $props();
 
   const payload = $derived(conflictPayload(item));
   const copy = $derived(conflictCopyPayload(item));
@@ -124,8 +120,10 @@
     if (busy) return;
     busy = true;
     try {
-      const path = await review.resolveConflict(item, resolution);
-      if (thenEdit) app.openInFiles(path);
+      const path = await conflicts.resolveConflict(item, resolution);
+      if (thenEdit) await conflicts.openFile(item, path);
+    } catch (e) {
+      toast.error("Could not resolve the conflict", e);
     } finally {
       busy = false;
     }
@@ -135,14 +133,16 @@
     if (busy) return;
     busy = true;
     try {
-      await review.resolveConflictCopy(item, resolution);
+      await conflicts.resolveCopy(item, resolution);
+    } catch (e) {
+      toast.error("Could not keep that version", e);
     } finally {
       busy = false;
     }
   }
 
   function openBoth() {
-    app.openInFiles(copy?.originalPath ?? copy?.copyPath ?? item.sourceRef);
+    void conflicts.openFile(item, copy?.originalPath ?? copy?.copyPath ?? item.sourceRef);
   }
 </script>
 

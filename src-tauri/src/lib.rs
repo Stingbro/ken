@@ -7,18 +7,17 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use ken_core::assistant::{self, OneshotOutcome};
-use ken_core::automation::{self, Automation};
 use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
 use ken_core::cloud;
 use ken_core::db::{
-    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, DigestRow, EdgeRow, EntityRow,
-    EventRow, FileRow, RunRow, SearchHit,
+    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, EdgeRow, EntityRow, EventRow,
+    FileRow, SearchHit,
 };
 use ken_core::digest;
 use ken_core::embedder::Embedder;
 use ken_core::knowledge_model::{self, AutoBuildTracker};
 use ken_core::model;
-use ken_core::engine::{self, EngineConfig, IngestEngine, IngestEvent};
+use ken_core::engine;
 use ken_core::family::{self, FamilyManifest, FamilyMember, Lane};
 use ken_core::family_sync::{self, GitTransport, PendingWrite, SystemGit};
 use ken_core::kenignore;
@@ -28,7 +27,6 @@ use ken_core::tasks;
 use ken_core::runner::{CancelToken, RunOutcome};
 use ken_core::hooks::HookListener;
 use ken_core::project::Project;
-use ken_core::recipe::{self, Mode, Recipe, RecipeEntry, Refresh, ResolvedRules, RulesOverride};
 use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
 use ken_core::routing;
@@ -39,6 +37,10 @@ use ken_core::record::{self, CaptureSource, LinearResampler, RecorderState, Sour
 use ken_core::transcript;
 use ken_core::user_state::{self, UserState};
 use ken_core::watch::{self, WatchHandle};
+
+/// Starting without a Vulkan driver on Windows (delay-loaded vulkan-1.dll).
+#[cfg(all(windows, target_env = "msvc"))]
+pub mod vulkan;
 
 enum TerminalHandle {
     /// Our own PTY (user chat opened in terminal mode).
@@ -56,20 +58,14 @@ struct MemberRuntime {
     /// reader run concurrently with the writers and still see their commits.
     search_db: Arc<Mutex<Db>>,
     _watch: WatchHandle,
-    engine: Arc<IngestEngine>,
-    /// Live on/off handle for the semantic-index build step, mirroring
-    /// `EngineConfig::semantic_embedder`. A clone of the same `Arc<Mutex<..>>`
-    /// passed into `IngestEngine::start` at activation time, kept here so
+    /// Live on/off handle for the semantic-index build step: `Some` while
+    /// `semanticIndex` is on and the model loaded, so
     /// `set_project_feature("semanticIndex", ..)` and `hybrid_search` can
-    /// read/toggle it without restarting the engine (see `EngineConfig`'s
-    /// doc comment in ken-core for why this is safe to clone and mutate from
-    /// outside the engine's worker thread).
+    /// read/toggle it.
     semantic_embedder: Arc<Mutex<Option<Box<dyn Embedder + Send>>>>,
-    /// Cancel token for an in-flight manually-triggered `rebuild_semantic_index`
-    /// call spawned by `set_project_feature("semanticIndex", true)`. `None`
-    /// when no manual build is running (recipe-triggered builds inside
-    /// `execute_ingest` use their own per-run token and aren't tracked here).
-    /// Set when the build thread is spawned, cleared when it finishes;
+    /// Cancel token for an in-flight `rebuild_semantic_index` spawned by
+    /// `apply_semantic_index_flag`. `None` when no build is running. Set when
+    /// the build thread is spawned, cleared when it finishes;
     /// `set_project_feature("semanticIndex", false)` cancels it if present.
     semantic_build_cancel: Arc<Mutex<Option<CancelToken>>>,
     /// One-time latch for the ~50k `chunks` row-count guardrail (semantic-index
@@ -82,8 +78,6 @@ struct MemberRuntime {
     chat_db: Arc<Mutex<Db>>,
     sync: Arc<SyncEngine>,
     terminals: Arc<Mutex<std::collections::HashMap<String, TerminalHandle>>>,
-    /// True while a digest generation thread is running for this project.
-    digest_running: Arc<AtomicBool>,
     /// True while a knowledge-model build thread is running.
     knowledge_running: Arc<AtomicBool>,
     /// True while a background reindex (clear + full rescan) is running, so a
@@ -508,6 +502,132 @@ fn build_semantic_embedder() -> Option<Box<dyn Embedder + Send>> {
     ken_core::embedder::installed_embedding_model()
 }
 
+type EmbedderSlot = Arc<Mutex<Option<Box<dyn Embedder + Send>>>>;
+
+/// One embedding model for the whole app: every repo's slot is this one, so
+/// a workspace of five repos holds the model once, not five times.
+fn shared_embedder() -> EmbedderSlot {
+    static SLOT: std::sync::OnceLock<EmbedderSlot> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(Mutex::new(None))).clone()
+}
+
+/// The selected embedding model, loaded into the shared slot unless it is
+/// already there. `(model id, width)`, or `None` with no model installed.
+fn ensure_shared_embedder() -> Option<(String, usize)> {
+    let slot = shared_embedder();
+    let wanted = ken_core::embedder::selected_profile()?;
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = guard.as_ref() {
+        if e.model_id() == wanted.model_id {
+            return Some((e.model_id(), e.dim()));
+        }
+    }
+    // Drop the old model before loading the new one: two in memory at once
+    // is what a switch on a small laptop cannot afford.
+    guard.take();
+    let e = build_semantic_embedder()?;
+    let out = (e.model_id(), e.dim());
+    *guard = Some(e);
+    Some(out)
+}
+
+/// The shared embedder, locked per batch rather than for a whole build, so a
+/// search between two batches is not held up by a re-read of every file.
+struct SlotEmbedder {
+    slot: EmbedderSlot,
+    model_id: String,
+    dim: usize,
+}
+
+impl Embedder for SlotEmbedder {
+    fn embed(&mut self, texts: &[String]) -> ken_core::Result<Vec<Vec<f32>>> {
+        let mut guard = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_deref_mut() {
+            Some(e) if e.model_id() == self.model_id => e.embed(texts),
+            _ => Err(ken_core::Error::Other("the embedding model changed during the build".into())),
+        }
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn model_id(&self) -> String {
+        self.model_id.clone()
+    }
+
+    fn embed_query(&mut self, text: &str) -> ken_core::Result<Vec<f32>> {
+        let mut guard = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_deref_mut() {
+            Some(e) => e.embed_query(text),
+            None => Err(ken_core::Error::Other("no embedding model".into())),
+        }
+    }
+}
+
+/// Builds running now, by repo: files done and total.
+fn semantic_builds() -> &'static Mutex<std::collections::HashMap<uuid::Uuid, (usize, usize)>> {
+    static BUILDS: std::sync::OnceLock<Mutex<std::collections::HashMap<uuid::Uuid, (usize, usize)>>> = std::sync::OnceLock::new();
+    BUILDS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The search-by-meaning index, for Settings: which model, how far, and
+/// whether a re-read is running. Also the `semantic-progress` payload.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddingStateDto {
+    model: Option<String>,
+    dims: Option<usize>,
+    embedded: usize,
+    total: usize,
+    rebuilding: bool,
+    device: String,
+}
+
+/// While builds run: files read for meaning over files to read, across repos.
+fn emit_semantic_progress(app: &AppHandle) {
+    let (embedded, total, rebuilding) = {
+        let builds = semantic_builds().lock().unwrap_or_else(|p| p.into_inner());
+        let (d, t) = builds.values().fold((0, 0), |(d, t), (bd, bt)| (d + bd, t + bt));
+        (d, t, !builds.is_empty())
+    };
+    let (model, dims) = {
+        let slot = shared_embedder();
+        let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().map(|e| (Some(e.model_id()), Some(e.dim()))).unwrap_or((None, None))
+    };
+    let _ = app.emit(
+        "semantic-progress",
+        EmbeddingStateDto { model, dims, embedded, total, rebuilding, device: device_label() },
+    );
+}
+
+/// "NVIDIA RTX PRO 2000 (Vulkan)" or "CPU".
+fn device_label() -> String {
+    let d = ken_core::compute::device();
+    match d.name {
+        Some(n) => format!("{n} ({})", if d.backend == "metal" { "Metal" } else { "Vulkan" }),
+        None => "CPU".into(),
+    }
+}
+
+/// Re-apply search by meaning to every open repo that has it on: after a
+/// model is installed or switched, or the graphics card setting changes.
+fn reapply_semantic_index_everywhere(app: &AppHandle, state: &SharedState) {
+    let targets: Vec<uuid::Uuid> = {
+        let guard = state.lock().unwrap();
+        guard
+            .members
+            .iter()
+            .filter(|(_, m)| semantic_index_enabled(&guard.app_settings, &m.project))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in targets {
+        let _ = apply_semantic_index_flag(app, state, Some(id), true);
+    }
+}
+
 /// semantic-index task 2.4 / spike `S4-knn-latency.md`: once a project's
 /// `chunks` table crosses ~50k rows, KNN latency starts to degrade. This
 /// never blocks or disables search — it's a one-time, latched warning so
@@ -577,12 +697,11 @@ fn apply_semantic_index_flag(
     };
 
     if !enabled {
-        // Turning off: drop the live embedder (this alone stops future
-        // recipe-triggered rebuilds, since `engine.rs` only rebuilds when
-        // the slot is `Some`) and cancel any rebuild currently in flight.
-        // Existing chunk/vector tables are left in place per the proposal —
-        // toggling back on resumes rather than starting over.
-        embedder_slot.lock().unwrap().take();
+        // Turning off for this repo: cancel its rebuild. The embedder is
+        // shared with the other repos, so it stays; this repo's searches stop
+        // using it because its flag is off. Existing vectors are kept, so
+        // turning it back on resumes rather than starting over.
+        let _ = embedder_slot;
         if let Some(token) = cancel_slot.lock().unwrap().take() {
             token.cancel();
         }
@@ -591,24 +710,17 @@ fn apply_semantic_index_flag(
 
     let project_id = project.config.id;
 
-    let Some(embedder) = build_semantic_embedder() else {
+    let Some((model_id, dim)) = ensure_shared_embedder() else {
         emit_member(
             app,
             project_id,
             "semantic-index-state",
             SemanticIndexStateEvent::Unavailable {
-                reason: "embedding model not installed — download it in Settings".into(),
+                reason: "No search-by-meaning model is installed. Download one in Settings › This machine.".into(),
             },
         );
         return Ok(());
     };
-
-    // Install the live embedder so future recipe-triggered ingest runs
-    // auto-rebuild; then kick an immediate background backfill for content
-    // that was already indexed before the flag was turned on. Installing
-    // the embedder alone would only affect the *next* ingest run, which may
-    // be arbitrarily delayed.
-    *embedder_slot.lock().unwrap() = Some(embedder);
 
     let token = CancelToken::new();
     if let Some(old) = cancel_slot.lock().unwrap().replace(token.clone()) {
@@ -630,12 +742,9 @@ fn apply_semantic_index_flag(
                 return;
             }
         };
-        let mut guard = bg_embedder_slot.lock().unwrap();
-        let Some(embedder) = guard.as_deref_mut() else {
-            // Flag was turned off again before this thread got to run.
-            return;
-        };
+        let mut embedder = SlotEmbedder { slot: bg_embedder_slot, model_id, dim };
         let progress_app = bg_app.clone();
+        semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id, (0, 0));
         // project-profiler task 2.3: resolve the stored profile only when the
         // `profiler` flag is on for this project — `None` otherwise, which
         // makes `rebuild_semantic_index_with_profile` byte-identical to the
@@ -643,10 +752,11 @@ fn apply_semantic_index_flag(
         // flag-off inertness guarantee).
         let profiler_enabled = ken_core::features::effective_flag(&app_settings, &project, "profiler");
         let profile = profiler_enabled.then(|| ken_core::profiler::ProjectProfile::load(&project.root));
+        let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let result = engine::rebuild_semantic_index_with_profile(
             &project,
             &mut db,
-            embedder,
+            &mut embedder,
             &token,
             |done, total| {
                 emit_member(
@@ -655,10 +765,16 @@ fn apply_semantic_index_flag(
                     "semantic-index-state",
                     SemanticIndexStateEvent::Building { done, total },
                 );
+                semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id, (done, total));
+                if done == total || last_emit.elapsed() >= std::time::Duration::from_millis(500) {
+                    last_emit = std::time::Instant::now();
+                    emit_semantic_progress(&progress_app);
+                }
             },
             profile.as_ref(),
         );
-        drop(guard);
+        semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).remove(&project_id);
+        emit_semantic_progress(&bg_app);
         match result {
             Ok(true) => {
                 emit_member(&bg_app, project_id, "semantic-index-state", SemanticIndexStateEvent::Ready);
@@ -704,10 +820,17 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
 
     let mut guard = state.lock().unwrap();
 
+    // A workspace's own `.ken-workspace` (its memory) is not a repo: it is
+    // never registered, and an entry an earlier version wrote goes.
     let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
-    registry.add(&project);
-    registry.last_project = Some(project.config.id);
-    registry.save(&guard.base_dir).map_err(err)?;
+    let forgot = registry.forget_workspace_folders();
+    if !ken_core::registry::is_workspace_folder(&project.root) {
+        registry.add(&project);
+        registry.last_project = Some(project.config.id);
+        registry.save(&guard.base_dir).map_err(err)?;
+    } else if forgot {
+        registry.save(&guard.base_dir).map_err(err)?;
+    }
 
     let mut db = Db::open(&guard.base_dir, project.config.id).map_err(err)?;
     let watch_db_path = db_path(&guard.base_dir, project.config.id);
@@ -799,116 +922,11 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
             h
         }
     };
-    let engine_app = app.clone();
-    let ingest_chat_db = chat_db.clone();
-    // Live on/off handle for the semantic-index build step (semantic-index
-    // task 2.1). Cloned before being moved into `EngineConfig` so the same
-    // `Arc<Mutex<..>>` can also live on `MemberRuntime`, letting
-    // `set_project_feature`/`hybrid_search` read or toggle it without
-    // restarting the engine — see `EngineConfig::semantic_embedder`'s doc
-    // comment in ken-core for why cloning the Arc (not the config) is safe.
-    let semantic_embedder: Arc<Mutex<Option<Box<dyn Embedder + Send>>>> =
-        Arc::new(Mutex::new(None));
-    let engine_semantic_embedder = semantic_embedder.clone();
+    // Live on/off handle for the semantic-index build step (see
+    // `MemberRuntime::semantic_embedder`).
+    let semantic_embedder: EmbedderSlot = shared_embedder();
     // One-time latch for the ~50k chunk guardrail (semantic-index task 2.4).
-    // Created here (not inline in the `MemberRuntime` literal below) so the
-    // same Arc can also be checked from the ingest-event closure right below,
-    // covering the recipe-triggered incremental rebuild path in addition to
-    // the manual background rebuild in `apply_semantic_index_flag`.
     let semantic_index_warned_large = Arc::new(AtomicBool::new(false));
-    let engine_warned_large = semantic_index_warned_large.clone();
-    let engine_search_db = search_db.clone();
-    let engine = Arc::new(
-        IngestEngine::start(
-            project.root.clone(),
-            watch_db_path.clone(),
-            hooks.clone(),
-            EngineConfig {
-                semantic_embedder: engine_semantic_embedder,
-                ..EngineConfig::default()
-            },
-            move |ev: IngestEvent| {
-                // Ingest runs surface as system sessions in the chat drawer.
-                if let Some(sid) = &ev.session_id {
-                    let status = match ev.status.as_str() {
-                        "running" => "working",
-                        "blocked" => "needs_input",
-                        "failed" => "error",
-                        _ => "done",
-                    };
-                    let now = engine::now_epoch();
-                    let mut db = ingest_chat_db.lock().unwrap();
-                    let row = db.get_chat(sid).ok().flatten().unwrap_or(ChatRow {
-                        id: sid.clone(),
-                        title: if ev.kind == "automation" {
-                            format!("Automation — {}", ev.slug)
-                        } else {
-                            format!("Ingest — {}", ev.slug)
-                        },
-                        kind: ev.kind.clone(),
-                        pinned: false,
-                        status: status.into(),
-                        created_at: now,
-                        last_active_at: now,
-                        archived: false,
-                        model: None,
-                        // Ingest/automation sessions are inherently one
-                        // project's own run — never cross-project.
-                        scope: None,
-                    });
-                    let _ = db.upsert_chat(&ChatRow {
-                        status: status.into(),
-                        last_active_at: now,
-                        ..row
-                    });
-                    if let Ok(Some(updated)) = db.get_chat(sid) {
-                        emit_member(&engine_app, project_id, "chat-updated", updated);
-                    }
-                }
-                // The engine already drives `rebuild_semantic_index` itself
-                // for recipe-triggered runs when an embedder is installed
-                // (see `engine.rs`'s ingest step) — it has no dedicated event
-                // for that, just these two `activity` strings, so translate
-                // them into `semantic-index-state` here (semantic-index task
-                // 2.3). The explicit background rebuild in
-                // `apply_semantic_index_flag` emits the same event directly.
-                if let Some(activity) = ev.activity.as_deref() {
-                    if let Some(rest) = activity.strip_prefix("Embedding chunks: ") {
-                        if let Some((done_s, total_s)) = rest.split_once('/') {
-                            if let (Ok(done), Ok(total)) =
-                                (done_s.parse::<usize>(), total_s.parse::<usize>())
-                            {
-                                emit_member(
-                                    &engine_app,
-                                    project_id,
-                                    "semantic-index-state",
-                                    SemanticIndexStateEvent::Building { done, total },
-                                );
-                                if total > 0 && done == total {
-                                    if let Ok(db) = engine_search_db.lock() {
-                                        maybe_warn_large_index(&engine_app, project_id, &db, &engine_warned_large);
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(reason) =
-                        activity.strip_prefix("Semantic index rebuild failed: ")
-                    {
-                        emit_member(
-                            &engine_app,
-                            project_id,
-                            "semantic-index-state",
-                            SemanticIndexStateEvent::Unavailable {
-                                reason: reason.to_string(),
-                            },
-                        );
-                    }
-                }
-                emit_member(&engine_app, project_id, "ingest-run-changed", ev);
-            },
-        )
-        .map_err(err)?,
-    );
 
     // Conversation engine (chat drawer). Missing CLI → chats explain how to
     // install; everything else works.
@@ -1095,17 +1113,22 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     let kenignore_db_path = watch_db_path.clone();
 
     let emit_app = app.clone();
-    let watch_engine = engine.clone();
     let watch_sync = sync_engine.clone();
     let watch_knowledge = auto_knowledge.clone();
     let watch_state = state.clone();
+    let watch_project = project.clone();
+    let watch_base = guard.base_dir.clone();
     let watch = watch::start(
         project.clone(),
         watch_db_path,
         Duration::from_secs(2),
         move |stats: &ScanStats| {
             if !stats.changed_paths.is_empty() {
-                watch_engine.sources_changed(stats.changed_paths.clone());
+                // A source landed in (or left) the inbox: read it, once the
+                // changes settle.
+                if stats.changed_paths.iter().any(|p| p.starts_with(&format!("{}/", ken_core::ingest::RAW))) {
+                    schedule_ingest_pass(&watch_state, &watch_project, &watch_base);
+                }
                 watch_sync.changed(stats.changed_paths.clone());
                 // Same signal, slower consumer: the knowledge model is
                 // rebuilt only once the changes stop coming.
@@ -1187,7 +1210,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         db,
         search_db,
         _watch: watch,
-        engine,
         semantic_embedder,
         semantic_build_cancel: Arc::new(Mutex::new(None)),
         semantic_index_warned_large,
@@ -1195,7 +1217,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         chat_db,
         sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        digest_running: Arc::new(AtomicBool::new(false)),
         knowledge_running: Arc::new(AtomicBool::new(false)),
         reindex_running: Arc::new(AtomicBool::new(false)),
         profiling_running: Arc::new(AtomicBool::new(false)),
@@ -1384,7 +1405,7 @@ fn background_hydrate_worker(
         // Snapshot everything the tick needs, then drop the lock immediately —
         // the download and re-index below must not hold it. A different project
         // being open means this tick is stale (the drop guard will stop us).
-        let (base, project, engine, sync, auto_knowledge) = {
+        let (base, project, sync, auto_knowledge) = {
             let guard = state.lock().unwrap();
             // Own project by id — see `extraction_worker`. The old
             // `values().next()` plus id-mismatch check meant that with several
@@ -1399,7 +1420,6 @@ fn background_hydrate_worker(
             (
                 guard.base_dir.clone(),
                 active.project.clone(),
-                active.engine.clone(),
                 active.sync.clone(),
                 active.auto_knowledge.clone(),
             )
@@ -1441,7 +1461,6 @@ fn background_hydrate_worker(
                         // a just-downloaded doc reaches ingests, Map/Timeline and
                         // sync, and the footer's cloud_only count drops.
                         let paths = vec![rel.clone()];
-                        engine.sources_changed(paths.clone());
                         sync.changed(paths.clone());
                         auto_knowledge.changed();
                         emit_member(
@@ -2062,6 +2081,25 @@ fn open_workspace_inner(
             "member-status",
             MemberStatusEvent::Dormant { name: name.clone() },
         );
+    }
+
+    // A repo with the inbox and no kind said is the team's wiki: say so,
+    // with the team of the group it is in.
+    {
+        let guard = state.lock().unwrap();
+        if let Ok(mut reg) = Registry::load(&guard.base_dir) {
+            let groups = ws.config.effective_groups();
+            let mut changed = false;
+            for (name, root, _) in &ok_members {
+                let team = groups.iter().find(|g| g.members.contains(name)).map(|g| g.name.as_str());
+                changed |= reg.infer_library(root, team);
+            }
+            if changed {
+                if let Err(e) = reg.save(&guard.base_dir) {
+                    eprintln!("warning: could not record the wiki's kind: {e}");
+                }
+            }
+        }
     }
 
     // Install bookkeeping (holds the resolved manifest + resident LRU).
@@ -3326,13 +3364,12 @@ async fn hydrate_file(
 
     // Snapshot everything the download, re-index, and notifications need, then
     // drop the global lock immediately — none of this may hold it.
-    let (base, project, engine, sync, auto_knowledge) = {
+    let (base, project, sync, auto_knowledge) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
         (
             guard.base_dir.clone(),
             active.project.clone(),
-            active.engine.clone(),
             active.sync.clone(),
             active.auto_knowledge.clone(),
         )
@@ -3370,7 +3407,6 @@ async fn hydrate_file(
     // immediately instead of waiting for an edit or a manual reindex.
     if changed {
         let paths = vec![rel_path.clone()];
-        engine.sources_changed(paths.clone());
         sync.changed(paths.clone());
         auto_knowledge.changed();
         emit_member(
@@ -3967,7 +4003,11 @@ struct RecordStateDto {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RecordSaved {
+    /// The transcript's path in the library's Raw/; for an audio-only
+    /// recording, the folder in app data its audio was kept in.
     rel_path: String,
+    /// The library the transcript is in; none for an audio-only recording.
+    project_id: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -3984,8 +4024,10 @@ struct RecordErrorDto {
 struct RecordSession {
     state: RecorderState,
     started: Instant,
+    /// The take's WAVs while it runs, in app data (`record/<id>/`).
     tmp_dir: PathBuf,
-    project_root: PathBuf,
+    /// The library whose Raw/ the transcript goes into.
+    project_id: uuid::Uuid,
     // Per-source capture backends (stopped on finish).
     mic: Option<Box<dyn CaptureSource>>,
     system: Option<Box<dyn CaptureSource>>,
@@ -4011,6 +4053,17 @@ struct ChannelWriter {
     last_emit: Instant,
     app: AppHandle,
     source: Source,
+    /// Write the silence a source does not deliver (WASAPI loopback sends
+    /// nothing while nothing plays), so this channel keeps the recording's
+    /// clock and Me and Them line up.
+    pad_to_clock: bool,
+    /// 16 kHz samples written so far.
+    written: u64,
+    /// The recording clock: when this channel started, the time spent
+    /// paused, and when the current pause began.
+    started: Instant,
+    paused_total: Duration,
+    paused_at: Option<Instant>,
 }
 
 impl ChannelWriter {
@@ -4019,6 +4072,7 @@ impl ChannelWriter {
         path: PathBuf,
         app: AppHandle,
         source: Source,
+        pad_to_clock: bool,
     ) -> Self {
         ChannelWriter {
             writer: Some(writer),
@@ -4029,7 +4083,40 @@ impl ChannelWriter {
             last_emit: Instant::now(),
             app,
             source,
+            pad_to_clock,
+            written: 0,
+            started: Instant::now(),
+            paused_total: Duration::ZERO,
+            paused_at: None,
         }
+    }
+
+    /// Recording time on this channel: wall time less the pauses.
+    fn clock_ms(&self) -> u64 {
+        let paused_now = self.paused_at.map(|p| p.elapsed()).unwrap_or_default();
+        self.started.elapsed().saturating_sub(self.paused_total + paused_now).as_millis() as u64
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        match (self.paused, paused) {
+            (false, true) => self.paused_at = Some(Instant::now()),
+            (true, false) => {
+                if let Some(at) = self.paused_at.take() {
+                    self.paused_total += at.elapsed();
+                }
+            }
+            _ => {}
+        }
+        self.paused = paused;
+    }
+
+    fn write(&mut self, samples: &[f32]) {
+        if let Some(w) = self.writer.as_mut() {
+            for s in samples {
+                let _ = w.write_sample(record::f32_to_i16(*s));
+            }
+        }
+        self.written += samples.len() as u64;
     }
 
     fn feed(&mut self, device: &[f32], rate: u32, channels: u16) {
@@ -4043,13 +4130,16 @@ impl ChannelWriter {
             self.resampler_ready = true;
         }
         let mono = record::downmix_to_mono(device, channels);
-        let samples = self.resampler.process(&mono);
-        let level = record::rms(&samples);
-        if let Some(w) = self.writer.as_mut() {
-            for s in &samples {
-                let _ = w.write_sample(record::f32_to_i16(*s));
+        if self.pad_to_clock && rate > 0 {
+            let block = (mono.len() as u64 * record::TARGET_RATE as u64 / rate as u64) as usize;
+            let gap = record::silence_gap(self.written, self.clock_ms(), block);
+            if gap > 0 {
+                self.write(&vec![0.0; gap]);
             }
         }
+        let samples = self.resampler.process(&mono);
+        let level = record::rms(&samples);
+        self.write(&samples);
         // ~10 Hz meter, throttled per source.
         if self.last_emit.elapsed().as_millis() >= 100 {
             self.last_emit = Instant::now();
@@ -4064,11 +4154,7 @@ impl ChannelWriter {
     fn finalize_flush(&mut self) {
         if self.resampler_ready {
             let tail = self.resampler.finish();
-            if let Some(w) = self.writer.as_mut() {
-                for s in &tail {
-                    let _ = w.write_sample(record::f32_to_i16(*s));
-                }
-            }
+            self.write(&tail);
         }
         if let Some(w) = self.writer.take() {
             let _ = w.finalize();
@@ -4079,38 +4165,42 @@ impl ChannelWriter {
 /// A single input device's `(id, name)`.
 #[tauri::command]
 fn record_input_devices() -> CmdResult<Vec<AudioDeviceDto>> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(record::mac::list_input_devices()
-            .into_iter()
-            .map(|(id, name)| AudioDeviceDto { id, name })
-            .collect())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(Vec::new())
-    }
+    Ok(record::cpal::list_input_devices()
+        .into_iter()
+        .map(|(id, name)| AudioDeviceDto { id, name })
+        .collect())
+}
+
+/// What this machine can record: a microphone, system audio (Windows:
+/// WASAPI loopback of the default output; macOS: ScreenCaptureKit), and why
+/// not when one is missing.
+#[tauri::command]
+fn record_support() -> CmdResult<record::Support> {
+    Ok(record::support())
 }
 
 #[tauri::command]
 fn record_permissions() -> CmdResult<RecordPermissionsDto> {
     #[cfg(target_os = "macos")]
     let (mic, screen) = (record::mac::mic_permission(), record::mac::screen_permission());
-    #[cfg(not(target_os = "macos"))]
-    let (mic, screen) = (
-        record::PermissionStatus::Unsupported,
-        record::PermissionStatus::Unsupported,
-    );
+    // System audio on Windows needs no permission; the microphone has its
+    // privacy switch.
+    #[cfg(windows)]
+    let (mic, screen) = (record::win::mic_permission(), record::PermissionStatus::Granted);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let (mic, screen) = (record::PermissionStatus::Granted, record::PermissionStatus::Unsupported);
     Ok(RecordPermissionsDto {
         mic,
         screen,
-        mic_settings_url: record::MIC_SETTINGS_URL.into(),
-        screen_settings_url: record::SCREEN_SETTINGS_URL.into(),
+        mic_settings_url: record::mic_settings_url().into(),
+        screen_settings_url: record::screen_settings_url().into(),
     })
 }
 
 #[tauri::command]
 fn record_request_permission(kind: String) -> CmdResult<()> {
+    // Only macOS can ask; Windows reads its privacy switch, which a person
+    // turns on in Settings (`record_open_settings`).
     #[cfg(target_os = "macos")]
     match kind.as_str() {
         "mic" => record::mac::request_mic(),
@@ -4123,17 +4213,18 @@ fn record_request_permission(kind: String) -> CmdResult<()> {
     Ok(())
 }
 
-/// Open a macOS System Settings privacy deep link. Routed through Rust (rather
-/// than the JS opener) because the frontend `opener:default` capability scope
-/// does not permit the `x-apple.systempreferences:` scheme; a server-side
-/// `open_url` bypasses that scope. `open_external` can't be reused — it resolves
-/// its argument against the project root as a file path.
+/// Open this OS's privacy settings page for recording. Routed through Rust
+/// (rather than the JS opener) because the frontend `opener:default`
+/// capability scope does not permit the `x-apple.systempreferences:` or
+/// `ms-settings:` schemes; a server-side `open_url` bypasses that scope.
+/// `open_external` can't be reused — it resolves its argument against the
+/// project root as a file path.
 #[tauri::command]
 fn record_open_settings(app: AppHandle, url: String) -> CmdResult<()> {
     // Routing through Rust bypasses the frontend `opener:default` scope for ANY
-    // scheme, so validate server-side: only the two known macOS privacy deep
-    // links may open — anything else (file:, arbitrary app schemes) is refused.
-    if url != record::MIC_SETTINGS_URL && url != record::SCREEN_SETTINGS_URL {
+    // scheme, so validate server-side: only this OS's own privacy pages may
+    // open — anything else (file:, arbitrary app schemes) is refused.
+    if !record::is_settings_url(&url) {
         return Err("refused to open an unrecognized settings URL".into());
     }
     tauri_plugin_opener::OpenerExt::opener(&app)
@@ -4141,6 +4232,9 @@ fn record_open_settings(app: AppHandle, url: String) -> CmdResult<()> {
         .map_err(err)
 }
 
+/// Start a take: the microphone and/or system audio, into WAVs in app data.
+/// The transcript goes into the team wiki's Raw/ (`team`'s library) when
+/// the take stops. Refused when no requested source could start.
 #[tauri::command]
 fn record_start(
     app: AppHandle,
@@ -4148,15 +4242,27 @@ fn record_start(
     mic: bool,
     system: bool,
     device_id: Option<String>,
+    team: Option<String>,
 ) -> CmdResult<()> {
     if !mic && !system {
         return Err("Pick at least one source to record.".into());
     }
-    let (root, base) = {
-        let guard = state.lock().unwrap();
-        let active = member(&guard, None).map_err(|_| "Open a project first.")?;
-        (active.project.root.clone(), guard.base_dir.clone())
-    };
+    let support = record::support();
+    if system && !support.system {
+        return Err(support.reason.unwrap_or_else(|| "System audio can't be recorded on this computer.".into()));
+    }
+    if mic && !support.mic {
+        return Err(support.reason.unwrap_or_else(|| "No microphone is connected.".into()));
+    }
+    // Windows records silence from a microphone its privacy switch blocks.
+    #[cfg(windows)]
+    if mic && record::win::mic_permission() == record::PermissionStatus::Denied {
+        return Err("Microphone access is off in Windows Settings › Privacy & security › Microphone. Turn it on for desktop apps, then try again.".into());
+    }
+    // Where the transcript will go, found now so a take is never made with
+    // nowhere to put it.
+    let project_id = inbox_member(&app, &state, team.as_deref())?;
+    let base = { state.lock().unwrap().base_dir.clone() };
     let slot = { state.lock().unwrap().record.clone() };
     // Guard against a second recording.
     {
@@ -4174,7 +4280,7 @@ fn record_start(
         state: RecorderState::new(),
         started: now,
         tmp_dir: tmp_dir.clone(),
-        project_root: root,
+        project_id,
         mic: None,
         system: None,
         mic_chan: None,
@@ -4184,50 +4290,61 @@ fn record_start(
 
     // Build each requested channel's writer + backend. If a backend fails to
     // start, tear down anything already started and clean the temp dir.
-    #[cfg(target_os = "macos")]
-    {
-        let mut build = || -> CmdResult<()> {
-            if mic {
-                let path = tmp_dir.join("me.wav");
-                let writer = record::create_wav(&path).map_err(err)?;
-                let chan =
-                    Arc::new(Mutex::new(ChannelWriter::new(writer, path, app.clone(), Source::Mic)));
-                let chan2 = chan.clone();
-                let mut src = Box::new(record::mac::MicSource::new(device_id.clone()));
-                src.start(Box::new(move |data, rate, ch| chan2.lock().unwrap().feed(data, rate, ch)))
-                    .map_err(err)?;
-                sess.mic = Some(src);
-                sess.mic_chan = Some(chan);
-            }
-            if system {
-                let path = tmp_dir.join("them.wav");
-                let writer = record::create_wav(&path).map_err(err)?;
-                let chan = Arc::new(Mutex::new(ChannelWriter::new(
-                    writer,
-                    path,
-                    app.clone(),
-                    Source::System,
-                )));
-                let chan2 = chan.clone();
-                let mut src = Box::new(record::mac::SystemAudioSource::new());
-                src.start(Box::new(move |data, rate, ch| chan2.lock().unwrap().feed(data, rate, ch)))
-                    .map_err(err)?;
-                sess.system = Some(src);
-                sess.system_chan = Some(chan);
-            }
-            Ok(())
-        };
-        if let Err(e) = build() {
-            stop_backends(&mut sess);
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e);
+    let mut build = || -> CmdResult<()> {
+        if mic {
+            let path = tmp_dir.join("me.wav");
+            let writer = record::create_wav(&path).map_err(err)?;
+            let chan = Arc::new(Mutex::new(ChannelWriter::new(writer, path, app.clone(), Source::Mic, false)));
+            let chan2 = chan.clone();
+            let mut src = Box::new(record::cpal::MicSource::new(device_id.clone()));
+            src.start(Box::new(move |data, rate, ch| chan2.lock().unwrap().feed(data, rate, ch)))
+                .map_err(err)?;
+            sess.mic = Some(src);
+            sess.mic_chan = Some(chan);
         }
+        if system {
+            let path = tmp_dir.join("them.wav");
+            let writer = record::create_wav(&path).map_err(err)?;
+            let chan = Arc::new(Mutex::new(ChannelWriter::new(writer, path, app.clone(), Source::System, cfg!(windows))));
+            let chan2 = chan.clone();
+            let mut src = system_source()?;
+            src.start(Box::new(move |data, rate, ch| chan2.lock().unwrap().feed(data, rate, ch)))
+                .map_err(err)?;
+            sess.system = Some(src);
+            sess.system_chan = Some(chan);
+        }
+        Ok(())
+    };
+    if let Err(e) = build() {
+        stop_backends(&mut sess);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+    if sess.mic.is_none() && sess.system.is_none() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err("No recording source could start on this computer.".into());
     }
 
     let dto = RecordStateDto { phase: sess.state.phase, elapsed_ms: 0, mic, system };
     *slot.lock().unwrap() = Some(sess);
     let _ = app.emit("record-state", dto);
     Ok(())
+}
+
+/// This OS's system-audio capture backend.
+fn system_source() -> CmdResult<Box<dyn CaptureSource>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(record::mac::SystemAudioSource::new()))
+    }
+    #[cfg(windows)]
+    {
+        Ok(Box::new(record::win::SystemAudioSource::new()))
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Err("System audio is recorded on Windows and macOS only.".into())
+    }
 }
 
 #[tauri::command]
@@ -4271,6 +4388,10 @@ fn record_cancel(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     Ok(())
 }
 
+/// Stop the take. `storage`: `transcript` (the default: the audio goes once
+/// the transcript is written), `both` (the audio is kept too), or `audio`
+/// (no transcript). Kept audio lives in app data (`recordings/`), never in a
+/// repo. The transcript goes into the library's Raw/ and is read at once.
 #[tauri::command]
 fn record_stop(app: AppHandle, state: State<SharedState>, storage: String) -> CmdResult<()> {
     let slot = { state.lock().unwrap().record.clone() };
@@ -4282,30 +4403,27 @@ fn record_stop(app: AppHandle, state: State<SharedState>, storage: String) -> Cm
 
     let _ = app.emit("record-transcribing", ());
     // Do the slow transcription + write off the command thread.
-    let root = sess.project_root.clone();
     let base = { state.lock().unwrap().base_dir.clone() };
-    let mic_wav = sess.mic_chan.as_ref().map(|c| c.lock().unwrap().path.clone());
-    let system_wav = sess.system_chan.as_ref().map(|c| c.lock().unwrap().path.clone());
-    let mic_on = sess.state.mic;
-    let system_on = sess.state.system;
-    let tmp_dir = sess.tmp_dir.clone();
+    let take = Take {
+        project_id: sess.project_id,
+        tmp_dir: sess.tmp_dir.clone(),
+        mic_wav: sess.mic_chan.as_ref().map(|c| c.lock().unwrap().path.clone()),
+        system_wav: sess.system_chan.as_ref().map(|c| c.lock().unwrap().path.clone()),
+        duration,
+    };
     let inner = state.inner().clone();
 
     std::thread::spawn(move || {
-        let outcome = finish_recording(
-            &app, &inner, &root, &base, &tmp_dir, &storage, mic_on, system_on, mic_wav, system_wav,
-            duration,
-        );
+        let outcome = finish_recording(&app, &inner, &base, &storage, &take);
         if let Err(e) = outcome {
-            // Unexpected failure (e.g. couldn't create the Recordings dir). The
-            // transcription-failure path is handled inside `finish_recording`
-            // and does not surface here. Keep the temp WAVs so nothing is lost.
-            let _ = app.emit("record-error", RecordErrorDto { message: e, can_retry: true });
-            let _ = app.emit(
-                "record-state",
-                RecordStateDto { phase: record::Phase::Idle, elapsed_ms: 0, mic: false, system: false },
-            );
+            // Unexpected failure (e.g. couldn't write the transcript). The
+            // temp WAVs stay in app data so nothing is lost.
+            let _ = app.emit("record-error", RecordErrorDto { message: e, can_retry: false });
         }
+        let _ = app.emit(
+            "record-state",
+            RecordStateDto { phase: record::Phase::Idle, elapsed_ms: 0, mic: false, system: false },
+        );
     });
     Ok(())
 }
@@ -4332,10 +4450,10 @@ fn state_dto(sess: &RecordSession) -> RecordStateDto {
 
 fn set_paused(sess: &mut RecordSession, paused: bool) {
     if let Some(c) = &sess.mic_chan {
-        c.lock().unwrap().paused = paused;
+        c.lock().unwrap().set_paused(paused);
     }
     if let Some(c) = &sess.system_chan {
-        c.lock().unwrap().paused = paused;
+        c.lock().unwrap().set_paused(paused);
     }
 }
 
@@ -4356,225 +4474,211 @@ fn stop_backends(sess: &mut RecordSession) {
     }
 }
 
-/// Off-thread finish: move the audio into the project, (optionally) transcribe,
-/// write the markdown doc, and index everything. Honors the storage choice and
-/// the failure rule (transcription failure keeps the audio, emits
-/// `record-error{ canRetry: true }`, deletes nothing).
-#[allow(clippy::too_many_arguments)]
-fn finish_recording(
-    app: &AppHandle,
-    state: &SharedState,
-    root: &Path,
-    _base: &Path,
-    tmp_dir: &Path,
-    storage: &str,
-    mic_on: bool,
-    system_on: bool,
+/// A stopped take, ready to finish.
+struct Take {
+    project_id: uuid::Uuid,
+    tmp_dir: PathBuf,
     mic_wav: Option<PathBuf>,
     system_wav: Option<PathBuf>,
     duration: Duration,
-) -> CmdResult<()> {
+}
+
+/// Move a file, copying when it crosses drives.
+fn move_across(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device(&e) => {
+            std::fs::copy(from, to)?;
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Off-thread finish: transcribe the take, write the transcript into the
+/// library's Raw/ (never an empty one) and start the read; keep the audio in
+/// app data when asked, or when there is no transcript to show for it.
+fn finish_recording(app: &AppHandle, state: &SharedState, base: &Path, storage: &str, take: &Take) -> CmdResult<()> {
     use chrono::{Datelike, Local, Timelike};
-    // Best-effort: the project may have switched by the time transcription
-    // starts, so `transcript-progress` below just falls back to unscoped.
-    let transcribe_project_id = {
-        let guard = state.lock().unwrap();
-        member(&guard, None).ok().map(|a| a.project.config.id)
-    };
     let now = Local::now();
     let (y, mo, d, h, mi) = (now.year(), now.month(), now.day(), now.hour(), now.minute());
-    let recordings = root.join("Recordings");
-    std::fs::create_dir_all(&recordings).map_err(err)?;
     let stem = record::recording_stem(y, mo, d, h, mi);
-    let md_name = record::unique_name(&recordings, &stem, "md");
-    let md_stem = md_name.trim_end_matches(".md").to_string();
-    let header = record::metadata_header(y, mo, d, h, mi, duration, mic_on, system_on);
+    let (mic_on, system_on) = (take.mic_wav.is_some(), take.system_wav.is_some());
     let single = mic_on ^ system_on;
 
-    // Move the WAVs into the project up front so the audio is preserved no matter
-    // what happens during transcription ("keeps audio regardless of choice,
-    // deletes nothing"). For a successful transcript-only run they are deleted
-    // afterward. Returns each moved WAV's (abs path, project-relative path).
-    let move_wav = |src: &Option<PathBuf>, suffix: &str| -> CmdResult<Option<(PathBuf, String)>> {
-        let Some(src) = src else { return Ok(None) };
-        if !src.is_file() {
-            return Ok(None);
+    // Kept audio goes to app data, `recordings/`, beside nothing in a repo.
+    let audio_dir = base.join("recordings");
+    let keep_audio = || -> CmdResult<Vec<PathBuf>> {
+        std::fs::create_dir_all(&audio_dir).map_err(err)?;
+        let mut kept = Vec::new();
+        for (src, suffix) in [(&take.mic_wav, "Me"), (&take.system_wav, "Them")] {
+            let Some(src) = src.as_ref().filter(|p| p.is_file()) else { continue };
+            let wav_stem = if single { stem.clone() } else { format!("{stem} - {suffix}") };
+            let dest = audio_dir.join(record::unique_name(&audio_dir, &wav_stem, "wav"));
+            move_across(src, &dest).map_err(err)?;
+            kept.push(dest);
         }
-        let wav_stem = if single { md_stem.clone() } else { format!("{md_stem} - {suffix}") };
-        let name = record::unique_name(&recordings, &wav_stem, "wav");
-        let dest = recordings.join(&name);
-        // The temp WAV lives under app-data; the project may be on another
-        // volume (e.g. Dropbox), so fall back to copy+remove on a cross-device
-        // rename rather than failing.
-        match std::fs::rename(src, &dest) {
-            Ok(()) => {}
-            #[cfg(unix)]
-            Err(e) if e.raw_os_error() == Some(EXDEV) => {
-                std::fs::copy(src, &dest).map_err(err)?;
-                let _ = std::fs::remove_file(src);
-            }
-            Err(e) => return Err(err(e)),
-        }
-        Ok(Some((dest, format!("Recordings/{name}"))))
+        let _ = std::fs::remove_dir_all(&take.tmp_dir);
+        Ok(kept)
     };
-    let mut mic_moved = move_wav(&mic_wav, "Me")?;
-    let mut sys_moved = move_wav(&system_wav, "Them")?;
-
-    let md_rel = format!("Recordings/{md_name}");
-    let mut failure: Option<String> = None;
-
-    let body = if storage == "audio" {
-        record::AUDIO_ONLY_NOTE.to_string()
-    } else {
-        // Transcribe each present channel from its moved location, honouring the
-        // user's selected transcription model (§10) — same resolution as the
-        // other transcription call sites, not the hard-coded Base constant.
-        let model = model::selected_model_path(_base, model::ModelCategory::Transcription)
-            .unwrap_or_else(|| transcript::model_path(_base));
-        let transcribe_all = || -> CmdResult<String> {
-            if !model.is_file() {
-                return Err("Download a transcription model in Settings to make transcripts.".into());
-            }
-            let channel_count =
-                mic_moved.is_some() as usize + sys_moved.is_some() as usize;
-            // One continuous bar across sequential channels: Me fills the first
-            // half, Them the second (or the whole bar when only one exists).
-            let scaled_sink = |idx: usize| -> transcript::ProgressFn {
-                let app = app.clone();
-                let rel = md_rel.clone();
-                let last = std::sync::atomic::AtomicI32::new(-1);
-                std::sync::Arc::new(move |phase| {
-                    if let transcript::TranscriptPhase::Transcribing(p) = phase {
-                        let overall = transcript::scale_channel_pct(idx, channel_count, p);
-                        if last.swap(overall as i32, Ordering::Relaxed) == overall as i32 {
-                            return;
-                        }
-                        emit_transcript_phase(
-                            &app,
-                            transcribe_project_id,
-                            &rel,
-                            transcript::TranscriptPhase::Transcribing(overall),
-                        );
-                    }
-                })
-            };
-            let mut me_cues = Vec::new();
-            let mut them_cues = Vec::new();
-            let mut idx = 0usize;
-            if let Some((p, _)) = &mic_moved {
-                let samples = record::read_wav_f32(p).map_err(err)?;
-                me_cues = transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx))
-                    .map_err(err)?;
-                idx += 1;
-            }
-            if let Some((p, _)) = &sys_moved {
-                let samples = record::read_wav_f32(p).map_err(err)?;
-                them_cues =
-                    transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx))
-                        .map_err(err)?;
-            }
-            let channels: Vec<record::LabeledChannel> = if single {
-                vec![record::LabeledChannel {
-                    label: None,
-                    cues: if mic_on { &me_cues } else { &them_cues },
-                }]
-            } else {
-                vec![
-                    record::LabeledChannel { label: Some("Me"), cues: &me_cues },
-                    record::LabeledChannel { label: Some("Them"), cues: &them_cues },
-                ]
-            };
-            Ok(record::merge_transcript(&channels))
-        };
-        match transcribe_all() {
-            Ok(body) => {
-                // Transcript-only success: the audio was a temp — remove it now.
-                if storage == "transcript" {
-                    if let Some((p, _)) = mic_moved.take() {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    if let Some((p, _)) = sys_moved.take() {
-                        let _ = std::fs::remove_file(p);
-                    }
-                }
-                body
-            }
-            Err(e) => {
-                // Failure rule: keep the audio, note it in the doc, flag retry.
-                failure = Some(e.clone());
-                format!("{}\n_Transcription failed: {e}_\n", record::AUDIO_ONLY_NOTE)
-            }
-        }
+    let fail = |message: String| {
+        let _ = app.emit("record-error", RecordErrorDto { message, can_retry: false });
+        Ok(())
     };
 
-    let doc = record::build_document(&header, &body);
-    // In a library with an inbox, a transcript lands in Raw/ so it is
-    // ingested like any other source; the audio stays in Recordings/ (Ken
-    // cannot read a WAV, and ingest would stop on it). An audio-only or
-    // failed recording stays whole in Recordings/, where retry expects it.
-    let raw_dir = root.join(ken_core::ingest::RAW);
-    let (md_dir, md_name, md_rel) = if storage != "audio" && failure.is_none() && raw_dir.is_dir() {
-        let name = record::unique_name(&raw_dir, &md_stem, "md");
-        let rel = format!("{}/{name}", ken_core::ingest::RAW);
-        (raw_dir, name, rel)
-    } else {
-        (recordings.clone(), md_name, md_rel)
-    };
-    std::fs::write(md_dir.join(&md_name), &doc).map_err(err)?;
-    let _ = std::fs::remove_dir_all(tmp_dir);
-
-    let mic_rel = mic_moved.map(|(_, rel)| rel);
-    let sys_rel = sys_moved.map(|(_, rel)| rel);
-
-    // Index the new files so they're searchable + automation-eligible.
-    // The recording belongs to the project the user is looking at, so resolve
-    // through `focused` rather than taking an arbitrary member. The old code
-    // also read the id and the runtime in two separate `values().next()`
-    // calls, which is only coincidentally the same member.
-    let project_id = {
-        let mut guard = state.lock().unwrap();
-        match member_mut(&mut guard, None) {
-            Ok(active) => {
-                let id = active.project.config.id;
-                let _ = scan::refresh_path(&active.project, &mut active.db, &md_rel);
-                for rel in [mic_rel, sys_rel].into_iter().flatten() {
-                    let _ = scan::refresh_path(&active.project, &mut active.db, &rel);
-                }
-                Some(id)
-            }
-            Err(_) => None,
-        }
-    };
-    match project_id {
-        Some(id) => emit_member(&app, id, "index-updated", ScanStats::default()),
-        // Project closed mid-save — nothing to scope the event to.
-        None => {
-            let _ = app.emit("index-updated", ScanStats::default());
-        }
-    }
-
-    if let Some(e) = failure {
+    if storage == "audio" {
+        keep_audio()?;
         let _ = app.emit(
-            "record-error",
-            RecordErrorDto {
-                message: format!("Saved the audio; transcription failed: {e}"),
-                can_retry: true,
-            },
+            "record-saved",
+            RecordSaved { rel_path: audio_dir.to_string_lossy().into_owned(), project_id: None },
         );
-    } else {
-        let _ = app.emit("record-saved", RecordSaved { rel_path: md_rel });
+        return Ok(());
     }
-    let _ = app.emit(
-        "record-state",
-        RecordStateDto { phase: record::Phase::Idle, elapsed_ms: 0, mic: false, system: false },
+
+    // The library and where in its Raw/ the transcript goes.
+    let project = {
+        let guard = state.lock().unwrap();
+        guard.members.get(&take.project_id).map(|m| m.project.clone())
+    };
+    let Some(project) = project else {
+        let kept = keep_audio()?;
+        return fail(format!(
+            "The team wiki closed before the transcript was written. The audio is kept in {}.",
+            kept.first().map(|p| p.display().to_string()).unwrap_or_else(|| audio_dir.display().to_string())
+        ));
+    };
+    let raw_dir = project.root.join(ken_core::ingest::RAW);
+    std::fs::create_dir_all(&raw_dir).map_err(err)?;
+    let md_name = record::unique_name(&raw_dir, &stem, "md");
+    let md_rel = format!("{}/{md_name}", ken_core::ingest::RAW);
+
+    let Some(model) = transcription_model(base) else {
+        let kept = keep_audio()?;
+        return fail(format!(
+            "Install a transcription model in Settings to make transcripts. The audio is kept in {}.",
+            kept.first().map(|p| p.display().to_string()).unwrap_or_else(|| audio_dir.display().to_string())
+        ));
+    };
+    let channel_count = mic_on as usize + system_on as usize;
+    // One continuous bar across sequential channels: Me fills the first
+    // half, Them the second (or the whole bar when only one exists).
+    let scaled_sink = |idx: usize| -> transcript::ProgressFn {
+        let app = app.clone();
+        let rel = md_rel.clone();
+        let pid = take.project_id;
+        let last = std::sync::atomic::AtomicI32::new(-1);
+        std::sync::Arc::new(move |phase| {
+            if let transcript::TranscriptPhase::Transcribing(p) = phase {
+                let overall = transcript::scale_channel_pct(idx, channel_count, p);
+                if last.swap(overall as i32, Ordering::Relaxed) == overall as i32 {
+                    return;
+                }
+                emit_transcript_phase(&app, Some(pid), &rel, transcript::TranscriptPhase::Transcribing(overall));
+            }
+        })
+    };
+    let transcribe_all = || -> CmdResult<String> {
+        let mut me_cues = Vec::new();
+        let mut them_cues = Vec::new();
+        let mut idx = 0usize;
+        if let Some(p) = &take.mic_wav {
+            let samples = record::read_wav_f32(p).map_err(err)?;
+            me_cues = transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx)).map_err(err)?;
+            idx += 1;
+        }
+        if let Some(p) = &take.system_wav {
+            let samples = record::read_wav_f32(p).map_err(err)?;
+            them_cues = transcript::transcribe_with_progress(&model, &samples, scaled_sink(idx)).map_err(err)?;
+        }
+        let channels: Vec<record::LabeledChannel> = if single {
+            vec![record::LabeledChannel { label: None, cues: if mic_on { &me_cues } else { &them_cues } }]
+        } else {
+            vec![
+                record::LabeledChannel { label: Some("Me"), cues: &me_cues },
+                record::LabeledChannel { label: Some("Them"), cues: &them_cues },
+            ]
+        };
+        Ok(record::merge_transcript(&channels))
+    };
+    let body = match transcribe_all() {
+        Ok(body) => body,
+        Err(e) => {
+            let kept = keep_audio()?;
+            return fail(format!(
+                "Transcription failed: {e}. The audio is kept in {}.",
+                kept.first().map(|p| p.display().to_string()).unwrap_or_else(|| audio_dir.display().to_string())
+            ));
+        }
+    };
+    if body.trim().is_empty() {
+        // Never an empty transcript in Raw/.
+        let kept = keep_audio()?;
+        return fail(format!(
+            "Nothing was heard in the recording, so no transcript was written. The audio is kept in {}.",
+            kept.first().map(|p| p.display().to_string()).unwrap_or_else(|| audio_dir.display().to_string())
+        ));
+    }
+
+    let kept: Vec<String> = if storage == "both" {
+        keep_audio()?.into_iter().map(|p| p.display().to_string()).collect()
+    } else {
+        let _ = std::fs::remove_dir_all(&take.tmp_dir);
+        Vec::new()
+    };
+    let me = cached_git_me();
+    let when = format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}");
+    let header = record::metadata_header(y, mo, d, h, mi, take.duration, mic_on, system_on);
+    let doc = format!(
+        "{}{}",
+        record::recording_frontmatter(&when, me.name.as_deref().or(me.email.as_deref()), &kept),
+        record::build_document(&header, &body)
     );
+    std::fs::write(raw_dir.join(&md_name), &doc).map_err(err)?;
+
+    // Index it, then read it.
+    let (base_dir, ws_root) = {
+        let mut guard = state.lock().unwrap();
+        if let Some(m) = guard.members.get_mut(&take.project_id) {
+            let _ = scan::refresh_path(&m.project, &mut m.db, &md_rel);
+        }
+        (guard.base_dir.clone(), guard.workspace.as_ref().map(|w| w.ws.root.clone()))
+    };
+    emit_member(app, take.project_id, "index-updated", ScanStats::default());
+    start_ingest_pass(&project, &base_dir, ws_root, true);
+    let _ = app.emit("record-saved", RecordSaved { rel_path: md_rel, project_id: Some(take.project_id.to_string()) });
     Ok(())
 }
 
-/// `errno` for a cross-device rename on Unix; `fs::rename` fails with this when
-/// source and destination live on different filesystems.
-#[cfg(unix)]
-const EXDEV: i32 = 18;
+/// Whether a rename failed because the two paths are on different drives:
+/// `EXDEV` (18) on Unix, `ERROR_NOT_SAME_DEVICE` (17) on Windows. The caller
+/// copies and removes instead.
+fn is_cross_device(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(18)
+    }
+    #[cfg(windows)]
+    {
+        e.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// What a person calls the OS's file manager, for "move it there instead".
+fn file_manager() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Finder"
+    } else if cfg!(windows) {
+        "File Explorer"
+    } else {
+        "your file manager"
+    }
+}
 
 /// Reconcile the index after a folder (or file) has moved on disk: rewrite every
 /// row keyed by the old path prefix to the new one. A move changes no file's
@@ -4638,13 +4742,12 @@ fn move_file(
 
     match std::fs::rename(&from_abs, &to_abs) {
         Ok(()) => {}
-        #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+        Err(e) if is_cross_device(&e) => {
             if from_is_dir {
-                return Err(
-                    "That folder can't be moved across drives from here — move it in Finder instead."
-                        .to_string(),
-                );
+                return Err(format!(
+                    "That folder can't be moved across drives from here — move it in {} instead.",
+                    file_manager()
+                ));
             }
             std::fs::copy(&from_abs, &to_abs).map_err(err)?;
             std::fs::remove_file(&from_abs).map_err(err)?;
@@ -4993,13 +5096,12 @@ fn import_commit(
     dest_folder_rel: String,
     create_folder: bool,
 ) -> CmdResult<String> {
-    let (root, project, engine, sync, auto_knowledge) = {
+    let (root, project, sync, auto_knowledge) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
         (
             active.project.root.clone(),
             active.project.clone(),
-            active.engine.clone(),
             active.sync.clone(),
             active.auto_knowledge.clone(),
         )
@@ -5024,8 +5126,7 @@ fn import_commit(
     // staging → final is a move; the external original was already copied.
     match std::fs::rename(&staged_abs, &final_abs) {
         Ok(()) => {}
-        #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(EXDEV) => {
+        Err(e) if is_cross_device(&e) => {
             std::fs::copy(&staged_abs, &final_abs).map_err(err)?;
             std::fs::remove_file(&staged_abs).map_err(err)?;
         }
@@ -5040,7 +5141,6 @@ fn import_commit(
     };
     if changed {
         let paths = vec![final_rel.clone()];
-        engine.sources_changed(paths.clone());
         sync.changed(paths.clone());
         auto_knowledge.changed();
         emit_member(
@@ -5331,9 +5431,8 @@ fn generate_transcript(app: AppHandle, state: State<SharedState>, rel_path: Stri
         )
     };
     let ffmpeg = transcript::discover_ffmpeg();
-    let model = model::selected_model_path(&base, model::ModelCategory::Transcription)
-        .unwrap_or_else(|| transcript::model_path(&base));
-    if let Some(blocker) = transcript::transcription_blocker(ffmpeg.is_some(), model.is_file(), &model) {
+    let model = transcription_model(&base);
+    if let Some(blocker) = transcript::transcription_blocker(Path::new(&rel_path), ffmpeg.is_some(), model.is_some()) {
         return Err(blocker);
     }
     let job = TranscriptionJob {
@@ -5341,8 +5440,8 @@ fn generate_transcript(app: AppHandle, state: State<SharedState>, rel_path: Stri
         root,
         project_id,
         jobs,
-        ffmpeg: ffmpeg.unwrap(),
-        model,
+        ffmpeg,
+        model: model.unwrap_or_default(),
         rel_path,
         quiet: false,
     };
@@ -5355,7 +5454,8 @@ struct TranscriptionJob {
     root: PathBuf,
     project_id: uuid::Uuid,
     jobs: Arc<Mutex<TranscriptJobs>>,
-    ffmpeg: PathBuf,
+    /// Only for what Ken cannot decode itself (`transcript::decodes_in_process`).
+    ffmpeg: Option<PathBuf>,
     model: PathBuf,
     rel_path: String,
     /// Automatic (ingest) jobs stay silent on failure; manual ones don't.
@@ -5398,15 +5498,15 @@ fn enqueue_transcriptions(
             active.transcripts.clone(),
         )
     };
-    let Some(ffmpeg) = transcript::discover_ffmpeg() else {
-        return; // no ffmpeg → quiet no-op
-    };
-    let model = model::selected_model_path(&base, model::ModelCategory::Transcription)
-        .unwrap_or_else(|| transcript::model_path(&base));
-    if !model.is_file() {
+    let ffmpeg = transcript::discover_ffmpeg();
+    let Some(model) = transcription_model(&base) else {
         return; // no model → quiet no-op
-    }
+    };
     for rel in rels {
+        // What only ffmpeg can read waits quietly when it is missing.
+        if transcript::transcription_blocker(Path::new(rel), ffmpeg.is_some(), true).is_some() {
+            continue;
+        }
         spawn_transcription(app, TranscriptionJob {
             state: state.clone(),
             root: root.clone(),
@@ -5440,7 +5540,7 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
         let on_progress =
             transcript_progress_sink(app.clone(), job.project_id, job.rel_path.clone());
         let result = transcript::generate_and_cache_with_progress(
-            &job.ffmpeg, &job.model, &job.root, &job.rel_path, on_progress,
+            job.ffmpeg.as_deref(), &job.model, &job.root, &job.rel_path, on_progress,
         );
         match result {
             Ok(_) => {
@@ -5481,11 +5581,13 @@ struct ModelStatusDto {
     expected_bytes: u64,
     /// The recommended default, pre-selected in the UI.
     recommended: bool,
-    /// "transcription" | "language"
+    /// "transcription" | "embedding"
     category: String,
-    /// "recommended" | "advanced"
+    /// "light" | "recommended" | "advanced" | "best"
     tier: String,
     blurb: String,
+    /// The languages it handles, as a person says them.
+    languages: String,
     /// Whether this is the selected model for its category.
     selected: bool,
 }
@@ -5523,11 +5625,9 @@ fn status_dto(
             model::ModelCategory::Language => "language".into(),
             model::ModelCategory::Embedding => "embedding".into(),
         },
-        tier: match entry.tier {
-            model::ModelTier::Recommended => "recommended".into(),
-            model::ModelTier::Advanced => "advanced".into(),
-        },
+        tier: entry.tier.as_str().into(),
         blurb: entry.blurb.to_string(),
+        languages: entry.languages.to_string(),
         selected: entry.spec.id == selected_id,
     }
 }
@@ -5553,22 +5653,21 @@ fn model_status(state: State<SharedState>) -> CmdResult<ModelStatusDto> {
 fn list_models(state: State<SharedState>) -> CmdResult<Vec<ModelStatusDto>> {
     let base = { state.lock().unwrap().base_dir.clone() };
     let sel_trans = model::selected(&base, model::ModelCategory::Transcription).id;
-    // The language selection is resolved lazily, per language entry: while the
-    // language catalog is empty `model::selected(_, Language)` has no recommended
-    // fallback and would panic, so we never call it until a language entry exists.
+    let sel_embed = model::selected(&base, model::ModelCategory::Embedding).id;
+    // Settings offers transcription and search by meaning only; the unused
+    // language models are listed only when a file is still on disk, so it can
+    // be removed.
+    let unused = model::language_catalog().into_iter().filter(|e| model::installed_size(&base, &e.spec).is_some());
     Ok(model::catalog()
-        .iter()
+        .into_iter()
+        .chain(unused)
         .map(|e| {
             let selected_id = match e.category {
                 model::ModelCategory::Transcription => sel_trans.clone(),
-                model::ModelCategory::Language => {
-                    model::selected(&base, model::ModelCategory::Language).id
-                }
-                model::ModelCategory::Embedding => {
-                    model::selected(&base, model::ModelCategory::Embedding).id
-                }
+                model::ModelCategory::Embedding => sel_embed.clone(),
+                model::ModelCategory::Language => String::new(),
             };
-            status_dto(&base, e, &selected_id)
+            status_dto(&base, &e, &selected_id)
         })
         .collect())
 }
@@ -5634,6 +5733,12 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
                 if is_language {
                     ken_core::local_llm::notify_model_installed();
                 }
+                // A transcription model: recordings waiting in an inbox can
+                // be read now.
+                if model::category_specs(model::ModelCategory::Transcription).iter().any(|s| s.id == spec.id) {
+                    use tauri::Manager;
+                    start_ingest_passes(app.state::<SharedState>().inner());
+                }
                 // A newly installed Embedding model: if the active project has
                 // semanticIndex on, the earlier toggle/open bailed `unavailable`
                 // because the model file was missing — resume now, same as
@@ -5645,18 +5750,7 @@ fn download_model(app: AppHandle, state: State<SharedState>, id: String) -> CmdR
                 if is_embedding {
                     use tauri::Manager;
                     let state = app.state::<SharedState>();
-                    let enabled = {
-                        let guard = state.lock().unwrap();
-                        guard
-                            .members
-                            .values()
-                            .next()
-                            .map(|a| semantic_index_enabled(&guard.app_settings, &a.project))
-                            .unwrap_or(false)
-                    };
-                    if enabled {
-                        let _ = apply_semantic_index_flag(&app, state.inner(), None, true);
-                    }
+                    reapply_semantic_index_everywhere(&app, state.inner());
                 }
             }
             Err(e) => {
@@ -5691,579 +5785,97 @@ fn remove_model(state: State<SharedState>, id: String) -> CmdResult<()> {
 /// Persist the user's chosen model for a category
 /// ("transcription" | "language" | "embedding").
 #[tauri::command]
-fn set_model_selection(state: State<SharedState>, category: String, id: String) -> CmdResult<()> {
+fn set_model_selection(app: AppHandle, state: State<SharedState>, category: String, id: String) -> CmdResult<()> {
     let base = { state.lock().unwrap().base_dir.clone() };
     let cat = match category.as_str() {
         "transcription" => model::ModelCategory::Transcription,
-        "language" => model::ModelCategory::Language,
-        // Embedding has a single catalog entry, so "switching" is a no-op for
-        // the live embedder — persisting the selection is all that's needed.
         "embedding" => model::ModelCategory::Embedding,
         other => return Err(format!("unknown model category: {other}")),
     };
     model::set_selected(&base, cat, &id).map_err(err)?;
-    if cat == model::ModelCategory::Language {
-        // Switching 4B↔8B: rebuild the engine with the newly selected file on
-        // the next job (cheap flag flip; no-op before the service spawns).
-        ken_core::local_llm::notify_model_installed();
+    if cat == model::ModelCategory::Embedding {
+        // Another embedding model: load it, and re-read every repo for
+        // meaning with it (the build drops the old vectors when the model
+        // differs). Keyword search keeps working meanwhile.
+        let app = app.clone();
+        let state = state.inner().clone();
+        std::thread::spawn(move || reapply_semantic_index_everywhere(&app, &state));
     }
     Ok(())
 }
 
-// ---------- ingest commands ----------
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestSummary {
-    entry: RecipeEntry,
-    last_run: Option<RunRow>,
-    resolved_rules: Option<ResolvedRules>,
-    stale: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestDetail {
-    recipe: Recipe,
-    runs: Vec<RunRow>,
-    resolved_rules: ResolvedRules,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestForm {
-    slug: Option<String>,
-    name: String,
-    #[serde(default)]
-    description: String,
-    instruction: String,
-    #[serde(default)]
-    sources: Vec<String>,
-    output: String,
-    mode: Mode,
-    refresh: Refresh,
-    #[serde(default)]
-    rules: Option<RulesOverride>,
-}
-
-fn kebab(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.chars() {
-        if c.is_alphanumeric() {
-            out.extend(c.to_lowercase());
-        } else if !out.ends_with('-') && !out.is_empty() {
-            out.push('-');
-        }
+/// The search-by-meaning index now (Settings › This machine).
+#[tauri::command]
+fn embedding_state(state: State<SharedState>) -> CmdResult<EmbeddingStateDto> {
+    let dbs: Vec<Arc<Mutex<Db>>> = {
+        let guard = state.lock().unwrap();
+        guard.members.values().map(|m| m.search_db.clone()).collect()
+    };
+    let (mut embedded, mut total) = (0usize, 0usize);
+    for db in dbs {
+        let db = db.lock().unwrap_or_else(|p| p.into_inner());
+        embedded += db.vector_count().unwrap_or(0).max(0) as usize;
+        total += db.chunk_count().unwrap_or(0).max(0) as usize;
     }
-    let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() { "ingest".into() } else { trimmed }
-}
-
-#[tauri::command]
-fn list_ingests(state: State<SharedState>) -> CmdResult<Vec<IngestSummary>> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let now = engine::now_epoch();
-    let mut out = Vec::new();
-    for entry in recipe::list(&active.project).map_err(err)? {
-        let (last_run, rules, stale) = match &entry {
-            RecipeEntry::Ok { recipe: r } => {
-                let last = active.db.list_runs(&r.slug, 1).map_err(err)?.into_iter().next();
-                let rules = recipe::resolve_rules(r, &active.project);
-                let stale = last
-                    .as_ref()
-                    .filter(|l| l.status == "fresh")
-                    .map(|l| now - l.started_at > rules.stale_days as i64 * 86_400)
-                    .unwrap_or(false);
-                (last, Some(rules), stale)
-            }
-            RecipeEntry::Broken { .. } => (None, None, false),
-        };
-        out.push(IngestSummary { entry, last_run, resolved_rules: rules, stale });
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-fn get_ingest(state: State<SharedState>, slug: String) -> CmdResult<IngestDetail> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let recipe = recipe::load_slug(&active.project, &slug).map_err(err)?;
-    let runs = active.db.list_runs(&slug, 20).map_err(err)?;
-    let resolved_rules = recipe::resolve_rules(&recipe, &active.project);
-    Ok(IngestDetail { recipe, runs, resolved_rules })
-}
-
-#[tauri::command]
-fn save_ingest(state: State<SharedState>, form: IngestForm) -> CmdResult<Recipe> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let slug = match form.slug {
-        Some(s) => s,
-        None => {
-            // New ingest: derive a unique slug from the name.
-            let base = kebab(&form.name);
-            let mut slug = base.clone();
-            let mut n = 2;
-            while recipe::recipe_path(&active.project.root, &slug).exists() {
-                slug = format!("{base}-{n}");
-                n += 1;
-            }
-            slug
+    let rebuilding = !semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+    let (model, dims) = {
+        let slot = shared_embedder();
+        let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            Some(e) => (Some(e.model_id()), Some(e.dim())),
+            None => (ken_core::embedder::selected_profile().map(|p| p.model_id.to_string()), None),
         }
     };
-    // Editing goes through the loaded recipe so unknown frontmatter fields
-    // survive; a fresh slug builds from scratch.
-    let mut recipe = recipe::load_slug(&active.project, &slug).unwrap_or_else(|_| {
-        Recipe::build(
-            slug.clone(),
-            String::new(),
-            String::new(),
-            Vec::new(),
-            String::from("out.md"),
-            form.mode,
-            form.refresh,
-            None,
-            String::from("-"),
-        )
-    });
-    recipe.update_from_form(
-        form.name,
-        form.description,
-        form.sources,
-        form.output,
-        form.mode,
-        form.refresh,
-        form.rules,
-        form.instruction,
-    );
-    recipe::save(&active.project, &recipe).map_err(err)?;
-    let recipe = recipe::load_slug(&active.project, &recipe.slug).map_err(err)?;
-    Ok(recipe)
+    Ok(EmbeddingStateDto { model, dims, embedded, total, rebuilding, device: device_label() })
 }
 
-#[tauri::command]
-fn delete_ingest(state: State<SharedState>, slug: String) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    recipe::delete(&active.project, &slug).map_err(err)
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GpuInfoDto {
+    device: Option<String>,
+    /// "vulkan" | "metal" | "cpu"
+    backend: String,
+    use_gpu: bool,
 }
 
+/// The device the on-device models run on, and the graphics card setting.
 #[tauri::command]
-fn run_ingest(state: State<SharedState>, slug: String, full: Option<bool>) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    active.engine.trigger(&slug, full.unwrap_or(true));
-    Ok(())
-}
-
-#[tauri::command]
-fn cancel_run(state: State<SharedState>, slug: String, kind: Option<String>) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    // Default to Ingest for older callers; automations pass kind="automation".
-    let kind = match kind.as_deref() {
-        Some("automation") => engine::RunKind::Automation,
-        _ => engine::RunKind::Ingest,
+fn gpu_info(state: State<SharedState>) -> CmdResult<GpuInfoDto> {
+    let use_gpu = use_gpu_setting(&state.lock().unwrap().app_settings);
+    let d = ken_core::compute::device();
+    let backend = match d.backend.as_str() {
+        b if b.contains("metal") => "metal",
+        b if b.contains("vulkan") => "vulkan",
+        _ => "cpu",
     };
-    active.engine.cancel(kind, &slug);
+    Ok(GpuInfoDto { device: d.name, backend: backend.into(), use_gpu })
+}
+
+/// Turn the graphics card on or off for the on-device models. The models
+/// are loaded again where they now run.
+#[tauri::command]
+fn set_use_gpu(app: AppHandle, state: State<SharedState>, on: bool) -> CmdResult<()> {
+    {
+        let mut guard = state.lock().unwrap();
+        guard.app_settings.extra.insert("useGpu".into(), serde_json::Value::Bool(on));
+        guard.app_settings.save(&guard.base_dir).map_err(err)?;
+    }
+    ken_core::compute::set_use_gpu(on);
+    // The loaded model sits where it was loaded; drop it so the next build
+    // and search load it on the new device.
+    shared_embedder().lock().unwrap_or_else(|p| p.into_inner()).take();
+    let app = app.clone();
+    let state = state.inner().clone();
+    std::thread::spawn(move || reapply_semantic_index_everywhere(&app, &state));
     Ok(())
 }
 
-/// Tell listeners (ingests + review stores) a run changed outside the
-/// engine — approvals and discards resolve runs from a command, not a run
-/// thread, so the engine never emits for them.
-fn emit_run_changed(app: &AppHandle, project_id: uuid::Uuid, db: &Db, run_id: i64) {
-    if let Ok(Some(run)) = db.get_run(run_id) {
-        emit_member(
-            app,
-            project_id,
-            "ingest-run-changed",
-            IngestEvent::at(&run.kind, &run.slug, run_id, run.session_id, &run.status, run.summary),
-        );
-    }
+/// The `useGpu` setting, on unless the person turned it off.
+fn use_gpu_setting(app_settings: &ken_core::settings::AppSettings) -> bool {
+    app_settings.extra.get("useGpu").and_then(serde_json::Value::as_bool).unwrap_or(true)
 }
 
-#[tauri::command]
-fn approve_run(app: AppHandle, state: State<SharedState>, run_id: i64) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    engine::approve_run(&active.project, &mut active.db, run_id).map_err(err)?;
-    // Applied files land on disk; index them promptly.
-    let _ = scan::scan(&active.project, &mut active.db);
-    emit_run_changed(&app, active.project.config.id, &active.db, run_id);
-    Ok(())
-}
-
-#[tauri::command]
-fn discard_run(app: AppHandle, state: State<SharedState>, run_id: i64) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    engine::discard_run(&active.project, &mut active.db, run_id).map_err(err)?;
-    emit_run_changed(&app, active.project.config.id, &active.db, run_id);
-    Ok(())
-}
-
-#[tauri::command]
-fn pending_approvals(state: State<SharedState>) -> CmdResult<Vec<RunRow>> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    active.db.runs_with_status("pending_approval").map_err(err)
-}
-
-// ---------- automations ----------
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AutomationDetail {
-    automation: Automation,
-    runs: Vec<RunRow>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AutomationForm {
-    slug: Option<String>,
-    name: String,
-    globs: Vec<String>,
-    prompt: String,
-    #[serde(default)]
-    auto_apply: bool,
-    #[serde(default = "default_true_cmd")]
-    enabled: bool,
-}
-fn default_true_cmd() -> bool {
-    true
-}
-
-#[tauri::command]
-fn list_automations(state: State<SharedState>) -> CmdResult<Vec<Automation>> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    automation::list_ok(&active.project).map_err(err)
-}
-
-#[tauri::command]
-fn get_automation(state: State<SharedState>, slug: String) -> CmdResult<AutomationDetail> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let automation = automation::load_slug(&active.project, &slug).map_err(err)?;
-    let runs = active.db.list_runs_of_kind(&slug, "automation", 20).map_err(err)?;
-    Ok(AutomationDetail { automation, runs })
-}
-
-#[tauri::command]
-fn save_automation(state: State<SharedState>, form: AutomationForm) -> CmdResult<Automation> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let slug = match form.slug {
-        Some(s) => s,
-        None => {
-            let base = kebab(&form.name);
-            let mut slug = base.clone();
-            let mut n = 2;
-            while automation::automation_path(&active.project.root, &slug).exists() {
-                slug = format!("{base}-{n}");
-                n += 1;
-            }
-            slug
-        }
-    };
-    // Preserve unknown frontmatter on edit.
-    let mut a = automation::load_slug(&active.project, &slug).unwrap_or_else(|_| Automation {
-        slug: slug.clone(),
-        name: String::new(),
-        globs: vec![],
-        prompt: String::from("-"),
-        auto_apply: false,
-        enabled: true,
-        extra: Default::default(),
-    });
-    a.name = form.name;
-    a.globs = form.globs;
-    a.prompt = form.prompt;
-    a.auto_apply = form.auto_apply;
-    a.enabled = form.enabled;
-    automation::save(&active.project, &a).map_err(err)?;
-    automation::load_slug(&active.project, &a.slug).map_err(err)
-}
-
-#[tauri::command]
-fn delete_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    automation::delete(&active.project, &slug).map_err(err)
-}
-
-#[tauri::command]
-fn run_automation(state: State<SharedState>, slug: String) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    active.engine.run_automation(&slug);
-    Ok(())
-}
-
-#[tauri::command]
-fn approve_automation_proposal(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    engine::approve_automation_proposal(&active.engine, &mut active.db, item_id).map_err(err)?;
-    let _ = app.emit("review-changed", ());
-    Ok(())
-}
-
-#[tauri::command]
-fn discard_automation_proposal(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    engine::discard_automation_proposal(&mut active.db, item_id).map_err(err)?;
-    let _ = app.emit("review-changed", ());
-    Ok(())
-}
-
-// ---------- review inbox ----------
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InboxItem {
-    /// Kind-prefixed and stable across refreshes: "run-12", "stale-people",
-    /// "file-notes/x.pdf", "broken-people", "item-3".
-    id: String,
-    /// `approval` | `stale` | `failed-file` | `broken-recipe` | `stored`
-    /// | `conflict` | `conflict-copy`
-    kind: String,
-    title: String,
-    body: String,
-    when: i64,
-    source_ref: String,
-    /// Kind-specific JSON for stored items (conflict versions, copy paths).
-    payload: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ReviewInbox {
-    items: Vec<InboxItem>,
-    done: Vec<InboxItem>,
-}
-
-/// Sort key mirroring the prototype's top-down severity order.
-fn inbox_rank(kind: &str) -> u8 {
-    match kind {
-        "approval" => 0,
-        "automation-proposal" => 1,
-        "conflict" | "conflict-copy" => 2,
-        "stored" | "ingest" | "page-proposal" => 3,
-        "broken-recipe" => 4,
-        "failed-file" => 5,
-        _ => 6, // stale
-    }
-}
-
-/// Stored items carry their real kind when the frontend knows it
-/// (conflicts render their own detail); anything else stays generic.
-fn stored_kind(kind: &str) -> String {
-    match kind {
-        "conflict" | "conflict-copy" | "automation-proposal" | "ingest" | "page-proposal" => kind.to_string(),
-        _ => "stored".to_string(),
-    }
-}
-
-/// The unified Review inbox, assembled at read time: pending approvals,
-/// stale ingests, failed files, and broken recipes stay derived from their
-/// own sources of truth; stored review items are merged in. `done` is the
-/// last 7 days of resolved items.
-/// How many stored items wait on Review in each open repo of the chosen
-/// team (all of the workspace with no team): Review reads one repo at a
-/// time, so the others are named with their count.
-#[tauri::command]
-fn team_review_counts(state: State<SharedState>, team: Option<String>) -> CmdResult<Vec<(String, String, usize)>> {
-    let guard = state.lock().unwrap();
-    let Some(ws) = guard.workspace.as_ref() else { return Ok(Vec::new()) };
-    let names: Option<Vec<String>> = team.as_deref().map(|t| ws.ws.config.effective_group_members(t));
-    let mut out = Vec::new();
-    for m in &ws.ws.members {
-        if names.as_ref().is_some_and(|n| !n.contains(&m.name)) {
-            continue;
-        }
-        let ken_core::workspace::MemberStatus::Ok(p) = &m.status else { continue };
-        let Some(rt) = guard.members.get(&p.config.id) else { continue };
-        let n = rt.db.list_open_review_items().map(|v| v.len()).unwrap_or(0);
-        out.push((p.config.id.to_string(), m.name.clone(), n));
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-fn review_inbox(state: State<SharedState>) -> CmdResult<ReviewInbox> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let now = engine::now_epoch();
-    let mut items: Vec<InboxItem> = Vec::new();
-
-    // Per-user, per-project ignores (app-data, never synced): a file the user
-    // silenced drops out of the inbox entirely, so the list AND the live badge
-    // count reflect the choice. The file stays indexed — only its nag is hidden.
-    let ignored = UserState::load(&guard.base_dir, active.project.config.id).ignored;
-
-    // One walk over the recipes yields stale + broken items and the
-    // name/threshold lookups the run-based items need.
-    let mut names: std::collections::HashMap<String, String> = Default::default();
-    let mut thresholds: std::collections::HashMap<String, f64> = Default::default();
-    for entry in recipe::list(&active.project).map_err(err)? {
-        match entry {
-            RecipeEntry::Ok { recipe: r } => {
-                let rules = recipe::resolve_rules(&r, &active.project);
-                names.insert(r.slug.clone(), r.name.clone());
-                thresholds.insert(r.slug.clone(), rules.review_threshold_pct as f64 / 100.0);
-                // Same staleness derivation as list_ingests.
-                let last = active.db.list_runs(&r.slug, 1).map_err(err)?.into_iter().next();
-                if let Some(last) = last.filter(|l| l.status == "fresh") {
-                    if now - last.started_at > rules.stale_days as i64 * 86_400 {
-                        items.push(InboxItem {
-                            id: format!("stale-{}", r.slug),
-                            kind: "stale".into(),
-                            title: format!("{} may be out of date", r.name),
-                            body: format!(
-                                "{} hasn't been refreshed in over {} days. Run it to check for drift, or leave it if nothing has changed.",
-                                r.output, rules.stale_days
-                            ),
-                            when: last.started_at,
-                            source_ref: r.slug.clone(),
-                            payload: None,
-                        });
-                    }
-                }
-            }
-            RecipeEntry::Broken { error } => {
-                let when = recipe::recipe_path(&active.project.root, &error.slug)
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(now);
-                items.push(InboxItem {
-                    id: format!("broken-{}", error.slug),
-                    kind: "broken-recipe".into(),
-                    title: format!("The {} recipe has a problem", error.slug),
-                    body: format!(
-                        "Ken can't read this ingest recipe, so it won't run — {}. Open it in Ingests to fix or recreate it.",
-                        error.reason
-                    ),
-                    when,
-                    source_ref: error.slug,
-                    payload: None,
-                });
-            }
-        }
-    }
-
-    for run in active.db.runs_with_status("pending_approval").map_err(err)? {
-        let name = names.get(&run.slug).cloned().unwrap_or_else(|| run.slug.clone());
-        let held = run
-            .summary
-            .clone()
-            .unwrap_or_else(|| "A large update is staged.".into());
-        items.push(InboxItem {
-            id: format!("run-{}", run.id),
-            kind: "approval".into(),
-            title: format!("Large refresh — {name}"),
-            body: format!(
-                "{held}\n\nApprove to write the update, or discard to keep the document as it is."
-            ),
-            when: run.finished_at.unwrap_or(run.started_at),
-            source_ref: run.slug,
-            payload: None,
-        });
-    }
-
-    for f in active.db.list_files().map_err(err)? {
-        if f.status != "failed" {
-            continue;
-        }
-        if ignored.contains(&f.rel_path) {
-            continue;
-        }
-        let file_name = f.rel_path.rsplit('/').next().unwrap_or(&f.rel_path).to_string();
-        items.push(InboxItem {
-            id: format!("file-{}", f.rel_path),
-            kind: "failed-file".into(),
-            title: format!("{file_name} couldn't be read"),
-            body: format!(
-                "Ken couldn't get text out of this file, so its contents aren't searchable — {}. It's still findable by name; open it in Files for the details.",
-                f.error.as_deref().unwrap_or("the reason is unknown")
-            ),
-            when: f.mtime,
-            source_ref: f.rel_path,
-            payload: None,
-        });
-    }
-
-    for it in active.db.list_open_review_items().map_err(err)? {
-        let kind = stored_kind(&it.kind);
-        // Conflicts/stored items reference a file in `source_ref`; skip the ones
-        // whose file the user ignored. Slug-based kinds carry no file ref.
-        if user_state::inbox_item_ignored(&kind, &it.source_ref, &ignored) {
-            continue;
-        }
-        items.push(InboxItem {
-            id: format!("item-{}", it.id),
-            kind,
-            title: it.title,
-            body: it.body,
-            when: it.created_at,
-            source_ref: it.source_ref,
-            payload: it.payload,
-        });
-    }
-
-    items.sort_by(|a, b| {
-        inbox_rank(&a.kind)
-            .cmp(&inbox_rank(&b.kind))
-            .then(b.when.cmp(&a.when))
-    });
-
-    // Done: the simplest honest cut — discarded runs (only reachable from
-    // pending_approval), fresh runs whose ratio exceeded their threshold
-    // (i.e. held-then-approved; a first full build can also land here),
-    // and resolved stored items.
-    let since = now - 7 * 86_400;
-    let default_threshold = recipe::DEFAULT_RULES.review_threshold_pct as f64 / 100.0;
-    let mut done: Vec<InboxItem> = Vec::new();
-    for run in active.db.runs_finished_since(since).map_err(err)? {
-        let threshold = thresholds.get(&run.slug).copied().unwrap_or(default_threshold);
-        let what = match run.status.as_str() {
-            "discarded" => "Refresh discarded",
-            "fresh" if run.change_ratio.is_some_and(|r| r > threshold) => "Large refresh applied",
-            _ => continue,
-        };
-        let name = names.get(&run.slug).cloned().unwrap_or_else(|| run.slug.clone());
-        done.push(InboxItem {
-            id: format!("run-{}", run.id),
-            kind: "approval".into(),
-            title: format!("{what} — {name}"),
-            body: run.summary.clone().unwrap_or_default(),
-            when: run.finished_at.unwrap_or(run.started_at),
-            source_ref: run.slug,
-            payload: None,
-        });
-    }
-    for it in active.db.list_recent_resolved_review_items(since).map_err(err)? {
-        done.push(InboxItem {
-            id: format!("item-{}", it.id),
-            kind: stored_kind(&it.kind),
-            title: it.title,
-            body: it.body,
-            when: it.resolved_at.unwrap_or(it.created_at),
-            source_ref: it.source_ref,
-            payload: None,
-        });
-    }
-    done.sort_by(|a, b| b.when.cmp(&a.when));
-
-    Ok(ReviewInbox { items, done })
-}
+// ---------- the Review store ----------
 
 #[tauri::command]
 fn resolve_review_item(state: State<SharedState>, id: i64, project_id: Option<String>) -> CmdResult<()> {
@@ -6485,9 +6097,11 @@ fn resolve_conflict(
     item_id: i64,
     resolution: String,
     content: Option<String>,
+    project_id: Option<String>,
 ) -> CmdResult<String> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let active = member_mut(&mut guard, pid)?;
     let item = active
         .db
         .get_review_item(item_id)
@@ -6539,9 +6153,11 @@ fn resolve_conflict_copy(
     state: State<SharedState>,
     item_id: i64,
     resolution: String,
+    project_id: Option<String>,
 ) -> CmdResult<String> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
+    let active = member_mut(&mut guard, pid)?;
     let item = active
         .db
         .get_review_item(item_id)
@@ -6601,19 +6217,75 @@ fn resolve_conflict_copy(
     Ok(survivor)
 }
 
+/// A sync conflict or a conflicted copy, for the banner at the top of Files.
+/// Shaped like the Review item the conflict view reads (`id` is
+/// `item-<n>`), plus the repo it is in: resolve it with `resolve_conflict` /
+/// `resolve_conflict_copy` and this `project_id`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictItemDto {
+    id: String,
+    item_id: i64,
+    /// `conflict` | `conflict-copy`
+    kind: String,
+    title: String,
+    body: String,
+    when: i64,
+    source_ref: String,
+    /// The versions (conflict) or the copy's paths (conflict-copy), as JSON.
+    payload: Option<String>,
+    project_id: String,
+    repo: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesBannerDto {
+    /// Every open conflict and conflicted copy in the team's open repos,
+    /// newest first.
+    conflicts: Vec<ConflictItemDto>,
+    /// How many of them are conflicted copies (a shared drive's).
+    conflicted_copies: usize,
+}
+
+/// The banner at the top of Files: the sync conflicts and conflicted copies
+/// waiting in the chosen team's open repos (every open repo with no team),
+/// less those on files I ignore.
 #[tauri::command]
-fn set_ingest_runner_mode(state: State<SharedState>, mode: String) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    let active = member_mut(&mut guard, None)?;
-    if mode != "hidden-tui" && mode != "headless" {
-        return Err("unknown runner mode".into());
+fn files_banner(state: State<SharedState>, team: Option<String>) -> CmdResult<FilesBannerDto> {
+    let guard = state.lock().unwrap();
+    let repos: Vec<(uuid::Uuid, String)> = match guard.workspace.as_ref() {
+        Some(ws) => team_repos(&ws.ws, team.as_deref()).into_iter().map(|r| (r.id, r.name)).collect(),
+        None => guard.members.values().map(|m| (m.project.config.id, m.project.config.name.clone())).collect(),
+    };
+    let mut conflicts = Vec::new();
+    for (id, name) in repos {
+        let Some(m) = guard.members.get(&id) else { continue };
+        let ignored = UserState::load(&guard.base_dir, id).ignored;
+        for it in m.db.list_open_review_items().map_err(err)? {
+            if it.kind != "conflict" && it.kind != "conflict-copy" {
+                continue;
+            }
+            if user_state::inbox_item_ignored(&it.kind, &it.source_ref, &ignored) {
+                continue;
+            }
+            conflicts.push(ConflictItemDto {
+                id: format!("item-{}", it.id),
+                item_id: it.id,
+                kind: it.kind,
+                title: it.title,
+                body: it.body,
+                when: it.created_at,
+                source_ref: it.source_ref,
+                payload: it.payload,
+                project_id: id.to_string(),
+                repo: name.clone(),
+            });
+        }
     }
-    active
-        .project
-        .config
-        .extra
-        .insert("ingestRunner".into(), serde_json::Value::String(mode));
-    active.project.save().map_err(err)
+    conflicts.sort_by(|a, b| b.when.cmp(&a.when));
+    let conflicted_copies = conflicts.iter().filter(|c| c.kind == "conflict-copy").count();
+    Ok(FilesBannerDto { conflicts, conflicted_copies })
 }
 
 /// Is background download-and-index of cloud-offline documents enabled?
@@ -6672,12 +6344,17 @@ struct ClaudeDoctor {
     help: String,
 }
 
+/// Where Claude Code is and its version. `help` is the per-OS install help
+/// when it is not found, plus a line for each half-updated npm install that
+/// was skipped; it can be non-empty when Claude Code is found.
 #[tauri::command]
 fn claude_doctor() -> CmdResult<ClaudeDoctor> {
     match ken_core::runner::discover_claude() {
         Some(path) => {
-            let version = std::process::Command::new(&path)
+            let mut cmd = std::process::Command::new(&path);
+            let version = ken_core::proc::quiet(&mut cmd)
                 .arg("--version")
+                .stdin(std::process::Stdio::null())
                 .output()
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -6685,40 +6362,20 @@ fn claude_doctor() -> CmdResult<ClaudeDoctor> {
                 found: true,
                 path: Some(path.to_string_lossy().into_owned()),
                 version,
-                help: String::new(),
+                help: ken_core::runner::claude_help(true),
             })
         }
         None => Ok(ClaudeDoctor {
             found: false,
             path: None,
             version: None,
-            help: ken_core::runner::MISSING_CLAUDE_HELP.to_string(),
+            help: ken_core::runner::claude_help(false),
         }),
     }
 }
 
 
 // ---------- daily digest + quick answer ----------
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct DigestDto {
-    /// Local calendar day, `yyyy-mm-dd`.
-    date: String,
-    body: String,
-    sources: Vec<String>,
-    generated_at: i64,
-}
-
-fn digest_dto(row: &DigestRow) -> DigestDto {
-    let parsed = digest::parse_digest(&row.content);
-    DigestDto {
-        date: row.date.clone(),
-        body: parsed.body,
-        sources: parsed.sources,
-        generated_at: row.created_at,
-    }
-}
 
 fn local_date_today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
@@ -6734,144 +6391,6 @@ fn local_time_hhmm() -> String {
 fn local_hour() -> u32 {
     use chrono::Timelike;
     chrono::Local::now().hour()
-}
-
-/// The cheap digest check, run on activate, window focus, and (with
-/// `force`) from the refresh command: today already digested → nothing;
-/// otherwise past 07:00 local with Claude installed and nothing in
-/// flight → generate in the background, store, and emit
-/// `digest-updated`. A day with nothing to report stores the quiet
-/// fallback without calling Claude.
-fn maybe_generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    // The digest is for the project the user is in, so resolve through
-    // `focused` rather than whichever member the map happened to yield.
-    let Ok(active) = member_mut(&mut guard, None) else {
-        return Ok(());
-    };
-    let today = local_date_today();
-    if !force {
-        if active.db.get_digest(&today).map_err(err)?.is_some() {
-            return Ok(()); // already written today
-        }
-        if local_hour() < 7 {
-            return Ok(()); // the digest is a morning thing
-        }
-    }
-    let running = active.digest_running.clone();
-    if running.swap(true, Ordering::SeqCst) {
-        return if force {
-            Err("Today's digest is already being written.".into())
-        } else {
-            Ok(())
-        };
-    }
-    // Everything below must clear the flag on early return.
-    let done = |r: &Arc<AtomicBool>| r.store(false, Ordering::SeqCst);
-
-    let since = engine::now_epoch() - 86_400;
-    let sources = match digest::gather(&active.db, since) {
-        Ok(s) => s,
-        Err(e) => {
-            done(&running);
-            return Err(err(e));
-        }
-    };
-    if sources.is_quiet() {
-        // Nothing happened — say so honestly, no AI call.
-        let now = engine::now_epoch();
-        active
-            .db
-            .upsert_digest(&today, digest::QUIET_DIGEST, now)
-            .map_err(err)?;
-        done(&running);
-        if let Ok(Some(row)) = active.db.get_digest(&today) {
-            emit_member(app, active.project.config.id, "digest-updated", digest_dto(&row));
-        }
-        return Ok(());
-    }
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        done(&running);
-        return if force {
-            Err(ken_core::runner::MISSING_CLAUDE_HELP.into())
-        } else {
-            Ok(())
-        };
-    };
-
-    let prompt = digest::compose_digest_prompt(&active.project.config.name, &sources);
-    let root = active.project.root.clone();
-    let project_id = active.project.config.id;
-    let base = guard.base_dir.clone();
-    drop(guard);
-
-    let thread_app = app.clone();
-    let thread_state = state.clone();
-    let _ = app.emit("digest-generating", ());
-    std::thread::spawn(move || {
-        let outcome = assistant::oneshot(
-            &binary,
-            &root,
-            &prompt,
-            Duration::from_secs(180),
-            &CancelToken::new(),
-        );
-        // If the user switched projects mid-write, store quietly but
-        // don't repaint the new project's Home with the old digest.
-        let still_active = || {
-            let guard = thread_state.lock().unwrap();
-            guard
-                .members
-                .values()
-                .next()
-                .is_some_and(|a| a.project.config.id == project_id)
-        };
-        match outcome {
-            Ok(OneshotOutcome::Completed(text)) => {
-                if let Ok(mut db) = Db::open(&base, project_id) {
-                    let _ = db.upsert_digest(&today, &text, engine::now_epoch());
-                    if let Ok(Some(row)) = db.get_digest(&today) {
-                        if still_active() {
-                            emit_member(&thread_app, project_id, "digest-updated", digest_dto(&row));
-                        }
-                    }
-                }
-            }
-            Ok(OneshotOutcome::TimedOut) if still_active() => {
-                let _ = thread_app.emit(
-                    "digest-error",
-                    "Writing the digest took too long and was stopped — it'll try again later.",
-                );
-            }
-            Ok(OneshotOutcome::Failed(detail)) if still_active() => {
-                let _ = thread_app.emit("digest-error", detail);
-            }
-            Err(e) => {
-                let _ = thread_app.emit("digest-error", e.to_string());
-            }
-            _ => {}
-        }
-        running.store(false, Ordering::SeqCst);
-    });
-    Ok(())
-}
-
-/// Today's digest, parsed for the Home card. None until it's written.
-#[tauri::command]
-fn current_digest(state: State<SharedState>) -> CmdResult<Option<DigestDto>> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    Ok(active
-        .db
-        .get_digest(&local_date_today())
-        .map_err(err)?
-        .map(|row| digest_dto(&row)))
-}
-
-/// Force-regenerate today's digest ("Write it now" / re-run).
-#[tauri::command]
-fn refresh_digest(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
-    maybe_generate_digest(&app, state.inner(), true)
 }
 
 #[derive(Serialize, Clone)]
@@ -7234,11 +6753,7 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
 /// `drift.intervalDays` says otherwise), or now when `force`. It spawns git
 /// per cited file, so callers run it off the UI thread. Returns the run.
 fn run_drift_if_due(project: &Project, db: &mut Db, force: bool) -> Option<ken_core::drift::DriftRun> {
-    let kind = ken_core::registry::kind_of(&project.root);
-    let library = kind
-        .iter()
-        .any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki));
-    if !library && !force {
+    if !ken_core::registry::is_library(&project.root) && !force {
         return None;
     }
     let now = engine::now_epoch();
@@ -7264,38 +6779,90 @@ fn run_drift_if_due(project: &Project, db: &mut Db, force: bool) -> Option<ken_c
 static INGEST_RUNNING: std::sync::LazyLock<Mutex<std::collections::HashSet<uuid::Uuid>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-/// The source each library's pass is reading now, for the Ingest screen.
-static INGEST_READING: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+/// Libraries asked for another pass while one ran: it runs again when it
+/// ends, so a source dropped mid-pass is not left queued.
+static INGEST_AGAIN: std::sync::LazyLock<Mutex<std::collections::HashSet<uuid::Uuid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// The source each library's pass is on now, and what it is doing with it.
+type PassAt = (String, ken_core::ingest::PassPhase);
+static INGEST_READING: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, PassAt>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Why a library's last pass stopped before the end (Claude Code itself
+/// failed), until the next pass starts.
+static INGEST_STOPPED: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// The latest inbox change per library, so the watcher's pass waits until
+/// a burst of changes settles.
+static INGEST_SETTLE_GEN: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// How long the inbox must stay unchanged before the watcher starts a pass.
+const INGEST_SETTLE: Duration = Duration::from_secs(5);
 
 /// The open workspace's folder, where Your day's tasks live.
 fn workspace_root_of(state: &SharedState) -> Option<std::path::PathBuf> {
     lock_tolerant(state).workspace.as_ref().map(|w| w.ws.root.clone())
 }
 
-/// Read every source waiting in a team or wiki repo's `Research/Ingestion/
-/// Raw/`, one at a time on a background thread, through the Claude CLI.
-/// Each becomes a dated note and one Review card, and what follows from it
-/// is written at once (my next steps into `ws_root`'s Your day); a source
-/// that fails stays in Raw with a Review item saying why. `force` runs it
-/// for any kind. Returns whether a pass started.
+/// The Whisper model a pass transcribes with: the selected one when it is
+/// installed, else any installed one.
+fn transcription_model(base: &Path) -> Option<PathBuf> {
+    model::selected_model_path(base, model::ModelCategory::Transcription)
+        .or_else(|| Some(transcript::model_path(base)).filter(|p| p.is_file()))
+}
+
+/// A pass over `project`'s inbox once its changes settle ([`INGEST_SETTLE`]):
+/// the watcher's way in, so a file copied into Raw/ by hand is read too.
+fn schedule_ingest_pass(state: &SharedState, project: &Project, base: &Path) {
+    let id = project.config.id;
+    let gen = {
+        let mut gens = INGEST_SETTLE_GEN.lock().unwrap();
+        let g = gens.entry(id).or_insert(0);
+        *g += 1;
+        *g
+    };
+    let (state, project, base) = (state.clone(), project.clone(), base.to_path_buf());
+    std::thread::spawn(move || {
+        std::thread::sleep(INGEST_SETTLE);
+        if INGEST_SETTLE_GEN.lock().unwrap().get(&id) != Some(&gen) {
+            return; // a later change restarted the wait
+        }
+        start_ingest_pass(&project, &base, workspace_root_of(&state), false);
+    });
+}
+
+/// Read every new source waiting in a library's `Research/Ingestion/Raw/`,
+/// one at a time on a background thread, through the Claude CLI
+/// (`ingest::run_pass`): a recording is transcribed first with the selected
+/// Whisper model; each source becomes its dated note and its card, and what
+/// follows from it is written at once (my next steps into `ws_root`'s Your
+/// day). A source that fails stays in Raw with its failure recorded and the
+/// pass moves on; the pass stops only when the CLI itself fails. A library is
+/// a repo with the inbox, whatever its kind (`registry::is_library`); `force`
+/// reads any repo with an inbox. Returns whether a pass started or was
+/// queued behind the one running.
 fn start_ingest_pass(project: &Project, base: &Path, ws_root: Option<std::path::PathBuf>, force: bool) -> bool {
     let root = project.root.clone();
     if !ken_core::ingest::has_inbox(&root) || ken_core::ingest::waiting(&root).is_empty() {
         return false;
     }
-    let library = ken_core::registry::kind_of(&root)
-        .iter()
-        .any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki));
-    if !library && !force {
+    if !force && !ken_core::registry::is_library(&root) {
         return false;
     }
+    let id = project.config.id;
     let Some(binary) = ken_core::runner::discover_claude() else {
+        INGEST_STOPPED.lock().unwrap().insert(id, ken_core::runner::MISSING_CLAUDE_HELP.to_string());
         return false;
     };
-    let id = project.config.id;
-    if !INGEST_RUNNING.lock().unwrap().insert(id) {
-        return false;
+    {
+        let mut running = INGEST_RUNNING.lock().unwrap();
+        if !running.insert(id) {
+            INGEST_AGAIN.lock().unwrap().insert(id);
+            return true;
+        }
     }
     let base = base.to_path_buf();
     // Where a note's actions become tickets: the team repo on this library's team.
@@ -7311,66 +6878,73 @@ fn start_ingest_pass(project: &Project, base: &Path, ws_root: Option<std::path::
             .map(|e| e.path.clone())
     });
     std::thread::spawn(move || {
-        if let Ok(mut db) = Db::open(&base, id) {
-            // Only new sources: one whose note waits for review is not read again.
-            for raw in ken_core::ingest::waiting_new(&root, &db).unwrap_or_default() {
-                INGEST_READING.lock().unwrap().insert(id, raw.clone());
-                let today = local_date_today();
-                let generate = |prompt: &str| -> ken_core::Result<String> {
-                    match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
-                        ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
-                        ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
-                        ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
-                        ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
-                    }
-                };
-                let done = ken_core::ingest::ingest_one(&root, &mut db, &raw, &today, engine::now_epoch(), generate);
-                // What follows from the note is written at once and recorded
-                // on its card; rulings, method changes, held edits and
-                // actions wait there.
-                if let Ok(placement) = &done {
-                    if let Ok(note) = std::fs::read_to_string(root.join(&placement.note)) {
-                        let ask = |prompt: &str| -> ken_core::Result<String> {
-                            match ken_core::assistant::oneshot(&binary, &root, prompt, Duration::from_secs(600), &CancelToken::new())? {
-                                ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
-                                ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
-                                ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
-                                ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
+        loop {
+            INGEST_STOPPED.lock().unwrap().remove(&id);
+            match Db::open(&base, id) {
+                Ok(mut db) => {
+                    let me = cached_git_me();
+                    let stamp = local_stamp_now();
+                    let targets = ken_core::ingest::Targets {
+                        team_repo: team_repo.as_deref(),
+                        workspace: ws_root.as_deref(),
+                        me: &me,
+                        stamp: &stamp,
+                    };
+                    let model = transcription_model(&base);
+                    let ffmpeg = transcript::discover_ffmpeg();
+                    let transcriber = ken_core::ingest::Transcriber { model: model.as_deref(), ffmpeg: ffmpeg.as_deref() };
+                    let on_phase: Arc<dyn Fn(&str, ken_core::ingest::PassPhase) + Send + Sync> = Arc::new(move |raw, phase| {
+                        INGEST_READING.lock().unwrap().insert(id, (raw.to_string(), phase));
+                    });
+                    let call = |prompt: &str| {
+                        ken_core::ingest::call_result(ken_core::assistant::oneshot(
+                            &binary,
+                            &root,
+                            prompt,
+                            Duration::from_secs(600),
+                            &CancelToken::new(),
+                        ))
+                    };
+                    let today = local_date_today();
+                    match ken_core::ingest::run_pass(&root, &mut db, &targets, &today, engine::now_epoch, transcriber, call, &on_phase) {
+                        Ok(report) => {
+                            if let Some(why) = report.stopped {
+                                INGEST_STOPPED.lock().unwrap().insert(id, why);
                             }
-                        };
-                        let me = cached_git_me();
-                        let stamp = local_stamp_now();
-                        let targets = ken_core::ingest::Targets {
-                            team_repo: team_repo.as_deref(),
-                            workspace: ws_root.as_deref(),
-                            me: &me,
-                            stamp: &stamp,
-                        };
-                        if let Err(e) = ken_core::ingest::follow_ups(&root, &mut db, placement, &note, &today, engine::now_epoch(), &targets, ask) {
-                            eprintln!("warning: ingest follow-ups for {raw} failed: {e}");
                         }
+                        Err(e) => eprintln!("warning: ingest pass failed: {e}"),
                     }
                 }
-                if let Err(e) = done {
-                    let open = db.list_open_review_items().unwrap_or_default();
-                    if !open.iter().any(|it| it.kind == "ingest-failed" && it.source_ref == raw) {
-                        let _ = db.insert_review_item(
-                            "ingest-failed",
-                            &format!("Could not ingest {}", raw.rsplit('/').next().unwrap_or(&raw)),
-                            &format!("It stays in Raw/. {e}"),
-                            &raw,
-                            None,
-                            engine::now_epoch(),
-                        );
-                    }
-                    break; // one failure (often the CLI) stops the pass; the next scan retries
-                }
+                Err(e) => eprintln!("warning: ingest pass could not open the index: {e}"),
+            }
+            INGEST_READING.lock().unwrap().remove(&id);
+            // Asked for again while this one ran: go round once more.
+            let mut running = INGEST_RUNNING.lock().unwrap();
+            if !INGEST_AGAIN.lock().unwrap().remove(&id) {
+                running.remove(&id);
+                break;
             }
         }
-        INGEST_RUNNING.lock().unwrap().remove(&id);
-        INGEST_READING.lock().unwrap().remove(&id);
     });
     true
+}
+
+/// A pass over every open library, as after a transcription model is
+/// installed: recordings that waited for one are read.
+fn start_ingest_passes(state: &SharedState) {
+    let (libraries, base, ws_root) = {
+        let guard = lock_tolerant(state);
+        let libs: Vec<Project> = guard
+            .members
+            .values()
+            .map(|m| m.project.clone())
+            .filter(|p| ken_core::ingest::has_inbox(&p.root))
+            .collect();
+        (libs, guard.base_dir.clone(), guard.workspace.as_ref().map(|w| w.ws.root.clone()))
+    };
+    for p in libraries {
+        start_ingest_pass(&p, &base, ws_root.clone(), false);
+    }
 }
 
 /// Every workspace member as the wiki sees it: folder, kinds and team from
@@ -7437,8 +7011,9 @@ fn claude_generate(binary: std::path::PathBuf, root: std::path::PathBuf) -> impl
 /// Draft the first wiki pages (item 4b) into the workspace member `wiki`,
 /// from its team's repos plus an optional folder of documents: a Repo Map
 /// page per repo, each from that repo alone, then the team pages from those
-/// pages. Runs in the background through the Claude CLI; the result is one
-/// Review card. Never touches a page a person wrote.
+/// pages. Runs in the background through the Claude CLI; the result shows
+/// on the Team screen (`team_overview`'s findings). Never touches a page a
+/// person wrote.
 #[tauri::command]
 fn draft_wiki(state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
     let (base, wiki_root, wiki_id, repos) = {
@@ -7654,9 +7229,11 @@ fn inbox_member(app: &AppHandle, state: &SharedState, team: Option<&str>) -> Cmd
 struct RawSourceDto {
     path: String,
     name: String,
-    /// `queued` | `reading` | `read` | `failed`
+    /// `queued` | `transcribing` | `reading` | `read` | `failed` | `waiting`
+    /// (a recording waiting for what Ken cannot make here: a transcription
+    /// model, ffmpeg)
     state: String,
-    /// Why it failed, when it did.
+    /// Why it failed or waits; how far transcribing is (`42%`).
     detail: Option<String>,
     /// meeting | recording | document: from its note once read, else a
     /// guess from the file (empty when there is none).
@@ -7685,7 +7262,7 @@ struct IngestedDto {
     present: Vec<String>,
     /// When the note was written (Unix seconds).
     at: i64,
-    /// Still on Review (not yet seen), or seen and filed.
+    /// Not yet seen, or seen and filed.
     open: bool,
     /// What was written from it, one kind per write (undone ones left out).
     written: Vec<ken_core::ingest::WriteKind>,
@@ -7697,7 +7274,8 @@ struct IngestedDto {
 fn raw_kind(name: &str) -> &'static str {
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
     match ext.as_str() {
-        "vtt" | "srt" | "mp4" | "mov" | "m4a" | "mp3" | "wav" | "webm" | "mkv" => "recording",
+        "vtt" | "srt" | "mp4" | "mov" | "m4v" | "avi" | "m4a" | "aac" | "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus"
+        | "webm" | "mkv" => "recording",
         "pdf" | "docx" | "doc" | "pptx" | "xlsx" | "odt" | "rtf" | "html" => "document",
         _ => "",
     }
@@ -7728,6 +7306,14 @@ struct IngestOverviewDto {
     ingested: Vec<IngestedDto>,
     running: bool,
     claude_found: bool,
+    /// Sources with something waiting on the person, for the Ingest badge:
+    /// in Raw, one that failed, waits for a transcript it cannot get, or has
+    /// rulings, tickets or held edits waiting; filed, one with those still
+    /// waiting.
+    waiting: usize,
+    /// Why the last read stopped before the end (Claude Code itself failed:
+    /// not installed, not logged in, timed out), until the next one starts.
+    stopped: Option<String>,
 }
 
 /// The Ingest screen: the library's inbox for the chosen team, every source
@@ -7737,6 +7323,7 @@ struct IngestOverviewDto {
 fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestOverviewDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let guard = state.lock().unwrap();
+    let base = guard.base_dir.clone();
     let active = member(&guard, Some(id))?;
     let root = &active.project.root;
     let db = &active.db;
@@ -7750,20 +7337,33 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
         .filter(|(_, c)| !c.filed)
         .collect();
     let waits = |note: &str| ken_core::ingest::proposals_from(db, note).map(|p| p.len()).unwrap_or(0);
-    let raw = ken_core::ingest::waiting(root)
+    // What a recording with no transcript waits for, if anything.
+    let has_model = transcription_model(&base).is_some();
+    let has_ffmpeg = std::cell::OnceCell::new();
+    let raw: Vec<RawSourceDto> = ken_core::ingest::waiting(root)
         .into_iter()
         .map(|path| {
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            let failed = open.iter().find(|it| it.kind == "ingest-failed" && it.source_ref == path);
+            let failed = open.iter().find(|it| it.kind == ken_core::ingest::FAILED_KIND && it.source_ref == path);
             let card = cards.iter().find(|(_, c)| c.placement.raw == path);
-            let state = if reading.as_deref() == Some(path.as_str()) {
-                "reading"
-            } else if failed.is_some() {
-                "failed"
-            } else if card.is_some() {
-                "read"
-            } else {
-                "queued"
+            let on_it = reading.as_ref().filter(|(p, _)| *p == path).map(|(_, phase)| *phase);
+            let waits_for = || {
+                if !ken_core::ingest::needs_transcript(root, &path) {
+                    return None;
+                }
+                let ffmpeg = *has_ffmpeg.get_or_init(|| transcript::discover_ffmpeg().is_some());
+                transcript::waiting_reason(&root.join(&path), ffmpeg, has_model)
+            };
+            let (state, detail) = match (on_it, card, failed) {
+                (Some(ken_core::ingest::PassPhase::Transcribing(pct)), _, _) => ("transcribing", Some(format!("{pct}%"))),
+                (Some(ken_core::ingest::PassPhase::Reading), _, _) => ("reading", None),
+                // Read since it failed: the card is what counts.
+                (None, Some(_), _) => ("read", None),
+                (None, None, Some(f)) => ("failed", Some(f.body.clone())),
+                (None, None, None) => match waits_for() {
+                    Some(why) => ("waiting", Some(why)),
+                    None => ("queued", None),
+                },
             };
             let (kind, length, present) = match card {
                 Some((_, c)) => {
@@ -7774,7 +7374,7 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
             };
             RawSourceDto {
                 state: state.to_string(),
-                detail: failed.map(|f| f.body.clone()),
+                detail,
                 kind,
                 length,
                 present,
@@ -7786,6 +7386,7 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
             }
         })
         .collect();
+    let mut filed_waiting = 0;
     let ingested = db
         .review_items_of_kind(ken_core::ingest::REVIEW_KIND, 200)
         .map_err(err)?
@@ -7795,6 +7396,10 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
             let text = std::fs::read_to_string(root.join(&note)).unwrap_or_default();
             let t = ken_core::ingest::takeaways(&text);
             let card = ken_core::ingest::card_of(it.payload.as_deref());
+            let waiting = waits(&note);
+            if waiting > 0 && card.as_ref().is_some_and(|c| c.filed) {
+                filed_waiting += 1;
+            }
             IngestedDto {
                 id: it.id,
                 title: if t.title.is_empty() { it.title.trim_start_matches("Ingested: ").to_string() } else { t.title },
@@ -7804,11 +7409,12 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
                 at: it.created_at,
                 open: it.status == "open",
                 written: card.as_ref().map(live_writes).unwrap_or_default(),
-                waiting: waits(&note),
+                waiting,
                 note,
             }
         })
         .collect();
+    let waiting = raw.iter().filter(|r| r.state == "failed" || r.state == "waiting" || r.waiting > 0).count() + filed_waiting;
     Ok(IngestOverviewDto {
         project_id: id.to_string(),
         library: active.project.config.name.clone(),
@@ -7816,6 +7422,8 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
         ingested,
         running: INGEST_RUNNING.lock().unwrap().contains(&id),
         claude_found: ken_core::runner::discover_claude().is_some(),
+        waiting,
+        stopped: INGEST_STOPPED.lock().unwrap().get(&id).cloned(),
     })
 }
 
@@ -8064,6 +7672,149 @@ fn ingest_add_bytes(app: AppHandle, state: State<SharedState>, request: tauri::i
     Ok(format!("{}/{}", ken_core::ingest::RAW, target.file_name().unwrap().to_string_lossy()))
 }
 
+/// `YYYY-MM-DD HH.MM`, local: how a source Ken writes into an inbox is named.
+fn local_source_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H.%M").to_string()
+}
+
+/// Write a source Ken made (a note, a chat) into the library's Raw/ and
+/// start the read. Returns its path in Raw.
+fn add_source(app: &AppHandle, state: &SharedState, team: Option<&str>, name: &str, text: &str) -> CmdResult<String> {
+    let id = inbox_member(app, state, team)?;
+    let (project, base) = {
+        let guard = state.lock().unwrap();
+        (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
+    };
+    let target = raw_target(&project.root, name)?;
+    std::fs::write(&target, text).map_err(|e| format!("could not write {name}: {e}"))?;
+    if ken_core::runner::discover_claude().is_none() {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    }
+    start_ingest_pass(&project, &base, workspace_root_of(state), true);
+    Ok(format!("{}/{}", ken_core::ingest::RAW, target.file_name().unwrap().to_string_lossy()))
+}
+
+/// Write a note on the Ingest screen: it lands in the library's Raw/ as
+/// `YYYY-MM-DD HH.MM Note - <title>.md` (`kind: note`, by me) and is read
+/// at once. Returns its path in Raw.
+#[tauri::command]
+fn ingest_add_text(app: AppHandle, state: State<SharedState>, team: Option<String>, title: Option<String>, text: String) -> CmdResult<String> {
+    if text.trim().is_empty() {
+        return Err("Write the note first.".into());
+    }
+    let me = cached_git_me();
+    let (name, doc) = ken_core::ingest::note_source(&local_source_stamp(), title.as_deref(), &text, me.name.as_deref().or(me.email.as_deref()));
+    add_source(&app, state.inner(), team.as_deref(), &name, &doc)
+}
+
+/// Send a chat to Ingest, whole or the messages named: the person's and
+/// Ken's turns only, as **Me** and **Ken**, into the library's Raw/ as
+/// `YYYY-MM-DD HH.MM Chat - <chat title>.md` (`kind: session`), read at
+/// once. `project_id` is the repo the chat is kept in. Returns its path in
+/// Raw.
+#[tauri::command]
+fn ingest_add_chat(
+    app: AppHandle,
+    state: State<SharedState>,
+    team: Option<String>,
+    project_id: String,
+    chat_id: String,
+    message_ids: Option<Vec<i64>>,
+) -> CmdResult<String> {
+    let pid: uuid::Uuid = project_id.parse().map_err(err)?;
+    let (chat, messages) = {
+        let guard = state.lock().unwrap();
+        match guard.members.get(&pid) {
+            Some(m) => {
+                let db = m.chat_db.lock().unwrap();
+                (db.get_chat(&chat_id).map_err(err)?, db.chat_messages(&chat_id).map_err(err)?)
+            }
+            None => {
+                let db = Db::open_read_only(&guard.base_dir, pid).map_err(err)?;
+                (db.get_chat(&chat_id).map_err(err)?, db.chat_messages(&chat_id).map_err(err)?)
+            }
+        }
+    };
+    let chat = chat.ok_or("That chat is not there any more.")?;
+    let turns: Vec<ken_core::ingest::ChatTurn> = messages
+        .into_iter()
+        .filter(|m| message_ids.as_ref().is_none_or(|ids| ids.contains(&m.id)))
+        .map(|m| ken_core::ingest::ChatTurn { role: m.role, content: m.content })
+        .collect();
+    let me = cached_git_me();
+    let (name, doc) = ken_core::ingest::chat_source(&local_source_stamp(), &chat.title, &chat.id, me.name.as_deref().or(me.email.as_deref()), &turns)
+        .ok_or("Nothing to send: pick a message from you or from Ken.")?;
+    add_source(&app, state.inner(), team.as_deref(), &name, &doc)
+}
+
+/// The library's source at `path` (in Raw/), checked to be one.
+fn raw_source(root: &Path, path: &str) -> CmdResult<String> {
+    let rel = path.replace('\\', "/");
+    if !ken_core::ingest::waiting(root).contains(&rel) {
+        return Err(format!("{rel} is not in Raw/ any more."));
+    }
+    Ok(rel)
+}
+
+/// Try a source that could not be read again: its failure is cleared and a
+/// read starts. Returns whether one started.
+#[tauri::command]
+fn ingest_retry(app: AppHandle, state: State<SharedState>, team: Option<String>, path: String) -> CmdResult<bool> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
+    let (project, base, ws_root) = {
+        let mut guard = state.lock().unwrap();
+        let base = guard.base_dir.clone();
+        let ws_root = guard.workspace.as_ref().map(|w| w.ws.root.clone());
+        let active = member_mut(&mut guard, Some(id))?;
+        let rel = raw_source(&active.project.root, &path)?;
+        ken_core::ingest::resolve_failure(&mut active.db, &rel, engine::now_epoch()).map_err(err)?;
+        (active.project.clone(), base, ws_root)
+    };
+    if ken_core::runner::discover_claude().is_none() {
+        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
+    }
+    Ok(start_ingest_pass(&project, &base, ws_root, true))
+}
+
+/// Take a source out of Raw/: the file goes to the trash (never a hard
+/// delete) and its failure is cleared. A source already read is filed with
+/// Seen, or its writes undone first.
+#[tauri::command]
+async fn ingest_remove(app: AppHandle, state: State<'_, SharedState>, team: Option<String>, path: String) -> CmdResult<()> {
+    let id = inbox_member(&app, &state, team.as_deref())?;
+    let (abs, rel, undone_card) = {
+        let guard = state.lock().unwrap();
+        let active = member(&guard, Some(id))?;
+        let rel = raw_source(&active.project.root, &path)?;
+        let card = active
+            .db
+            .list_open_review_items()
+            .map_err(err)?
+            .into_iter()
+            .filter(|it| it.kind == ken_core::ingest::REVIEW_KIND)
+            .find_map(|it| ken_core::ingest::card_of(it.payload.as_deref()).filter(|c| !c.filed && c.placement.raw == rel).map(|c| (it.id, c)));
+        let undone_card = match card {
+            Some((_, c)) if !c.undone => {
+                return Err("This source has been read. Mark it Seen to file it, or Undo all to take back what it wrote, then remove it.".into())
+            }
+            Some((item, _)) => Some(item),
+            None => None,
+        };
+        (active.project.resolve(&rel).map_err(err)?, rel, undone_card)
+    };
+    let to_trash = abs.clone();
+    tauri::async_runtime::spawn_blocking(move || trash_path(&to_trash)).await.map_err(|e| e.to_string())??;
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, Some(id))?;
+    let now = engine::now_epoch();
+    ken_core::ingest::resolve_failure(&mut active.db, &rel, now).map_err(err)?;
+    if let Some(item) = undone_card {
+        active.db.resolve_review_item(item, now).map_err(err)?;
+    }
+    let _ = deindex_removed(&active.project, &mut active.db, &rel, false);
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IngestStatusDto {
@@ -8208,15 +7959,6 @@ fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, 
     Ok(filed.placement.source)
 }
 
-/// The last drift sweep for the focused project, if one has run.
-#[tauri::command]
-fn drift_status(state: State<SharedState>, project_id: Option<String>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
-    let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
-    let guard = state.lock().unwrap();
-    let active = member(&guard, id)?;
-    active.db.last_drift_run().map_err(err)
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TeamRepoDto {
@@ -8271,8 +8013,57 @@ struct TeamOverviewDto {
     ignores: Vec<String>,
     /// The wiki's last drift sweep.
     sweep: Option<ken_core::drift::DriftRun>,
+    /// What waits on a person in the wiki: the last sweep's findings, the
+    /// link report, and what the wiki's drafts left (pages to read, pages
+    /// not drafted, proposals, repos that left the team).
+    findings: Vec<TeamFindingDto>,
     rules: Vec<TeamPageDto>,
     templates: Vec<TeamPageDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamFindingDto {
+    /// From the sweep: `void` · `gone` · `changed` · `aged`. From the link
+    /// report: `missing-page` · `broken-link` · `ambiguous-name`. From the
+    /// drafts: `draft` · `draft-failed` · `proposal` · `repo-removed`.
+    kind: String,
+    title: String,
+    detail: String,
+    /// The page to open, in the repo `project_id` names; empty when the
+    /// finding is about the sweep itself.
+    path: String,
+    project_id: String,
+    /// A proposal's id, for `apply_page_proposal` and `resolve_review_item`.
+    item_id: Option<i64>,
+}
+
+/// The findings for the Team screen, from the wiki's index and its last
+/// sweep, at most 20 of each link-report kind.
+fn team_findings(wiki_id: &str, root: &Path, db: &Db, sweep: Option<&ken_core::drift::DriftRun>) -> Vec<TeamFindingDto> {
+    let mut out: Vec<TeamFindingDto> = Vec::new();
+    let mut push = |kind: String, title: String, detail: String, path: String, item_id: Option<i64>| {
+        out.push(TeamFindingDto { kind, title, detail, path, project_id: wiki_id.to_string(), item_id });
+    };
+    if let Some(run) = sweep {
+        for f in ken_core::drift::findings(run) {
+            push(f.kind, f.title, f.detail, f.path, None);
+        }
+    }
+    if let Ok(report) = ken_core::links::report(db) {
+        for f in ken_core::links::findings(&report, 20) {
+            push(f.kind, f.title, f.detail, f.path, None);
+        }
+    }
+    match ken_core::wikidraft::findings(root, db) {
+        Ok(found) => {
+            for f in found {
+                push(f.kind, f.title, f.detail, f.path, f.item_id);
+            }
+        }
+        Err(e) => eprintln!("warning: could not read the wiki's draft findings: {e}"),
+    }
+    out
 }
 
 fn git_line(root: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -8381,6 +8172,7 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     }
     let wiki = wiki_index.map(|i| repos.remove(i));
     let mut sweep = None;
+    let mut findings = Vec::new();
     let (mut rules, mut templates) = (Vec::new(), Vec::new());
     if let Some(w) = &wiki {
         let root = std::path::Path::new(&w.path);
@@ -8403,7 +8195,10 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             }
         }
         if let Ok(id) = w.id.parse::<uuid::Uuid>() {
-            sweep = guard.members.get(&id).and_then(|m| m.db.last_drift_run().ok().flatten());
+            if let Some(m) = guard.members.get(&id) {
+                sweep = m.db.last_drift_run().ok().flatten();
+                findings = team_findings(&w.id, root, &m.db, sweep.as_ref());
+            }
         }
         rules = pages_in(root, "Ways-of-Working/Rules");
         templates = pages_in(root, "Templates");
@@ -8420,6 +8215,7 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         gaps,
         ignores,
         sweep,
+        findings,
         rules,
         templates,
     })
@@ -10228,13 +10024,61 @@ struct DayMeDto {
     email: Option<String>,
 }
 
+/// An open escalation addressed to me (`escalations/*.md` in a team repo),
+/// read-only: its row opens the file in Files.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DayEscalationDto {
+    id: String,
+    title: String,
+    raised_by: Option<String>,
+    status: String,
+    ticket: Option<String>,
+    raised: Option<String>,
+    blocks: Option<String>,
+    project_id: String,
+    repo: String,
+    rel_path: String,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DayStateDto {
     tickets: Vec<DayTicketDto>,
     tasks: Vec<DayTaskDto>,
+    /// Open escalations addressed to me, from every repo of the team.
+    escalations: Vec<DayEscalationDto>,
     me: DayMeDto,
     has_tickets: bool,
+}
+
+/// Open escalations addressed to me in `repos`, oldest raised first.
+fn my_escalations(repos: &[TeamRepo], me: &ken_core::day::Me) -> Vec<DayEscalationDto> {
+    if !me.is_known() {
+        return Vec::new();
+    }
+    let mut out: Vec<DayEscalationDto> = repos
+        .iter()
+        .flat_map(|repo| {
+            ken_core::day::scan_escalations(&repo.root)
+                .into_iter()
+                .filter(|e| e.open && me.addressed(e))
+                .map(move |e| DayEscalationDto {
+                    id: e.id,
+                    title: e.title,
+                    raised_by: e.raised_by,
+                    status: e.status,
+                    ticket: e.ticket,
+                    raised: e.raised,
+                    blocks: e.blocks,
+                    project_id: repo.id.to_string(),
+                    repo: repo.name.clone(),
+                    rel_path: e.rel_path,
+                })
+        })
+        .collect();
+    out.sort_by(|a, b| (a.raised.is_none(), &a.raised, &a.id).cmp(&(b.raised.is_none(), &b.raised, &b.id)));
+    out
 }
 
 fn ws_rel_path(ws_root: &Path, path: &Path) -> String {
@@ -10420,10 +10264,13 @@ fn day_state(state: State<SharedState>, team: Option<String>) -> CmdResult<DaySt
         .collect();
 
     let me = cached_git_me();
-    let (tickets, has_tickets) = my_tickets(&team_repos(&ws, team.as_deref()), &me, &all);
+    let repos = team_repos(&ws, team.as_deref());
+    let (tickets, has_tickets) = my_tickets(&repos, &me, &all);
+    let escalations = my_escalations(&repos, &me);
     Ok(DayStateDto {
         tickets,
         tasks: tasks_out,
+        escalations,
         me: DayMeDto { name: me.name, email: me.email },
         has_tickets,
     })
@@ -10955,8 +10802,8 @@ struct TaskWriteNote {
 const TASK_WRITE_NOTE_TTL: Duration = Duration::from_secs(30);
 
 /// The folders Your day reads: the workspace home, each member's ticket
-/// files (`tickets/` and one folder deeper), and my board and inbox in
-/// each family. Only paths are taken under the lock; the folder listing
+/// files (`tickets/` and one folder deeper) and escalations, and my board
+/// and inbox in each family. Only paths are taken under the lock; the folder listing
 /// happens after. `None` when no workspace is open.
 fn day_watch_dirs(state: &SharedState) -> Option<Vec<PathBuf>> {
     let (mut dirs, repo_roots) = {
@@ -10981,6 +10828,7 @@ fn day_watch_dirs(state: &SharedState) -> Option<Vec<PathBuf>> {
             }
         }
         dirs.push(tickets);
+        dirs.push(root.join(ken_core::day::ESCALATIONS_DIR));
     }
     Some(dirs)
 }
@@ -11148,123 +10996,9 @@ fn spawn_task_board_watch(app: AppHandle, state: SharedState) -> StopOnDrop {
 }
 
 // ---------------------------------------------------------------------
-// ken-home-workspace tasks 2.4/2.5: the workspace digest and the members
-// overview — the two reads Home needs to describe a whole workspace
-// instead of whichever member happens to be focused.
+// The workspace's members: candidates to add, ignored folders, groups, and
+// the members overview the add/remove commands return.
 // ---------------------------------------------------------------------
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MemberDigestDto {
-    project_id: uuid::Uuid,
-    name: String,
-    body: String,
-    sources: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MemberAwaitingDto {
-    project_id: uuid::Uuid,
-    name: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceDigestDto {
-    date: String,
-    members: Vec<MemberDigestDto>,
-    /// Members with no digest stored for `date` — named, never dropped.
-    awaiting: Vec<MemberAwaitingDto>,
-    has_content: bool,
-}
-
-/// The workspace digest: every member's ALREADY-STORED digest for the day
-/// (ken-home-workspace 2.4).
-///
-/// Composes and never generates (design D4). It does not call
-/// `maybe_generate_digest`, touch the in-flight guard, consult the 07:00
-/// gate, or write a `digests` row — a member with nothing stored for the
-/// day comes back in `awaiting`. Generation stays owned entirely by the
-/// per-project scheduler, which already holds all of that state.
-///
-/// Dormant members are read the same way `route_search` searches them:
-/// their index opens by project id without activating anything.
-#[tauri::command]
-fn workspace_digest(state: State<SharedState>, day: Option<String>) -> CmdResult<WorkspaceDigestDto> {
-    let today = day.unwrap_or_else(local_date_today);
-
-    let (base_dir, members) = {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-
-        let members: Vec<(uuid::Uuid, String, Option<Arc<Mutex<Db>>>)> = ws
-            .ws
-            .members
-            .iter()
-            .filter_map(|m| match &m.status {
-                ken_core::workspace::MemberStatus::Ok(p) => Some(p),
-                _ => None,
-            })
-            .map(|p| {
-                (
-                    p.config.id,
-                    p.config.name.clone(),
-                    guard.members.get(&p.config.id).map(|m| m.search_db.clone()),
-                )
-            })
-            .collect();
-
-        (guard.base_dir.clone(), members)
-    };
-
-    // Reads happen off the lock — a dormant member's open is real I/O.
-    let inputs: Vec<ken_core::workspace_digest::MemberDigestInput> = members
-        .into_iter()
-        .map(|(project_id, name, live)| {
-            let content = match live {
-                Some(db) => db.lock().unwrap().get_digest(&today).ok().flatten(),
-                None => Db::open(&base_dir, project_id)
-                    .ok()
-                    .and_then(|db| db.get_digest(&today).ok().flatten()),
-            }
-            .map(|row| row.content);
-            ken_core::workspace_digest::MemberDigestInput {
-                project_id,
-                name,
-                content,
-            }
-        })
-        .collect();
-
-    let composed = ken_core::workspace_digest::compose_workspace_digest(&today, &inputs);
-
-    Ok(WorkspaceDigestDto {
-        date: composed.date.clone(),
-        members: composed
-            .members
-            .iter()
-            .map(|m| MemberDigestDto {
-                project_id: m.project_id,
-                name: m.name.clone(),
-                body: m.body.clone(),
-                sources: m.sources.clone(),
-            })
-            .collect(),
-        awaiting: composed
-            .awaiting
-            .iter()
-            .map(|m| MemberAwaitingDto {
-                project_id: m.project_id,
-                name: m.name.clone(),
-            })
-            .collect(),
-        has_content: composed.has_content(),
-    })
-}
 
 /// Sibling folders under the workspace root that are NOT yet members —
 /// the "add this repo too" list. Mirrors `discover_candidates`' filtering
@@ -11454,21 +11188,21 @@ fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<
     workspace_members_overview(state)
 }
 
-/// What removing a member did: the fresh roster, and the team wiki that got
-/// a Review card listing the pages still citing it.
+/// What removing a member did: the fresh roster, and the team wiki whose
+/// pages still cite it (listed on the Team screen).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemovedMemberDto {
     members: Vec<MemberOverviewDto>,
-    /// The wiki carrying the card, and how many pages it lists.
+    /// The wiki whose pages cite it, and how many.
     wiki: Option<String>,
     citing_pages: usize,
 }
 
 /// Take a repo out of the open workspace: out of the manifest and its
 /// groups, its runtime closed. The folder, its files and its index stay; the
-/// repo stays in Ken's list. When the team it was on has a wiki, that wiki
-/// gets one Review card listing the pages that still cite it.
+/// repo stays in Ken's list. When the team it was on has a wiki, the Team
+/// screen lists the wiki's pages that still cite it.
 #[tauri::command]
 fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult<RemovedMemberDto> {
     let (wiki, citing_pages) = {
@@ -11501,7 +11235,7 @@ fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult
         if let Some((_, wiki_id)) = wiki_target {
             if let Ok(mut db) = Db::open(&base, wiki_id) {
                 let repo = ken_core::workspace::member_leaf(&name);
-                pages = ken_core::wikidraft::file_removed_card(&mut db, repo, engine::now_epoch()).map_err(err)?.unwrap_or(0);
+                pages = ken_core::wikidraft::record_removed_repo(&mut db, repo).map_err(err)?.unwrap_or(0);
             }
         }
         (wiki.filter(|_| pages > 0), pages)
@@ -11615,18 +11349,14 @@ struct MemberOverviewDto {
     unread: usize,
 }
 
-/// Per-member state for Home's members strip (ken-home-workspace 2.5).
-///
-/// This is the per-member read path `loadFocusedMemberState` documents as
-/// missing — it deliberately covers EVERY manifest member, including
-/// `Missing` and `Invalid` ones. `Workspace::open` does not fail on those,
-/// so without this surface they are invisible everywhere in the app.
+/// Per-member state, what `workspace_add_member` and
+/// `workspace_remove_member` return. It covers EVERY manifest member,
+/// including `Missing` and `Invalid` ones.
 ///
 /// Read-only in the strict sense: a member whose user-state has never been
 /// baselined reports `unread: 0` rather than its whole tree, and no
 /// baseline is written — computing an overview must not mark a project's
 /// files as seen.
-#[tauri::command]
 fn workspace_members_overview(state: State<SharedState>) -> CmdResult<Vec<MemberOverviewDto>> {
     enum Entry {
         Ok {
@@ -12025,13 +11755,20 @@ const MAX_OCR_PAGES: usize = 50;
 
 /// One background OCR worker per open project, mirroring `extraction_worker` but
 /// independent of the local LLM and the knowledge-model coverage accounting. It
-/// drains `ocr_pending`: reads each queued file's bytes, runs Apple Vision
-/// (`ken_core::ocr`), stores the recognized regions, merges the text into
+/// drains `ocr_pending`: reads each queued file's bytes, runs the OS's OCR
+/// (`ken_core::ocr`: Vision on macOS, Windows.Media.Ocr on Windows), stores
+/// the recognized regions, merges the text into
 /// `contents` (→ FTS, so search picks it up), and emits a coalesced
 /// `index-updated`. Errors are recorded with bounded retries; the queue is
 /// self-healing (errored-with-budget rows return to `pending` when it goes
 /// idle). Never runs inline in a scan — OCR is slow and must stay off that path.
 fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: Arc<AtomicBool>) {
+    // No OCR engine on this machine: nothing is queued (scan checks the same),
+    // and rows queued earlier wait for one rather than being marked done.
+    if !ken_core::ocr::available() {
+        return;
+    }
+    ken_core::ocr::init_worker_thread();
     let mut last_emit = Instant::now() - Duration::from_secs(1);
     let mut pending_emit = false;
     // Own connection, opened once and reused; dropped when the project closes.
@@ -12051,7 +11788,12 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
         };
         if db.is_none() {
             match Db::open(&base, project_id) {
-                Ok(d) => db = Some(d),
+                Ok(mut d) => {
+                    // Files marked done before this OS had an engine (Windows
+                    // until now) are read once, now that it has one.
+                    let _ = d.requeue_ocr_for_engine(ken_core::ocr::ENGINE, ken_core::ocr::ENGINE_BEFORE_STAMP);
+                    db = Some(d)
+                }
                 Err(_) => {
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
@@ -12314,12 +12056,8 @@ fn send_chat_message(
         .unwrap_or_default();
     drop(guard);
 
-    // Claude Code shows a blocking trust dialog the first time it touches an
-    // unseen folder; pre-trusting the siblings we just told it to read keeps
-    // a cross-project question from wedging on that prompt.
-    for (_, root) in &scope_siblings {
-        chat::ensure_folder_trusted(std::path::Path::new(root));
-    }
+    // No folder trust here: the chat runs in print mode, which never shows
+    // Claude Code's trust dialog (see `chat::ensure_folder_trusted`).
 
     // Design D4: workspace-scope memories + the focused project's own,
     // ordered/budgeted by `memory::build_injection`. Composed here rather
@@ -12885,9 +12623,11 @@ fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> 
     Ok(options)
 }
 
-/// Copy the bundled ken-mcp sidecar over `dest` when the bytes differ, so
-/// `~/.local/bin/ken-mcp` (installed by install.sh) stays in sync across
-/// auto-updates. Returns whether a copy happened.
+/// Copy the bundled ken-mcp sidecar over `dest` when the bytes differ, so the
+/// copy the install script put on PATH (`~/.local/bin/ken-mcp` from
+/// install.sh, `%LOCALAPPDATA%\Programs\ken-mcp\ken-mcp.exe` from
+/// install.ps1) stays in sync across auto-updates. Returns whether a copy
+/// happened.
 fn refresh_ken_mcp_from(bundled: &std::path::Path, dest: &std::path::Path) -> std::io::Result<bool> {
     let new_bytes = std::fs::read(bundled)?;
     if let Ok(old_bytes) = std::fs::read(dest) {
@@ -12907,8 +12647,41 @@ fn refresh_ken_mcp_from(bundled: &std::path::Path, dest: &std::path::Path) -> st
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
-    std::fs::rename(&tmp, dest)?;
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        // Windows will not replace an exe that is running (an agent has it
+        // open), but it will rename it: move it aside, then put the new one
+        // in place. The old file goes once nothing runs it.
+        #[cfg(windows)]
+        {
+            let old = dest.with_extension("old");
+            let _ = std::fs::remove_file(&old);
+            if std::fs::rename(dest, &old).is_ok() && std::fs::rename(&tmp, dest).is_ok() {
+                let _ = std::fs::remove_file(&old);
+                return Ok(true);
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(true)
+}
+
+/// Where the install script put ken-mcp on PATH, and the bundled sidecar
+/// next to the app to copy over it. On Windows only a copy install.ps1 made
+/// is kept current; Ken's own chat uses the sidecar directly.
+fn ken_mcp_copy_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    #[cfg(windows)]
+    {
+        let local = std::env::var_os("LOCALAPPDATA")?;
+        let dest = std::path::PathBuf::from(local).join("Programs").join("ken-mcp").join("ken-mcp.exe");
+        dest.exists().then(|| (exe_dir.join("ken-mcp.exe"), dest))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some((exe_dir.join("ken-mcp"), std::path::PathBuf::from(home).join(".local/bin/ken-mcp")))
+    }
 }
 
 /// Locate the bundled sidecar (next to the app executable) and refresh the
@@ -12917,13 +12690,10 @@ fn refresh_ken_mcp() {
     if cfg!(debug_assertions) {
         return;
     }
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let dest = std::path::PathBuf::from(home).join(".local/bin/ken-mcp");
-    let bundled = match std::env::current_exe() {
-        Ok(exe) => exe.parent().map(|d| d.join("ken-mcp")),
-        Err(_) => None,
-    };
-    let Some(bundled) = bundled.filter(|p| p.exists()) else { return };
+    let Some((bundled, dest)) = ken_mcp_copy_paths() else { return };
+    if !bundled.exists() {
+        return;
+    }
     match refresh_ken_mcp_from(&bundled, &dest) {
         Ok(true) => eprintln!("ken-mcp refreshed at {}", dest.display()),
         Ok(false) => {}
@@ -13937,12 +13707,17 @@ fn reveal_main_window(app: &tauri::AppHandle) {
 }
 
 pub fn run() {
+    // Before any model loads (see `vulkan`): no Vulkan driver, CPU models.
+    #[cfg(all(windows, target_env = "msvc"))]
+    vulkan::prefer_cpu_without_loader();
     let base_dir = ken_core::registry::default_base_dir()
         .expect("no OS data directory available");
     // Hand the app-data dir to the on-device LLM so it can resolve/load the
     // installed model; this is the only wiring that activates the local path.
     ken_core::local_llm::init(base_dir.clone());
     let app_settings = ken_core::settings::AppSettings::load(&base_dir);
+    // The graphics card setting, before any model loads.
+    ken_core::compute::set_use_gpu(use_gpu_setting(&app_settings));
     let state: SharedState = Arc::new(Mutex::new(AppState {
         base_dir,
         hooks: None,
@@ -13967,6 +13742,9 @@ pub fn run() {
     }));
 
     tauri::Builder::default()
+        // First, so a second launch hands over to the running Ken (its window
+        // comes back from the tray) before it sets up anything of its own.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| reveal_main_window(app)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -14110,23 +13888,6 @@ pub fn run() {
             download_model,
             remove_model,
             set_model_selection,
-            list_ingests,
-            get_ingest,
-            save_ingest,
-            delete_ingest,
-            run_ingest,
-            cancel_run,
-            approve_run,
-            discard_run,
-            pending_approvals,
-            list_automations,
-            get_automation,
-            save_automation,
-            delete_automation,
-            run_automation,
-            approve_automation_proposal,
-            discard_automation_proposal,
-            review_inbox,
             resolve_review_item,
             ignore_file,
             unignore_file,
@@ -14143,7 +13904,6 @@ pub fn run() {
             page_links,
             code_file,
             code_usages,
-            drift_status,
             run_drift_now,
             setup_propose,
             setup_confirm,
@@ -14154,11 +13914,18 @@ pub fn run() {
             ingest_status,
             ingest_overview,
             team_wiki,
+            embedding_state,
+            gpu_info,
+            set_use_gpu,
             ingest_card,
             ingest_add,
             ingest_add_bytes,
+            ingest_add_text,
+            ingest_add_chat,
+            ingest_retry,
+            ingest_remove,
+            files_banner,
             team_overview,
-            team_review_counts,
             team_save_ignores,
             team_add_rule,
             ingest_now,
@@ -14173,15 +13940,12 @@ pub fn run() {
             sync_now,
             resolve_conflict,
             resolve_conflict_copy,
-            set_ingest_runner_mode,
             get_background_index,
             set_background_index,
             get_transcribe_on_index,
             set_transcribe_on_index,
             claude_doctor,
             mcp_info,
-            current_digest,
-            refresh_digest,
             quick_answer,
             look_for,
             warm_llm,
@@ -14214,6 +13978,7 @@ pub fn run() {
             record_permissions,
             record_request_permission,
             record_open_settings,
+            record_support,
             record_start,
             record_pause,
             record_resume,
@@ -14231,8 +13996,6 @@ pub fn run() {
             ticket_tasks,
             team_digest,
             refresh_team_digest,
-            workspace_digest,
-            workspace_members_overview,
             workspace_groups,
             workspace_set_group,
             workspace_remove_group,
@@ -14262,6 +14025,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running Ken")
         .run(|_app, event| {
+            // Clicking Ken in the Dock while its window is hidden in the tray.
+            #[cfg(target_os = "macos")]
+            {
+                if let tauri::RunEvent::Reopen { .. } = event {
+                    reveal_main_window(_app);
+                }
+            }
             if let tauri::RunEvent::Exit = event {
                 // ggml (statically linked via llama-cpp-2 / whisper-rs) frees
                 // its Metal device in a C++ static destructor, which
@@ -14517,5 +14287,64 @@ mod your_day_tests {
         );
         assert!(day_change_unexplained(&last, &current, &mut writes));
         assert!(writes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ingest_record_tests {
+    use super::*;
+
+    #[test]
+    fn a_move_across_drives_is_recognised_on_each_os() {
+        let code = if cfg!(windows) { 17 } else { 18 };
+        assert!(is_cross_device(&std::io::Error::from_raw_os_error(code)));
+        assert!(!is_cross_device(&std::io::Error::from_raw_os_error(2)));
+        let d = tempfile::tempdir().unwrap();
+        let (from, to) = (d.path().join("a.wav"), d.path().join("b.wav"));
+        std::fs::write(&from, b"x").unwrap();
+        move_across(&from, &to).unwrap();
+        assert!(!from.exists() && to.is_file());
+    }
+
+    #[test]
+    fn your_day_lists_open_escalations_for_me_from_every_team_repo() {
+        let d = tempfile::tempdir().unwrap();
+        let team = d.path().join("Team");
+        let wiki = d.path().join("Wiki");
+        for (root, file, text) in [
+            (&team, "E-001.md", "---\nid: E-001\nto: chris\nstatus: open\nraised: 2026-09-20\n---\n\n# Which save format?\n"),
+            (&team, "E-002.md", "---\nid: E-002\nto: Kate\nstatus: open\n---\n\n# Not mine\n"),
+            (&wiki, "E-003.md", "---\nid: E-003\nto: Chris Staud\nstatus: open\nraised: 2026-09-01\nblocks: SR-4\n---\n\n# Older one\n"),
+            (&wiki, "E-004.md", "---\nid: E-004\nto: Chris Staud\nstatus: answered\n---\n\n# Done\n"),
+        ] {
+            std::fs::create_dir_all(root.join("escalations")).unwrap();
+            std::fs::write(root.join("escalations").join(file), text).unwrap();
+        }
+        let repos = vec![
+            TeamRepo { id: uuid::Uuid::new_v4(), name: "Team".into(), root: team },
+            TeamRepo { id: uuid::Uuid::new_v4(), name: "Wiki".into(), root: wiki },
+        ];
+        let me = ken_core::day::Me { name: Some("Chris Staud".into()), email: None };
+        let found = my_escalations(&repos, &me);
+        assert_eq!(found.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["E-003", "E-001"], "oldest raised first");
+        assert_eq!(found[0].repo, "Wiki");
+        assert_eq!(found[0].rel_path, "escalations/E-003.md");
+        assert_eq!(found[0].blocks.as_deref(), Some("SR-4"));
+        assert!(my_escalations(&repos, &ken_core::day::Me::default()).is_empty(), "no identity, no list");
+    }
+
+    #[test]
+    fn the_team_screen_reads_the_link_report_and_the_drafts_from_the_wiki() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("Current")).unwrap();
+        std::fs::write(root.join("Current/Team.md"), "---\nstatus: draft\n---\n# Team\nSee [[Ghost]].\n").unwrap();
+        let project = Project::create(root, "Wiki").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&data.path().join("w.db")).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        let found = team_findings("w1", root, &db, None);
+        assert!(found.iter().any(|f| f.kind == "missing-page" && f.path == "Current/Team.md" && f.project_id == "w1"), "{:?}", found.iter().map(|f| &f.title).collect::<Vec<_>>());
+        assert!(found.iter().all(|f| f.kind != "draft"), "nothing drafted by Ken yet");
     }
 }

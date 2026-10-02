@@ -1,29 +1,37 @@
 <script lang="ts">
-  // Ingest, the inbox that empties (the Wright white box, frame 8b). Drop a
-  // file or choose one: Ken puts it in the team library's
-  // Research/Ingestion/Raw/ and reads it at once into a dated note in
-  // Ingested/. What follows from the note is written then and there, each
-  // write citing the note: page edits and new pages, ideas, escalations, my
-  // next steps. The card is read afterwards, not confirmed: each write has
+  // Ingest, the inbox that empties (the Wright white box, frame 8b). Four
+  // ways to add a source: drop or choose files, record, write a note, or take
+  // a chat. Each lands in the team library's Research/Ingestion/Raw/ and is
+  // read at once into a dated note in Ingested/. What follows from the note
+  // is written then and there, each write citing the note: page edits and
+  // new pages, ideas, escalations, my next steps. The card is read afterwards, not confirmed: each write has
   // Open and Undo. Only four things wait: a ruling for its decider, a change
   // to Ways-of-Working as a ticket, an edit staging held, an action as a
   // ticket. Seen files the source beside its note; Undo all takes it back.
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import {
-    api,
-    type IngestCard,
-    type IngestOverview,
-    type IngestProposal,
-    type IngestWrite,
-    type InboxItem,
-  } from "../lib/api";
+  import { api, type IngestCard, type IngestOverview, type IngestProposal, type IngestWrite } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
+  import { record } from "../lib/record.svelte";
+  import { rail } from "../lib/rail.svelte";
   import { renderMarkdown } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
-  import { pageName, stagingLine, writtenLine } from "../lib/ingestCard";
-  import ProposalDetail from "../review/ProposalDetail.svelte";
+  import { errorText } from "../lib/toast.svelte";
+  import { claudeInstallHelp } from "../lib/platform";
+  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import {
+    canReadNow,
+    ingestBusy,
+    pageName,
+    rawActions,
+    rawStateLabel,
+    stagingLine,
+    writtenLine,
+  } from "../lib/ingestCard";
+  import ProposalDetail from "./ProposalDetail.svelte";
+  import RecordPanel from "./RecordPanel.svelte";
+  import ChatSource from "./ChatSource.svelte";
 
   let overview = $state<IngestOverview | null>(null);
   let error = $state<string | null>(null);
@@ -35,7 +43,28 @@
   let adding = $state(0);
   let openDiff = $state<number | null>(null);
 
+  // The four ways to add a source.
+  type Source = "files" | "record" | "note" | "chat";
+  const SOURCES: { v: Source; label: string }[] = [
+    { v: "files", label: "Files" },
+    { v: "record", label: "Record" },
+    { v: "note", label: "Note" },
+    { v: "chat", label: "Chat" },
+  ];
+  let source = $state<Source>("files");
+  let noteTitle = $state("");
+  let noteText = $state("");
+
   const team = $derived(scope.team);
+
+  // Coming to Ingest while a take runs (the title-bar pill) shows the recorder.
+  $effect(() => {
+    if (app.screen === "ingests" && (record.recording || record.transcribing)) source = "record";
+  });
+  // A finished take is in Raw now.
+  $effect(() => {
+    if (record.savedPath) untrack(() => void refresh());
+  });
 
   // Read sources still in Raw have their card; under them, the rest.
   const rawCards = $derived(new Set((overview?.raw ?? []).map((r) => r.cardId).filter((id) => id !== null)));
@@ -44,6 +73,7 @@
   async function refresh() {
     try {
       overview = await api.ingestOverview(team);
+      rail.setIngest(overview.waiting ?? 0);
       error = null;
       // The newest read source is shown until the person picks another.
       if (selected === null) {
@@ -83,9 +113,7 @@
   onMount(() => {
     // While anything is being read, the list follows it.
     const t = setInterval(() => {
-      if (overview && (overview.running || overview.raw.some((r) => r.state === "queued" || r.state === "reading"))) {
-        void reload();
-      }
+      if (ingestBusy(overview)) void reload();
     }, 4000);
     return () => clearInterval(t);
   });
@@ -123,6 +151,81 @@
     await refresh();
   }
 
+  async function addNote() {
+    const text = noteText.trim();
+    if (!text) return;
+    busy = "note";
+    try {
+      await api.ingestAddText(team, noteTitle.trim() || null, text);
+      noteTitle = "";
+      noteText = "";
+      notice = "The note is in Raw. Ken reads it now.";
+      error = null;
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      busy = null;
+      await refresh();
+    }
+  }
+
+  async function chatAdded() {
+    notice = "The chat is in Raw. Ken reads it now.";
+    error = null;
+    await refresh();
+  }
+
+  async function readNow() {
+    busy = "now";
+    try {
+      const started = await api.ingestNow(team);
+      notice = started ? "Reading what is queued." : "A read is already running; the queue is next.";
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      busy = null;
+      await refresh();
+    }
+  }
+
+  async function retry(r: IngestOverview["raw"][number]) {
+    busy = `r${r.path}`;
+    try {
+      const started = await api.ingestRetry(team, r.path);
+      notice = started ? `Reading ${r.name} again.` : `${r.name} is read on the next pass.`;
+      error = null;
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      busy = null;
+      await refresh();
+    }
+  }
+
+  function askRemove(e: MouseEvent, r: IngestOverview["raw"][number]) {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    openConfirm(rect.left, rect.bottom + 4, {
+      title: `Remove ${r.name} from Raw?`,
+      body: "It goes to the system trash, and Ken does not read it.",
+      confirmLabel: "Move to Trash",
+      onConfirm: () => void remove(r),
+    });
+  }
+
+  async function remove(r: IngestOverview["raw"][number]) {
+    busy = `x${r.path}`;
+    try {
+      await api.ingestRemove(team, r.path);
+      notice = `${r.name} is in the trash.`;
+      error = null;
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      busy = null;
+      await refresh();
+    }
+  }
+
   async function openIn(projectId: string, path: string) {
     if (app.focused !== projectId) await app.focusMember(projectId);
     app.openInFiles(path);
@@ -158,17 +261,6 @@
       await reload();
     }
   }
-
-  // A waiting item as the Review card type, so the diff reads it the same way.
-  const asItem = (p: IngestProposal): InboxItem => ({
-    id: `stored-${p.id}`,
-    kind: "page-proposal",
-    title: p.title,
-    body: p.body,
-    when: 0,
-    sourceRef: p.page,
-    payload: p.payload,
-  });
 
   /** A ruling's words, from its waiting item. */
   function rulingOf(p: IngestProposal): string {
@@ -263,15 +355,8 @@
     task: "my day",
   };
 
-  const stateLabel: Record<string, string> = {
-    queued: "in the queue",
-    reading: "reading",
-    read: "read",
-    failed: "could not read",
-  };
-
   function rawSub(r: IngestOverview["raw"][number]): string {
-    const bits = [r.kind, r.length, r.present.length > 0 ? `${r.present.length} present` : "", stateLabel[r.state] ?? r.state];
+    const bits = [r.kind, r.length, r.present.length > 0 ? `${r.present.length} present` : "", rawStateLabel(r.state)];
     if (r.state === "read") bits.push(writtenLine(r.written, r.waiting));
     return bits.filter((b) => b).join(" · ");
   }
@@ -295,29 +380,82 @@
       {#if overview}<span class="chip" title="Its Research/Ingestion/ folders">{overview.library}</span>{/if}
     </div>
 
-    <button class="drop" onclick={chooseFiles}>
-      <strong>Drop a file</strong> or choose one
-      <span class="sub">A transcript, a recording, a document or notes. Ken files it in Raw/ and reads it.</span>
-    </button>
+    <div class="sources" role="tablist" aria-label="Add a source">
+      {#each SOURCES as s (s.v)}
+        <button
+          class="seg"
+          class:on={source === s.v}
+          role="tab"
+          aria-selected={source === s.v}
+          onclick={() => (source = s.v)}
+        >
+          {s.label}{#if s.v === "record" && record.recording}<span class="rec-dot" title="Recording"></span>{/if}
+        </button>
+      {/each}
+    </div>
+
+    {#if source === "files"}
+      <button class="drop" onclick={chooseFiles}>
+        <strong>Drop files</strong> or choose them
+        <span class="sub">A transcript, a recording, a document or notes. Ken files each in Raw/ and reads it.</span>
+      </button>
+    {:else if source === "record"}
+      <div class="panel"><RecordPanel {team} /></div>
+    {:else if source === "note"}
+      <div class="panel note-form">
+        <input bind:value={noteTitle} placeholder="Title (optional)" aria-label="Title" />
+        <textarea bind:value={noteText} rows="7" placeholder="What was said, decided or found" aria-label="Note"></textarea>
+        <div class="panel-actions">
+          <button class="btn btn-small btn-primary" disabled={!noteText.trim() || busy !== null} onclick={addNote}>Add</button>
+        </div>
+      </div>
+    {:else}
+      <div class="panel"><ChatSource {team} onAdded={chatAdded} /></div>
+    {/if}
     {#if adding > 0}<p class="note">Adding {adding} {adding === 1 ? "file" : "files"}…</p>{/if}
     {#if error}<p class="warn">{error}</p>{/if}
     {#if notice}<p class="note">{notice}</p>{/if}
     {#if overview && !overview.claudeFound}
-      <p class="warn">Reading needs the Claude Code CLI. Install it and run <span class="mono">claude</span> once to log in.</p>
+      <p class="warn">Reading needs Claude Code. {claudeInstallHelp()}</p>
     {/if}
 
     {#if overview}
-      <div class="divider">raw · {overview.raw.length}</div>
+      <div class="divider with-action">
+        <span>raw · {overview.raw.length}</span>
+        {#if canReadNow(overview)}
+          <button class="link" disabled={busy !== null} onclick={readNow}>Read now</button>
+        {/if}
+      </div>
       {#each overview.raw as r (r.path)}
-        <button
-          class="row"
-          class:current={r.cardId !== null && r.cardId === selected}
-          title={r.detail ?? r.path}
-          onclick={() => (r.cardId !== null ? (selected = r.cardId) : inLibrary(r.path))}
-        >
-          <span class="name">{r.name}</span>
-          <span class="sub" class:bad={r.state === "failed"} class:live={r.state === "reading"}>{rawSub(r)}</span>
-        </button>
+        {@const actions = rawActions(r.state)}
+        <div class="rawrow" class:current={r.cardId !== null && r.cardId === selected}>
+          <button
+            class="row"
+            title={r.path}
+            onclick={() => (r.cardId !== null ? (selected = r.cardId) : inLibrary(r.path))}
+          >
+            <span class="name">{r.name}</span>
+            <span
+              class="sub"
+              class:bad={r.state === "failed"}
+              class:wait={r.state === "waiting"}
+              class:live={r.state === "reading" || r.state === "transcribing"}>{rawSub(r)}</span
+            >
+          </button>
+          {#if (r.state === "failed" || r.state === "waiting") && r.detail}
+            <p class="reason" class:bad={r.state === "failed"}>{r.detail}</p>
+          {/if}
+          {#if actions.length > 0}
+            <div class="raw-actions">
+              {#if actions.includes("retry")}
+                <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => retry(r)}>Try again</button>
+              {/if}
+              {#if actions.includes("remove")}
+                <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={(e) => askRemove(e, r)}>Remove</button>
+              {/if}
+            </div>
+          {/if}
+        </div>
       {:else}
         <p class="note">Nothing in Raw.</p>
       {/each}
@@ -445,7 +583,7 @@
               <button class="btn btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
             </span>
           </div>
-          {#if openDiff === p.id}<ProposalDetail item={asItem(p)} />{/if}
+          {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
         </div>
       {/each}
       {#each held as p (p.id)}
@@ -461,7 +599,7 @@
               <button class="btn btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
             </span>
           </div>
-          <ProposalDetail item={asItem(p)} />
+          <ProposalDetail payload={p.payload} />
         </div>
       {/each}
       {#if rulings.length + tickets.length + held.length === 0}
@@ -484,7 +622,7 @@
 <style>
   .ingest {
     display: grid;
-    grid-template-columns: 300px minmax(0, 1fr);
+    grid-template-columns: 320px minmax(0, 1fr);
     height: 100%;
     min-height: 0;
   }
@@ -550,6 +688,113 @@
   }
   .drop:hover {
     border-color: var(--accent);
+  }
+  .sources {
+    display: flex;
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    overflow: hidden;
+  }
+  .sources .seg {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 5px 0;
+    border: none;
+    background: var(--surface);
+    color: var(--ink-secondary);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .sources .seg + .seg {
+    border-left: 1px solid var(--border);
+  }
+  .sources .seg:hover {
+    background: var(--sunken);
+  }
+  .sources .seg.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent-deep);
+    font-weight: 600;
+  }
+  .rec-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--danger);
+  }
+  .panel {
+    margin: 8px 0 4px;
+  }
+  .note-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .note-form input,
+  .note-form textarea {
+    font: inherit;
+    font-size: 12.5px;
+    padding: 6px 8px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--ink);
+  }
+  .note-form textarea {
+    resize: vertical;
+    line-height: 1.5;
+  }
+  .panel-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .divider.with-action {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .divider .link {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .divider .link:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .rawrow {
+    display: flex;
+    flex-direction: column;
+    border-radius: 8px;
+  }
+  .rawrow.current {
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+  }
+  .rawrow .row {
+    width: 100%;
+  }
+  .reason {
+    margin: -2px 8px 4px;
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--needs-input-text);
+    overflow-wrap: anywhere;
+  }
+  .reason.bad {
+    color: var(--danger);
+  }
+  .raw-actions {
+    display: flex;
+    gap: 4px;
+    padding: 0 4px 4px;
+  }
+  .sub.wait {
+    color: var(--needs-input-text);
   }
   .divider {
     margin-top: 12px;

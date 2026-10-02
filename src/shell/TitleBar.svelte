@@ -6,6 +6,8 @@
   import ProjectSwitcher from "./ProjectSwitcher.svelte";
   import TeamSwitcher from "./TeamSwitcher.svelte";
   import { scope } from "../lib/scope.svelte";
+  import { record, recordClock } from "../lib/record.svelte";
+  import { isMac, shortcut } from "../lib/platform";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import Search from "@lucide/svelte/icons/search";
   import MessagesSquare from "@lucide/svelte/icons/messages-square";
@@ -28,7 +30,7 @@
   const syncTitle = $derived.by(() => {
     if (app.scanError) return app.scanError;
     if (app.syncState === "attention")
-      return app.syncDetail ?? "Something needs your attention — open Review.";
+      return app.syncDetail ?? "A sync conflict waits. The banner in Files opens it.";
     if (app.scanning) return "Indexing…";
     if (app.syncState === "syncing") return "Syncing with your team…";
     if (app.syncState === "synced") return "Synced with your team";
@@ -47,8 +49,10 @@
 </script>
 
 <header data-tauri-drag-region>
-  <!-- Space for the native macOS traffic lights (titleBarStyle: Overlay) -->
-  <div class="traffic-space" data-tauri-drag-region></div>
+  {#if isMac}
+    <!-- Space for the native macOS traffic lights (titleBarStyle: Overlay) -->
+    <div class="traffic-space" data-tauri-drag-region></div>
+  {/if}
 
   <KenMark size={22} />
 
@@ -67,8 +71,27 @@
   <button class="search" onclick={() => (app.searchOpen = true)}>
     <Search class="lens" size={14} strokeWidth={1.75} aria-hidden="true" />
     <span class="hint">{app.workspace ? `Search ${teamLabel}…` : "Search project knowledge…"}</span>
-    <span class="kbd">⌘K</span>
+    <span class="kbd">{shortcut("mod+K")}</span>
   </button>
+
+  {#if record.recording || record.transcribing}
+    <!-- A take runs on whatever screen the person is on; this opens Ingest. -->
+    <button
+      class="recording"
+      class:paused={record.phase === "paused"}
+      title="Recording for Ingest. Open Ingest to stop it."
+      onclick={() => (app.screen = "ingests")}
+    >
+      <span class="rec-dot"></span>
+      {#if record.transcribing}
+        Transcribing{record.transcribePct !== null ? ` ${record.transcribePct}%` : "…"}
+      {:else if record.phase === "paused"}
+        Paused {recordClock(record.elapsedMs)}
+      {:else}
+        Recording {recordClock(record.elapsedMs)}
+      {/if}
+    </button>
+  {/if}
 
   {#if updater.phase === "downloading"}
     <span class="update downloading" title={updateTitle}>
@@ -221,6 +244,36 @@
     border-color: var(--accent-deep);
     color: var(--surface);
     box-shadow: inset 0 1px 2px rgba(33, 30, 25, 0.25);
+  }
+  .recording {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 28px;
+    padding: 0 11px;
+    border-radius: 14px;
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+    color: var(--danger);
+    font-size: 12.5px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+  }
+  .recording:hover {
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+  }
+  .recording .rec-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--danger);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .recording.paused .rec-dot {
+    animation: none;
+    opacity: 0.5;
   }
   .need-dot {
     width: 7px;

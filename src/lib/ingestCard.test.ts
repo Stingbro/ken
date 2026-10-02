@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { pageName, sourcesWaiting, stagingLine, writtenLine } from "./ingestCard";
-import type { InboxItem } from "./api";
+import { canReadNow, ingestBusy, pageName, rawActions, rawStateLabel, stagingLine, writtenLine } from "./ingestCard";
+import type { RawSource } from "./api";
 
 describe("writtenLine", () => {
   it("counts pages, ideas and escalations, then what waits", () => {
@@ -32,26 +32,33 @@ describe("stagingLine", () => {
   });
 });
 
-describe("sourcesWaiting", () => {
-  const item = (id: string, kind: InboxItem["kind"], payload: string | null): InboxItem => ({
-    id,
-    kind,
-    title: "",
-    body: "",
-    when: 0,
-    sourceRef: "",
-    payload,
+describe("Raw rows", () => {
+  it("say where each source is", () => {
+    expect(rawStateLabel("queued")).toBe("in the queue");
+    expect(rawStateLabel("transcribing")).toBe("transcribing");
+    expect(rawStateLabel("waiting")).toBe("waiting for a transcript");
+    expect(rawStateLabel("failed")).toBe("could not read");
   });
-  it("counts distinct notes with something waiting", () => {
-    const items = [
-      item("stored-1", "page-proposal", JSON.stringify({ page: "a", base: "", proposed: "", from: "n1.md" })),
-      item("stored-2", "page-proposal", JSON.stringify({ page: "b", base: "", proposed: "", from: "n1.md" })),
-      item("stored-3", "page-proposal", JSON.stringify({ page: "c", base: "", proposed: "", from: "n2.md" })),
-      item("stored-4", "page-proposal", JSON.stringify({ page: "d", base: "", proposed: "" })),
-      item("stored-5", "ingest", null),
-      item("stored-6", "page-proposal", "not json"),
-    ];
-    expect(sourcesWaiting(items)).toBe(2);
-    expect(sourcesWaiting([])).toBe(0);
+  it("offer Try again and Remove only where they make sense", () => {
+    expect(rawActions("failed")).toEqual(["retry", "remove"]);
+    expect(rawActions("waiting")).toEqual(["retry", "remove"]);
+    expect(rawActions("queued")).toEqual(["remove"]);
+    expect(rawActions("reading")).toEqual([]);
+    expect(rawActions("transcribing")).toEqual([]);
+    expect(rawActions("read")).toEqual([]);
+  });
+});
+
+describe("Read now", () => {
+  const raw = (state: RawSource["state"]) => ({ state }) as RawSource;
+  it("shows when something is queued and no pass runs", () => {
+    expect(canReadNow({ running: false, raw: [raw("queued")] })).toBe(true);
+    expect(canReadNow({ running: true, raw: [raw("queued")] })).toBe(false);
+    expect(canReadNow({ running: false, raw: [raw("failed")] })).toBe(false);
+    expect(canReadNow(null)).toBe(false);
+  });
+  it("keeps the screen reading while anything moves", () => {
+    expect(ingestBusy({ running: false, raw: [raw("transcribing")] })).toBe(true);
+    expect(ingestBusy({ running: false, raw: [raw("waiting"), raw("read")] })).toBe(false);
   });
 });

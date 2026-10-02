@@ -23,6 +23,8 @@
   import PreviewLoading from "./previews/PreviewLoading.svelte";
   import TooLargeNotice from "./previews/TooLargeNotice.svelte";
   import { isHtmlPath } from "./previews/html";
+  import { shortcut } from "../lib/platform";
+  import { toast } from "../lib/toast.svelte";
 
   let { relPath }: { relPath: string } = $props();
 
@@ -99,6 +101,18 @@
     meta !== null && (isEditable(meta.kind) || isCsv) && !tooLarge,
   );
   const kind = $derived(meta?.kind ?? "binary");
+  // Ken could not read this file: the reason, and Ignore to stop flagging it.
+  const failure = $derived(
+    meta?.status === "failed" && !app.ignored.includes(relPath) ? (meta.error ?? "no reason given") : null,
+  );
+
+  async function ignoreFailure() {
+    try {
+      await app.ignoreFile(relPath);
+    } catch (e) {
+      toast.error("Could not ignore the file", e);
+    }
+  }
   // Read-only = we know what the file is and it renders as a preview rather than
   // an editor: either not editable at all (PreviewPane — PDF/image/office/HTML
   // page), or text that's too big to edit. Suppressed until the file is resolved
@@ -311,7 +325,7 @@
     {/if}
     <button
       class="action icon-only"
-      title="Find in document (⌘F)"
+      title="Find in document ({shortcut('mod+F')})"
       aria-label="Find in document"
       onclick={() => find.toggle()}
     >
@@ -347,6 +361,16 @@
       </span>
       <button class="btn btn-small" onclick={keepMine}>Keep my version</button>
       <button class="btn btn-small" onclick={reloadFromDisk}>Take the disk version</button>
+    </div>
+  {/if}
+
+  {#if failure}
+    <div class="failed" role="status">
+      <span class="fdot"></span>
+      <span class="ftext"><strong>Ken could not read this file.</strong> {failure}</span>
+      <button class="btn btn-small" title="Stop flagging this file (only for you)" onclick={() => void ignoreFailure()}>
+        Ignore
+      </button>
     </div>
   {/if}
 
@@ -566,6 +590,37 @@
     border-radius: 10px;
     font-size: 12.5px;
     flex: none;
+  }
+  .failed {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    /* Below the floating action bar, which sits over the top right. */
+    margin: 46px 20px 0;
+    padding: 9px 14px;
+    background: color-mix(in srgb, var(--danger) 6%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+    border-radius: 10px;
+    font-size: 12.5px;
+    flex: none;
+  }
+  .fdot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--danger);
+    flex: none;
+  }
+  .ftext {
+    flex: 1;
+    min-width: 0;
+    line-height: 1.5;
+    color: var(--ink-secondary);
+    overflow-wrap: anywhere;
+  }
+  .ftext strong {
+    color: var(--danger);
+    font-weight: 600;
   }
   .cdot {
     width: 8px;
