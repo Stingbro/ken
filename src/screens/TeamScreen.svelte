@@ -3,7 +3,8 @@
   // wrote them, one row each (kind, how deep Ken reads it, branch, commit,
   // how far behind its upstream), the workspace's ignore lines, what a scan
   // found and what a repo lacks for its kind, the wiki's weekly sweep and what
-  // its checks found, the team's rules and templates, and the team inbox.
+  // its checks found, and the team's rules and templates. It is Settings ›
+  // Team library in the Briefing design.
   // Each row opens that repo's own settings in a drawer. Add a repo (9b) and
   // Scan again sit at the top.
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -25,7 +26,6 @@
   import { findingLabel, kindlessRepos, orderFindings, proposedKinds } from "../lib/team";
   import type { TeamFinding } from "../lib/api";
   import RepoDrawer from "../team/RepoDrawer.svelte";
-  import TeamInbox from "../team/TeamInbox.svelte";
   import X from "@lucide/svelte/icons/x";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import SlidersHorizontal from "@lucide/svelte/icons/sliders-horizontal";
@@ -218,7 +218,6 @@
 
 <div class="team">
   <div class="head">
-    <h2>Team</h2>
     <strong class="tname">{team ?? overview?.workspace ?? ""}</strong>
     <span class="spacer"></span>
     {#if overview}
@@ -447,7 +446,6 @@
       </div>
     </div>
 
-    <TeamInbox />
   {/if}
 </div>
 
@@ -459,9 +457,6 @@
 
 <style>
   .team {
-    padding: 18px 24px;
-    height: 100%;
-    overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 10px;

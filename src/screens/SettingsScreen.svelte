@@ -1,4 +1,7 @@
 <script lang="ts">
+  import TeamScreen from "./TeamScreen.svelte";
+  import TeamInbox from "../team/TeamInbox.svelte";
+  import type { SettingsSection } from "../lib/app.svelte";
   // Settings: what is yours (You), what is this computer's (This machine),
   // Ken's features, the connector for agents, and About. Each repo's own
   // settings open from its row on Team.
@@ -39,6 +42,15 @@
   let doctor = $state<ClaudeDoctor | null>(null);
   let gpu = $state<GpuInfo | null>(null);
   let embedding = $state<EmbeddingState | null>(null);
+
+  const sections: { key: SettingsSection; label: string; sub: string }[] = [
+    { key: "general", label: "General", sub: "Appearance, files, updates" },
+    { key: "team", label: "Team library", sub: "Folders, rules, weekly check" },
+    { key: "sync", label: "Sync", sub: "Git and the team inbox" },
+    { key: "ai", label: "AI", sub: "Claude Code and models" },
+    { key: "agents", label: "Agents", sub: "The connector for your tools" },
+    { key: "rules", label: "Ingest rules", sub: "What Ken may write" },
+  ];
 
   const themeOptions: { value: ThemeMode; title: string }[] = [
     { value: "light", title: "Light" },
@@ -186,13 +198,67 @@
   }
 </script>
 
-<div class="wrap">
-  <div class="inner">
+<div class="settings">
+  <nav class="snav" aria-label="Settings">
     <h1>Settings</h1>
+    {#each sections as s (s.key)}
+      <button class:on={app.settingsSection === s.key} onclick={() => (app.settingsSection = s.key)}>
+        <span class="slabel">{s.label}</span>
+        <span class="ssub">{s.sub}</span>
+      </button>
+    {/each}
+  </nav>
+  <div class="wrap">
+  <div class="inner">
+    <h2 class="stitle">{sections.find((s) => s.key === app.settingsSection)?.label}</h2>
 
-    <!-- ── You ─────────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "team"}
+      <TeamScreen />
+    {/if}
+
+    {#if app.settingsSection === "sync"}
+      <section class="group">
+        <div class="card">
+          <div class="card-title">How the team's files sync</div>
+          <p class="note">
+            Each folder Ken reads syncs through its own Git remote, set in its row under Team library. A file two people
+            changed at once shows in the Inbox under Sync &amp; files, with both versions side by side.
+          </p>
+        </div>
+        <TeamInbox />
+      </section>
+    {/if}
+
+    {#if app.settingsSection === "rules"}
+      <section class="group">
+        <div class="card">
+          <div class="card-title">What Ken writes on its own</div>
+          <p class="note">
+            When a source is added, Ken writes the note and what follows from it at once, each citing the note: page edits,
+            new pages, ideas, escalations and your next steps. Each has an Undo on its card in Ingest.
+          </p>
+        </div>
+        <div class="card">
+          <div class="card-title">What waits for you</div>
+          <ul class="rules">
+            <li>A ruling, in the words of the person who decides it. Only they can accept it.</li>
+            <li>A change to Ways-of-Working, Conventions or a rule. It becomes a ticket.</li>
+            <li>An edit that rewrites more than a fifth of a page, or lands on a page someone changed while Ken was reading.</li>
+            <li>An action. It becomes a ticket once accepted.</li>
+          </ul>
+          <p class="note">These wait in the Inbox under Ken. Human edits always win.</p>
+        </div>
+        <div class="card">
+          <div class="card-title">The team's own rules</div>
+          <p class="note">The rules reviewers check work against are pages in the wiki. Add one under Team library.</p>
+          <div class="row"><button class="btn btn-small" onclick={() => (app.settingsSection = "team")}>Open Team library</button></div>
+        </div>
+      </section>
+    {/if}
+
+    <!-- ── General ─────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "general"}
     <section class="group">
-      <div class="group-head">You</div>
 
       <div class="card">
         <div class="card-title">Appearance</div>
@@ -239,61 +305,12 @@
         </div>
       {/if}
 
-      <div class="card">
-        <div class="card-title">Memory: journal distillation</div>
-        <p class="note">
-          Ken reads the workspace journal and drafts long-term memories from what keeps coming back. Nothing is
-          written to <span class="mono small">memory/</span> until you approve a draft below.
-        </p>
-        {#if memory.phase === "planning" || memory.phase === "distilling"}
-          <div class="row">
-            <span class="mini-spinner" aria-hidden="true"></span>
-            <span class="soft">{memory.phase === "planning" ? "Reading the journal…" : "Drafting…"}</span>
-          </div>
-        {/if}
-        {#if memory.phase === "error" && memory.errorReason}
-          <p class="note warn">Distillation failed: {memory.errorReason}</p>
-        {/if}
-        <div class="row">
-          <button
-            class="btn btn-small"
-            onclick={() => void memory.distill()}
-            disabled={memory.phase === "planning" || memory.phase === "distilling"}
-          >
-            {memory.phase === "planning" || memory.phase === "distilling" ? "Distilling…" : "Distill the journal"}
-          </button>
-        </div>
-      </div>
-
-      {#each memory.candidates as c (c.slug)}
-        <div class="card">
-          <div class="card-title">{c.slug}</div>
-          <div class="row"><span class="chip mono">.ken-workspace/memory/{c.slug}.md</span></div>
-          {#if c.description}<p class="note">{c.description}</p>{/if}
-          <pre class="memory-body">{bodyPreview(c.body)}</pre>
-          {#if c.sources.length > 0}
-            <div class="list">
-              {#each c.sources as src (src)}
-                {@const reason = unopenableReason(toWorkspaceAddress(src))}
-                <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>{src}</span>
-              {/each}
-            </div>
-          {/if}
-          <div class="row">
-            <button class="btn btn-small" onclick={() => void memory.resolve(c.slug, true)} disabled={memory.resolvingSlug === c.slug}>
-              Approve
-            </button>
-            <button class="btn btn-small" onclick={() => void memory.resolve(c.slug, false)} disabled={memory.resolvingSlug === c.slug}>
-              Dismiss
-            </button>
-          </div>
-        </div>
-      {/each}
     </section>
+    {/if}
 
-    <!-- ── This machine ───────────────────────────────────────────── -->
+    <!-- ── AI ─────────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "ai"}
     <section class="group">
-      <div class="group-head">This machine</div>
 
       <div class="card">
         <div class="card-title">Offline models</div>
@@ -408,12 +425,61 @@
           <p class="note">{backgroundReading.description}</p>
         </div>
       {/if}
+      <div class="card">
+        <div class="card-title">Memory: journal distillation</div>
+        <p class="note">
+          Ken reads the workspace journal and drafts long-term memories from what keeps coming back. Nothing is
+          written to <span class="mono small">memory/</span> until you approve a draft below.
+        </p>
+        {#if memory.phase === "planning" || memory.phase === "distilling"}
+          <div class="row">
+            <span class="mini-spinner" aria-hidden="true"></span>
+            <span class="soft">{memory.phase === "planning" ? "Reading the journal…" : "Drafting…"}</span>
+          </div>
+        {/if}
+        {#if memory.phase === "error" && memory.errorReason}
+          <p class="note warn">Distillation failed: {memory.errorReason}</p>
+        {/if}
+        <div class="row">
+          <button
+            class="btn btn-small"
+            onclick={() => void memory.distill()}
+            disabled={memory.phase === "planning" || memory.phase === "distilling"}
+          >
+            {memory.phase === "planning" || memory.phase === "distilling" ? "Distilling…" : "Distill the journal"}
+          </button>
+        </div>
+      </div>
+
+      {#each memory.candidates as c (c.slug)}
+        <div class="card">
+          <div class="card-title">{c.slug}</div>
+          <div class="row"><span class="chip mono">.ken-workspace/memory/{c.slug}.md</span></div>
+          {#if c.description}<p class="note">{c.description}</p>{/if}
+          <pre class="memory-body">{bodyPreview(c.body)}</pre>
+          {#if c.sources.length > 0}
+            <div class="list">
+              {#each c.sources as src (src)}
+                {@const reason = unopenableReason(toWorkspaceAddress(src))}
+                <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>{src}</span>
+              {/each}
+            </div>
+          {/if}
+          <div class="row">
+            <button class="btn btn-small" onclick={() => void memory.resolve(c.slug, true)} disabled={memory.resolvingSlug === c.slug}>
+              Approve
+            </button>
+            <button class="btn btn-small" onclick={() => void memory.resolve(c.slug, false)} disabled={memory.resolvingSlug === c.slug}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      {/each}
     </section>
 
-    <!-- ── Ken features ───────────────────────────────────────────── -->
     {#if kenFeatures.length > 0}
       <section class="group">
-        <div class="group-head">Ken features</div>
+        <div class="group-head">Features</div>
         {#each kenFeatures as flag (flag.name)}
           <div class="card">
             <div class="card-title">{flag.label}</div>
@@ -457,10 +523,11 @@
         {/each}
       </section>
     {/if}
+    {/if}
 
-    <!-- ── Connector for agents ───────────────────────────────────── -->
+    <!-- ── Agents ──────────────────────────────────────────────────── -->
+    {#if app.settingsSection === "agents"}
     <section class="group">
-      <div class="group-head">Connector for agents</div>
       <div class="card">
         <div class="mcp-head">
           <span class="card-title">Connect an agent</span>
@@ -499,8 +566,10 @@
         {/if}
       </div>
     </section>
+    {/if}
 
-    <!-- ── About ──────────────────────────────────────────────────── -->
+    <!-- ── About (General) ─────────────────────────────────────────── -->
+    {#if app.settingsSection === "general"}
     <section class="group">
       <div class="group-head">About</div>
       <div class="card">
@@ -508,25 +577,90 @@
           <span class="about-version">Ken v{whatsNew.version}</span>
           <button class="whats-new" onclick={() => whatsNew.show()}>What's new in this version</button>
         </div>
-        <p class="note">Each repo's own settings (reindex, watched folders, cloud files, sync) open from its row on Team.</p>
+        <p class="note">Each folder's own settings (reindex, watched folders, cloud files, sync) open from its row in Team library.</p>
       </div>
     </section>
+    {/if}
+  </div>
   </div>
 </div>
 
 <style>
+  .settings {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    min-height: 0;
+  }
+  .snav {
+    width: 230px;
+    flex: none;
+    border-right: 1px solid var(--line-soft);
+    padding: 24px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    box-sizing: border-box;
+    overflow-y: auto;
+  }
+  .snav h1 {
+    margin: 0 0 14px;
+    padding: 0 10px;
+    font-family: var(--font-serif);
+    font-size: 28px;
+    font-weight: 500;
+  }
+  .snav button {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
+    text-align: left;
+    color: var(--ink);
+  }
+  .snav button:hover {
+    background: var(--line-soft);
+  }
+  .snav button.on {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
+  .slabel {
+    font-size: 13.5px;
+    font-weight: 600;
+  }
+  .ssub {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+  .stitle {
+    margin: 0;
+    font-family: var(--font-serif);
+    font-size: 24px;
+    font-weight: 500;
+  }
+  .rules {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--ink-2);
+  }
   .wrap {
     flex: 1;
     min-width: 0;
     overflow-y: auto;
-    padding: 36px 44px;
+    padding: 32px 40px;
   }
   .inner {
-    max-width: 720px;
-    margin: 0 auto;
+    max-width: 760px;
     display: flex;
     flex-direction: column;
-    gap: 40px;
+    gap: 20px;
   }
   .group {
     display: flex;
@@ -540,12 +674,6 @@
     text-transform: uppercase;
     color: var(--ink-tertiary);
     margin-bottom: 2px;
-  }
-  h1 {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 28px;
-    font-weight: 500;
   }
   .card {
     background: var(--surface);
@@ -677,12 +805,6 @@
     align-items: flex-start;
     gap: 10px;
     cursor: pointer;
-  }
-  .mradio.off {
-    cursor: default;
-  }
-  .mradio.off .mname {
-    color: var(--ink-tertiary);
   }
   .mradio.indent {
     padding-left: 24px;
