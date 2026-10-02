@@ -7,14 +7,18 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, type IndexState, type RepoKind, type SetupRepoRow } from "../lib/api";
   import { app } from "../lib/app.svelte";
+  import FolderOpen from "@lucide/svelte/icons/folder-open";
   import {
+    commonParent,
     coveredRepos,
+    defaultTeamName,
     defaultWikiChoice,
     indexSummary,
     KINDS,
     mergeRows,
     newWikiPath,
-    noTeams,
+    onOneTeam,
+    renamedWikiChoice,
     suggestedTeams,
     teamWikis,
     toggleKind,
@@ -37,6 +41,39 @@
   const summary = $derived(indexSummary(rows));
   const teams = $derived(suggestedTeams(rows));
 
+  // A workspace is usually one team: every repo goes on it under one name.
+  // A person splits the repos across teams only when they belong to more.
+  let teamName = $state("");
+  let split = $state(false);
+  let teamProposed = false;
+  let nameTouched = false;
+
+  function goTeam() {
+    if (!teamProposed) {
+      teamProposed = true;
+      const proposed = suggestedTeams(rows);
+      split = proposed.length > 1;
+      teamName = proposed[0] ?? defaultTeamName(rows);
+    }
+    if (!split) rows = onOneTeam(rows, teamName);
+    step = "team";
+  }
+
+  function setTeamName(value: string) {
+    teamName = value;
+    rows = onOneTeam(rows, value);
+  }
+
+  function toggleSplit() {
+    split = !split;
+    if (!split) rows = onOneTeam(rows, teamName);
+  }
+
+  function goIndex() {
+    if (!nameTouched) name = teamName.trim() || teams[0] || name;
+    step = "index";
+  }
+
   // Item 4b: offered, never forced. Draft the first Current, architecture
   // and release pages into a wiki repo from these repos and their
   // descriptions, for a person to read.
@@ -50,28 +87,44 @@
   // Confirm does not try to create the folder again.
   let created = $state<Record<string, SetupRepoRow>>({});
   $effect(() => {
+    const parent = lastParent ?? commonParent(rows);
+    const before = Object.keys(wikiChoices);
     const next: Record<string, WikiChoice> = {};
     for (const t of teams) {
-      const was = wikiChoices[t];
+      // Typing the one team's name keeps its wiki choice.
+      const was =
+        wikiChoices[t] ??
+        (teams.length === 1 && before.length === 1 ? renamedWikiChoice(wikiChoices[before[0]], before[0], t) : undefined);
       const stillValid = was && (was.mode !== "existing" || teamWikis(rows, t).some((w) => w.member === was.member));
-      next[t] = stillValid ? was : defaultWikiChoice(rows, t);
+      next[t] = stillValid ? was : defaultWikiChoice(rows, t, parent);
     }
     if (JSON.stringify(next) !== JSON.stringify(wikiChoices)) wikiChoices = next;
   });
 
-  function chooseWiki(team: string, value: string) {
-    wikiChoices[team] =
-      value === "__new"
-        ? { mode: "new", parent: null, name: `${team}-Wiki` }
-        : value === "__none"
-          ? { mode: "none" }
-          : { mode: "existing", member: value };
+  // The folder last chosen for a new wiki, offered again when one is ticked.
+  let lastParent = $state<string | null>(null);
+
+  function chooseWiki(team: string, member: string) {
+    wikiChoices[team] = { mode: "existing", member };
+  }
+
+  function toggleNewWiki(team: string, on: boolean) {
+    wikiChoices[team] = on
+      ? { mode: "new", parent: lastParent ?? commonParent(rows), name: `${team}-Wiki` }
+      : { mode: "none" };
   }
 
   async function chooseWikiParent(team: string) {
-    const folder = await openDialog({ directory: true, title: `Where the ${team} wiki goes` });
     const c = wikiChoices[team];
-    if (typeof folder === "string" && c?.mode === "new") wikiChoices[team] = { ...c, parent: folder };
+    const folder = await openDialog({
+      directory: true,
+      title: `Where the ${team} wiki goes`,
+      defaultPath: c?.mode === "new" && c.parent ? c.parent : undefined,
+    });
+    if (typeof folder === "string" && c?.mode === "new") {
+      lastParent = folder;
+      wikiChoices[team] = { ...c, parent: folder };
+    }
   }
 
   /** Wikis to draft into: each team's (existing or to be created), then any
@@ -117,11 +170,6 @@
   function remove(row: SetupRepoRow) {
     rows = rows.filter((r) => r !== row);
     if (row.path) removed = [...removed, row.path];
-  }
-
-  function kenOnly() {
-    rows = noTeams(rows);
-    step = "index";
   }
 
   async function confirm() {
@@ -200,7 +248,7 @@
               <span class="evidence mono" title={row.path ?? ""}>{row.path}</span>
               {#if row.evidence.length > 0}<span class="evidence">{row.evidence.join(" · ")}</span>{/if}
               <textarea
-                class="description"
+                class="textarea description"
                 rows="2"
                 placeholder="What is this repo for, and how is it used?"
                 bind:value={row.description}
@@ -235,86 +283,60 @@
       </p>
     {/if}
     <div class="actions">
-      <button class="btn btn-primary" disabled={rows.every((r) => !r.include)} onclick={() => (step = "team")}>Next</button>
+      <button class="btn btn-primary" disabled={rows.every((r) => !r.include)} onclick={goTeam}>Next</button>
       <button class="btn btn-ghost" onclick={onclose}>Cancel</button>
     </div>
   {:else if step === "team"}
-    <h2>Who do you work with?</h2>
-    <p class="note">
-      A team is a name over a set of repos. Picking a team picks its repos at once, and its graph
-      is built over them.
-    </p>
-    <div class="table" role="table">
-      <div class="tr head teams" role="row"><span>Repo</span><span>Team</span></div>
-      {#each rows.filter((r) => r.include) as row (row.path ?? row.member)}
-        <div class="tr teams" role="row">
-          <span class="mono">{row.member}</span>
-          <input
-            class="team"
-            placeholder="—"
-            value={row.team ?? ""}
-            oninput={(e) => (row.team = (e.currentTarget as HTMLInputElement).value.trim() || null)}
-            aria-label="Team for {row.member}"
-          />
-        </div>
-      {/each}
-    </div>
-    <p class="note">
-      {#if teams.length > 0}
-        Suggested: {teams.join(" · ")}, from folders of repos and docs READMEs that name their code.
-      {:else}
-        No team suggested; type a name to group repos, or leave them each on their own.
-      {/if}
-    </p>
-    {#if teams.length > 0}
-      <h3>Each team's wiki</h3>
+    <h2>Your team</h2>
+    {#if !split}
       <p class="note">
-        A team keeps one wiki: what is true now, how it works, and a page per repo on what lives
-        where. Use a wiki repo you picked, or create one from the Ways-of-Working template.
+        The repos you picked are one team. It keeps one wiki, and Home, search and chat cover its repos.
       </p>
+      <label class="field">
+        <span class="field-label">Team name</span>
+        <input
+          class="input"
+          value={teamName}
+          placeholder="The team's name"
+          oninput={(e) => setTeamName((e.currentTarget as HTMLInputElement).value)}
+        />
+      </label>
+      <p class="note">
+        {#each rows.filter((r) => r.include) as row, i (row.path ?? row.member)}{i > 0 ? " · " : ""}<span class="mono">{row.member}</span>{/each}
+      </p>
+      {#if teams.length === 1}
+        <h3>Wiki</h3>
+        {@render wikiRow(teams[0])}
+      {/if}
+    {:else}
+      <p class="note">Repos with the same team name are one team, and each team keeps one wiki.</p>
       <div class="table" role="table">
-        {#each teams as t (t)}
-          {@const c = wikiChoices[t] ?? { mode: "none" }}
-          <div class="tr wikis" role="row">
-            <span class="mono">{t}</span>
-            <span>
-              <select
-                aria-label="Wiki for {t}"
-                value={c.mode === "existing" ? c.member : c.mode === "new" ? "__new" : "__none"}
-                onchange={(e) => chooseWiki(t, (e.currentTarget as HTMLSelectElement).value)}
-              >
-                {#each teamWikis(rows, t) as w (w.member)}<option value={w.member}>Use {w.member}</option>{/each}
-                <option value="__new">Create a new wiki…</option>
-                <option value="__none">No wiki for now</option>
-              </select>
-            </span>
-            <span class="new-wiki">
-              {#if c.mode === "new"}
-                <input
-                  class="team"
-                  value={c.name}
-                  aria-label="Name of the new {t} wiki"
-                  oninput={(e) => (wikiChoices[t] = { ...c, name: (e.currentTarget as HTMLInputElement).value })}
-                />
-                <button class="btn btn-ghost" onclick={() => chooseWikiParent(t)}>
-                  {c.parent ? `In ${c.parent}` : "Choose where…"}
-                </button>
-              {/if}
-            </span>
+        <div class="tr head teams" role="row"><span>Repo</span><span>Team</span></div>
+        {#each rows.filter((r) => r.include) as row (row.path ?? row.member)}
+          <div class="tr teams" role="row">
+            <span class="mono">{row.member}</span>
+            <input
+              class="input team"
+              placeholder="No team"
+              value={row.team ?? ""}
+              oninput={(e) => (row.team = (e.currentTarget as HTMLInputElement).value.trim() || null)}
+              aria-label="Team for {row.member}"
+            />
           </div>
         {/each}
       </div>
-      {#if Object.values(wikiChoices).some((c) => c.mode === "new")}
-        <p class="note">
-          A new wiki is a new folder with the template's pages, its Start Here listing the team's
-          repos and what each is for, and one git commit. It stays on this computer; adding a remote
-          and pushing is yours to do.
-        </p>
-      {/if}
+      {#each teams as t (t)}
+        <h3>{t}'s wiki</h3>
+        {@render wikiRow(t)}
+      {/each}
     {/if}
+    <div>
+      <button class="btn btn-link" onclick={toggleSplit}>
+        {split ? "Put them all on one team" : "These repos belong to more than one team"}
+      </button>
+    </div>
     <div class="actions">
-      <button class="btn btn-primary" disabled={!wikiChoicesReady(wikiChoices)} onclick={() => (step = "index")}>Next</button>
-      <button class="btn btn-ghost" onclick={kenOnly}>None, Ken only</button>
+      <button class="btn btn-primary" disabled={!wikiChoicesReady(wikiChoices)} onclick={goIndex}>Next</button>
       <button class="btn btn-ghost" onclick={() => (step = "repos")}>Back</button>
     </div>
   {:else}
@@ -327,8 +349,9 @@
       <strong>{summary.entities}</strong> read for entities · <strong>{summary.search}</strong>
       searchable only · <strong>{summary.off}</strong> not indexed
     </p>
-    <label class="name">
-      Workspace name <input bind:value={name} />
+    <label class="field">
+      <span class="field-label">Workspace name</span>
+      <input class="input" bind:value={name} oninput={() => (nameTouched = true)} />
     </label>
     {#if draftTargets.length > 0}
       <div class="draft">
@@ -358,6 +381,58 @@
       <button class="btn btn-ghost" onclick={() => (step = "team")}>Back</button>
     </div>
   {/if}
+
+  {#snippet wikiRow(t: string)}
+    {@const c = wikiChoices[t] ?? { mode: "none" }}
+    {@const existing = teamWikis(rows, t)}
+    <div class="wiki">
+      {#if existing.length > 0}
+        <span class="note">
+          {#if existing.length === 1}
+            Uses <span class="mono">{existing[0].member}</span>, the wiki repo you picked.
+          {:else}
+            Uses
+            <select
+              aria-label="Wiki for {t}"
+              value={c.mode === "existing" ? c.member : existing[0].member}
+              onchange={(e) => chooseWiki(t, (e.currentTarget as HTMLSelectElement).value)}
+            >
+              {#each existing as w (w.member)}<option value={w.member}>{w.member}</option>{/each}
+            </select>
+          {/if}
+        </span>
+      {:else}
+        <label class="check-row">
+          <input type="checkbox" checked={c.mode === "new"} onchange={(e) => toggleNewWiki(t, e.currentTarget.checked)} />
+          <span>Create a wiki for {t} from the Ways of Working template</span>
+        </label>
+        {#if c.mode === "new"}
+          <div class="wiki-where">
+            <input
+              class="input"
+              value={c.name}
+              aria-label="Folder name of the {t} wiki"
+              oninput={(e) => (wikiChoices[t] = { ...c, name: (e.currentTarget as HTMLInputElement).value })}
+            />
+            <span class="in">in</span>
+            <button class="btn where" title={c.parent ?? ""} onclick={() => chooseWikiParent(t)}>
+              <FolderOpen size={14} strokeWidth={1.75} aria-hidden="true" />
+              <span class="where-path">{c.parent ?? "Choose a folder…"}</span>
+            </button>
+          </div>
+          <p class="note">
+            {#if c.parent}
+              Ken makes <span class="mono">{newWikiPath(c.parent, c.name || `${t}-Wiki`)}</span> with the template's
+              pages, a Start Here page listing the team's repos, and one git commit. It stays on this computer;
+              adding a remote and pushing is yours to do.
+            {:else}
+              Choose where the wiki folder goes, or untick it to go without one for now.
+            {/if}
+          </p>
+        {/if}
+      {/if}
+    </div>
+  {/snippet}
 
   {#if error}<div class="error">{error}</div>{/if}
 </div>
@@ -423,21 +498,61 @@
     grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr);
     align-items: center;
   }
-  .tr.wikis {
-    grid-template-columns: minmax(120px, 0.8fr) minmax(170px, 1fr) minmax(220px, 1.6fr);
-    align-items: center;
-  }
-  .new-wiki {
+  .field {
     display: flex;
+    flex-direction: column;
     gap: 6px;
-    align-items: center;
-    min-width: 0;
+    max-width: 360px;
   }
-  .new-wiki .btn {
-    white-space: nowrap;
+  .field-label {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ink-2);
+  }
+  .wiki {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+  .check-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13.5px;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .wiki-where {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding-left: 26px;
+  }
+  .wiki-where .input {
+    width: 160px;
+    flex: none;
+  }
+  .wiki-where + .note {
+    padding-left: 26px;
+  }
+  .in {
+    font-size: 13px;
+    color: var(--ink-3);
+  }
+  .where {
+    flex: 1;
+    min-width: 0;
+    justify-content: flex-start;
+  }
+  .where-path {
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 60%;
+    white-space: nowrap;
   }
   h3 {
     margin: 6px 0 0;
@@ -504,12 +619,6 @@
     border-color: var(--accent);
     color: var(--accent);
   }
-  .name {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    font-size: 13px;
-  }
   .draft {
     display: flex;
     flex-direction: column;
@@ -518,6 +627,12 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     font-size: 13px;
+  }
+  .draft label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
   }
   .error {
     color: var(--needs-input);

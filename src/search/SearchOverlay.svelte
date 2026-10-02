@@ -701,10 +701,12 @@
   }
   .member-pin {
     margin-left: 4px;
-    background: var(--surface);
+    background-color: var(--surface);
+    background-position: right 5px center;
+    background-size: 11px;
     border: 1px solid var(--border);
     border-radius: var(--radius-control, 6px);
-    padding: 2px 6px;
+    padding: 2px 20px 2px 6px;
     font: inherit;
     font-size: 12px;
     color: var(--ink-secondary);
@@ -836,10 +838,12 @@
   .kind-select {
     margin-left: auto;
     font-size: 11.5px;
-    padding: 2px 6px;
+    padding: 2px 20px 2px 6px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--surface);
+    background-color: var(--surface);
+    background-position: right 5px center;
+    background-size: 11px;
     color: var(--ink-secondary);
   }
   .tag-member {

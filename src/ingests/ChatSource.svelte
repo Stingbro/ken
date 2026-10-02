@@ -110,10 +110,10 @@
   select {
     font: inherit;
     font-size: 12.5px;
-    padding: 5px 8px;
+    padding: 5px 26px 5px 8px;
     border-radius: 7px;
     border: 1px solid var(--border-strong);
-    background: var(--surface);
+    background-color: var(--surface);
     color: var(--ink);
   }
   .msgs {

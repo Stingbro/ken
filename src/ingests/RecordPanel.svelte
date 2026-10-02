@@ -190,10 +190,12 @@
   .device select {
     flex: 1;
     min-width: 0;
-    padding: 4px 6px;
+    padding: 4px 24px 4px 8px;
     border-radius: 6px;
     border: 1px solid var(--border);
-    background: var(--surface);
+    background-color: var(--surface);
+    background-position: right 6px center;
+    background-size: 11px;
     color: var(--ink);
     font: inherit;
     font-size: 12px;

@@ -499,10 +499,15 @@
     font: inherit;
     font-size: 12.5px;
     color: var(--ink);
-    background: var(--surface);
+    background-color: var(--surface);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 3px 8px;
+  }
+  .field select {
+    padding-right: 24px;
+    background-position: right 6px center;
+    background-size: 11px;
   }
   .link-input {
     min-width: 200px;

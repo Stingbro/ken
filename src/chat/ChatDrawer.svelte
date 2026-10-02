@@ -661,8 +661,10 @@
     font-size: 11.5px;
     color: var(--ink-secondary);
     border: 1px solid var(--border);
-    background: transparent;
-    padding: 4px 6px;
+    background-color: transparent;
+    background-position: right 5px center;
+    background-size: 11px;
+    padding: 4px 20px 4px 7px;
     border-radius: 7px;
     max-width: 110px;
   }
