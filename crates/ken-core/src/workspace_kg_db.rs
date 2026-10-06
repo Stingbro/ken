@@ -19,7 +19,7 @@
 //! `db::db_path`'s `base.join(...)` pattern) rather than depending on a
 //! workspace handle type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -95,7 +95,7 @@ impl WorkspaceKgDb {
                 );
 
                 -- One row per merged concept (proposal.md: kinds reuse the
-                -- per-project set person|organization|topic|decision|other).
+                -- per-project set person|organization|repo|topic|decision|other).
                 -- `summary` is always non-empty once written by the merge
                 -- pass (spec: "every global entity is a wiki page").
                 CREATE TABLE IF NOT EXISTS global_entities (
@@ -382,6 +382,36 @@ impl WorkspaceKgDb {
             .query_map([], Self::map_global_edge)?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// The entities joined to any of `global_ids` by Claude's map
+    /// (`imported`) or the judge (`llm`), never by co-occurrence, which only
+    /// says two names share files. Added 2026-10-06 for routing, when
+    /// co-occurrence was 610 of the dry run's 756 edges. Sorted, without
+    /// `global_ids` themselves.
+    pub fn strongly_related(&self, global_ids: &[i64]) -> Result<Vec<i64>> {
+        if global_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<i64> = global_ids.iter().copied().collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT src_global_id, dst_global_id FROM global_edges
+             WHERE provenance IN ('imported', 'llm')",
+        )?;
+        let pairs = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out: Vec<i64> = pairs
+            .into_iter()
+            .filter_map(|(a, b)| match (wanted.contains(&a), wanted.contains(&b)) {
+                (true, false) => Some(b),
+                (false, true) => Some(a),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     fn map_global_edge(r: &rusqlite::Row) -> rusqlite::Result<GlobalEdgeRow> {
@@ -696,6 +726,23 @@ mod tests {
         let row = db.get_global_entity(id).unwrap().unwrap();
         assert_eq!(row.summary, "An MMO.");
         assert_eq!(row.updated_at, 200);
+    }
+
+    #[test]
+    fn strongly_related_follows_claude_and_judged_edges_only() {
+        let db = WorkspaceKgDb::open_in_memory().unwrap();
+        let ids: Vec<i64> = ["A", "B", "C", "D", "E"]
+            .iter()
+            .map(|n| db.insert_global_entity("topic", n, "s", 1).unwrap())
+            .collect();
+        db.insert_global_edge(ids[0], ids[1], "depends on", 1.0, "imported").unwrap();
+        db.insert_global_edge(ids[2], ids[0], "documents", 2.0, "llm").unwrap();
+        db.insert_global_edge(ids[0], ids[3], "related", 3.0, "cooccur").unwrap();
+        db.insert_global_edge(ids[1], ids[4], "owns", 1.0, "imported").unwrap();
+        assert_eq!(db.strongly_related(&[ids[0]]).unwrap(), vec![ids[1], ids[2]]);
+        // Both ends asked for: the edge between them adds nothing.
+        assert_eq!(db.strongly_related(&[ids[0], ids[1]]).unwrap(), vec![ids[2], ids[4]]);
+        assert!(db.strongly_related(&[]).unwrap().is_empty());
     }
 
     #[test]
