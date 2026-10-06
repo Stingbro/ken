@@ -72,6 +72,16 @@ impl FileKind {
             | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "swift" | "kt" | "sh" | "bash"
             | "zsh" | "sql" | "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "html"
             | "htm" | "css" | "scss" | "xml" | "csv" => FileKind::Code,
+            // Build scripts, module variants, Vue and game-UI markup were read
+            // as binary, so their words were never searchable: on 2026-10-06
+            // "how is the mod packaged" missed build.gradle.kts and "one party
+            // member's row on the HUD" missed PartyMemberChip.ui (Shattered
+            // Realms has 129 .ui and 43 .mjs files). Named one by one rather
+            // than "any file without NUL bytes is text", which would also read
+            // the 12,000 .blockyanim/.blockymodel/.particle* asset files that
+            // are meant to stay name-only. `.env.example` is still a secret
+            // name (kenignore), so it is not here.
+            "kts" | "gradle" | "properties" | "mjs" | "cjs" | "mts" | "cts" | "vue" | "ui" | "lang" => FileKind::Code,
             "docx" => FileKind::Docx,
             "xlsx" | "xlsm" => FileKind::Xlsx,
             "pptx" => FileKind::Pptx,
@@ -507,6 +517,35 @@ mod tests {
         assert_eq!(FileKind::from_path(Path::new("x.unknown")), FileKind::Binary);
         assert_eq!(FileKind::from_path(Path::new("noext")), FileKind::Binary);
         assert_eq!(FileKind::from_path(Path::new("call.srt")), FileKind::Txt);
+    }
+
+    #[test]
+    fn build_scripts_and_ui_markup_are_text() {
+        for name in [
+            "build.gradle.kts",
+            "settings.gradle",
+            "gradle.properties",
+            "scripts/gen.mjs",
+            "lib/x.cjs",
+            "src/a.mts",
+            "src/a.cts",
+            "App.vue",
+            "Common/UI/Custom/Party/PartyMemberChip.ui",
+            "Server/Languages/en-US/server.lang",
+            "Cargo.toml",
+            "setup.cfg",
+            "php.ini",
+        ] {
+            assert_eq!(FileKind::from_path(Path::new(name)), FileKind::Code, "{name}");
+        }
+        // Engine asset formats stay name-only.
+        for name in ["Sword.blockymodel", "Swing.blockyanim", "Spark.particlespawner"] {
+            assert_eq!(FileKind::from_path(Path::new(name)), FileKind::Binary, "{name}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("PartyMemberChip.ui");
+        std::fs::write(&path, "Group #NameCell { Anchor: (Width: 168); }\n").unwrap();
+        assert!(extract(&path).unwrap().text.contains("NameCell"));
     }
 
     #[test]

@@ -72,9 +72,10 @@ impl Default for IndexProfile {
 pub const PROSE_EXTS: &[&str] = &["md", "mdx", "txt", "pdf"];
 /// Source-code and other structured/dense-text extensions. See [`PROSE_EXTS`].
 pub const CODE_EXTS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "h", "cc", "cpp",
-    "hpp", "cs", "rb", "php", "swift", "kt", "kts", "sql", "sh", "bash", "ps1", "toml", "yaml",
-    "yml", "json", "css", "scss", "html", "svelte", "vue",
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "py", "go", "java", "c", "h", "cc",
+    "cpp", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "gradle", "properties", "sql", "sh",
+    "bash", "ps1", "toml", "yaml", "yml", "json", "css", "scss", "html", "svelte", "vue", "ui",
+    "lang",
 ];
 
 impl IndexProfile {
@@ -131,10 +132,6 @@ const CHUNK_CAP: usize = 200;
 /// Split `text` (the contents of `rel_path`) into chunks per `profile`.
 /// Pure and infallible: empty/whitespace-only text yields no chunks.
 pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chunk> {
-    // Reserved for future per-path overrides (e.g. path-pattern profiles);
-    // profile selection itself happens in the caller via `default_for`.
-    let _ = rel_path;
-
     if text.trim().is_empty() {
         return Vec::new();
     }
@@ -144,10 +141,14 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
         ChunkMode::Code => chunk_code(text, profile),
         ChunkMode::Skip => Vec::new(),
     };
+    let mut pieces: Vec<(usize, String)> = pieces.into_iter().filter(|(_, p)| !p.trim().is_empty()).collect();
+    pieces.truncate(CHUNK_CAP);
+    if profile.mode == ChunkMode::Code && rel_path.to_ascii_lowercase().ends_with(".json") {
+        pieces = with_json_headers(rel_path, text, pieces);
+    }
 
     pieces
         .into_iter()
-        .filter(|(_, p)| !p.trim().is_empty())
         .take(CHUNK_CAP)
         .enumerate()
         .map(|(seq, (line, text))| {
@@ -286,6 +287,195 @@ fn chunk_code(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
         chunks.push((start, current));
     }
     chunks
+}
+
+/// Keys whose string values go in a JSON chunk's header: what its numbers
+/// belong to.
+const JSON_NAME_KEYS: &[&str] = &["$Comment", "Description", "Name"];
+/// Longest key outline in a JSON chunk's header, in bytes, cut between keys.
+const JSON_KEYS_MAX: usize = 600;
+/// Longest list of names in a JSON chunk's header, in bytes, cut between names.
+const JSON_NAMES_MAX: usize = 300;
+
+/// Each JSON chunk starts with a short header: the file's path, the key
+/// paths it holds (`Weapons[].Tiers[].DamageMin`), and the `$Comment`,
+/// `Description` and `Name` strings of it and of the objects it sits in,
+/// then its raw text. On 2026-10-06 "base damage ranges for each weapon"
+/// could not find data/equipment/WeaponBases.json, whose chunks are keys and
+/// numbers only; the header says what the numbers are.
+fn with_json_headers(rel_path: &str, text: &str, pieces: Vec<(usize, String)>) -> Vec<(usize, String)> {
+    let starts: Vec<usize> = pieces.iter().map(|(line, _)| *line).collect();
+    let outline = json_outline(text, &starts);
+    pieces
+        .into_iter()
+        .zip(outline.at_start)
+        .map(|((line, body), (enclosing, ancestor_names))| {
+            let end = line + body.lines().count().saturating_sub(1);
+            let in_chunk = |l: &usize| (line..=end).contains(l);
+            let keys = std::iter::once(enclosing)
+                .filter(|p| !p.is_empty())
+                .chain(outline.keys.iter().filter(|(l, _)| in_chunk(l)).map(|(_, p)| p.clone()));
+            let names = ancestor_names
+                .into_iter()
+                .chain(outline.names.iter().filter(|(l, _)| in_chunk(l)).map(|(_, n)| n.clone()));
+            let mut header = format!("{rel_path}\nkeys: {}\n", joined_within(keys, " ", JSON_KEYS_MAX));
+            let names = joined_within(names, " · ", JSON_NAMES_MAX);
+            if !names.is_empty() {
+                header.push_str(&names);
+                header.push('\n');
+            }
+            (line, header + &body)
+        })
+        .collect()
+}
+
+/// Distinct `items` joined by `sep`, stopping before the one that would pass
+/// `max` bytes.
+fn joined_within(items: impl Iterator<Item = String>, sep: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        if item.is_empty() || !seen.insert(item.clone()) {
+            continue;
+        }
+        if !out.is_empty() && out.len() + sep.len() + item.len() > max {
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str(sep);
+        }
+        out.push_str(&item);
+    }
+    out
+}
+
+/// What [`json_outline`] reads from a JSON text.
+#[derive(Debug, Default)]
+struct JsonOutline {
+    /// (line, key path) for every key, in order.
+    keys: Vec<(usize, String)>,
+    /// (line, value) for every string under a [`JSON_NAME_KEYS`] key.
+    names: Vec<(usize, String)>,
+    /// For each asked start line: the path of the container open there, and
+    /// the names already read in the objects open there.
+    at_start: Vec<(String, Vec<String>)>,
+}
+
+/// One open object or array while reading JSON.
+struct JsonFrame {
+    array: bool,
+    /// The key this container is the value of.
+    key: Option<String>,
+    names: Vec<String>,
+}
+
+fn json_path(stack: &[JsonFrame], key: Option<&str>) -> String {
+    let mut path = String::new();
+    for frame in stack {
+        if let Some(k) = &frame.key {
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(k);
+        }
+        if frame.array {
+            path.push_str("[]");
+        }
+    }
+    if let Some(k) = key {
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(k);
+    }
+    path
+}
+
+/// Read a JSON text's keys, line by line, without parsing it into values: a
+/// file that is not quite JSON (comments, a trailing comma) still yields
+/// what it can. `starts` are the 1-based lines whose surroundings are wanted,
+/// in order.
+fn json_outline(text: &str, starts: &[usize]) -> JsonOutline {
+    let mut out = JsonOutline::default();
+    let mut stack: Vec<JsonFrame> = Vec::new();
+    // The key whose value comes next, and a string just read that is not yet
+    // known to be a key or a value.
+    let mut pending_key: Option<String> = None;
+    let mut last_string: Option<(usize, String)> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut buf = String::new();
+    let mut line = 1usize;
+    let mut next_start = 0usize;
+    let snapshot = |stack: &[JsonFrame], line: usize, next_start: &mut usize, at_start: &mut Vec<(String, Vec<String>)>| {
+        while *next_start < starts.len() && starts[*next_start] <= line {
+            at_start.push((json_path(stack, None), stack.iter().flat_map(|f| f.names.iter().cloned()).collect()));
+            *next_start += 1;
+        }
+    };
+    // A string that turned out to be a value: kept when its key is a name.
+    let value = |stack: &mut Vec<JsonFrame>, pending_key: &mut Option<String>, last: Option<(usize, String)>, names: &mut Vec<(usize, String)>| {
+        let key = pending_key.take();
+        let (Some((l, s)), Some(k)) = (last, key) else { return };
+        if JSON_NAME_KEYS.iter().any(|n| n.eq_ignore_ascii_case(&k)) && !s.trim().is_empty() {
+            if let Some(top) = stack.last_mut() {
+                top.names.push(s.clone());
+            }
+            names.push((l, s));
+        }
+    };
+    snapshot(&stack, line, &mut next_start, &mut out.at_start);
+    for c in text.chars() {
+        if c == '\n' {
+            line += 1;
+            if !in_string {
+                snapshot(&stack, line, &mut next_start, &mut out.at_start);
+            }
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+                buf.push(c);
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+                last_string = Some((line, std::mem::take(&mut buf)));
+            } else {
+                buf.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                buf.clear();
+            }
+            ':' => {
+                if let Some((l, key)) = last_string.take() {
+                    if stack.last().is_some_and(|f| !f.array) {
+                        out.keys.push((l, json_path(&stack, Some(&key))));
+                    }
+                    pending_key = Some(key);
+                }
+            }
+            '{' | '[' => {
+                last_string = None;
+                stack.push(JsonFrame { array: c == '[', key: pending_key.take(), names: Vec::new() });
+            }
+            '}' | ']' => {
+                value(&mut stack, &mut pending_key, last_string.take(), &mut out.names);
+                stack.pop();
+            }
+            ',' => value(&mut stack, &mut pending_key, last_string.take(), &mut out.names),
+            _ => {}
+        }
+    }
+    // Start lines past the end (a text with no final newline).
+    while out.at_start.len() < starts.len() {
+        out.at_start.push((String::new(), Vec::new()));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -474,6 +664,58 @@ mod tests {
             &profile,
         );
         assert_ne!(a[0].content_hash, c[0].content_hash);
+    }
+
+    #[test]
+    fn a_json_chunk_says_what_its_numbers_are() {
+        let mut text = String::from("{\n  \"$Comment\": \"Base damage per weapon, by tier.\",\n  \"Weapons\": [\n");
+        for i in 0..40 {
+            text.push_str(&format!(
+                "    {{\n      \"Name\": \"Sword {i}\",\n      \"Tiers\": [\n        {{ \"DamageMin\": {i}, \"DamageMax\": {} }}\n      ]\n    }},\n",
+                i + 5
+            ));
+        }
+        text.push_str("    { \"Name\": \"Last\" }\n  ]\n}\n");
+        let profile = IndexProfile { mode: ChunkMode::Code, target_tokens: 60, overlap_pct: 0.0 };
+        let chunks = chunk_file("data/equipment/WeaponBases.json", &text, &profile);
+        assert!(chunks.len() > 3, "{}", chunks.len());
+
+        let first = &chunks[0].text;
+        assert!(first.starts_with("data/equipment/WeaponBases.json\nkeys: $Comment Weapons Weapons[].Name Weapons[].Tiers"), "{first}");
+        assert!(first.contains("Base damage per weapon, by tier."), "{first}");
+        // The raw text is still there, after the header.
+        assert!(first.contains("\"DamageMin\": 0"), "{first}");
+
+        // A chunk from the middle knows where it sits and what holds it.
+        let mid = &chunks[2].text;
+        assert!(mid.contains("keys: Weapons[]"), "{mid}");
+        assert!(mid.contains("Weapons[].Tiers[].DamageMin"), "{mid}");
+        assert!(mid.contains("Base damage per weapon, by tier."), "the file's comment holds every chunk: {mid}");
+        // Its line is still the file line its own text starts on, the one
+        // after the three header lines (path, keys, names).
+        assert_eq!(mid.lines().nth(3).unwrap(), text.lines().nth(chunks[2].line - 1).unwrap());
+    }
+
+    #[test]
+    fn json_outline_reads_keys_names_and_what_is_open() {
+        let text = "{\n \"Bases\": {\n  \"Sword_T1\": {\n   \"MinLow\": 4,\n   \"Name\": \"Stone \\\"Crude\\\" sword\"\n  }\n },\n \"List\": [1, 2, \"x\"]\n}\n";
+        let o = json_outline(text, &[1, 4, 8]);
+        let keys: Vec<&str> = o.keys.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(keys, ["Bases", "Bases.Sword_T1", "Bases.Sword_T1.MinLow", "Bases.Sword_T1.Name", "List"]);
+        assert_eq!(o.names, vec![(5, "Stone \"Crude\" sword".to_string())]);
+        assert_eq!(o.at_start[0], (String::new(), vec![]));
+        assert_eq!(o.at_start[1].0, "Bases.Sword_T1");
+        assert_eq!(o.at_start[2].0, "", "back at the top by line 8");
+        // Not JSON at all: no keys, no panic, one answer per start line.
+        let o = json_outline("not { json [ at \" all", &[1, 9]);
+        assert!(o.keys.is_empty() && o.at_start.len() == 2);
+    }
+
+    #[test]
+    fn only_json_gets_a_header() {
+        let profile = IndexProfile::default_for("a.yaml");
+        let chunks = chunk_file("a.yaml", "Name: x\nDamage: 4\n", &profile);
+        assert_eq!(chunks[0].text, "Name: x\nDamage: 4");
     }
 
     #[test]

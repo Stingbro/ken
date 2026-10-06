@@ -886,6 +886,30 @@ mod tests {
         }
     }
 
+    /// A `.ui` file indexed when `.ui` read as binary: name only, its byte
+    /// hash stored. Once the kind says text, the next scan reads it, though
+    /// its bytes are the same.
+    #[test]
+    fn a_file_whose_kind_became_text_is_read_by_the_next_scan() {
+        let (_dir, project) = temp_project();
+        let mut db = Db::open_in_memory().unwrap();
+        fs::write(project.root.join("PartyMemberChip.ui"), "Group #NameCell { Anchor: (Width: 168); }\n").unwrap();
+        scan(&project, &mut db).unwrap();
+        let row = db.get_file("PartyMemberChip.ui").unwrap().unwrap();
+        // As an older Ken left it.
+        db.upsert_file("PartyMemberChip.ui", "binary", row.size, row.mtime, STATUS_METADATA_ONLY, None, "").unwrap();
+        db.delete_chunks("PartyMemberChip.ui").unwrap();
+        assert!(db.file_byte_hash("PartyMemberChip.ui").unwrap().is_some());
+        assert!(db.search_chunks_fts("NameCell", 5).unwrap().is_empty());
+
+        assert_eq!(db.refresh_stored_kinds().unwrap(), 1);
+        let stats = scan(&project, &mut db).unwrap();
+        assert_eq!(stats.updated, 1, "{stats:?}");
+        let row = db.get_file("PartyMemberChip.ui").unwrap().unwrap();
+        assert_eq!((row.kind.as_str(), row.status.as_str()), ("code", STATUS_INDEXED));
+        assert_eq!(db.search_chunks_fts("NameCell", 5).unwrap().first().map(|h| h.path.as_str()), Some("PartyMemberChip.ui"));
+    }
+
     #[test]
     fn indexing_enqueues_changed_files_for_extraction() {
         let (dir, project) = temp_project();
