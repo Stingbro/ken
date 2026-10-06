@@ -72,9 +72,10 @@ impl Default for IndexProfile {
 pub const PROSE_EXTS: &[&str] = &["md", "mdx", "txt", "pdf"];
 /// Source-code and other structured/dense-text extensions. See [`PROSE_EXTS`].
 pub const CODE_EXTS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "h", "cc", "cpp",
-    "hpp", "cs", "rb", "php", "swift", "kt", "kts", "sql", "sh", "bash", "ps1", "toml", "yaml",
-    "yml", "json", "css", "scss", "html", "svelte", "vue",
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "py", "go", "java", "c", "h", "cc",
+    "cpp", "hpp", "cs", "rb", "php", "swift", "kt", "kts", "gradle", "properties", "sql", "sh",
+    "bash", "ps1", "toml", "yaml", "yml", "json", "css", "scss", "html", "svelte", "vue", "ui",
+    "lang",
 ];
 
 impl IndexProfile {

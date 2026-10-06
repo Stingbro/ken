@@ -3021,8 +3021,12 @@ impl Db {
             let old_was_content = stored_kind != "binary" && stored_kind != "image";
             let gains_content = !old_was_content && new_kind.has_content();
             if gains_content {
+                // The byte hash goes too: with it, the scan sees the same
+                // bytes, takes the new mtime for a sync client's touch and
+                // never reads the file (2026-10-06: `.ui` and `.kts` rows
+                // stayed name-only after they became text).
                 tx.execute(
-                    "UPDATE files SET kind = ?2, mtime = ?3 WHERE rel_path = ?1",
+                    "UPDATE files SET kind = ?2, mtime = ?3, byte_hash = NULL WHERE rel_path = ?1",
                     params![rel, new_str, Self::REINDEX_SENTINEL_MTIME],
                 )?;
             } else {
