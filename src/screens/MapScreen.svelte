@@ -97,6 +97,7 @@
   const KINDS: { kind: EntityKind; label: string }[] = [
     { kind: "person", label: "People" },
     { kind: "organization", label: "Orgs" },
+    { kind: "repo", label: "Repos" },
     { kind: "topic", label: "Topics" },
     { kind: "decision", label: "Decisions" },
     { kind: "other", label: "Other" },
@@ -703,6 +704,7 @@
      encoding is identical everywhere. No new tokens, no literals. */
   .kind-person { --k: var(--accent); }
   .kind-organization { --k: var(--healthy); }
+  .kind-repo { --k: var(--ink-secondary); }
   .kind-topic { --k: var(--file-doc); }
   .kind-decision { --k: var(--needs-input); }
   .kind-other { --k: var(--ink-tertiary); }

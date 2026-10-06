@@ -633,7 +633,7 @@ export interface QuickAnswerDelta {
 /** A knowledge-model entity (Map node). */
 export interface EntityRow {
   id: number;
-  kind: "person" | "organization" | "topic" | "decision" | "other";
+  kind: "person" | "organization" | "repo" | "topic" | "decision" | "other";
   name: string;
   summary: string;
   /** Project-relative paths this entity is grounded in. */
@@ -704,7 +704,7 @@ export interface KnowledgeModelState {
  *  per-project set". Duplicated as a literal union here (rather than
  *  imported from `./knowledge`) to avoid a circular import back into this
  *  module — federated-kg task 3.1. */
-type EntityKind = "person" | "organization" | "topic" | "decision" | "other";
+type EntityKind = "person" | "organization" | "repo" | "topic" | "decision" | "other";
 
 /** Mirrors `WorkspaceKgMemberStatusDto` (federated-kg task 2.2) — one open
  *  member's staleness in `workspace_kg_overview`. */

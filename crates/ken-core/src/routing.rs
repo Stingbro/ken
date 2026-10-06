@@ -177,8 +177,10 @@ pub struct MemberInfo {
 /// 2. **KG-guided**: only reached if `kg.is_some()` and no member was named.
 ///    Global entities whose normalized name is contained in the normalized
 ///    query are looked up via `WorkspaceKgDb::rank_projects_for_entities`,
-///    ranked by link count then pointer density, mapped back to current
-///    members, capped at [`KG_TARGET_CAP`].
+///    ranked by link count then pointer density, then the projects of the
+///    entities Claude's map or the judge related to them (never
+///    co-occurrence), mapped back to current members, capped at
+///    [`KG_TARGET_CAP`].
 /// 3. **Broadcast**: reached when neither tier above produced a target
 ///    (`kg` is `None`, the KG read failed, no entity matched, or matched
 ///    entities' projects aren't current members). Every `index_ready`
@@ -256,14 +258,19 @@ fn kg_guided_targets(
         return None;
     }
 
-    let ranked = kg.rank_projects_for_entities(&matched_ids).ok()?;
+    // The named entities' projects first, then the projects of what Claude's
+    // map or the judge related to them; a co-occurrence edge only says two
+    // names share files, so it never steers a route.
+    let mut ranked = kg.rank_projects_for_entities(&matched_ids).ok()?;
+    let related = kg.strongly_related(&matched_ids).unwrap_or_default();
+    ranked.extend(kg.rank_projects_for_entities(&related).unwrap_or_default());
     let member_ids: HashSet<Uuid> = members.iter().map(|m| m.project_id).collect();
-    let targets: Vec<Uuid> = ranked
-        .into_iter()
-        .filter_map(|r| Uuid::parse_str(&r.project_id).ok())
-        .filter(|pid| member_ids.contains(pid))
-        .take(KG_TARGET_CAP)
-        .collect();
+    let mut targets: Vec<Uuid> = Vec::new();
+    for pid in ranked.into_iter().filter_map(|r| Uuid::parse_str(&r.project_id).ok()) {
+        if targets.len() < KG_TARGET_CAP && member_ids.contains(&pid) && !targets.contains(&pid) {
+            targets.push(pid);
+        }
+    }
     Some((targets, matched_ids))
 }
 
@@ -1025,6 +1032,35 @@ mod tests {
         assert_eq!(plan.targets[..3].len(), 3, "the graph ranks at most 3");
         assert_eq!(plan.targets.len(), 4, "then the other ready members, up to the broadcast cap");
         assert_eq!(plan.reason, RouteReason::KgEntities(vec![entity]));
+    }
+
+    /// The graph steers by what Claude or the judge related to a named
+    /// entity; a co-occurrence edge (two names in the same files) does not.
+    #[test]
+    fn a_route_follows_claudes_and_judged_edges_not_cooccurrence() {
+        let kg = WorkspaceKgDb::open_in_memory().unwrap();
+        let named = kg.insert_global_entity("topic", "Balance Studio", "a tools app", 1).unwrap();
+        let by_claude = kg.insert_global_entity("repo", "Tools", "the authoring suite", 1).unwrap();
+        let by_files = kg.insert_global_entity("topic", "Patchlines", "update channels", 1).unwrap();
+        let (p1, p2, p3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        kg.insert_entity_link(named, p1, 1, "Balance Studio").unwrap();
+        kg.insert_entity_link(by_claude, p2, 2, "Tools").unwrap();
+        kg.insert_entity_link(by_files, p3, 3, "Patchlines").unwrap();
+        kg.insert_global_edge(named, by_claude, "app in", 1.0, "imported").unwrap();
+        kg.insert_global_edge(named, by_files, "related", 2.0, "cooccur").unwrap();
+        // p2 is the least active member, so only Claude's edge puts it ahead
+        // of p4; p3 is still indexing, so the broadcast fill cannot add it
+        // either: only the graph could, and its co-occurrence edge must not.
+        let p4 = Uuid::new_v4();
+        let members = vec![
+            member(p1, "Wiki", true, 10),
+            member(p2, "Docs", true, 5),
+            member(p3, "Ref", false, 900),
+            member(p4, "Site", true, 300),
+        ];
+        let plan = plan_route("what changed in balance studio?", &members, Some(&kg));
+        assert_eq!(plan.targets, vec![p1, p2, p4]);
+        assert_eq!(plan.reason, RouteReason::KgEntities(vec![named]));
     }
 
     /// A code repo is never in the graph: a question about an entity the

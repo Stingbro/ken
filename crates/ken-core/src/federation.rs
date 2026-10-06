@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::Db;
+use crate::knowledge_model::{is_activity_label, is_bot_or_agent};
 use crate::runner::CancelToken;
 use crate::workspace_kg_db::WorkspaceKgDb;
 use crate::{Error, Result};
@@ -33,7 +34,8 @@ use crate::{Error, Result};
 pub struct SnapshotEntity {
     /// Row id in the member's own `entities` table — NOT a global id.
     pub local_id: i64,
-    /// `person` | `organization` | `topic` | `decision` | `other`.
+    /// One of `knowledge_model::ENTITY_KINDS` (person, organization, repo,
+    /// topic, decision, other).
     pub kind: String,
     pub name: String,
     pub summary: String,
@@ -159,6 +161,11 @@ const MAX_EDIT_DISTANCE: usize = 2;
 /// Shortest token length that counts as a "shared token" near-miss signal —
 /// avoids pairing on stop-word-length fragments.
 const MIN_SHARED_TOKEN_LEN: usize = 2;
+/// Two entities co-occur only when at least this many files name them both.
+/// Measured 2026-10-06: one shared file made 557 of the dry run's 610
+/// co-occurrence edges (a roster page alone pairs everyone on it), drowning
+/// Claude's 96; two shared files leave 53.
+const MIN_SHARED_FILES: f64 = 2.0;
 
 /// The optional LLM seam for federation's garnish passes (design D5: summary
 /// merge, near-miss adjudication, typed-relation linking). A thin `&self`,
@@ -297,6 +304,11 @@ fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (mi, snap) in snapshots.iter().enumerate() {
         for e in &snap.entities {
+            // A member mapped before bots were dropped still holds them: a
+            // bot left out here takes its edges and co-occurrences with it.
+            if e.kind == "person" && is_bot_or_agent(&e.name) {
+                continue;
+            }
             let name = normalize_name(&e.name);
             let same_name = by_name.entry(name).or_default();
             let found = same_name.iter().copied().find(|&ci| kinds_agree(&clusters[ci].kind, &e.kind));
@@ -821,7 +833,9 @@ fn merge_snapshots(
             ) else {
                 continue;
             };
-            if sa == sb {
+            // Commit counts are git statistics, not knowledge (a member mapped
+            // before the parser dropped them still holds them).
+            if sa == sb || is_activity_label(&e.label) {
                 continue;
             }
             *imported.entry((sa, sb, e.label.clone())).or_insert(0.0) += 1.0;
@@ -853,6 +867,13 @@ fn merge_snapshots(
             }
         }
     }
+    // A pair co-occurs only from MIN_SHARED_FILES shared files, and only when
+    // Claude has not already said how the two relate: its edge says more than
+    // "related" does. Measured 2026-10-06: 65 of the dry run's 610
+    // co-occurrence pairs repeated a pair Claude had already related.
+    let claude_pairs: HashSet<(usize, usize)> =
+        imported.keys().map(|(a, b, _)| (*a.min(b), *a.max(b))).collect();
+    cooccur.retain(|pair, shared| *shared >= MIN_SHARED_FILES && !claude_pairs.contains(pair));
 
     // --- optional typed-relation linking pass (task 1.5): top co-occurring
     // pairs get an `llm`-provenance edge with a proposed relation; without a
@@ -888,7 +909,9 @@ fn merge_snapshots(
                 Err(_) => vec!["related".to_string(); ranked.len()],
             };
             for (k, &(pair, _)) in ranked.iter().enumerate() {
-                llm_relations.insert(pair, relations[k].clone());
+                if !is_activity_label(&relations[k]) {
+                    llm_relations.insert(pair, relations[k].clone());
+                }
             }
         }
     }
@@ -904,7 +927,8 @@ fn merge_snapshots(
             provenance: "imported",
         });
     }
-    for (&(src, dst), &weight) in &cooccur {
+    // A judged pair keeps the judge's relation in place of a plain "related".
+    for (&(src, dst), &weight) in cooccur.iter().filter(|(pair, _)| !llm_relations.contains_key(*pair)) {
         edges.push(PlannedEdge {
             src,
             dst,
@@ -1432,7 +1456,9 @@ mod tests {
                 global_entities: 4,
                 entity_links: 5,
                 imported_edges: 1,
-                cooccur_edges: 4,
+                // Every co-mention here is a single shared file: none is
+                // enough for a co-occurrence edge (MIN_SHARED_FILES).
+                cooccur_edges: 0,
                 llm_edges: 0,
                 llm_passes: false,
             }
@@ -1458,7 +1484,7 @@ mod tests {
         let imported: Vec<_> = edges.iter().filter(|e| e.provenance == "imported").collect();
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].relation, "led by");
-        assert_eq!(edges.iter().filter(|e| e.provenance == "cooccur").count(), 4);
+        assert_eq!(edges.iter().filter(|e| e.provenance == "cooccur").count(), 0);
         assert!(edges.iter().all(|e| e.provenance != "llm"));
 
         // Pointer integrity: every pointer resolves to a real member source
@@ -1544,6 +1570,118 @@ mod tests {
         assert_eq!(kg.list_global_entities().unwrap().len(), 4, "graph must be unchanged");
     }
 
+    fn ent(local_id: i64, kind: &str, name: &str, sources: &[&str]) -> SnapshotEntity {
+        SnapshotEntity {
+            local_id,
+            kind: kind.into(),
+            name: name.into(),
+            summary: format!("{name}."),
+            sources: sources.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn edge(a: i64, b: i64, label: &str) -> SnapshotEdge {
+        SnapshotEdge { a, b, label: label.into() }
+    }
+
+    /// `(provenance, relation, src name, dst name)` for every planned edge.
+    fn planned(plan: &MergePlan) -> Vec<(&'static str, String, String, String)> {
+        plan.edges
+            .iter()
+            .map(|e| (e.provenance, e.relation.clone(), plan.clusters[e.src].name.clone(), plan.clusters[e.dst].name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn bots_and_commit_counts_never_reach_the_workspace_graph() {
+        // A member mapped before the parser learned these rules.
+        let snap = MemberSnapshot {
+            project_id: pa(),
+            watermark: Some(1),
+            entities: vec![
+                ent(1, "person", "Chris", &["Team.md"]),
+                ent(2, "person", "Claude", &["Team.md"]),
+                ent(3, "person", "Hytale Sync Bot", &["Team.md"]),
+                ent(4, "other", "Shattered-Realms", &["Team.md"]),
+                ent(5, "topic", "Claude", &["Tools.md"]),
+            ],
+            edges: vec![
+                edge(1, 4, "top committer"),
+                edge(1, 4, "owns"),
+                edge(2, 4, "commits to"),
+                edge(3, 4, "syncs"),
+            ],
+        };
+        let plan = merge_snapshots(&[snap], None, &CancelToken::new()).unwrap().unwrap();
+        let names: Vec<(&str, &str)> = plan.clusters.iter().map(|c| (c.kind.as_str(), c.name.as_str())).collect();
+        assert_eq!(names, vec![("person", "Chris"), ("other", "Shattered-Realms"), ("topic", "Claude")]);
+        assert_eq!(planned(&plan), vec![("imported", "owns".into(), "Chris".into(), "Shattered-Realms".into())]);
+    }
+
+    /// Five topics: A and B share two files, A and C one, A and D two (but
+    /// Claude related A and D), B and E two.
+    fn cooccur_snapshot() -> MemberSnapshot {
+        MemberSnapshot {
+            project_id: pa(),
+            watermark: Some(1),
+            entities: vec![
+                ent(1, "topic", "Alpha", &["x.md", "y.md", "z.md"]),
+                ent(2, "topic", "Beta", &["x.md", "y.md", "w.md", "v.md"]),
+                ent(3, "topic", "Gamma", &["x.md"]),
+                ent(4, "topic", "Delta", &["y.md", "z.md"]),
+                ent(5, "topic", "Epsilon", &["w.md", "v.md"]),
+            ],
+            edges: vec![edge(1, 4, "depends on")],
+        }
+    }
+
+    #[test]
+    fn cooccurrence_needs_two_shared_files_and_yields_to_claudes_edge() {
+        let plan = merge_snapshots(&[cooccur_snapshot()], None, &CancelToken::new()).unwrap().unwrap();
+        assert_eq!(
+            planned(&plan),
+            vec![
+                ("imported", "depends on".into(), "Alpha".into(), "Delta".into()),
+                ("cooccur", "related".into(), "Alpha".into(), "Beta".into()),
+                ("cooccur", "related".into(), "Beta".into(), "Epsilon".into()),
+            ],
+            "Alpha-Gamma share one file; Alpha-Delta already has Claude's edge"
+        );
+    }
+
+    /// Answers the linking pass for the first pair only; adjudicates nothing.
+    struct LinkFirstLlm;
+    impl FederationLlm for LinkFirstLlm {
+        fn complete(&self, _prompt: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn judge(&self, prompt: &str) -> Result<String> {
+            if prompt.contains("SHORT relation phrase") {
+                Ok(r#"[{"i":0,"relation":"documents"},{"i":1,"relation":"one commit"}]"#.into())
+            } else {
+                Ok("[]".into())
+            }
+        }
+    }
+
+    #[test]
+    fn a_judged_pair_replaces_its_cooccurrence_edge() {
+        let llm = LinkFirstLlm;
+        let plan = merge_snapshots(&[cooccur_snapshot()], Some(&llm as &dyn FederationLlm), &CancelToken::new())
+            .unwrap()
+            .unwrap();
+        // Alpha-Beta was judged: its "related" gives way. Beta-Epsilon's
+        // judged relation was a commit count, so it stays plain co-occurrence.
+        assert_eq!(
+            planned(&plan),
+            vec![
+                ("imported", "depends on".into(), "Alpha".into(), "Delta".into()),
+                ("cooccur", "related".into(), "Beta".into(), "Epsilon".into()),
+                ("llm", "documents".into(), "Alpha".into(), "Beta".into()),
+            ]
+        );
+    }
+
     /// Deterministic in-process LLM stub (no model, no network): merges the one
     /// near-miss pair and returns a fixed merged summary. Exercises the tier-2
     /// union + summary-merge wiring that `llm = None` never reaches.
@@ -1606,5 +1744,110 @@ mod tests {
         let g = &kg.list_global_entities().unwrap()[0];
         assert_eq!(g.summary, "Merged: the Shattered Realms game.");
         assert_eq!(kg.get_meta("llm_passes").unwrap().as_deref(), Some("true"));
+    }
+
+    /// Replays the recorded judge: each linking pair gets the relation the
+    /// recorded build stored for it; a pair it never judged is left out (so
+    /// it falls back to "related") and counted; nothing is merged.
+    struct ReplayLlm {
+        recorded: HashMap<(String, String), String>,
+        unjudged: std::cell::Cell<usize>,
+    }
+    impl FederationLlm for ReplayLlm {
+        fn complete(&self, _prompt: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn judge(&self, prompt: &str) -> Result<String> {
+            if !prompt.contains("SHORT relation phrase") {
+                return Ok("[]".into());
+            }
+            let strip_kind = |s: &str| s.rfind(" (").map(|i| s[..i].to_string()).unwrap_or_else(|| s.to_string());
+            let mut out = Vec::new();
+            for line in prompt.lines() {
+                let Some((i, rest)) = line.split_once(". A: ") else { continue };
+                let Ok(i) = i.trim().parse::<usize>() else { continue };
+                let Some((a, b)) = rest.split_once(" | B: ") else { continue };
+                let (a, b) = (strip_kind(a), strip_kind(b));
+                let found = self.recorded.get(&(a.clone(), b.clone())).or_else(|| self.recorded.get(&(b, a)));
+                match found {
+                    Some(r) => out.push(serde_json::json!({"i": i, "relation": r})),
+                    None => self.unjudged.set(self.unjudged.get() + 1),
+                }
+            }
+            Ok(serde_json::Value::Array(out).to_string())
+        }
+    }
+
+    /// Read-only replay of a recorded workspace build under today's rules.
+    /// `KEN_DRYRUN_KG` names a COPY of a workspace's kg.sqlite (opening runs
+    /// the schema check, so never point it at a live file). Re-merges the
+    /// cached member snapshots, replaying the recorded judge, and prints the
+    /// before/after counts by kind and edge label. Run with
+    /// `-- --ignored --nocapture federation::tests::dry_run_replay_report`.
+    #[test]
+    #[ignore = "needs KEN_DRYRUN_KG: a copy of a recorded kg.sqlite"]
+    fn dry_run_replay_report() {
+        let path = std::env::var("KEN_DRYRUN_KG").expect("KEN_DRYRUN_KG");
+        let kg = WorkspaceKgDb::open_at(std::path::Path::new(&path)).unwrap();
+        let count = |items: Vec<String>| -> BTreeMap<String, usize> {
+            let mut m = BTreeMap::new();
+            for i in items {
+                *m.entry(i).or_insert(0) += 1;
+            }
+            m
+        };
+
+        let globals = kg.list_global_entities().unwrap();
+        let name_of: HashMap<i64, String> = globals.iter().map(|g| (g.id, g.name.clone())).collect();
+        let edges = kg.list_all_edges().unwrap();
+        let mut recorded = HashMap::new();
+        for e in edges.iter().filter(|e| e.provenance == "llm") {
+            recorded.insert((name_of[&e.src_global_id].clone(), name_of[&e.dst_global_id].clone()), e.relation.clone());
+        }
+        println!("BEFORE: {} entities, {} edges", globals.len(), edges.len());
+        println!("  kinds: {:?}", count(globals.iter().map(|g| g.kind.clone()).collect()));
+        println!("  people: {:?}", globals.iter().filter(|g| g.kind == "person").map(|g| g.name.as_str()).collect::<Vec<_>>());
+        println!("  edges by provenance: {:?}", count(edges.iter().map(|e| e.provenance.clone()).collect()));
+        println!(
+            "  imported labels: {:?}",
+            count(edges.iter().filter(|e| e.provenance == "imported").map(|e| e.relation.clone()).collect())
+        );
+
+        let snapshots: Vec<MemberSnapshot> = kg
+            .list_cached_project_ids()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                let row = kg.get_snapshot(Uuid::parse_str(id).unwrap()).unwrap().unwrap();
+                serde_json::from_str(&row.snapshot).unwrap()
+            })
+            .collect();
+        let llm = ReplayLlm { recorded, unjudged: std::cell::Cell::new(0) };
+        let plan = merge_snapshots(&snapshots, Some(&llm as &dyn FederationLlm), &CancelToken::new())
+            .unwrap()
+            .unwrap();
+        println!("AFTER: {} entities, {} edges", plan.clusters.len(), plan.edges.len());
+        println!("  kinds: {:?}", count(plan.clusters.iter().map(|c| c.kind.clone()).collect()));
+        println!(
+            "  people: {:?}",
+            plan.clusters.iter().filter(|c| c.kind == "person").map(|c| c.name.as_str()).collect::<Vec<_>>()
+        );
+        println!("  edges by provenance: {:?}", count(plan.edges.iter().map(|e| e.provenance.to_string()).collect()));
+        println!(
+            "  imported labels: {:?}",
+            count(plan.edges.iter().filter(|e| e.provenance == "imported").map(|e| e.relation.clone()).collect())
+        );
+        println!("  judged pairs the recorded build never judged (fell back to \"related\"): {}", llm.unjudged.get());
+        let dropped: Vec<&str> = globals
+            .iter()
+            .filter(|g| !plan.clusters.iter().any(|c| c.name == g.name && c.kind == g.kind))
+            .map(|g| g.name.as_str())
+            .collect();
+        println!("  entities dropped: {dropped:?}");
+        let plain = merge_snapshots(&snapshots, None, &CancelToken::new()).unwrap().unwrap();
+        println!(
+            "WITHOUT A JUDGE: edges by provenance: {:?}",
+            count(plain.edges.iter().map(|e| e.provenance.to_string()).collect())
+        );
     }
 }

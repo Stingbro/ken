@@ -149,6 +149,7 @@
   }
   .kind-person { --k: var(--accent); }
   .kind-organization { --k: var(--healthy); }
+  .kind-repo { --k: var(--ink-secondary); }
   .kind-topic { --k: var(--file-doc); }
   .kind-decision { --k: var(--needs-input); }
   .kind-other { --k: var(--ink-tertiary); }
