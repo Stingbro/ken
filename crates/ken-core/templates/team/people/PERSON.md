@@ -1,6 +1,8 @@
 ---
 id: {{handle}}
 name: {{Full Name}}
+emails: [{{every address you commit from}}]
+aliases: [{{every other name you commit or are known under}}]
 persona: {{Plan | Build | Lead | Design | All}}   # for THIS team; can differ per team
   # which surfaces open first. Decides what you see, never what is required.
 ---
