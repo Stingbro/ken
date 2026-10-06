@@ -2,16 +2,18 @@
 //! 4b). Offered, never forced: Claude reads the repos (briefs by section,
 //! READMEs, build files, top docs, layout, imports, changelogs by version,
 //! who has committed recently), and any folder of documents a person adds (a
-//! Confluence export, say), and drafts the Current pages, the architecture
-//! page and a first business doc, the release notes, for a person to review.
+//! Confluence export, say), and drafts the pages the templates README says
+//! Ken drafts (Current, Conventions, Platform, Reference, the release notes),
+//! a Repo Map page for every repo and an architecture page for every code
+//! repo, for a person to review.
 //!
 //! Four rules keep it honest:
 //! - A page a person wrote is never touched. A page is drafted only when it
 //!   is missing or is still an untouched template (it has `{{…}}` left).
 //! - Every drafted page is `status: draft` with no `verified:` date, so the
 //!   age rule keeps raising it until someone reads it against its sources.
-//! - Every page names the sources it came from, in its frontmatter and its
-//!   first line, as `repo:path` locators.
+//! - Every page names the sources it came from, in its frontmatter and
+//!   inline, as `repo:path` locators.
 //! - Every repo path a drafted page names is checked against what git
 //!   tracks, and a page naming one the checkout lacks goes back once.
 //!
@@ -55,10 +57,13 @@ pub struct Source {
 }
 
 /// The pages drafted, in order: (path in the wiki, what the page is for).
+/// The library pages the templates README says Ken drafts; a repo's own
+/// pages are [`REPO_MAP`] and [`KIND_PAGES`].
 pub const PAGES: &[(&str, &str)] = &[
     (
         "Current/Project.md",
-        "what the project is and does, for someone who never reads code: the product, who it is for, the goal and the next milestone",
+        "what the product is and what it does for the people who use it, for someone who never reads code, from the READMEs and briefs; \
+         who it is for, the goal and what is out of scope only where a source says so",
     ),
     (
         "Current/Team.md",
@@ -71,9 +76,34 @@ pub const PAGES: &[(&str, &str)] = &[
          git adds only a column of who has committed to each area recently (the recent contributors by folder), never an owner",
     ),
     (
-        "Conventions/ARCHITECTURE.md",
-        "the system's layers: what lives where, what may call what, the entry points, with a mermaid diagram; \
-         name every pair of folders the code has importing each other",
+        "Current/Feature-Status.md",
+        "each feature, from the changelog and the code that registers it, with the tests that name it and the commit read; \
+         whether it was used in the running product is a person's to say",
+    ),
+    (
+        "Conventions/Architecture.md",
+        "how the code repos fit together: each code repo, what it builds, which repos import or call which and how, with a mermaid diagram; \
+         each repo's own layers are on its page, `Conventions/Architecture-<repo>.md`, so link it rather than repeat it",
+    ),
+    (
+        "Conventions/Code.md",
+        "the code conventions the tools enforce, from the lint and formatter config, and the helpers that exist and where they live",
+    ),
+    (
+        "Conventions/Data-and-Config.md",
+        "the data and config folders, their formats and the code that loads each",
+    ),
+    (
+        "Conventions/Testing.md",
+        "the test suites and how each is run, from `.ken/gates.json` and the test config, and the fixture folders",
+    ),
+    (
+        "Conventions/Registries.md",
+        "the registries in the code (installers, routes, command lists): where each is and what registers in it",
+    ),
+    (
+        "Platform/Index.md",
+        "one row per reference repo and pinned dependency: what it is, the version pinned and where the pin is",
     ),
     (
         "Work/Releases.md",
@@ -81,9 +111,23 @@ pub const PAGES: &[(&str, &str)] = &[
          first an Unreleased section of what landed since the newest tag, grouped by what it does for the user, from the changes since it",
     ),
     (
-        "Vocabulary.md",
-        "the team's words, both directions: each term the team, the client or the business uses, what it means in plain words, \
-         and the word the code or the platform uses for it where that differs; glossaries first",
+        "Reference/Systems.md",
+        "one row per system, from the code that registers it: its code and data paths, and the rulings (D-nnn) its code cites",
+    ),
+    (
+        "Reference/Config-Map.md",
+        "every config file and key, its default, and the code that reads it",
+    ),
+    (
+        "Reference/Build-and-Run.md",
+        "per repo: the tools and versions the build files pin, the scripts and tasks the build files define, \
+         the `.ken/gates.json` commands, and the environment variables the code reads",
+    ),
+    (
+        "Reference/Vocabulary.md",
+        "the traps where a search in one word misses a page in another, and nothing else: a word the team, the users or the briefs use \
+         that differs from the code's or the platform's word; a word with two meanings; a rename, from commit messages and the briefs. \
+         A word that means what it says gets no row; glossaries first",
     ),
 ];
 
@@ -976,7 +1020,6 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
          - Use only what the sources below say. Where they say nothing, write `(not in the sources yet)` rather than guess.\n\
          - Cite sources inline as their labels in backticks, e.g. `ken:README.md`, once at the end of each paragraph, list item or table row, for every source it used.\n\
          - Frontmatter: keep the template's keys; set `status: draft`; set `updated: {today}`; do NOT write a `verified:` line (a person verifies it later); list every source you used under `sources:` as its label.\n\
-         - The first line under the title says: Drafted by Ken on {today} from the sources listed; not yet verified by a person.\n\
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
          - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
          - A source labelled `repo:FILE:line` is the part of FILE that starts at that line; cite it by that label.\n\
@@ -1420,7 +1463,7 @@ pub fn placeholders_left(wiki: &Path) -> Vec<String> {
     let pages = crate::wikinew::TEMPLATE
         .iter()
         .map(|(p, _)| *p)
-        .filter(|p| p.ends_with(".md") && !crate::wikinew::is_copy_template(p));
+        .filter(|p| p.ends_with(".md") && !p.starts_with("Templates/"));
     for page in pages {
         let Ok(text) = fs::read_to_string(wiki.join(page)) else { continue };
         for line in text.lines().filter(|l| !l.trim_start().starts_with("verified:")) {
@@ -1523,20 +1566,38 @@ fn draft_pages(
     check: &PathCheck,
 ) -> Result<()> {
     for (page, purpose) in pages {
-        let path = wiki.join(page);
-        let existing = fs::read_to_string(&path).ok();
-        if !may_draft(existing.as_deref()) {
-            report.kept.push(page.clone());
-            continue;
+        draft_page(wiki, page, purpose, None, sources, today, report, generate, check)?;
+    }
+    Ok(())
+}
+
+/// Draft `page` unless the wiki already has it, from the page itself while
+/// it is a template, else from `blank` (a copy of a `Templates/` blank).
+#[allow(clippy::too_many_arguments)]
+fn draft_page(
+    wiki: &Path,
+    page: &str,
+    purpose: &str,
+    blank: Option<&str>,
+    sources: &[Source],
+    today: &str,
+    report: &mut DraftReport,
+    generate: &mut impl FnMut(&str) -> Result<String>,
+    check: &PathCheck,
+) -> Result<()> {
+    let path = wiki.join(page);
+    let existing = fs::read_to_string(&path).ok();
+    if !may_draft(existing.as_deref()) {
+        report.kept.push(page.to_string());
+        return Ok(());
+    }
+    match generate(&prompt(page, purpose, existing.as_deref().or(blank), sources, today)).and_then(|r| finish(&r)) {
+        Ok(text) => {
+            let text = check_paths(page, text, check, report, generate);
+            write_page(&path, &text)?;
+            report.drafted.push(page.to_string());
         }
-        match generate(&prompt(page, purpose, existing.as_deref(), sources, today)).and_then(|r| finish(&r)) {
-            Ok(text) => {
-                let text = check_paths(page, text, check, report, generate);
-                write_page(&path, &text)?;
-                report.drafted.push(page.clone());
-            }
-            Err(e) => report.failed.push((page.clone(), e.to_string())),
-        }
+        Err(e) => report.failed.push((page.to_string(), e.to_string())),
     }
     Ok(())
 }
@@ -1688,6 +1749,55 @@ pub fn repo_page(name: &str) -> String {
     format!("{REPO_MAP}/{}.md", crate::workspace::member_leaf(name))
 }
 
+/// A repo's own pages beside its Repo Map page, by its kind, each from a
+/// blank in `Templates/` and copied where `Templates/Index.md` says: (the
+/// kind, the blank, where the copy goes with `{}` for the repo, the blank's
+/// placeholders that are the repo's name, what the page is for). A code repo
+/// gets its layers; a reference repo, which the team reads and never
+/// changes, gets a dependency page and never an architecture page.
+pub const KIND_PAGES: &[(crate::registry::RepoKind, &str, &str, &[&str], &str)] = &[
+    (
+        crate::registry::RepoKind::Code,
+        "Templates/Repo-Architecture.md",
+        "Conventions/Architecture-{}.md",
+        &["{{Repo}}", "{{repo}}"],
+        "one code repo's layers: each layer, the folder it lives in, what it holds and which layers it may call; \
+         what must never call what, and why where a source says; every pair of folders the code has importing each other, as a known gap; \
+         the checks that enforce a layer rule; and a mermaid diagram",
+    ),
+    (
+        crate::registry::RepoKind::Reference,
+        "Templates/Dependency.md",
+        "Platform/{}.md",
+        &["{{Dependency Name}}", "{{dependency}}"],
+        "one reference repo the team reads and never changes: what it is, the version pinned and where the pin is, \
+         where its source, docs and data live, and its licence; its quirks and update procedure only where a source says",
+    ),
+];
+
+/// The pages of [`KIND_PAGES`] a repo of `kinds` gets: (page, blank, purpose).
+pub fn kind_pages(name: &str, kinds: &[crate::registry::RepoKind]) -> Vec<(String, &'static str, &'static str)> {
+    use crate::registry::RepoKind;
+    let leaf = crate::workspace::member_leaf(name);
+    KIND_PAGES
+        .iter()
+        .filter(|(k, ..)| kinds.contains(k) && !(*k == RepoKind::Code && kinds.contains(&RepoKind::Reference)))
+        .map(|(_, blank, at, _, purpose)| (at.replace("{}", leaf), *blank, *purpose))
+        .collect()
+}
+
+/// The blank a repo's page is drafted from: the wiki's own copy of it, else
+/// the bundled one, with the repo's name filled in.
+fn blank_for(wiki: &Path, blank: &str, name: &str) -> String {
+    let text = fs::read_to_string(wiki.join(blank))
+        .ok()
+        .or_else(|| crate::wikinew::TEMPLATE.iter().find(|(p, _)| *p == blank).map(|(_, t)| t.to_string()))
+        .unwrap_or_default();
+    let leaf = crate::workspace::member_leaf(name);
+    let names = KIND_PAGES.iter().find(|(_, b, ..)| *b == blank).map_or(&[][..], |(_, _, _, n, _)| *n);
+    names.iter().fold(text, |t, p| t.replace(p, leaf))
+}
+
 /// The Repo Map's index: a table of every repo page with what it is for.
 /// Written by Ken, not the model: it is a list, and a list has no facts to
 /// get wrong.
@@ -1818,10 +1928,18 @@ pub fn team_sources(wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)], e
 fn page_topics(page: &str) -> &'static [Topic] {
     match page {
         "Current/Project.md" => &[Topic::Project],
+        "Current/Feature-Status.md" => &[Topic::Project, Topic::Releases],
         "Current/Team.md" | "Current/Who-Does-What.md" => &[Topic::People],
-        "Conventions/ARCHITECTURE.md" => &[Topic::Architecture],
+        "Conventions/Architecture.md"
+        | "Conventions/Code.md"
+        | "Conventions/Data-and-Config.md"
+        | "Conventions/Registries.md"
+        | "Platform/Index.md"
+        | "Reference/Systems.md"
+        | "Reference/Config-Map.md" => &[Topic::Architecture],
+        "Conventions/Testing.md" | "Reference/Build-and-Run.md" => &[Topic::Build],
         "Work/Releases.md" => &[Topic::Releases],
-        "Vocabulary.md" => &[Topic::Vocabulary],
+        "Reference/Vocabulary.md" => &[Topic::Vocabulary],
         _ => &[],
     }
 }
@@ -1889,7 +2007,7 @@ pub fn page_sources(page: &str, wiki: &Path, wiki_name: &str, repos: &[(String, 
                     push(format!("{name}:(version tags, newest first)"), newest.join("\n"), &mut mine);
                 }
             }
-            "Conventions/ARCHITECTURE.md" => {
+            "Conventions/Architecture.md" => {
                 let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
                 if !reference {
                     if let Some(d) = folder_imports(root) {
@@ -1932,7 +2050,8 @@ fn dedup_labels(labels: &mut Vec<String>) {
     labels.retain(|l| seen.insert(l.clone()));
 }
 
-/// Pass one: each repo's Repo Map page, from that repo alone.
+/// Pass one: each repo's Repo Map page and its pages by kind
+/// ([`kind_pages`]), from that repo alone.
 fn draft_repo_pages(
     wiki: &Path,
     repos: &[(String, PathBuf)],
@@ -1942,15 +2061,25 @@ fn draft_repo_pages(
     check: &PathCheck,
 ) -> Result<()> {
     for (name, root) in repos {
-        let page = repo_page(name);
-        // A page a person keeps is not drafted, so its sources are not read.
-        if !may_draft(fs::read_to_string(wiki.join(&page)).ok().as_deref()) {
-            report.kept.push(page);
-            continue;
+        let mut pages = vec![(repo_page(name), REPO_PURPOSE, None)];
+        for (page, blank, purpose) in kind_pages(name, &crate::registry::kind_of(root)) {
+            pages.push((page, purpose, Some(blank_for(wiki, blank, name))));
         }
-        let sources = gather_repo(name, root);
-        report.sources.extend(sources.iter().map(|s| s.label.clone()));
-        draft_pages(wiki, &[(page, REPO_PURPOSE.to_string())], &sources, today, report, generate, check)?;
+        let mut sources: Option<Vec<Source>> = None;
+        for (page, purpose, blank) in pages {
+            // A page a person keeps is not drafted, so its sources are not read.
+            if !may_draft(fs::read_to_string(wiki.join(&page)).ok().as_deref()) {
+                report.kept.push(page);
+                continue;
+            }
+            if sources.is_none() {
+                let read = gather_repo(name, root);
+                report.sources.extend(read.iter().map(|s| s.label.clone()));
+                sources = Some(read);
+            }
+            let sources = sources.as_deref().unwrap_or_default();
+            draft_page(wiki, &page, purpose, blank.as_deref(), sources, today, report, generate, check)?;
+        }
     }
     Ok(())
 }
@@ -1981,9 +2110,9 @@ fn draft_team_pages(
 }
 
 /// Draft a team's wiki: a Repo Map page per repo (each from that repo
-/// alone), the Repo Map index, then the team pages of [`PAGES`] from the
-/// repo pages and descriptions. `repos` are the team's repos, the wiki
-/// itself left out. The result is kept for the Team screen.
+/// alone) and its pages by kind, the Repo Map index, then the team pages of
+/// [`PAGES`] from the repo pages and descriptions. `repos` are the team's
+/// repos, the wiki itself left out. The result is kept for the Team screen.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_team(
     wiki: &Path,
@@ -2062,12 +2191,13 @@ impl Proposal {
 
 /// Pages a new repo changes, and what each should gain.
 const ON_ADD: &[(&str, &str)] = &[
-    ("Conventions/ARCHITECTURE.md", "work the new repos into the layers, what may call what, and the diagram"),
+    ("Conventions/Architecture.md", "work the new repos into the repo table, what may call what, and the diagram"),
     ("Current/Who-Does-What.md", "add who owns each new repo and who to ask"),
     ("Current/Project.md", "say what the new repos add to the project, only if they change what it is or does"),
     (
-        "Vocabulary.md",
-        "add a row to the word table for each term the new repos use for something the team already names differently",
+        "Reference/Vocabulary.md",
+        "add a row for each trap the new repos bring: a word they use for something the team already names differently, \
+         a word with two meanings, a rename; never a word that means what it says",
     ),
 ];
 
@@ -2362,6 +2492,37 @@ mod tests {
     }
 
     #[test]
+    fn a_code_repo_gets_its_layers_page_and_a_reference_repo_a_dependency_page() {
+        use crate::registry::RepoKind;
+        let pages = |kinds: &[RepoKind]| kind_pages("team/Game", kinds).into_iter().map(|(p, b, _)| (p, b)).collect::<Vec<_>>();
+        let arch = ("Conventions/Architecture-Game.md".to_string(), "Templates/Repo-Architecture.md");
+        assert_eq!(pages(&[RepoKind::Code]), vec![arch]);
+        assert_eq!(pages(&[RepoKind::Reference]), vec![("Platform/Game.md".to_string(), "Templates/Dependency.md")]);
+        assert_eq!(pages(&[RepoKind::Code, RepoKind::Reference]).len(), 1, "a reference repo never gets an architecture page");
+        assert!(pages(&[RepoKind::Team]).is_empty() && pages(&[]).is_empty());
+
+        // The blank, its repo named, is the template while the page is missing.
+        let wiki = tempfile::tempdir().unwrap();
+        let blank = blank_for(wiki.path(), "Templates/Repo-Architecture.md", "team/Game");
+        assert!(blank.contains("title: \"Game Architecture\"") && !blank.contains("{{Repo}}") && blank.contains("{{layer name}}"));
+        let dep = blank_for(wiki.path(), "Templates/Dependency.md", "Engine");
+        assert!(dep.contains("# Engine\n") && dep.contains("[[{{Repo}} Architecture]]"), "a code repo's placeholder stays");
+        let sources = vec![Source { label: "Game:README.md".into(), text: "A game.".into() }];
+        let mut report = DraftReport::default();
+        let mut sent = String::new();
+        let mut generate = |p: &str| {
+            sent = p.to_string();
+            Ok("---\ntitle: Game Architecture\n---\n# Game Architecture\n".to_string())
+        };
+        let page = "Conventions/Architecture-Game.md";
+        draft_page(wiki.path(), page, "layers", Some(&blank), &sources, "2026-10-06", &mut report, &mut generate, &PathCheck::default())
+            .unwrap();
+        assert!(sent.contains("TEMPLATE (fill it in") && sent.contains("# Game Architecture"));
+        assert!(!sent.contains("Drafted by Ken on"), "no byline");
+        assert_eq!(report.drafted, vec![page]);
+    }
+
+    #[test]
     fn a_wiki_is_drafted_around_what_a_person_wrote() {
         let wiki = tempfile::tempdir().unwrap();
         fs::create_dir_all(wiki.path().join("Current")).unwrap();
@@ -2376,19 +2537,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report.kept, vec!["Current/Team.md"]);
-        assert_eq!(
-            report.drafted,
-            vec!["Current/Project.md", "Current/Who-Does-What.md", "Conventions/ARCHITECTURE.md", "Work/Releases.md", "Vocabulary.md"]
-        );
+        let others: Vec<&str> = PAGES.iter().map(|(p, _)| *p).filter(|p| *p != "Current/Team.md").collect();
+        assert_eq!(report.drafted, others);
         assert!(prompts[0].contains("{{one paragraph}}"), "the template page's own text is the template");
         assert!(prompts.iter().all(|p| p.contains("=== game:README.md ===")));
         assert_eq!(fs::read_to_string(wiki.path().join("Current/Team.md")).unwrap(), "---\ntitle: Team\n---\nAna leads; Ben reviews.\n");
-        assert!(fs::read_to_string(wiki.path().join("Conventions/ARCHITECTURE.md")).unwrap().contains("status: draft"));
+        assert!(fs::read_to_string(wiki.path().join("Conventions/Architecture.md")).unwrap().contains("status: draft"));
         let kept = last_draft(&db).unwrap();
         assert!(kept.title.starts_with("First wiki drafted") && kept.report.kept == vec!["Current/Team.md"]);
         assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none(), "no Review item");
         let found = findings(wiki.path(), &db).unwrap();
-        assert!(found.iter().any(|f| f.kind == "draft" && f.path == "Conventions/ARCHITECTURE.md"), "{found:?}");
+        assert!(found.iter().any(|f| f.kind == "draft" && f.path == "Conventions/Architecture.md"), "{found:?}");
     }
 
     #[test]
@@ -2459,10 +2618,15 @@ mod tests {
         let wiki = tempfile::tempdir().unwrap();
         crate::wikinew::create(wiki.path(), "Payments", &[], "2026-09-28").unwrap();
         let left = placeholders_left(wiki.path());
-        assert!(left.contains(&"START-HERE.md: {{The trap that costs the most}}".to_string()), "{left:?}");
-        assert!(left.contains(&"CLAUDE.md: {{project-specific gotcha}}".to_string()));
+        assert!(left.contains(&"START-HERE.md: {{what a newcomer loses before finding it}}".to_string()), "{left:?}");
+        assert!(left.contains(&"CLAUDE.md: {{a trap that costs time on this team, and the page that holds it}}".to_string()));
         assert!(!left.iter().any(|l| l.contains("{{Domain}}")), "Ken names the Domain section itself");
-        assert!(!left.iter().any(|l| l.starts_with("Templates/") || l.contains("{{date}}")), "{left:?}");
+        assert!(!left.iter().any(|l| l.starts_with("Templates/")), "{left:?}");
+        // Every page's `updated:` is dated; a date in a table or a count is a person's.
+        for (page, _) in crate::wikinew::TEMPLATE.iter().filter(|(p, _)| p.ends_with(".md") && !p.starts_with("Templates/")) {
+            let text = fs::read_to_string(wiki.path().join(page)).unwrap();
+            assert!(!text.lines().any(|l| l.starts_with("updated:") && l.contains("{{")), "{page}");
+        }
     }
 
     fn page(title: &str) -> String {
@@ -2490,7 +2654,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(&report.drafted[..3], &["Repo-Map/Game.md", "Repo-Map/Tools.md", "Repo-Map/Index.md"]);
-        assert!(report.drafted.contains(&"Conventions/ARCHITECTURE.md".to_string()));
+        assert!(report.drafted.contains(&"Conventions/Architecture.md".to_string()));
         // Pass one reads one repo each.
         assert!(prompts[0].contains("=== Game:README.md ===") && !prompts[0].contains("Tools:README.md"));
         assert!(prompts[1].contains("=== Tools:README.md ===") && !prompts[1].contains("Game:README.md"));
@@ -2499,8 +2663,8 @@ mod tests {
         // project is, so Project gets it and the architecture page does not.
         let team = &prompts[2];
         assert!(team.contains("=== Wiki:Repo-Map/Game.md ===") && team.contains("=== Wiki:Repo-Map/Tools.md ==="), "{team}");
-        assert!(team.contains("=== Game:README.md ===") && !prompts[5].contains("=== Game:README.md ==="));
-        assert!(prompts[5].contains("`Conventions/ARCHITECTURE.md`"));
+        let arch = prompts.iter().find(|p| p.contains("`Conventions/Architecture.md`")).unwrap();
+        assert!(team.contains("=== Game:README.md ===") && !arch.contains("=== Game:README.md ==="));
         let index = fs::read_to_string(wiki.join("Repo-Map/Index.md")).unwrap();
         assert!(index.contains("| [[Game]] | (not said yet) |") && index.contains("| [[Tools]] |"));
     }
@@ -2524,7 +2688,7 @@ mod tests {
         let index = "---\ntitle: Repo Map\n---\n| repo | what it is for |\n|---|---|\n| [[Game]] | The client. |\n";
         fs::write(wiki.join("Repo-Map/Index.md"), index).unwrap();
         let arch = "---\ntitle: Architecture\n---\nGame calls the server.\n";
-        fs::write(wiki.join("Conventions/ARCHITECTURE.md"), arch).unwrap();
+        fs::write(wiki.join("Conventions/Architecture.md"), arch).unwrap();
         fs::write(wiki.join("Current/Who-Does-What.md"), "---\ntitle: Who\n---\nAna owns Game.\n").unwrap();
         fs::write(wiki.join("Current/Project.md"), "---\ntitle: Project\n---\nA game.\n").unwrap();
         let game = repo(d.path(), "Game", "# Game\n");
@@ -2533,9 +2697,9 @@ mod tests {
         let report = draft_added(&wiki, "Wiki", &mut db, &[tools.clone()], &[game, tools], "2026-09-25", 9, |p| {
             Ok(if p.contains("`Repo-Map/Tools.md`") {
                 page("Tools")
-            } else if p.contains("`Conventions/ARCHITECTURE.md`") {
+            } else if p.contains("`Conventions/Architecture.md`") {
                 "---\ntitle: Architecture\n---\nGame calls the server. Tools writes levels the Game loads.\n".into()
-            } else if p.contains("`Vocabulary.md`") {
+            } else if p.contains("`Reference/Vocabulary.md`") {
                 page("Vocabulary")
             } else {
                 "NO CHANGE".into()
@@ -2543,10 +2707,10 @@ mod tests {
         })
         .unwrap();
         assert!(report.drafted.contains(&"Repo-Map/Tools.md".to_string()), "{report:?}");
-        assert!(report.drafted.contains(&"Vocabulary.md".to_string()), "a missing page is drafted whole");
-        assert_eq!(report.proposed, vec!["Repo-Map/Index.md", "Conventions/ARCHITECTURE.md"]);
+        assert!(report.drafted.contains(&"Reference/Vocabulary.md".to_string()), "a missing page is drafted whole");
+        assert_eq!(report.proposed, vec!["Repo-Map/Index.md", "Conventions/Architecture.md"]);
         assert_eq!(report.kept, vec!["Current/Who-Does-What.md", "Current/Project.md"]);
-        assert_eq!(fs::read_to_string(wiki.join("Conventions/ARCHITECTURE.md")).unwrap(), arch, "a kept page is never written");
+        assert_eq!(fs::read_to_string(wiki.join("Conventions/Architecture.md")).unwrap(), arch, "a kept page is never written");
 
         let items = db.list_open_review_items().unwrap();
         let mut props: Vec<Proposal> = items
@@ -2560,7 +2724,7 @@ mod tests {
 
         // Applied while the page reads as it did; refused once it changed.
         apply(&wiki, &props[1]).unwrap();
-        assert!(fs::read_to_string(wiki.join("Conventions/ARCHITECTURE.md")).unwrap().contains("Tools writes levels"));
+        assert!(fs::read_to_string(wiki.join("Conventions/Architecture.md")).unwrap().contains("Tools writes levels"));
         fs::write(wiki.join("Repo-Map/Index.md"), format!("{index}| [[Server]] | added by hand |\n")).unwrap();
         assert_eq!(apply(&wiki, &props[0]), Err(ApplyError::Changed));
     }
@@ -2689,10 +2853,10 @@ mod tests {
         let wiki = d.path().join("Wiki");
         let repos = vec![("Game".to_string(), root.clone())];
         let of = |page: &str| -> Vec<Source> { page_sources(page, &wiki, "Wiki", &repos) };
-        let architecture = of("Conventions/ARCHITECTURE.md");
+        let architecture = of("Conventions/Architecture.md");
         assert!(architecture.iter().any(|s| s.label == arch && s.text.contains("services never call systems")), "{architecture:?}");
         assert!(!architecture.iter().any(|s| s.text.contains("Ana decides")));
-        assert!(of("Vocabulary.md").iter().any(|s| s.text.contains("called Stamina")));
+        assert!(of("Reference/Vocabulary.md").iter().any(|s| s.text.contains("called Stamina")));
         assert!(of("Current/Team.md").iter().any(|s| s.text.contains("Ana decides")));
         assert!(of("Current/Project.md").iter().any(|s| s.label == "Game:CLAUDE.md" && s.text.contains("tactics game")));
 
