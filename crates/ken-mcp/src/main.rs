@@ -9,6 +9,7 @@
 //! unscoped, the project tools take a required `project` argument matched
 //! against Ken's registry.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use uuid::Uuid;
 
 use ken_core::day;
 use ken_core::db::Db;
+use ken_core::embedder::Embedder;
 use ken_core::family::{self, FamilyManifest, InboxKind, InboxTaskPayload, Lane, NewInboxItem};
 use ken_core::family_sync::{self, ConnectionState, GitTransport, PendingWrite, SyncEngine, SystemGit};
 use ken_core::memory;
@@ -44,6 +46,17 @@ struct Server {
     base_dir: PathBuf,
     /// Root the server is locked to (`--project <path>`), if any.
     scoped: Option<PathBuf>,
+    /// The embedding model, loaded by the first search that needs it.
+    meaning: RefCell<Meaning>,
+}
+
+/// Meaning search in this process: not tried yet, the model, or why not.
+#[derive(Default)]
+enum Meaning {
+    #[default]
+    Unloaded,
+    Ready(Box<dyn Embedder + Send>),
+    Off(String),
 }
 
 fn main() {
@@ -76,7 +89,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut server = Server { base_dir, scoped };
+    // The embedding model is found where the app installs it, and runs where
+    // the app's graphics-card setting says: a query embeds in about 55 ms on
+    // the graphics card and took 0.3 to 5 s on a busy CPU (2026-10-06).
+    ken_core::local_llm::init(base_dir.clone());
+    let use_gpu = AppSettings::load(&base_dir).extra.get("useGpu").and_then(Value::as_bool);
+    ken_core::compute::set_use_gpu(use_gpu.unwrap_or(true));
+    let mut server = Server { base_dir, scoped, ..Default::default() };
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -296,10 +315,12 @@ it uses. For how a module fits in and what depends on it.",
         }),
         json!({
             "name": "search_knowledge",
-            "description": "Full-text search across a Ken project's indexed \
-documents (notes, docs, spreadsheets, PDFs…). Returns ranked hits with the \
-file path and a snippet; matched terms are shown in **bold**. All words must \
-match; the last word may be a prefix.",
+            "description": "Whole-file keyword search in ONE Ken project: best for an exact \
+name, term or phrase you expect in a file. Files holding every word come first, one line each \
+(path, ken:// address and a short excerpt with matched words in **bold**; cheap, about 200 \
+characters a hit). When no file has every word it says so and gives the closest passages \
+instead (any word, and meaning when Ken's embedding model is installed). For a question, or \
+when you don't know the project, use route_query first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -314,14 +335,18 @@ match; the last word may be a prefix.",
         }),
         json!({
             "name": "read_document",
-            "description": "Read one document from a Ken project by its \
-project-relative path (as returned by search_knowledge or list_documents). \
-Text files return their raw content (capped at 200 KB); binary formats \
-(docx, xlsx, pptx, pdf, images) return the text Ken's indexer extracted.",
+            "description": "Read a document, or just some of its lines, after a search: the \
+way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> you get the \
+lines around n (10 before, 40 after), numbered — one cheap call. start_line/end_line pick other \
+lines. With no line, the whole file comes back (up to 200 KB, so costly for a big file). Also \
+takes a project-relative path (with `project`). Binary formats (docx, xlsx, pptx, pdf, images) \
+return the text Ken's indexer extracted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Project-relative file path." },
+                    "path": { "type": "string", "description": "A ken:// address from a hit (#L<n> included), or a project-relative file path." },
+                    "start_line": { "type": "integer", "description": "First line to return, 1-based. Alone, it returns 50 lines from there." },
+                    "end_line": { "type": "integer", "description": "Last line to return, inclusive." },
                     "project": project_arg
                 },
                 "required": ["path"]
@@ -371,20 +396,16 @@ than an error — semantic_search and route_query keep working without it.",
         }));
         tools.push(json!({
             "name": "semantic_search",
-            "description": "Hybrid keyword+meaning search of one Ken \
-project's indexed documents, ranked the same way Ken's own hybrid search \
-ranks it. Prefer this over route_query when you already know which project \
-to search (e.g. from list_projects, kg_search, or because the user named \
-it) — it searches only that project and is faster. This ken-mcp server has \
-no embedding model of its own, so there is no fresh query embedding: \
-results are keyword (FTS) matches reranked by the hybrid merge logic, not \
-true meaning-based matches, regardless of the project's own index \
-maturity. Hits carry ken:// addresses.",
+            "description": "route_query for ONE project you already know (the user named it, \
+or list_projects or an earlier hit told you): the same keyword and meaning search, ranked the \
+same way, and the same short hits — path:line, ken:// address, kind and about 300 characters \
+around the best-matching lines. Call read_document with a hit's address for more. Meaning \
+search uses Ken's installed embedding model; without it the answer says it was keyword only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search terms." },
-                    "limit": { "type": "integer", "description": "Maximum hits to return (default 20)." },
+                    "query": { "type": "string", "description": "A question or search terms." },
+                    "limit": { "type": "integer", "description": "Maximum hits to return (default 10)." },
                     "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                     "project": project_arg
@@ -394,19 +415,19 @@ maturity. Hits carry ken:// addresses.",
         }));
         tools.push(json!({
             "name": "route_query",
-            "description": "One-shot workspace search: figures out which \
-project(s) are relevant — a named project first, then the workspace \
-knowledge graph, then broadcasting to every project with a ready semantic \
-index — searches each with the same hybrid ranking semantic_search uses, \
-and returns one merged, ranked, cited list. Prefer semantic_search instead \
-when you already know the target project; use this when you don't. Every \
-hit carries a ken:// address, plus kg:// breadcrumbs for the entities that \
-picked the target when the knowledge graph did the routing.",
+            "description": "START HERE to find where something is, or what the team knows \
+about a question, in plain words. Searches every Ken project that matters (a project the \
+query names, else those the workspace knowledge graph points to, else all of them) by \
+keyword and by meaning, and returns one merged ranked list. Each hit is short — repo:path:line \
+to cite, ken:// address, kind, and about 300 characters around the best-matching lines — so \
+ten hits cost about 6,000 characters. For more of a hit call read_document with its ken:// \
+address (the #L line included): the lines around it, one cheap call. Meaning search uses \
+Ken's installed embedding model; without it the answer says it was keyword only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search terms — also matched against project names for direct routing." },
-                    "limit": { "type": "integer", "description": "Maximum merged hits to return (default 20)." },
+                    "query": { "type": "string", "description": "A question or search terms — also matched against project names for direct routing." },
+                    "limit": { "type": "integer", "description": "Maximum merged hits to return (default 10)." },
                     "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                 },
@@ -719,11 +740,7 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
             hits.truncate(limit);
             let mut out = note.unwrap_or_default();
             if hits.is_empty() {
-                out.push_str(&format!(
-                    "No matches for {query:?} in project \"{}\" (every word must match here; \
-semantic_search is more forgiving). {LOOK_YOURSELF}",
-                    project.config.name
-                ));
+                out.push_str(&closest_passages(server, &db, &project, &query, limit, audience.as_deref(), &types)?);
             } else {
                 out.push_str(&format!(
                     "{} result{} for {query:?} in project \"{}\":\n",
@@ -748,15 +765,20 @@ semantic_search is more forgiving). {LOOK_YOURSELF}",
         "read_document" => {
             let path = require_str(args, "path")?;
             // A ken://<project id>/<path>#L12 address, as search returns it,
-            // names its repo and its file.
+            // names its repo, its file and the line to read around.
             let mut named = args.clone();
             let path = match path.strip_prefix("ken://").and_then(|r| r.split_once('/')) {
                 Some((id, rel)) => {
                     named["project"] = json!(id);
-                    rel.split('#').next().unwrap_or(rel).replace("%20", " ")
+                    rel.replace("%20", " ")
                 }
                 None => path,
             };
+            let (path, fragment) = match path.split_once('#') {
+                Some((file, frag)) => (file.to_string(), Some(frag.to_string())),
+                None => (path, None),
+            };
+            let range = line_range(args, fragment.as_deref());
             let (project, note) = resolve_project(server, &named)?;
             // Validate before anything else so `..`/absolute paths are
             // refused outright, whatever the index says.
@@ -775,8 +797,13 @@ list_documents or search_knowledge to find valid paths.",
                     )
                 })?;
             let mut out = note.unwrap_or_default();
-            match row.kind.as_str() {
-                "md" | "txt" | "code" => {
+            match (row.kind.as_str(), range) {
+                ("md" | "txt" | "code", Some(r)) => {
+                    let bytes = std::fs::read(&abs)
+                        .map_err(|e| format!("could not read {path:?}: {e}"))?;
+                    out.push_str(&numbered_lines(&String::from_utf8_lossy(&bytes), r));
+                }
+                ("md" | "txt" | "code", None) => {
                     let bytes = std::fs::read(&abs)
                         .map_err(|e| format!("could not read {path:?}: {e}"))?;
                     let truncated = bytes.len() > MAX_DOCUMENT_BYTES;
@@ -790,7 +817,7 @@ list_documents or search_knowledge to find valid paths.",
                         out.push_str("\n\n[truncated — file exceeds the 200 KB read limit]");
                     }
                 }
-                kind => {
+                (kind, _) => {
                     let text = db
                         .get_text(&path)
                         .map_err(|e| format!("index lookup failed: {e}"))?
@@ -804,6 +831,10 @@ list_documents or search_knowledge to find valid paths.",
 text in the index (it is indexed by name only)."
                             ),
                         })?;
+                    let text = match range {
+                        Some(r) => numbered_lines(&text, r),
+                        None => text,
+                    };
                     out.push_str(&format!(
                         "[{kind} file — this is the text Ken's indexer \
 extracted, not the original bytes]\n\n{text}"
@@ -854,6 +885,99 @@ extracted, not the original bytes]\n\n{text}"
         }
         _ => Err(format!("unknown tool: {name:?}")),
     }
+}
+
+/// The lines read_document returns, 1-based and inclusive: `start_line` and
+/// `end_line`, or the address's `#L88` (around it) or `#L88-L120`; None
+/// reads the whole file.
+fn line_range(args: &Value, fragment: Option<&str>) -> Option<(i64, i64)> {
+    let arg = |k: &str| args.get(k).and_then(Value::as_i64).filter(|n| *n >= 1);
+    let span = READ_BEFORE + READ_AFTER;
+    match (arg("start_line"), arg("end_line")) {
+        (Some(a), Some(b)) => return Some((a, b.max(a))),
+        (Some(a), None) => return Some((a, a + span)),
+        (None, Some(b)) => return Some(((b - span).max(1), b)),
+        (None, None) => {}
+    }
+    let frag = fragment?.strip_prefix('L')?;
+    let num = |s: &str| s.trim_start_matches('L').parse::<i64>().ok().filter(|n| *n >= 1);
+    match frag.split_once('-') {
+        Some((a, b)) => {
+            let a = num(a)?;
+            Some((a, num(b).unwrap_or(a).max(a)))
+        }
+        None => {
+            let n = num(frag)?;
+            Some(((n - READ_BEFORE).max(1), n + READ_AFTER))
+        }
+    }
+}
+
+/// Lines `a` to `b` of `text`, each led by its number, under a line saying
+/// which of how many they are.
+fn numbered_lines(text: &str, (a, b): (i64, i64)) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len() as i64;
+    if a > total {
+        return format!("[the file has {total} lines; there is no line {a}]");
+    }
+    let b = b.min(total);
+    let mut out = format!("[lines {a}-{b} of {total}]\n");
+    for n in a..=b {
+        out.push_str(&format!("{n}: {}\n", lines[(n - 1) as usize]));
+    }
+    if out.len() > MAX_DOCUMENT_BYTES {
+        out.truncate(floor_char_boundary_at(out.as_bytes(), MAX_DOCUMENT_BYTES));
+        out.push_str("\n\n[truncated — the lines exceed the 200 KB read limit]");
+    }
+    out
+}
+
+/// search_knowledge when no file holds every word: the passages
+/// semantic_search would give (any word, ranked by how many match, and by
+/// meaning when the model is installed), one per file, in search_knowledge's
+/// own line shape. All-words found the right file for 1 of 45 natural
+/// questions (Shattered Realms eval, 2026-10-06).
+fn closest_passages(
+    server: &Server,
+    db: &Db,
+    project: &Project,
+    query: &str,
+    limit: usize,
+    audience: Option<&str>,
+    types: &[ken_core::contenttype::ContentType],
+) -> Result<String, String> {
+    let qv = query_vector(server, query);
+    let mut hits = routing::search_member_of(db, query, vector_for(db, &qv), fetch_for(audience, types, limit) * 2, types)
+        .map_err(|e| format!("search failed: {e}"))?;
+    hits.retain(|h| ken_core::pagemeta::suits(audience, h.page.as_ref().and_then(|p| p.audience)));
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|h| seen.insert(h.path.clone()));
+    hits.truncate(limit);
+    let name = &project.config.name;
+    if hits.is_empty() {
+        return Ok(format!("No matches for {query:?} in project \"{name}\". {LOOK_YOURSELF}"));
+    }
+    let mut out = format!(
+        "No file in project \"{name}\" has every word of {query:?}; the {} closest passage{} instead (any word{}):\n",
+        hits.len(),
+        if hits.len() == 1 { "" } else { "s" },
+        if qv.is_ok() { ", and meaning" } else { "" },
+    );
+    out.push_str(&keyword_only_note(&qv));
+    for (i, hit) in hits.iter().enumerate() {
+        let (snippet, line) = short_hit(db, Some(&project.root), query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, EXCERPT_CHARS);
+        out.push_str(&format!(
+            "\n{}. {} {} ({}{}) — {}",
+            i + 1,
+            kind_tag(&hit.path),
+            hit.path,
+            ken_address(project.config.id, &hit.path),
+            line.map(|l| format!("#L{l}")).unwrap_or_default(),
+            snippet.split_whitespace().collect::<Vec<_>>().join(" "),
+        ));
+    }
+    Ok(out)
 }
 
 fn require_str(args: &Value, key: &str) -> Result<String, String> {
@@ -966,39 +1090,32 @@ work without it (route_query just skips straight to broadcasting)."
     Ok(out)
 }
 
-/// Single-member hybrid search (task 3.3), delegating to
-/// `routing::search_member` — the same FTS+KNN+merge_and_rerank composition
-/// src-tauri's `hybrid_search` command uses, generalized for reuse
-/// (routing.rs module doc). `query_vec` is unconditionally `None`: this
-/// build has no embedder (`ken-core = { default-features = false }` in
-/// Cargo.toml — ken-mcp is the FTS-only sidecar), and substituting
-/// `FakeEmbedder` is the one thing that type's own doc says never to do (it
-/// would silently return meaningless hash-based vectors against a real
-/// semantic index). `search_member` degrades exactly as designed: keyword
-/// (FTS) hits, reranked by hybrid search's own merge logic — honestly
-/// short of true semantic search, whatever the project's own index
-/// maturity is.
+/// Single-member hybrid search (task 3.3): `routing::search_member_of`, the
+/// same keyword + meaning composition src-tauri's `hybrid_search` command
+/// uses, with the question embedded by the app's own model when it is
+/// installed ([`query_vector`]) and keyword only, said in one line, when not.
 fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
     let query = require_str(args, "query")?;
     let limit = args
         .get("limit")
         .and_then(|l| l.as_u64())
         .map(|l| l.clamp(1, 200) as usize)
-        .unwrap_or(20);
+        .unwrap_or(ROUTE_LIMIT);
     if !kg_routing_enabled(&AppSettings::load(&server.base_dir)) {
-        return Err("semantic_search requires the kgRouting feature flag, \
-which is off. Use search_knowledge instead."
+        return Err("semantic_search requires the kgRouting feature flag, which is off. Use search_knowledge instead."
             .into());
     }
     let (project, note) = resolve_project(server, args)?;
     let db = open_index(server, &project)?;
     let audience = audience_arg(args);
     let types = types_arg(args);
-    let mut hits = routing::search_member_of(&db, &query, None, fetch_for(audience.as_deref(), &types, limit), &types)
+    let qv = query_vector(server, &query);
+    let mut hits = routing::search_member_of(&db, &query, vector_for(&db, &qv), fetch_for(audience.as_deref(), &types, limit), &types)
         .map_err(|e| format!("search failed: {e}"))?;
     hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
     hits.truncate(limit);
     let mut out = note.unwrap_or_default();
+    out.push_str(&keyword_only_note(&qv));
     if hits.is_empty() {
         out.push_str(&format!(
             "No matches for {query:?} in project \"{}\". {LOOK_YOURSELF}",
@@ -1006,40 +1123,32 @@ which is off. Use search_knowledge instead."
         ));
     } else {
         out.push_str(&format!(
-            "{} result{} for {query:?} in project \"{}\" (keyword-ranked — \
-this server has no query embedding model; see the tool description):\n",
+            "{} result{} for {query:?} in project \"{}\":\n",
             hits.len(),
             if hits.len() == 1 { "" } else { "s" },
             project.config.name
         ));
         for (i, hit) in hits.iter().enumerate() {
+            let (snippet, line) = short_hit(&db, Some(&project.root), &query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, SNIPPET_CHARS);
             out.push_str(&format!(
-                "\n{}. {} {}{} [{}] {} — {}",
+                "\n{}. {} {}{} ({}{}) [{}]",
                 i + 1,
                 kind_tag(&hit.path),
-                ken_address(project.config.id, &hit.path),
-                hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
-                source_label(hit.source),
                 hit.path,
-                hit.snippet
+                line.map(|l| format!(":{l}")).unwrap_or_default(),
+                ken_address(project.config.id, &hit.path),
+                line.map(|l| format!("#L{l}")).unwrap_or_default(),
+                source_label(hit.source),
             ));
+            if let Some(note) = hit.page.as_ref().and_then(page_note) {
+                out.push_str(&format!(" ({note})"));
+            }
+            out.push_str(&indented(&snippet));
         }
     }
     Ok(out)
 }
 
-/// Route + fan-out + merge (task 3.4): `routing::plan_route`, then a
-/// per-target `routing::search_member`, then `routing::merge_routed`.
-///
-/// This does NOT call `routing::execute_plan` even though that's the
-/// ken-core composition of exactly these three steps — `execute_plan`
-/// requires a live `&mut dyn Embedder` to call `.embed_query()`, and (per
-/// `semantic_search`'s doc above) this build has none to give it; faking
-/// one with `FakeEmbedder` is the one thing that module's doc says not to
-/// do. So this is `execute_plan`'s own per-target loop, copied by hand with
-/// `query_vec` unconditionally `None` — the "honest adaptation" its module
-/// doc explicitly anticipates for a caller in ken-mcp's position, ending in
-/// the same pure `merge_routed` call `execute_plan` itself makes.
 /// "When and why did this change": a file's commits, or commits whose message
 /// or change matches words, asked of git directly (read-only), so it is as
 /// current as the repo.
@@ -1351,13 +1460,266 @@ fn kind_tag(path: &str) -> String {
     format!("[{}]", ken_core::contenttype::of(path).as_str())
 }
 
+// --- short hits and meaning search ---
+
+/// About this many characters of each hit are shown: whole chunks made a
+/// route_query answer a median 17,660 characters for 8 hits (Shattered
+/// Realms eval, 2026-10-06), and read_document gives the rest on request.
+const SNIPPET_CHARS: usize = 300;
+
+/// search_knowledge's fallback excerpts stay one short line like its
+/// whole-file hits: at 300 characters its answers grew from a median 1,947
+/// to 14,819 characters over five repos (Shattered Realms eval, 2026-10-06).
+const EXCERPT_CHARS: usize = 160;
+
+/// Lines read_document shows before and after a single line it is pointed
+/// at (`#L88`), so reading around a hit is one call of about 50 lines.
+const READ_BEFORE: i64 = 10;
+const READ_AFTER: i64 = 40;
+
+/// A query word as matched in a hit's lines: its first two thirds, at least
+/// five letters, so "validated" finds "validation".
+fn stem(word: &str) -> String {
+    let n = word.chars().count();
+    let keep = if n > 5 { (n * 2).div_ceil(3).max(5) } else { n };
+    word.chars().take(keep).collect()
+}
+
+/// The lines of `text` that best match `query`, about `width` characters
+/// long, and the index of the best line; `pin` is a line the hit already
+/// names (a definition's), shown in place of the best match.
+fn snippet_around(text: &str, query: &str, pin: Option<usize>, width: usize) -> (String, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return (String::new(), 0);
+    }
+    let stems: Vec<String> = ken_core::db::significant_tokens(query)
+        .iter()
+        .map(|t| stem(&t.to_lowercase()))
+        .filter(|s| s.chars().count() >= 2)
+        .collect();
+    let score = |l: &str| {
+        let l = l.to_lowercase();
+        stems.iter().filter(|s| l.contains(s.as_str())).count()
+    };
+    let best = match pin.filter(|&p| p < lines.len()) {
+        Some(p) => p,
+        None => {
+            let (mut best, mut top) = (None, 0);
+            for (i, l) in lines.iter().enumerate() {
+                let s = score(l);
+                if s > top {
+                    (best, top) = (Some(i), s);
+                }
+            }
+            best.unwrap_or_else(|| lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0))
+        }
+    };
+    // Grow around the best line, the line below first, while it fits.
+    let cost = |l: &str| l.trim().chars().count() + 1;
+    let (mut lo, mut hi, mut used) = (best, best, cost(lines[best]));
+    // A line below too long to fit is shown cut rather than dropped: a
+    // heading that matched showed alone, without its paragraph (2026-10-06).
+    let mut tail: Option<String> = None;
+    loop {
+        let mut grew = false;
+        if tail.is_none() && hi + 1 < lines.len() {
+            if used + cost(lines[hi + 1]) <= width {
+                hi += 1;
+                used += cost(lines[hi]);
+                grew = true;
+            } else {
+                let room = width.saturating_sub(used + 1);
+                let cut: String = lines[hi + 1].trim().chars().take(room).collect();
+                tail = Some(if room > 40 { format!("{cut}…") } else { String::new() });
+                used = width.min(used + room);
+            }
+        }
+        if lo > 0 && used + cost(lines[lo - 1]) <= width {
+            lo -= 1;
+            used += cost(lines[lo]);
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    let shown: Vec<&str> = lines[lo..=hi].iter().copied().filter(|l| !l.trim().is_empty()).collect();
+    let lead = |l: &str| l.chars().take_while(|c| c.is_whitespace()).count();
+    let indent = shown.iter().map(|l| lead(l)).min().unwrap_or(0);
+    let mut out: Vec<String> = shown
+        .iter()
+        .map(|l| {
+            let cut: usize = l.chars().take(indent).map(char::len_utf8).sum();
+            clip(l[cut..].trim_end(), &stems, width)
+        })
+        .collect();
+    out.extend(tail.filter(|t| !t.is_empty()));
+    (out.join("\n"), best)
+}
+
+/// One line cut to `width` characters around its first matching word: an
+/// inlined data file is one line of tens of thousands of characters.
+fn clip(line: &str, stems: &[String], width: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= width {
+        return line.to_string();
+    }
+    let lower = line.to_lowercase();
+    let at = stems
+        .iter()
+        .filter_map(|s| lower.find(s.as_str()))
+        .min()
+        .map(|b| lower[..b].chars().count())
+        .unwrap_or(0);
+    let from = at.saturating_sub(width / 4).min(chars.len() - width);
+    let mut s: String = chars[from..from + width].iter().collect();
+    if from > 0 {
+        s.insert(0, '…');
+    }
+    if from + width < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// The file line `needle` (a trimmed line of a hit) is on, nearest `near`:
+/// a prose chunk starts with the tail of the chunk before and folds blank
+/// lines, so counting its lines drifts from the file's.
+fn file_line(path: &Path, needle: &str, near: i64) -> Option<i64> {
+    if needle.is_empty() || std::fs::metadata(path).ok()?.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == needle)
+        .map(|(i, _)| i as i64 + 1)
+        .min_by_key(|n| (n - near).abs())
+}
+
+/// A hit cut to its best lines and the file line the best one is on.
+/// `line` is what search gave: the chunk's first line, or a definition's
+/// own line, which the snippet then shows.
+fn short_hit(db: &Db, root: Option<&Path>, query: &str, path: &str, chunk_id: i64, text: &str, line: Option<i64>, width: usize) -> (String, Option<i64>) {
+    let mut start = db.chunk_line(chunk_id).ok().flatten();
+    let mut text = text.to_string();
+    let pinned = line.filter(|l| Some(*l) != start);
+    if let (Some(l), Some(s)) = (pinned, start) {
+        if l < s || l >= s + text.lines().count() as i64 {
+            if let Ok(Some((id, t))) = db.chunk_at_line(path, l) {
+                text = t;
+                start = db.chunk_line(id).ok().flatten();
+            }
+        }
+    }
+    let pin = pinned.zip(start).and_then(|(l, s)| usize::try_from(l - s).ok());
+    let (snippet, best) = snippet_around(&text, query, pin, width);
+    let line = match (pinned, start) {
+        (Some(l), _) => Some(l),
+        (None, Some(s)) => {
+            let near = s + best as i64;
+            let needle = text.lines().nth(best).unwrap_or("").trim();
+            Some(root.and_then(|r| file_line(&r.join(path), needle, near)).unwrap_or(near))
+        }
+        (None, None) => line,
+    };
+    (snippet, line)
+}
+
+/// A snippet on the lines under its hit, indented.
+fn indented(snippet: &str) -> String {
+    if snippet.is_empty() {
+        return String::new();
+    }
+    format!("\n   {}", snippet.replace('\n', "\n   "))
+}
+
+/// The question as a vector, and the model that made it; or why there is
+/// none, as one line for the answer.
+type QueryVector = Result<(Vec<f32>, String), String>;
+
+/// Embed the query with the app's embedding model, loaded once per server
+/// process on first use: without it every MCP search was keyword only
+/// (Shattered Realms eval, 2026-10-06).
+fn query_vector(server: &Server, query: &str) -> QueryVector {
+    let mut slot = server.meaning.borrow_mut();
+    if matches!(*slot, Meaning::Unloaded) {
+        *slot = load_meaning();
+    }
+    match &mut *slot {
+        Meaning::Ready(model) => model
+            .embed_query(query)
+            .map(|v| (v, model.model_id()))
+            .map_err(|e| format!("embedding the question failed ({e})")),
+        Meaning::Off(why) => Err(why.clone()),
+        Meaning::Unloaded => Err("the embedding model was not loaded".into()),
+    }
+}
+
+/// The embedding model the app installed (`<data dir>/whisper`, chosen in
+/// `models/selection.json`), or why meaning search is off.
+fn load_meaning() -> Meaning {
+    #[cfg(all(windows, target_env = "msvc"))]
+    if !vulkan_loader_present() {
+        return Meaning::Off("this PC has no Vulkan loader (vulkan-1.dll), which the embedding model's library needs".into());
+    }
+    if ken_core::embedder::selected_profile().is_none() {
+        return Meaning::Off("no embedding model is installed (Ken: Settings, Models)".into());
+    }
+    match ken_core::embedder::installed_embedding_model() {
+        Some(model) => Meaning::Ready(model),
+        None => Meaning::Off("the embedding model did not load".into()),
+    }
+}
+
+/// Whether vulkan-1.dll loads: it is delay-loaded (build.rs), and llama.cpp
+/// calls it as it starts, so without it the model is never loaded.
+#[cfg(all(windows, target_env = "msvc"))]
+fn vulkan_loader_present() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut std::ffi::c_void;
+    }
+    let name: Vec<u16> = "vulkan-1.dll\0".encode_utf16().collect();
+    // SAFETY: a NUL-terminated wide string that outlives the call; the
+    // module stays loaded, which is what the delay-load helper reuses.
+    !unsafe { LoadLibraryW(name.as_ptr()) }.is_null()
+}
+
+/// The query vector for one index, only when that index was built by the
+/// same model: another model's vectors have another size and meaning.
+fn vector_for<'a>(db: &Db, qv: &'a QueryVector) -> Option<&'a [f32]> {
+    let (v, model) = qv.as_ref().ok()?;
+    (db.embed_model().ok().flatten().as_deref() == Some(model.as_str())).then_some(v.as_slice())
+}
+
+/// One line saying a search was keyword only and why; empty when meaning
+/// search ran.
+fn keyword_only_note(qv: &QueryVector) -> String {
+    match qv {
+        Ok(_) => String::new(),
+        Err(why) => format!("Keyword search only: {why}.\n"),
+    }
+}
+
+/// Hits route_query and semantic_search return unless asked: eight short
+/// hits measured a median 4,554 characters (Shattered Realms eval,
+/// 2026-10-06), so ten cost about 6,000, where eight whole chunks took 17,660.
+const ROUTE_LIMIT: usize = 10;
+
+/// Route + fan-out + merge (task 3.4): `routing::plan_route`, then a
+/// per-target `routing::search_member_of_with`, then `routing::merge_routed`
+/// — `execute_plan`'s own loop, written out so each member gets the query
+/// vector only when its index was built by the same model ([`vector_for`]).
+/// The question is embedded once for every member; hits are cut short last.
 fn route_query(server: &Server, args: &Value) -> Result<String, String> {
     let query = require_str(args, "query")?;
     let limit = args
         .get("limit")
         .and_then(|l| l.as_u64())
         .map(|l| l.clamp(1, 200) as usize)
-        .unwrap_or(20);
+        .unwrap_or(ROUTE_LIMIT);
     let app_settings = AppSettings::load(&server.base_dir);
     if !kg_routing_enabled(&app_settings) {
         return Err("route_query requires the kgRouting feature flag, which is off.".into());
@@ -1416,6 +1778,7 @@ folder in the Ken app first."
     let types = types_arg(args);
     // One vocabulary for the whole search (the team wiki's widens every repo).
     let shared_vocab = routing::workspace_vocabulary(dbs.values());
+    let qv = if plan.targets.is_empty() { Err("nothing to search".to_string()) } else { query_vector(server, &query) };
 
     let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
     for &project_id in &plan.targets {
@@ -1462,7 +1825,7 @@ folder in the Ken app first."
             });
             continue;
         };
-        match routing::search_member_of_with(db, &query, None, fetch_for(audience.as_deref(), &types, limit), &types, Some(&shared_vocab)) {
+        match routing::search_member_of_with(db, &query, vector_for(db, &qv), fetch_for(audience.as_deref(), &types, limit), &types, Some(&shared_vocab)) {
             Ok(mut hits) => member_hits.push(MemberHits {
                 hits: {
                     hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
@@ -1482,8 +1845,30 @@ folder in the Ken app first."
         }
     }
 
-    let report = routing::merge_routed(&plan, &member_hits, limit);
-    Ok(format_execution_report(&report))
+    let mut report = routing::merge_routed(&plan, &member_hits, limit);
+    for hit in &mut report.results {
+        let Some(db) = dbs.get(&hit.project_id) else { continue };
+        let root = registry.projects.iter().find(|e| e.id == hit.project_id).map(|e| e.path.as_path());
+        let (snippet, line) = short_hit(db, root, &query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, SNIPPET_CHARS);
+        // The locator ends in the chunk's line; it now names the best line.
+        if let (Some(old), Some(new)) = (hit.line, line) {
+            if let Some(stem) = hit.locator.strip_suffix(&format!(":{old}")) {
+                hit.locator = format!("{stem}:{new}");
+            }
+        }
+        hit.snippet = snippet;
+        hit.line = line;
+    }
+    let mut out = format_execution_report(&report);
+    if !plan.targets.is_empty() {
+        let note = keyword_only_note(&qv);
+        // After the Route and Members lines, which a reader looks for first.
+        match out.match_indices('\n').nth(1) {
+            Some((at, _)) => out.insert_str(at + 1, &note),
+            None => out.push_str(&note),
+        }
+    }
+    Ok(out)
 }
 
 /// Renders a route_query [`routing::ExecutionReport`] as tool-call text
@@ -1527,14 +1912,13 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
     for (i, hit) in report.results.iter().enumerate() {
         // The locator is what to cite; the ken:// address is what to open.
         out.push_str(&format!(
-            "\n{}. {} {} ({}{}) [{}] — {}",
+            "\n{}. {} {} ({}{}) [{}]",
             i + 1,
             kind_tag(&hit.path),
             hit.locator,
             hit.address,
             hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
             source_label(hit.source),
-            hit.snippet
         ));
         if let Some(note) = hit.page.as_ref().and_then(page_note) {
             out.push_str(&format!(" ({note})"));
@@ -1542,6 +1926,7 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
         if !hit.kg_breadcrumbs.is_empty() {
             out.push_str(&format!(" ({})", hit.kg_breadcrumbs.join(" ")));
         }
+        out.push_str(&indented(&hit.snippet));
     }
     out
 }
@@ -2518,11 +2903,15 @@ argument is required (a name or folder path). {available}"
         ));
     };
 
+    // By id too, as the scoped branch above does: a hit's ken://<id>/ address
+    // read on an unscoped server failed with "No Ken project matches" (2026-10-06).
+    let requested_id = requested.parse::<Uuid>().ok();
     let entry = registry
         .projects
         .iter()
         .find(|p| {
             p.name.eq_ignore_ascii_case(requested)
+                || Some(p.id) == requested_id
                 || p.path == Path::new(requested)
                 || same_canonical(&p.path, Path::new(requested))
         })
@@ -2765,6 +3154,7 @@ mod tests {
             server: Server {
                 base_dir: base.path().to_path_buf(),
                 scoped: scoped.then(|| root_path.clone()),
+                ..Default::default()
             },
             root: root_path,
             _base: base,
@@ -3114,6 +3504,7 @@ mod tests {
         let server = Server {
             base_dir: base.path().to_path_buf(),
             scoped: None,
+            ..Default::default()
         };
         (base, root_a, root_b, server)
     }
@@ -3208,6 +3599,146 @@ mod tests {
     }
 
     #[test]
+    fn search_uses_meaning_when_the_model_is_there_and_says_so_when_not() {
+        let (_base, _ra, _rb, mut server) = two_project_fixture();
+        // No model installed: keyword only, in one line.
+        let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "launch schedule", "project": "Atlas"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("Keyword search only: no embedding model is installed"), "{text}");
+        assert!(text.contains("[keyword]") && !text.contains("semantic]"), "{text}");
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        assert!(text.starts_with("Route: "), "the note follows the route: {text}");
+        assert!(text.contains("\nKeyword search only:"), "{text}");
+
+        // The model the indexes were built with: meaning joins keyword.
+        server.meaning = RefCell::new(Meaning::Ready(Box::new(ken_core::embedder::FakeEmbedder::new())));
+        let (text, _) = tool(&mut server, "semantic_search", json!({"query": "launch schedule", "project": "Atlas"}));
+        assert!(!text.contains("Keyword search only"), "{text}");
+        assert!(text.contains("[keyword+semantic]"), "{text}");
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        assert!(!text.contains("Keyword search only"), "{text}");
+        assert!(text.contains("semantic]"), "{text}");
+    }
+
+    #[test]
+    fn a_vector_goes_only_to_an_index_built_by_its_model() {
+        let (base, _ra, _rb, server) = two_project_fixture();
+        let registry = Registry::load(&server.base_dir).unwrap();
+        let db = Db::open(base.path(), registry.projects[0].id).unwrap();
+        let qv: QueryVector = Ok((vec![0.0; 8], "fake-hash-8".to_string()));
+        assert!(vector_for(&db, &qv).is_some());
+        let other: QueryVector = Ok((vec![0.0; 768], "nomic-embed-text-v1.5".to_string()));
+        assert!(vector_for(&db, &other).is_none());
+        assert!(vector_for(&db, &Err("off".into())).is_none());
+    }
+
+    #[test]
+    fn a_snippet_is_the_best_lines_and_about_300_characters() {
+        let mut text = String::new();
+        for i in 1..=60 {
+            text.push_str(&format!("    line {i} says nothing in particular about anything here\n"));
+        }
+        text.push_str("    fn grace_period() { // offline players keep their party\n");
+        for i in 62..=120 {
+            text.push_str(&format!("    line {i} says nothing in particular about anything here\n"));
+        }
+        let (snip, best) = snippet_around(&text, "how long is the offline grace for players", None, SNIPPET_CHARS);
+        assert_eq!(best, 60, "{snip}");
+        assert!(snip.contains("fn grace_period()"), "{snip}");
+        assert!(snip.chars().count() <= SNIPPET_CHARS + 10, "{} chars: {snip}", snip.chars().count());
+        assert!(!snip.starts_with(' '), "dedented: {snip}");
+        // A line the hit names is shown instead of the best match.
+        let (snip, best) = snippet_around(&text, "offline grace", Some(3), SNIPPET_CHARS);
+        assert_eq!(best, 3);
+        assert!(snip.contains("line 4 says"), "{snip}");
+        // One enormous line is cut around its match.
+        let blob = format!("{}needle{}", "x".repeat(5000), "y".repeat(5000));
+        let (snip, _) = snippet_around(&blob, "needle", None, SNIPPET_CHARS);
+        assert!(snip.contains("needle") && snip.chars().count() <= SNIPPET_CHARS + 2, "{snip}");
+        // A heading that matched brings the start of its long paragraph.
+        let page = format!("## Grace for players\n\n{}\n", "Offline party members keep their place for a while. ".repeat(20));
+        let (snip, _) = snippet_around(&page, "grace players", None, SNIPPET_CHARS);
+        assert!(snip.starts_with("## Grace for players\nOffline party members"), "{snip}");
+        assert!(snip.ends_with('…') && snip.chars().count() <= SNIPPET_CHARS + 2, "{snip}");
+        assert_eq!(stem("validated"), "valida");
+        assert_eq!(stem("party"), "party");
+    }
+
+    #[test]
+    fn route_query_hits_are_short_and_point_at_the_matching_line() {
+        let (_base, ra, _rb, mut server) = two_project_fixture();
+        let mut long = String::from("# Launch\n\n");
+        for i in 0..40 {
+            long.push_str(&format!("Paragraph {i} of filler text that talks about nothing at all, at some length.\n\n"));
+        }
+        long.push_str("The rollback window for the launch is ninety minutes.\n");
+        std::fs::write(ra.path().join("plan.md"), &long).unwrap();
+        let project = Project::open(ra.path()).unwrap();
+        let mut db = Db::open(&server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        index_semantically(&project, &mut db);
+        drop(db);
+
+        let (text, is_err) = tool(&mut server, "route_query", json!({"query": "Atlas rollback window ninety minutes"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("plan.md:83 ("), "the line of the match, not the chunk's: {text}");
+        assert!(text.contains("plan.md#L83)"), "{text}");
+        assert!(text.contains("\n   The rollback window for the launch is ninety minutes."), "{text}");
+        assert!(text.len() < 2_000, "{} characters: {text}", text.len());
+    }
+
+    #[test]
+    fn search_knowledge_falls_back_to_the_closest_passages_for_a_question() {
+        let mut fx = fixture(true);
+        // No file has "owns", "cutover" and "date" together.
+        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({"query": "Who owns the cutover date?"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("has every word"), "{text}");
+        assert!(text.contains("Keyword search only:"), "{text}");
+        assert!(text.contains(". [doc] People.md (ken://"), "same line shape: {text}");
+        assert!(text.contains("notes/meeting.md"), "{text}");
+        // All words in one file: the file-level answer, unchanged.
+        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing cutover"}));
+        assert!(!text.contains("has every word"), "{text}");
+        // Words in no file at all: still empty.
+        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "zebra xylophone"}));
+        assert!(text.starts_with("No matches"), "{text}");
+    }
+
+    #[test]
+    fn read_document_reads_lines_around_an_address_or_a_range() {
+        let mut fx = fixture(true);
+        let body: String = (1..=100).map(|i| format!("row {i}\n")).collect();
+        std::fs::write(fx.root.join("rows.txt"), &body).unwrap();
+        let project = Project::open(&fx.root).unwrap();
+        let mut db = Db::open(&fx.server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        drop(db);
+        let address = format!("ken://{}/rows.txt#L50", project.config.id);
+
+        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": address}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("[lines 40-90 of 100]\n40: row 40\n"), "{text}");
+        assert!(text.ends_with("90: row 90\n"), "{text}");
+
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt", "start_line": 3, "end_line": 4}));
+        assert_eq!(text, "[lines 3-4 of 100]\n3: row 3\n4: row 4\n");
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt#L98-L120"}));
+        assert!(text.starts_with("[lines 98-100 of 100]"), "{text}");
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt", "start_line": 500}));
+        assert!(text.contains("no line 500"), "{text}");
+        // No range: the whole file, as before.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt"}));
+        assert_eq!(text, body);
+
+        // An unscoped server finds the project by the address's id.
+        fx.server.scoped = None;
+        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": address}));
+        assert!(!is_err, "{text}");
+        assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
+    }
+
+    #[test]
     fn list_projects_says_which_projects_routed_search_can_use() {
         // Routed search is built in: on whatever settings.json says.
         let mut fx = fixture(true);
@@ -3244,7 +3775,7 @@ mod tests {
         settings.features.insert("workspace".into(), true.into());
         settings.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         (base, ws_parent, proj_root, server)
     }
 
@@ -3365,7 +3896,7 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.features.insert("workspace".into(), true.into());
         settings.save(base.path()).unwrap();
-        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
 
         let (text, is_err) = tool(&mut server, "journal_append", json!({"text": "hi"}));
         assert!(is_err, "{text}");
@@ -3408,7 +3939,7 @@ mod tests {
         registry.last_workspace = Some(workspace.config.id);
         registry.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         (base, ws_parent, server)
     }
 
@@ -3583,7 +4114,7 @@ mod tests {
     /// tool-list tests, which never touch `families/`.
     fn family_flag_fixture() -> (tempfile::TempDir, Server) {
         let base = tempfile::tempdir().unwrap();
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         (base, server)
     }
 
@@ -3672,7 +4203,7 @@ mod tests {
         registry.save(base.path()).unwrap();
 
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
         Some((base, remote_dir, ws_parent, server, family_id, clone_root))
     }
 
