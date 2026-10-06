@@ -17,10 +17,34 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// Number of chunk texts embedded per `Embedder::embed` call. Keeps a single
-/// call bounded and gives the cancel check a reasonable granularity without
-/// paying per-chunk call overhead.
-const EMBED_BATCH: usize = 16;
+/// Number of chunk texts embedded per `Embedder::embed` call, gathered across
+/// files. Each call makes one model context and packs its chunks several to a
+/// pass; one call per file (most files are one or two chunks) spent the time
+/// making contexts, not vectors.
+const EMBED_BATCH: usize = 128;
+
+/// Embed `ids`/`texts` and store the vectors. One chunk the model can't take
+/// must not stop the index: the batch is retried one by one and only what
+/// fails is left out (it stays keyword-searchable, and is retried next build).
+fn embed_pending(db: &mut Db, embedder: &mut dyn Embedder, ids: &mut Vec<i64>, texts: &mut Vec<String>) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    match embedder.embed(texts) {
+        Ok(vecs) => db.store_embeddings(ids, &vecs)?,
+        Err(batch_err) => {
+            for (id, text) in ids.iter().zip(texts.iter()) {
+                match embedder.embed(std::slice::from_ref(text)) {
+                    Ok(v) => db.store_embeddings(&[*id], &v)?,
+                    Err(e) => eprintln!("semantic index: chunk {id} skipped: {e} (batch: {batch_err})"),
+                }
+            }
+        }
+    }
+    ids.clear();
+    texts.clear();
+    Ok(())
+}
 
 /// Regenerate `chunks` and `vec_chunks` from the project's indexed contents
 /// alone (nothing else feeds it — see spec "The semantic index is entirely
@@ -90,6 +114,10 @@ pub fn rebuild_semantic_index_with_profile(
     let user_rules = project.kenignore_rules();
     let rule_sets: &[&[crate::kenignore::Rule]] = &[&kind_rules, &user_rules];
 
+    // Chunks still to embed, gathered across files.
+    let mut pending_ids: Vec<i64> = Vec::new();
+    let mut pending_texts: Vec<String> = Vec::new();
+
     for (done, file) in files.into_iter().enumerate() {
         if token.is_cancelled() {
             return Ok(false);
@@ -131,31 +159,17 @@ pub fn rebuild_semantic_index_with_profile(
         // rebuild runs, so a chunk can be unchanged here and still unembedded.
         // `upsert_chunks` drops the vector of a chunk whose text changed, so
         // those are missing too.
-        let (embed_ids, embed_texts): (Vec<i64>, Vec<String>) =
-            db.chunks_missing_vectors(&file.rel_path)?.into_iter().unzip();
-
-        for (id_batch, text_batch) in embed_ids
-            .chunks(EMBED_BATCH)
-            .zip(embed_texts.chunks(EMBED_BATCH))
-        {
-            match embedder.embed(text_batch) {
-                Ok(vecs) => db.store_embeddings(id_batch, &vecs)?,
-                // One chunk the model can't take must not stop the index:
-                // embed the batch one by one and leave out only what fails
-                // (it stays keyword-searchable, and is retried next build).
-                Err(batch_err) => {
-                    for (id, text) in id_batch.iter().zip(text_batch) {
-                        match embedder.embed(std::slice::from_ref(text)) {
-                            Ok(v) => db.store_embeddings(&[*id], &v)?,
-                            Err(e) => eprintln!("semantic index: {} chunk {id} skipped: {e} (batch: {batch_err})", file.rel_path),
-                        }
-                    }
-                }
+        for (id, text) in db.chunks_missing_vectors(&file.rel_path)? {
+            pending_ids.push(id);
+            pending_texts.push(text);
+            if pending_ids.len() >= EMBED_BATCH {
+                embed_pending(db, embedder, &mut pending_ids, &mut pending_texts)?;
             }
         }
 
         on_progress(done + 1, total);
     }
+    embed_pending(db, embedder, &mut pending_ids, &mut pending_texts)?;
 
     db.set_embed_model(&embedder.model_id())?;
     db.set_embed_dim(embedder.dim())?;

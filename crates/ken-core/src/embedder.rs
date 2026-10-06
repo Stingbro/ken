@@ -182,6 +182,12 @@ mod llama {
     /// be chunked before reaching the embedder.
     const N_CTX: u32 = 2048;
 
+    /// Most chunks run through the model in one pass. A mean-pooled model
+    /// takes many short sequences side by side in one batch; one pass per
+    /// chunk left the graphics card idle most of the time (about 10 chunks a
+    /// second on an RTX A4000 at 12% load, measured 2026-10-05).
+    const N_SEQ: u32 = 32;
+
     /// The real embedding model, run as a second llama.cpp context sharing the
     /// process-wide backend with the language model. 768-dim, mean-pooled,
     /// L2-normalized output. Gated behind the `local-llm` feature.
@@ -227,6 +233,7 @@ mod llama {
                 .with_n_ctx(NonZeroU32::new(N_CTX))
                 .with_n_batch(N_CTX)
                 .with_n_ubatch(N_CTX)
+                .with_n_seq_max(if self.profile.pooling == Pooling::Mean { N_SEQ } else { 1 })
                 .with_n_threads(threads)
                 .with_n_threads_batch(threads)
                 .with_embeddings(true)
@@ -239,9 +246,10 @@ mod llama {
                 .map_err(|e| Error::Other(format!("couldn't create embedding context: {e}")))
         }
 
-        /// Embed one already-prefixed string into a mean-pooled, L2-normalized
-        /// vector in `ctx`, cleared first so state never leaks between inputs.
-        fn embed_prefixed(&self, ctx: &mut LlamaContext<'_>, text: &str) -> Result<Vec<f32>> {
+        /// The tokens one already-prefixed string is embedded from: NUL
+        /// refused, cut to the context, closed by end-of-text when the
+        /// model pools on it.
+        fn tokens(&self, text: &str) -> Result<Vec<llama_cpp_2::token::LlamaToken>> {
             // The tokenizer takes a C string: a NUL (binary-ish text from a
             // PDF or a data file) would end it, so it is refused outright.
             let text = text.replace('\0', " ");
@@ -249,9 +257,6 @@ mod llama {
                 .model
                 .str_to_token(&text, AddBos::Always)
                 .map_err(|e| Error::Other(format!("tokenize failed: {e}")))?;
-            if tokens.is_empty() {
-                return Ok(vec![0.0; self.dim]);
-            }
             // A dense chunk (a table, minified code) can tokenize past the
             // window. Its opening stands for it, as it would in a search
             // result; failing instead stopped the whole meaning index at
@@ -259,7 +264,7 @@ mod llama {
             tokens.truncate(N_CTX as usize);
             // Last-token pooling reads the vector at the end-of-text token;
             // add it when the tokenizer did not (or truncation cut it off).
-            if self.profile.add_eos {
+            if self.profile.add_eos && !tokens.is_empty() {
                 let eos = self.model.token_eos();
                 if tokens.last() != Some(&eos) {
                     if tokens.len() >= N_CTX as usize {
@@ -268,7 +273,16 @@ mod llama {
                     tokens.push(eos);
                 }
             }
+            Ok(tokens)
+        }
 
+        /// Embed one already-prefixed string into a pooled, L2-normalized
+        /// vector in `ctx`, cleared first so state never leaks between inputs.
+        fn embed_prefixed(&self, ctx: &mut LlamaContext<'_>, text: &str) -> Result<Vec<f32>> {
+            let tokens = self.tokens(text)?;
+            if tokens.is_empty() {
+                return Ok(vec![0.0; self.dim]);
+            }
             ctx.clear_kv_cache();
             let mut batch = LlamaBatch::new(tokens.len(), 1);
             // logits_all = true so every token's output is enabled, ensuring
@@ -287,6 +301,52 @@ mod llama {
             Ok(v)
         }
 
+        /// Embed many already-prefixed strings, several sequences to a pass
+        /// (up to [`N_SEQ`], their tokens together within the context), one
+        /// pooled vector per sequence. Mean pooling only: each sequence is
+        /// pooled on its own, so the vectors are the ones one at a time gives.
+        fn embed_packed(&self, ctx: &mut LlamaContext<'_>, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let toks: Vec<Vec<llama_cpp_2::token::LlamaToken>> =
+                texts.iter().map(|t| self.tokens(t)).collect::<Result<_>>()?;
+            let mut out: Vec<Vec<f32>> = vec![vec![0.0; self.dim]; texts.len()];
+            let mut i = 0;
+            while i < toks.len() {
+                let mut group: Vec<usize> = Vec::new();
+                let mut total = 0usize;
+                while i < toks.len()
+                    && group.len() < N_SEQ as usize
+                    && (group.is_empty() || total + toks[i].len() <= N_CTX as usize)
+                {
+                    if !toks[i].is_empty() {
+                        total += toks[i].len();
+                        group.push(i);
+                    }
+                    i += 1;
+                }
+                if group.is_empty() {
+                    continue;
+                }
+                ctx.clear_kv_cache();
+                let mut batch = LlamaBatch::new(total, group.len() as i32);
+                for (seq, &k) in group.iter().enumerate() {
+                    batch
+                        .add_sequence(&toks[k], seq as i32, true)
+                        .map_err(|e| Error::Other(format!("batch add failed: {e}")))?;
+                }
+                ctx.decode(&mut batch)
+                    .map_err(|e| Error::Other(format!("embedding decode failed: {e}")))?;
+                for (seq, &k) in group.iter().enumerate() {
+                    let e = ctx
+                        .embeddings_seq_ith(seq as i32)
+                        .map_err(|e| Error::Other(format!("couldn't read embedding: {e}")))?;
+                    let mut v = e.to_vec();
+                    l2_normalize(&mut v);
+                    out[k] = v;
+                }
+            }
+            Ok(out)
+        }
+
         /// Embed a query, with the model's query prefix.
         pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
             let mut ctx = self.context()?;
@@ -297,10 +357,11 @@ mod llama {
     impl Embedder for LlamaEmbedder {
         fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             let mut ctx = self.context()?;
-            texts
-                .iter()
-                .map(|t| self.embed_prefixed(&mut ctx, &format!("{}{t}", self.profile.doc_prefix)))
-                .collect()
+            let prefixed: Vec<String> = texts.iter().map(|t| format!("{}{t}", self.profile.doc_prefix)).collect();
+            if self.profile.pooling == Pooling::Mean && prefixed.len() > 1 {
+                return self.embed_packed(&mut ctx, &prefixed);
+            }
+            prefixed.iter().map(|t| self.embed_prefixed(&mut ctx, t)).collect()
         }
 
         fn dim(&self) -> usize {
