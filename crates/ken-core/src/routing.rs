@@ -1511,9 +1511,10 @@ mod tests {
         use crate::runner::CancelToken;
         use crate::{engine, scan};
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Reference")).unwrap();
         std::fs::write(
-            dir.path().join("Vocabulary.md"),
-            "# Vocabulary\n\n| our word | the platform's word | where it lives |\n|---|---|---|\n| shard | region | Engine/World.md |\n",
+            dir.path().join("Reference/Vocabulary.md"),
+            "# Vocabulary\n\n| our word | the code's or platform's word | shown in |\n|---|---|---|\n| shard | region | Engine/World.md |\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("Platform")).unwrap();

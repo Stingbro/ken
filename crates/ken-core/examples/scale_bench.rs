@@ -49,9 +49,10 @@ fn generate(root: &Path, n: usize) {
     for i in 0..pages {
         fs::write(wiki.join(format!("page-{i}.md")), wiki_page(i, pages)).unwrap();
     }
+    fs::create_dir_all(root.join("Reference")).unwrap();
     fs::write(
-        root.join("Vocabulary.md"),
-        "# Vocabulary\n\n| our word | the platform's word | where it lives |\n|---|---|---|\n| shard | region | src/ |\n",
+        root.join("Reference/Vocabulary.md"),
+        "# Vocabulary\n\n| our word | the code's or platform's word | shown in |\n|---|---|---|\n| shard | region | src/ |\n",
     )
     .unwrap();
     fs::write(root.join("START-HERE.md"), "# Start here\n\nRead this first.\n").unwrap();
