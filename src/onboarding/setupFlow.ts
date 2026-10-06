@@ -1,6 +1,6 @@
 // Pure helpers behind SetupFlow, kept out of the .svelte file so they can be
 // unit-tested without a DOM.
-import type { RepoKind, SetupRepoRow } from "../lib/api";
+import type { CoveredRepo, RepoKind, SetupRepoRow } from "../lib/api";
 
 export const KINDS: RepoKind[] = ["team", "wiki", "code", "reference"];
 
@@ -96,11 +96,12 @@ export function renamedWikiChoice(c: WikiChoice, from: string, to: string): Wiki
   return c.mode === "new" && c.name === `${from}-Wiki` ? { ...c, name: `${to}-Wiki` } : c;
 }
 
-/** The team's repos a new wiki lists on its Start Here page. */
-export function coveredRepos(rows: SetupRepoRow[], team: string): { name: string; description: string }[] {
+/** The team's repos a new wiki lists on its Start Here page, with the kinds
+ *  and folders the team manifest names them by. */
+export function coveredRepos(rows: SetupRepoRow[], team: string): CoveredRepo[] {
   return rows
     .filter((r) => r.include && r.team === team && !r.kind.includes("wiki"))
-    .map((r) => ({ name: r.member, description: r.description }));
+    .map((r) => ({ name: r.member, description: r.description, kind: r.kind, path: r.path }));
 }
 
 /** A new wiki's folder: `name` inside `parent`, in the parent's own separator. */

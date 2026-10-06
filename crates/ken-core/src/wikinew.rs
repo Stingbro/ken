@@ -53,11 +53,18 @@ pub const TEMPLATE: &[(&str, &str)] = template![
     "Ways-of-Working/Ways-of-Working.md",
 ];
 
-/// A repo the new wiki covers: its name in the workspace and what it is for.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A repo the new wiki covers: its name in the workspace and what it is for,
+/// and, when set-up knows them, its kinds and folder (for the team manifest:
+/// on 2026-10-06 its code and reference entries stayed `{{placeholders}}`
+/// though Ken had registered all four repos).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Covered {
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub kind: Vec<crate::registry::RepoKind>,
+    #[serde(default)]
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// Pages that are templates for people to copy keep their placeholders,
@@ -176,7 +183,8 @@ pub fn create_with(dir: &Path, team: &str, repos: &[Covered], today: &str, team_
                 fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
             }
             let text = text.replace("\r\n", "\n");
-            fs::write(&dest, crate::teamnew::fill(path, &text, team, &wiki, Some(&wiki))).map_err(|e| Error::io(&dest, e))?;
+            let filled = crate::teamnew::fill(path, &text, team, &wiki, Some(&wiki), repos);
+            fs::write(&dest, filled).map_err(|e| Error::io(&dest, e))?;
         }
     }
     git_commit_all(dir, &format!("Start the {team} wiki from the Ways-of-Working template"))
@@ -200,8 +208,8 @@ mod tests {
 
     fn repos() -> Vec<Covered> {
         vec![
-            Covered { name: "Game".into(), description: "The game client.\nBuilt nightly.".into() },
-            Covered { name: "Tools".into(), description: String::new() },
+            Covered { name: "Game".into(), description: "The game client.\nBuilt nightly.".into(), ..Default::default() },
+            Covered { name: "Tools".into(), description: String::new(), ..Default::default() },
         ]
     }
 

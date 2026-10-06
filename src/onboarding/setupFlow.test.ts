@@ -83,7 +83,7 @@ describe("setup flow", () => {
     expect(defaultWikiChoice(rows, "Realms")).toEqual({ mode: "existing", member: "docs" });
     expect(defaultWikiChoice(rows, "Ops")).toEqual({ mode: "new", parent: null, name: "Ops-Wiki" });
     expect(defaultWikiChoice(rows, "Ops", "C:/Code")).toEqual({ mode: "new", parent: "C:/Code", name: "Ops-Wiki" });
-    expect(coveredRepos(rows, "Realms")).toEqual([{ name: "game", description: "The client" }]);
+    expect(coveredRepos(rows, "Realms")).toEqual([{ name: "game", description: "The client", kind: ["code"], path: "C:/Code/game" }]);
   });
 
   it("a new wiki needs a folder and a name", () => {

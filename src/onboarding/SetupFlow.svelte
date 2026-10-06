@@ -207,7 +207,7 @@
         const wikiName = w?.mode === "new" ? w.name.trim() : w?.mode === "existing" ? w.member : null;
         const row =
           createdTeamRepos[t] ??
-          (await api.setupCreateTeamRepo(newWikiPath(c.parent, c.name), t, wikiName, all.map((r) => r.member)));
+          (await api.setupCreateTeamRepo(newWikiPath(c.parent, c.name), t, wikiName, all.map((r) => r.member), coveredRepos(all, t)));
         createdTeamRepos[t] = row;
         all = [...all.filter((r) => r.path !== row.path), row];
       }
