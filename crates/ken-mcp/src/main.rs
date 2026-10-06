@@ -2518,11 +2518,15 @@ argument is required (a name or folder path). {available}"
         ));
     };
 
+    // By id too, as the scoped branch above does: a hit's ken://<id>/ address
+    // read on an unscoped server failed with "No Ken project matches" (2026-10-06).
+    let requested_id = requested.parse::<Uuid>().ok();
     let entry = registry
         .projects
         .iter()
         .find(|p| {
             p.name.eq_ignore_ascii_case(requested)
+                || Some(p.id) == requested_id
                 || p.path == Path::new(requested)
                 || same_canonical(&p.path, Path::new(requested))
         })
