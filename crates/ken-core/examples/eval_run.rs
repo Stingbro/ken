@@ -179,7 +179,12 @@ fn phase_setup(base: &Path, parent: &Path) -> Result<()> {
     let covered: Vec<wikinew::Covered> = rows
         .iter()
         .filter(|r| r.include)
-        .map(|r| wikinew::Covered { name: r.member.clone(), description: r.description.clone() })
+        .map(|r| wikinew::Covered {
+            name: r.member.clone(),
+            description: r.description.clone(),
+            kind: r.kind.clone(),
+            path: r.path.clone(),
+        })
         .collect();
     let taken: Vec<String> = rows.iter().map(|r| r.member.clone()).collect();
     let mut wiki = setup::create_wiki(&parent.join(wiki_name()), &team(), &covered, &taken, &today())?;

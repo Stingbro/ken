@@ -7276,16 +7276,19 @@ async fn setup_create_wiki(
     .map_err(|e| e.to_string())?
 }
 
-/// Set-up's "Create a team repo": the method's team template at `dir`.
+/// Set-up's "Create a team repo": the method's team template at `dir`, its
+/// manifest naming the team's `repos` with their kinds.
 #[tauri::command]
 async fn setup_create_team_repo(
     dir: String,
     team: String,
     wiki: Option<String>,
     taken: Vec<String>,
+    repos: Option<Vec<ken_core::wikinew::Covered>>,
 ) -> CmdResult<ken_core::setup::RepoRow> {
     tauri::async_runtime::spawn_blocking(move || {
-        ken_core::setup::create_team_repo(Path::new(&dir), &team, wiki.as_deref(), &taken).map_err(err)
+        let repos = repos.unwrap_or_default();
+        ken_core::setup::create_team_repo(Path::new(&dir), &team, wiki.as_deref(), &repos, &taken).map_err(err)
     })
     .await
     .map_err(|e| e.to_string())?

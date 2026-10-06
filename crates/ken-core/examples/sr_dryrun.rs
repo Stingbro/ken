@@ -89,7 +89,12 @@ fn run_setup(base: &Path, parent: &Path) -> ken_core::Result<()> {
     let covered: Vec<wikinew::Covered> = rows
         .iter()
         .filter(|r| r.include)
-        .map(|r| wikinew::Covered { name: r.member.clone(), description: r.description.clone() })
+        .map(|r| wikinew::Covered {
+            name: r.member.clone(),
+            description: r.description.clone(),
+            kind: r.kind.clone(),
+            path: r.path.clone(),
+        })
         .collect();
     let taken: Vec<String> = rows.iter().map(|r| r.member.clone()).collect();
     let wiki_name = format!("{TEAM}-Wiki");

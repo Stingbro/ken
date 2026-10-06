@@ -40,6 +40,14 @@ export interface SetupRepoRow {
   description: string;
 }
 
+/** Mirrors `wikinew::Covered`: a repo a new wiki or team repo names. */
+export interface CoveredRepo {
+  name: string;
+  description: string;
+  kind?: RepoKind[];
+  path?: string | null;
+}
+
 /** Mirrors `setup::IgnoreRow`: one ignore line the scan would add. */
 export interface SetupIgnoreRow {
   pattern: string;
@@ -1459,11 +1467,12 @@ export const api = {
   /** A team wiki from the bundled template, in a new or empty folder. */
   /** `holdsTeam`: the team has no team repo, so the new docs repo also holds
    *  its tickets, decisions, ideas and people (one repo of both kinds). */
-  setupCreateWiki: (dir: string, team: string, repos: { name: string; description: string }[], taken: string[], holdsTeam = false) =>
+  setupCreateWiki: (dir: string, team: string, repos: CoveredRepo[], taken: string[], holdsTeam = false) =>
     invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken, holdsTeam }),
-  /** Set-up's "Create a team repo": the method's team template at `dir`. */
-  setupCreateTeamRepo: (dir: string, team: string, wiki: string | null, taken: string[]) =>
-    invoke<SetupRepoRow>("setup_create_team_repo", { dir, team, wiki, taken }),
+  /** Set-up's "Create a team repo": the method's team template at `dir`,
+   *  its manifest naming the team's `repos` with their kinds. */
+  setupCreateTeamRepo: (dir: string, team: string, wiki: string | null, taken: string[], repos: CoveredRepo[] = []) =>
+    invoke<SetupRepoRow>("setup_create_team_repo", { dir, team, wiki, taken, repos }),
   /** Apply a proposed page change; returns the page written. */
   applyPageProposal: (itemId: number, projectId: string | null = null) =>
     invoke<string>("apply_page_proposal", { itemId, projectId }),

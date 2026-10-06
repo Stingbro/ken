@@ -375,12 +375,21 @@ pub fn propose(parent: &Path) -> Result<Proposal> {
 }
 
 /// The first plain paragraph of a repo's README, one line, for its
-/// proposed description. Empty when it has none.
+/// proposed description; of its CLAUDE.md or AGENTS.md when it has no
+/// README that says one (Shattered-Realms-Tools has none, and on 2026-10-06
+/// its row read "(not said yet)" though its CLAUDE.md opens with what it is).
+/// Empty when none of them says.
 pub fn readme_summary(dir: &Path) -> String {
-    let Some(text) = ["README.md", "readme.md", "README", "START-HERE.md"].iter().find_map(|f| fs::read_to_string(dir.join(f)).ok())
-    else {
-        return String::new();
-    };
+    ["README.md", "readme.md", "README", "START-HERE.md", "CLAUDE.md", "AGENTS.md"]
+        .iter()
+        .filter_map(|f| fs::read_to_string(dir.join(f)).ok())
+        .map(|t| first_paragraph(&t))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+/// A Markdown file's first plain paragraph as one line, at most 220 characters.
+fn first_paragraph(text: &str) -> String {
     let para: Vec<&str> = text
         .lines()
         .map(str::trim)
@@ -690,9 +699,16 @@ pub fn create_wiki_with(
 
 /// Create a team's team repo at `dir` from the bundled template (see
 /// [`crate::teamnew`]) and return its set-up row: a team repo on `team`,
-/// read for entities. `wiki` is the team wiki's name, when it has one.
-pub fn create_team_repo(dir: &Path, team: &str, wiki: Option<&str>, taken: &[String]) -> Result<RepoRow> {
-    crate::teamnew::create(dir, team, wiki)?;
+/// read for entities. `wiki` is the team wiki's name, when it has one;
+/// `repos` the team's other repos, named in its manifest.
+pub fn create_team_repo(
+    dir: &Path,
+    team: &str,
+    wiki: Option<&str>,
+    repos: &[crate::wikinew::Covered],
+    taken: &[String],
+) -> Result<RepoRow> {
+    crate::teamnew::create(dir, team, wiki, repos)?;
     let mut row = propose_repos(&[dir.to_path_buf()], taken)?
         .rows
         .into_iter()
@@ -792,9 +808,25 @@ mod tests {
         for f in ["tickets/TICKET.md", "decisions/DECISIONS.md", "people/README.md", ".wright/team.json", "Current/Project.md"] {
             assert!(dir.join(f).exists(), "{f}");
         }
+        // One entry of both kinds, not the docs repo twice (2026-10-06).
+        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join(".wright/team.json")).unwrap()).unwrap();
+        assert_eq!(manifest["repos"]["Realms-Wiki"]["kind"], serde_json::json!(["team", "wiki"]));
+        let text = fs::read_to_string(dir.join(".wright/team.json")).unwrap();
+        assert_eq!(text.matches("\"Realms-Wiki\": {").count(), 1, "{text}");
         let alone = create_wiki(&parent.path().join("Other-Wiki"), "Other", &[], &[], "2026-10-06").unwrap();
         assert_eq!(alone.kind, vec![RepoKind::Wiki]);
         assert!(!parent.path().join("Other-Wiki/tickets").exists());
+    }
+
+    #[test]
+    fn a_repo_with_no_readme_is_described_from_its_brief() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("CLAUDE.md"), "# ShatterdRealmsTools\n\nThe authoring suite. pnpm workspace.\n\n## Repos\n").unwrap();
+        assert_eq!(readme_summary(d.path()), "The authoring suite. pnpm workspace.");
+        fs::write(d.path().join("README.md"), "# Tools\n\n![badge](x.svg)\n").unwrap();
+        assert_eq!(readme_summary(d.path()), "The authoring suite. pnpm workspace.", "a README that says nothing is passed over");
+        fs::write(d.path().join("README.md"), "# Tools\n\nThe level editor.\n").unwrap();
+        assert_eq!(readme_summary(d.path()), "The level editor.");
     }
 
     #[test]
@@ -1010,7 +1042,7 @@ mod tests {
     fn a_new_wiki_joins_set_up_as_the_teams_wiki() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("Realms-Wiki");
-        let covered = vec![crate::wikinew::Covered { name: "Game".into(), description: "The client.".into() }];
+        let covered = vec![crate::wikinew::Covered { name: "Game".into(), description: "The client.".into(), ..Default::default() }];
         let row = create_wiki(&dir, "Realms", &covered, &["Game".into()], "2026-09-25").unwrap();
         assert_eq!(row.member, "Realms-Wiki");
         assert_eq!(row.kind, vec![RepoKind::Wiki]);
