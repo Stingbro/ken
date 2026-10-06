@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -679,10 +679,52 @@ impl Db {
                 "#,
             )?;
         }
+        if version < 16 {
+            // index-words (2026-10-06): the keyword index gains a `names`
+            // column (`fts_names`), so it is made again and filled from the
+            // stored chunks here, with no file read. Files whose chunks or
+            // code map changed with it are read again by the next scan, once:
+            // JSON (each chunk now starts with its key outline) and the
+            // languages whose code map gained kinds (Java enums, fields and
+            // records; TypeScript enums and type aliases). Clearing the byte
+            // hash makes the scan read them rather than see an unchanged file.
+            self.rebuild_chunks_fts()?;
+            self.conn.execute(
+                r#"UPDATE files SET mtime = ?1, byte_hash = NULL
+                   WHERE status = 'indexed'
+                     AND (lower(rel_path) LIKE '%.json' OR lower(rel_path) LIKE '%.java'
+                          OR lower(rel_path) LIKE '%.ts' OR lower(rel_path) LIKE '%.tsx'
+                          OR lower(rel_path) LIKE '%.mts' OR lower(rel_path) LIKE '%.cts')"#,
+                params![Self::REINDEX_SENTINEL_MTIME],
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    /// Make the chunk keyword index (`chunks_fts`) again with today's columns
+    /// and fill it from the stored chunks, in one transaction.
+    fn rebuild_chunks_fts(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS chunks_fts;
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(text, names);
+            "#,
+        )?;
+        {
+            let mut read = tx.prepare("SELECT id, path, text FROM chunks")?;
+            let mut write = tx.prepare("INSERT INTO chunks_fts(rowid, text, names) VALUES (?1, ?2, ?3)")?;
+            let mut rows = read.query([])?;
+            while let Some(row) = rows.next()? {
+                let (id, path, text): (i64, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
+                write.execute(params![id, text, fts_names(&path, &text)])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -885,13 +927,13 @@ impl Db {
                 )?;
                 // chunks_fts row: delete-then-reinsert rather than UPDATE since
                 // FTS5 doesn't support partial-column UPDATE semantics the way
-                // a normal table does. Indexed text is path/filename/symbol-
-                // augmented (task 1.10, S7b Condition A) — `chunks.text`
-                // above stays the plain chunk text used for embeddings.
+                // a normal table does. The `names` column holds the path,
+                // file name and symbol names and their parts (`fts_names`);
+                // `text` is the chunk's own text, as embedded.
                 tx.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![id])?;
                 tx.execute(
-                    "INSERT INTO chunks_fts(rowid, text) VALUES (?1, ?2)",
-                    params![id, fts_index_text(path, &chunk.text)],
+                    "INSERT INTO chunks_fts(rowid, text, names) VALUES (?1, ?2, ?3)",
+                    params![id, chunk.text, fts_names(path, &chunk.text)],
                 )?;
                 if vec_exists {
                     tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
@@ -1051,7 +1093,7 @@ impl Db {
         if !table_exists(&self.conn, "chunks_fts")? {
             return Ok(Vec::new());
         }
-        let fts_query = build_fts_query(&tokens);
+        let fts_query = build_chunk_query(&tokens, false);
         // Rank inside the full-text table first and join only the top `k`:
         // joined first, SQLite reads every match's section text before it
         // sorts, which for a common word at tens of thousands of files cost
@@ -1082,7 +1124,7 @@ impl Db {
         // "validated"). When all-words finds too little, chunks with any of
         // them follow, bm25 putting those with the most and rarest first.
         if hits.len() < k && tokens.len() > 1 {
-            for hit in run(&build_fts_query_any(&tokens))? {
+            for hit in run(&build_chunk_query(&tokens, true))? {
                 if hits.len() >= k {
                     break;
                 }
@@ -3800,53 +3842,98 @@ fn path_tokens(rel_path: &str) -> String {
         .join(" ")
 }
 
-fn symbol_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
+/// Declaration patterns, a recall aid for search and not a parser: false
+/// negatives on exotic syntax are fine, a false positive adds a stray word.
+/// The first is a declaration keyword after any modifiers (`pub fn x`,
+/// `public final class X`, `export const x`). The second is a typed member
+/// after at least one modifier (`private static final int MAX_ROWS = 7;`,
+/// `public void open()`, `private readonly x: T`): on 2026-10-06 the single
+/// old pattern read `static` as the keyword in Java and indexed the return
+/// types (`void boolean final`) instead of the names.
+fn symbol_regexes() -> &'static [Regex; 2] {
+    static RE: OnceLock<[Regex; 2]> = OnceLock::new();
     RE.get_or_init(|| {
-        // Language-agnostic heuristic: an identifier immediately following a
-        // common top-level declaration keyword, at (or near) the start of a
-        // line. Covers Rust/JS/TS/Python/Go/Java/C#/C++-ish surface syntax
-        // well enough for FTS header purposes — this is a recall aid for
-        // search, not a real parser, so false negatives on exotic syntax are
-        // fine and false positives are harmless (they just add a stray token
-        // to the header).
-        Regex::new(
-            r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+|export\s+(?:default\s+)?|public\s+|private\s+|protected\s+|static\s+|async\s+|abstract\s+)*(?:fn|function|def|class|struct|enum|trait|interface|impl|type|const|static|let|var|func|mod|module)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        )
-        .expect("symbol_regex is a fixed, valid pattern")
+        [
+            Regex::new(
+                r"(?m)^[ \t]*(?:(?:pub(?:\([^)]*\))?|export|default|public|private|protected|internal|static|final|abstract|sealed|async|override|unsafe|extern)\s+)*(?:fn|function|def|class|struct|enum|trait|interface|impl|type|const|let|var|val|fun|func|mod|module|record)\s+([A-Za-z_][A-Za-z0-9_]*)",
+            )
+            .expect("a fixed, valid pattern"),
+            Regex::new(
+                r"(?m)^[ \t]*(?:(?:pub|public|private|protected|internal|static|final|abstract|synchronized|native|override|virtual|readonly|volatile|transient|default)\s+)+(?:[A-Za-z_][A-Za-z0-9_.]*(?:<[^;{}()=]*>)?(?:\[\])*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[(=;:]",
+            )
+            .expect("a fixed, valid pattern"),
+        ]
     })
 }
 
-/// Extract top-level-ish declaration names from a chunk's text (regex
-/// heuristic, no per-language parsing — see `symbol_regex`).
+/// Declared names in a chunk's text (see [`symbol_regexes`]).
 fn extract_symbol_names(text: &str) -> Vec<String> {
-    symbol_regex()
-        .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+    symbol_regexes()
+        .iter()
+        .flat_map(|re| re.captures_iter(text).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())))
         .collect()
 }
 
-/// Build the text actually indexed into `chunks_fts` for one chunk: relative
-/// path tokens + filename stem + regex-extracted declaration names,
-/// prepended ahead of the chunk's own text (S7b Condition A, semantic-index
-/// task 1.10). This is FTS-only augmentation — `chunks.text` (the embedding
-/// input, and what callers see back via `search_chunks_fts`'s `c.text`
-/// join) is never touched.
-fn fts_index_text(rel_path: &str, chunk_text: &str) -> String {
-    let path_part = path_tokens(rel_path);
-    let name_part = name_tokens(rel_path);
-    let symbols = extract_symbol_names(chunk_text).join(" ");
-    let mut header = String::with_capacity(path_part.len() + name_part.len() + symbols.len() + 3);
-    header.push_str(&path_part);
-    if !name_part.is_empty() {
-        header.push(' ');
-        header.push_str(&name_part);
+/// A name's parts: split at `_` and `-`, then at camelCase and digit
+/// boundaries (`search::camel_parts`), keeping each `_`/`-` part whole too.
+/// Parts of one letter are dropped. Empty when the name has no parts.
+fn name_parts(word: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let pieces: Vec<&str> = word.split(['_', '-']).filter(|p| !p.is_empty()).collect();
+    for piece in &pieces {
+        let camel = crate::search::camel_parts(piece);
+        if pieces.len() > 1 {
+            out.push(piece.to_string());
+        }
+        if camel.len() > 1 {
+            out.extend(camel.into_iter().filter(|p| p.chars().count() > 1));
+        }
     }
-    if !symbols.is_empty() {
-        header.push(' ');
-        header.push_str(&symbols);
+    out
+}
+
+/// Words longer than this in a chunk are not split into the `names` column:
+/// base64 and hashes, not names.
+const NAME_WORD_MAX: usize = 64;
+
+/// The `names` column of the chunk keyword index: the path's words, the
+/// declared names in the chunk, and the parts of every camelCase or
+/// snake_case word in the chunk, each part also as its light stem
+/// (`search::stem`), distinct words only. On 2026-10-06 "base damage ranges
+/// for each weapon" never matched data/equipment/WeaponBases.json, because
+/// `WeaponBases` is one token to the index; now `weapon`, `bases` and `bas`
+/// are in its names. A column of its own rather than a header line on the
+/// text: BM25 normalises each column by its own length, so a name match in
+/// a long chunk of numbers is not diluted by the numbers, and a word repeated
+/// fifty times in the code still counts once here.
+fn fts_names(rel_path: &str, chunk_text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |w: &str| {
+        if !w.is_empty() && seen.insert(w.to_lowercase()) {
+            out.push(w.to_string());
+        }
+    };
+    let declared = extract_symbol_names(chunk_text);
+    let named = path_tokens(rel_path).split(' ').map(str::to_string).chain(declared).collect::<Vec<_>>();
+    for word in &named {
+        add(word);
+        add(&crate::search::stem(&word.to_lowercase()));
+        for part in name_parts(word) {
+            add(&part);
+            add(&crate::search::stem(&part.to_lowercase()));
+        }
     }
-    format!("{header} {chunk_text}")
+    for word in chunk_text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if word.len() > NAME_WORD_MAX || word.chars().all(|c| c.is_ascii_digit() || c == '_') {
+            continue;
+        }
+        for part in name_parts(word) {
+            add(&part);
+            add(&crate::search::stem(&part.to_lowercase()));
+        }
+    }
+    out.join(" ")
 }
 
 fn like_escape(s: &str) -> String {
@@ -3915,14 +4002,36 @@ pub fn significant_tokens(query: &str) -> Vec<String> {
     significant_token_list(&query_tokens(query))
 }
 
-/// Build an FTS5 query from tokens: each quoted, all ANDed, last token as
-/// prefix for as-you-type feel.
-/// Any of `tokens` (FTS5 `OR`), each exact: the fallback when all of them
-/// together match too little.
-fn build_fts_query_any(tokens: &[String]) -> String {
-    tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(" OR ")
+/// A query for the chunk keyword index: all of `tokens` (the last as an
+/// as-you-type prefix), or with `any` any of them, each exact; the any-word
+/// form is the fallback when all of them together match too little. Each
+/// word also matches its light stem (`search::stem`) when that differs, the
+/// form the `names` column holds (`fts_names`): "base" then meets
+/// `WeaponBases`.
+fn build_chunk_query(tokens: &[String], any: bool) -> String {
+    let last = tokens.len().saturating_sub(1);
+    let terms: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            // The as-you-type prefix as in `build_fts_query`.
+            let word = if !any && i == last && t.chars().count() >= 2 { format!("\"{t}\" *") } else { format!("\"{t}\"") };
+            let lower = t.to_lowercase();
+            let stem = crate::search::stem(&lower);
+            if stem == lower {
+                word
+            } else {
+                format!("({word} OR \"{stem}\")")
+            }
+        })
+        .collect();
+    // FTS5 ANDs bare phrases side by side, but a bracketed group needs
+    // the word.
+    terms.join(if any { " OR " } else { " AND " })
 }
 
+/// Build an FTS5 query from tokens: each quoted, all ANDed, last token as
+/// prefix for as-you-type feel.
 fn build_fts_query(tokens: &[String]) -> String {
     let last = tokens.len().saturating_sub(1);
     let parts: Vec<String> = tokens
@@ -4219,6 +4328,89 @@ mod tests {
         assert!(names.contains(&"Widget".to_string()), "{names:?}");
         assert!(names.contains(&"handle".to_string()), "{names:?}");
         assert!(names.contains(&"makeThing".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn java_declarations_give_names_not_return_types() {
+        let text = "public enum StashTab {\n    ITEMS;\n    public static final short MAX_ROWS = 7;\n    private final Map<String, List<Row>> rows = new HashMap<>();\n    public static boolean isOpen(int x) {\n    public final class Inner {\n    public void close() {\n    public record Slot(int i) {}\n";
+        let names = extract_symbol_names(text);
+        for want in ["StashTab", "MAX_ROWS", "rows", "isOpen", "Inner", "close", "Slot"] {
+            assert!(names.contains(&want.to_string()), "{want} in {names:?}");
+        }
+        for junk in ["void", "boolean", "final", "short", "static"] {
+            assert!(!names.contains(&junk.to_string()), "{junk} in {names:?}");
+        }
+        // Rust and TypeScript still read as before.
+        let names = extract_symbol_names("pub static mut COUNT: u32 = 0;\npub(crate) struct Store;\n  private readonly cache: Map<string, number>;\n");
+        for want in ["COUNT", "Store", "cache"] {
+            assert!(names.contains(&want.to_string()), "{want} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn fts_names_split_compound_names_and_keep_them_whole() {
+        let names = fts_names("data/equipment/WeaponBases.json", "{ \"CritMultiplier\": 1.5, \"MAX_ROWS\": 7, \"plain\": \"aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgZW5jb2RlZCBkYXRhIHRoYXQgaXMgbG9uZw\" }");
+        let words: Vec<&str> = names.split(' ').collect();
+        for want in ["data", "equipment", "WeaponBases", "Weapon", "Bases", "bas", "json", "Crit", "Multiplier", "MAX", "ROWS", "row"] {
+            assert!(words.contains(&want), "{want} in {names}");
+        }
+        assert!(!words.contains(&"plain"), "a word with no parts stays in the text column only: {names}");
+        assert!(!names.contains("GVsb"), "a long base64 run is not split: {names}");
+        assert_eq!(words.len(), words.iter().map(|w| w.to_lowercase()).collect::<std::collections::HashSet<_>>().len(), "distinct words: {names}");
+        assert_eq!(name_parts("Sword_T1_Stone"), vec!["Sword", "T1", "Stone"]);
+        assert_eq!(name_parts("HTTPServer2Config"), vec!["HTTP", "Server", "Config"]);
+        assert!(name_parts("plain").is_empty());
+    }
+
+    #[test]
+    fn split_names_and_stems_find_a_data_file_by_its_words() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_chunks("data/equipment/WeaponBases.json", &[chunk(0, "{ \"Bases\": { \"Sword_T1\": { \"MinLow\": 4 } } }", "h0")], crate::kenignore::Tier::Full)
+            .unwrap();
+        db.upsert_chunks("docs/notes.md", &[chunk(0, "Nothing about arms here.", "h1")], crate::kenignore::Tier::Full)
+            .unwrap();
+        for q in ["weapon bases", "base weapon", "WeaponBases", "weapon base damage ranges"] {
+            let hits = db.search_chunks_fts(q, 5).unwrap();
+            assert_eq!(hits.first().map(|h| h.path.as_str()), Some("data/equipment/WeaponBases.json"), "{q}: {hits:?}");
+        }
+        // The text column is the chunk's own text, nothing added.
+        let text: String = db.conn.query_row("SELECT text FROM chunks_fts WHERE rowid = 1", [], |r| r.get(0)).unwrap();
+        assert!(text.starts_with("{ \"Bases\""), "{text}");
+    }
+
+    #[test]
+    fn chunk_queries_add_each_words_stem() {
+        let t = |s: &[&str]| s.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(build_chunk_query(&t(&["weapon", "bases"]), false), "\"weapon\" AND (\"bases\" * OR \"bas\")");
+        assert_eq!(build_chunk_query(&t(&["Ranges", "x"]), true), "(\"Ranges\" OR \"rang\") OR \"x\"");
+    }
+
+    #[test]
+    fn schema_16_rebuilds_the_keyword_index_and_marks_files_to_read_again() {
+        let mut db = Db::open_in_memory().unwrap();
+        for (path, status) in [("a/WeaponBases.json", "indexed"), ("src/Stash.java", "indexed"), ("notes.md", "indexed"), ("x.ts", "metadata_only")] {
+            db.upsert_file(path, "code", 1, 5, status, None, "x").unwrap();
+            db.set_file_byte_hash(path, "abc", 5).unwrap();
+        }
+        db.upsert_chunks("a/WeaponBases.json", &[chunk(0, "{ \"MinLow\": 4 }", "h0")], crate::kenignore::Tier::Full)
+            .unwrap();
+        // An index from before: the old one-column table, filled the old way.
+        db.conn
+            .execute_batch(
+                "DROP TABLE chunks_fts; CREATE VIRTUAL TABLE chunks_fts USING fts5(text);
+                 INSERT INTO chunks_fts(rowid, text) SELECT id, text FROM chunks;
+                 UPDATE meta SET value = '15' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        db.migrate().unwrap();
+        assert_eq!(db.search_chunks_fts("weapon bases", 5).unwrap().len(), 1, "filled again from the stored chunks");
+        let names: String = db.conn.query_row("SELECT names FROM chunks_fts", [], |r| r.get(0)).unwrap();
+        assert!(names.contains("Weapon") && names.contains("Min"), "{names}");
+        for (path, again) in [("a/WeaponBases.json", true), ("src/Stash.java", true), ("notes.md", false), ("x.ts", false)] {
+            let row = db.get_file(path).unwrap().unwrap();
+            assert_eq!(row.mtime == -1, again, "{path}");
+            assert_eq!(db.file_byte_hash(path).unwrap().is_none(), again, "{path}");
+        }
     }
 
     #[test]
