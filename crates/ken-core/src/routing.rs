@@ -128,6 +128,10 @@ pub struct RoutePlan {
     /// [`merge_routed`] as a tie-break — earlier here wins a scoring tie).
     pub targets: Vec<Uuid>,
     pub reason: RouteReason,
+    /// The question asks about the platform the team builds on
+    /// ([`asks_about_platform`]): a reference repo's assets then rank as
+    /// equals of the team's own files.
+    pub platform: bool,
 }
 
 /// Per-member outcome of an actual search attempt (design D5: "not-ready
@@ -187,6 +191,7 @@ pub struct MemberInfo {
 ///    member, most-recent-activity first, capped at [`BROADCAST_CAP`].
 pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb>) -> RoutePlan {
     let normalized_query = normalize_name(query);
+    let platform = asks_about_platform(query);
 
     let named: Vec<Uuid> = members
         .iter()
@@ -197,6 +202,7 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
         return RoutePlan {
             targets: named,
             reason: RouteReason::Named,
+            platform,
         };
     }
 
@@ -222,6 +228,7 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
                 return RoutePlan {
                     targets,
                     reason: RouteReason::KgEntities(matched_ids),
+                    platform,
                 };
             }
         }
@@ -231,6 +238,7 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
     RoutePlan {
         targets,
         reason: RouteReason::Broadcast,
+        platform,
     }
 }
 
@@ -697,6 +705,39 @@ pub fn workspace_vocabulary<'a>(dbs: impl IntoIterator<Item = &'a Db>) -> crate:
     crate::vocab::Vocabulary::merged(vocabs.iter())
 }
 
+/// What a reference repo's asset gives up when the question is about the
+/// team's own work: less than one filename word. On 2026-10-06 the JSON
+/// headers and the `names` column put the game's own `Weapon_Shield_Copper.json`
+/// and `Coins.json` above the mod's code for "how much stamina does it cost to
+/// take a hit while holding up a weapon or shield" and "how many coins do you
+/// get for breaking an item down": an asset named for a question's nouns
+/// matches it in name only.
+pub const W_REFERENCE_ASSET: f64 = 2.0;
+
+/// Words that put a question on the platform rather than on the team's own
+/// work.
+const PLATFORM_WORDS: &[&str] =
+    &["engine", "platform", "built-in", "builtin", "vanilla", "base game", "out of the box", "upstream", "sdk", "framework"];
+
+/// Whether `query` asks about the platform the team builds on ("does the
+/// engine have a boss health bar", "the game's built-in minimap").
+pub fn asks_about_platform(query: &str) -> bool {
+    let words: String = query.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { ' ' }).collect();
+    let words = format!(" {} ", words.split_whitespace().collect::<Vec<_>>().join(" "));
+    PLATFORM_WORDS.iter().any(|w| words.contains(&format!(" {w} ")))
+}
+
+/// Whether `path`, in a repo of `kinds`, is a reference repo's asset (its
+/// JSON, YAML and data files) that `plan` does not ask about: a question
+/// that names the repo, or the platform, wants them as much as anything.
+fn reference_asset(plan: &RoutePlan, kinds: &[crate::registry::RepoKind], path: &str) -> bool {
+    use crate::contenttype::ContentType as T;
+    kinds.contains(&crate::registry::RepoKind::Reference)
+        && !plan.platform
+        && plan.reason != RouteReason::Named
+        && matches!(crate::contenttype::of(path), T::Config | T::Data)
+}
+
 /// What a page's band adds to its relevance: less than one filename word.
 pub const W_BAND: f64 = 0.75;
 
@@ -871,15 +912,14 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
         if mh.status != MemberStatus::Searched {
             continue;
         }
-        // Once per member: its commit, and whether its pages are notes. A
-        // member missing from the registry is cited as plain repo:path:line.
-        let (sha, wiki) = match crate::registry::entry_of(mh.project_id) {
-            Some((root, kind)) => (
-                head_sha(&root),
-                kind.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki)),
-            ),
-            None => (None, false),
+        // Once per member: its commit, its kinds, and whether its pages are
+        // notes. A member missing from the registry is cited as plain
+        // repo:path:line.
+        let (sha, kinds) = match crate::registry::entry_of(mh.project_id) {
+            Some((root, kind)) => (head_sha(&root), kind),
+            None => (None, Vec::new()),
         };
+        let wiki = kinds.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki));
         let order = target_order.get(&mh.project_id).copied().unwrap_or(usize::MAX);
         for (i, hit) in mh.hits.iter().enumerate() {
             let rank = i + 1;
@@ -902,7 +942,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     page: hit.page.clone(),
                     kg_breadcrumbs: breadcrumbs.clone(),
                 },
-                hit.score,
+                hit.score - if reference_asset(plan, &kinds, &hit.path) { W_REFERENCE_ASSET } else { 0.0 },
             ));
         }
     }
@@ -1152,6 +1192,7 @@ mod tests {
         let plan = RoutePlan {
             targets: vec![a, b],
             reason: RouteReason::Broadcast,
+            platform: false,
         };
         let member_hits = vec![
             MemberHits {
@@ -1249,9 +1290,29 @@ mod tests {
     /// Relevance decides across members: a strong hit in the second repo
     /// beats a weak first hit in the first, whatever the plan's order.
     #[test]
+    fn a_reference_repos_assets_yield_unless_the_question_is_about_the_platform() {
+        use crate::registry::RepoKind;
+        let plan = |platform, reason| RoutePlan { targets: vec![], reason, platform };
+        let asked = plan(false, RouteReason::Broadcast);
+        let shield = "HytaleAssets/Server/Item/Items/Weapon/Shield/Weapon_Shield_Copper.json";
+        assert!(reference_asset(&asked, &[RepoKind::Reference], shield));
+        assert!(!reference_asset(&asked, &[RepoKind::Reference], "server/core/HytaleServerConfig.java"), "its code competes as before");
+        assert!(!reference_asset(&asked, &[RepoKind::Code], "src/main/resources/Server/Item/Items/Coins/Bronze_Coin.json"), "the team's own assets");
+        assert!(!reference_asset(&plan(true, RouteReason::Broadcast), &[RepoKind::Reference], shield), "a platform question");
+        assert!(!reference_asset(&plan(false, RouteReason::Named), &[RepoKind::Reference], shield), "the question names the repo");
+
+        assert!(asks_about_platform("Does the engine have a boss health bar?"));
+        assert!(asks_about_platform("How do we add our own pins to the game's built-in minimap?"));
+        assert!(asks_about_platform("Which shapes does it support out of the box?"));
+        assert!(!asks_about_platform("How much stamina does it cost to take a hit while holding up a weapon or shield?"));
+        assert!(!asks_about_platform("Who leads engineering?"), "whole words only");
+        assert!(plan_route("does the engine have flags", &[], None).platform);
+    }
+
+    #[test]
     fn scored_hits_merge_by_relevance_across_members() {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast };
+        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false };
         let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
         let member_hits = vec![
             MemberHits {
@@ -1294,6 +1355,7 @@ mod tests {
         let plan = RoutePlan {
             targets: vec![a],
             reason: RouteReason::Broadcast,
+            platform: false,
         };
         let member_hits = vec![MemberHits {
             project_id: a,
@@ -1314,6 +1376,7 @@ mod tests {
         let plan = RoutePlan {
             targets: vec![ready_id, building_id],
             reason: RouteReason::Broadcast,
+            platform: false,
         };
 
         let ready_db = fixture_db_with_chunk("notes/found.md", "the quokka naps");
@@ -1363,6 +1426,7 @@ mod tests {
         let plan = RoutePlan {
             targets: vec![a, missing],
             reason: RouteReason::Broadcast,
+            platform: false,
         };
         let db = fixture_db_with_chunk("x.md", "hello world");
         let targets = vec![MemberDbHandle {
@@ -1423,6 +1487,7 @@ mod tests {
         let plan = RoutePlan {
             targets: vec![a],
             reason: RouteReason::KgEntities(vec![42]),
+            platform: false,
         };
         let member_hits = vec![MemberHits {
             project_id: a,
@@ -1451,7 +1516,7 @@ mod tests {
     fn binding_pages_lead_the_merged_list_across_members() {
         use crate::pagemeta::{hit_page, PageMeta};
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast };
+        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false };
         let paged = |path: &str, id: i64, meta: Option<PageMeta>| HybridHit {
             page: hit_page(path, meta),
             ..hit(path, id)
@@ -1487,6 +1552,7 @@ mod tests {
         let plan = RoutePlan {
             targets: vec![a],
             reason: RouteReason::Named,
+            platform: false,
         };
         let member_hits = vec![MemberHits {
             project_id: a,
