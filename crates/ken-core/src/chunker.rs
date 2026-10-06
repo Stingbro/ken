@@ -225,7 +225,10 @@ fn tail(s: &str, n: usize) -> String {
 
 /// Chunks as (first line of the chunk's own content, text).
 fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
-    let target_chars = (profile.target_tokens * 4).max(1);
+    // A file too long for `CHUNK_CAP` chunks of the target size gets bigger
+    // chunks rather than losing its end: sized to fill three quarters of the
+    // cap, which leaves room for the chunks that end short of the size.
+    let target_chars = (profile.target_tokens * 4).max(1).max(text.len() / (CHUNK_CAP * 3 / 4));
     let overlap_chars = ((target_chars as f32) * profile.overlap_pct).round() as usize;
 
     let blocks = split_prose_blocks(text);
@@ -236,6 +239,20 @@ fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
     let mut line: Option<usize> = None;
 
     for (block_line, block) in blocks {
+        // One paragraph or table longer than a chunk is cut at its line ends
+        // into chunks of its own. Kept whole, the 2,300-row table of
+        // decisions/Cited-in-Code.md was one 445 KB chunk on 2026-10-06: it
+        // held every word of nearly every question, so it matched them all
+        // and answered none.
+        if block.len() > target_chars {
+            if !current.trim().is_empty() {
+                chunks.push((line.unwrap_or(block_line), std::mem::take(&mut current)));
+            }
+            current.clear();
+            line = None;
+            chunks.extend(split_long_block(block_line, &block, target_chars));
+            continue;
+        }
         let is_heading = block.starts_with('#');
         let would_exceed = !current.is_empty() && current.len() + block.len() + 2 > target_chars;
         // Headings always start a fresh chunk (no merging a new section into
@@ -262,6 +279,41 @@ fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
         chunks.push((line.unwrap_or(1), current));
     }
     chunks
+}
+
+/// A block starting on line `start` cut at line ends into pieces of at most
+/// `max` bytes (a single longer line stays whole), each with the line it
+/// starts on. A Markdown table's header and rule rows start every piece, so
+/// each still reads as the table it came from.
+fn split_long_block(start: usize, block: &str, max: usize) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = block.lines().collect();
+    let is_rule = |l: &str| {
+        let l = l.trim();
+        l.starts_with('|') && l.contains('-') && l.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+    };
+    let header = (lines.len() > 2 && lines[0].trim_start().starts_with('|') && is_rule(lines[1]))
+        .then(|| format!("{}\n{}\n", lines[0], lines[1]));
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut first: Option<usize> = None;
+    for (i, row) in lines.iter().enumerate() {
+        if first.is_some() && current.len() + row.len() + 1 > max {
+            pieces.push((first.take().unwrap_or(start), std::mem::take(&mut current)));
+        }
+        if first.is_none() {
+            if let Some(h) = header.as_deref().filter(|_| i >= 2) {
+                current.push_str(h);
+            }
+            first = Some(start + i);
+        } else {
+            current.push('\n');
+        }
+        current.push_str(row);
+    }
+    if let Some(l) = first {
+        pieces.push((l, current));
+    }
+    pieces
 }
 
 /// Chunks as (first line, text).
@@ -641,6 +693,35 @@ mod tests {
         let chunks = chunk_file("generated.rs", &text, &profile);
         assert_eq!(chunks.len(), CHUNK_CAP);
         assert_eq!(chunks.last().unwrap().seq, CHUNK_CAP - 1);
+    }
+
+    #[test]
+    fn a_table_longer_than_a_chunk_is_cut_at_its_rows_and_keeps_its_header() {
+        let header = "| id | cited at | the comment |\n|---|---|---|\n";
+        let mut text = format!("# Decisions Cited in Code\n\n{header}");
+        for i in 0..200 {
+            text.push_str(&format!("| D-{i:03} | `game:src/save{i}.rs:{i}` | // D-{i:03}: worlds save as region files |\n"));
+        }
+        let chunks = chunk_file("decisions/Cited-in-Code.md", &text, &IndexProfile::default_for("x.md"));
+        assert_eq!(chunks[0].text, "# Decisions Cited in Code", "the heading before it stays its own chunk");
+        assert!(chunks.len() > 10, "{} chunks", chunks.len());
+        for c in &chunks[1..] {
+            assert!(c.text.len() <= 350 * 4, "{} bytes", c.text.len());
+            assert!(c.text.starts_with(header), "every piece reads as the table: {:?}", c.text);
+        }
+        let rows: Vec<&str> = chunks.iter().flat_map(|c| c.text.lines().filter(|l| l.starts_with("| D-"))).collect();
+        assert_eq!(rows.len(), 200, "each row once");
+        // A piece is cited at its first row, not at the header it repeats.
+        let first_row = chunks[2].text.lines().nth(2).unwrap();
+        assert_eq!(chunks[2].line, text.lines().position(|l| l == first_row).unwrap() + 1);
+    }
+
+    #[test]
+    fn a_prose_file_too_long_for_the_cap_keeps_its_end() {
+        let text: String = (0..6000).map(|i| format!("row {i:04} of a generated listing, wide enough to fill a page\n")).collect();
+        let chunks = chunk_file("evidence/boot.txt", &text, &IndexProfile::default_for("boot.txt"));
+        assert!(chunks.len() <= CHUNK_CAP, "{} chunks", chunks.len());
+        assert!(chunks.last().unwrap().text.ends_with("row 5999 of a generated listing, wide enough to fill a page"));
     }
 
     #[test]

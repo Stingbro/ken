@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -698,6 +698,20 @@ impl Db {
                 params![Self::REINDEX_SENTINEL_MTIME],
             )?;
         }
+        if version < 17 {
+            // search-regression (2026-10-06): a prose paragraph or table
+            // longer than a chunk is cut at its line ends, and a file too
+            // long for the chunk cap gets bigger chunks (`chunker`). Prose
+            // files are read again by the next scan, once, to be chunked
+            // that way; a chunk whose text is unchanged keeps its vector.
+            self.conn.execute(
+                r#"UPDATE files SET mtime = ?1, byte_hash = NULL
+                   WHERE status = 'indexed'
+                     AND (lower(rel_path) LIKE '%.md' OR lower(rel_path) LIKE '%.mdx'
+                          OR lower(rel_path) LIKE '%.txt' OR lower(rel_path) LIKE '%.pdf')"#,
+                params![Self::REINDEX_SENTINEL_MTIME],
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -1074,10 +1088,10 @@ impl Db {
     /// eventually) has a ready-made `Vec<FtsHit>` to feed into
     /// `search::merge_hits` alongside `semantic_search`'s KNN hits. Reuses
     /// the same tokenize/stopword/prefix-match query building as the
-    /// file-grain `search()` above. Returns up to `k` hits ordered
-    /// best-first (by BM25 rank); returns an empty `Vec` (never errors) for
-    /// an empty/stopword-only query, `k == 0`, or a pre-v12 DB where
-    /// `chunks_fts` doesn't exist yet.
+    /// file-grain `search()` above. Returns up to `k` hits, each the best
+    /// chunk of a different file, ordered best-first (by BM25 rank); returns
+    /// an empty `Vec` (never errors) for an empty/stopword-only query,
+    /// `k == 0`, or a pre-v12 DB where `chunks_fts` doesn't exist yet.
     pub fn search_chunks_fts(&self, query: &str, k: usize) -> Result<Vec<FtsHit>> {
         if k == 0 {
             return Ok(Vec::new());
@@ -1094,44 +1108,49 @@ impl Db {
             return Ok(Vec::new());
         }
         let fts_query = build_chunk_query(&tokens, false);
-        // Rank inside the full-text table first and join only the top `k`:
+        // Rank inside the full-text table first and join only the top ones:
         // joined first, SQLite reads every match's section text before it
         // sorts, which for a common word at tens of thousands of files cost
-        // most of a second. Same rows, same order.
-        let mut stmt = self.conn.prepare(
-            r#"SELECT c.id, c.path, c.text
-               FROM (SELECT rowid AS id, rank AS r
+        // most of a second. Same rows, same order. The text is read only for
+        // the chunks kept.
+        let mut ranked = self.conn.prepare(
+            r#"SELECT c.id, c.path
+               FROM (SELECT rowid AS id, bm25(chunks_fts, 1.0, ?3) AS r
                      FROM chunks_fts
                      WHERE chunks_fts MATCH ?1
-                     ORDER BY rank
+                     ORDER BY r
                      LIMIT ?2) t
                JOIN chunks c ON c.id = t.id
                ORDER BY t.r"#,
         )?;
-        let mut run = |q: &str| -> Result<Vec<FtsHit>> {
-            let rows = stmt.query_map(params![q, k as i64], |r| {
-                Ok(FtsHit {
-                    chunk_id: r.get(0)?,
-                    path: r.get(1)?,
-                    text: r.get(2)?,
-                })
-            })?;
-            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let mut text_of = self.conn.prepare_cached("SELECT text FROM chunks WHERE id = ?1")?;
+        let depth = (k * CHUNKS_READ_PER_FILE) as i64;
+        let mut add = |q: &str, hits: &mut Vec<FtsHit>, names: f64| -> Result<()> {
+            let rows = ranked
+                .query_map(params![q, depth, names], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (chunk_id, path) in rows {
+                if hits.len() >= k {
+                    break;
+                }
+                if hits.iter().any(|h| h.path == path) {
+                    continue;
+                }
+                let text = text_of.query_row(params![chunk_id], |r| r.get(0))?;
+                hits.push(FtsHit { chunk_id, path, text });
+            }
+            Ok(())
         };
-        let mut hits = run(&fts_query)?;
+        let mut hits = Vec::new();
+        add(&fts_query, &mut hits, 1.0)?;
         // A question asks in its own words: "how are tokens validated in the
         // backend" has no chunk with every word ("validation", not
         // "validated"). When all-words finds too little, chunks with any of
         // them follow, bm25 putting those with the most and rarest first.
+        // Such a question is in plain words, so there a name counts for less
+        // ([`W_NAMES_ANY`]).
         if hits.len() < k && tokens.len() > 1 {
-            for hit in run(&build_chunk_query(&tokens, true))? {
-                if hits.len() >= k {
-                    break;
-                }
-                if !hits.iter().any(|h| h.chunk_id == hit.chunk_id) {
-                    hits.push(hit);
-                }
-            }
+            add(&build_chunk_query(&tokens, true), &mut hits, W_NAMES_ANY)?;
         }
         Ok(hits)
     }
@@ -3892,6 +3911,23 @@ fn name_parts(word: &str) -> Vec<String> {
     out
 }
 
+/// The `names` column's BM25 weight (the text's is 1) in the any-word
+/// search, which runs when no chunk holds every word of a question: a
+/// question in plain words. At full weight one common word among a file's
+/// names outranked a chunk whose text held most of the question: for "why
+/// doesn't a looted world chest come back on the next tick", every file
+/// with `Chest` in a name came before ChestPoolRespawn.java, whose text has
+/// six of the eight words (2026-10-06: file 14 in its repo, 4 with names
+/// left out). A quarter keeps a name in the score without letting it lead.
+const W_NAMES_ANY: f64 = 0.25;
+
+/// How many chunks the keyword search reads for each file it returns. A
+/// file's best chunk stands for it. Read chunk by chunk, "do I keep the
+/// bolts I already loaded" (2026-10-06) filled a repo's eight places with
+/// four sections of AmmoKeepDecisionTest.java and two of CHANGELOG.md, and
+/// AmmoKeep.java, the sixth file, never reached the ranking.
+const CHUNKS_READ_PER_FILE: usize = 4;
+
 /// Words longer than this in a chunk are not split into the `names` column:
 /// base64 and hashes, not names.
 const NAME_WORD_MAX: usize = 64;
@@ -3941,10 +3977,19 @@ fn like_escape(s: &str) -> String {
 }
 
 /// Split raw user input into safe query tokens: alphanumeric runs only —
-/// FTS5 syntax and LIKE wildcards can't survive this.
+/// FTS5 syntax and LIKE wildcards can't survive this. The ending of a
+/// possessive or contraction goes first ("game's" is `game`, "doesn't" is
+/// `doesn`): as a word of its own, `s` or `t` had to be in every chunk an
+/// all-words search returned, and in the any-word search it matched every
+/// `t` variable in the code.
 fn query_tokens(input: &str) -> Vec<String> {
     input
-        .split(|c: char| !c.is_alphanumeric())
+        .split_whitespace()
+        .map(|word| match word.trim_end_matches(|c: char| !c.is_alphanumeric()).rsplit_once(['\'', '’']) {
+            Some((stem, end)) if ["s", "t", "d", "ll", "re", "ve", "m"].contains(&end.to_lowercase().as_str()) => stem,
+            _ => word,
+        })
+        .flat_map(|word| word.split(|c: char| !c.is_alphanumeric()))
         .filter(|t| !t.is_empty())
         .map(|t| t.to_string())
         .collect()
@@ -4406,9 +4451,68 @@ mod tests {
         assert_eq!(db.search_chunks_fts("weapon bases", 5).unwrap().len(), 1, "filled again from the stored chunks");
         let names: String = db.conn.query_row("SELECT names FROM chunks_fts", [], |r| r.get(0)).unwrap();
         assert!(names.contains("Weapon") && names.contains("Min"), "{names}");
-        for (path, again) in [("a/WeaponBases.json", true), ("src/Stash.java", true), ("notes.md", false), ("x.ts", false)] {
+        // notes.md is read again too, by schema 17's step.
+        for (path, again) in [("a/WeaponBases.json", true), ("src/Stash.java", true), ("notes.md", true), ("x.ts", false)] {
             let row = db.get_file(path).unwrap().unwrap();
             assert_eq!(row.mtime == -1, again, "{path}");
+            assert_eq!(db.file_byte_hash(path).unwrap().is_none(), again, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_possessive_or_contraction_ending_is_not_a_word_of_its_own() {
+        assert_eq!(query_tokens("the base game's assets jar"), vec!["the", "base", "game", "assets", "jar"]);
+        assert_eq!(query_tokens("Why doesn't a chest come back?"), vec!["Why", "doesn", "a", "chest", "come", "back"]);
+        assert_eq!(query_tokens("a party’s trip"), vec!["a", "party", "trip"]);
+        assert_eq!(query_tokens("O'Brien's 'quoted' notes"), vec!["O", "Brien", "quoted", "notes"]);
+        assert_eq!(query_tokens("auth.rs::validate"), vec!["auth", "rs", "validate"]);
+    }
+
+    #[test]
+    fn keyword_search_returns_files_not_sections_of_one_file() {
+        let mut db = Db::open_in_memory().unwrap();
+        let sections: Vec<_> = (0..6).map(|i| chunk(i, &format!("the crossbow keeps its bolts loaded, case {i}"), &format!("t{i}"))).collect();
+        db.upsert_chunks("src/test/AmmoKeepDecisionTest.java", &sections, crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("src/main/AmmoKeep.java", &[chunk(0, "bolts stay loaded when the crossbow is put away", "a0")], crate::kenignore::Tier::Full)
+            .unwrap();
+        let hits = db.search_chunks_fts("crossbow bolts loaded", 2).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths.contains(&"src/main/AmmoKeep.java"), "{paths:?}");
+    }
+
+    #[test]
+    fn a_plain_words_question_weighs_names_less_than_the_text() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Names that hold three of the words; a text that holds five.
+        db.upsert_chunks("src/chest/LootedWorldChest.java", &[chunk(0, "class LootedWorldChest { int x; }", "n0")], crate::kenignore::Tier::Full)
+            .unwrap();
+        db.upsert_chunks(
+            "src/chest/PoolRespawn.java",
+            &[chunk(0, "a chest emptied this tick comes back on a later tick, never the next one", "t0")],
+            crate::kenignore::Tier::Full,
+        )
+        .unwrap();
+        for i in 0..20 {
+            db.upsert_chunks(&format!("src/other/Filler{i}.java"), &[chunk(0, &format!("unrelated code number {i}"), "f")], crate::kenignore::Tier::Full)
+                .unwrap();
+        }
+        // No chunk has every word, so the any-word search ranks them.
+        let hits = db.search_chunks_fts("why doesn't a looted world chest come back on the next tick", 2).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("src/chest/PoolRespawn.java"), "{hits:?}");
+    }
+
+    #[test]
+    fn schema_17_marks_prose_files_to_read_again() {
+        let mut db = Db::open_in_memory().unwrap();
+        for (path, status) in [("decisions/Cited-in-Code.md", "indexed"), ("logs/boot.txt", "indexed"), ("src/Stash.java", "indexed"), ("old.md", "metadata_only")] {
+            db.upsert_file(path, "code", 1, 5, status, None, "x").unwrap();
+            db.set_file_byte_hash(path, "abc", 5).unwrap();
+        }
+        db.conn.execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'", []).unwrap();
+        db.migrate().unwrap();
+        for (path, again) in [("decisions/Cited-in-Code.md", true), ("logs/boot.txt", true), ("src/Stash.java", false), ("old.md", false)] {
+            assert_eq!(db.get_file(path).unwrap().unwrap().mtime == -1, again, "{path}");
             assert_eq!(db.file_byte_hash(path).unwrap().is_none(), again, "{path}");
         }
     }

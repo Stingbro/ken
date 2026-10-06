@@ -9766,10 +9766,12 @@ async fn route_search(
             (Some(id), _) => routing::RoutePlan {
                 targets: vec![id],
                 reason: routing::RouteReason::Named,
+                platform: routing::asks_about_platform(&query_for_plan),
             },
             (None, Some(ids)) => routing::RoutePlan {
                 targets: ids,
                 reason: routing::RouteReason::Named,
+                platform: routing::asks_about_platform(&query_for_plan),
             },
             (None, None) => {
                 let kg = if kg_enabled {
