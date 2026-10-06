@@ -1457,8 +1457,10 @@ export const api = {
    *  and proposes changes to kept pages. Returns the wikis being updated. */
   wikiAddRepos: (members: string[]) => invoke<string[]>("wiki_add_repos", { members }),
   /** A team wiki from the bundled template, in a new or empty folder. */
-  setupCreateWiki: (dir: string, team: string, repos: { name: string; description: string }[], taken: string[]) =>
-    invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken }),
+  /** `holdsTeam`: the team has no team repo, so the new docs repo also holds
+   *  its tickets, decisions, ideas and people (one repo of both kinds). */
+  setupCreateWiki: (dir: string, team: string, repos: { name: string; description: string }[], taken: string[], holdsTeam = false) =>
+    invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken, holdsTeam }),
   /** Set-up's "Create a team repo": the method's team template at `dir`. */
   setupCreateTeamRepo: (dir: string, team: string, wiki: string | null, taken: string[]) =>
     invoke<SetupRepoRow>("setup_create_team_repo", { dir, team, wiki, taken }),

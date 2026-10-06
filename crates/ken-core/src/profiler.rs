@@ -45,6 +45,9 @@ pub const REPO_MARKERS: &[&str] = &[
     "go.mod",
     "pom.xml",
     "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
     "Gemfile",
     "requirements.txt",
     "CMakeLists.txt",
@@ -61,6 +64,9 @@ const MARKER_EXCLUDES: &[(&str, &[&str])] = &[
     ("go.mod", &["vendor"]),
     ("pom.xml", &["target"]),
     ("build.gradle", &["build", ".gradle"]),
+    ("build.gradle.kts", &["build", ".gradle"]),
+    ("settings.gradle", &["build", ".gradle"]),
+    ("settings.gradle.kts", &["build", ".gradle"]),
     ("*.sln", &["bin", "obj"]),
 ];
 

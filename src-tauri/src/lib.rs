@@ -2692,14 +2692,30 @@ fn set_project_kind(
             state: if status.active { "synced" } else { "off" }.into(),
             detail: None,
         });
+        rescan_member(&app, &guard.base_dir, &member.project);
     }
     Ok(registry.statuses())
+}
+
+/// Scan an open repo again in the background, after what it is changed: a
+/// repo given its kind is read for the first time, and one whose index state
+/// changed has its files re-tiered.
+fn rescan_member(app: &AppHandle, base: &Path, project: &Project) {
+    let (app, base, project) = (app.clone(), base.to_path_buf(), project.clone());
+    std::thread::spawn(move || {
+        if let Ok(mut db) = Db::open(&base, project.config.id) {
+            if let Ok(stats) = scan::scan(&project, &mut db) {
+                emit_member(&app, project.config.id, "index-updated", stats);
+            }
+        }
+    });
 }
 
 /// Set how deep Ken reads a repo (off / search / entities), or clear the
 /// choice so it follows the kind. The next scan re-tiers its files.
 #[tauri::command]
 fn set_project_index(
+    app: AppHandle,
     state: State<SharedState>,
     id: String,
     index: Option<ken_core::registry::IndexState>,
@@ -2711,6 +2727,9 @@ fn set_project_index(
         return Err(format!("no project with id {id}"));
     }
     registry.save(&guard.base_dir).map_err(err)?;
+    if let Some(member) = guard.members.get(&uuid) {
+        rescan_member(&app, &guard.base_dir, &member.project);
+    }
     Ok(registry.statuses())
 }
 
@@ -7247,9 +7266,11 @@ async fn setup_create_wiki(
     team: String,
     repos: Vec<ken_core::wikinew::Covered>,
     taken: Vec<String>,
+    holds_team: Option<bool>,
 ) -> CmdResult<ken_core::setup::RepoRow> {
     tauri::async_runtime::spawn_blocking(move || {
-        ken_core::setup::create_wiki(Path::new(&dir), &team, &repos, &taken, &local_date_today()).map_err(err)
+        ken_core::setup::create_wiki_with(Path::new(&dir), &team, &repos, &taken, &local_date_today(), holds_team.unwrap_or(false))
+            .map_err(err)
     })
     .await
     .map_err(|e| e.to_string())?

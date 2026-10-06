@@ -146,6 +146,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
 /// `repos`, then make it a git repo with one commit. Refuses a folder that
 /// already holds anything, so it can never write over a person's files.
 pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<()> {
+    create_with(dir, team, repos, today, false)
+}
+
+/// [`create`], and with `team_parts` the team template's folders too
+/// (tickets, decisions, ideas, people, the team manifest): a team with no
+/// team repo keeps its tickets in its docs repo, as one repo of both kinds.
+pub fn create_with(dir: &Path, team: &str, repos: &[Covered], today: &str, team_parts: bool) -> Result<()> {
     if dir.exists() && fs::read_dir(dir).map_err(|e| Error::io(dir, e))?.next().is_some() {
         return Err(Error::Other(format!("{} is not empty; pick a new folder for the wiki", dir.display())));
     }
@@ -158,6 +165,19 @@ pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<
         // LF, whatever the checkout Ken was built from used.
         let text = text.replace("\r\n", "\n");
         fs::write(&dest, fill(path, &text, team, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
+    }
+    if team_parts {
+        for (path, text) in crate::teamnew::TEMPLATE {
+            let dest = dir.join(path);
+            if dest.exists() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+            }
+            let text = text.replace("\r\n", "\n");
+            fs::write(&dest, crate::teamnew::fill(path, &text, team, &wiki, Some(&wiki))).map_err(|e| Error::io(&dest, e))?;
+        }
     }
     git_commit_all(dir, &format!("Start the {team} wiki from the Ways-of-Working template"))
 }

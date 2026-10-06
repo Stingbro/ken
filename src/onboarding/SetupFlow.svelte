@@ -218,9 +218,11 @@
         const c = wikiChoices[t];
         if (c?.mode === "existing" && fillExisting[t]) drafts.push(c.member);
         if (c?.mode !== "new" || !c.parent) continue;
+        // No team repo picked or made: the docs repo holds the tickets too.
+        const holdsTeam = !all.some((r) => r.include && r.team === t && r.kind.includes("team"));
         const row =
           created[t] ??
-          (await api.setupCreateWiki(newWikiPath(c.parent, c.name), t, coveredRepos(all, t), all.map((r) => r.member)));
+          (await api.setupCreateWiki(newWikiPath(c.parent, c.name), t, coveredRepos(all, t), all.map((r) => r.member), holdsTeam));
         created[t] = row;
         all = [...all.filter((r) => r.path !== row.path), row];
         drafts.push(row.member);

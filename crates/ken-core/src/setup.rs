@@ -148,11 +148,10 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
     .filter(|(p, _)| dir.join(p).exists())
     .map(|(_, e)| e)
     .collect();
-    let team: Vec<&str> = [("tickets", "tickets/"), ("decisions", "decisions/"), ("ideas", "ideas/"), (".wright", ".wright/")]
-        .into_iter()
-        .filter(|(p, _)| dir.join(p).is_dir())
-        .map(|(_, e)| e)
-        .collect();
+    // A team repo says so with its manifest. A folder name is not evidence:
+    // a code repo can keep a `tickets/README.md` pointing at where tickets
+    // moved, and that one file made it a team repo read in full.
+    let team: Vec<&str> = if dir.join(".wright").join("team.json").is_file() { vec![".wright/team.json"] } else { Vec::new() };
     let mut code: Vec<String> = crate::profiler::REPO_MARKERS
         .iter()
         .copied()
@@ -660,14 +659,28 @@ pub fn propose_repos(picked: &[PathBuf], taken: &[String]) -> Result<Proposal> {
 /// [`crate::wikinew`]), covering `repos`, and return its set-up row: a wiki
 /// on `team`, read for entities. `taken` are names already in use.
 pub fn create_wiki(dir: &Path, team: &str, repos: &[crate::wikinew::Covered], taken: &[String], today: &str) -> Result<RepoRow> {
-    crate::wikinew::create(dir, team, repos, today)?;
+    create_wiki_with(dir, team, repos, taken, today, false)
+}
+
+/// [`create_wiki`]; with `holds_team` the wiki is also the team repo (the
+/// team has no team repo of its own): it gets the team template's folders and
+/// both kinds, so tickets, decisions and people live in the docs repo.
+pub fn create_wiki_with(
+    dir: &Path,
+    team: &str,
+    repos: &[crate::wikinew::Covered],
+    taken: &[String],
+    today: &str,
+    holds_team: bool,
+) -> Result<RepoRow> {
+    crate::wikinew::create_with(dir, team, repos, today, holds_team)?;
     let mut row = propose_repos(&[dir.to_path_buf()], taken)?
         .rows
         .into_iter()
         .next()
         .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
     row.include = true;
-    row.kind = vec![RepoKind::Wiki];
+    row.kind = if holds_team { vec![RepoKind::Team, RepoKind::Wiki] } else { vec![RepoKind::Wiki] };
     row.team = Some(team.to_string());
     row.index = IndexState::Entities;
     row.description = format!("The {team} team's wiki: what is true now, how the team works, and what lives where in each repo.");
@@ -769,6 +782,33 @@ pub fn rescan(parent: &Path) -> Result<Vec<Moved>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_docs_repo_with_no_team_repo_holds_the_tickets_too() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("Realms-Wiki");
+        let row = create_wiki_with(&dir, "Realms", &[], &[], "2026-10-06", true).unwrap();
+        assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
+        for f in ["tickets/TICKET.md", "decisions/DECISIONS.md", "people/README.md", ".wright/team.json", "Current/Project.md"] {
+            assert!(dir.join(f).exists(), "{f}");
+        }
+        let alone = create_wiki(&parent.path().join("Other-Wiki"), "Other", &[], &[], "2026-10-06").unwrap();
+        assert_eq!(alone.kind, vec![RepoKind::Wiki]);
+        assert!(!parent.path().join("Other-Wiki/tickets").exists());
+    }
+
+    #[test]
+    fn a_stray_tickets_folder_does_not_make_a_team_repo() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("tickets")).unwrap();
+        fs::write(d.path().join("tickets/README.md"), "Tickets moved to the docs repo.").unwrap();
+        fs::write(d.path().join("build.gradle.kts"), "").unwrap();
+        let (kind, _) = detect(d.path());
+        assert_eq!(kind, vec![RepoKind::Code]);
+        fs::create_dir_all(d.path().join(".wright")).unwrap();
+        fs::write(d.path().join(".wright/team.json"), "{}").unwrap();
+        assert!(detect(d.path()).0.contains(&RepoKind::Team));
+    }
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {

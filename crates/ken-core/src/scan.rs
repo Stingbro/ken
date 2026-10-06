@@ -232,6 +232,11 @@ fn is_transient_error(error: &str) -> bool {
 /// Walk the project and bring the index to match the folder exactly.
 pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
+    // A repo whose kind nobody has set is not read at all: set-up says what
+    // each repo is before any indexing happens. What is indexed stays.
+    if crate::registry::awaits_kind(&project.root) {
+        return Ok(stats);
+    }
 
     // kenignore (D2): built-ins first, user `.kenignore` appended last so a
     // `!` line can override them. Loaded once per scan, not per file —
@@ -570,6 +575,9 @@ fn index_one(
 /// Re-index one path in response to a watcher event: index if it exists and
 /// is included, remove otherwise. Returns true if the index changed.
 pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
+    if crate::registry::awaits_kind(&project.root) {
+        return Ok(false);
+    }
     let abs = project.root.join(rel);
     let excluded = project.is_excluded(rel)
         || is_hidden_rel(rel)
@@ -737,6 +745,9 @@ pub const SCOPED_MAX: usize = 2_000;
 /// `None` when a full scan is the right tool: too many paths, or a folder
 /// among them (a folder moved in brings files no event named).
 pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Option<ScanStats>> {
+    if crate::registry::awaits_kind(&project.root) {
+        return Ok(Some(ScanStats::default()));
+    }
     if rels.len() > SCOPED_MAX || rels.iter().any(|r| project.root.join(r).is_dir()) {
         return Ok(None);
     }

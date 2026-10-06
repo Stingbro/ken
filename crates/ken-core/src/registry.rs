@@ -186,6 +186,22 @@ pub fn index_of(root: &Path) -> (Vec<RepoKind>, Option<IndexState>) {
         .unwrap_or_default()
 }
 
+/// A repo nobody has said the kind of yet: registered, a git repo, and not
+/// a team-inbox clone. Ken reads none of it until a person sets its kind, so
+/// a repo is never indexed on a guess (a code repo with no kind is read for
+/// entities in full). Ken's own folders (the workspace memory) are not git
+/// repos and are read as before.
+pub fn awaits_kind(root: &Path) -> bool {
+    if !root.join(".git").exists() || root.join("family.json").exists() {
+        return false;
+    }
+    default_base_dir()
+        .and_then(|base| Registry::load(&base))
+        .ok()
+        .and_then(|reg| reg.entry_at(root).map(|e| e.kind.is_empty() && e.index.is_none()))
+        .unwrap_or(false)
+}
+
 /// What a person said the repo at `root` is for, from the default registry.
 pub fn description_of(root: &Path) -> Option<String> {
     default_base_dir()
@@ -238,6 +254,11 @@ impl Registry {
     /// Kind and team are what a person said about the repo, so a re-add
     /// keeps them.
     pub fn add(&mut self, project: &Project) {
+        // One entry per folder: a repo made again in the same folder (a new
+        // id) replaces the old entry, which lookups by folder would otherwise
+        // keep finding first, with its old kind.
+        let here = canonical(&project.root);
+        self.projects.retain(|e| e.id == project.config.id || canonical(&e.path) != here);
         match self.projects.iter_mut().find(|e| e.id == project.config.id) {
             Some(existing) => {
                 existing.name = project.config.name.clone();
@@ -387,6 +408,22 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repo_made_again_in_the_same_folder_replaces_the_old_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Project::create(dir.path(), "Wiki").unwrap();
+        let mut reg = Registry::default();
+        reg.add(&first);
+        reg.set_kind(first.config.id, vec![RepoKind::Wiki], None);
+        std::fs::remove_dir_all(dir.path().join(".ken")).unwrap();
+        let again = Project::create(dir.path(), "Wiki").unwrap();
+        assert_ne!(first.config.id, again.config.id);
+        reg.add(&again);
+        reg.set_kind(again.config.id, vec![RepoKind::Team, RepoKind::Wiki], None);
+        assert_eq!(reg.projects.len(), 1);
+        assert_eq!(reg.entry_at(dir.path()).unwrap().kind, vec![RepoKind::Team, RepoKind::Wiki]);
+    }
     use tempfile::tempdir;
 
     #[test]
