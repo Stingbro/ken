@@ -1,37 +1,36 @@
 ---
 title: "Write for the altitude, like teammates talking"
+aliases: ["Write for the altitude, like teammates talking", "write-for-the-altitude-like-teammates-talking", "how should a page sound", "Write like you would say it out loud"]
 status: current
+audience: method
 updated: 2026-09-12
 ---
 
 # Write for the altitude, like teammates talking
 
-Say it the way you would in a working session. Put the important claim first. Save IDs, catalogues, and machinery for the page that owns them.
+Write it the way you would say it in a working session: the important claim first, and ids, catalogues and machinery only on the page that owns them.
 
-## The incident
+[[#Incident]] · [[#Symptom]] · [[#Page Shapes]]
 
-2026-09-12. A lead reading the method summary: even a "dried" rewrite of *"Thirteen gates, three of which can never be dropped…"* still failed — gate counts and G-numbers mean nothing at that level, and the page sounded like AI poetry or compressed jargon instead of a collaborative team explaining how they work. Cost: people bounce off the method before they reach the useful parts.
+## Incident
 
-## What it looks like when broken
+2026-09-12. A lead read the method summary out loud. Even a plainer rewrite of *"Thirteen gates, three of which can never be dropped…"* failed: gate counts and gate ids meant nothing at that level, and the page sounded like compressed jargon rather than a team explaining how it works. People stopped reading before they reached the useful parts. This rule replaced an earlier one, "Write like you would say it out loud", which the same reading showed was not enough on its own.
 
-- Lead with counts, IDs, or catalogues on an overview page (G0, thirteen gates, eight presets) when the reader has no map yet
-- Stacked cadence / colon poetry ("on scope, on decisions and on documents")
-- Dry compression that is short but still opaque ("three never drop")
-- Manifesto tone where a working note would do
-- Explaining *how the machinery is wired* before *what problem it solves*
+## Symptom
 
-## What good looks like
+| looks like | example |
+|---|---|
+| counts, ids or catalogues on an overview page, before the reader has a map | G0, thirteen gates, eight presets in the first paragraph |
+| stacked cadence and colon drops | "on scope, on decisions and on documents" |
+| short but opaque | "three never drop" |
+| a manifesto where a working note would do | a closing line that would sit on a slide |
+| how the machinery is wired, before what problem it solves | the gate order before the reason for gates |
+| the same claim twice in different words | "optional, and it is optional" |
 
-- Overview pages: problem → what we do about it → where to go deeper. No gate IDs unless the page is the gate catalogue.
-- Detail pages: IDs, dials, and catalogues are fine — that is their job.
-- Tone: collaborative working session — bounce ideas, talk implementation — not a pitch deck and not a poem.
-- One claim per sentence. Prefer "we check that tickets didn't quietly touch extra files" over "standing comparison of what was declared against what is true."
-- Keep real incidents and quotes; they are evidence, not style.
+## Page Shapes
 
-## Also: no spicy one-liners
-
-AI drafting loves a punchy closer. In this method that reads as fake. Prefer dry teammate prose over a slogan. If a line would work on a conference slide, cut it from the manual.
-
-## Also: don't restate
-
-If the sentence already said it (optional, human reviews, etc.), cut the follow-up that repeats the same idea in different words.
+| page | shape |
+|---|---|
+| overview | the problem, what we do about it, where to go deeper · no gate ids unless it is the gate catalogue |
+| detail | ids, dials and catalogues are its job |
+| any | one claim per sentence · real incidents and quotes kept, because they are evidence · plain prose, never a slogan |

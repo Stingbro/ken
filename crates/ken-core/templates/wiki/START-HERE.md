@@ -1,44 +1,66 @@
+---
+title: "Start Here"
+aliases: ["Start Here", "where do I start", "what is in the library", "what should I read first"]
+status: current
+audience: business
+updated: {{date}}
+---
+
 # Start Here
 
-**The {{team_name}} knowledge library.** Open it in Ken for the graph, backlinks
-and search across every repo in the workspace; a link may name a page in any of
-them.
+The {{team_name}} library: the traps that cost the most, the repos, the sections and the order to read them in. Not here: how we work → [[Ways-of-Working]]; what is true about the project now → [[Current]].
 
-Repos, siblings of this library — resolve them **relatively**, the parent differs
-per machine, so never write an absolute path into a note.
+[[#Traps]] · [[#Repos]] · [[#Sections]] · [[#Reading Order]] · [[#Other Folders]]
+
+## Traps
+
+| trap | what happens | page |
+|---|---|---|
+| {{the trap that costs a newcomer the most time, such as where the platform's content lives or a word the code spells differently}} | {{what a newcomer loses before finding it}} | {{[[the page that holds it]]}} |
+
+## Repos
+
+Each repo sits beside this one under one folder. Name a sibling by its repo name, never by an absolute path, because the parent folder differs per machine.
 
 | repo | what it is |
 |---|---|
-| `{{wiki_repo}}` | **this** — all documentation |
-| `{{team_repo}}` | tickets · ideas · decisions · method and team config |
-| `{{code_repo}}` | the code |
+| `{{wiki_repo}}` | this repo · the library |
+| `{{team_repo}}` | tickets · ideas · escalations · decisions · people · method and team config |
+| `{{code_repo}}` | {{what the code repo builds}} |
+| `{{reference_repo}}` | {{the upstream source we read and never write}} |
 
-## The Library
+## Sections
 
-Every section gets an **index note** saying what belongs in it, what does not,
-and where that goes instead.
+Every page has one home, and each section's index says what belongs there and where the rest goes.
 
-| section | what is in it |
+| section | holds | pages |
+|---|---|---|
+| [[Ways-of-Working]] | how we work · the rules, one page each · the only section people must follow | {{n}} |
+| [[Conventions]] | how we do things here, one page per area · what a review reads a change against | {{n}} |
+| [[Platform]] | each upstream or reference dependency: its version · its quirks · where its content lives | {{n}} |
+| [[Design]] | what we chose to build, and why not the alternative | {{n}} |
+| [[Work]] | release notes and release history · incidents | {{n}} |
+| [[Reference]] | systems · config map · build and run · vocabulary · how-tos | {{n}} |
+| [[Current]] | the project · the team · who does what · feature status · roadmap | {{n}} |
+| [[Research]] | what past sessions found, dated · the Ingestion inbox | {{n}} |
+
+Pages counted {{date}}. Research is evidence at the time it was written, never current state, so a Research page is cited with its date.
+
+## Reading Order
+
+1. The first row of Traps.
+2. [[Vocabulary]] · the words where a search misses. Check it before deciding something does not exist.
+3. [[Research-Ladder]] · where to look, in what order.
+4. [[Project]] and [[Feature Status]] · what we are building, and what is built.
+5. [[Build and Run]] · how to build, test and run each repo.
+6. [[Lifecycle]] · Plan, Size, Build, Release, Learn.
+7. [[Rules]] · the binding rules, one page each, with the incident behind each.
+
+## Other Folders
+
+| folder | holds |
 |---|---|
-| [[Ways-of-Working]] | how we work — **binding** |
-| [[Current]] | what is true now: what the project is about · how the team is structured · who does what — **maintained, rewritten in place** |
-| **Conventions** | the way we do it here, one page per area — descriptive: what a review reads a diff against |
-| **{{Domain}}** | how the system works, verified against the source |
-| **Design** | what we chose to build, and why not the alternative |
-| **Work** | release notes and release history — tickets and ideas live in the team repo |
-| **Reference** | standards, config, calculators |
-| **Research** | 🗄️ what sessions found, **at the time**; [[Ingestion]] (`Research/Ingestion/`) is the inbox for meetings, recordings and documents, and it empties |
-| **Repo-Map/** · **Templates/** | what lives where in the code · doc templates |
-
-⚠️ Cite `Research/` as evidence; never read it as current state.
-
-## Read in This Order
-
-1. **{{The trap that costs the most}}** — the thing people lose the most time on
-   before they find it. Put it first, above everything.
-2. [[Vocabulary]] — our word vs the platform's, both directions. Check it before
-   concluding a feature does not exist.
-3. [[Research-Ladder]] — where to look, in what order.
-4. [[Lifecycle]] — Plan → Size → Build → Release → Learn.
-5. [[Rules]] — the binding rules, one note each, with the incident behind it.
-6. **Repo-Map/** — what lives where in the code.
+| `Templates/` | the blanks a new page is copied from · listed on [[Templates]] |
+| `_meta/` | the library's own checks and housekeeping |
+| `Repo-Map/` | where things live in each repo · written by Ken from the code |
+| `tickets/` · `ideas/` · `escalations/` · `decisions/` · `people/` · `method/` · `team/` · `runs/` | the team repo's folders, here when the team keeps tickets and library in one repo |

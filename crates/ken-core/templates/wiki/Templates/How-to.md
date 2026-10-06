@@ -1,26 +1,32 @@
 ---
-title: "{{How to do the thing}}"
-aliases: ["{{how do I do the thing}}", "{{where is the thing configured}}"]   # the questions people will type; a wiki link never resolves by title
+title: "{{How to Do the Thing}}"
+aliases: ["{{How to Do the Thing}}", "{{how do I do the thing}}", "{{where is the thing configured}}"]   # the questions people type · a name link never resolves by title
 status: current
-updated: {{date}}       # when this page was last edited
-verified: {{date}}      # a person read this against its sources; never stamped in bulk
-pin: {{commit}}         # the commit those sources were verified at
-sources:              # with none, the docs check never flags this page and the page vouches for nothing; the standing sweep still raises it after thirty days unverified
-  - {{repo:path/to/file}}
+audience: dev
+updated: {{date}}
+verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
+pin: {{commit}}         # the commit the sources were read at
+sources:                # with none, the Docs drift check never flags this page and it vouches for nothing
+  - "{{repo:path of each file a step touches}}"
 ---
 
-# {{How to do the thing}}
+# {{How to Do the Thing}}
 
-**When you need this:** one line, so search finds it and a reader can bail early.
+How to {{do the thing}}, step by step, and what goes wrong. Not here: {{the page that explains why it works this way}}.
+
+[[#When You Need This]] · [[#Steps]] · [[#Failures]]
+
+## When You Need This
+
+{{One line naming the moment, so search finds it and a reader can stop early.}}
 
 ## Steps
 
-1.
-2.
+1. {{step, with the command or the file}}
+2. {{step}}
 
-## What goes wrong
+## Failures
 
-The failure modes, each with its symptom.
-
-<!-- The docs check diffs `sources:` from the pin to the repo's default branch
-     and flags this page when they have moved. -->
+| symptom | cause | fix |
+|---|---|---|
+| {{what you see}} | {{why}} | {{what to do}} |

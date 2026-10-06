@@ -14,7 +14,7 @@ use std::path::Path;
 use crate::{Error, Result};
 
 /// Which copy of the method's template is bundled.
-pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/team @ 1f625d7";
+pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/team @ bed53fc";
 
 macro_rules! template {
     ($($path:literal),* $(,)?) => {
@@ -26,7 +26,10 @@ macro_rules! template {
 pub const TEMPLATE: &[(&str, &str)] = template![
     ".wright/team.json",
     "README.md",
+    "decisions/Cited-in-Code.md",
     "decisions/DECISIONS.md",
+    "escalations/ESCALATION.md",
+    "escalations/README.md",
     "ideas/IDEA.md",
     "ideas/README.md",
     "method/README.md",
@@ -184,7 +187,8 @@ fn fill_repos(text: &str, team_repo: &str, wiki: Option<&str>, repos: &[crate::w
 }
 
 /// One template file with what Ken knows filled in. Copy templates (a
-/// ticket, a person, an idea) keep their placeholders, the key aside.
+/// ticket, a person, an idea, an escalation) keep their placeholders, the
+/// key aside.
 /// `repos` are the team's other repos as set-up registered them.
 pub fn fill(
     path: &str,
@@ -197,7 +201,7 @@ pub fn fill(
     let key = ticket_key(team);
     let text = if path == ".wright/team.json" { fill_repos(text, team_repo, wiki, repos) } else { text.to_string() };
     let mut t = text.replace("{{KEY}}", &key);
-    let is_copy = path.ends_with("TICKET.md") || path.ends_with("PERSON.md") || path.ends_with("IDEA.md");
+    let is_copy = ["TICKET.md", "PERSON.md", "IDEA.md", "ESCALATION.md"].iter().any(|c| path.ends_with(c));
     if !is_copy {
         t = t.replace("{{team_name}}", team).replace("{{team_repo}}", team_repo);
         if let Some(w) = wiki {
@@ -253,7 +257,7 @@ mod tests {
     #[test]
     fn fill_names_the_team_and_repos_and_keeps_copy_templates() {
         let readme = TEMPLATE.iter().find(|(p, _)| *p == "README.md").unwrap().1;
-        assert!(fill("README.md", readme, "AUR", "AUR-Team", Some("AUR-Wiki"), &[]).starts_with("# AUR — team repo"));
+        assert!(fill("README.md", readme, "AUR", "AUR-Team", Some("AUR-Wiki"), &[]).starts_with("# AUR\n"));
         let json = TEMPLATE.iter().find(|(p, _)| *p == ".wright/team.json").unwrap().1;
         let t = fill(".wright/team.json", json, "AUR", "AUR-Team", Some("AUR-Wiki"), &[]);
         assert!(t.contains("\"team\": \"AUR\"") && t.contains("\"key\": \"AUR\"") && t.contains("\"AUR-Team\": {") && t.contains("\"AUR-Wiki\": {"));
@@ -312,6 +316,16 @@ mod tests {
         assert!(r.contains_key("{{code_repo}}") && r.contains_key("{{reference_repo}}"));
         assert_eq!(r["AUR-Team"]["kind"], "team");
         assert_eq!(r["AUR-Wiki"]["kind"], "wiki");
+    }
+
+    #[test]
+    fn the_template_list_is_exactly_the_bundled_folder() {
+        let mut listed: Vec<String> = TEMPLATE.iter().map(|(p, _)| p.to_string()).collect();
+        listed.sort();
+        assert_eq!(listed, crate::wikinew::tests::files_under("team"), "TEMPLATE and templates/team differ");
+        for (path, text) in TEMPLATE {
+            assert!(!text.contains('\r'), "{path} has a CR");
+        }
     }
 
     #[test]
