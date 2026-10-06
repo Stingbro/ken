@@ -2109,10 +2109,30 @@ fn draft_team_pages(
     Ok(())
 }
 
+/// Rebuild the team's list of the rulings its code cites
+/// ([`crate::teamnew::write_cited_in_code`]) from the code repos of `repos`,
+/// in the team repo: the wiki when it holds the decisions log, else the
+/// first of `repos` that does. Nothing to do without a log.
+fn cite_rulings(wiki: &Path, repos: &[(String, PathBuf)], today: &str) -> Result<()> {
+    use crate::registry::RepoKind;
+    let roots = std::iter::once(wiki).chain(repos.iter().map(|(_, r)| r.as_path()));
+    let Some(team) = roots.into_iter().find(|r| r.join(crate::ingest::TEAM_DECISIONS).is_file()) else { return Ok(()) };
+    let code: Vec<(String, PathBuf)> = repos
+        .iter()
+        .filter(|(_, r)| {
+            let kinds = crate::registry::kind_of(r);
+            kinds.contains(&RepoKind::Code) && !kinds.contains(&RepoKind::Reference)
+        })
+        .cloned()
+        .collect();
+    crate::teamnew::write_cited_in_code(team, &code, today).map(|_| ())
+}
+
 /// Draft a team's wiki: a Repo Map page per repo (each from that repo
 /// alone) and its pages by kind, the Repo Map index, then the team pages of
-/// [`PAGES`] from the repo pages and descriptions. `repos` are the team's
-/// repos, the wiki itself left out. The result is kept for the Team screen.
+/// [`PAGES`] from the repo pages and descriptions, and the team repo's
+/// rulings cited in code ([`cite_rulings`]). `repos` are the team's repos,
+/// the wiki itself left out. The result is kept for the Team screen.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_team(
     wiki: &Path,
@@ -2138,6 +2158,7 @@ pub fn draft_team(
     let extra = extra.map(gather_extra).unwrap_or_default();
     let common = team_sources(wiki, wiki_name, repos, &extra);
     draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, today, &mut report, &mut generate, &check)?;
+    cite_rulings(wiki, repos, today)?;
     dedup_labels(&mut report.sources);
     pin_drafted(wiki, &report.drafted, repos)?;
     report.to_fill = placeholders_left(wiki);
@@ -2326,6 +2347,7 @@ pub fn draft_added(
             Err(e) => report.failed.push((page.to_string(), e.to_string())),
         }
     }
+    cite_rulings(wiki, all, today)?;
     dedup_labels(&mut report.sources);
     pin_drafted(wiki, &report.drafted, all)?;
     let title =
