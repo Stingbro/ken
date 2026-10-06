@@ -15,7 +15,7 @@ use std::process::Command;
 use crate::{Error, Result};
 
 /// Which copy of the method's template is bundled.
-pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/team @ bed53fc";
+pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/team @ 55ad357";
 
 macro_rules! template {
     ($($path:literal),* $(,)?) => {

@@ -35,6 +35,7 @@ pub mod memory;
 pub mod model;
 pub mod ocr;
 pub mod pagemeta;
+pub mod people;
 pub mod proc;
 pub mod profiler;
 pub mod project;

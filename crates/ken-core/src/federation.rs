@@ -296,7 +296,15 @@ fn voted_kind(votes: &[String]) -> Option<String> {
 /// the member DB's own id order (`list_entities_with_edges` is `ORDER BY
 /// id`). Returns the clusters plus a `(member, local_id) -> cluster index`
 /// map used to resolve edges and co-occurrence.
-fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize, i64), usize>) {
+///
+/// A person the team's `roster` lists by this name, an alias or an address
+/// ([`crate::people::Person::is_named`]) groups under their roster name, as a
+/// person, and is never dropped as a bot. The team says who is one person;
+/// nothing here guesses it.
+fn tier1_clusters(
+    snapshots: &[MemberSnapshot],
+    roster: &[crate::people::Person],
+) -> (Vec<Cluster>, HashMap<(usize, i64), usize>) {
     let mut clusters: Vec<Cluster> = Vec::new();
     let mut index: HashMap<(usize, i64), usize> = HashMap::new();
     // Clusters by normalized name; a name can hold more than one when its
@@ -304,20 +312,24 @@ fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (mi, snap) in snapshots.iter().enumerate() {
         for e in &snap.entities {
+            let listed = crate::people::by_name(roster, &e.name).filter(|_| kinds_agree(&e.kind, "person"));
             // A member mapped before bots were dropped still holds them: a
             // bot left out here takes its edges and co-occurrences with it.
-            if e.kind == "person" && is_bot_or_agent(&e.name) {
+            if listed.is_none() && e.kind == "person" && is_bot_or_agent(&e.name) {
                 continue;
             }
-            let name = normalize_name(&e.name);
-            let same_name = by_name.entry(name).or_default();
-            let found = same_name.iter().copied().find(|&ci| kinds_agree(&clusters[ci].kind, &e.kind));
+            let (shown, kind) = match listed {
+                Some(p) => (&p.name, "person"),
+                None => (&e.name, e.kind.as_str()),
+            };
+            let same_name = by_name.entry(normalize_name(shown)).or_default();
+            let found = same_name.iter().copied().find(|&ci| kinds_agree(&clusters[ci].kind, kind));
             let ci = match found {
                 Some(ci) => ci,
                 None => {
                     clusters.push(Cluster {
-                        kind: e.kind.clone(),
-                        name: e.name.clone(),
+                        kind: kind.to_string(),
+                        name: shown.clone(),
                         locals: Vec::new(),
                         votes: Vec::new(),
                     });
@@ -325,12 +337,15 @@ fn tier1_clusters(snapshots: &[MemberSnapshot]) -> (Vec<Cluster>, HashMap<(usize
                     clusters.len() - 1
                 }
             };
+            if listed.is_some() {
+                clusters[ci].name = shown.clone();
+            }
             // The merged concept takes the most specific kind it was given.
-            if kind_rank(&e.kind) > kind_rank(&clusters[ci].kind) {
-                clusters[ci].kind = e.kind.clone();
+            if kind_rank(kind) > kind_rank(&clusters[ci].kind) {
+                clusters[ci].kind = kind.to_string();
             }
             clusters[ci].locals.push((mi, e.local_id, e.name.clone()));
-            clusters[ci].votes.push(e.kind.clone());
+            clusters[ci].votes.push(kind.to_string());
             index.insert((mi, e.local_id), ci);
         }
     }
@@ -672,11 +687,12 @@ impl UnionFind {
 /// existing graph untouched. `llm = None` is fully deterministic.
 fn merge_snapshots(
     snapshots: &[MemberSnapshot],
+    roster: &[crate::people::Person],
     llm: Option<&dyn FederationLlm>,
     cancel: &CancelToken,
 ) -> Result<Option<MergePlan>> {
     // Tier 1.
-    let (clusters0, index0) = tier1_clusters(snapshots);
+    let (clusters0, index0) = tier1_clusters(snapshots, roster);
 
     // Tier 2: LLM adjudication of near-miss pairs (skipped entirely without a
     // model — the deterministic path).
@@ -971,9 +987,13 @@ fn merge_snapshots(
 /// `now` (epoch seconds) stamps `updated_at`/`cached_at`, kept as a parameter
 /// — not read from the clock — exactly as [`snapshot_for_member`] does, so
 /// callers and tests stay reproducible.
+///
+/// `roster` is every team's `people/` files ([`crate::people::roster_of`]):
+/// the names and addresses each person is known by merge into one person.
 pub fn build_workspace_kg(
     kg: &mut WorkspaceKgDb,
     members: &[Member<'_>],
+    roster: &[crate::people::Person],
     llm: Option<&dyn FederationLlm>,
     now: i64,
     cancel: &CancelToken,
@@ -993,7 +1013,7 @@ pub fn build_workspace_kg(
     }
 
     // Phase 2: merge (in memory). None ⇒ cancelled during an LLM pass.
-    let Some(plan) = merge_snapshots(&snapshots, llm, cancel)? else {
+    let Some(plan) = merge_snapshots(&snapshots, roster, llm, cancel)? else {
         return Ok(BuildReport::cancelled(members.len(), llm_passes));
     };
     if cancel.is_cancelled() {
@@ -1352,7 +1372,7 @@ mod tests {
                 SnapshotEntity { local_id: 7, kind: "organization".into(), name: "Snowflake".into(), summary: String::new(), sources: vec![] },
             ],
         };
-        let (clusters, _) = tier1_clusters(&[snap]);
+        let (clusters, _) = tier1_clusters(&[snap], &[]);
         assert_eq!(clusters.len(), 6, "Jordan twice, Snowflake once");
         let snowflake = clusters.iter().find(|c| c.name == "Snowflake").unwrap();
         assert_eq!((snowflake.kind.as_str(), snowflake.locals.len()), ("organization", 2));
@@ -1385,11 +1405,51 @@ mod tests {
             edges: vec![],
             entities: vec![person(1, "Kyle"), person(2, "Kyle Ahlstrom"), person(3, "Kyle Royse"), person(4, "Kyle Alhstrom")],
         };
-        let (clusters, _) = tier1_clusters(&[snap]);
+        let (clusters, _) = tier1_clusters(&[snap], &[]);
         let names = |(i, j): (usize, usize)| (clusters[i].name.clone(), clusters[j].name.clone());
         let pairs: Vec<(String, String)> = candidate_pairs(&clusters).into_iter().map(names).collect();
         assert!(!pairs.iter().any(|(a, b)| a == "Kyle" || b == "Kyle"), "{pairs:?}");
         assert!(pairs.iter().any(|(a, b)| [a.as_str(), b.as_str()] == ["Kyle Ahlstrom", "Kyle Alhstrom"] || [a.as_str(), b.as_str()] == ["Kyle Alhstrom", "Kyle Ahlstrom"]), "a typo is still asked: {pairs:?}");
+    }
+
+    /// The roster says Stingbro and AlpahSignalAI are Chris Lee: the two
+    /// members' entities merge into him, under his roster name, and a roster
+    /// person named like a bot is kept.
+    #[test]
+    fn names_a_roster_lists_for_one_person_merge_into_that_person() {
+        let entity = |id, kind: &str, name: &str| SnapshotEntity { local_id: id, kind: kind.into(), name: name.into(), summary: String::new(), sources: vec![] };
+        let a = MemberSnapshot {
+            project_id: pa(),
+            watermark: Some(1),
+            edges: vec![SnapshotEdge { a: 1, b: 2, label: "maintains".into() }],
+            entities: vec![entity(1, "person", "Stingbro"), entity(2, "topic", "Rift Studio"), entity(3, "person", "Mabel Bot")],
+        };
+        let b = MemberSnapshot {
+            project_id: pb(),
+            watermark: Some(1),
+            edges: vec![],
+            entities: vec![entity(1, "other", "AlpahSignalAI"), entity(2, "person", "dependabot"), entity(3, "person", "Ana Ruiz")],
+        };
+        let roster = vec![
+            crate::people::Person {
+                id: "chris".into(),
+                name: "Chris Lee".into(),
+                emails: vec!["alpha.signal.ai@gmail.com".into()],
+                aliases: vec!["Stingbro".into(), "AlpahSignalAI".into()],
+            },
+            crate::people::Person { id: "mabel".into(), name: "Mabel Bot".into(), ..Default::default() },
+        ];
+        let plan = merge_snapshots(&[a.clone(), b.clone()], &roster, None, &CancelToken::new()).unwrap().unwrap();
+        let names: Vec<(&str, &str)> = plan.clusters.iter().map(|c| (c.name.as_str(), c.kind.as_str())).collect();
+        assert_eq!(names, vec![("Chris Lee", "person"), ("Rift Studio", "topic"), ("Mabel Bot", "person"), ("Ana Ruiz", "person")]);
+        let chris: Vec<&str> = plan.clusters[0].locals.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert_eq!(chris, vec!["Stingbro", "AlpahSignalAI"], "both members' names, one person");
+        assert_eq!((plan.edges[0].src, plan.edges[0].dst), (0, 1), "edges follow the merged person");
+
+        // No roster: as before, two people, and the bot-named one dropped.
+        let plain = merge_snapshots(&[a, b], &[], None, &CancelToken::new()).unwrap().unwrap();
+        let names: Vec<&str> = plain.clusters.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["Stingbro", "Rift Studio", "AlpahSignalAI", "Ana Ruiz"]);
     }
 
     #[test]
@@ -1446,7 +1506,7 @@ mod tests {
         let b = member_b();
         let mut kg = WorkspaceKgDb::open_in_memory().unwrap();
         let report =
-            build_workspace_kg(&mut kg, &members(&a, &b), None, 1_000, &CancelToken::new()).unwrap();
+            build_workspace_kg(&mut kg, &members(&a, &b), &[], None, 1_000, &CancelToken::new()).unwrap();
 
         assert_eq!(
             report,
@@ -1509,12 +1569,12 @@ mod tests {
         let b = member_b();
 
         let mut kg1 = WorkspaceKgDb::open_in_memory().unwrap();
-        build_workspace_kg(&mut kg1, &members(&a, &b), None, 1_000, &CancelToken::new()).unwrap();
+        build_workspace_kg(&mut kg1, &members(&a, &b), &[], None, 1_000, &CancelToken::new()).unwrap();
 
         // A brand-new kg.sqlite (== the file was deleted) rebuilt from the same
         // members at the same `now`.
         let mut kg2 = WorkspaceKgDb::open_in_memory().unwrap();
-        build_workspace_kg(&mut kg2, &members(&a, &b), None, 1_000, &CancelToken::new()).unwrap();
+        build_workspace_kg(&mut kg2, &members(&a, &b), &[], None, 1_000, &CancelToken::new()).unwrap();
 
         assert_eq!(kg1.list_global_entities().unwrap(), kg2.list_global_entities().unwrap());
         assert_eq!(kg1.list_all_edges().unwrap(), kg2.list_all_edges().unwrap());
@@ -1537,12 +1597,12 @@ mod tests {
         let b = member_b();
         let mut kg = WorkspaceKgDb::open_in_memory().unwrap();
 
-        build_workspace_kg(&mut kg, &members(&a, &b), None, 1_000, &CancelToken::new()).unwrap();
+        build_workspace_kg(&mut kg, &members(&a, &b), &[], None, 1_000, &CancelToken::new()).unwrap();
         assert_eq!(kg.get_snapshot(pa()).unwrap().unwrap().cached_at, 1_000);
 
         // Second build at a later `now`; watermarks are unchanged, so the
         // snapshot cache is a hit and its `cached_at` is NOT rewritten.
-        build_workspace_kg(&mut kg, &members(&a, &b), None, 2_000, &CancelToken::new()).unwrap();
+        build_workspace_kg(&mut kg, &members(&a, &b), &[], None, 2_000, &CancelToken::new()).unwrap();
         assert_eq!(
             kg.get_snapshot(pa()).unwrap().unwrap().cached_at,
             1_000,
@@ -1557,14 +1617,14 @@ mod tests {
         let mut kg = WorkspaceKgDb::open_in_memory().unwrap();
 
         // A complete first build.
-        build_workspace_kg(&mut kg, &members(&a, &b), None, 1_000, &CancelToken::new()).unwrap();
+        build_workspace_kg(&mut kg, &members(&a, &b), &[], None, 1_000, &CancelToken::new()).unwrap();
         assert_eq!(kg.list_global_entities().unwrap().len(), 4);
 
         // A rebuild whose token is already cancelled: no clear, no partial
         // write — the first build's graph is left fully intact.
         let cancel = CancelToken::new();
         cancel.cancel();
-        let report = build_workspace_kg(&mut kg, &members(&a, &b), None, 2_000, &cancel).unwrap();
+        let report = build_workspace_kg(&mut kg, &members(&a, &b), &[], None, 2_000, &cancel).unwrap();
         assert!(report.cancelled);
         assert_eq!(report.global_entities, 0);
         assert_eq!(kg.list_global_entities().unwrap().len(), 4, "graph must be unchanged");
@@ -1612,7 +1672,7 @@ mod tests {
                 edge(3, 4, "syncs"),
             ],
         };
-        let plan = merge_snapshots(&[snap], None, &CancelToken::new()).unwrap().unwrap();
+        let plan = merge_snapshots(&[snap], &[], None, &CancelToken::new()).unwrap().unwrap();
         let names: Vec<(&str, &str)> = plan.clusters.iter().map(|c| (c.kind.as_str(), c.name.as_str())).collect();
         assert_eq!(names, vec![("person", "Chris"), ("other", "Shattered-Realms"), ("topic", "Claude")]);
         assert_eq!(planned(&plan), vec![("imported", "owns".into(), "Chris".into(), "Shattered-Realms".into())]);
@@ -1637,7 +1697,7 @@ mod tests {
 
     #[test]
     fn cooccurrence_needs_two_shared_files_and_yields_to_claudes_edge() {
-        let plan = merge_snapshots(&[cooccur_snapshot()], None, &CancelToken::new()).unwrap().unwrap();
+        let plan = merge_snapshots(&[cooccur_snapshot()], &[], None, &CancelToken::new()).unwrap().unwrap();
         assert_eq!(
             planned(&plan),
             vec![
@@ -1667,7 +1727,7 @@ mod tests {
     #[test]
     fn a_judged_pair_replaces_its_cooccurrence_edge() {
         let llm = LinkFirstLlm;
-        let plan = merge_snapshots(&[cooccur_snapshot()], Some(&llm as &dyn FederationLlm), &CancelToken::new())
+        let plan = merge_snapshots(&[cooccur_snapshot()], &[], Some(&llm as &dyn FederationLlm), &CancelToken::new())
             .unwrap()
             .unwrap();
         // Alpha-Beta was judged: its "related" gives way. Beta-Epsilon's
@@ -1732,6 +1792,7 @@ mod tests {
         let report = build_workspace_kg(
             &mut kg,
             &members(&a, &b),
+            &[],
             Some(&llm as &dyn FederationLlm),
             1_000,
             &CancelToken::new(),
@@ -1823,7 +1884,7 @@ mod tests {
             })
             .collect();
         let llm = ReplayLlm { recorded, unjudged: std::cell::Cell::new(0) };
-        let plan = merge_snapshots(&snapshots, Some(&llm as &dyn FederationLlm), &CancelToken::new())
+        let plan = merge_snapshots(&snapshots, &[], Some(&llm as &dyn FederationLlm), &CancelToken::new())
             .unwrap()
             .unwrap();
         println!("AFTER: {} entities, {} edges", plan.clusters.len(), plan.edges.len());
@@ -1844,7 +1905,7 @@ mod tests {
             .map(|g| g.name.as_str())
             .collect();
         println!("  entities dropped: {dropped:?}");
-        let plain = merge_snapshots(&snapshots, None, &CancelToken::new()).unwrap().unwrap();
+        let plain = merge_snapshots(&snapshots, &[], None, &CancelToken::new()).unwrap().unwrap();
         println!(
             "WITHOUT A JUDGE: edges by provenance: {:?}",
             count(plain.edges.iter().map(|e| e.provenance.to_string()).collect())

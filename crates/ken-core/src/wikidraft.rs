@@ -339,35 +339,29 @@ pub fn is_bot(name: &str, email: &str) -> bool {
         || (e.contains("noreply") && local.contains("bot"))
 }
 
-/// The person behind an email: a GitHub noreply address
-/// (`123+name@users.noreply.github.com`) counts by its user name, any other
-/// by the address itself, in lower case.
-fn person_key(email: &str) -> String {
-    let e = email.trim().to_lowercase();
-    match e.strip_suffix("@users.noreply.github.com") {
-        Some(local) => format!("github:{}", local.split_once('+').map_or(local, |(_, user)| user)),
-        None => e,
-    }
-}
-
 /// Who has committed to each top-level folder in the last 90 days, as
-/// `folder/: Name (commits), …`, at most three a folder, most first. One
-/// person per email, shown under the name they commit with most; bots and AI
-/// agents left out. This is a column of recent hands, never an owner: the
-/// 2026-10-06 draft read a whole-history shortlog and put the template's
-/// committers from before the team existed into the team's roles table.
-pub fn recent_contributors(root: &Path) -> Option<String> {
+/// `folder/: Name (commits), …`, at most three a folder, most first. A
+/// commit identity the team's `roster` lists counts as that person, under
+/// their roster name, and is never dropped as a bot; any other is one person
+/// per email ([`crate::people::person_key`]), shown under the name they
+/// commit with most, bots and AI agents left out. The Shattered Realms draft
+/// listed one person's three identities as three people. This is a column of
+/// recent hands, never an owner: the 2026-10-06 draft read a whole-history
+/// shortlog and put the template's committers from before the team existed
+/// into the team's roles table.
+pub fn recent_contributors(root: &Path, roster: &[crate::people::Person]) -> Option<String> {
     let text = git_text(root, &["log", "--since=90.days", "--no-merges", "--format=%x1e%aN%x1f%aE", "--name-only"])?;
     let mut counts: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
     let mut names: HashMap<String, HashMap<String, usize>> = HashMap::new();
     for rec in text.split('\x1e').filter(|r| !r.trim().is_empty()) {
         let mut lines = rec.lines();
         let Some((name, email)) = lines.next().and_then(|l| l.split_once('\x1f')) else { continue };
-        if is_bot(name, email) {
-            continue;
-        }
-        let key = person_key(email);
-        *names.entry(key.clone()).or_default().entry(name.trim().to_string()).or_default() += 1;
+        let (key, shown) = match crate::people::by_commit(roster, name, email) {
+            Some(p) => (format!("roster:{}", p.id), p.name.clone()),
+            None if is_bot(name, email) => continue,
+            None => (crate::people::person_key(email), name.trim().to_string()),
+        };
+        *names.entry(key.clone()).or_default().entry(shown).or_default() += 1;
         let areas: BTreeSet<String> = lines
             .map(str::trim)
             .filter(|l| !l.is_empty())
@@ -884,16 +878,7 @@ fn release_notes(name: &str, root: &Path, per_file: usize, budget: usize) -> Vec
 
 /// A repo's `people/` files, its README and the PERSON.md template aside.
 fn people_files(name: &str, root: &Path) -> Vec<Source> {
-    let mut files: Vec<PathBuf> = fs::read_dir(root.join("people"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "md"))
-        .filter(|p| p.file_name().is_some_and(|n| !n.eq_ignore_ascii_case("README.md") && !n.eq_ignore_ascii_case("PERSON.md")))
-        .collect();
-    files.sort();
-    files
+    crate::people::files(root)
         .into_iter()
         .filter_map(|p| {
             let text = read_plain(&p)?;
@@ -908,7 +893,8 @@ fn people_files(name: &str, root: &Path) -> Vec<Source> {
 /// layout and import map; INSTALL; its newest release notes; CODEOWNERS,
 /// `people/` and who has committed recently; its version tags; up to ten
 /// docs; then every other brief section, in order, while the budget lasts.
-pub fn gather_repo(name: &str, root: &Path) -> Vec<Source> {
+/// `roster` is the team's ([`team_roster`]), for the recent contributors.
+pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     let push = pusher(REPO_BUDGET);
     // What a person said this repo is for, at set-up: read first, so the
@@ -955,7 +941,7 @@ pub fn gather_repo(name: &str, root: &Path) -> Vec<Source> {
     for s in people_files(name, root) {
         push(s.label, s.text, &mut out);
     }
-    if let Some(a) = recent_contributors(root) {
+    if let Some(a) = recent_contributors(root, roster) {
         push(format!("{name}:(recent contributors by folder, last 90 days, from git)"), a, &mut out);
     }
     if let Some(t) = git_tags(root) {
@@ -1001,7 +987,8 @@ pub fn gather_extra(dir: &Path) -> Vec<Source> {
 
 /// Every repo's sources, each within its own budget, then `extra`.
 pub fn gather(repos: &[(String, PathBuf)], extra: Option<&Path>) -> Vec<Source> {
-    let mut out: Vec<Source> = repos.iter().flat_map(|(n, r)| gather_repo(n, r)).collect();
+    let roster = crate::people::roster_of(repos.iter().map(|(_, r)| r.as_path()));
+    let mut out: Vec<Source> = repos.iter().flat_map(|(n, r)| gather_repo(n, r, &roster)).collect();
     if let Some(dir) = extra {
         out.extend(gather_extra(dir));
     }
@@ -1982,8 +1969,14 @@ fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
 /// CODEOWNERS, `people/` files (the wiki's too) and the recent contributors;
 /// for the architecture page the import map; for Project the newest version
 /// tags; then for every page the brief sections whose topic serves it
-/// ([`page_topics`]).
-pub fn page_sources(page: &str, wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)]) -> Vec<Source> {
+/// ([`page_topics`]). `roster` is the team's ([`team_roster`]).
+pub fn page_sources(
+    page: &str,
+    wiki: &Path,
+    wiki_name: &str,
+    repos: &[(String, PathBuf)],
+    roster: &[crate::people::Person],
+) -> Vec<Source> {
     let people = matches!(page, "Current/Team.md" | "Current/Who-Does-What.md");
     let mut per_repo: Vec<Vec<Source>> = Vec::new();
     for (name, root) in repos {
@@ -2024,7 +2017,7 @@ pub fn page_sources(page: &str, wiki: &Path, wiki_name: &str, repos: &[(String, 
                 for s in people_files(name, root) {
                     push(s.label, s.text, &mut mine);
                 }
-                if let Some(a) = recent_contributors(root) {
+                if let Some(a) = recent_contributors(root, roster) {
                     push(format!("{name}:(recent contributors by folder, last 90 days, from git)"), a, &mut mine);
                 }
             }
@@ -2055,6 +2048,7 @@ fn dedup_labels(labels: &mut Vec<String>) {
 fn draft_repo_pages(
     wiki: &Path,
     repos: &[(String, PathBuf)],
+    roster: &[crate::people::Person],
     today: &str,
     report: &mut DraftReport,
     generate: &mut impl FnMut(&str) -> Result<String>,
@@ -2073,7 +2067,7 @@ fn draft_repo_pages(
                 continue;
             }
             if sources.is_none() {
-                let read = gather_repo(name, root);
+                let read = gather_repo(name, root, roster);
                 report.sources.extend(read.iter().map(|s| s.label.clone()));
                 sources = Some(read);
             }
@@ -2093,6 +2087,7 @@ fn draft_team_pages(
     pages: &[(String, String)],
     common: &[Source],
     repos: &[(String, PathBuf)],
+    roster: &[crate::people::Person],
     today: &str,
     report: &mut DraftReport,
     generate: &mut impl FnMut(&str) -> Result<String>,
@@ -2101,12 +2096,19 @@ fn draft_team_pages(
     for (page, purpose) in pages {
         let mut sources = common.to_vec();
         if may_draft(fs::read_to_string(wiki.join(page)).ok().as_deref()) {
-            sources.extend(page_sources(page, wiki, wiki_name, repos));
+            sources.extend(page_sources(page, wiki, wiki_name, repos, roster));
             report.sources.extend(sources.iter().map(|s| s.label.clone()));
         }
         draft_pages(wiki, &[(page.clone(), purpose.clone())], &sources, today, report, generate, check)?;
     }
     Ok(())
+}
+
+/// The team's roster: the `people/` files of the wiki and of `repos`, so a
+/// team repo is read wherever it sits, and a wiki that holds the team's
+/// folders too.
+fn team_roster(wiki: &Path, repos: &[(String, PathBuf)]) -> Vec<crate::people::Person> {
+    crate::people::roster_of(std::iter::once(wiki).chain(repos.iter().map(|(_, r)| r.as_path())))
 }
 
 /// Rebuild the team's list of the rulings its code cites
@@ -2146,7 +2148,8 @@ pub fn draft_team(
 ) -> Result<DraftReport> {
     let mut report = DraftReport::default();
     let check = PathCheck::of(repos);
-    draft_repo_pages(wiki, repos, today, &mut report, &mut generate, &check)?;
+    let roster = team_roster(wiki, repos);
+    draft_repo_pages(wiki, repos, &roster, today, &mut report, &mut generate, &check)?;
     let described: Vec<(String, String)> = repos.iter().map(|(n, r)| (n.clone(), describe_repo(wiki, n, r))).collect();
     let index = format!("{REPO_MAP}/Index.md");
     let index_path = wiki.join(&index);
@@ -2157,7 +2160,7 @@ pub fn draft_team(
     fill_start_here(wiki, &described)?;
     let extra = extra.map(gather_extra).unwrap_or_default();
     let common = team_sources(wiki, wiki_name, repos, &extra);
-    draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, today, &mut report, &mut generate, &check)?;
+    draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, &roster, today, &mut report, &mut generate, &check)?;
     cite_rulings(wiki, repos, today)?;
     dedup_labels(&mut report.sources);
     pin_drafted(wiki, &report.drafted, repos)?;
@@ -2293,7 +2296,10 @@ pub fn draft_added(
     let mut report = DraftReport::default();
     let names: Vec<String> = added.iter().map(|(n, _)| n.clone()).collect();
     let check = PathCheck::of(all);
-    draft_repo_pages(wiki, added, today, &mut report, &mut generate, &check)?;
+    // The roster from every repo of the team: the team repo may not be one
+    // of those added.
+    let roster = team_roster(wiki, all);
+    draft_repo_pages(wiki, added, &roster, today, &mut report, &mut generate, &check)?;
 
     // The index: a new one lists every repo; a kept one gains a row per new repo.
     let index = format!("{REPO_MAP}/Index.md");
@@ -2331,11 +2337,11 @@ pub fn draft_added(
                 PAGES.iter().find(|(p, _)| p == page).map(|(_, u)| u.to_string()).unwrap_or_else(|| change.to_string());
             let everything = team_sources(wiki, wiki_name, all, &[]);
             let pages = [(page.to_string(), purpose)];
-            draft_team_pages(wiki, wiki_name, &pages, &everything, all, today, &mut report, &mut generate, &check)?;
+            draft_team_pages(wiki, wiki_name, &pages, &everything, all, &roster, today, &mut report, &mut generate, &check)?;
             continue;
         }
         let mut sources = common.clone();
-        sources.extend(page_sources(page, wiki, wiki_name, added));
+        sources.extend(page_sources(page, wiki, wiki_name, added, &roster));
         report.sources.extend(sources.iter().map(|s| s.label.clone()));
         let existing = existing.unwrap_or_default();
         match generate(&update_prompt(page, change, &existing, &sources, today)).and_then(|r| finish_update(&r, &existing)) {
@@ -2598,7 +2604,7 @@ mod tests {
              import each other (a -> b / b -> a):\napp/db <-> app/services (1 / 1)\n\n\
              most imported files (how many files import each):\napp/services/users.py (2)"
         );
-        let labels: Vec<String> = gather_repo("app", root).into_iter().map(|s| s.label).collect();
+        let labels: Vec<String> = gather_repo("app", root, &[]).into_iter().map(|s| s.label).collect();
         assert!(labels.contains(&"app:(imports between folders, from the code)".to_string()), "{labels:?}");
     }
 
@@ -2864,7 +2870,7 @@ mod tests {
         let arch = format!("Game:CLAUDE.md:{}", line_of("## Key Architectural Patterns"));
 
         // The repo page: building, structure and what it is first, then the rest.
-        let labels: Vec<String> = gather_repo("Game", &root).into_iter().map(|s| s.label).collect();
+        let labels: Vec<String> = gather_repo("Game", &root, &[]).into_iter().map(|s| s.label).collect();
         let at = |l: &str| labels.iter().position(|x| x == l).unwrap_or_else(|| panic!("{l} in {labels:?}"));
         let build = format!("Game:CLAUDE.md:{}", line_of("## Build & Run"));
         let weapons = format!("Game:CLAUDE.md:{}", line_of("## Weapon Types"));
@@ -2874,7 +2880,7 @@ mod tests {
         // A team page: only what serves it.
         let wiki = d.path().join("Wiki");
         let repos = vec![("Game".to_string(), root.clone())];
-        let of = |page: &str| -> Vec<Source> { page_sources(page, &wiki, "Wiki", &repos) };
+        let of = |page: &str| -> Vec<Source> { page_sources(page, &wiki, "Wiki", &repos, &[]) };
         let architecture = of("Conventions/Architecture.md");
         assert!(architecture.iter().any(|s| s.label == arch && s.text.contains("services never call systems")), "{architecture:?}");
         assert!(!architecture.iter().any(|s| s.text.contains("Ana decides")));
@@ -2908,7 +2914,7 @@ mod tests {
             ],
         );
         assert_eq!(top_files(root, &["README.md", "readme.md", "Readme.md"]).len(), 1, "one file, read once");
-        let s = gather_repo("tools", root);
+        let s = gather_repo("tools", root, &[]);
         let text = |label: &str| s.iter().find(|x| x.label == label).map(|x| x.text.clone()).unwrap_or_else(|| panic!("{label}"));
         assert_eq!(s.iter().filter(|x| x.label.to_lowercase().starts_with("tools:readme")).count(), 1);
         assert!(text("tools:package.json").contains("start: pnpm --filter shell tauri dev"));
@@ -3040,7 +3046,7 @@ mod tests {
         assert_eq!(heads, vec!["[Unreleased]", "0.0.15 — 2026-09-25", "v0.0.14"]);
         assert!(v[1].text.contains("### Added") && v[1].text.contains("realms") && !v[1].text.contains("polygon"));
         write(root, &[("CHANGELOG.md", changelog)]);
-        let notes = page_sources("Work/Releases.md", root, "Wiki", &[("game".to_string(), root.to_path_buf())]);
+        let notes = page_sources("Work/Releases.md", root, "Wiki", &[("game".to_string(), root.to_path_buf())], &[]);
         let labels: Vec<&str> = notes.iter().map(|s| s.label.as_str()).collect();
         assert!(labels.contains(&"game:CHANGELOG.md:5") && labels.contains(&"game:CHANGELOG.md:9") && labels.contains(&"game:CHANGELOG.md:15"), "{labels:?}");
         assert!(labels.contains(&"game:(version tags, newest first)") && labels.contains(&"game:(changes since v0.0.42)"));
@@ -3090,7 +3096,7 @@ mod tests {
         commit("Claude <noreply@anthropic.com>", "src/w.rs");
         commit("Hytale Sync Bot <sync@hytale.example>", "src/v.rs");
         commit("Cursor Agent <cursoragent@cursor.com>", "README.md");
-        let rows = recent_contributors(root).unwrap();
+        let rows = recent_contributors(root, &[]).unwrap();
         assert!(rows.contains("data/: Ádám Liszkai (2), Chris (1)"), "UTF-8 names, most first: {rows}");
         assert!(rows.contains("src/: Chris (2)\n"), "one person per GitHub id, under the name used most: {rows}");
         assert!(!rows.contains("(top-level files)"), "a bot's only folder has no row: {rows}");
@@ -3103,11 +3109,68 @@ mod tests {
         let p = prompt("Current/Team.md", "the team", None, &[], "2026-10-06");
         assert!(p.contains("Never write a role nobody stated") && p.contains("Never speculate whether two names are one person"));
         write(root, &[("people/ana.md", "# Ana\nDecides balance.\n"), ("people/PERSON.md", "{{name}}\n"), ("CODEOWNERS", "data/ @ana\n")]);
-        let s = page_sources("Current/Who-Does-What.md", root, "Wiki", &[("game".to_string(), root.to_path_buf())]);
+        let s = page_sources("Current/Who-Does-What.md", root, "Wiki", &[("game".to_string(), root.to_path_buf())], &[]);
         let labels: Vec<&str> = s.iter().map(|x| x.label.as_str()).collect();
         assert!(labels.contains(&"game:CODEOWNERS") && labels.contains(&"game:people/ana.md"), "{labels:?}");
         assert!(labels.contains(&"game:(recent contributors by folder, last 90 days, from git)"));
         assert!(!labels.iter().any(|l| l.ends_with("PERSON.md")), "the template to copy is not a person");
+    }
+
+    /// One person who commits as three identities is counted once, under the
+    /// name the roster gives them, and a roster person is never a bot.
+    #[test]
+    fn recent_contributors_count_a_roster_person_once() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        git_in(root, &["init", "-q"]);
+        let mut n = 0;
+        let mut commit = |who: &str, file: &str| {
+            n += 1;
+            write(root, &[(file, &n.to_string())]);
+            git_in(root, &["add", "-A"]);
+            git_in(root, &["commit", "-q", "--author", who, "-m", &format!("change {n}")]);
+        };
+        commit("Chris <14892384+Stingbro@users.noreply.github.com>", "src/a.rs");
+        commit("Stingbro <nonameisavalibleatthemomment@gmail.com>", "src/b.rs");
+        commit("AlpahSignalAI <alpha.signal.ai@gmail.com>", "src/c.rs");
+        commit("Ana Ruiz <ana@example.com>", "src/d.rs");
+        commit("Mabel Bot <mabel@example.com>", "docs/e.md");
+        commit("Hytale Sync Bot <sync@hytale.example>", "docs/f.md");
+
+        // No roster: as before, one person per address.
+        let rows = recent_contributors(root, &[]).unwrap();
+        assert!(rows.contains("src/: AlpahSignalAI (1), Ana Ruiz (1), Chris (1)"), "{rows}");
+        assert!(!rows.contains("docs/"), "{rows}");
+
+        write(
+            root,
+            &[
+                (
+                    "people/chris.md",
+                    "---
+id: chris
+name: Chris Lee
+emails: [14892384+Stingbro@users.noreply.github.com, nonameisavalibleatthemomment@gmail.com, alpha.signal.ai@gmail.com]
+aliases: [Stingbro, AlpahSignalAI]
+---
+",
+                ),
+                ("people/mabel.md", "---
+id: mabel
+name: Mabel Bot
+---
+"),
+            ],
+        );
+        let roster = crate::people::roster(root);
+        assert_eq!(roster.len(), 2);
+        let rows = recent_contributors(root, &roster).unwrap();
+        assert!(rows.contains("src/: Chris Lee (3), Ana Ruiz (1)
+"), "three identities, one person: {rows}");
+        assert!(!rows.contains("AlpahSignalAI") && !rows.contains("Stingbro"), "{rows}");
+        assert!(rows.contains("docs/: Mabel Bot (1)
+"), "the roster beats the bot list: {rows}");
+        assert!(!rows.contains("Sync Bot"), "a bot not on the roster stays out: {rows}");
     }
 
     /// Item 8: the index and START-HERE say what a repo is for once its page

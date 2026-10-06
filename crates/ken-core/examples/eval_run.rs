@@ -750,7 +750,9 @@ fn phase_kg(base: &Path, parent: &Path) -> Result<()> {
     let fed: Vec<federation::Member> = ms.iter().map(|(_, id, db)| federation::Member { project_id: *id, db }).collect();
     let mut kg = WorkspaceKgDb::open(parent)?;
     let llm = LocalLlm { claude: ken_core::runner::discover_claude(), root: parent.to_path_buf() };
-    let rep = federation::build_workspace_kg(&mut kg, &fed, Some(&llm), engine::now_epoch(), &CancelToken::new())?;
+    let roots: Vec<PathBuf> = members(parent)?.into_iter().map(|(_, p)| p.root).collect();
+    let roster = ken_core::people::roster_of(roots.iter().map(PathBuf::as_path));
+    let rep = federation::build_workspace_kg(&mut kg, &fed, &roster, Some(&llm), engine::now_epoch(), &CancelToken::new())?;
     let names: HashMap<String, &str> = ms.iter().map(|(n, id, _)| (id.to_string(), n.as_str())).collect();
     println!("# Workspace knowledge graph\n\nMembers: {:?}\n\n{rep:#?}\n", ms.iter().map(|m| &m.0).collect::<Vec<_>>());
 

@@ -8964,8 +8964,27 @@ fn workspace_kg_members(guard: &AppState) -> Vec<uuid::Uuid> {
         .collect()
 }
 
+/// Every team's roster in the workspace: the `people/` files of each member
+/// the manifest lists, or of the open members with no workspace. The graph
+/// merges the names and addresses a roster gives one person into them.
+fn workspace_roster(guard: &AppState) -> Vec<ken_core::people::Person> {
+    let roots: Vec<std::path::PathBuf> = match guard.workspace.as_ref() {
+        Some(w) => w
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some(p.root.clone()),
+                _ => None,
+            })
+            .collect(),
+        None => guard.members.values().map(|m| m.project.root.clone()).collect(),
+    };
+    ken_core::people::roster_of(roots.iter().map(|r| r.as_path()))
+}
+
 fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
-    let (base_dir, kg_root, running, cancel_slot, mut member_ids, enabled) = {
+    let (base_dir, kg_root, running, cancel_slot, mut member_ids, enabled, roster) = {
         let guard = state.lock().unwrap();
         (
             guard.base_dir.clone(),
@@ -8974,6 +8993,7 @@ fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
             guard.workspace_kg_cancel.clone(),
             workspace_kg_members(&guard),
             federated_kg_enabled(&guard.app_settings),
+            workspace_roster(&guard),
         )
     };
     if !enabled || running.swap(true, Ordering::SeqCst) {
@@ -9018,7 +9038,7 @@ fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
                 .collect();
             let llm: Option<&dyn ken_core::federation::FederationLlm> =
                 if llm_ready { Some(&federation_llm) } else { None };
-            ken_core::federation::build_workspace_kg(&mut kg, &members, llm, now, &token)
+            ken_core::federation::build_workspace_kg(&mut kg, &members, &roster, llm, now, &token)
         })();
 
         let event = match build {
