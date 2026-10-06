@@ -243,8 +243,14 @@ pub fn gather_repo(name: &str, root: &Path) -> Vec<Source> {
     // The shape of the repo before its long docs, so a documentation-heavy
     // repo cannot crowd it out of the budget.
     push(format!("{name}:(layout)"), layout(root), &mut out);
-    if let Some(d) = folder_imports(root) {
-        push(format!("{name}:(imports between folders, from the code)"), d, &mut out);
+    // Not for a reference repo: the team reads it and never changes it, and
+    // its import map was the slowest part of a draft (1,514 s on a 74,000-file
+    // platform source, against 26 s for the team's own mod, 2026-10-05).
+    let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
+    if !reference {
+        if let Some(d) = folder_imports(root) {
+            push(format!("{name}:(imports between folders, from the code)"), d, &mut out);
+        }
     }
     for dir in ["docs", "doc", "documentation"] {
         let mut docs: Vec<PathBuf> = fs::read_dir(root.join(dir))

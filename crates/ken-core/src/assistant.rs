@@ -239,12 +239,32 @@ pub fn chat_oneshot(
     timeout: Duration,
     cancel: &CancelToken,
 ) -> Result<OneshotOutcome> {
+    chat_oneshot_with(binary, project_root, dirs, mcp_config, prompt, timeout, cancel, true)
+}
+
+/// [`chat_oneshot`]; with `look` false, Ken's MCP tools only (no file
+/// tools, no folders added), to measure what Ken's own search answers.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_oneshot_with(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    mcp_config: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    look: bool,
+) -> Result<OneshotOutcome> {
     let mut allowed: Vec<String> = crate::chat::KEN_MCP_ALLOWED
         .iter()
         .filter(|t| **t != "open_in_ken")
         .map(|t| format!("mcp__ken__{t}"))
         .collect();
-    allowed.push(LOOK_TOOLS.to_string());
+    if look {
+        allowed.push(LOOK_TOOLS.to_string());
+    }
+    let disallowed = if look { "Edit,MultiEdit,Write,NotebookEdit,Bash".to_string() } else { format!("Edit,MultiEdit,Write,NotebookEdit,Bash,{LOOK_TOOLS}") };
+    let dirs: &[std::path::PathBuf] = if look { dirs } else { &[] };
     let mut args: Vec<String> = vec![
         "--permission-mode".into(),
         "default".into(),
@@ -255,7 +275,7 @@ pub fn chat_oneshot(
         "--allowedTools".into(),
         allowed.join(","),
         "--disallowedTools".into(),
-        "Edit,MultiEdit,Write,NotebookEdit,Bash".into(),
+        disallowed,
     ];
     for dir in dirs.iter().filter(|d| d.as_path() != project_root) {
         args.push("--add-dir".into());

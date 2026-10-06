@@ -363,12 +363,22 @@ fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
             Some(c) => format!("{c}\n\n{q}"),
             None => q.to_string(),
         };
-        let outcome = assistant::chat_oneshot(&binary, &wiki.root, &dirs, &cfg, &prompt, Duration::from_secs(300), &CancelToken::new())?;
+        // KEN_EVAL_MCP_ONLY=1: Ken's MCP tools alone, no file tools, to
+        // measure what Ken's own search answers.
+        let look = std::env::var("KEN_EVAL_MCP_ONLY").map_or(true, |v| v != "1");
+        let outcome =
+            assistant::chat_oneshot_with(&binary, &wiki.root, &dirs, &cfg, &prompt, Duration::from_secs(300), &CancelToken::new(), look)?;
         let answer = match outcome {
             assistant::OneshotOutcome::Completed(t) => t,
             other => format!("(no answer: {other:?})"),
         };
-        let lower = answer.to_lowercase();
+        // A ken:// citation names the repo by id: read it as `<repo>/<path>`,
+        // the form the expected answers use, so a right citation counts.
+        let mut cited = answer.clone();
+        for (name, id) in &cite {
+            cited = cited.replace(&format!("ken://{id}/"), &format!("{name}/"));
+        }
+        let lower = cited.to_lowercase();
         let hit = expects.iter().any(|e| lower.contains(e));
         let missing = !hit && (lower.contains("isn't there") || lower.contains("not there") || lower.contains("could not find") || lower.contains("couldn't find"));
         asked += 1;
@@ -892,32 +902,28 @@ fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         // in KEN_EVAL_TYPES, if set), then merged by relevance.
         let types = ken_core::contenttype::parse_filter(std::env::var("KEN_EVAL_TYPES").ok().as_deref());
         let query_vec = emb.as_mut().and_then(|e| e.embed_query(q).ok());
-        let member_hits: Vec<routing::MemberHits> = plan
-            .targets
-            .iter()
-            .filter_map(|id| handles.iter().find(|h| h.project_id == *id))
-            .map(|h| routing::MemberHits {
-                project_id: h.project_id,
-                member_name: h.name.to_string(),
-                status: routing::MemberStatus::Searched,
-                hits: routing::search_member_of(h.db, q, query_vec.as_deref(), 8, &types).unwrap_or_default(),
-            })
-            .collect();
-        let hybrid = routing::merge_routed(&plan, &member_hits, 8);
+        let shared = routing::workspace_vocabulary(handles.iter().map(|h| h.db));
+        let search = |qv: Option<&[f32]>| -> Vec<routing::MemberHits> {
+            plan.targets
+                .iter()
+                .filter_map(|id| handles.iter().find(|h| h.project_id == *id))
+                .map(|h| routing::MemberHits {
+                    project_id: h.project_id,
+                    member_name: h.name.to_string(),
+                    status: routing::MemberStatus::Searched,
+                    hits: routing::search_member_of_with(h.db, q, qv, 8, &types, Some(&shared)).unwrap_or_default(),
+                })
+                .collect()
+        };
+        let hybrid = routing::merge_routed(&plan, &search(query_vec.as_deref()), 8);
         let ms_h = t.elapsed().as_millis();
-        let keyword: Vec<MemberHitsLite> = plan
-            .targets
-            .iter()
-            .filter_map(|id| handles.iter().find(|h| h.project_id == *id))
-            .map(|h| MemberHitsLite {
-                member: h.name.to_string(),
-                paths: routing::search_member(h.db, q, None, 8).unwrap_or_default().into_iter().map(|x| x.path).collect(),
-            })
-            .collect();
+        // Keyword only, merged across repos the same way as hybrid, so the two
+        // columns compare like with like.
+        let keyword = routing::merge_routed(&plan, &search(None), 8);
 
         let rank_of = |paths: &[String]| paths.iter().position(|p| expects.iter().any(|e| p.contains(e)));
         let hybrid_paths: Vec<String> = hybrid.results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect();
-        let kw_paths: Vec<String> = keyword.iter().flat_map(|k| k.paths.iter().map(move |p| format!("{}/{}", k.member, p))).collect();
+        let kw_paths: Vec<String> = keyword.results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect();
         let hr = rank_of(&hybrid_paths);
         let kr = rank_of(&kw_paths);
         scores.0 += 1;
