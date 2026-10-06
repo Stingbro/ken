@@ -453,7 +453,7 @@ mod tests {
     fn the_section_decides_the_audience_unless_the_page_says() {
         assert_eq!(audience_of(section_of("Current/Project.md"), None), Some(Audience::Business));
         assert_eq!(audience_of(section_of("Work/Releases.md"), None), Some(Audience::Business));
-        assert_eq!(audience_of(section_of("Conventions/ARCHITECTURE.md"), None), Some(Audience::Dev));
+        assert_eq!(audience_of(section_of("Conventions/Architecture.md"), None), Some(Audience::Dev));
         assert_eq!(audience_of(section_of("Ways-of-Working/Rules.md"), None), Some(Audience::Method));
         assert_eq!(audience_of(section_of("Research/spike.md"), None), None);
         let says = parse("---

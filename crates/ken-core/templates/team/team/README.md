@@ -1,6 +1,6 @@
 # team/ — this team's overlay
 
-Add-only, by construction. The failure that actually happens is teams quietly
+Add-only, by construction. The usual failure is teams quietly
 removing what was uncomfortable, not teams adding too much.
 
 - Add a status — do not delete `done`.

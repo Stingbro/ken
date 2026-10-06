@@ -9,12 +9,13 @@
 //! person's step, as for the wiki.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::{Error, Result};
 
 /// Which copy of the method's template is bundled.
-pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/team @ 1f625d7";
+pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/team @ bed53fc";
 
 macro_rules! template {
     ($($path:literal),* $(,)?) => {
@@ -26,7 +27,10 @@ macro_rules! template {
 pub const TEMPLATE: &[(&str, &str)] = template![
     ".wright/team.json",
     "README.md",
+    "decisions/Cited-in-Code.md",
     "decisions/DECISIONS.md",
+    "escalations/ESCALATION.md",
+    "escalations/README.md",
     "ideas/IDEA.md",
     "ideas/README.md",
     "method/README.md",
@@ -184,7 +188,8 @@ fn fill_repos(text: &str, team_repo: &str, wiki: Option<&str>, repos: &[crate::w
 }
 
 /// One template file with what Ken knows filled in. Copy templates (a
-/// ticket, a person, an idea) keep their placeholders, the key aside.
+/// ticket, a person, an idea, an escalation) keep their placeholders, the
+/// key aside.
 /// `repos` are the team's other repos as set-up registered them.
 pub fn fill(
     path: &str,
@@ -197,7 +202,7 @@ pub fn fill(
     let key = ticket_key(team);
     let text = if path == ".wright/team.json" { fill_repos(text, team_repo, wiki, repos) } else { text.to_string() };
     let mut t = text.replace("{{KEY}}", &key);
-    let is_copy = path.ends_with("TICKET.md") || path.ends_with("PERSON.md") || path.ends_with("IDEA.md");
+    let is_copy = ["TICKET.md", "PERSON.md", "IDEA.md", "ESCALATION.md"].iter().any(|c| path.ends_with(c));
     if !is_copy {
         t = t.replace("{{team_name}}", team).replace("{{team_repo}}", team_repo);
         if let Some(w) = wiki {
@@ -227,6 +232,156 @@ pub fn create(dir: &Path, team: &str, wiki: Option<&str>, repos: &[crate::wikine
     crate::wikinew::git_commit_all(dir, &format!("Start the {team} team repo from the Ways-of-Working template"))
 }
 
+// --- The rulings the code cites (`decisions/Cited-in-Code.md`), generated
+// from the code repos' tracked files and checked against the log. ---------
+
+/// The generated page, in the team repo.
+pub const CITED_IN_CODE: &str = "decisions/Cited-in-Code.md";
+
+/// What rebuilds the page, as the page says.
+const CITED_BY: &str = "Ken's wiki draft";
+
+/// The ruling ids `line` cites: `D-nnn` (three digits or more) standing
+/// alone, or a link to one, `DECISIONS.md#d-nnn`.
+fn ruling_ids(line: &str) -> Vec<String> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    for i in 0..b.len().saturating_sub(2) {
+        let id_start = match b[i] {
+            b'D' => i == 0 || !b[i - 1].is_ascii_alphanumeric(),
+            b'd' => i > 0 && b[i - 1] == b'#',
+            _ => false,
+        };
+        if !id_start || b[i + 1] != b'-' {
+            continue;
+        }
+        let digits: String = line[i + 2..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let after = b.get(i + 2 + digits.len());
+        if digits.len() >= 3 && !after.is_some_and(|c| c.is_ascii_alphanumeric()) {
+            out.push(format!("D-{digits}"));
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// Each ruling id `root`'s tracked files cite: (id, `repo:path:line`, the
+/// line as written).
+fn citations(name: &str, root: &Path) -> Vec<(String, String, String)> {
+    let mut cmd = Command::new("git");
+    let out = crate::proc::quiet(&mut cmd)
+        .args(["-c", "core.quotepath=off", "grep", "-n", "-I", "-i", "-E", "d-[0-9]{3}"])
+        .current_dir(root)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    let mut found = Vec::new();
+    for hit in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut parts = hit.splitn(3, ':');
+        let (Some(path), Some(line), Some(text)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        for id in ruling_ids(text) {
+            found.push((id, format!("{name}:{path}:{line}"), text.trim().to_string()));
+        }
+    }
+    found
+}
+
+/// The decisions log's entries: id and the rest of its first line.
+fn log_entries(log: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in log.lines().map(str::trim) {
+        if line.starts_with("```") {
+            in_fence = !in_fence; // the format example, not an entry
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if let Some(id) = ruling_ids(line).into_iter().next().filter(|id| line.starts_with(id.as_str())) {
+            let rest = line[id.len()..].trim_start_matches([' ', '-', '·', '—']).trim();
+            out.push((id, rest.to_string()));
+        }
+    }
+    out
+}
+
+/// A table cell: one line, no pipes, at most 200 characters.
+fn cell(s: &str) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ").replace('|', "\\|");
+    if s.chars().count() > 200 {
+        format!("{}…", s.chars().take(199).collect::<String>())
+    } else {
+        s
+    }
+}
+
+/// `decisions/Cited-in-Code.md` for `code`, the team's code repos, against
+/// `log` (the text of `DECISIONS.md`): every ruling id their tracked files
+/// cite, split by whether the log has it. None with no code repo to read.
+pub fn cited_in_code(code: &[(String, PathBuf)], log: &str, today: &str) -> Option<String> {
+    if code.is_empty() {
+        return None;
+    }
+    let template = TEMPLATE.iter().find(|(p, _)| *p == CITED_IN_CODE)?.1.replace("\r\n", "\n");
+    let entries = log_entries(log);
+    let mut cited: Vec<(String, String, String)> = code.iter().flat_map(|(n, r)| citations(n, r)).collect();
+    cited.sort();
+    let (mut missing, mut logged) = (String::new(), String::new());
+    for (id, at, text) in &cited {
+        match entries.iter().find(|(e, _)| e == id) {
+            Some((_, ruling)) => logged.push_str(&format!("| {id} | `{at}` | {} |\n", cell(ruling))),
+            None => missing.push_str(&format!("| {id} | `{at}` | {} |\n", cell(text))),
+        }
+    }
+    let names: Vec<&str> = code.iter().map(|(n, _)| n.as_str()).collect();
+    let heads: Vec<String> = code
+        .iter()
+        .map(|(n, r)| {
+            let head = repo_facts(r).1.unwrap_or_default();
+            format!("{n}@{}", &head[..head.len().min(12)])
+        })
+        .collect();
+    let searched: Vec<String> = names.iter().map(|n| format!("{n} (every tracked file)")).collect();
+    let mut page = String::new();
+    for line in template.split_inclusive('\n') {
+        if line.starts_with("| {{D-nnn}} |") {
+            page.push_str(if line.contains("{{the comment line") { &missing } else { &logged });
+        } else {
+            page.push_str(line);
+        }
+    }
+    Some(
+        page.replace("{{code repos, each with the path searched}}", &searched.join(" · "))
+            .replace("{{repo@sha for each code repo, from one run}}", &heads.join(" · "))
+            .replace("{{the command that rebuilds this page}}", CITED_BY)
+            .replace("{{repos}}", &names.join(", "))
+            .replace("{{repo@sha}}", &heads.join(" · "))
+            .replace("{{command}}", CITED_BY)
+            .replace("{{date}}", today),
+    )
+}
+
+/// Rebuild `team`'s `decisions/Cited-in-Code.md` from `code` (see
+/// [`cited_in_code`]). A page that no longer says `generated: true` is a
+/// person's, and is left alone. Whether it was written.
+pub fn write_cited_in_code(team: &Path, code: &[(String, PathBuf)], today: &str) -> Result<bool> {
+    let path = team.join(CITED_IN_CODE);
+    let existing = fs::read_to_string(&path).ok();
+    if existing.as_deref().is_some_and(|t| !t.lines().any(|l| l.trim() == "generated: true")) {
+        return Ok(false);
+    }
+    let log = fs::read_to_string(team.join("decisions/DECISIONS.md")).unwrap_or_default();
+    let Some(page) = cited_in_code(code, &log, today) else { return Ok(false) };
+    if existing.as_deref() == Some(page.as_str()) {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    }
+    fs::write(&path, page).map_err(|e| Error::io(&path, e))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +408,7 @@ mod tests {
     #[test]
     fn fill_names_the_team_and_repos_and_keeps_copy_templates() {
         let readme = TEMPLATE.iter().find(|(p, _)| *p == "README.md").unwrap().1;
-        assert!(fill("README.md", readme, "AUR", "AUR-Team", Some("AUR-Wiki"), &[]).starts_with("# AUR — team repo"));
+        assert!(fill("README.md", readme, "AUR", "AUR-Team", Some("AUR-Wiki"), &[]).starts_with("# AUR\n"));
         let json = TEMPLATE.iter().find(|(p, _)| *p == ".wright/team.json").unwrap().1;
         let t = fill(".wright/team.json", json, "AUR", "AUR-Team", Some("AUR-Wiki"), &[]);
         assert!(t.contains("\"team\": \"AUR\"") && t.contains("\"key\": \"AUR\"") && t.contains("\"AUR-Team\": {") && t.contains("\"AUR-Wiki\": {"));
@@ -312,6 +467,61 @@ mod tests {
         assert!(r.contains_key("{{code_repo}}") && r.contains_key("{{reference_repo}}"));
         assert_eq!(r["AUR-Team"]["kind"], "team");
         assert_eq!(r["AUR-Wiki"]["kind"], "wiki");
+    }
+
+    #[test]
+    fn the_rulings_the_code_cites_are_listed_against_the_log() {
+        assert_eq!(ruling_ids("// D-012: saves are region files; see DECISIONS.md#d-007"), vec!["D-012", "D-007"]);
+        assert!(ruling_ids("HD-123 · D-12 · D-0123a · grid-d-100").is_empty(), "not an id: a word, two digits, a letter after, no link");
+
+        let d = tempfile::tempdir().unwrap();
+        let game = d.path().join("Game");
+        fs::create_dir_all(game.join("src")).unwrap();
+        fs::write(game.join("src/save.rs"), "fn save() {}\n// D-012: worlds save as region files | always\n").unwrap();
+        fs::write(game.join("src/combat.rs"), "// Stamina, not energy (D-031).\n").unwrap();
+        fs::write(game.join("notes.txt"), "D-099 untracked, never read\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&game)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["add", "src"]);
+        git(&["commit", "-q", "-m", "first"]);
+        let log = "```\nD-001 - 2026-01-01 - topic - THE RULING.\n```\n\n## Log\n\nD-012 - 2026-09-01 - saves - Worlds save as region files.\n";
+        let code = vec![("Game".to_string(), game.clone())];
+        let page = cited_in_code(&code, log, "2026-10-06").unwrap();
+        assert!(page.contains("| D-031 | `Game:src/combat.rs:1` | // Stamina, not energy (D-031). |\n"), "{page}");
+        assert!(page.contains("| D-012 | `Game:src/save.rs:2` | 2026-09-01 - saves - Worlds save as region files. |\n"), "{page}");
+        assert!(!page.contains("D-099") && !page.contains("D-001 |"), "untracked files and the format example are not read");
+        assert!(page.contains("updated: 2026-10-06") && page.contains("generated: true") && !page.contains("{{"), "{page}");
+        let not_in_log = &page[page.find("## Not in the Log").unwrap()..page.find("## In the Log").unwrap()];
+        assert!(not_in_log.contains("D-031") && !not_in_log.contains("D-012"));
+        assert_eq!(cited_in_code(&[], log, "2026-10-06"), None, "no code repo, no page");
+
+        // Written while it is generated; a page a person took over is theirs.
+        let team = d.path().join("Team");
+        fs::create_dir_all(team.join("decisions")).unwrap();
+        fs::write(team.join("decisions/DECISIONS.md"), log).unwrap();
+        assert!(write_cited_in_code(&team, &code, "2026-10-06").unwrap());
+        assert!(!write_cited_in_code(&team, &code, "2026-10-06").unwrap(), "unchanged");
+        fs::write(team.join(CITED_IN_CODE), "# Cited\n\nKept by hand.\n").unwrap();
+        assert!(!write_cited_in_code(&team, &code, "2026-10-07").unwrap());
+        assert_eq!(fs::read_to_string(team.join(CITED_IN_CODE)).unwrap(), "# Cited\n\nKept by hand.\n");
+    }
+
+    #[test]
+    fn the_template_list_is_exactly_the_bundled_folder() {
+        let mut listed: Vec<String> = TEMPLATE.iter().map(|(p, _)| p.to_string()).collect();
+        listed.sort();
+        assert_eq!(listed, crate::wikinew::tests::files_under("team"), "TEMPLATE and templates/team differ");
+        for (path, text) in TEMPLATE {
+            assert!(!text.contains('\r'), "{path} has a CR");
+        }
     }
 
     #[test]

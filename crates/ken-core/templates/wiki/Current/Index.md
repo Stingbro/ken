@@ -1,21 +1,27 @@
 ---
-aliases: ["Current", "what is true now"]
-tags: [moc, current]
+title: "Current"
+aliases: ["Current", "what is true now", "what is the state of the project"]
+status: current
+audience: business
 updated: {{date}}
 ---
 
 # Current
 
-What is true now about the project and the team. **Maintained**: each page is rewritten in place when something changes, never appended to. An ingest that changes what is true here rewrites the page and cites its note.
+What is true now about the project and the team, rewritten in place when it changes and never appended to. Not here: how the product works → [[Reference]] and [[Platform]]; what we chose to build and why → [[Design]]; how we work → [[Ways-of-Working]]; a ruling → the decisions log; what was said in a meeting → [[Ingestion]].
+
+[[#Pages]] · [[#Belongs Here]]
+
+## Pages
 
 | page | holds |
 |---|---|
-| [[Project]] | what the project is currently about: the goal · the next milestone · what is out of scope |
-| [[Team]] | how the team is structured: roles · who decides what · who hands work to whom |
-| [[Who-Does-What]] | who owns which area or repo, and who to ask |
+| [[Project]] | the product · who it is for · the goal · what is out of scope |
+| [[Roadmap]] | the milestones, next first, each with its target date and state |
+| [[Feature Status]] | each feature: built · reachable · tested · when someone last checked |
+| [[Team]] | roles · who decides what · who hands work to whom |
+| [[Who Does What]] | who owns each area and repo, and who to ask |
 
-A project overview nobody updates still reads as current to every session that loads it. Each page carries `verified:` and the note that last changed it; the drift check's standing sweep raises one unverified for thirty days.
+## Belongs Here
 
-## Not Here
-
-How the system works (→ {{Domain}}), what we chose to build and why (→ Design), how we work (→ Ways-of-Working), the way we do it here (→ Conventions), a ruling (→ the decisions log in the team repo), what was said in a meeting (→ `Research/Ingestion/`).
+A fact a reader needs as it stands today, which goes stale unless someone rewrites it. Each page carries `verified:`, the date a person last read it against its sources, and `changed_by:`, the note that last changed it. When an Ingested note changes what is true here, the page is rewritten and cites the note. The standing sweep raises a page unverified for thirty days, because a stale overview still reads as current to every session that loads it.

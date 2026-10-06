@@ -141,6 +141,8 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
         ("Research/Ingestion", "Research/Ingestion"),
         ("Ways-of-Working", "a Ways-of-Working section"),
         ("Current", "a Current section"),
+        ("Reference/Vocabulary.md", "a Vocabulary page"),
+        // Where libraries laid down before the 2026-10 template kept it.
         ("Vocabulary.md", "a Vocabulary page"),
         ("START-HERE.md", "START-HERE.md"),
     ]

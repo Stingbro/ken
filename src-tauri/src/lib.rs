@@ -8295,7 +8295,8 @@ fn page_title(root: &std::path::Path, rel: &str) -> String {
         .unwrap_or_else(|| rel.rsplit('/').next().unwrap_or(rel).trim_end_matches(".md").to_string())
 }
 
-/// The `.md` pages directly in `dir` of `root`, titled, the copy templates
+/// The `.md` pages directly in `dir` of `root`, titled, the copy template a
+/// wiki laid down before the 2026-10 template kept among its rules
 /// (`RULE.md`) left out.
 fn pages_in(root: &std::path::Path, dir: &str) -> Vec<TeamPageDto> {
     let mut out: Vec<TeamPageDto> = std::fs::read_dir(root.join(dir))
@@ -8498,9 +8499,14 @@ fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> Cm
     if path.exists() {
         return Err(format!("{rel} is already there"));
     }
-    let template = std::fs::read_to_string(root.join("Ways-of-Working/Rules/RULE.md")).unwrap_or_else(|_| "---\ntitle: \"{{the-rule-as-a-sentence}}\"\nstatus: current\n---\n\n# {{The rule, as a sentence}}\n".into());
+    // `Templates/Rule.md`; a wiki laid down before the 2026-10 template kept
+    // its blank beside the rules, as `RULE.md`.
+    let template = std::fs::read_to_string(root.join("Templates/Rule.md"))
+        .or_else(|_| std::fs::read_to_string(root.join("Ways-of-Working/Rules/RULE.md")))
+        .unwrap_or_else(|_| "---\ntitle: \"{{the-rule-as-a-sentence}}\"\nstatus: current\n---\n\n# {{The rule, as a sentence}}\n".into());
     let text = template
         .replace("{{the-rule-as-a-sentence}}", rule)
+        .replace("{{The Rule as a Sentence}}", rule)
         .replace("{{The rule, as a sentence}}", rule)
         .replace("{{date}}", &local_date_today());
     std::fs::create_dir_all(path.parent().unwrap()).map_err(err)?;

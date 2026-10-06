@@ -1,25 +1,34 @@
 ---
 title: "Team"
-aliases: ["team", "how is the team structured", "who decides"]
+aliases: ["Team", "how is the team structured", "who decides", "who reviews", "who releases"]
 status: current
+audience: business
 updated: {{date}}
-verified: {{date}}      # a person read this against its sources; never stamped in bulk
-changed_by: "[[{{the ingested note that last changed it}}]]"
+verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
+changed_by: "[[{{the Ingested note that last changed it}}]]"
 sources:
-  - "[[{{ingested note}}]]"
-  - "D-{{nnn}}"
+  - "{{team_repo}}:people/"
+  - "{{repo:path of any other doc that names a role}}"
 ---
 
 # Team
 
-Rewritten in place when something changes, never appended to.
+The roles on the team, who decides what, and who takes work at each stage. Not here: who owns which area or repo → [[Who Does What]]; each person's own preferences → their file in the team repo's `people/`; the stages themselves → [[Lifecycle]].
+
+[[#Roles]] · [[#Handoffs]]
 
 ## Roles
 
 | role | who | decides |
 |---|---|---|
-| {{role}} | {{name}} | {{what they rule on}} |
+| {{a role a people/ file or a repo doc names}} | {{name, as in people/}} | {{what they rule on}} |
 
 ## Handoffs
 
-{{one paragraph: who takes work in, who sizes, who reviews, who releases; the stages themselves are on [[Lifecycle]]}}
+| stage | who | hands to |
+|---|---|---|
+| Plan | {{who takes requests in and writes the story}} | {{who sizes}} |
+| Size | {{who confirms the size}} | {{who builds}} |
+| Build | {{who builds}} | {{who reviews}} |
+| Release | {{who sees it working and ships it}} | {{who writes it down}} |
+| Learn | {{who writes the closing notes and the rulings}} | — |

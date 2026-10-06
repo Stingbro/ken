@@ -1,19 +1,20 @@
 ---
-title: "{{What it was}} - {{date}}"
-aliases: ["{{What it was}} - {{date}}"]
+title: "{{What It Was}} {{date}}"
+aliases: ["{{What It Was}} {{date}}"]
 status: evidence
+audience: business
 updated: {{date}}
 source: Research/Ingestion/Ingested/{{date}}-{{name}}/{{source file}}
 present: [{{who was there}}]
 ---
 
-# {{What it was}} - {{date}}
+# {{What It Was}} {{date}}
 
-Evidence, at the time. Cite it; do not read it as current doctrine.
+The write-up of {{the source}}, as evidence at {{date}}: cite it, never read it as current rules. Not here: what is true now → [[Current]]; a ruling once its decider accepts it → the decisions log.
 
 Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends, if it ends early.}}
 
-Keep the sections this kind of source needs and drop the rest. A meeting or session usually needs all of them; a document needs the summary, takeaways, contradictions and what it changes; a short note may need only a summary and next steps.
+Keep the sections this kind of source needs and drop the rest. A meeting or session needs most of them; a document needs the summary, takeaways, contradictions and what it changes; a short note may need only a summary and next steps.
 
 ## Summary
 
@@ -31,7 +32,7 @@ Keep the sections this kind of source needs and drop the rest. A meeting or sess
 
 ## Contradictions
 
-- {{Where the source disagrees with a wiki page, or with itself}} — {{the page, or the two places in the source}}.
+- {{Where the source disagrees with a library page, or with itself}} — {{the page, or the two places in the source}}.
 
 ## What Was Said
 

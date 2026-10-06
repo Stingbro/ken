@@ -1,43 +1,27 @@
 ---
-title: "Agents — Session Start"
-aliases: ["Session Start", "where do I start a session"]
+title: "Session Start"
+aliases: ["Session Start", "where do I start a session", "what do I read before a ticket", "Agents"]
 status: current
-tags: [agents, moc]
+audience: method
+updated: {{date}}
+verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
 ---
 
-# Agents — Session Start
+# Session Start
 
-**Read this page first** on every new ticket or fresh session. Then open **one**
-map or how-to — do not start by grepping half the repo.
+The checklist for a new ticket or a fresh session, read first every time. Not here: which source wins and the search order → [[Research-Ladder]]; the rules → [[Rules]].
 
-Pattern: [Karpathy's LLM wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
-— compound knowledge into linked pages; the wiki is the map; code is ground
-truth for detail.
+[[#Checklist]] · [[#Reading Cost]]
 
-## Source of Truth
+## Checklist
 
-| layer | role |
-|---|---|
-| this wiki | how we work, where things live, the gotchas |
-| the code | implementation truth |
-| {{upstream/vendor docs}} | the official account |
-| {{decompiled or generated sources}} | signatures only, when the rest fails |
+1. Open the ticket and set `status: in-progress`.
+2. Open the repo map (`Repo-Map/`, where things live in each repo) for where the code lives, and [[Build and Run]] for how to run it.
+3. Open one matching how-to, system page or convention page.
+4. Search the code only then, under the paths those pages named. Use the code map before grep: the definition, its usages, the file's outline and its imports. Read the lines around each hit, never a long file whole.
+5. Read the platform's generated or decompiled sources last.
+6. Write what you learn that will last back into the page that owns it, because a fact left in a chat log is found by no later session.
 
-## Session Checklist
+## Reading Cost
 
-1. Open the ticket. Set `status: in-progress`.
-2. Read the **Repo Map** for "where does X live?"
-3. Open **one** matching how-to.
-4. Only then search the code, under the paths the map named. Use the code map
-   before grep: the definition, its usages, the file's outline and imports.
-   Read the lines around each hit. Do not read a long file whole.
-5. Generated or decompiled sources **last** — see the Research Ladder.
-6. When you learn something lasting, **write it back** into the wiki. Don't
-   leave truth only in a chat log.
-
-## Token Hygiene
-
-1. Repo Map = *where* · how-to = *how* · code = the exact signature.
-2. After a hard bug, **compound** the lesson into the how-to or the gotchas.
-3. Do not re-derive what a reference page already holds.
-4. For why code changed, read its git history. Do not guess.
+Reading the repo map or one how-to costs fewer tokens than searching many files, and re-deriving what a page already holds costs the most. After a hard bug, the lesson goes into the how-to or the convention page it belongs to. For why code changed, read its git history.

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 /// Which copy of the method's template is bundled.
-pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/wiki @ b824813";
+pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/wiki @ bed53fc";
 
 macro_rules! template {
     ($($path:literal),* $(,)?) => {
@@ -30,27 +30,56 @@ macro_rules! template {
 pub const TEMPLATE: &[(&str, &str)] = template![
     "CLAUDE.md",
     "START-HERE.md",
-    "Vocabulary.md",
     "_meta/README.md",
-    "Conventions/ARCHITECTURE.md",
-    "Conventions/CONVENTION.md",
+    "Conventions/Index.md",
+    "Conventions/Architecture.md",
+    "Conventions/Code.md",
+    "Conventions/Data-and-Config.md",
+    "Conventions/Registries.md",
+    "Conventions/Testing.md",
     "Current/Index.md",
+    "Current/Feature-Status.md",
     "Current/Project.md",
+    "Current/Roadmap.md",
     "Current/Team.md",
     "Current/Who-Does-What.md",
+    "Design/Index.md",
+    "Design/Principles.md",
+    "Platform/Index.md",
+    "Reference/Index.md",
+    "Reference/Build-and-Run.md",
+    "Reference/Config-Map.md",
+    "Reference/How-tos.md",
+    "Reference/How-tos/.gitkeep",
+    "Reference/Systems.md",
+    "Reference/Systems/.gitkeep",
+    "Reference/Vocabulary.md",
+    "Research/Index.md",
+    "Research/Findings/.gitkeep",
     "Research/Ingestion/Index.md",
     "Research/Ingestion/Ingested/.gitkeep",
     "Research/Ingestion/Raw/.gitkeep",
+    "Templates/Index.md",
+    "Templates/Convention.md",
+    "Templates/Dependency.md",
+    "Templates/Design-Note.md",
+    "Templates/Finding.md",
     "Templates/How-to.md",
+    "Templates/Incident.md",
     "Templates/Ingested-note.md",
+    "Templates/Repo-Architecture.md",
+    "Templates/Rule.md",
+    "Templates/System.md",
+    "Ways-of-Working/Ways-of-Working.md",
     "Ways-of-Working/Agents/Index.md",
     "Ways-of-Working/Lifecycle.md",
     "Ways-of-Working/Research-Ladder.md",
     "Ways-of-Working/Rules.md",
-    "Ways-of-Working/Rules/RULE.md",
     "Ways-of-Working/Rules/write-for-the-altitude-like-teammates-talking.md",
-    "Ways-of-Working/Rules/write-like-you-would-say-it-out-loud.md",
-    "Ways-of-Working/Ways-of-Working.md",
+    "Work/Index.md",
+    "Work/Incidents.md",
+    "Work/Incidents/.gitkeep",
+    "Work/Releases.md",
 ];
 
 /// A repo the new wiki covers: its name in the workspace and what it is for,
@@ -68,9 +97,9 @@ pub struct Covered {
 }
 
 /// Pages that are templates for people to copy keep their placeholders,
-/// dates included.
+/// dates included. The blanks all live in `Templates/`; its index is a page.
 pub(crate) fn is_copy_template(path: &str) -> bool {
-    path.starts_with("Templates/") || path.ends_with("/RULE.md") || path.ends_with("/CONVENTION.md")
+    path.starts_with("Templates/") && path != "Templates/Index.md"
 }
 
 fn one_line(s: &str) -> String {
@@ -112,7 +141,7 @@ pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], t
     }
     if path == "START-HERE.md" {
         // The repo table: this wiki, then each of the team's repos.
-        let mut rows = format!("| `{wiki}` | **this** — all documentation |\n");
+        let mut rows = format!("| `{wiki}` | this repo · the library |\n");
         for r in repos {
             rows.push_str(&format!("| `{}` | {} |\n", r.name, one_line(&r.description)));
         }
@@ -203,7 +232,7 @@ pub(crate) fn git_commit_all(dir: &Path, msg: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn repos() -> Vec<Covered> {
@@ -217,9 +246,38 @@ mod tests {
     fn start_here_lists_this_wiki_and_the_teams_repos() {
         let text = TEMPLATE.iter().find(|(p, _)| *p == "START-HERE.md").unwrap().1;
         let t = fill("START-HERE.md", text, "Realms", "Realms-Wiki", &repos(), "2026-09-25");
-        assert!(t.contains("**The Realms knowledge library.**"));
-        assert!(t.contains("| `Realms-Wiki` | **this** — all documentation |\n| `Game` | The game client. Built nightly. |\n| `Tools` | (not said yet) |"));
+        assert!(t.contains("The Realms library: the traps"));
+        assert!(t.contains("| `Realms-Wiki` | this repo · the library |\n| `Game` | The game client. Built nightly. |\n| `Tools` | (not said yet) |"));
         assert!(!t.contains("{{team_repo}}") && !t.contains("{{code_repo}}"));
+    }
+
+    /// Every file under `templates/<dir>`, as a path inside it, sorted.
+    pub(crate) fn files_under(dir: &str) -> Vec<String> {
+        fn walk(root: &Path, at: &Path, out: &mut Vec<String>) {
+            for e in fs::read_dir(at).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(root, &p, out);
+                } else {
+                    out.push(p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates").join(dir);
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_template_list_is_exactly_the_bundled_folder() {
+        let mut listed: Vec<String> = TEMPLATE.iter().map(|(p, _)| p.to_string()).collect();
+        listed.sort();
+        assert_eq!(listed, files_under("wiki"), "TEMPLATE and templates/wiki differ");
+        for (path, text) in TEMPLATE {
+            assert!(!text.contains('\r'), "{path} has a CR");
+        }
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! terms anyone might search by").
 //!
 //! Three sources, all read from what the index already stores:
-//! - the Vocabulary page's word tables (our word ↔ the platform's word);
+//! - the Vocabulary page's word tables (our word ↔ the platform's word, and
+//!   old name ↔ new name);
 //! - each decisions-log entry's topic and `aliases:` line;
 //! - each page's frontmatter title and `aliases`.
 //!
@@ -156,9 +157,11 @@ fn cells(line: &str) -> Option<Vec<String>> {
 }
 
 /// Rows of the word tables: a table whose header starts with "our word" and
-/// "the platform's word" (either order). Each row's first two cells are one
-/// group. Other tables (Method Words is word and meaning, not two words) are
-/// skipped.
+/// "the platform's word" (either order; the page at `Reference/Vocabulary.md`
+/// says "the code's or platform's word"), and Renames, "old name" and "new
+/// name". Each row's first two cells are one group. Other tables (Method
+/// Words is word and meaning, Words With Two Meanings is one word's two
+/// senses, not two words) are skipped.
 pub fn parse_vocabulary(text: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut in_word_table = false;
@@ -170,8 +173,10 @@ pub fn parse_vocabulary(text: &str) -> Vec<Vec<String>> {
             continue;
         };
         if !in_word_table && !after_header {
-            let h: Vec<String> = row.iter().map(|c| c.to_lowercase()).collect();
-            let word = |c: &str| c == "our word" || c == "the platform's word" || c == "the platform’s word";
+            let h: Vec<String> = row.iter().map(|c| c.to_lowercase().replace('’', "'")).collect();
+            let word = |c: &str| {
+                matches!(c, "our word" | "the platform's word" | "the code's or platform's word" | "old name" | "new name")
+            };
             in_word_table = h.len() >= 2 && word(&h[0]) && word(&h[1]);
             after_header = true;
             continue;
@@ -239,6 +244,18 @@ mod tests {
     fn word_tables_pair_our_word_with_the_platforms() {
         let text = "## Our Words\n\n| our word | the platform's word | where it lives |\n|---|---|---|\n| {{our word}} | {{the platform's word}} | x |\n| shard | region | Engine/World.md |\n\n## Method Words\n\n| word | means | where it lives |\n|---|---|---|\n| backlog | the Board's ranked list | tickets/ |\n";
         assert_eq!(parse_vocabulary(text), vec![vec!["shard".to_string(), "region".to_string()]]);
+    }
+
+    /// The page as the template lays it down at `Reference/Vocabulary.md`.
+    #[test]
+    fn the_reference_page_pairs_words_that_differ_and_renames() {
+        let page = crate::wikinew::TEMPLATE.iter().find(|(p, _)| *p == "Reference/Vocabulary.md").unwrap().1;
+        assert!(parse_vocabulary(page).is_empty(), "placeholders and Method Words are no rows");
+        let text = "## Words That Differ\n\n| our word | the code's or platform's word | shown in |\n|---|---|---|\n| shard | region | Engine/World.java:12 |\n\n\
+                    ## Words With Two Meanings\n\n| word | meaning here | other meaning | shown in |\n|---|---|---|---|\n| zone | a PvP area | a world chunk | x |\n\n\
+                    ## Renames\n\n| old name | new name | since | still under the old name |\n|---|---|---|---|\n| Guild | Clan | D-014 | guild_id |\n";
+        let words = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+        assert_eq!(parse_vocabulary(text), vec![words("shard", "region"), words("Guild", "Clan")]);
     }
 
     #[test]
