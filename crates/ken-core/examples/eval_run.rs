@@ -922,11 +922,13 @@ fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
                 })
                 .collect()
         };
-        let hybrid = routing::merge_routed(&plan, &search(query_vec.as_deref()), 8);
+        let hybrid_members = search(query_vec.as_deref());
+        let hybrid = routing::merge_routed(&plan, &hybrid_members, 8);
         let ms_h = t.elapsed().as_millis();
         // Keyword only, merged across repos the same way as hybrid, so the two
         // columns compare like with like.
-        let keyword = routing::merge_routed(&plan, &search(None), 8);
+        let keyword_members = search(None);
+        let keyword = routing::merge_routed(&plan, &keyword_members, 8);
 
         let rank_of = |paths: &[String]| paths.iter().position(|p| expects.iter().any(|e| p.contains(e)));
         let hybrid_paths: Vec<String> = hybrid.results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect();
@@ -961,6 +963,22 @@ fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
             println!("{}. `{}/{}`{} ({:?}) — {}", i + 1, r.member_name, r.path, r.line.map(|l| format!(":{l}")).unwrap_or_default(), r.source, short(&r.snippet, 110));
         }
         println!();
+        // KEN_EVAL_VERBOSE: the keyword list too, and each member's own hits
+        // with the score they merged by, to see why a file ranks where it does.
+        if std::env::var_os("KEN_EVAL_VERBOSE").is_some() {
+            println!("Keyword:\n");
+            for (i, r) in keyword.results.iter().take(6).enumerate() {
+                println!("{}. `{}/{}`{} ({:?})", i + 1, r.member_name, r.path, r.line.map(|l| format!(":{l}")).unwrap_or_default(), r.source);
+            }
+            for (label, mh) in [("hybrid", &hybrid_members), ("keyword", &keyword_members)] {
+                println!("\nPer member, {label}:\n");
+                for m in mh {
+                    let row: Vec<String> = m.hits.iter().map(|h| format!("{:.2} {} ({}c)", h.score, h.path, h.snippet.len())).collect();
+                    println!("- {}: {}", m.member_name, row.join(" · "));
+                }
+            }
+            println!();
+        }
     }
     let (n, h1, h5, k1, k5) = scores;
     println!("## Score over {n} questions\n\n| | hit@1 | hit@5 |\n|---|---|---|\n| hybrid (keyword + meaning, routed) | {h1} | {h5} |\n| keyword only | {k1} | {k5} |");
