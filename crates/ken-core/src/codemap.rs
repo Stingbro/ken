@@ -78,10 +78,10 @@ impl Lang {
             Lang::JavaScript => TagsConfiguration::new(tree_sitter_javascript::LANGUAGE.into(), js, ""),
             // TypeScript's tags query covers only what TypeScript adds
             // (interfaces, modules); functions and classes are JavaScript's.
-            Lang::TypeScript => TagsConfiguration::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), &format!("{js}\n{ts}"), ""),
-            Lang::Tsx => TagsConfiguration::new(tree_sitter_typescript::LANGUAGE_TSX.into(), &format!("{js}\n{ts}"), ""),
+            Lang::TypeScript => TagsConfiguration::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), &format!("{js}\n{ts}\n{TS_MORE}"), ""),
+            Lang::Tsx => TagsConfiguration::new(tree_sitter_typescript::LANGUAGE_TSX.into(), &format!("{js}\n{ts}\n{TS_MORE}"), ""),
             Lang::Go => TagsConfiguration::new(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::TAGS_QUERY, ""),
-            Lang::Java => TagsConfiguration::new(tree_sitter_java::LANGUAGE.into(), tree_sitter_java::TAGS_QUERY, ""),
+            Lang::Java => TagsConfiguration::new(tree_sitter_java::LANGUAGE.into(), &format!("{}\n{JAVA_MORE}", tree_sitter_java::TAGS_QUERY), ""),
             // Its query repeats the namespace pattern with a bare `@module`
             // capture, which tree-sitter-tags refuses: without that line.
             Lang::CSharp => TagsConfiguration::new(
@@ -94,6 +94,31 @@ impl Lang {
         built.ok()
     }
 }
+
+/// Java definitions the grammar's own tags query leaves out: enums and their
+/// constants, records, annotation types, and fields, a `static final` field
+/// as a constant. On 2026-10-06 the Shattered Realms map held no enum and no
+/// field, so `StashTab` and `MAX_ROWS` had no definition. When two patterns
+/// tag one name the first wins, so the constant pattern comes before the
+/// field one.
+const JAVA_MORE: &str = r#"
+(enum_declaration name: (identifier) @name) @definition.enum
+(enum_constant name: (identifier) @name) @definition.constant
+(record_declaration name: (identifier) @name) @definition.record
+(annotation_type_declaration name: (identifier) @name) @definition.interface
+(field_declaration (modifiers "static" "final") declarator: (variable_declarator name: (identifier) @name)) @definition.constant
+(field_declaration declarator: (variable_declarator name: (identifier) @name)) @definition.field
+(constant_declaration declarator: (variable_declarator name: (identifier) @name)) @definition.constant
+"#;
+
+/// TypeScript definitions its tags query leaves out: enums, their members,
+/// and type aliases.
+const TS_MORE: &str = r#"
+(enum_declaration name: (identifier) @name) @definition.enum
+(enum_body name: (property_identifier) @name @definition.constant)
+(enum_assignment name: (property_identifier) @name) @definition.constant
+(type_alias_declaration name: (type_identifier) @name) @definition.type
+"#;
 
 /// Files larger than this are not parsed (generated code, vendored bundles).
 const MAX_BYTES: usize = 1_000_000;
@@ -521,6 +546,42 @@ mod tests {
         assert_eq!(cs.imports, vec!["Acme.Store".to_string()]);
 
         assert!(map_file("README.md", "# no").is_none(), "not code");
+    }
+
+    #[test]
+    fn java_enums_records_fields_and_constants_are_definitions() {
+        let src = "package a;\npublic enum StashTab {\n    ITEMS,\n    GEAR;\n    public static final short MAX_ROWS = 7;\n    private int count;\n    public short defaultCapacity() { return 9; }\n}\nrecord Slot(int i) {}\n@interface Marker {}\ninterface Limits { int CAP = 3; }\n";
+        let map = map_file("src/StashTab.java", src).unwrap();
+        let defs: Vec<(&str, &str)> = map.symbols.iter().filter(|s| s.is_def).map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        for want in [
+            ("StashTab", "enum"),
+            ("ITEMS", "constant"),
+            ("GEAR", "constant"),
+            ("MAX_ROWS", "constant"),
+            ("count", "field"),
+            ("defaultCapacity", "method"),
+            ("Slot", "record"),
+            ("Marker", "interface"),
+            ("Limits", "interface"),
+            ("CAP", "constant"),
+        ] {
+            assert!(defs.contains(&want), "{want:?} in {defs:?}");
+        }
+        let max = map.symbols.iter().find(|s| s.name == "MAX_ROWS").unwrap();
+        assert_eq!(max.line, 5);
+    }
+
+    #[test]
+    fn typescript_enums_members_and_type_aliases_are_definitions() {
+        let src = "export enum Tier { Crude, Sturdy = 2 }\nexport type Path = string[];\nexport interface Hit { path: Path }\n";
+        let map = map_file("src/tier.ts", src).unwrap();
+        let defs: Vec<(&str, &str)> = map.symbols.iter().filter(|s| s.is_def).map(|s| (s.name.as_str(), s.kind.as_str())).collect();
+        for want in [("Tier", "enum"), ("Crude", "constant"), ("Sturdy", "constant"), ("Path", "type"), ("Hit", "interface")] {
+            assert!(defs.contains(&want), "{want:?} in {defs:?}");
+        }
+        let tsx = map_file("src/a.tsx", "enum Mode { On }\ntype P = { x: number };\n").unwrap();
+        assert!(tsx.symbols.iter().any(|s| s.name == "Mode" && s.is_def), "{:?}", tsx.symbols);
+        assert!(tsx.symbols.iter().any(|s| s.name == "P" && s.is_def), "{:?}", tsx.symbols);
     }
 
     #[test]
