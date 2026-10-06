@@ -1414,6 +1414,8 @@ folder in the Ken app first."
     let plan = routing::plan_route(&query, &members, kg.as_ref());
     let audience = audience_arg(args);
     let types = types_arg(args);
+    // One vocabulary for the whole search (the team wiki's widens every repo).
+    let shared_vocab = routing::workspace_vocabulary(dbs.values());
 
     let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
     for &project_id in &plan.targets {
@@ -1460,7 +1462,7 @@ folder in the Ken app first."
             });
             continue;
         };
-        match routing::search_member_of(db, &query, None, fetch_for(audience.as_deref(), &types, limit), &types) {
+        match routing::search_member_of_with(db, &query, None, fetch_for(audience.as_deref(), &types, limit), &types, Some(&shared_vocab)) {
             Ok(mut hits) => member_hits.push(MemberHits {
                 hits: {
                     hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));

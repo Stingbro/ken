@@ -144,6 +144,12 @@ pub fn merge_and_rerank(fts_hits: &[FtsHit], vec_hits: &[VecHit], query: &str) -
     rerank(query, merge_hits(fts_hits, vec_hits), vec_hits)
 }
 
+/// [`merge_and_rerank`] with meaning distances for keyword hits the KNN list
+/// missed (see [`rerank_with`]).
+pub fn merge_and_rerank_with(fts_hits: &[FtsHit], vec_hits: &[VecHit], query: &str, extra: &HashMap<String, f64>) -> Vec<HybridHit> {
+    rerank_with(query, merge_hits(fts_hits, vec_hits), vec_hits, extra)
+}
+
 // --- Reranking (semantic-index S7b Condition C) -----------------------------
 //
 // B4 owns recall and a validated *default* order (FTS precision first, KNN
@@ -192,12 +198,73 @@ pub fn similarity(distance: f64) -> f64 {
     (1.0 - distance * distance / 2.0).clamp(0.0, 1.0)
 }
 
-/// Lowercase, split on any non-alphanumeric run, drop empties.
+/// Lowercase, split on any non-alphanumeric run, drop empties; each word
+/// also yields its camelCase and digit parts (`WeaponBases` → `weaponbases`,
+/// `weapon`, `bases`), and every token is lightly stemmed, so a question's
+/// "weapon base" meets a file named `WeaponBases.json`.
 fn tokenize_lower(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect()
+    let mut out = Vec::new();
+    for word in s.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        out.push(stem(&word.to_lowercase()));
+        let parts = camel_parts(word);
+        if parts.len() > 1 {
+            out.extend(parts.iter().map(|p| stem(&p.to_lowercase())));
+        }
+    }
+    out
+}
+
+/// A word's camelCase and letter/digit parts: `HTTPServer2Config` →
+/// `HTTP`, `Server`, `2`, `Config`. A word with no boundary is one part.
+pub fn camel_parts(word: &str) -> Vec<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for i in 1..chars.len() {
+        let (a, b) = (chars[i - 1], chars[i]);
+        let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+        let boundary = (a.is_lowercase() && b.is_uppercase())
+            || (a.is_uppercase() && b.is_uppercase() && next_lower)
+            || (a.is_alphabetic() && b.is_ascii_digit())
+            || (a.is_ascii_digit() && b.is_alphabetic());
+        if boundary {
+            parts.push(chars[start..i].iter().collect());
+            start = i;
+        }
+    }
+    parts.push(chars[start..].iter().collect());
+    parts
+}
+
+/// A light English stem, the same on both sides of a match: plurals and the
+/// common verb endings, never below three letters. `bases`, `based` and
+/// `base` meet; `class` and `status` keep their `s`.
+pub fn stem(t: &str) -> String {
+    if t.chars().count() <= 3 || !t.is_ascii() {
+        return t.to_string();
+    }
+    let mut s = t.to_string();
+    if let Some(r) = s.strip_suffix("ies").filter(|r| r.len() >= 3) {
+        s = format!("{r}y");
+    } else if let Some(r) = s.strip_suffix("es").filter(|r| r.ends_with("ss") || r.ends_with('x') || r.ends_with("ch") || r.ends_with("sh")) {
+        s = r.to_string();
+    } else if s.ends_with('s') && !s.ends_with("ss") && !s.ends_with("us") && !s.ends_with("is") {
+        s.pop();
+    } else if let Some(r) = s.strip_suffix("ing").filter(|r| r.len() >= 3) {
+        s = r.to_string();
+    } else if let Some(r) = s.strip_suffix("ed").filter(|r| r.len() >= 3) {
+        s = r.to_string();
+    }
+    // Doubled consonant left by "running"/"stopped": one is enough.
+    let b = s.as_bytes();
+    if s.len() >= 4 && b[b.len() - 1] == b[b.len() - 2] && !b"aeiouls".contains(&b[b.len() - 1]) {
+        s.pop();
+    }
+    // A trailing e goes, so base, bases, based and basing meet.
+    if s.len() > 3 && s.ends_with('e') {
+        s.pop();
+    }
+    s
 }
 
 /// Rerank an already-merged (B4) hit list by query-aware precision score,
@@ -210,15 +277,33 @@ fn tokenize_lower(s: &str) -> Vec<String> {
 /// function still runs and, absent any discriminating signal, returns the input
 /// order unchanged.
 pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<HybridHit> {
-    // Query tokens via the same stopword-aware tokenizer the FTS path uses, so
+    rerank_with(query, hits, vec_hits, &HashMap::new())
+}
+
+/// [`rerank`], with meaning distances for paths the nearest-neighbour list
+/// did not return (`extra`: path → distance of its best stored chunk). Every
+/// candidate with a stored vector is then weighed by meaning the same way,
+/// not only the few the KNN list happened to hold: a keyword winner outside
+/// the KNN top `k` used to lose to its neighbours inside it.
+pub fn rerank_with(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit], extra: &HashMap<String, f64>) -> Vec<HybridHit> {
+    // Query words via the same stopword-aware tokenizer the FTS path uses, so
     // the reranker keys off exactly the terms search treated as significant.
-    let q_tokens: HashSet<String> = crate::db::significant_tokens(query)
-        .iter()
-        .map(|t| t.to_lowercase())
-        .collect();
+    // Each word is matched by any of its forms: itself, its stem, its
+    // camelCase parts.
+    let mut q_groups: Vec<HashSet<String>> = Vec::new();
+    for t in crate::db::significant_tokens(query) {
+        let forms: HashSet<String> = tokenize_lower(&t).into_iter().collect();
+        if !forms.is_empty() && !q_groups.contains(&forms) {
+            q_groups.push(forms);
+        }
+    }
+    let q_tokens = q_groups.len();
 
     // Best (smallest) vector distance seen per path, for the semantic term.
     let mut best_dist: HashMap<&str, f64> = HashMap::new();
+    for (path, d) in extra {
+        best_dist.insert(path.as_str(), *d);
+    }
     for v in vec_hits {
         best_dist
             .entry(v.path.as_str())
@@ -233,7 +318,7 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
     let score = |hit: &HybridHit| -> f64 {
         let mut s = 0.0;
 
-        if !q_tokens.is_empty() {
+        if q_tokens > 0 {
             let filename = hit.path.rsplit(['/', '\\']).next().unwrap_or(&hit.path);
             let filename_tokens: HashSet<String> = tokenize_lower(filename).into_iter().collect();
             let path_tokens: HashSet<String> = tokenize_lower(&hit.path).into_iter().collect();
@@ -242,8 +327,9 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
 
             let mut lexical = 0.0;
             let mut covered = 0usize;
-            for qt in &q_tokens {
-                let (f, p, t) = (filename_tokens.contains(qt), path_tokens.contains(qt), snippet_tokens.contains(qt));
+            for forms in &q_groups {
+                let any = |set: &HashSet<String>| forms.iter().any(|f| set.contains(f));
+                let (f, p, t) = (any(&filename_tokens), any(&path_tokens), any(&snippet_tokens));
                 if f {
                     lexical += W_FILENAME;
                 }
@@ -259,7 +345,7 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
             // four in a file name ("client" in `Client Vocabulary.md` for
             // "what money is the client paying us") is a quarter of a match,
             // not a strong one; a hit with every word keeps its full score.
-            s += lexical * covered as f64 / q_tokens.len() as f64;
+            s += lexical * covered as f64 / q_tokens as f64;
         }
 
         if let Some(&dist) = best_dist.get(hit.path.as_str()) {
@@ -289,6 +375,45 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camel_case_and_digits_split_into_parts() {
+        assert_eq!(camel_parts("WeaponBases"), vec!["Weapon", "Bases"]);
+        assert_eq!(camel_parts("HTTPServer2Config"), vec!["HTTP", "Server", "2", "Config"]);
+        assert_eq!(camel_parts("stamina"), vec!["stamina"]);
+    }
+
+    #[test]
+    fn stem_meets_plurals_and_verb_endings() {
+        assert_eq!(stem("bases"), stem("base"));
+        assert_eq!(stem("based"), stem("base"));
+        assert_eq!(stem("running"), stem("run"));
+        assert_eq!(stem("runs"), "run");
+        assert_eq!(stem("bosses"), "boss");
+        assert_eq!(stem("status"), "status");
+        assert_eq!(stem("class"), "class");
+    }
+
+    #[test]
+    fn a_question_word_meets_a_camel_case_file_name() {
+        let hits = vec![
+            HybridHit { path: "docs/notes.md".into(), chunk_id: 1, snippet: "weapon notes".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
+            HybridHit { path: "data/WeaponBases.json".into(), chunk_id: 2, snippet: "{}".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
+        ];
+        let out = rerank("where are the weapon base stats", hits, &[]);
+        assert_eq!(out[0].path, "data/WeaponBases.json");
+    }
+
+    #[test]
+    fn a_keyword_hit_outside_the_knn_list_still_gets_its_meaning_score() {
+        let hits = vec![
+            HybridHit { path: "a.rs".into(), chunk_id: 1, snippet: "x".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
+            HybridHit { path: "b.rs".into(), chunk_id: 2, snippet: "x".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
+        ];
+        let extra: HashMap<String, f64> = [("b.rs".to_string(), 0.3)].into_iter().collect();
+        let out = rerank_with("zzz", hits, &[], &extra);
+        assert_eq!(out[0].path, "b.rs");
+    }
 
     fn fts(chunk_id: i64, path: &str, text: &str) -> FtsHit {
         FtsHit {

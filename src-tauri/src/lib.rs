@@ -9759,6 +9759,15 @@ async fn route_search(
         .filter_map(|s| s.search_db.map(|db| (s.project_id, db)))
         .collect();
     db_by_id.extend(dormant_dbs);
+    // One vocabulary for the whole search: the team wiki's Vocabulary page
+    // and decisions aliases widen the search in every repo, not only the wiki.
+    let shared_vocab = {
+        let vocabs: Vec<ken_core::vocab::Vocabulary> = db_by_id
+            .values()
+            .filter_map(|db| db.lock().ok().and_then(|g| ken_core::vocab::Vocabulary::cached(&g).ok()))
+            .collect();
+        Arc::new(ken_core::vocab::Vocabulary::merged(vocabs.iter()))
+    };
 
     // Concurrent fan-out (design D5: "per-member searches run concurrently"):
     // every target's search is its own `spawn_blocking` task, started before
@@ -9776,6 +9785,7 @@ async fn route_search(
         let ev_app = app.clone();
         let audience = audience.clone();
         let wanted = wanted.clone();
+        let shared_vocab = shared_vocab.clone();
         handles.push(tauri::async_runtime::spawn_blocking(
             move || -> routing::MemberHits {
                 let result = if let Some(db) = db {
@@ -9788,7 +9798,7 @@ async fn route_search(
                         }
                     } else {
                         let db = db.lock().unwrap();
-                        match routing::search_member_of(&db, &query, query_vec.as_deref(), fetch, &wanted) {
+                        match routing::search_member_of_with(&db, &query, query_vec.as_deref(), fetch, &wanted, Some(&shared_vocab)) {
                             Ok(mut hits) => routing::MemberHits {
                                 hits: {
                                     hits.retain(|h| {

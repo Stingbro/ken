@@ -70,6 +70,20 @@ impl Vocabulary {
         }
     }
 
+    /// Several vocabularies as one (a workspace's members), each group kept
+    /// once.
+    pub fn merged<'a>(vocabs: impl IntoIterator<Item = &'a Vocabulary>) -> Vocabulary {
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for v in vocabs {
+            for g in &v.groups {
+                if !groups.contains(g) {
+                    groups.push(g.clone());
+                }
+            }
+        }
+        Vocabulary { groups }
+    }
+
     pub fn from_groups(groups: Vec<Vec<String>>) -> Vocabulary {
         let groups = groups
             .into_iter()

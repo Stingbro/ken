@@ -350,19 +350,45 @@ fn ken_address(project_id: Uuid, rel_path: &str) -> String {
 /// call (no embedder, or `db.vec_available()` is false); the FTS-only path
 /// degrades exactly like the Tauri command's.
 pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usize) -> Result<Vec<HybridHit>> {
+    search_member_with(db, query, query_vec, limit, None)
+}
+
+/// [`search_member`] with the workspace's vocabulary as well as the
+/// member's own: a Vocabulary page in the team's wiki then widens the search
+/// in every repo, not only in the wiki. Routed searches build it once with
+/// [`workspace_vocabulary`] and pass it to every member.
+pub fn search_member_with(
+    db: &Db,
+    query: &str,
+    query_vec: Option<&[f32]>,
+    limit: usize,
+    shared: Option<&crate::vocab::Vocabulary>,
+) -> Result<Vec<HybridHit>> {
     let mut fts_hits = db.search_chunks_fts(query, limit)?;
     // The team's other words for what was asked (Vocabulary page, decisions
     // aliases, page aliases): each alternative phrasing runs as its own
     // keyword search, its new chunks after the original's.
-    for alt in crate::vocab::Vocabulary::cached(db)?.alternatives(query) {
+    let own = crate::vocab::Vocabulary::cached(db)?;
+    let vocab = match shared {
+        Some(s) => crate::vocab::Vocabulary::merged([&own, s]),
+        None => own,
+    };
+    for alt in vocab.alternatives(query) {
         for hit in db.search_chunks_fts(&alt, limit)? {
             if !fts_hits.iter().any(|h| h.chunk_id == hit.chunk_id) {
                 fts_hits.push(hit);
             }
         }
     }
-    let vec_hits = match query_vec {
-        Some(qv) if db.vec_available() => db
+    // Meaning only from a finished meaning index: a half-built one holds
+    // whatever was embedded first (asset JSON, in path order) and handed
+    // the meaning bonus to those files alone.
+    let query_vec = match query_vec {
+        Some(qv) if db.vec_available() && db.semantic_built_at()?.is_some() => Some(qv),
+        _ => None,
+    };
+    let vec_hits: Vec<search::VecHit> = match query_vec {
+        Some(qv) => db
             .semantic_search(qv, limit)?
             .into_iter()
             .map(|(chunk_id, path, text, distance)| search::VecHit {
@@ -372,9 +398,28 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
                 distance,
             })
             .collect(),
-        _ => Vec::new(),
+        None => Vec::new(),
     };
-    let mut hits = search::merge_and_rerank(&fts_hits, &vec_hits, query);
+    // Every keyword hit with a stored vector is weighed by meaning too, so
+    // relevance is on one scale whichever list a hit came from.
+    let mut extra: HashMap<String, f64> = HashMap::new();
+    if let Some(qv) = query_vec {
+        let missing: Vec<i64> = fts_hits
+            .iter()
+            .filter(|f| !vec_hits.iter().any(|v| v.chunk_id == f.chunk_id))
+            .map(|f| f.chunk_id)
+            .collect();
+        let dist = db.chunk_distances(qv, &missing)?;
+        for f in &fts_hits {
+            if let Some(&d) = dist.get(&f.chunk_id) {
+                let e = extra.entry(f.path.clone()).or_insert(d);
+                if d < *e {
+                    *e = d;
+                }
+            }
+        }
+    }
+    let mut hits = search::merge_and_rerank_with(&fts_hits, &vec_hits, query, &extra);
     for hit in &mut hits {
         hit.line = db.chunk_line(hit.chunk_id)?;
         hit.page = crate::pagemeta::hit_page(&hit.path, db.page_meta(&hit.path)?);
@@ -398,9 +443,11 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
 /// name match, so "where is get_current_user" leads with its definition.
 pub const W_SYMBOL: f64 = 3.5;
 
-/// The code map as a signal: a query that names a symbol (an identifier, or
-/// any word when the question is about code) puts where it is defined among
-/// the hits, at its line. Prose questions are left to the text layers.
+/// The code map as a signal: a query that names a symbol (a word shaped
+/// like an identifier: `snake_case`, `camelCase`, `Type::name`) puts where it
+/// is defined among the hits, at its line. Plain words are left to the text
+/// layers: looked up as symbols, "where", "and" and "set" each pulled five
+/// unrelated definitions to the top with a file name's weight.
 fn find_symbols(db: &Db, query: &str, intent: Option<Intent>, hits: &mut Vec<HybridHit>) -> Result<()> {
     if intent == Some(Intent::Prose) {
         return Ok(());
@@ -412,7 +459,7 @@ fn find_symbols(db: &Db, query: &str, intent: Option<Intent>, hits: &mut Vec<Hyb
         .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
         .map(|w| w.trim_matches(':').to_string())
         .filter(|w| w.len() >= 3)
-        .filter(|w| identifier(w) || intent == Some(Intent::Code))
+        .filter(|w| identifier(w))
         .filter(|w| !crate::db::significant_tokens(w).is_empty())
         .collect();
     let mut changed = false;
@@ -612,13 +659,35 @@ pub fn search_member_of(
     limit: usize,
     types: &[crate::contenttype::ContentType],
 ) -> Result<Vec<HybridHit>> {
+    search_member_of_with(db, query, query_vec, limit, types, None)
+}
+
+/// [`search_member_of`] with the workspace's vocabulary (see
+/// [`search_member_with`]).
+pub fn search_member_of_with(
+    db: &Db,
+    query: &str,
+    query_vec: Option<&[f32]>,
+    limit: usize,
+    types: &[crate::contenttype::ContentType],
+    shared: Option<&crate::vocab::Vocabulary>,
+) -> Result<Vec<HybridHit>> {
     if types.is_empty() {
-        return search_member(db, query, query_vec, limit);
+        return search_member_with(db, query, query_vec, limit, shared);
     }
-    let mut hits = search_member(db, query, query_vec, limit * 5)?;
+    let mut hits = search_member_with(db, query, query_vec, limit * 5, shared)?;
     hits.retain(|h| crate::contenttype::is_wanted(&h.path, types));
     hits.truncate(limit);
     Ok(hits)
+}
+
+/// One vocabulary for a routed search: every member's stored vocabulary
+/// together, so the team wiki's Vocabulary page and decisions aliases widen
+/// the search in the code repos too. Members are read once per search.
+pub fn workspace_vocabulary<'a>(dbs: impl IntoIterator<Item = &'a Db>) -> crate::vocab::Vocabulary {
+    let vocabs: Vec<crate::vocab::Vocabulary> =
+        dbs.into_iter().filter_map(|db| crate::vocab::Vocabulary::cached(db).ok()).collect();
+    crate::vocab::Vocabulary::merged(vocabs.iter())
 }
 
 /// What a page's band adds to its relevance: less than one filename word.
@@ -726,6 +795,7 @@ pub fn execute_plan(
     limit: usize,
 ) -> ExecutionReport {
     let query_vec = embedder.embed_query(query).ok();
+    let vocab = workspace_vocabulary(targets.iter().map(|t| t.db));
 
     let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
     for project_id in &plan.targets {
@@ -747,7 +817,7 @@ pub fn execute_plan(
             });
             continue;
         }
-        match search_member(target.db, query, query_vec.as_deref(), limit) {
+        match search_member_with(target.db, query, query_vec.as_deref(), limit, Some(&vocab)) {
             Ok(hits) => member_hits.push(MemberHits {
                 project_id: *project_id,
                 member_name: target.name.to_string(),

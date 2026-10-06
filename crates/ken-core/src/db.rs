@@ -1005,6 +1005,26 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Distance from `query_vec` to each listed chunk's stored vector, for
+    /// the chunks that have one: the meaning score of a keyword hit the KNN
+    /// list did not return. Same L2 distance `semantic_search` reports.
+    pub fn chunk_distances(&self, query_vec: &[f32], chunk_ids: &[i64]) -> Result<std::collections::HashMap<i64, f64>> {
+        let mut out = std::collections::HashMap::new();
+        if !self.vec_available || chunk_ids.is_empty() || !table_exists(&self.conn, "vec_chunks")? {
+            return Ok(out);
+        }
+        let blob = f32_slice_to_blob(query_vec);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT vec_distance_l2(embedding, ?1) FROM vec_chunks WHERE chunk_id = ?2")?;
+        for id in chunk_ids {
+            if let Some(d) = stmt.query_row(params![blob, id], |r| r.get::<_, f64>(0)).optional()? {
+                out.insert(*id, d);
+            }
+        }
+        Ok(out)
+    }
+
     /// Chunk-level FTS5 search over `chunks_fts`, joined back to `chunks`
     /// for the owning path/text — the chunk-grain counterpart to
     /// `semantic_search`, added for task 1.8 so hybrid search (this crate's
