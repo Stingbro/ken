@@ -163,10 +163,23 @@ fn read_plain(path: &Path) -> Option<String> {
     (!t.trim().is_empty()).then_some(t)
 }
 
+/// One line of text within `n` characters, cut at a character boundary
+/// with `…`: a line quoted as evidence, never a source.
+pub(crate) fn clip_line(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Run git in `root` and read what it prints as UTF-8, whatever the
 /// console's code page: on Windows a contributor's accented name came out
 /// garbled in the 2026-10-06 dry run. None when git fails.
-fn git_text(root: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_text(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     let out = crate::proc::quiet(&mut cmd)
         .args(["-c", "i18n.logOutputEncoding=UTF-8", "-c", "core.quotePath=false"])
@@ -175,6 +188,44 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
         .output()
         .ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The lines `git grep -F` finds for `needle` in `root`'s code and data,
+/// docs left out, as `repo:path:line: text`, test files last, at most 40;
+/// with how many there were in all.
+pub(crate) fn grep_repo(repo: &str, root: &Path, needle: &str, ignore_case: bool) -> (usize, Vec<String>) {
+    let mut args = vec!["grep", "-n", "-I", "-F"];
+    if ignore_case {
+        args.push("-i");
+    }
+    args.extend(["-e", needle, "--", ".", ":!*.md", ":!*.mdx", ":!*.txt", ":!*.rst", ":!*.adoc"]);
+    let text = git_text(root, &args).unwrap_or_default();
+    let mut lines: Vec<(bool, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let (path, rest) = l.split_once(':')?;
+            let (n, body) = rest.split_once(':')?;
+            Some((crate::checkout::is_test_path(path), format!("{repo}:{path}:{n}: {}", clip_line(body.trim(), 200))))
+        })
+        .collect();
+    let count = lines.len();
+    lines.sort_by_key(|(test, _)| *test);
+    (count, lines.into_iter().take(40).map(|(_, l)| l).collect())
+}
+
+/// [`grep_repo`] for `word` as a whole word, in any case: `KING` finds the
+/// `"King"` a loader still accepts, not `making`.
+pub(crate) fn grep_repo_word(repo: &str, root: &Path, word: &str) -> (usize, Vec<String>) {
+    let text = git_text(root, &["grep", "-n", "-I", "-F", "-i", "-w", "-e", word, "--", ".", ":!*.md", ":!*.txt"]).unwrap_or_default();
+    let lines: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            let (path, rest) = l.split_once(':')?;
+            let (n, body) = rest.split_once(':')?;
+            Some(format!("{repo}:{path}:{n}: {}", clip_line(body.trim(), 200)))
+        })
+        .collect();
+    (lines.len(), lines.into_iter().take(20).collect())
 }
 
 /// Every file git tracks in `root`, as `/`-separated paths.
@@ -1001,20 +1052,53 @@ fn rank_pages(s: &Section) -> Vec<&'static str> {
     ranked
 }
 
-/// Every part of a repo's briefs, each sent to ONE team page: the first of
-/// [`rank_pages`] with room left in [`PAGE_BUDGET`]. Every part reaches a
-/// page while any has room, and none is sent twice, so one fact is drafted
-/// on one page.
+/// Pages one part of a brief goes to at most.
+const PART_PAGES: usize = 3;
+
+/// Every part of a repo's briefs, sent to every team page it fits, up to
+/// [`PART_PAGES`], each within [`PAGE_BUDGET`]: the first of [`rank_pages`]
+/// with room left, so every part reaches a page while any has room; then
+/// each other page whose words fit it at least half as well as the page it
+/// fits best ([`page_scores`]). One fact, one page is the drafting's rule,
+/// not the reading's: the page that owns a fact states it and the others
+/// link. Sent to one page only, on 2026-10-07 six pages thinned, Systems
+/// said no source described the registrations Feature-Status described from
+/// the same source, and Team lost who approves the mod's protected paths.
 fn route_parts(name: &str, briefs: &[(String, Vec<Section>)]) -> BTreeMap<&'static str, Vec<Source>> {
-    let mut out: BTreeMap<&'static str, Vec<Source>> = BTreeMap::new();
+    let parts: Vec<(&String, &Section)> = briefs.iter().flat_map(|(f, secs)| secs.iter().map(move |s| (f, s))).collect();
+    let mut sent: Vec<Vec<&'static str>> = vec![Vec::new(); parts.len()];
     let mut used: HashMap<&'static str, usize> = HashMap::new();
-    for (file, sections) in briefs {
-        for s in sections {
-            let Some(page) = rank_pages(s).into_iter().find(|p| used.get(p).copied().unwrap_or(0) + s.text.len() <= PAGE_BUDGET) else {
-                continue;
-            };
-            *used.entry(page).or_default() += s.text.len();
-            out.entry(page).or_default().push(Source { label: part_label(name, file, s.line), text: s.text.clone() });
+    let room = |page: &'static str, n: usize, used: &mut HashMap<&'static str, usize>| {
+        let fits = used.get(page).copied().unwrap_or(0) + n <= PAGE_BUDGET;
+        if fits {
+            *used.entry(page).or_default() += n;
+        }
+        fits
+    };
+    // Each part's best page first, for every part, then the others it
+    // fits while room is left: a second page never crowds out a first.
+    for (k, (_, s)) in parts.iter().enumerate() {
+        if let Some(page) = rank_pages(s).into_iter().find(|p| room(*p, s.text.len(), &mut used)) {
+            sent[k].push(page);
+        }
+    }
+    for (k, (_, s)) in parts.iter().enumerate() {
+        let scores = page_scores(&s.heading, &s.text);
+        let score = |p: &str| scores.iter().find(|(q, _)| *q == p).map_or(0, |(_, n)| *n);
+        let best = scores.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        for page in rank_pages(s) {
+            if sent[k].len() >= PART_PAGES || sent[k].is_empty() {
+                break;
+            }
+            if !sent[k].contains(&page) && score(page) > 0 && score(page) * 2 >= best && room(page, s.text.len(), &mut used) {
+                sent[k].push(page);
+            }
+        }
+    }
+    let mut out: BTreeMap<&'static str, Vec<Source>> = BTreeMap::new();
+    for (k, (file, s)) in parts.iter().enumerate() {
+        for page in &sent[k] {
+            out.entry(*page).or_default().push(Source { label: part_label(name, file, s.line), text: s.text.clone() });
         }
     }
     out
@@ -1025,12 +1109,30 @@ fn route_parts(name: &str, briefs: &[(String, Vec<Section>)]) -> BTreeMap<&'stat
 /// their section went to; each line cited by its own line.
 fn word_lines(name: &str, briefs: &[(String, Vec<Section>)]) -> Option<String> {
     const SIGNS: &[&str] = &["renamed", "rename", "is called", "are called", "the word", "spelled", "spelling", "a.k.a", "aka ", "alias", "formerly"];
+    lines_with(name, briefs, SIGNS)
+}
+
+/// The lines of a repo's briefs that name who decides, approves or owns
+/// something, whatever section they sit in, for Team and Who Does What: on
+/// 2026-10-07 the mod's protected paths, which need Chris's yes, sat in a
+/// build section, and Team wrote that all of his decisions were in Tools.
+fn decider_lines(name: &str, briefs: &[(String, Vec<Section>)]) -> Option<String> {
+    const SIGNS: &[&str] = &[
+        "decide", "decider", "decision", "approv", "sign off", "sign-off", "'s yes", "’s yes", "owner", " owns ", "protected", "must ask",
+        "permission", "rules on", "ruling", "review",
+    ];
+    lines_with(name, briefs, SIGNS)
+}
+
+/// Each line of a repo's briefs that names one of `signs`, cited by its
+/// own line, as `repo:FILE:line: text`.
+fn lines_with(name: &str, briefs: &[(String, Vec<Section>)], signs: &[&str]) -> Option<String> {
     let mut out = String::new();
     for (file, sections) in briefs {
         for s in sections {
             for (i, line) in s.text.lines().enumerate() {
                 let lower = line.to_lowercase();
-                if SIGNS.iter().any(|k| lower.contains(k)) {
+                if signs.iter().any(|k| lower.contains(k)) {
                     out.push_str(&format!("{name}:{file}:{}: {}\n", s.line + i, clip(line.trim(), 600)));
                 }
             }
@@ -1045,6 +1147,28 @@ const BRIEFS: &[&str] = &["CLAUDE.md", "AGENTS.md", "README.md", "README", "CONT
 /// Each brief of `root`, split into its sections.
 fn briefs(root: &Path) -> Vec<(String, Vec<Section>)> {
     top_files(root, BRIEFS).into_iter().filter_map(|(n, p)| read_plain(&p).map(|t| (n, brief_sections(&t)))).collect()
+}
+
+/// The folders whose Markdown is a repo's other docs.
+const DOC_DIRS: &[&str] = &["docs", "doc", "documentation"];
+
+/// A repo's other docs (up to ten Markdown files of each of [`DOC_DIRS`]),
+/// split by section like a brief, so a team page they fit reads them: on
+/// 2026-10-07 Tools' `docs/CODE-STANDARDS.md` reached only the repo pages,
+/// and Conventions/Code was four purpose sentences.
+fn doc_briefs(root: &Path) -> Vec<(String, Vec<Section>)> {
+    let mut out = Vec::new();
+    for dir in DOC_DIRS {
+        let mut docs: Vec<PathBuf> =
+            fs::read_dir(root.join(dir)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+        docs.sort();
+        for p in docs.into_iter().take(10) {
+            let Some(t) = read_plain(&p) else { continue };
+            let Some(file) = p.file_name().map(|f| format!("{dir}/{}", f.to_string_lossy())) else { continue };
+            out.push((file, brief_sections(&t)));
+        }
+    }
+    out
 }
 
 /// Every heading of the briefs with the line it is on: what each brief
@@ -1073,14 +1197,29 @@ fn part_label(name: &str, file: &str, line: usize) -> String {
 /// A repo's brief sections whose topic `pick` takes, in file order, each
 /// labelled by [`part_label`], while `budget` lasts.
 fn sections_for(name: &str, briefs: &[(String, Vec<Section>)], pick: impl Fn(Topic) -> bool, budget: usize) -> Vec<Source> {
+    parts_for(name, briefs, |s| pick(topic_of(&s.heading)), budget)
+}
+
+/// A repo's brief parts that `pick` takes, in file order, each labelled by
+/// [`part_label`], while `budget` lasts. A part is whole: one that does not
+/// fit is skipped for a later, smaller one. Only a part longer than
+/// [`SECTION_MAX`] (one paragraph with no blank line in it) is cut, and
+/// marked so.
+fn parts_for(name: &str, briefs: &[(String, Vec<Section>)], pick: impl Fn(&Section) -> bool, budget: usize) -> Vec<Source> {
     let mut out = Vec::new();
     let mut used = 0;
-    let picked = briefs.iter().flat_map(|(f, secs)| secs.iter().map(move |s| (f, s))).filter(|(_, s)| pick(topic_of(&s.heading)));
+    let picked = briefs.iter().flat_map(|(f, secs)| secs.iter().map(move |s| (f, s))).filter(|(_, s)| pick(s));
     for (file, s) in picked {
         if budget.saturating_sub(used) < 200 {
             break;
         }
-        let text = clip(&s.text, SECTION_MAX.min(budget - used));
+        let text = if s.text.len() > SECTION_MAX {
+            clip(&s.text, SECTION_MAX.min(budget - used))
+        } else if used + s.text.len() <= budget {
+            s.text.clone()
+        } else {
+            continue;
+        };
         used += text.len();
         out.push(Source { label: part_label(name, file, s.line), text });
     }
@@ -1218,21 +1357,25 @@ fn build_files(root: &Path) -> Vec<(String, String)> {
 /// out of date ([`checkout_sources`]).
 pub const REGISTERS: &str = "(what the code registers, from its entry points)";
 pub const VALUES: &str = "(values in the checkout: build and data files)";
-/// Characters of one of them.
+/// Characters of one of them on a repo's page.
 const CHECKOUT_MAX: usize = 16_000;
+/// Characters of the values a team page that states values reads from one
+/// repo, every data file whole ([`crate::checkout::values`]).
+const TEAM_VALUES_MAX: usize = 40_000;
 
 /// What the checkout says now: what the code wires together at start-up
 /// ([`crate::checkout::registrations`]) when `wiring`, and the versions the
 /// build files pin with the values of the data files the briefs name
-/// ([`crate::checkout::values`]) when `values`. Wiring is never read for a
-/// reference repo: its code is the platform's, and large.
+/// ([`crate::checkout::values`]), within `values` characters, when it is
+/// given. Wiring is never read for a reference repo: its code is the
+/// platform's, and large.
 fn checkout_sources(
     name: &str,
     root: &Path,
     tracked: &[String],
     briefs: &[(String, Vec<Section>)],
     wiring: bool,
-    values: bool,
+    values: Option<usize>,
 ) -> Vec<Source> {
     let mut out = Vec::new();
     if wiring {
@@ -1240,13 +1383,19 @@ fn checkout_sources(
             out.push(Source { label: format!("{name}:{REGISTERS}"), text: t });
         }
     }
-    if values {
+    if let Some(budget) = values {
         let brief_text: String = briefs.iter().flat_map(|(_, secs)| secs.iter().map(|s| s.text.as_str())).collect();
-        if let Some(t) = crate::checkout::values(root, tracked, &brief_text) {
+        if let Some(t) = crate::checkout::values(root, tracked, &brief_text, budget) {
             out.push(Source { label: format!("{name}:{VALUES}"), text: t });
         }
     }
     out
+}
+
+/// Whether a source is one of [`checkout_sources`]: given whole or not at
+/// all, never cut.
+fn is_checkout(label: &str) -> bool {
+    label.ends_with(REGISTERS) || label.ends_with(VALUES)
 }
 
 /// The release-notes files read per version.
@@ -1278,13 +1427,24 @@ fn people_files(name: &str, root: &Path) -> Vec<Source> {
         .collect()
 }
 
+/// `source` pushed whole while `budget` characters last in all, else named
+/// with its size: a source of [`checkout_sources`] is never cut.
+fn push_whole(label: String, text: String, out: &mut Vec<Source>, budget: usize) {
+    let used: usize = out.iter().map(|s| s.text.len()).sum();
+    let text = if used + text.len() <= budget { text } else { format!("(left out for room: {} characters; never cut)", text.len()) };
+    out.push(Source { label, text });
+}
+
 /// What one repo's page is made from, in this order, clipped to
 /// [`REPO_BUDGET`]: its description; the outline of its briefs; its build
-/// files; the brief sections on building, structure and what it is; its
-/// layout and import map; INSTALL; its newest release notes; CODEOWNERS,
-/// `people/` and who has committed recently; its version tags; up to ten
-/// docs; then every other brief section, in order, while the budget lasts.
-/// `roster` is the team's ([`team_roster`]), for the recent contributors.
+/// files; the brief sections on building, structure and what it is, up to
+/// half the budget, ahead of what the checkout says now ([`checkout_sources`],
+/// each whole or left out); its layout and import map; INSTALL; its newest
+/// release notes; CODEOWNERS, `people/` and who has committed recently; its
+/// version tags; up to ten docs; then every other brief section, in order,
+/// while the budget lasts. On 2026-10-07 the checkout's sources came first
+/// and the brief's sections got what was left. `roster` is the team's
+/// ([`team_roster`]), for the recent contributors.
 pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     let push = pusher(REPO_BUDGET);
@@ -1300,15 +1460,13 @@ pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) ->
     for (file, summary) in build_files(root) {
         push(format!("{name}:{file}"), clip(&summary, BUILD_MAX), &mut out);
     }
+    let wants = [Topic::Build, Topic::Architecture, Topic::Project];
+    out.extend(sections_for(name, &briefs, |t| wants.contains(&t), REPO_BUDGET / 2));
     let tracked = ls_files(root).unwrap_or_default();
     let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
-    let push_checkout = pusher_of(REPO_BUDGET, CHECKOUT_MAX);
-    for s in checkout_sources(name, root, &tracked, &briefs, !reference, true) {
-        push_checkout(s.label, s.text, &mut out);
+    for s in checkout_sources(name, root, &tracked, &briefs, !reference, Some(CHECKOUT_MAX)) {
+        push_whole(s.label, s.text, &mut out, REPO_BUDGET);
     }
-    let used: usize = out.iter().map(|s| s.text.len()).sum();
-    let wants = [Topic::Build, Topic::Architecture, Topic::Project];
-    out.extend(sections_for(name, &briefs, |t| wants.contains(&t), (REPO_BUDGET * 2 / 3).saturating_sub(used)));
     // The shape of the repo before its long docs, so a documentation-heavy
     // repo cannot crowd it out of the budget; each whole up to its own budget.
     let push_map = pusher_of(REPO_BUDGET, LAYOUT_BUDGET);
@@ -1364,6 +1522,52 @@ pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) ->
     out
 }
 
+/// The team pages whose words make a brief's part one about a repo's layers.
+const LAYER_PAGES: &[&str] = &["Conventions/Architecture.md", "Conventions/Code.md", "Conventions/Registries.md", "Reference/Systems.md"];
+
+/// Whether a part of a brief is about layers, patterns, wiring or the
+/// rules of the code: its topic is architecture, or a page of
+/// [`LAYER_PAGES`] is among the pages it fits best.
+fn about_layers(s: &Section) -> bool {
+    let topic = match topic_of(&s.heading) {
+        Topic::Other if !s.parent.is_empty() => topic_of(&s.parent),
+        t => t,
+    };
+    if topic == Topic::Architecture {
+        return true;
+    }
+    let scores = page_scores(&s.heading, &s.text);
+    let best = scores.iter().map(|(_, n)| *n).max().unwrap_or(0);
+    best > 0 && scores.iter().any(|(p, n)| LAYER_PAGES.contains(p) && *n * 2 >= best)
+}
+
+/// What a code repo's layers page is made from, within [`REPO_BUDGET`]:
+/// its description and the outline of its briefs, then every part of its
+/// briefs about layers, patterns, wiring and rules ([`about_layers`]), in
+/// order, up to half the budget, then its import map, what its code
+/// registers and its layout from `map` (what its Repo Map page read), then
+/// its other brief parts while the budget lasts. On 2026-10-07 the mod's
+/// architecture page read the brief by budget in file order: its
+/// architecture sections start 56,000 characters in, and the page lost 9 of
+/// its 11 "may not" rules.
+pub fn layers_sources(name: &str, root: &Path, map: &[Source]) -> Vec<Source> {
+    let briefs = briefs(root);
+    let pick = |what: &str| map.iter().find(|s| s.label == format!("{name}:{what}")).cloned();
+    let mut out: Vec<Source> = ["(what this repo is for, in the team's words)", "(headings of its briefs, with their lines)"]
+        .iter()
+        .filter_map(|w| pick(w))
+        .collect();
+    out.extend(parts_for(name, &briefs, about_layers, REPO_BUDGET / 2));
+    for what in ["(imports between folders, from the code)", REGISTERS, "(layout)"] {
+        if let Some(s) = pick(what) {
+            push_whole(s.label, s.text, &mut out, REPO_BUDGET);
+        }
+    }
+    let used: usize = out.iter().map(|s| s.text.len()).sum();
+    out.extend(parts_for(name, &briefs, |s| !about_layers(s), REPO_BUDGET.saturating_sub(used)));
+    out
+}
+
 /// Every readable document in a folder a person added (a Confluence
 /// export, say), clipped to [`SOURCE_BUDGET`].
 pub fn gather_extra(dir: &Path) -> Vec<Source> {
@@ -1400,8 +1604,9 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
         "You are drafting one page of a team's wiki, `{page}`, for a person to review. The page is: {purpose}.\n\n\
          Rules:\n\
          - Use only what the sources below say. Where they say nothing, leave the fact out: never write a row, a cell or a field that says something is unknown or not in the sources. Keep a template's table rows only where you have a source for the row's main column, and leave a cell empty when only it has none.\n\
-         - End the page with one line, `To fill: …`, naming once what a person should add that the sources do not say. Leave the line out when nothing is missing.\n\
-         - Cite sources inline as their labels in backticks, e.g. `ken:README.md`, once at the end of each paragraph, list item or table row, for every source it used.\n\
+         - End the page with one line, `To fill: …`, naming once what a person should add that the sources do not say. Before you name an item, look for its answer in the page's own frontmatter, in the sources below and in the pages of this wiki: name only what none of them answers, and never the `pin` (Ken writes it). Leave the line out when nothing is missing.\n\
+         - Every statement cites its source. Each table row, list item and paragraph ends with the label of the source that says it, in backticks: `repo:FILE:line` at the line that says it when the source has lines (e.g. `ken:README.md:12`), else the source's label (e.g. `ken:README.md`); or a link, `[[Page]]`, when another page of the wiki owns the fact. In a table, the citations go in its source column (`shown in`, `evidence`, `sources`), else at the end of its last cell. A statement with no citation is taken out before the page is published, and every one is checked against what it cites.\n\
+         - Write only what the cited source says: never a reason, purpose or consequence it does not give, and never a wider claim (\"all\", \"only\", \"every\", \"none\") than it makes. Give a list or set whole, as the source gives it; where a source gives only part of a set (\"the first 5 of 49\"), say so.\n\
          - Frontmatter: keep the template's keys; set `status: draft`; set `updated: {today}`; do NOT write a `verified:` line (a person verifies it later); list every source you used under `sources:` as its label.\n\
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
          - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
@@ -1623,21 +1828,53 @@ fn page_tokens(page: &str) -> Vec<(bool, usize, String)> {
 /// [`as_path`] reads as a path, a brace list once per path in it
 /// ([`expand_braces`]). `repos` are the repo names a citation may start with.
 pub fn named_paths(page: &str, repos: &[&str]) -> Vec<(Option<String>, String)> {
+    named_paths_at(page, repos).into_iter().map(|(r, p, _)| (r, p)).collect()
+}
+
+/// [`named_paths`], each with the line of the page it is first named on.
+fn named_paths_at(page: &str, repos: &[&str]) -> Vec<(Option<String>, String, usize)> {
     let mut names: Vec<&str> = repos.to_vec();
     // `Game-Tools` before `Game`, so a longer name is never cut short.
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    let mut out: Vec<(Option<String>, String)> = Vec::new();
-    for (front, _, token) in page_tokens(page) {
+    let mut out: Vec<(Option<String>, String, usize)> = Vec::new();
+    for (front, at, token) in page_tokens(page) {
         for t in expand_braces(&token) {
             match as_path(&t, &names) {
-                Some(p) if !front || p.0.is_some() => out.push(p),
+                Some((r, p)) if !front || r.is_some() => out.push((r, p, at)),
                 _ => {}
             }
         }
     }
     let mut seen = HashSet::new();
-    out.retain(|p| seen.insert(p.clone()));
+    out.retain(|(r, p, _)| seen.insert((r.clone(), p.clone())));
     out
+}
+
+/// A path that stands for many by a placeholder: `tickets/SR-NNN.md`,
+/// `logs/XXXX.log`.
+fn is_placeholder_path(path: &str) -> bool {
+    path.split(['/', '-', '_', '.']).any(|seg| seg.len() >= 3 && (seg.chars().all(|c| c == 'N') || seg.chars().all(|c| c == 'X') || seg.chars().all(|c| c == 'n')))
+}
+
+/// Whether a line places what it names in a repo Ken did not read: a
+/// `../Other-Repo/` path, a vault or another repo named in words, or a
+/// repo-like name (`Team-Docs`, `sr-docs`) that is none of `repos`.
+fn names_unread_repo(line: &str, repos: &[&str]) -> bool {
+    let l = line.to_lowercase();
+    let above = line.split(|c: char| c.is_whitespace() || c == '`' || c == '(').any(|t| t.starts_with("../"));
+    if above || [" vault", "other repo", "another repo", "docs repo", "team repo"].iter().any(|k| l.contains(k)) {
+        return true;
+    }
+    let repo_like = |t: &str| {
+        let t = t.trim_matches(|c: char| !c.is_alphanumeric());
+        t.len() >= 4
+            && t.contains('-')
+            && t.chars().all(|c| c.is_alphanumeric() || c == '-')
+            && !repos.iter().any(|r| r.eq_ignore_ascii_case(t) || crate::workspace::member_leaf(r).eq_ignore_ascii_case(t))
+            && (t.split('-').filter(|p| p.starts_with(|c: char| c.is_uppercase())).count() >= 2
+                || ["docs", "wiki", "vault"].iter().any(|s| t.to_lowercase().ends_with(s)))
+    };
+    line.split('`').skip(1).step_by(2).any(repo_like) || line.split_whitespace().any(|w| repo_like(w) && w.trim_matches(|c: char| !c.is_alphanumeric()).split('-').count() >= 3)
 }
 
 /// One path a page names that no repo tracks.
@@ -1667,6 +1904,12 @@ pub struct Checked {
     pub paths: Vec<MissingPath>,
     pub names: Vec<String>,
     pub versions: Vec<StaleVersion>,
+    /// What the check cannot judge and left alone, each with why: a
+    /// front-matter key, an example name, a name on a line that says it is
+    /// gone, a range's bound, a glob, a path in a repo Ken did not read.
+    pub skipped: Vec<String>,
+    /// Ken's search of the checkout for each of `names`, in its order.
+    pub searched: Vec<String>,
 }
 
 impl Checked {
@@ -1676,10 +1919,10 @@ impl Checked {
 }
 
 /// One repo's tracked files, split into segments.
-struct Tracked {
-    name: String,
-    root: PathBuf,
-    files: Vec<Vec<String>>,
+pub(crate) struct Tracked {
+    pub(crate) name: String,
+    pub(crate) root: PathBuf,
+    pub(crate) files: Vec<Vec<String>>,
     /// Every folder name anywhere in the repo.
     folders: HashSet<String>,
     /// The names its code defines and uses ([`crate::checkout::names`]).
@@ -1687,7 +1930,10 @@ struct Tracked {
     /// The versions its build files pin.
     pins: Vec<crate::checkout::Pin>,
     /// Whether its code was read for names; a shallow one is searched.
-    deep: bool,
+    pub(crate) deep: bool,
+    /// Whether it is the team's library, the wiki itself: a page may name
+    /// its paths, but a path is never rewritten to one of them.
+    pub(crate) library: bool,
 }
 
 /// Whether segment `s` matches pattern segment `pat`, where `*`, `<name>`
@@ -1807,14 +2053,19 @@ impl Tracked {
 /// checked against.
 #[derive(Default)]
 pub struct PathCheck {
-    repos: Vec<Tracked>,
+    pub(crate) repos: Vec<Tracked>,
+    /// The commit each repo was read at.
+    pub(crate) heads: HashMap<String, String>,
+    /// What `git grep` found for a needle in a repo, for the run.
+    #[allow(clippy::type_complexity)]
+    pub(crate) greps: std::cell::RefCell<HashMap<String, (usize, Vec<String>)>>,
 }
 
 impl PathCheck {
     /// Read from the checkouts: a reference repo's names are its files' and
     /// folders' only, since its code is the platform's and large.
     pub fn of(repos: &[(String, PathBuf)]) -> PathCheck {
-        let repos = repos
+        let tracked = repos
             .iter()
             .filter_map(|(name, root)| {
                 let tracked = ls_files(root)?;
@@ -1823,10 +2074,10 @@ impl PathCheck {
                 let deep = !crate::registry::kind_of(root).contains(&crate::registry::RepoKind::Reference);
                 let names = crate::checkout::names(root, &tracked, deep);
                 let pins = crate::checkout::pins(root, &tracked);
-                Some(Tracked { name: name.clone(), root: root.clone(), files, folders, names, pins, deep })
+                Some(Tracked { name: name.clone(), root: root.clone(), files, folders, names, pins, deep, library: false })
             })
             .collect();
-        PathCheck { repos }
+        PathCheck { repos: tracked, heads: repo_heads(repos), ..Default::default() }
     }
 
     /// The check with the team's library added for paths alone: a page may
@@ -1836,8 +2087,38 @@ impl PathCheck {
         let files: Vec<Vec<String>> = tracked.iter().map(|f| f.split('/').map(str::to_string).collect()).collect();
         let folders = files.iter().flat_map(|f| f[..f.len() - 1].iter().cloned()).collect();
         let names = crate::checkout::names(root, &tracked, false);
-        self.repos.push(Tracked { name: name.to_string(), root: root.to_path_buf(), files, folders, names, pins: Vec::new(), deep: true });
+        self.repos.push(Tracked {
+            name: name.to_string(),
+            root: root.to_path_buf(),
+            files,
+            folders,
+            names,
+            pins: Vec::new(),
+            deep: true,
+            library: true,
+        });
         self
+    }
+
+    /// Where `git grep -F` finds `needle` in the team's code repos (the
+    /// library and a reference repo left out), as `repo:path:line: text`:
+    /// at most `max` lines, and how many there were in all.
+    pub(crate) fn search(&self, needle: &str, max: usize) -> (usize, Vec<String>) {
+        let mut count = 0;
+        let mut out = Vec::new();
+        for t in self.repos.iter().filter(|t| t.deep && !t.library) {
+            let key = format!("{}\0false\0{needle}", t.name);
+            let hit = self.greps.borrow().get(&key).cloned();
+            let (n, lines) = hit.unwrap_or_else(|| {
+                let found = grep_repo(&t.name, &t.root, needle, false);
+                self.greps.borrow_mut().insert(key, found.clone());
+                found
+            });
+            count += n;
+            out.extend(lines);
+        }
+        out.truncate(max);
+        (count, out)
     }
 
     /// The paths `page` names that no repo has, each with where a file or
@@ -1847,12 +2128,38 @@ impl PathCheck {
     /// first segment is a folder the repo has somewhere, so `owner/repo` and
     /// branch names are left alone.
     pub fn missing(&self, page: &str, home: Option<&str>) -> Vec<MissingPath> {
+        self.paths_checked(page, home).0
+    }
+
+    /// [`PathCheck::missing`], and the paths left unchecked with why: a
+    /// placeholder (`tickets/SR-NNN.md`), and a bare path on a line that
+    /// places it in a repo Ken did not read (the docs vault's
+    /// `_meta/ticketcheck.py`, 2026-10-07). A missing path's match is never
+    /// the wiki's own page: the brief's `sr-docs/Engine/Reference/Vocabulary.md`
+    /// became the wiki's `Reference/Vocabulary.md`, and the page pointed at itself.
+    fn paths_checked(&self, page: &str, home: Option<&str>) -> (Vec<MissingPath>, Vec<String>) {
         if self.repos.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let names: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+        let lines: Vec<&str> = page.lines().collect();
+        let mut skipped: Vec<String> = Vec::new();
         let mut out = Vec::new();
-        for (repo, path) in named_paths(page, &names) {
+        for (repo, path, at) in named_paths_at(page, &names) {
+            let why = if is_placeholder_path(&path) {
+                Some("a pattern")
+            } else if repo.is_none() && names_unread_repo(lines.get(at).copied().unwrap_or_default(), &names) {
+                Some("in a repo Ken did not read")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                let line = format!("`{path}` ({why})");
+                if !skipped.contains(&line) {
+                    skipped.push(line);
+                }
+                continue;
+            }
             let mut scope: Vec<&Tracked> = self.repos.iter().filter(|t| repo.as_ref().is_none_or(|r| *r == t.name)).collect();
             scope.sort_by_key(|t| Some(t.name.as_str()) != home);
             let is_file = has_file_ext(&path);
@@ -1865,17 +2172,22 @@ impl PathCheck {
             if scope.iter().any(|t| t.has(&path, is_file) || t.untracked(&path)) {
                 continue;
             }
-            let mut now: Vec<String> =
-                scope.iter().flat_map(|t| t.lookup(&path, is_file).into_iter().map(move |p| format!("{}:{p}", t.name))).collect();
+            let mut now: Vec<String> = scope
+                .iter()
+                .filter(|t| !t.library)
+                .flat_map(|t| t.lookup(&path, is_file).into_iter().map(move |p| format!("{}:{p}", t.name)))
+                .collect();
             // A test fixture's copy is never what a page means when the real
             // file is there too.
             if now.iter().any(|p| !crate::checkout::is_test_path(p)) {
                 now.retain(|p| !crate::checkout::is_test_path(p));
             }
             now.truncate(5);
-            out.push(MissingPath { path, repo, now });
+            if !out.iter().any(|m: &MissingPath| m.path == path && m.repo == repo) {
+                out.push(MissingPath { path, repo, now });
+            }
         }
-        out
+        (out, skipped)
     }
 
     /// The names `page` writes as code ([`crate::checkout::as_symbol`]) that
@@ -1887,18 +2199,50 @@ impl PathCheck {
     /// drafted from the mod's brief on 2026-10-06, after the test audit had
     /// removed both.
     pub fn unknown_names(&self, page: &str) -> Vec<String> {
+        self.names_checked(page).0
+    }
+
+    /// [`PathCheck::unknown_names`], and what was left unchecked with why.
+    /// A name is known whole or inside a longer identifier
+    /// ([`crate::checkout::Names::has`]); never judged: a key of the page's
+    /// own front matter, a name a brief gives as an example (`MyComponent`,
+    /// `myConfig`, `FooBar`), and a name on a line that says it does not
+    /// exist (2026-10-07: `changed_by`, `MyComponent` and `stopServer` each
+    /// cost a correction call).
+    fn names_checked(&self, page: &str) -> (Vec<String>, Vec<String>) {
         if self.repos.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let repos: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+        let keys = front_keys(page);
+        let lines: Vec<&str> = page.lines().collect();
         let mut out: Vec<String> = Vec::new();
-        for (front, _, token) in page_tokens(page) {
+        let mut skipped: Vec<String> = Vec::new();
+        let skip = |name: &str, why: &str, skipped: &mut Vec<String>| {
+            let line = format!("`{name}` ({why})");
+            if !skipped.contains(&line) {
+                skipped.push(line);
+            }
+        };
+        for (front, at, token) in page_tokens(page) {
             if front || as_path(&token, &repos).is_some() {
                 continue;
             }
             let Some((name, is_class)) = crate::checkout::as_symbol(&token) else { continue };
+            if keys.contains(&name) {
+                skip(&name, "a key of the page's front matter", &mut skipped);
+                continue;
+            }
+            if is_example_name(&name) {
+                skip(&name, "an example name", &mut skipped);
+                continue;
+            }
+            if says_absent(lines.get(at).copied().unwrap_or_default()) {
+                skip(&name, "on a line that says it does not exist", &mut skipped);
+                continue;
+            }
             let test = is_class && ["Test", "Tests", "Spec", "IT"].iter().any(|s| name.ends_with(s));
-            let known = self.repos.iter().any(|t| t.names.defined.contains(&name) || (!test && t.names.used.contains(&name)));
+            let known = self.repos.iter().any(|t| t.names.defined.contains(&name) || (!test && t.names.has(&name)));
             if !known && !out.contains(&name) {
                 out.push(name);
             }
@@ -1922,7 +2266,7 @@ impl PathCheck {
                 out.retain(|n| !hits.contains(n.as_str()));
             }
         }
-        out
+        (out, skipped)
     }
 
     /// The versions `page` states that a build file of some repo pins
@@ -1932,8 +2276,16 @@ impl PathCheck {
     /// Six pages carried the engine pin a dated note gave, `pre.3`, while
     /// `gradle.properties` said `pre.5` (2026-10-06).
     pub fn stale_versions(&self, page: &str) -> Vec<StaleVersion> {
+        self.versions_checked(page).0
+    }
+
+    /// [`PathCheck::stale_versions`], and the versions left unchecked: a
+    /// range's bound (`<0.8.0` in `>=0.7.0-pre.1 <0.8.0`) is no pin, and
+    /// cost a correction call on 2026-10-07.
+    fn versions_checked(&self, page: &str) -> (Vec<StaleVersion>, Vec<String>) {
         let pinned: HashSet<&str> = self.repos.iter().flat_map(|t| t.pins.iter().map(|p| p.value.as_str())).collect();
         let mut out: Vec<StaleVersion> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         let (mut in_front, mut fence) = (false, false);
         for (i, line) in page.lines().enumerate() {
             let t = line.trim();
@@ -1949,6 +2301,13 @@ impl PathCheck {
             }
             for written in crate::checkout::versions_in(line) {
                 if pinned.contains(written.as_str()) {
+                    continue;
+                }
+                if range_bound(line, &written) {
+                    let why = format!("`{written}` (a range's bound)");
+                    if !skipped.contains(&why) {
+                        skipped.push(why);
+                    }
                     continue;
                 }
                 let core = crate::checkout::version_core(&written);
@@ -1970,16 +2329,81 @@ impl PathCheck {
                 }
             }
         }
-        out
+        (out, skipped)
     }
 
     /// Everything [`PathCheck`] finds in the page at `page_path`. A page of
     /// history ([`is_history`]) names old versions on purpose, so its
     /// versions are not checked.
     pub fn check(&self, page_path: &str, page: &str, home: Option<&str>) -> Checked {
-        let versions = if is_history(page_path) { Vec::new() } else { self.stale_versions(page) };
-        Checked { paths: self.missing(page, home), names: self.unknown_names(page), versions }
+        let (versions, mut skipped) = if is_history(page_path) { (Vec::new(), Vec::new()) } else { self.versions_checked(page) };
+        let (paths, path_skips) = self.paths_checked(page, home);
+        let (names, name_skips) = self.names_checked(page);
+        skipped.extend(path_skips);
+        skipped.extend(name_skips);
+        let searched = names.iter().map(|n| search_line(self, n)).collect();
+        Checked { paths, names, versions, skipped, searched }
     }
+}
+
+/// The keys of a page's front matter: `changed_by`, `pin`, `sources`.
+fn front_keys(page: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut lines = page.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return out;
+    }
+    for l in lines.take_while(|l| l.trim_end() != "---") {
+        if l.starts_with([' ', '-', '\t']) {
+            continue;
+        }
+        if let Some((k, _)) = l.split_once(':') {
+            out.insert(k.trim().to_string());
+        }
+    }
+    out
+}
+
+/// A name a brief or a template gives as an example, not the team's code:
+/// `MyComponent`, `myConfig`, `FooBar`, `ExampleService`, `YourType`.
+fn is_example_name(name: &str) -> bool {
+    let parts = crate::checkout::ident_parts(name);
+    parts.first().is_some_and(|p| ["my", "your", "foo", "bar", "baz", "example", "sample", "some"].contains(&p.as_str()))
+}
+
+/// Whether a line says something is gone, removed or missing: the kind of
+/// line a correction wrote on 2026-10-07 for `kill_stats`, which
+/// `reset_kill_stats` still registered.
+pub(crate) fn says_gone(text: &str) -> bool {
+    let l = text.to_lowercase();
+    [
+        "is gone", "are gone", "no longer exist", "no longer in", "does not exist", "doesn't exist", "do not exist", "don't exist",
+        "no repo has", "was removed", "were removed", "has been removed", "have been removed", "was deleted", "were deleted",
+        "no longer has",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+/// Whether a line says the thing it names does not exist: "there is no
+/// `stopServer` task", "no such command", "is gone".
+fn says_absent(line: &str) -> bool {
+    let l = line.to_lowercase();
+    says_gone(line) || ["there is no ", "there are no ", "no such ", "not a task", "never existed"].iter().any(|k| l.contains(k))
+}
+
+/// Whether `version` stands in `line` as a range's bound: right after `<`,
+/// `>`, `=`, `^` or `~` (`>=0.7.0-pre.1 <0.8.0`).
+fn range_bound(line: &str, version: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = line[from..].find(version).map(|i| from + i) {
+        let before = line[..i].trim_end_matches(['v', 'V']).trim_end();
+        if before.ends_with(['<', '>', '=', '^', '~']) {
+            return true;
+        }
+        from = i + version.len();
+    }
+    false
 }
 
 /// The one call that corrects a drafted page: each path the checkout lacks
@@ -1999,22 +2423,89 @@ pub fn correction_prompt(page_path: &str, page: &str, found: &Checked) -> String
             s.push_str(&format!("- path `{}`{cited}: not there; a file or folder of that name is at {}\n", m.path, at.join(", ")));
         }
     }
-    for n in &found.names {
-        s.push_str(&format!("- name `{n}`: written as code, and no repo defines it, has a file of that name or uses it\n"));
+    for (n, search) in found.names.iter().zip(found.searched.iter().map(Some).chain(std::iter::repeat(None))) {
+        s.push_str(&format!("- name `{n}`: written as code, and no repo defines it, has a file of that name or uses it"));
+        if let Some(search) = search {
+            s.push_str(&format!("; {search}"));
+        }
+        s.push('\n');
     }
     for v in &found.versions {
         s.push_str(&format!("- version `{}`: `{}:{}` has `{} = {}`\n", v.written, v.repo, v.pin.file, v.pin.key, v.pin.value));
     }
     s.push_str(
         "\nCorrect the page: write each path where the code has it now, choosing by what the page says about it; a \
-         name the code no longer has, leave out or say it is gone; a version, write as the build file has it and cite \
-         the file. Kept as they are: a path the sources place outside these repos (another repo, the docs vault), a \
+         name the code no longer has, leave out, and say it is gone only when Ken's search above found no hits; a \
+         version, write as the build file has it and cite the file. Kept as they are: a path the sources place outside \
+         these repos (another repo, the docs vault), a \
          file the sources say something makes (a build, the server at run time, a person), a name that is a product, \
          a tool, an example or a word rather than the team's code, and a version the page gives as history. Change nothing else. \
          Reply with the whole corrected page, starting with `---`. No preamble, no code fences around it.\n\nTHE PAGE:\n",
     );
     s.push_str(page);
     s
+}
+
+/// Ken's search of the checkout for `name`, in words for a prompt and a log:
+/// `git grep -F` over the team's code repos, docs left out.
+fn search_line(check: &PathCheck, name: &str) -> String {
+    let repos: Vec<&str> = check.repos.iter().filter(|t| t.deep && !t.library).map(|t| t.name.as_str()).collect();
+    let (n, hits) = check.search(name, 3);
+    if n == 0 {
+        format!("Ken's search (`git grep -F {name}` over {}, docs left out): no hits", repos.join(", "))
+    } else {
+        format!("Ken's search (`git grep -F {name}` over {}): {n} lines, e.g. {}", repos.join(", "), hits.join(" · "))
+    }
+}
+
+/// `fixed`, a corrected page, with every line the correction made say that
+/// something is gone put back as `before` had it, unless Ken's search of
+/// the checkout finds nothing for each name the line says is gone: a row by
+/// its first cell, another line dropped. On 2026-10-07 a correction wrote
+/// that `kill_stats` "is gone: no repo has it now" while
+/// `reset_kill_stats` registered it. Each line put back or dropped, with
+/// the search, as (before, after, search).
+fn guard_absences(before: &str, fixed: &str, check: &PathCheck) -> (String, Vec<(String, String, String)>) {
+    let old: HashSet<&str> = before.lines().collect();
+    let repos: Vec<&str> = check.repos.iter().map(|t| t.name.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut undone = Vec::new();
+    for line in fixed.lines() {
+        if old.contains(line) || !says_gone(line) {
+            out.push(line.to_string());
+            continue;
+        }
+        let names: Vec<String> = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| as_path(t, &repos).is_none())
+            .filter_map(|t| crate::checkout::as_symbol(t).map(|(n, _)| n).or_else(|| (t.len() >= 4 && !t.contains(' ')).then(|| t.to_string())))
+            .collect();
+        let found: Vec<String> = names.iter().filter(|n| check.search(n, 1).0 > 0).map(|n| search_line(check, n)).collect();
+        if found.is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let first_cell = |l: &str| l.trim().trim_matches('|').split('|').next().map(|c| c.trim().to_string());
+        let original = line
+            .trim()
+            .starts_with('|')
+            .then(|| before.lines().find(|o| o.trim().starts_with('|') && first_cell(o) == first_cell(line)))
+            .flatten();
+        match original {
+            Some(o) => {
+                out.push(o.to_string());
+                undone.push((line.to_string(), o.to_string(), found.join("; ")));
+            }
+            None => undone.push((line.to_string(), String::new(), found.join("; "))),
+        }
+    }
+    let mut text = out.join("\n");
+    if fixed.ends_with('\n') {
+        text.push('\n');
+    }
+    (text, undone)
 }
 
 /// `page` with each backticked token and frontmatter item that `f` maps
@@ -2114,6 +2605,9 @@ fn check_paths(
         report.corrected.push(format!("{page_path}: `{from}` -> `{to}` (rewritten, one match)"));
     }
     let found = check.check(page_path, &text, home);
+    if !found.skipped.is_empty() {
+        report.corrected.push(format!("{page_path}: not checked: {}", found.skipped.join(", ")));
+    }
     if found.is_empty() {
         return text;
     }
@@ -2121,6 +2615,11 @@ fn check_paths(
     match generate(&correction_prompt(page_path, &text, &found)).and_then(|r| finish(&r)) {
         Ok(fixed) => {
             report.corrected.push(format!("{page_path}: sent back once for {listed}"));
+            let (fixed, undone) = guard_absences(&text, &fixed, check);
+            for (said, back, search) in undone {
+                let now = if back.is_empty() { "dropped".to_string() } else { format!("put back as `{back}`") };
+                report.corrected.push(format!("{page_path}: the correction wrote `{said}`; {now}, since {search}"));
+            }
             fixed
         }
         Err(e) => {
@@ -2176,6 +2675,14 @@ pub struct DraftReport {
     /// names and versions listed ([`check_paths`]).
     #[serde(default)]
     pub corrected: Vec<String>,
+    /// What the check of each page against its sources found, one line a
+    /// page ([`crate::wikiverify::check`]).
+    #[serde(default)]
+    pub verified: Vec<String>,
+    /// Every statement that check changed or removed, and every `To fill:`
+    /// item it answered, with before, after and evidence.
+    #[serde(default)]
+    pub changes: Vec<crate::wikiverify::Change>,
 }
 
 /// The template placeholders still in `wiki`'s pages, as `page: placeholder`.
@@ -2250,7 +2757,8 @@ pub fn pin_sources(page: &str, heads: &HashMap<String, String>) -> String {
         }
         if in_front && bare.starts_with("pin:") && !cited.is_empty() {
             let value = bare["pin:".len()..].split(" #").next().unwrap_or_default().trim();
-            if value.is_empty() || value.contains("{{") {
+            // `""` and `''` are empty too: eight pages kept `pin: ""` on 2026-10-07.
+            if value.trim_matches(['"', '\'']).trim().is_empty() || value.contains("{{") {
                 let pin = match cited.as_slice() {
                     [one] => heads[*one].clone(),
                     many => many.iter().map(|r| format!("{r}@{}", heads[*r])).collect::<Vec<_>>().join(", "),
@@ -2361,15 +2869,56 @@ fn draft_page(
         report.kept.push(page.to_string());
         return Ok(());
     }
-    match generate(&prompt(page, purpose, existing.as_deref().or(blank), sources, today)).and_then(|r| finish(&r)) {
+    let template = existing.as_deref().or(blank);
+    match generate(&prompt(page, purpose, template, sources, today)).and_then(|r| finish(&r)) {
         Ok(text) => {
             let text = check_paths(page, text, check, report, generate);
-            write_page(&path, &text)?;
-            report.drafted.push(page.to_string());
+            let lines = template_lines(template.unwrap_or_default());
+            match verify(page, &text, &lines, sources, wiki, check, report, generate) {
+                Ok(text) => {
+                    write_page(&path, &text)?;
+                    report.drafted.push(page.to_string());
+                }
+                Err(e) => report.failed.push((page.to_string(), e.to_string())),
+            }
         }
         Err(e) => report.failed.push((page.to_string(), e.to_string())),
     }
     Ok(())
+}
+
+/// The lines of a template, trimmed: a drafted line that is one of them is
+/// the template's, never a claim to check.
+fn template_lines(template: &str) -> HashSet<String> {
+    template.lines().map(str::trim).filter(|l| !l.is_empty() && !l.contains("{{")).map(String::from).collect()
+}
+
+/// `text`, a page just drafted, checked against its sources
+/// ([`crate::wikiverify::check`]) and logged in `report`. With no checkout
+/// to read (the single-folder [`draft`]), as it is. An error when the check
+/// could not be made: nothing unverified is published.
+#[allow(clippy::too_many_arguments)]
+fn verify(
+    page: &str,
+    text: &str,
+    template: &HashSet<String>,
+    sources: &[Source],
+    wiki: &Path,
+    check: &PathCheck,
+    report: &mut DraftReport,
+    generate: &mut impl FnMut(&str) -> Result<String>,
+) -> Result<String> {
+    if check.repos.is_empty() {
+        return Ok(text.to_string());
+    }
+    let drafted = report.drafted.clone();
+    let ctx = crate::wikiverify::Ctx { check, sources, wiki, drafted: &drafted };
+    let (page_text, done) = crate::wikiverify::check(page, text, template, &ctx, generate)?;
+    if !done.summary.is_empty() {
+        report.verified.push(done.summary);
+    }
+    report.changes.extend(done.changes);
+    Ok(page_text)
 }
 
 /// A draft's result as the wiki keeps it, for the Team screen.
@@ -2502,7 +3051,7 @@ pub const OWNS: &[(&str, &str)] = &[
 ];
 
 /// What `page` owns ([`OWNS`]).
-fn owns(page: &str) -> &'static str {
+pub(crate) fn owns(page: &str) -> &'static str {
     OWNS.iter().find(|(p, _)| *p == page).map_or("", |(_, o)| o)
 }
 
@@ -2795,7 +3344,8 @@ fn fair_shares(sizes: &[usize], budget: usize) -> Vec<usize> {
     out
 }
 
-/// `sources` in order while `budget` lasts, the last one clipped to fit.
+/// `sources` in order while `budget` lasts, the last one clipped to fit;
+/// a source of [`checkout_sources`] is never cut, but named with its size.
 fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
     let mut out = Vec::new();
     let mut used = 0;
@@ -2803,11 +3353,31 @@ fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
         if used >= budget {
             break;
         }
-        let text = clip(&s.text, budget - used);
+        let text = if is_checkout(&s.label) && used + s.text.len() > budget {
+            format!("(left out for room: {} characters; never cut)", s.text.len())
+        } else {
+            clip(&s.text, budget - used)
+        };
         used += text.len();
         out.push(Source { label: s.label, text });
     }
     out
+}
+
+/// `sources` in order, each whole, while `budget` lasts: one that does not
+/// fit is skipped for a later, smaller one.
+fn whole_within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
+    let mut used = 0;
+    sources
+        .into_iter()
+        .filter(|s| {
+            let fits = used + s.text.len() <= budget;
+            if fits {
+                used += s.text.len();
+            }
+            fits
+        })
+        .collect()
 }
 
 /// What one team page reads from the repos themselves, beside the repo
@@ -2815,10 +3385,12 @@ fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
 /// ([`fair_shares`]): for Releases the version tags, what landed since the
 /// newest and each version's own notes; for Team and Who Does What the
 /// CODEOWNERS, `people/` files (the wiki's too) and the recent contributors;
-/// for the architecture page the import map; for Project the newest version
-/// tags; for Vocabulary the briefs' lines about words; then for every page
-/// the parts of the briefs routed to it ([`route_parts`]). `roster` is the
-/// team's ([`team_roster`]).
+/// and the lines of the briefs that name who decides ([`decider_lines`]),
+/// with `.ken/gates.json` (its protected paths); for the architecture page
+/// the import map; for Project the newest version tags; for Vocabulary the
+/// briefs' lines about words; then for every page the parts of the briefs
+/// and the repo's other docs ([`doc_briefs`]) routed to it ([`route_parts`]).
+/// `roster` is the team's ([`team_roster`]).
 pub fn page_sources(
     page: &str,
     wiki: &Path,
@@ -2837,7 +3409,7 @@ pub fn page_sources(
         if wiring || values {
             let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
             let tracked = ls_files(root).unwrap_or_default();
-            mine.extend(checkout_sources(name, root, &tracked, &briefs(root), wiring && !reference, values));
+            mine.extend(checkout_sources(name, root, &tracked, &briefs(root), wiring && !reference, values.then_some(TEAM_VALUES_MAX)));
         }
         match page {
             "Work/Releases.md" => {
@@ -2876,19 +3448,26 @@ pub fn page_sources(
                 if let Some(a) = recent_contributors(root, roster) {
                     push(format!("{name}:(recent contributors by folder, last 90 days, from git)"), a, &mut mine);
                 }
+                if let Some(t) = read_plain(&root.join(".ken").join("gates.json")) {
+                    push(format!("{name}:.ken/gates.json"), t, &mut mine);
+                }
+                if let Some(d) = decider_lines(name, &briefs(root)) {
+                    push(format!("{name}:(lines of its briefs about who decides)"), d, &mut mine);
+                }
             }
             _ => {}
         }
-        // The parts of its briefs routed to this page, each to one page.
-        let briefs = briefs(root);
+        // The parts of its briefs and other docs routed to this page.
+        let mut briefs = briefs(root);
         if page == "Reference/Vocabulary.md" {
             if let Some(w) = word_lines(name, &briefs) {
                 push(format!("{name}:(lines of its briefs about words and names)"), w, &mut mine);
             }
         }
+        briefs.extend(doc_briefs(root));
         let routed = route_parts(name, &briefs).remove(page).unwrap_or_default();
         let left = PAGE_BUDGET.saturating_sub(used(&mine));
-        mine.extend(within(routed, left));
+        mine.extend(whole_within(routed, left));
         per_repo.push(mine);
     }
     let sizes: Vec<usize> = per_repo.iter().map(|v| v.iter().map(|s| s.text.len()).sum()).collect();
@@ -2941,7 +3520,10 @@ fn draft_repo_pages(
                 report.sources.extend(read.iter().map(|s| s.label.clone()));
                 sources = Some(read);
             }
-            let sources = sources.as_deref().unwrap_or_default();
+            let map = sources.as_deref().unwrap_or_default();
+            // A layers page reads the briefs' parts about layers first.
+            let layered = page.starts_with("Conventions/Architecture-").then(|| layers_sources(name, root, map));
+            let sources = layered.as_deref().unwrap_or(map);
             draft_page(wiki, &page, purpose, blank.as_deref(), sources, today, report, generate, check)?;
         }
     }
@@ -3094,6 +3676,7 @@ fn draft_traps(
     roster: &[crate::people::Person],
     report: &mut DraftReport,
     generate: &mut impl FnMut(&str) -> Result<String>,
+    check: &PathCheck,
 ) -> Result<()> {
     let path = wiki.join(START_HERE);
     let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
@@ -3109,8 +3692,17 @@ fn draft_traps(
     let filled = generate(&traps_prompt(&page_directory(repos), &sources)).map(|r| fill_traps(&text, &traps_rows(&r)));
     match filled {
         Ok(Some(page)) => {
-            write_page(&path, &page)?;
-            report.drafted.push(START_HERE.to_string());
+            // Only the rows are Ken's: every line set-up wrote is left alone.
+            let set_up: HashSet<String> = text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            let kept_a_row = |p: &str| p.lines().any(|l| l.trim().starts_with('|') && !set_up.contains(l.trim()));
+            match verify(START_HERE, &page, &set_up, &sources, wiki, check, report, generate) {
+                Ok(checked) if kept_a_row(&checked) => {
+                    write_page(&path, &checked)?;
+                    report.drafted.push(START_HERE.to_string());
+                }
+                Ok(_) => report.failed.push((START_HERE.to_string(), "no Traps row was borne out by its source".into())),
+                Err(e) => report.failed.push((START_HERE.to_string(), e.to_string())),
+            }
         }
         Ok(None) => report.failed.push((START_HERE.to_string(), "the reply had no Traps rows".into())),
         Err(e) => report.failed.push((START_HERE.to_string(), e.to_string())),
@@ -3150,7 +3742,7 @@ pub fn draft_team(
     let extra = extra.map(gather_extra).unwrap_or_default();
     let common = team_sources(wiki_name, repos, &extra);
     draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, &roster, today, &mut report, &mut generate, &check)?;
-    draft_traps(wiki, wiki_name, repos, &roster, &mut report, &mut generate)?;
+    draft_traps(wiki, wiki_name, repos, &roster, &mut report, &mut generate, &check)?;
     cite_rulings(wiki, repos, today)?;
     dedup_labels(&mut report.sources);
     pin_drafted(wiki, &report.drafted, repos)?;
@@ -3673,6 +4265,16 @@ mod tests {
         }
     }
 
+    /// The reply of a check that finds every statement of the page borne
+    /// out by its source; None for any other prompt.
+    fn all_supported(prompt: &str) -> Option<String> {
+        if !prompt.starts_with("You are checking one drafted page") {
+            return None;
+        }
+        let ids: Vec<&str> = prompt.lines().filter_map(|l| l.split_once(" (line ").map(|(id, _)| id)).filter(|id| id.starts_with('S')).collect();
+        Some(format!("[{}]", ids.iter().map(|id| format!("{{\"id\": \"{id}\", \"verdict\": \"supported\"}}")).collect::<Vec<_>>().join(", ")))
+    }
+
     fn page(title: &str) -> String {
         format!("---\ntitle: {title}\nsources:\n  - x\n---\n# {title}\nDrafted by Ken.\n")
     }
@@ -4072,7 +4674,8 @@ mod tests {
             ```\nOldGoneTest 0.7.0-pre.1\n```\n";
         let found = check.check("Platform/Index.md", page, None);
         assert!(found.paths.is_empty(), "{:?}", found.paths);
-        assert_eq!(found.names, vec!["getInstance", "OneNameLineComposerTest"], "a comment naming a test is not the test");
+        // `getInstance` is inside `freezesGetInstance`; a comment naming a test is not the test.
+        assert_eq!(found.names, vec!["OneNameLineComposerTest"]);
         let v: Vec<(&str, &str)> = found.versions.iter().map(|v| (v.written.as_str(), v.pin.value.as_str())).collect();
         assert_eq!(v, vec![("0.7.0-pre.3", "0.7.0-pre.5")], "history in a release list is not a pin");
         let p = correction_prompt("Platform/Index.md", page, &found);
@@ -4080,7 +4683,7 @@ mod tests {
         assert!(p.contains("- version `0.7.0-pre.3`: `game:gradle.properties` has `hytale_version = 0.7.0-pre.5`"), "{p}");
         assert_eq!(
             found_list(&found),
-            "names `getInstance`, `OneNameLineComposerTest`; versions `0.7.0-pre.3` (game:gradle.properties hytale_version = 0.7.0-pre.5)"
+            "names `OneNameLineComposerTest`; versions `0.7.0-pre.3` (game:gradle.properties hytale_version = 0.7.0-pre.5)"
         );
     }
 
@@ -4370,9 +4973,12 @@ name: Mabel Bot
         crate::wikinew::create(&wiki, "Realms", &covered, "2026-10-06").unwrap();
         assert!(fs::read_to_string(wiki.join("START-HERE.md")).unwrap().contains("| `Tools` | (not said yet) |"));
         let repos = vec![repo(d.path(), "Tools", "# Tools\n")];
+        // A git checkout, so a citation of it is one the check can read.
+        git_in(&repos[0].1, &["init", "-q"]);
+        git_in(&repos[0].1, &["add", "-A"]);
         let mut db = Db::open_in_memory().unwrap();
         draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-10-06", 5, |p| {
-            Ok(if p.contains("`Repo-Map/Tools.md`") { tools_page.to_string() } else { page("Drafted") })
+            Ok(all_supported(p).unwrap_or_else(|| if p.contains("`Repo-Map/Tools.md`") { tools_page.to_string() } else { page("Drafted") }))
         })
         .unwrap();
         let index = fs::read_to_string(wiki.join("Repo-Map/Index.md")).unwrap();
@@ -4383,7 +4989,7 @@ name: Mabel Bot
 
     /// A long section is split at its `###` headings and then at blank lines,
     /// never cut, each part at its own line; and every part of a brief goes
-    /// to exactly one page, a part no topic claims included.
+    /// to at least one page and at most three, a part no topic claims included.
     #[test]
     fn every_part_of_a_brief_reaches_one_page_and_long_sections_are_split() {
         let gotchas: String = (0..6).map(|i| format!("### Trap {i}\n\n{}", "Never edit the generated manifest by hand.\n\n".repeat(60))).collect();
@@ -4418,7 +5024,7 @@ name: Mabel Bot
         for s in &parts {
             let label = part_label("Game", "CLAUDE.md", s.line);
             let pages = reached.get(&label).cloned().unwrap_or_default();
-            assert_eq!(pages.len(), 1, "{label} ({}) went to {pages:?}", s.heading);
+            assert!((1..=PART_PAGES).contains(&pages.len()), "{label} ({}) went to {pages:?}", s.heading);
         }
         assert_eq!(reached[&part_label("Game", "CLAUDE.md", trap.line)], vec![START_HERE]);
         let team = parts.iter().find(|s| s.heading == "Team").unwrap();
@@ -4442,12 +5048,14 @@ name: Mabel Bot
         let before = fs::read_to_string(wiki.join(START_HERE)).unwrap();
         let root = d.path().join("Game");
         write(&root, &[("CLAUDE.md", "# Game\n\nA game.\n\n## Common Gotchas\n\n- The base game's assets live in the server jar.\n- Energy is Stamina in code.\n")]);
+        git_in(&root, &["init", "-q"]);
+        git_in(&root, &["add", "-A"]);
         let repos = vec![("Game".to_string(), root)];
         let mut db = Db::open_in_memory().unwrap();
         let mut asked: Vec<String> = Vec::new();
         let report = draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-10-06", 5, |p| {
             asked.push(p.to_string());
-            Ok(if p.contains("the Traps table") { reply.to_string() } else { page("Drafted") })
+            Ok(all_supported(p).unwrap_or_else(|| if p.contains("the Traps table") { reply.to_string() } else { page("Drafted") }))
         })
         .unwrap();
         let traps = asked.iter().find(|p| p.contains("the Traps table")).expect("a traps call");
@@ -4464,5 +5072,113 @@ name: Mabel Bot
         })
         .unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// One fact, one page is the drafting's rule, not the reading's: a part
+    /// goes to every page it fits as well, the people pages read who decides
+    /// wherever a brief says it, a repo's other docs reach the team pages,
+    /// and a repo's layers page reads the parts about layers first.
+    #[test]
+    fn a_part_reaches_every_page_it_fits() {
+        let d = tempfile::tempdir().unwrap();
+        let filler = "The server boots from the jar and loads the world.\n\n".repeat(1_400); // ~73,000 characters
+        let brief = format!(
+            "# Game\n\nA tactics game.\n\n## Build and run\n\n{filler}## Running the server\n\n\
+             Paths no lane touches without Chris's yes: `run/`, `gradle.properties`.\n\n\
+             ## Registries, wiring and config keys\n\nEvery installer registers its systems and its config keys in setup(), in order.\n\
+             Config defaults are read once at start-up by each installer.\n"
+        );
+        let root = d.path().join("Game");
+        write(
+            &root,
+            &[
+                ("CLAUDE.md", &brief),
+                (".ken/gates.json", "{\"protected\": [\"run/\"], \"_protected_note\": \"Paths no lane touches without Chris's yes.\"}"),
+                ("docs/CODE-STANDARDS.md", "# Code standards\n\n## Style\n\nLint with the formatter; helpers live in `utils/`. Follow the style conventions.\n"),
+            ],
+        );
+        let briefs = vec![("CLAUDE.md".to_string(), brief_sections(&brief))];
+        let routed = route_parts("Game", &briefs);
+        let line_of = |h: &str| brief.lines().position(|l| l == h).unwrap() + 1;
+        let wiring = format!("Game:CLAUDE.md:{}", line_of("## Registries, wiring and config keys"));
+        let pages_of = |label: &str| -> Vec<&str> { routed.iter().filter(|(_, v)| v.iter().any(|s| s.label == label)).map(|(p, _)| *p).collect() };
+        let wired = pages_of(&wiring);
+        assert!(wired.contains(&"Conventions/Registries.md") && wired.contains(&"Reference/Config-Map.md"), "{wired:?}");
+        assert!(wired.len() <= PART_PAGES);
+
+        // Who decides reaches Team though it sits in a build section that
+        // fills Build and Run.
+        let repos = vec![("Game".to_string(), root.clone())];
+        let wiki = d.path().join("Wiki");
+        let team = page_sources("Current/Team.md", &wiki, "Wiki", &repos, &[]);
+        let who = team.iter().find(|s| s.label == "Game:(lines of its briefs about who decides)").expect("the decider lines");
+        assert!(who.text.contains(&format!("Game:CLAUDE.md:{}: Paths no lane touches without Chris's yes", line_of("Paths no lane touches without Chris's yes: `run/`, `gradle.properties`."))), "{}", who.text);
+        assert!(team.iter().any(|s| s.label == "Game:.ken/gates.json"), "the protected paths");
+        let code = page_sources("Conventions/Code.md", &wiki, "Wiki", &repos, &[]);
+        assert!(code.iter().any(|s| s.label.starts_with("Game:docs/CODE-STANDARDS.md") && s.text.contains("helpers live in")), "{code:?}");
+
+        // The layers page: the parts about layers before what the code registers.
+        let map = vec![Source { label: format!("Game:{REGISTERS}"), text: "GamePlugin.java:5 setup(): 3 statements".into() }];
+        let layers: Vec<String> = layers_sources("Game", &root, &map).into_iter().map(|s| s.label).collect();
+        let at = |l: &str| layers.iter().position(|x| x == l).unwrap_or_else(|| panic!("{l} in {layers:?}"));
+        assert!(at(&wiring) < at(&format!("Game:{REGISTERS}")), "{layers:?}");
+    }
+
+    /// A pin a draft wrote as `""` is empty: Ken fills it.
+    #[test]
+    fn an_empty_pin_is_filled() {
+        let heads: HashMap<String, String> = [("app".to_string(), "0a1b2c3d4e5f".to_string())].into();
+        for empty in ["pin: \"\"   # the commit each repo's sources were read at", "pin: ''", "pin:"] {
+            let page = format!("---\ntitle: V\n{empty}\nsources:\n  - app:README.md\n---\n# V\n");
+            assert!(pin_sources(&page, &heads).contains("\npin: 0a1b2c3d4e5f\n"), "{empty}: {}", pin_sources(&page, &heads));
+        }
+    }
+
+    /// The name check finds a name inside a longer identifier, never
+    /// rewrites a path to the wiki's own page, and leaves alone what it
+    /// cannot judge, saying so; and a correction may say a thing is gone
+    /// only when Ken's search finds nothing.
+    #[test]
+    fn the_check_is_precise_and_says_what_it_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("game");
+        write(
+            &root,
+            &[
+                ("gradle.properties", "hytale_version = 0.7.0-pre.5\n"),
+                ("src/commands/ResetCommand.java", "class ResetCommand {\n  String NAME = \"reset_kill_stats\";\n}\n"),
+            ],
+        );
+        git_in(&root, &["init", "-q"]);
+        git_in(&root, &["add", "-A"]);
+        let wiki = d.path().join("Wiki");
+        write(&wiki, &[("Reference/Vocabulary.md", "# Vocabulary\n")]);
+        git_in(&wiki, &["init", "-q"]);
+        git_in(&wiki, &["add", "-A"]);
+        let check = PathCheck::of(&[("game".to_string(), root.clone())]).with_library("Wiki", &wiki);
+        let page = "---\ntitle: V\nchanged_by: \"\"\n---\n# V\n\
+            The ids say `kill_stats`; `changed_by` is set by a person; add `MyComponent` to `myConfig`.\n\
+            There is no `stopServer` task. The manifest takes `>=0.7.0-pre.1 <0.8.0`.\n\
+            The brief names the word map at `sr-docs/Engine/Reference/Vocabulary.md`.\n\
+            The docs vault's `_meta/ticketcheck.py` runs at G2; tickets are `tickets/SR-NNN.md`.\n";
+        let found = check.check("Reference/Vocabulary.md", page, None);
+        assert!(found.names.is_empty(), "{:?}", found.names);
+        assert!(found.versions.is_empty(), "{:?}", found.versions);
+        let paths: Vec<(&str, &[String])> = found.paths.iter().map(|m| (m.path.as_str(), m.now.as_slice())).collect();
+        assert_eq!(paths, vec![("sr-docs/Engine/Reference/Vocabulary.md", &[][..])], "never the wiki's own page");
+        for skipped in ["`changed_by` (a key of the page's front matter)", "`MyComponent` (an example name)", "`myConfig` (an example name)", "`stopServer` (on a line that says it does not exist)", "`0.8.0` (a range's bound)", "`_meta/ticketcheck.py` (in a repo Ken did not read)", "`tickets/SR-NNN.md` (a pattern)"] {
+            assert!(found.skipped.contains(&skipped.to_string()), "{skipped}: {:?}", found.skipped);
+        }
+        let (text, _) = rewrite_single_matches(page, &found.paths);
+        assert_eq!(text, page, "a path is never rewritten to the wiki itself");
+
+        // A correction that says `kill_stats` is gone is put back: Ken's
+        // search finds it; one that says `Gone` is gone stands.
+        let before = "# V\n\n| word | code's word |\n|---|---|\n| Chronicle | `kill_stats` `game:x:1` |\n| Old | `Gone` |\n";
+        let fixed = "# V\n\n| word | code's word |\n|---|---|\n| Chronicle | `kill_stats` is gone: no repo has it now |\n| Old | `GoneThing` is gone: no repo has it now |\n";
+        let (out, undone) = guard_absences(before, fixed, &check);
+        assert!(out.contains("| Chronicle | `kill_stats` `game:x:1` |") && out.contains("`GoneThing` is gone"), "{out}");
+        assert_eq!(undone.len(), 1);
+        assert!(undone[0].2.contains("git grep -F kill_stats") && undone[0].2.contains("game:src/commands/ResetCommand.java:2"), "{:?}", undone);
     }
 }
