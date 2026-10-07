@@ -5,6 +5,7 @@ status: current
 audience: business
 updated: {{date}}
 verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
+pin: "{{repo@sha for each repo the sources are in}}"   # the commit each repo's sources were read at
 sources:
   - "{{repo:path of the fix, or repo@sha}}"
   - "{{the log, alert or ticket that first showed it}}"

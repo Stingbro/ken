@@ -4,7 +4,6 @@ aliases: ["Lifecycle", "how does work move", "L1 to L5", "what are the stages"]
 status: current
 audience: method
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
 ---
 
 # Lifecycle

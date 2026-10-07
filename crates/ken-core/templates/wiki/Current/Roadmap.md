@@ -5,6 +5,7 @@ status: current
 audience: business
 updated: {{date}}
 verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
+pin: "{{repo@sha for each repo the sources are in}}"   # the commit each repo's sources were read at
 changed_by: "[[{{the Ingested note that last changed it}}]]"
 sources:
   - "[[{{the Ingested note or ruling that set the milestones}}]]"

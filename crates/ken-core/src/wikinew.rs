@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 /// Which copy of the method's template is bundled.
-pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/wiki @ bed53fc";
+pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/wiki @ 15afe07";
 
 macro_rules! template {
     ($($path:literal),* $(,)?) => {

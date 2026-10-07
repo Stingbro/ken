@@ -14,7 +14,7 @@ The write-up of {{the source}}, as evidence at {{date}}: cite it, never read it 
 
 Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends, if it ends early.}}
 
-Keep the sections this kind of source needs and drop the rest. A meeting or session needs most of them; a document needs the summary, takeaways, contradictions and what it changes; a short note may need only a summary and next steps.
+Keep the sections this kind of source needs and drop the rest. A meeting or session needs most of them; a document needs Summary, Key Takeaways, What It Overturns, Contradictions and Escalations; a short note may need only Summary, Actions and Requests, and Next Steps. Keep each heading as written, because Ken reads rulings, actions, escalations and next steps back by their headings.
 
 ## Summary
 

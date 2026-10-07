@@ -4,6 +4,7 @@ aliases: ["{{Question Answered}} {{date}}", "{{the question, as someone would as
 status: evidence
 audience: dev
 updated: {{date}}
+pin: "{{repo@sha for each repo the sources are in}}"   # the commit each repo's sources were read at
 sources:
   - "{{repo:path:line of each file the answer rests on}}"
 ---

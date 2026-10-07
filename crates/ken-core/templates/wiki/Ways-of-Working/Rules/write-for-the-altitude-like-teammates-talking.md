@@ -4,6 +4,10 @@ aliases: ["Write for the altitude, like teammates talking", "write-for-the-altit
 status: current
 audience: method
 updated: 2026-09-12
+verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
+pin: "Ways-of-Working@a4db365"   # the commit the sources were read at
+sources:
+  - "Ways-of-Working:docs/manual/writing.html"
 ---
 
 # Write for the altitude, like teammates talking

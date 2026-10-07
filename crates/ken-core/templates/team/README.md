@@ -20,9 +20,9 @@ The team's operational state: tickets, ideas, escalations, decisions, the method
 
 These folders change hourly, and the library's pages pin themselves to commits: the Docs drift check reads `git diff <pin>..<default branch>`, so a library kept in its own repo has a history that stays readable. A team with no team repo keeps these folders in its docs repo, beside the library's sections; no file here shares a path with a library file, so the two templates lay down into one folder. `.wright/team.json` then lists that repo once, with kind `["team", "wiki"]`.
 
-## Not Yet in the Template
+## Not in the Template
 
-The method's Starting a Workspace page lists these files in the team template, and none of them is laid down yet.
+These files belong in the team repo, and the template lays none of them down. Until a team adds the guard, nothing but review stops an overlay change from removing something load-bearing.
 
 | file | what it does | where it comes from |
 |---|---|---|

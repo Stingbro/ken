@@ -11,7 +11,7 @@ This file loads into every session, so it carries the short form of every rule. 
 | read | for |
 |---|---|
 | `Ways-of-Working/Ways-of-Working.md` | the method, and where to look in what order |
-| `Ways-of-Working/Rules/` | the binding rules · one file per rule, named as the rule, each carrying its incident |
+| `Ways-of-Working/Rules/` | the rules · one file per rule, named as the rule, each carrying its incident |
 | `Ways-of-Working/Agents/Index.md` | session start: the checklist for a new ticket or session |
 | `Conventions/` | how we do things here, one page per area · what a review reads a change against · architecture per repo |
 | `Platform/` | each upstream or reference dependency: version pinned · quirks · where its content lives · how updates land |
@@ -23,7 +23,7 @@ This file loads into every session, so it carries the short form of every rule. 
 | `Research/Ingestion/` | the inbox: a source dropped in `Raw/` becomes a dated note in `Ingested/` · neither folder is a research source |
 | `Templates/` | the blanks a new page is copied from |
 
-## Binding Rules
+## Rules
 
 - **Search the library first.** Re-deriving from code is slower than reading the page that holds the answer. If the answer is not here and you find it, write it back; the finding is not done until you do.
 - **Search before saying something is missing.** Before reporting that something does not exist, search the code, the data files, the platform's config and the platform's source, and name what was searched. Search the library three ways at once: the knowledge graph, search, and the links between its pages. If search returns little, read the repos directly before answering.
@@ -31,6 +31,6 @@ This file loads into every session, so it carries the short form of every rule. 
 - **Use the code map before grep.** The code map gives each symbol's definition and usages, and each file's outline and imports. For why code changed, read its git history.
 - **A Research page is evidence from its date, not current state.** Cite it with its date.
 - **Open the repo map or a how-to before searching files.** The repo map (`Repo-Map/`, where things live in each repo) says where to look and a how-to says how a task is done, and reading one page costs fewer tokens than searching many files.
-- **A source dropped in `Research/Ingestion/Raw/` is written up at once, and nobody confirms it.** Each source gets a write-up: a summary, the key takeaways, contradictions, rulings, escalations and next steps, as that kind of source needs. What follows from it is written and cites the note. A ruling waits for its decider, and a change to Ways-of-Working, Conventions or a rule becomes a ticket, because work and reviews are read against them.
+- **A source dropped in `Research/Ingestion/Raw/` is written up at once, and nobody confirms it.** Each source gets a write-up from `Templates/Ingested-note.md`, keeping the sections that kind of source needs. What follows from it is written and cites the note. A ruling waits for its decider, and a change to Ways-of-Working, Conventions or a rule becomes a ticket, because work and reviews are read against them.
 - **A page is done when something links to it.** A page nothing links to is never found by a later search.
 - {{a trap that costs time on this team, and the page that holds it}}

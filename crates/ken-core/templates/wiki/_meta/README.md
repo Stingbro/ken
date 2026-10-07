@@ -2,6 +2,8 @@
 
 The library's own checks and housekeeping: each script's kind, the contract every instrument meets, and the rules for generated pages. Not here: what each section holds → `START-HERE.md`.
 
+[[#Scripts]] · [[#Checks the Method Expects]] · [[#The Instrument Contract]] · [[#Generated Pages]]
+
 ## Scripts
 
 | script | kind | does |

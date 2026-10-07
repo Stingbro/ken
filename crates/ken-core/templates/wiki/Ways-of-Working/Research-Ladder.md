@@ -4,7 +4,6 @@ aliases: ["Research Ladder", "Research ladder", "where do I look", "what order d
 status: current
 audience: method
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
 ---
 
 # Research Ladder

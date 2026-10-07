@@ -4,7 +4,6 @@ aliases: ["Session Start", "where do I start a session", "what do I read before 
 status: current
 audience: method
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
 ---
 
 # Session Start

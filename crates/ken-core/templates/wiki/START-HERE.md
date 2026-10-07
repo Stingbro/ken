@@ -54,7 +54,7 @@ Pages counted {{date}}. Research is evidence at the time it was written, never c
 4. [[Project]] and [[Feature Status]] · what we are building, and what is built.
 5. [[Build and Run]] · how to build, test and run each repo.
 6. [[Lifecycle]] · Plan, Size, Build, Release, Learn.
-7. [[Rules]] · the binding rules, one page each, with the incident behind each.
+7. [[Rules]] · the rules, one page each, with the incident behind each.
 
 ## Other Folders
 

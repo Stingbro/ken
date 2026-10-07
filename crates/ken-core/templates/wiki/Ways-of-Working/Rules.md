@@ -4,12 +4,11 @@ aliases: ["Rules", "binding rules", "what are the rules"]
 status: current
 audience: method
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
 ---
 
 # Rules
 
-The binding rules, one page each in `Rules/`, named as the rule, each with the incident behind it. Not here: how code is written → [[Conventions]]; each incident in full → [[Incidents]]; the blank a rule is written from → `Templates/Rule.md`.
+The rules, one page each in `Rules/`, named as the rule, each with the incident behind it. Not here: how code is written → [[Conventions]]; each incident in full → [[Incidents]]; the blank a rule is written from → `Templates/Rule.md`.
 
 [[#Rules in Force]] · [[#Retired Rules]]
 

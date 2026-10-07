@@ -22,7 +22,7 @@ A team with no team repo keeps tickets, ideas, escalations, decisions and people
 
 ## Placeholders
 
-A placeholder is written `{{what goes here}}` and says what goes there. Ken fills `{{team_name}}`, `{{wiki_repo}}`, `{{team_repo}}`, `{{KEY}}`, the repo table on Start Here and every `updated:` date at set-up. A page Ken drafts fills what the repos show, and the rest stays for a person. `verified:` stays empty until a person reads the page against its sources.
+A placeholder is written `{{what goes here}}` and says what goes there. Ken fills `{{team_name}}`, `{{wiki_repo}}`, `{{team_repo}}`, `{{KEY}}`, the repo table on Start Here and every `updated:` date at set-up. A page Ken drafts fills what the repos show, and the rest stays for a person. Only a page with `sources:` carries `pin:` and `verified:`; the entry point, the section indexes and the list pages carry neither, and a Research finding has `pin:` but no `verified:`. `verified:` stays empty until a person reads the page against its sources.
 
 ## Library Pages
 
@@ -53,7 +53,7 @@ Drafted by: **set-up** is filled at set-up with names only · **Ken** is drafted
 | `Current/Roadmap.md` | Current | person | — | every milestone and date |
 | `Current/Feature-Status.md` | Current | Ken | each feature from the changelog and the registration code · the tests that name it · the commit read | whether it was used in the running product |
 | `Current/Team.md` | Current | Ken | roles a `people/` file or a repo doc names | who decides what · the handoffs |
-| `Current/Who-Does-What.md` | Current | Ken | owners from CODEOWNERS · recent committers per area from git | who to ask |
+| `Current/Who-Does-What.md` | Current | Ken | owners from `people/`, then CODEOWNERS · recent committers per area from git, named as `people/` names them | who to ask |
 | `Research/Ingestion/Index.md` | Research | method | the contents lists, as sources arrive | — |
 | `Repo-Map/Index.md` · `Repo-Map/{{repo}}.md` | Repo Map, a section Ken writes from the code | Ken | one page per repo: what it is for · what lives where · which folders call which · who owns it and who commits · how it is built, run and released · the index of those pages | what a repo is for, where its own docs do not say |
 

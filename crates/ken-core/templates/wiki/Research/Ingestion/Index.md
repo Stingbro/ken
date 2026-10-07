@@ -22,7 +22,7 @@ The inbox for material that is not yet the record: meeting transcripts, recordin
 ## Workflow
 
 1. Drop the source in `Raw/`. A recording made in Ken lands here as its transcript.
-2. It is read and written up from `Templates/Ingested-note.md`: a summary, the key takeaways, contradictions, rulings, escalations and next steps, with the sections that kind of source needs.
+2. It is read and written up from `Templates/Ingested-note.md`, keeping the sections that kind of source needs, from Summary and Key Takeaways to Next Steps.
 3. What the note calls for is written, citing the note: page edits, requests on Intake, ideas on Intake's Ideas tab, escalations to the people named, and items on someone's day. Nobody confirms it. A ruling waits for its decider; a change to Ways-of-Working, Conventions or a rule becomes a ticket.
 4. The write-up shows on the source's card on Ken's Ingest screen. A person reads it and can undo anything wrong.
 5. What is now true about the project or the team is rewritten on its page in [[Current]], never appended to. A lasting fact with no page yet becomes a page in its section, with the note as a source. A note is linked, never copied.
