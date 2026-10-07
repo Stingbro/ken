@@ -328,6 +328,11 @@ fn phase_wiki(base: &Path, parent: &Path) -> Result<()> {
         generate,
     )?;
     println!("- drafted: {:?}\n- kept: {:?}\n- failed: {:?}\n- proposed: {:?}\n- still to fill: {:?}\n- sources used: {}", report.drafted, report.kept, report.failed, report.proposed, report.to_fill, report.sources.len());
+    // What the check against the checkout rewrote or sent back, page by page.
+    println!("- corrected: {}", report.corrected.len());
+    for c in &report.corrected {
+        println!("  - {c}");
+    }
     let stats = scan::scan(&wiki, &mut db)?;
     println!("- wiki rescanned: {} added, {} updated", stats.added, stats.updated);
     Ok(())

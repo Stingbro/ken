@@ -858,6 +858,41 @@ fn build_files(root: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// How a page cites what the checkout says now, beside a doc that may be
+/// out of date ([`checkout_sources`]).
+pub const REGISTERS: &str = "(what the code registers, from its entry points)";
+pub const VALUES: &str = "(values in the checkout: build and data files)";
+/// Characters of one of them.
+const CHECKOUT_MAX: usize = 16_000;
+
+/// What the checkout says now: what the code wires together at start-up
+/// ([`crate::checkout::registrations`]) when `wiring`, and the versions the
+/// build files pin with the values of the data files the briefs name
+/// ([`crate::checkout::values`]) when `values`. Wiring is never read for a
+/// reference repo: its code is the platform's, and large.
+fn checkout_sources(
+    name: &str,
+    root: &Path,
+    tracked: &[String],
+    briefs: &[(String, Vec<Section>)],
+    wiring: bool,
+    values: bool,
+) -> Vec<Source> {
+    let mut out = Vec::new();
+    if wiring {
+        if let Some(t) = crate::checkout::registrations(root, tracked) {
+            out.push(Source { label: format!("{name}:{REGISTERS}"), text: t });
+        }
+    }
+    if values {
+        let brief_text: String = briefs.iter().flat_map(|(_, secs)| secs.iter().map(|s| s.text.as_str())).collect();
+        if let Some(t) = crate::checkout::values(root, tracked, &brief_text) {
+            out.push(Source { label: format!("{name}:{VALUES}"), text: t });
+        }
+    }
+    out
+}
+
 /// The release-notes files read per version.
 const RELEASE_NOTES: &[&str] = &["CHANGELOG.md", "PATCHNOTES.md", "RELEASES.md", "HISTORY.md", "CHANGELOG"];
 
@@ -909,18 +944,22 @@ pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) ->
     for (file, summary) in build_files(root) {
         push(format!("{name}:{file}"), clip(&summary, BUILD_MAX), &mut out);
     }
+    let tracked = ls_files(root).unwrap_or_default();
+    let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
+    let push_checkout = pusher_of(REPO_BUDGET, CHECKOUT_MAX);
+    for s in checkout_sources(name, root, &tracked, &briefs, !reference, true) {
+        push_checkout(s.label, s.text, &mut out);
+    }
     let used: usize = out.iter().map(|s| s.text.len()).sum();
     let wants = [Topic::Build, Topic::Architecture, Topic::Project];
     out.extend(sections_for(name, &briefs, |t| wants.contains(&t), (REPO_BUDGET * 2 / 3).saturating_sub(used)));
     // The shape of the repo before its long docs, so a documentation-heavy
     // repo cannot crowd it out of the budget; each whole up to its own budget.
     let push_map = pusher_of(REPO_BUDGET, LAYOUT_BUDGET);
-    let tracked = ls_files(root).unwrap_or_default();
     push_map(format!("{name}:(layout)"), layout(root, &tracked), &mut out);
     // Not for a reference repo: the team reads it and never changes it, and
     // its import map was the slowest part of a draft (1,514 s on a 74,000-file
     // platform source, against 26 s for the team's own mod, 2026-10-05).
-    let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
     if !reference {
         if let Some(d) = folder_imports(root) {
             push_map(format!("{name}:(imports between folders, from the code)"), d, &mut out);
@@ -1010,6 +1049,7 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
          - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
          - A source labelled `repo:FILE:line` is the part of FILE that starts at that line; cite it by that label.\n\
+         - The checkout outranks a doc. Sources labelled `{REGISTERS}` and `{VALUES}`, and the build files, say what the code is now; a brief, README or note says what was true when it was written. Write a version, default, count, class, test, command or list of what is registered only as the checkout has it, and cite the file it is in.\n\
          - People: write an owner, a role or a decider only where CODEOWNERS, a `people/` file or a repo's own docs name one. Never write a role nobody stated. The recent contributors from git say who has committed lately, nothing more. Never speculate whether two names are one person.\n\
          - Reply with the finished page only, in Markdown, starting with `---`. No preamble, no code fences around it.\n\n"
     );
@@ -1136,15 +1176,30 @@ fn as_path(token: &str, repos: &[&str]) -> Option<(Option<String>, String)> {
     (plain_path(t) && (t.contains('/') || has_file_ext(t))).then(|| (None, t.to_string()))
 }
 
-/// The repo paths a page names, in order: each `repo:path` of its
-/// `sources:`, and each backticked token outside code fences that
-/// [`as_path`] reads as a path. `repos` are the repo names a citation may
-/// start with.
-pub fn named_paths(page: &str, repos: &[&str]) -> Vec<(Option<String>, String)> {
-    let mut names: Vec<&str> = repos.to_vec();
-    // `Game-Tools` before `Game`, so a longer name is never cut short.
-    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    let mut out: Vec<(Option<String>, String)> = Vec::new();
+/// A token with `{a,b,c}` in it, once per alternative, every list expanded;
+/// as it is when it has none. A brace list is several paths, never a
+/// wildcard: `data/mob_stats/t1/{light,medium,heavy}.json` was passed on
+/// 2026-10-06 while the files sit one folder deeper. A `{name}` with no comma
+/// stands for any one name and stays.
+pub fn expand_braces(token: &str) -> Vec<String> {
+    let mut from = 0;
+    while let Some(open) = token[from..].find('{').map(|i| from + i) {
+        let Some(close) = token[open..].find('}').map(|i| open + i) else { break };
+        let inner = &token[open + 1..close];
+        if inner.contains(',') {
+            let (head, tail) = (&token[..open], &token[close + 1..]);
+            return inner.split(',').flat_map(|alt| expand_braces(&format!("{head}{}{tail}", alt.trim()))).collect();
+        }
+        from = close + 1;
+    }
+    vec![token.to_string()]
+}
+
+/// The page's frontmatter list items and the backticked tokens of its body
+/// outside code fences, in order, each with whether it is in the frontmatter
+/// and the line of the body it is on.
+fn page_tokens(page: &str) -> Vec<(bool, usize, String)> {
+    let mut out = Vec::new();
     let (mut in_front, mut fence) = (false, false);
     for (i, line) in page.lines().enumerate() {
         let t = line.trim();
@@ -1154,9 +1209,7 @@ pub fn named_paths(page: &str, repos: &[&str]) -> Vec<(Option<String>, String)> 
         }
         if in_front {
             if let Some(item) = t.strip_prefix("- ") {
-                if let Some((Some(r), p)) = as_path(item.trim_matches(['"', '\'']), &names) {
-                    out.push((Some(r), p));
-                }
+                out.push((true, i, item.trim_matches(['"', '\'']).to_string()));
             }
             continue;
         }
@@ -1164,12 +1217,27 @@ pub fn named_paths(page: &str, repos: &[&str]) -> Vec<(Option<String>, String)> 
             fence = !fence;
             continue;
         }
-        if fence {
-            continue;
+        if !fence {
+            out.extend(line.split('`').skip(1).step_by(2).map(|token| (false, i, token.to_string())));
         }
-        for token in line.split('`').skip(1).step_by(2) {
-            if let Some(p) = as_path(token, &names) {
-                out.push(p);
+    }
+    out
+}
+
+/// The repo paths a page names, in order: each `repo:path` of its
+/// `sources:`, and each backticked token outside code fences that
+/// [`as_path`] reads as a path, a brace list once per path in it
+/// ([`expand_braces`]). `repos` are the repo names a citation may start with.
+pub fn named_paths(page: &str, repos: &[&str]) -> Vec<(Option<String>, String)> {
+    let mut names: Vec<&str> = repos.to_vec();
+    // `Game-Tools` before `Game`, so a longer name is never cut short.
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out: Vec<(Option<String>, String)> = Vec::new();
+    for (front, _, token) in page_tokens(page) {
+        for t in expand_braces(&token) {
+            match as_path(&t, &names) {
+                Some(p) if !front || p.0.is_some() => out.push(p),
+                _ => {}
             }
         }
     }
@@ -1189,6 +1257,30 @@ pub struct MissingPath {
     pub now: Vec<String>,
 }
 
+/// One version a page writes where a build file pins another of the same
+/// line (`0.7.0-pre.3` where `gradle.properties` has `0.7.0-pre.5`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaleVersion {
+    pub written: String,
+    pub repo: String,
+    pub pin: crate::checkout::Pin,
+}
+
+/// What the check found in one page: paths no repo has, names written as
+/// code that no repo has, and versions a build file pins otherwise.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Checked {
+    pub paths: Vec<MissingPath>,
+    pub names: Vec<String>,
+    pub versions: Vec<StaleVersion>,
+}
+
+impl Checked {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.names.is_empty() && self.versions.is_empty()
+    }
+}
+
 /// One repo's tracked files, split into segments.
 struct Tracked {
     name: String,
@@ -1196,6 +1288,12 @@ struct Tracked {
     files: Vec<Vec<String>>,
     /// Every folder name anywhere in the repo.
     folders: HashSet<String>,
+    /// The names its code defines and uses ([`crate::checkout::names`]).
+    names: crate::checkout::Names,
+    /// The versions its build files pin.
+    pins: Vec<crate::checkout::Pin>,
+    /// Whether its code was read for names; a shallow one is searched.
+    deep: bool,
 }
 
 /// Whether segment `s` matches pattern segment `pat`, where `*`, `<name>`
@@ -1310,25 +1408,42 @@ impl Tracked {
     }
 }
 
-/// The files each of the team's repos tracks, to check the paths a drafted
-/// page names against.
+/// The files each of the team's repos tracks, the names its code defines
+/// and uses, and the versions its build files pin: what a drafted page is
+/// checked against.
 #[derive(Default)]
 pub struct PathCheck {
     repos: Vec<Tracked>,
 }
 
 impl PathCheck {
+    /// Read from the checkouts: a reference repo's names are its files' and
+    /// folders' only, since its code is the platform's and large.
     pub fn of(repos: &[(String, PathBuf)]) -> PathCheck {
         let repos = repos
             .iter()
             .filter_map(|(name, root)| {
-                let files: Vec<Vec<String>> =
-                    ls_files(root)?.iter().map(|f| f.split('/').map(str::to_string).collect()).collect();
+                let tracked = ls_files(root)?;
+                let files: Vec<Vec<String>> = tracked.iter().map(|f| f.split('/').map(str::to_string).collect()).collect();
                 let folders = files.iter().flat_map(|f| f[..f.len() - 1].iter().cloned()).collect();
-                Some(Tracked { name: name.clone(), root: root.clone(), files, folders })
+                let deep = !crate::registry::kind_of(root).contains(&crate::registry::RepoKind::Reference);
+                let names = crate::checkout::names(root, &tracked, deep);
+                let pins = crate::checkout::pins(root, &tracked);
+                Some(Tracked { name: name.clone(), root: root.clone(), files, folders, names, pins, deep })
             })
             .collect();
         PathCheck { repos }
+    }
+
+    /// The check with the team's library added for paths alone: a page may
+    /// name the wiki's own `Templates/` or `decisions/`, which no code repo has.
+    pub fn with_library(mut self, name: &str, root: &Path) -> PathCheck {
+        let Some(tracked) = ls_files(root) else { return self };
+        let files: Vec<Vec<String>> = tracked.iter().map(|f| f.split('/').map(str::to_string).collect()).collect();
+        let folders = files.iter().flat_map(|f| f[..f.len() - 1].iter().cloned()).collect();
+        let names = crate::checkout::names(root, &tracked, false);
+        self.repos.push(Tracked { name: name.to_string(), root: root.to_path_buf(), files, folders, names, pins: Vec::new(), deep: true });
+        self
     }
 
     /// The paths `page` names that no repo has, each with where a file or
@@ -1356,49 +1471,241 @@ impl PathCheck {
             if scope.iter().any(|t| t.has(&path, is_file) || t.untracked(&path)) {
                 continue;
             }
-            let now: Vec<String> = scope
-                .iter()
-                .flat_map(|t| t.lookup(&path, is_file).into_iter().map(move |p| format!("{}:{p}", t.name)))
-                .take(5)
-                .collect();
+            let mut now: Vec<String> =
+                scope.iter().flat_map(|t| t.lookup(&path, is_file).into_iter().map(move |p| format!("{}:{p}", t.name))).collect();
+            // A test fixture's copy is never what a page means when the real
+            // file is there too.
+            if now.iter().any(|p| !crate::checkout::is_test_path(p)) {
+                now.retain(|p| !crate::checkout::is_test_path(p));
+            }
+            now.truncate(5);
             out.push(MissingPath { path, repo, now });
         }
         out
     }
+
+    /// The names `page` writes as code ([`crate::checkout::as_symbol`]) that
+    /// no repo has: a test no repo's code map defines and no file is named
+    /// after, or any other name (a class, a method, a constant, a key) that
+    /// no repo defines or uses in its code, data or build files. A doc keeps
+    /// naming a test after the test is gone, and a comment may still say its
+    /// name: `OneNameLineComposerTest` and `InventoryIsNotPackTest` were
+    /// drafted from the mod's brief on 2026-10-06, after the test audit had
+    /// removed both.
+    pub fn unknown_names(&self, page: &str) -> Vec<String> {
+        if self.repos.is_empty() {
+            return Vec::new();
+        }
+        let repos: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+        let mut out: Vec<String> = Vec::new();
+        for (front, _, token) in page_tokens(page) {
+            if front || as_path(&token, &repos).is_some() {
+                continue;
+            }
+            let Some((name, is_class)) = crate::checkout::as_symbol(&token) else { continue };
+            let test = is_class && ["Test", "Tests", "Spec", "IT"].iter().any(|s| name.ends_with(s));
+            let known = self.repos.iter().any(|t| t.names.defined.contains(&name) || (!test && t.names.used.contains(&name)));
+            if !known && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        // A repo read shallow (a platform the team only reads) is searched
+        // for what is left, once: its code is too large to map up front.
+        for t in self.repos.iter().filter(|t| !t.deep) {
+            let open: Vec<&String> = out.iter().filter(|n| !n.ends_with("Test")).collect();
+            if open.is_empty() {
+                break;
+            }
+            let mut args: Vec<String> = ["grep", "-o", "-h", "-w", "-F", "-I"].iter().map(|a| a.to_string()).collect();
+            for n in open {
+                args.push("-e".into());
+                args.push(n.clone());
+            }
+            args.extend(["--".to_string(), ":!*.md".to_string()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Some(hits) = git_text(&t.root, &args) {
+                let hits: HashSet<&str> = hits.lines().map(str::trim).collect();
+                out.retain(|n| !hits.contains(n.as_str()));
+            }
+        }
+        out
+    }
+
+    /// The versions `page` states that a build file of some repo pins
+    /// otherwise: a version of the same line as a pinned one (`0.7.0-pre.3`
+    /// against `0.7.0-pre.5`), or any version on a line that names a pinned
+    /// key (`hytale_version`), where the page's is none of the pinned ones.
+    /// Six pages carried the engine pin a dated note gave, `pre.3`, while
+    /// `gradle.properties` said `pre.5` (2026-10-06).
+    pub fn stale_versions(&self, page: &str) -> Vec<StaleVersion> {
+        let pinned: HashSet<&str> = self.repos.iter().flat_map(|t| t.pins.iter().map(|p| p.value.as_str())).collect();
+        let mut out: Vec<StaleVersion> = Vec::new();
+        let (mut in_front, mut fence) = (false, false);
+        for (i, line) in page.lines().enumerate() {
+            let t = line.trim();
+            if t == "---" && (i == 0 || in_front) {
+                in_front = i == 0;
+                continue;
+            }
+            if t.starts_with("```") || t.starts_with("~~~") {
+                fence = !fence;
+            }
+            if in_front || fence {
+                continue;
+            }
+            for written in crate::checkout::versions_in(line) {
+                if pinned.contains(written.as_str()) {
+                    continue;
+                }
+                let core = crate::checkout::version_core(&written);
+                let pre = written.contains(['-', '+']);
+                for repo in &self.repos {
+                    let named_key = |key: &str| {
+                        let leaf = key.rsplit('.').next().unwrap_or(key);
+                        leaf != "version" && leaf.len() >= 4 && line.contains(key)
+                    };
+                    let hit = repo.pins.iter().find(|p| {
+                        let same_line = crate::checkout::version_core(&p.value) == core && p.value.contains(['-', '+']) == pre;
+                        same_line || named_key(&p.key)
+                    });
+                    if let Some(p) = hit {
+                        if !out.iter().any(|s| s.written == written && s.pin == *p) {
+                            out.push(StaleVersion { written: written.clone(), repo: repo.name.clone(), pin: p.clone() });
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Everything [`PathCheck`] finds in the page at `page_path`. A page of
+    /// history ([`is_history`]) names old versions on purpose, so its
+    /// versions are not checked.
+    pub fn check(&self, page_path: &str, page: &str, home: Option<&str>) -> Checked {
+        let versions = if is_history(page_path) { Vec::new() } else { self.stale_versions(page) };
+        Checked { paths: self.missing(page, home), names: self.unknown_names(page), versions }
+    }
 }
 
-/// The one call that corrects a drafted page's missing paths: each path,
-/// and where the code has it now or that no repo does.
-pub fn correction_prompt(page_path: &str, page: &str, missing: &[MissingPath]) -> String {
+/// The one call that corrects a drafted page: each path the checkout lacks
+/// with where the code has it now or that no repo does, each name written as
+/// code that no repo has, and each version a build file pins otherwise.
+pub fn correction_prompt(page_path: &str, page: &str, found: &Checked) -> String {
     let mut s = format!(
-        "You drafted `{page_path}`, one page of a team's wiki. Ken checked every repo path the page names against the \
-         files each repo tracks in git, and these are not there:\n\n"
+        "You drafted `{page_path}`, one page of a team's wiki. Ken checked the page against the checkout of every repo \
+         of the team, and found these:\n\n"
     );
-    for m in missing {
+    for m in &found.paths {
         let cited = m.repo.as_deref().map(|r| format!(" (cited in {r})")).unwrap_or_default();
         if m.now.is_empty() {
-            s.push_str(&format!("- `{}`{cited}: no repo of the team has a file or folder of that name\n", m.path));
+            s.push_str(&format!("- path `{}`{cited}: no repo of the team has a file or folder of that name\n", m.path));
         } else {
             let at: Vec<String> = m.now.iter().map(|p| format!("`{p}`")).collect();
-            s.push_str(&format!("- `{}`{cited}: a file or folder of that name is at {}\n", m.path, at.join(", ")));
+            s.push_str(&format!("- path `{}`{cited}: not there; a file or folder of that name is at {}\n", m.path, at.join(", ")));
         }
     }
+    for n in &found.names {
+        s.push_str(&format!("- name `{n}`: written as code, and no repo defines it, has a file of that name or uses it\n"));
+    }
+    for v in &found.versions {
+        s.push_str(&format!("- version `{}`: `{}:{}` has `{} = {}`\n", v.written, v.repo, v.pin.file, v.pin.key, v.pin.value));
+    }
     s.push_str(
-        "\nCorrect the page: write each of these where the code has it now, choosing by what the page says about it; \
-         where the code no longer has it, leave it out or say it is gone. Two exceptions, kept as they are: a path the \
-         sources place outside these repos (another repo, the docs vault), and a file the sources say something makes \
-         (a build, the server at run time, a person). Change nothing else. Reply with the whole corrected page, starting \
-         with `---`. No preamble, no code fences around it.\n\nTHE PAGE:\n",
+        "\nCorrect the page: write each path where the code has it now, choosing by what the page says about it; a \
+         name the code no longer has, leave out or say it is gone; a version, write as the build file has it and cite \
+         the file. Kept as they are: a path the sources place outside these repos (another repo, the docs vault), a \
+         file the sources say something makes (a build, the server at run time, a person), a name that is a product, \
+         a tool, an example or a word rather than the team's code, and a version the page gives as history. Change nothing else. \
+         Reply with the whole corrected page, starting with `---`. No preamble, no code fences around it.\n\nTHE PAGE:\n",
     );
     s.push_str(page);
     s
 }
 
-/// `text`, a page just drafted, with the paths it names checked: when any
-/// is missing, ONE call to the model lists them with where the code has them
-/// now and takes the corrected page back. Never a second call: a path still
-/// wrong after it is for the person reading the draft. The page as drafted
-/// when the call fails.
+/// `page` with each backticked token and frontmatter item that `f` maps
+/// written as what it maps to.
+fn map_tokens(page: &str, f: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(page.len());
+    let (mut in_front, mut fence) = (false, false);
+    for (i, line) in page.split_inclusive('\n').enumerate() {
+        let t = line.trim();
+        if t == "---" && (i == 0 || in_front) {
+            in_front = i == 0;
+            out.push_str(line);
+            continue;
+        }
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = !fence;
+        }
+        if in_front {
+            let item = t.strip_prefix("- ").map(|x| x.trim_matches(['"', '\'']));
+            match item.and_then(&f) {
+                Some(new) => out.push_str(&line.replacen(item.unwrap_or_default(), &new, 1)),
+                None => out.push_str(line),
+            }
+            continue;
+        }
+        if fence {
+            out.push_str(line);
+            continue;
+        }
+        for (k, part) in line.split('`').enumerate() {
+            if k > 0 {
+                out.push('`');
+            }
+            match f(part).filter(|_| k % 2 == 1) {
+                Some(new) => out.push_str(&new),
+                None => out.push_str(part),
+            }
+        }
+    }
+    out
+}
+
+/// `page` with each missing path that the checkout has exactly one file or
+/// folder of that name for written as that one, in backticks and in the
+/// frontmatter, bare or cited: there is nothing for a model to choose, so no
+/// call is spent on it. A pattern, a cited line (`repo:path:12`, the line of
+/// another file) and a path from a brace list are left to the call. Each
+/// rewrite as (from, to).
+fn rewrite_single_matches(page: &str, missing: &[MissingPath]) -> (String, Vec<(String, String)>) {
+    let mut out = page.to_string();
+    let mut done = Vec::new();
+    for m in missing {
+        let [only] = m.now.as_slice() else { continue };
+        let Some((repo, to)) = only.split_once(':') else { continue };
+        // A file stays a file; a folder or a class named without its
+        // extension may become either.
+        if m.path.split('/').any(is_wild) || (has_file_ext(&m.path) && to.ends_with('/')) {
+            continue;
+        }
+        let cited = format!("{repo}:{}", m.path);
+        let next = map_tokens(&out, |t| {
+            let t = t.trim();
+            if t == m.path {
+                Some(to.to_string())
+            } else if t == cited {
+                Some(format!("{repo}:{to}"))
+            } else {
+                None
+            }
+        });
+        if next != out {
+            out = next;
+            done.push((m.path.clone(), only.clone()));
+        }
+    }
+    (out, done)
+}
+
+/// `text`, a page just drafted, checked against the checkout ([`PathCheck`]).
+/// A missing path the checkout has one match for is rewritten in place
+/// ([`rewrite_single_matches`]); for the rest, and every unknown name and
+/// stale version, ONE call to the model lists them and takes the corrected
+/// page back. Never a second call: what is still wrong after it is for the
+/// person reading the draft. The page as it stood when the call fails. Each
+/// rewrite and each call is logged in `report.corrected`.
 fn check_paths(
     page_path: &str,
     text: String,
@@ -1408,20 +1715,54 @@ fn check_paths(
 ) -> String {
     let home = check.repos.iter().find(|t| repo_page(&t.name) == page_path).map(|t| t.name.as_str());
     let missing = check.missing(&text, home);
-    if missing.is_empty() {
+    let (text, rewritten) = rewrite_single_matches(&text, &missing);
+    for (from, to) in &rewritten {
+        report.corrected.push(format!("{page_path}: `{from}` -> `{to}` (rewritten, one match)"));
+    }
+    let found = check.check(page_path, &text, home);
+    if found.is_empty() {
         return text;
     }
-    match generate(&correction_prompt(page_path, &text, &missing)).and_then(|r| finish(&r)) {
+    let listed = found_list(&found);
+    match generate(&correction_prompt(page_path, &text, &found)).and_then(|r| finish(&r)) {
         Ok(fixed) => {
-            let n = missing.len();
-            report.corrected.push(format!("{page_path}: {n} path{}", if n == 1 { "" } else { "s" }));
+            report.corrected.push(format!("{page_path}: sent back once for {listed}"));
             fixed
         }
-        Err(_) => text,
+        Err(e) => {
+            report.corrected.push(format!("{page_path}: the call to correct {listed} failed: {e}"));
+            text
+        }
     }
 }
 
-//// What a draft run did.
+/// Whether a page is history (release notes, incidents): what was true then.
+fn is_history(page_path: &str) -> bool {
+    page_path.starts_with("Work/")
+}
+
+/// What a check found, in one line for the run's log.
+pub fn found_list(found: &Checked) -> String {
+    let quoted = |v: Vec<String>| v.iter().map(|x| format!("`{x}`")).collect::<Vec<_>>().join(", ");
+    let mut parts: Vec<String> = Vec::new();
+    if !found.paths.is_empty() {
+        parts.push(format!("paths {}", quoted(found.paths.iter().map(|m| m.path.clone()).collect())));
+    }
+    if !found.names.is_empty() {
+        parts.push(format!("names {}", quoted(found.names.clone())));
+    }
+    if !found.versions.is_empty() {
+        let v: Vec<String> = found
+            .versions
+            .iter()
+            .map(|v| format!("`{}` ({}:{} {} = {})", v.written, v.repo, v.pin.file, v.pin.key, v.pin.value))
+            .collect();
+        parts.push(format!("versions {}", v.join(", ")));
+    }
+    parts.join("; ")
+}
+
+/// What a draft run did.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftReport {
@@ -1436,8 +1777,9 @@ pub struct DraftReport {
     /// Placeholders left in the wiki after the draft, as `page: placeholder`.
     #[serde(default)]
     pub to_fill: Vec<String>,
-    /// Pages whose named paths the checkout did not have, sent back once
-    /// to be corrected, as `page: n paths`.
+    /// What the check against the checkout changed, one line each: a path
+    /// rewritten to its one match, or a page sent back once with the paths,
+    /// names and versions listed ([`check_paths`]).
     #[serde(default)]
     pub corrected: Vec<String>,
 }
@@ -1931,6 +2273,19 @@ fn page_topics(page: &str) -> &'static [Topic] {
     }
 }
 
+/// Which of what the checkout says now ([`checkout_sources`]) a team page
+/// reads, as (what the code registers, the values): the pages that list
+/// systems, features and registries take the wiring, one row per
+/// registration; the pages that state versions, defaults and data take the
+/// values.
+fn checkout_wanted(page: &str) -> (bool, bool) {
+    match page {
+        "Reference/Systems.md" | "Current/Feature-Status.md" | "Conventions/Registries.md" => (true, false),
+        "Reference/Config-Map.md" | "Reference/Build-and-Run.md" | "Platform/Index.md" | "Conventions/Data-and-Config.md" => (false, true),
+        _ => (false, false),
+    }
+}
+
 /// Split `budget` between repos that would read `sizes`: an equal share
 /// each, and what a repo needs less than its share goes to the others. A
 /// strict equal share gave the mod's 40,000 characters of architecture the
@@ -1983,6 +2338,13 @@ pub fn page_sources(
         let mut mine: Vec<Source> = Vec::new();
         let push = pusher_of(PAGE_BUDGET, SECTION_MAX.max(LAYOUT_BUDGET));
         let used = |v: &[Source]| v.iter().map(|s| s.text.len()).sum::<usize>();
+        // What the checkout says now, first, so no doc's older figure wins.
+        let (wiring, values) = checkout_wanted(page);
+        if wiring || values {
+            let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
+            let tracked = ls_files(root).unwrap_or_default();
+            mine.extend(checkout_sources(name, root, &tracked, &briefs(root), wiring && !reference, values));
+        }
         match page {
             "Work/Releases.md" => {
                 if let Some(t) = git_tags(root) {
@@ -2147,7 +2509,7 @@ pub fn draft_team(
     mut generate: impl FnMut(&str) -> Result<String>,
 ) -> Result<DraftReport> {
     let mut report = DraftReport::default();
-    let check = PathCheck::of(repos);
+    let check = PathCheck::of(repos).with_library(wiki_name, wiki);
     let roster = team_roster(wiki, repos);
     draft_repo_pages(wiki, repos, &roster, today, &mut report, &mut generate, &check)?;
     let described: Vec<(String, String)> = repos.iter().map(|(n, r)| (n.clone(), describe_repo(wiki, n, r))).collect();
@@ -2295,7 +2657,7 @@ pub fn draft_added(
 ) -> Result<DraftReport> {
     let mut report = DraftReport::default();
     let names: Vec<String> = added.iter().map(|(n, _)| n.clone()).collect();
-    let check = PathCheck::of(all);
+    let check = PathCheck::of(all).with_library(wiki_name, wiki);
     // The roster from every repo of the team: the team repo may not be one
     // of those added.
     let roster = team_roster(wiki, all);
@@ -2976,13 +3338,71 @@ mod tests {
         let fixed = check_paths("Repo-Map/game.md", finish(page).unwrap(), &check, &mut report, &mut generate);
         let first = calls.borrow()[0].clone();
         assert_eq!(calls.borrow().len(), 1, "one correction call, never a loop");
-        assert!(first.contains("- `utils/CombatCalculator.java`: a file or folder of that name is at `game:src/main/java/dev/app/services/combat/CombatCalculator.java`"), "{first}");
-        assert!(first.contains("- `gone/Nothing.java`: no repo of the team has a file or folder of that name"));
+        // A path with one match is rewritten in place; the call gets the rest.
+        let full = "src/main/java/dev/app/services/combat/CombatCalculator.java";
+        assert!(first.contains(&format!("Damage maths is `{full}` (`{full}`)")), "{first}");
+        assert!(!first.contains("- path `utils/CombatCalculator"), "{first}");
+        assert!(first.contains("- path `data/*.json`: not there; a file or folder of that name is at `game:src/main/resources/data/`"), "{first}");
+        assert!(first.contains("- path `gone/Nothing.java`: no repo of the team has a file or folder of that name"));
         assert!(fixed.contains("status: draft") && fixed.contains("Still names"));
-        assert_eq!(report.corrected, vec!["Repo-Map/game.md: 5 paths"]);
+        assert_eq!(
+            report.corrected,
+            vec![
+                format!("Repo-Map/game.md: `utils/CombatCalculator.java` -> `game:{full}` (rewritten, one match)"),
+                format!("Repo-Map/game.md: `utils/CombatCalculator` -> `game:{full}` (rewritten, one match)"),
+                "Repo-Map/game.md: sent back once for paths `docs/OLD.md`, `data/*.json`, `gone/Nothing.java`".to_string(),
+            ]
+        );
+        // Only a path with one match: rewritten, bare and cited, and no call.
+        let one = "---\ntitle: Game\nsources:\n  - game:log/SrLog.java\n---\nLogging is `log/SrLog.java`.\n".to_string();
+        let fixed = check_paths("x.md", one, &check, &mut report, &mut generate);
+        assert_eq!(calls.borrow().len(), 1, "a single match costs no call");
+        assert!(fixed.contains("  - game:src/main/java/dev/app/utils/SrLog.java\n"), "{fixed}");
+        assert!(fixed.contains("Logging is `src/main/java/dev/app/utils/SrLog.java`."), "{fixed}");
+        // A brace list is one path per name in it, and a name is checked.
+        let braces = "---\ntitle: G\n---\nBases are `src/main/resources/data/equipment/{WeaponBases,ArmourBases}.json`.\n";
+        let paths: Vec<String> = check.missing(braces, None).into_iter().map(|m| m.path).collect();
+        assert_eq!(paths, vec!["src/main/resources/data/equipment/ArmourBases.json"]);
         let clean = "---\ntitle: Game\n---\nSee `src/main/resources/data/equipment/WeaponBases.json`.\n".to_string();
         assert_eq!(check_paths("x.md", clean.clone(), &check, &mut report, &mut generate), clean);
         assert_eq!(calls.borrow().len(), 1, "a clean page costs no call");
+    }
+
+    /// A name written as code must be in the code, and a version must be the
+    /// one the build file pins; both go into the page's one correction call.
+    #[test]
+    fn names_and_versions_a_page_states_are_checked_against_the_checkout() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("game");
+        write(
+            &root,
+            &[
+                ("gradle.properties", "# 0.7.0-pre.2 -> 0.7.0-pre.3 on 2026-09-17\nhytale_version = 0.7.0-pre.5\nversion = 0.0.15\n"),
+                ("src/test/java/dev/app/ArchitectureRulesTest.java", "class ArchitectureRulesTest {\n  void freezesGetInstance() {}\n}\n"),
+                ("src/test/java/dev/app/ItemNameLineTest.java", "// replaces OneNameLineComposerTest\nclass ItemNameLineTest {}\n"),
+                ("src/main/resources/data/combat/Causes.json", "{\"WeaponModMultiplier\": 1.17}\n"),
+            ],
+        );
+        git_in(&root, &["init", "-q"]);
+        git_in(&root, &["add", "-A"]);
+        let check = PathCheck::of(&[("game".to_string(), root.clone())]);
+        let page = "---\ntitle: Game\nsources:\n  - game:gradle.properties\n---\n\
+            `gradle.properties` pins the engine at 0.7.0-pre.3 (`hytale_version`).\n\
+            `ArchitectureRulesTest` freezes `getInstance()` via `freezesGetInstance`; `OneNameLineComposerTest` guards names.\n\
+            `WeaponModMultiplier` is 1.17; energy is `Stamina` in `JSON`. Releases 0.0.14 and 0.0.15 shipped.\n\
+            ```\nOldGoneTest 0.7.0-pre.1\n```\n";
+        let found = check.check("Platform/Index.md", page, None);
+        assert!(found.paths.is_empty(), "{:?}", found.paths);
+        assert_eq!(found.names, vec!["getInstance", "OneNameLineComposerTest"], "a comment naming a test is not the test");
+        let v: Vec<(&str, &str)> = found.versions.iter().map(|v| (v.written.as_str(), v.pin.value.as_str())).collect();
+        assert_eq!(v, vec![("0.7.0-pre.3", "0.7.0-pre.5")], "history in a release list is not a pin");
+        let p = correction_prompt("Platform/Index.md", page, &found);
+        assert!(p.contains("- name `OneNameLineComposerTest`: written as code, and no repo defines it"), "{p}");
+        assert!(p.contains("- version `0.7.0-pre.3`: `game:gradle.properties` has `hytale_version = 0.7.0-pre.5`"), "{p}");
+        assert_eq!(
+            found_list(&found),
+            "names `getInstance`, `OneNameLineComposerTest`; versions `0.7.0-pre.3` (game:gradle.properties hytale_version = 0.7.0-pre.5)"
+        );
     }
 
     /// Item 4: the import map names folders below the source root, so a
