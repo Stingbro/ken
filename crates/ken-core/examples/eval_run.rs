@@ -548,6 +548,32 @@ fn kb_format() -> bool {
     std::env::var("KEN_EVAL_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("kb"))
 }
 
+/// `KEN_EVAL_DUMP=<file>`: each question's per-member hits as one JSON line
+/// (member, whether it is the knowledge base or a reference repo, and each
+/// hit's path, score and band), so a merge policy can be tried on the same
+/// lists without searching again.
+fn dump_hits(label: &str, n: usize, expects: &[String], plan: &routing::RoutePlan, hits: &[routing::MemberHits]) {
+    let Some(path) = std::env::var_os("KEN_EVAL_DUMP") else { return };
+    let members: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|m| {
+            let kinds = ken_core::registry::entry_of(m.project_id).map(|(_, k)| k).unwrap_or_default();
+            serde_json::json!({
+                "member": m.member_name,
+                "order": plan.targets.iter().position(|t| *t == m.project_id),
+                "kb": routing::is_knowledge_base(&kinds),
+                "reference": kinds.contains(&ken_core::registry::RepoKind::Reference),
+                "hits": m.hits.iter().map(|h| serde_json::json!({"path": h.path, "score": h.score, "band": h.page.as_ref().map_or(1, |p| p.band)})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let line = serde_json::json!({"label": label, "n": n, "expects": expects, "reason": format!("{:?}", plan.reason), "platform": plan.platform, "members": members});
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// The question numbers in `KEN_EVAL_ONLY` (e.g. `9,10,15`); empty for all.
 fn only() -> Vec<usize> {
     std::env::var("KEN_EVAL_ONLY").unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect()
@@ -837,6 +863,9 @@ fn phase_kb_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
                     hits: routing::search_member_of_with(db, &q.text, qv.as_deref().filter(|_| fits(db)), limit, &types, Some(&shared)).unwrap_or_default(),
                 })
                 .collect();
+            if limit == ROUTE_LIMIT {
+                dump_hits("kb", q.n, &q.expects, &plan, &hits);
+            }
             pages(routing::merge_routed(&plan, &hits, limit).results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect())
         };
         let routed = route(ROUTE_LIMIT);
@@ -1424,6 +1453,9 @@ fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         // columns compare like with like.
         let keyword_members = search(None);
         let keyword = routing::merge_routed(&plan, &keyword_members, 8);
+        let expect_list: Vec<String> = expects.iter().map(|e| e.to_string()).collect();
+        dump_hits("hybrid", qi + 1, &expect_list, &plan, &hybrid_members);
+        dump_hits("keyword", qi + 1, &expect_list, &plan, &keyword_members);
 
         let rank_of = |paths: &[String]| paths.iter().position(|p| expects.iter().any(|e| p.contains(e)));
         let hybrid_paths: Vec<String> = hybrid.results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect();
