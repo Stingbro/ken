@@ -333,6 +333,16 @@ fn phase_wiki(base: &Path, parent: &Path) -> Result<()> {
     for c in &report.corrected {
         println!("  - {c}");
     }
+    // What the check of each page against its sources did, then every change.
+    println!("- verified: {}", report.verified.len());
+    for v in &report.verified {
+        println!("  - {v}");
+    }
+    println!("- changes: {}", report.changes.len());
+    for c in &report.changes {
+        let one = |s: &str| s.replace('\n', " ");
+        println!("  - {} {}: `{}` -> `{}` ({})", c.page, c.kind, one(&c.before), one(&c.after), one(&c.evidence));
+    }
     let stats = scan::scan(&wiki, &mut db)?;
     println!("- wiki rescanned: {} added, {} updated", stats.added, stats.updated);
     Ok(())

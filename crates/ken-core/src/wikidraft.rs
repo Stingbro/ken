@@ -213,6 +213,21 @@ pub(crate) fn grep_repo(repo: &str, root: &Path, needle: &str, ignore_case: bool
     (count, lines.into_iter().take(40).map(|(_, l)| l).collect())
 }
 
+/// [`grep_repo`] for `word` as a whole word, in any case: `KING` finds the
+/// `"King"` a loader still accepts, not `making`.
+pub(crate) fn grep_repo_word(repo: &str, root: &Path, word: &str) -> (usize, Vec<String>) {
+    let text = git_text(root, &["grep", "-n", "-I", "-F", "-i", "-w", "-e", word, "--", ".", ":!*.md", ":!*.txt"]).unwrap_or_default();
+    let lines: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            let (path, rest) = l.split_once(':')?;
+            let (n, body) = rest.split_once(':')?;
+            Some(format!("{repo}:{path}:{n}: {}", clip_line(body.trim(), 200)))
+        })
+        .collect();
+    (lines.len(), lines.into_iter().take(20).collect())
+}
+
 /// Every file git tracks in `root`, as `/`-separated paths.
 fn ls_files(root: &Path) -> Option<Vec<String>> {
     let text = git_text(root, &["ls-files", "-z"])?;
@@ -1446,8 +1461,9 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
         "You are drafting one page of a team's wiki, `{page}`, for a person to review. The page is: {purpose}.\n\n\
          Rules:\n\
          - Use only what the sources below say. Where they say nothing, leave the fact out: never write a row, a cell or a field that says something is unknown or not in the sources. Keep a template's table rows only where you have a source for the row's main column, and leave a cell empty when only it has none.\n\
-         - End the page with one line, `To fill: …`, naming once what a person should add that the sources do not say. Leave the line out when nothing is missing.\n\
-         - Cite sources inline as their labels in backticks, e.g. `ken:README.md`, once at the end of each paragraph, list item or table row, for every source it used.\n\
+         - End the page with one line, `To fill: …`, naming once what a person should add that the sources do not say. Before you name an item, look for its answer in the page's own frontmatter, in the sources below and in the pages of this wiki: name only what none of them answers, and never the `pin` (Ken writes it). Leave the line out when nothing is missing.\n\
+         - Every statement cites its source. Each table row, list item and paragraph ends with the label of the source that says it, in backticks: `repo:FILE:line` at the line that says it when the source has lines (e.g. `ken:README.md:12`), else the source's label (e.g. `ken:README.md`); or a link, `[[Page]]`, when another page of the wiki owns the fact. In a table, the citations go in its source column (`shown in`, `evidence`, `sources`), else at the end of its last cell. A statement with no citation is taken out before the page is published, and every one is checked against what it cites.\n\
+         - Write only what the cited source says: never a reason, purpose or consequence it does not give, and never a wider claim (\"all\", \"only\", \"every\", \"none\") than it makes. Give a list or set whole, as the source gives it; where a source gives only part of a set (\"the first 5 of 49\"), say so.\n\
          - Frontmatter: keep the template's keys; set `status: draft`; set `updated: {today}`; do NOT write a `verified:` line (a person verifies it later); list every source you used under `sources:` as its label.\n\
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
          - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
@@ -1895,6 +1911,8 @@ impl Tracked {
 #[derive(Default)]
 pub struct PathCheck {
     pub(crate) repos: Vec<Tracked>,
+    /// The commit each repo was read at.
+    pub(crate) heads: HashMap<String, String>,
     /// What `git grep` found for a needle in a repo, for the run.
     #[allow(clippy::type_complexity)]
     pub(crate) greps: std::cell::RefCell<HashMap<String, (usize, Vec<String>)>>,
@@ -1916,7 +1934,7 @@ impl PathCheck {
                 Some(Tracked { name: name.clone(), root: root.clone(), files, folders, names, pins, deep, library: false })
             })
             .collect();
-        PathCheck { repos: tracked, ..Default::default() }
+        PathCheck { repos: tracked, heads: repo_heads(repos), ..Default::default() }
     }
 
     /// The check with the team's library added for paths alone: a page may
@@ -2514,6 +2532,14 @@ pub struct DraftReport {
     /// names and versions listed ([`check_paths`]).
     #[serde(default)]
     pub corrected: Vec<String>,
+    /// What the check of each page against its sources found, one line a
+    /// page ([`crate::wikiverify::check`]).
+    #[serde(default)]
+    pub verified: Vec<String>,
+    /// Every statement that check changed or removed, and every `To fill:`
+    /// item it answered, with before, after and evidence.
+    #[serde(default)]
+    pub changes: Vec<crate::wikiverify::Change>,
 }
 
 /// The template placeholders still in `wiki`'s pages, as `page: placeholder`.
@@ -2700,15 +2726,56 @@ fn draft_page(
         report.kept.push(page.to_string());
         return Ok(());
     }
-    match generate(&prompt(page, purpose, existing.as_deref().or(blank), sources, today)).and_then(|r| finish(&r)) {
+    let template = existing.as_deref().or(blank);
+    match generate(&prompt(page, purpose, template, sources, today)).and_then(|r| finish(&r)) {
         Ok(text) => {
             let text = check_paths(page, text, check, report, generate);
-            write_page(&path, &text)?;
-            report.drafted.push(page.to_string());
+            let lines = template_lines(template.unwrap_or_default());
+            match verify(page, &text, &lines, sources, wiki, check, report, generate) {
+                Ok(text) => {
+                    write_page(&path, &text)?;
+                    report.drafted.push(page.to_string());
+                }
+                Err(e) => report.failed.push((page.to_string(), e.to_string())),
+            }
         }
         Err(e) => report.failed.push((page.to_string(), e.to_string())),
     }
     Ok(())
+}
+
+/// The lines of a template, trimmed: a drafted line that is one of them is
+/// the template's, never a claim to check.
+fn template_lines(template: &str) -> HashSet<String> {
+    template.lines().map(str::trim).filter(|l| !l.is_empty() && !l.contains("{{")).map(String::from).collect()
+}
+
+/// `text`, a page just drafted, checked against its sources
+/// ([`crate::wikiverify::check`]) and logged in `report`. With no checkout
+/// to read (the single-folder [`draft`]), as it is. An error when the check
+/// could not be made: nothing unverified is published.
+#[allow(clippy::too_many_arguments)]
+fn verify(
+    page: &str,
+    text: &str,
+    template: &HashSet<String>,
+    sources: &[Source],
+    wiki: &Path,
+    check: &PathCheck,
+    report: &mut DraftReport,
+    generate: &mut impl FnMut(&str) -> Result<String>,
+) -> Result<String> {
+    if check.repos.is_empty() {
+        return Ok(text.to_string());
+    }
+    let drafted = report.drafted.clone();
+    let ctx = crate::wikiverify::Ctx { check, sources, wiki, drafted: &drafted };
+    let (page_text, done) = crate::wikiverify::check(page, text, template, &ctx, generate)?;
+    if !done.summary.is_empty() {
+        report.verified.push(done.summary);
+    }
+    report.changes.extend(done.changes);
+    Ok(page_text)
 }
 
 /// A draft's result as the wiki keeps it, for the Team screen.
@@ -2841,7 +2908,7 @@ pub const OWNS: &[(&str, &str)] = &[
 ];
 
 /// What `page` owns ([`OWNS`]).
-fn owns(page: &str) -> &'static str {
+pub(crate) fn owns(page: &str) -> &'static str {
     OWNS.iter().find(|(p, _)| *p == page).map_or("", |(_, o)| o)
 }
 
@@ -3438,6 +3505,7 @@ fn draft_traps(
     roster: &[crate::people::Person],
     report: &mut DraftReport,
     generate: &mut impl FnMut(&str) -> Result<String>,
+    check: &PathCheck,
 ) -> Result<()> {
     let path = wiki.join(START_HERE);
     let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
@@ -3453,8 +3521,17 @@ fn draft_traps(
     let filled = generate(&traps_prompt(&page_directory(repos), &sources)).map(|r| fill_traps(&text, &traps_rows(&r)));
     match filled {
         Ok(Some(page)) => {
-            write_page(&path, &page)?;
-            report.drafted.push(START_HERE.to_string());
+            // Only the rows are Ken's: every line set-up wrote is left alone.
+            let set_up: HashSet<String> = text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            let kept_a_row = |p: &str| p.lines().any(|l| l.trim().starts_with('|') && !set_up.contains(l.trim()));
+            match verify(START_HERE, &page, &set_up, &sources, wiki, check, report, generate) {
+                Ok(checked) if kept_a_row(&checked) => {
+                    write_page(&path, &checked)?;
+                    report.drafted.push(START_HERE.to_string());
+                }
+                Ok(_) => report.failed.push((START_HERE.to_string(), "no Traps row was borne out by its source".into())),
+                Err(e) => report.failed.push((START_HERE.to_string(), e.to_string())),
+            }
         }
         Ok(None) => report.failed.push((START_HERE.to_string(), "the reply had no Traps rows".into())),
         Err(e) => report.failed.push((START_HERE.to_string(), e.to_string())),
@@ -3494,7 +3571,7 @@ pub fn draft_team(
     let extra = extra.map(gather_extra).unwrap_or_default();
     let common = team_sources(wiki_name, repos, &extra);
     draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, &roster, today, &mut report, &mut generate, &check)?;
-    draft_traps(wiki, wiki_name, repos, &roster, &mut report, &mut generate)?;
+    draft_traps(wiki, wiki_name, repos, &roster, &mut report, &mut generate, &check)?;
     cite_rulings(wiki, repos, today)?;
     dedup_labels(&mut report.sources);
     pin_drafted(wiki, &report.drafted, repos)?;
@@ -4015,6 +4092,16 @@ mod tests {
             let text = fs::read_to_string(wiki.path().join(page)).unwrap();
             assert!(!text.lines().any(|l| l.starts_with("updated:") && l.contains("{{")), "{page}");
         }
+    }
+
+    /// The reply of a check that finds every statement of the page borne
+    /// out by its source; None for any other prompt.
+    fn all_supported(prompt: &str) -> Option<String> {
+        if !prompt.starts_with("You are checking one drafted page") {
+            return None;
+        }
+        let ids: Vec<&str> = prompt.lines().filter_map(|l| l.split_once(" (line ").map(|(id, _)| id)).filter(|id| id.starts_with('S')).collect();
+        Some(format!("[{}]", ids.iter().map(|id| format!("{{\"id\": \"{id}\", \"verdict\": \"supported\"}}")).collect::<Vec<_>>().join(", ")))
     }
 
     fn page(title: &str) -> String {
@@ -4715,9 +4802,12 @@ name: Mabel Bot
         crate::wikinew::create(&wiki, "Realms", &covered, "2026-10-06").unwrap();
         assert!(fs::read_to_string(wiki.join("START-HERE.md")).unwrap().contains("| `Tools` | (not said yet) |"));
         let repos = vec![repo(d.path(), "Tools", "# Tools\n")];
+        // A git checkout, so a citation of it is one the check can read.
+        git_in(&repos[0].1, &["init", "-q"]);
+        git_in(&repos[0].1, &["add", "-A"]);
         let mut db = Db::open_in_memory().unwrap();
         draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-10-06", 5, |p| {
-            Ok(if p.contains("`Repo-Map/Tools.md`") { tools_page.to_string() } else { page("Drafted") })
+            Ok(all_supported(p).unwrap_or_else(|| if p.contains("`Repo-Map/Tools.md`") { tools_page.to_string() } else { page("Drafted") }))
         })
         .unwrap();
         let index = fs::read_to_string(wiki.join("Repo-Map/Index.md")).unwrap();
@@ -4787,12 +4877,14 @@ name: Mabel Bot
         let before = fs::read_to_string(wiki.join(START_HERE)).unwrap();
         let root = d.path().join("Game");
         write(&root, &[("CLAUDE.md", "# Game\n\nA game.\n\n## Common Gotchas\n\n- The base game's assets live in the server jar.\n- Energy is Stamina in code.\n")]);
+        git_in(&root, &["init", "-q"]);
+        git_in(&root, &["add", "-A"]);
         let repos = vec![("Game".to_string(), root)];
         let mut db = Db::open_in_memory().unwrap();
         let mut asked: Vec<String> = Vec::new();
         let report = draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-10-06", 5, |p| {
             asked.push(p.to_string());
-            Ok(if p.contains("the Traps table") { reply.to_string() } else { page("Drafted") })
+            Ok(all_supported(p).unwrap_or_else(|| if p.contains("the Traps table") { reply.to_string() } else { page("Drafted") }))
         })
         .unwrap();
         let traps = asked.iter().find(|p| p.contains("the Traps table")).expect("a traps call");
