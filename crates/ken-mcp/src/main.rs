@@ -750,12 +750,14 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
                 ));
                 for (i, hit) in hits.iter().enumerate() {
                     let snippet = hit.snippet.replace("<mark>", "**").replace("</mark>", "**");
+                    let label = ken_core::authority::hit_label(&db, &hit.rel_path, None).ok().flatten();
                     out.push_str(&format!(
-                        "\n{}. {} {} ({}) — {}",
+                        "\n{}. {} {} ({}){} — {}",
                         i + 1,
                         kind_tag(&hit.rel_path),
                         hit.rel_path,
                         ken_address(project.config.id, &hit.rel_path),
+                        label.map(|l| format!(" ({l})")).unwrap_or_default(),
                         snippet
                     ));
                 }
@@ -968,12 +970,13 @@ fn closest_passages(
     for (i, hit) in hits.iter().enumerate() {
         let (snippet, line) = short_hit(db, Some(&project.root), query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, EXCERPT_CHARS);
         out.push_str(&format!(
-            "\n{}. {} {} ({}{}) — {}",
+            "\n{}. {} {} ({}{}){} — {}",
             i + 1,
             kind_tag(&hit.path),
             hit.path,
             ken_address(project.config.id, &hit.path),
             line.map(|l| format!("#L{l}")).unwrap_or_default(),
+            hit.page.as_ref().and_then(page_note).map(|n| format!(" ({n})")).unwrap_or_default(),
             snippet.split_whitespace().collect::<Vec<_>>().join(" "),
         ));
     }
@@ -2331,10 +2334,17 @@ you. Pass assignee \"all\" to list every ticket."
     Ok(out)
 }
 
-/// What an agent must know before it trusts a page hit: that it is retired
-/// (and what replaces it), generated, dated evidence, or when a person last
-/// verified it.
+/// What an agent must know before it trusts a page hit: its label (`ruling
+/// D-410 · 2026-10-06`, `ticket · cancelled · 2026-07-21`), or for a hit
+/// without one, that it is retired (and what replaces it), generated, dated
+/// evidence, or when a person last verified it.
 fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
+    if let Some(label) = &p.label {
+        return Some(match p.generated {
+            true => format!("{label}: fix the generator, not the page"),
+            false => label.clone(),
+        });
+    }
     if p.retired {
         return Some(match p.replaced_by.is_empty() {
             true => "retired".to_string(),
@@ -3686,6 +3696,40 @@ mod tests {
         assert!(text.contains("plan.md#L83)"), "{text}");
         assert!(text.contains("\n   The rollback window for the launch is ninety minutes."), "{text}");
         assert!(text.len() < 2_000, "{} characters: {text}", text.len());
+    }
+
+    #[test]
+    fn every_page_hit_says_what_it_is_and_how_fresh() {
+        let (_base, ra, _rb, mut server) = two_project_fixture();
+        std::fs::create_dir_all(ra.path().join("tickets")).unwrap();
+        std::fs::write(
+            ra.path().join("tickets/AT-7.md"),
+            "---\nstatus: cancelled\nupdated: 2026-07-21\n---\n# Companion pets\n\nCompanion pets that follow the player.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ra.path().join("decisions")).unwrap();
+        let mut log = String::from("# DECISIONS\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        for i in (1..=6).rev() {
+            log.push_str(&format!("**D-{i:03}** · 2026-10-0{i} · pets — **RULING {i} ON SADDLES.** Chris, in chat.\n\n"));
+        }
+        log.push_str("**D-007** · 2026-10-07 · pets — **COMPANION PETS FOLLOW THE PLAYER.** Chris, in chat.\n");
+        std::fs::write(ra.path().join("decisions/DECISIONS.md"), &log).unwrap();
+        let project = Project::open(ra.path()).unwrap();
+        let mut db = Db::open(&server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        index_semantically(&project, &mut db);
+        drop(db);
+
+        let (text, is_err) = tool(&mut server, "route_query", json!({"query": "companion pets follow the player"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("tickets/AT-7.md"), "{text}");
+        assert!(text.contains("(ticket · cancelled · 2026-07-21)"), "{text}");
+        assert!(text.contains("(ruling D-007 · 2026-10-07)"), "the entry's own id and date: {text}");
+        let (text, _) = tool(&mut server, "semantic_search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
+        assert!(text.contains("(ticket · cancelled · 2026-07-21)") && text.contains("(ruling D-007 · 2026-10-07)"), "{text}");
+        let (text, _) = tool(&mut server, "search_knowledge", json!({"query": "companion pets", "project": "Atlas"}));
+        assert!(text.contains("(ticket · cancelled · 2026-07-21) — "), "{text}");
+        assert!(text.contains("decisions/DECISIONS.md (ken://") && text.contains(") (ruling) — "), "the log as a whole: {text}");
     }
 
     #[test]

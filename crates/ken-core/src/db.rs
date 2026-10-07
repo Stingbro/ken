@@ -2705,6 +2705,20 @@ impl Db {
         Ok(Some(out))
     }
 
+    /// A file's stored authority (`authority`): its tier's name and the
+    /// score it adds. None when it is neutral, or for an index made before
+    /// authority was stored.
+    pub fn authority_of(&self, rel_path: &str) -> Result<Option<(String, f64)>> {
+        if !table_exists(&self.conn, "file_authority")? {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .prepare_cached("SELECT tier, weight FROM file_authority WHERE rel_path = ?1")?
+            .query_row(params![rel_path], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .optional()?)
+    }
+
     /// Read the frontmatter of every indexed Markdown page that has no
     /// `page_meta` row, from its stored text (no file read). Pages indexed
     /// before frontmatter was read get theirs on the next open. Returns how

@@ -269,7 +269,48 @@ pub fn is_log(rel_path: &str, text: &str) -> bool {
 /// The entry a chunk of a log holds (id and title), read from its first
 /// lines: the chunk may start with the heading the entry sits under.
 pub fn chunk_entry(chunk_text: &str) -> Option<(String, String)> {
-    chunk_text.lines().filter(|l| !l.trim().is_empty()).take(3).find_map(entry_start)
+    entry_line(chunk_text).and_then(entry_start)
+}
+
+/// The line that starts the entry a chunk of a log holds (see
+/// [`chunk_entry`]).
+pub fn entry_line(chunk_text: &str) -> Option<&str> {
+    chunk_text.lines().filter(|l| !l.trim().is_empty()).take(3).find(|l| entry_start(l).is_some())
+}
+
+/// What an entry line carries between its id and its title: its date and
+/// topics (` · 2026-10-06 · anchors, tools — ` in `**D-410** · 2026-10-06 ·
+/// anchors, tools — **SPAWN ANCHORS…**`). None when the line starts no
+/// entry; empty for a heading entry (`## R-12: Title`).
+pub fn entry_head(line: &str) -> Option<&str> {
+    entry_start(line)?;
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return Some("");
+    }
+    let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
+    let (_, rest) = take_id(t.strip_prefix("**")?)?;
+    let rest = rest.strip_prefix("**")?;
+    Some(rest.split("**").next().unwrap_or(rest))
+}
+
+/// The date an entry carries in its head, if any.
+pub fn entry_date(line: &str) -> Option<String> {
+    entry_head(line).and_then(crate::pagemeta::date_in)
+}
+
+/// The topics an entry carries in its head, lowercased: `anchors`, `tools`
+/// for `**D-410** · 2026-10-06 · anchors, tools — **…**`. The head's parts
+/// that are not a date, split at commas.
+pub fn entry_topics(line: &str) -> Vec<String> {
+    let Some(head) = entry_head(line) else { return Vec::new() };
+    head.split('·')
+        .map(|p| p.trim_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':' | '|')))
+        .filter(|p| !p.is_empty() && crate::pagemeta::date_in(p).is_none())
+        .flat_map(|p| p.split(','))
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty() && t.chars().count() <= 40)
+        .collect()
 }
 
 /// A Markdown file whose body is a run of entries, one chunk per entry, or
@@ -1007,6 +1048,18 @@ mod tests {
         for not in ["### 2026-10-06", "**Note** a bold word", "**D-12x** not an id", "## D-12abc", "D-12 not bold", "**d-12** lower case"] {
             assert_eq!(entry_start(not), None, "{not}");
         }
+    }
+
+    #[test]
+    fn an_entry_head_gives_its_date_and_topics() {
+        let line = "**D-410** · 2026-10-06 · anchors, World Tool — **SPAWN ANCHORS ARE PLACED ONLY THROUGH THE TOOLS.** Chris, 2026-10-07.";
+        assert_eq!(entry_date(line).as_deref(), Some("2026-10-06"), "the head's date, not one in the body");
+        assert_eq!(entry_topics(line), vec!["anchors", "world tool"]);
+        assert_eq!(entry_line(&format!("### 2026-10-06\n\n{line}\n")), Some(line));
+        assert_eq!(entry_date("- **SR-012** · done — **Bump the engine.**"), None);
+        assert_eq!(entry_topics("- **SR-012** · done — **Bump the engine.**"), vec!["done"]);
+        assert_eq!(entry_date("## R-3: Spike number 3, 2026-01-02"), None, "a heading entry has no head");
+        assert_eq!(entry_head("plain prose"), None);
     }
 
     /// Prose with a few bold ids, or a few entries in a long page, is chunked

@@ -486,6 +486,13 @@ pub fn search_member_with(
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     follow_links(db, &mut hits)?;
     find_symbols(db, query, intent, &mut hits)?;
+    // Each page hit says what it is and how fresh: a ruling and its date, a
+    // ticket and its status (`authority::hit_label`).
+    for hit in &mut hits {
+        if let Some(page) = hit.page.as_mut() {
+            page.label = crate::authority::hit_label(db, &hit.path, Some(&hit.snippet))?;
+        }
+    }
     Ok(hits)
 }
 

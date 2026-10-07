@@ -185,8 +185,12 @@ fn date(v: &str) -> Option<String> {
 /// A date in a file name (`Standup - 2026-09-12.md`), for dating a Research
 /// note that has no frontmatter date.
 pub fn date_in_name(rel_path: &str) -> Option<String> {
-    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    (0..name.len().saturating_sub(9)).find_map(|i| name.get(i..).and_then(date))
+    date_in(rel_path.rsplit('/').next().unwrap_or(rel_path))
+}
+
+/// The first `YYYY-MM-DD` date anywhere in `text`.
+pub fn date_in(text: &str) -> Option<String> {
+    (0..text.len().saturating_sub(9)).find_map(|i| text.get(i..).and_then(date))
 }
 
 /// The library's top-level sections (docs-system, "Sections").
@@ -335,6 +339,9 @@ pub struct HitPage {
     pub band: u8,
     /// Who it is written for ([`audience_of`]).
     pub audience: Option<&'static str>,
+    /// How much the hit counts, in one short line (`authority::hit_label`):
+    /// filled by the search that has the index, None until then.
+    pub label: Option<String>,
 }
 
 /// The page facts for a hit on `rel_path`, or None when it is not a
@@ -361,6 +368,7 @@ pub fn hit_page(rel_path: &str, meta: Option<PageMeta>) -> Option<HitPage> {
         replaced_by: meta.replaced_by,
         band,
         audience,
+        label: None,
     })
 }
 
