@@ -453,7 +453,13 @@ pub fn search_member_with(
             }
         }
     }
-    let mut hits = search::merge_and_rerank_with(&fts_hits, &vec_hits, query, &extra);
+    // Each file's authority (`crate::authority`): rules and rulings count for
+    // more, tickets and dated evidence for less, inside this member's own
+    // ranking. An index from before authority was stored ranks by the page's
+    // band instead, as it did.
+    let paths: Vec<String> = fts_hits.iter().map(|h| h.path.clone()).chain(vec_hits.iter().map(|h| h.path.clone())).collect();
+    let authority = db.authority_weights(&paths)?;
+    let mut hits = search::merge_and_rerank_with(&fts_hits, &vec_hits, query, &extra, authority.as_ref().unwrap_or(&HashMap::new()));
     for hit in &mut hits {
         hit.line = db.chunk_line(hit.chunk_id)?;
         hit.page = crate::pagemeta::hit_page(&hit.path, db.page_meta(&hit.path)?);
@@ -465,7 +471,8 @@ pub fn search_member_with(
     let intent = query_intent(query);
     let now = crate::engine::now_epoch();
     for hit in &mut hits {
-        hit.score += band_bonus(hit) + hygiene(hit, now) + intent_bonus(intent, &hit.path);
+        let band = if authority.is_some() { 0.0 } else { band_bonus(hit) };
+        hit.score += band + hygiene(hit, now) + intent_bonus(intent, &hit.path);
     }
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     follow_links(db, &mut hits)?;
@@ -1288,6 +1295,35 @@ mod tests {
         assert_eq!(paths.first(), Some(&"Change Order.md"), "{paths:?}");
         assert!(paths.contains(&"Permit.md"), "the linked page joins: {paths:?}");
         assert!(!paths.contains(&"Other.md"), "{paths:?}");
+    }
+
+    /// A ruling outranks the closed ticket that says the same, a team file
+    /// can turn that around, and code keeps the score it had.
+    #[test]
+    fn a_ruling_outranks_a_closed_ticket_and_the_team_file_can_say_otherwise() {
+        use crate::project::Project;
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["decisions", "tickets", "src", ".wright"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        let rulings: String = (1..=6).map(|i| format!("**D-{i:03}** · 2026-10-0{i} · topic — **RULING {i}.** Unrelated ruling number {i}.\n\n")).collect();
+        std::fs::write(dir.path().join("decisions/DECISIONS.md"), format!("# DECISIONS\n\n**D-007** · 2026-10-07 · release — **MOD PULL REQUESTS ARE MERGED BY CHRIS.** Chris merges mod pull requests himself.\n\n{rulings}")).unwrap();
+        std::fs::write(dir.path().join("tickets/SR-101.md"), "---\nstatus: done\n---\n# SR-101\n\nWho merges mod pull requests? Chris merges mod pull requests himself.\n").unwrap();
+        std::fs::write(dir.path().join("src/merge.rs"), "// mod pull requests are merged by Chris himself\nfn merge() {}\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let ask = |db: &Db| search_member(db, "who merges mod pull requests", None, 8).unwrap();
+        let hits = ask(&db);
+        let pos = |hits: &[HybridHit], p: &str| hits.iter().position(|h| h.path == p).unwrap();
+        assert!(pos(&hits, "decisions/DECISIONS.md") < pos(&hits, "tickets/SR-101.md"), "{hits:?}");
+        let code = hits.iter().find(|h| h.path == "src/merge.rs").unwrap().score;
+
+        std::fs::write(dir.path().join(".wright/team.json"), r#"{"search": {"weights": {"tickets/": "rule", "decisions/": -3}}}"#).unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let hits = ask(&db);
+        assert!(pos(&hits, "tickets/SR-101.md") < pos(&hits, "decisions/DECISIONS.md"), "{hits:?}");
+        assert_eq!(hits.iter().find(|h| h.path == "src/merge.rs").unwrap().score, code, "code is neutral either way");
     }
 
     #[test]

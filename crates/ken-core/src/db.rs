@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -720,6 +720,22 @@ impl Db {
             // scan, and an entry whose text is unchanged keeps its vector.
             self.mark_log_pages_for_reindex()?;
         }
+        if version < 19 {
+            // kb-ranking (2026-10-07): each file's authority in search
+            // (`authority`), the tiers that are not neutral. Filled here with
+            // the default tiers from the stored frontmatter, no file read;
+            // the next scan applies the team file's overrides.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS file_authority (
+                    rel_path TEXT PRIMARY KEY,
+                    tier     TEXT NOT NULL,
+                    weight   REAL NOT NULL
+                );
+                "#,
+            )?;
+            crate::authority::refresh_with(self, &crate::authority::Roles::default(), None)?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -1323,6 +1339,7 @@ impl Db {
             tx.execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
+            tx.execute("DELETE FROM file_authority WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM page_links WHERE from_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM code_symbols WHERE path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM code_imports WHERE path = ?1", params![rel_path])?;
@@ -2618,6 +2635,74 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// The indexed files whose authority is worked out (`authority`): the
+    /// Markdown pages, or with `all` every file (a team override can reach
+    /// code too).
+    pub fn authority_candidates(&self, all: bool) -> Result<Vec<String>> {
+        let sql = if all {
+            "SELECT rel_path FROM files WHERE status = 'indexed'"
+        } else {
+            "SELECT rel_path FROM files WHERE status = 'indexed' AND kind = 'md'"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Whether `rel_path` is an indexed file.
+    pub fn is_indexed(&self, rel_path: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT 1 FROM files WHERE rel_path = ?1 AND status = 'indexed'")?
+            .exists(params![rel_path])?)
+    }
+
+    /// Store the files' authority (`authority`): with `only`, for those
+    /// paths (each forgotten first, so one that became neutral loses its
+    /// row); without, for every file, replacing what was stored.
+    pub fn set_authority(&self, rows: &[(String, crate::authority::Authority)], only: Option<&[String]>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        match only {
+            Some(paths) => {
+                for p in paths {
+                    tx.execute("DELETE FROM file_authority WHERE rel_path = ?1", params![p])?;
+                }
+            }
+            None => {
+                tx.execute("DELETE FROM file_authority", [])?;
+            }
+        }
+        for (rel, a) in rows {
+            tx.execute(
+                "INSERT OR REPLACE INTO file_authority (rel_path, tier, weight) VALUES (?1, ?2, ?3)",
+                params![rel, a.tier.name(), a.weight],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// What each of `paths` adds to a hit's score for its authority; a path
+    /// with none stored is neutral and absent. None for an index made before
+    /// authority was stored (opened read-only, so not upgraded): search then
+    /// ranks by the page's band, as it did.
+    pub fn authority_weights(&self, paths: &[String]) -> Result<Option<std::collections::HashMap<String, f64>>> {
+        if !table_exists(&self.conn, "file_authority")? {
+            return Ok(None);
+        }
+        let mut out = std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare_cached("SELECT weight FROM file_authority WHERE rel_path = ?1")?;
+        for p in paths {
+            if out.contains_key(p) {
+                continue;
+            }
+            if let Some(w) = stmt.query_row(params![p], |r| r.get::<_, f64>(0)).optional()? {
+                out.insert(p.clone(), w);
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Read the frontmatter of every indexed Markdown page that has no
