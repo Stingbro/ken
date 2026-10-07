@@ -132,6 +132,11 @@ pub struct RoutePlan {
     /// ([`asks_about_platform`]): a reference repo's assets then rank as
     /// equals of the team's own files.
     pub platform: bool,
+    /// The targets that are the team's knowledge base
+    /// ([`MemberInfo::knowledge_base`]): they keep a share of the merged
+    /// results ([`KB_LEAD`]). A member the registry calls a team or wiki
+    /// repo counts too, so a plan made by hand needs not list it.
+    pub knowledge: Vec<Uuid>,
 }
 
 /// Per-member outcome of an actual search attempt (design D5: "not-ready
@@ -210,10 +215,12 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
         .map(|m| m.project_id)
         .collect();
     if !named.is_empty() {
+        let knowledge = members.iter().filter(|m| m.knowledge_base && named.contains(&m.project_id)).map(|m| m.project_id).collect();
         return RoutePlan {
             targets: named,
             reason: RouteReason::Named,
             platform,
+            knowledge,
         };
     }
 
@@ -247,17 +254,19 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
                     targets,
                     reason: RouteReason::KgEntities(matched_ids),
                     platform,
+                    knowledge,
                 };
             }
         }
     }
 
-    let mut targets = knowledge;
+    let mut targets = knowledge.clone();
     targets.extend(ready.into_iter().filter(|m| !m.knowledge_base).take(BROADCAST_CAP).map(|m| m.project_id));
     RoutePlan {
         targets,
         reason: RouteReason::Broadcast,
         platform,
+        knowledge,
     }
 }
 
@@ -933,7 +942,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
 
     // (score, target_order, within-member rank, hit) — sorted score DESC,
     // then the two tie-breaks ASC.
-    let mut candidates: Vec<(f64, usize, usize, RoutedHit, f64)> = Vec::new();
+    let mut candidates: Vec<(f64, usize, usize, RoutedHit, f64, bool)> = Vec::new();
     for mh in member_hits {
         if mh.status != MemberStatus::Searched {
             continue;
@@ -946,6 +955,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
             None => (None, Vec::new()),
         };
         let wiki = kinds.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki));
+        let knowledge = plan.knowledge.contains(&mh.project_id) || is_knowledge_base(&kinds);
         let order = target_order.get(&mh.project_id).copied().unwrap_or(usize::MAX);
         for (i, hit) in mh.hits.iter().enumerate() {
             let rank = i + 1;
@@ -969,6 +979,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     kg_breadcrumbs: breadcrumbs.clone(),
                 },
                 hit.score - if reference_asset(plan, &kinds, &hit.path) { W_REFERENCE_ASSET } else { 0.0 },
+                knowledge,
             ));
         }
     }
@@ -991,10 +1002,11 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
     // A longer passage is the same answer wherever it sits (a copied doc, a
     // second checkout); a short one only when the file name matches too.
     let mut seen: std::collections::HashSet<(String, String)> = Default::default();
-    let results = candidates
+    let ranked: Vec<Ranked> = candidates
         .into_iter()
-        .map(|c| c.3)
-        .filter(|h| {
+        .map(|c| Ranked { rank: c.2, hit: c.3, score: c.4, knowledge: c.5 })
+        .filter(|r| {
+            let h = &r.hit;
             let name = if h.snippet.trim().len() > 80 {
                 String::new()
             } else {
@@ -1002,8 +1014,8 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
             };
             seen.insert((name, h.snippet.trim().to_string()))
         })
-        .take(limit)
         .collect();
+    let results = keep_knowledge_share(ranked).into_iter().take(limit).collect();
 
     let member_status = member_hits
         .iter()
@@ -1019,6 +1031,84 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
         results,
         member_status,
     }
+}
+
+/// How far the knowledge base's hits can fall behind another member's: its
+/// `k`-th best hit ranks ahead of every other member's `k + KB_LEAD`-th, so
+/// the wiki's best answer is never pushed out by each code repo's first few
+/// guesses. Measured 2026-10-07 on 31 questions the team's wiki answers:
+/// searched alone the wiki ranked the right page 1 to 10, but merged by
+/// relevance with five code repos its fifth hit lost to every repo's first,
+/// and route_query's top five held the page for 10 of the 31. Reserved
+/// places (two of the first five, four of the first ten) were tried too and
+/// cost the 45 code questions a top-five answer at every setting that
+/// helped the wiki; holding the wiki's rank against each repo's rank did not
+/// (see `KB_SHARE_FLOOR`).
+pub const KB_LEAD: usize = 3;
+/// A knowledge-base hit is held up only if it scores at least this share of
+/// the list's best hit: a wiki page that barely matches a question about
+/// code does not push the code down.
+pub const KB_SHARE_FLOOR: f64 = 0.6;
+
+/// One merged hit with what [`keep_knowledge_share`] needs: its rank in its
+/// own member's list, its merge score, and whether it is from the
+/// knowledge base.
+struct Ranked {
+    rank: usize,
+    hit: RoutedHit,
+    score: f64,
+    knowledge: bool,
+}
+
+/// Reorder a merged list, best first, so the knowledge base keeps its share
+/// ([`KB_LEAD`]): before another member's hit of rank `r`, each
+/// knowledge-base member's next hit of rank `r - KB_LEAD` or better is
+/// placed, if it scores at least [`KB_SHARE_FLOOR`] of the best. Every hit
+/// keeps its order within its own member, and a hit that ranks higher on
+/// relevance is never moved down by more than the hits placed ahead of it.
+fn keep_knowledge_share(ranked: Vec<Ranked>) -> Vec<RoutedHit> {
+    let best = ranked.first().map_or(0.0, |r| r.score);
+    let held_up = |r: &Ranked| r.knowledge && (best <= 0.0 || r.score >= KB_SHARE_FLOOR * best);
+    if !ranked.iter().any(|r| !r.knowledge) || !ranked.iter().any(held_up) {
+        return ranked.into_iter().map(|r| r.hit).collect();
+    }
+    // Each knowledge-base member's hits that may be held up, by own rank.
+    let mut queues: Vec<(Uuid, std::collections::VecDeque<usize>)> = Vec::new();
+    for (i, r) in ranked.iter().enumerate().filter(|(_, r)| held_up(r)) {
+        match queues.iter_mut().find(|(id, _)| *id == r.hit.project_id) {
+            Some((_, q)) => q.push_back(i),
+            None => queues.push((r.hit.project_id, std::collections::VecDeque::from([i]))),
+        }
+    }
+    for (_, q) in &mut queues {
+        q.make_contiguous().sort_by_key(|&i| ranked[i].rank);
+    }
+    let mut placed = vec![false; ranked.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(ranked.len());
+    for i in 0..ranked.len() {
+        if placed[i] {
+            continue;
+        }
+        if !ranked[i].knowledge {
+            for (_, q) in &mut queues {
+                while let Some(&k) = q.front() {
+                    if placed[k] {
+                        q.pop_front();
+                    } else if ranked[i].rank >= ranked[k].rank + KB_LEAD {
+                        q.pop_front();
+                        placed[k] = true;
+                        order.push(k);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        placed[i] = true;
+        order.push(i);
+    }
+    let mut hits: Vec<Option<RoutedHit>> = ranked.into_iter().map(|r| Some(r.hit)).collect();
+    order.into_iter().filter_map(|i| hits[i].take()).collect()
 }
 
 #[cfg(test)]
@@ -1236,6 +1326,7 @@ mod tests {
             targets: vec![a, b],
             reason: RouteReason::Broadcast,
             platform: false,
+            knowledge: vec![],
         };
         let member_hits = vec![
             MemberHits {
@@ -1364,7 +1455,7 @@ mod tests {
     #[test]
     fn a_reference_repos_assets_yield_unless_the_question_is_about_the_platform() {
         use crate::registry::RepoKind;
-        let plan = |platform, reason| RoutePlan { targets: vec![], reason, platform };
+        let plan = |platform, reason| RoutePlan { targets: vec![], reason, platform, knowledge: vec![] };
         let asked = plan(false, RouteReason::Broadcast);
         let shield = "HytaleAssets/Server/Item/Items/Weapon/Shield/Weapon_Shield_Copper.json";
         assert!(reference_asset(&asked, &[RepoKind::Reference], shield));
@@ -1384,7 +1475,7 @@ mod tests {
     #[test]
     fn scored_hits_merge_by_relevance_across_members() {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false };
+        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false, knowledge: vec![] };
         let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
         let member_hits = vec![
             MemberHits {
@@ -1402,6 +1493,49 @@ mod tests {
         ];
         let paths: Vec<String> = merge_routed(&plan, &member_hits, 10).results.into_iter().map(|r| r.path).collect();
         assert_eq!(paths, vec!["SOW.md", "design.md", "log.md", "spec.md"]);
+    }
+
+    /// The knowledge base's k-th hit ranks ahead of the code repo's
+    /// (k + 3)-th, its hits in their own order and the code's in theirs; a
+    /// wiki hit far weaker than the best is not held up.
+    #[test]
+    fn the_knowledge_base_keeps_its_share_of_the_merged_list() {
+        let (code, wiki) = (Uuid::new_v4(), Uuid::new_v4());
+        let plan = RoutePlan { targets: vec![wiki, code], reason: RouteReason::Broadcast, platform: false, knowledge: vec![wiki] };
+        let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
+        let merged = |wiki_scores: &[f64]| -> Vec<String> {
+            let member_hits = vec![
+                MemberHits {
+                    project_id: code,
+                    member_name: "code".into(),
+                    status: MemberStatus::Searched,
+                    hits: (0..10).map(|i| scored(&format!("src/f{i}.rs"), i, 9.0 - i as f64 * 0.1)).collect(),
+                },
+                MemberHits {
+                    project_id: wiki,
+                    member_name: "wiki".into(),
+                    status: MemberStatus::Searched,
+                    hits: wiki_scores.iter().enumerate().map(|(i, s)| scored(&format!("w{i}.md"), 100 + i as i64, *s)).collect(),
+                },
+            ];
+            merge_routed(&plan, &member_hits, 10).results.into_iter().map(|r| r.path).collect()
+        };
+        let paths = merged(&[6.0, 5.8, 5.6, 5.5, 5.0]);
+        assert_eq!(
+            paths,
+            vec!["src/f0.rs", "src/f1.rs", "src/f2.rs", "w0.md", "src/f3.rs", "w1.md", "src/f4.rs", "w2.md", "src/f5.rs", "w3.md"]
+        );
+        // Under half the best score: no reserved place, merged by relevance.
+        let paths = merged(&[4.0, 3.0]);
+        assert!(paths.iter().all(|p| p.starts_with("src/")), "{paths:?}");
+        // A wiki hit that wins on relevance is not held back.
+        let paths = merged(&[9.5, 1.0]);
+        assert_eq!(paths[0], "w0.md");
+        // The plan marks the knowledge base.
+        let mut members = vec![member(code, "app", true, 5), member(wiki, "Team-Docs", true, 1)];
+        members[1].knowledge_base = true;
+        assert_eq!(plan_route("who merges pull requests", &members, None).knowledge, vec![wiki]);
+        assert_eq!(plan_route("what does app build", &members, None).knowledge, Vec::<Uuid>::new(), "a named repo alone");
     }
 
     /// A question in its own words still finds the chunk that says it
@@ -1428,6 +1562,7 @@ mod tests {
             targets: vec![a],
             reason: RouteReason::Broadcast,
             platform: false,
+            knowledge: vec![],
         };
         let member_hits = vec![MemberHits {
             project_id: a,
@@ -1449,6 +1584,7 @@ mod tests {
             targets: vec![ready_id, building_id],
             reason: RouteReason::Broadcast,
             platform: false,
+            knowledge: vec![],
         };
 
         let ready_db = fixture_db_with_chunk("notes/found.md", "the quokka naps");
@@ -1499,6 +1635,7 @@ mod tests {
             targets: vec![a, missing],
             reason: RouteReason::Broadcast,
             platform: false,
+            knowledge: vec![],
         };
         let db = fixture_db_with_chunk("x.md", "hello world");
         let targets = vec![MemberDbHandle {
@@ -1560,6 +1697,7 @@ mod tests {
             targets: vec![a],
             reason: RouteReason::KgEntities(vec![42]),
             platform: false,
+            knowledge: vec![],
         };
         let member_hits = vec![MemberHits {
             project_id: a,
@@ -1588,7 +1726,7 @@ mod tests {
     fn binding_pages_lead_the_merged_list_across_members() {
         use crate::pagemeta::{hit_page, PageMeta};
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false };
+        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false, knowledge: vec![] };
         let paged = |path: &str, id: i64, meta: Option<PageMeta>| HybridHit {
             page: hit_page(path, meta),
             ..hit(path, id)
@@ -1625,6 +1763,7 @@ mod tests {
             targets: vec![a],
             reason: RouteReason::Named,
             platform: false,
+            knowledge: vec![],
         };
         let member_hits = vec![MemberHits {
             project_id: a,
