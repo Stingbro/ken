@@ -4,6 +4,7 @@
 
 pub mod assistant;
 pub mod bg_hydrate;
+pub mod checkout;
 pub mod chat;
 pub mod chunker;
 pub mod codemap;

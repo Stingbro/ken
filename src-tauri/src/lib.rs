@@ -12111,7 +12111,9 @@ fn extraction_worker(
         // extracted a single file, 25,859 rows stuck at `pending`, while the
         // tenth held 77 done / 355 error. A worker that knows its own id must
         // ask for its own id.
-        let (base, profiler_enabled, project_root, extraction_on) = {
+        // The roster comes along so a teammate whose name reads like a bot's
+        // is never dropped from the map.
+        let (base, profiler_enabled, project_root, extraction_on, roster) = {
             let guard = state.lock().unwrap();
             let Some(active) = guard.members.get(&project_id) else {
                 return; // project closed — this worker is done
@@ -12125,6 +12127,7 @@ fn extraction_worker(
                     &active.project,
                     "backgroundExtraction",
                 ),
+                workspace_roster(&guard),
             )
         };
         // Switched off: idle but stay alive, so turning it back on resumes
@@ -12170,7 +12173,7 @@ fn extraction_worker(
         if !wait_for_extraction_slot(&stop) {
             return;
         }
-        match knowledge_model::process_next_pending_with_addendum(db, &today, at, &generate, &addendum) {
+        match knowledge_model::process_next_pending_for(db, &today, at, &generate, &addendum, &roster) {
             Ok(Some(_)) => {
                 // A generation actually ran: close the slot behind us.
                 stamp_extraction_slot();

@@ -295,6 +295,20 @@ Document:\n"
 /// references, collapse duplicate pairs, enforce the caps. Only an
 /// answer with no parseable JSON object is an error.
 pub fn parse_extraction(raw: &str) -> Result<Extraction> {
+    parse_extraction_for(raw, &[])
+}
+
+/// Whether a person entity called `name` is dropped as a bot or an agent:
+/// never when the team's `roster` lists the name, an alias or an address
+/// ([`crate::people::by_name`]). The team says who is a person; a teammate
+/// whose handle ends in "bot" or reads like an agent's stays.
+fn dropped_as_bot(name: &str, roster: &[crate::people::Person]) -> bool {
+    crate::people::by_name(roster, name).is_none() && is_bot_or_agent(name)
+}
+
+/// [`parse_extraction`], with the team's `roster` checked before a person
+/// is dropped as a bot ([`dropped_as_bot`]).
+pub fn parse_extraction_for(raw: &str, roster: &[crate::people::Person]) -> Result<Extraction> {
     let no_json =
         || Error::Other("the model's answer contained no JSON object".into());
     let start = raw.find('{').ok_or_else(no_json)?;
@@ -314,7 +328,7 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
             continue; // no usable name — drop the record
         };
         let kind = coerce_kind(&item["kind"]);
-        if kind == "person" && is_bot_or_agent(&name) {
+        if kind == "person" && dropped_as_bot(&name, roster) {
             continue; // a tool, not a teammate; its connections now dangle and drop
         }
         aliases.push(if kind == "person" { person_aliases(&name, &item["aliases"]) } else { Vec::new() });
@@ -398,6 +412,12 @@ pub fn parse_extraction(raw: &str) -> Result<Extraction> {
 /// the JSON — the merge attributes everything to the file being extracted.
 /// Infallible: a malformed value yields an empty delta.
 pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
+    parse_delta_value_for(value, &[])
+}
+
+/// [`parse_delta_value`], with the team's `roster` checked before a person
+/// is dropped as a bot ([`dropped_as_bot`]).
+pub fn parse_delta_value_for(value: &serde_json::Value, roster: &[crate::people::Person]) -> Extraction {
     let empty = Vec::new();
     let mut entities: Vec<EntityInput> = Vec::new();
     for item in value["entities"].as_array().unwrap_or(&empty) {
@@ -408,7 +428,7 @@ pub fn parse_delta_value(value: &serde_json::Value) -> Extraction {
             continue;
         };
         let kind = coerce_kind(&item["kind"]);
-        if kind == "person" && is_bot_or_agent(&name) {
+        if kind == "person" && dropped_as_bot(&name, roster) {
             continue;
         }
         entities.push(EntityInput {
@@ -519,6 +539,25 @@ pub fn extract_one_with_addendum<G>(
 where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
+    extract_one_for(db, rel_path, content_hash, today, at, generate, addendum, &[])
+}
+
+/// [`extract_one_with_addendum`], with the team's `roster`: a person it
+/// lists is never dropped as a bot ([`dropped_as_bot`]).
+#[allow(clippy::too_many_arguments)]
+pub fn extract_one_for<G>(
+    db: &mut Db,
+    rel_path: &str,
+    content_hash: &str,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+    roster: &[crate::people::Person],
+) -> Result<()>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
     let text = db.get_text(rel_path)?.unwrap_or_default();
     // An empty (or whitespace-only) file has nothing to extract — mark it done
     // and skip the generation. A blank `.md`, a stub, or a file whose extractor
@@ -531,7 +570,7 @@ where
     let prompt = compose_file_prompt_with_addendum(rel_path, &text, today, addendum);
     match generate(&prompt) {
         Ok(value) => {
-            let delta = parse_delta_value(&value);
+            let delta = parse_delta_value_for(&value, roster);
             db.merge_knowledge_delta(rel_path, &delta, at)?;
             db.mark_extraction_done(rel_path, content_hash, at)?;
             Ok(())
@@ -570,10 +609,26 @@ pub fn process_next_pending_with_addendum<G>(
 where
     G: Fn(&str) -> Result<serde_json::Value>,
 {
+    process_next_pending_for(db, today, at, generate, addendum, &[])
+}
+
+/// [`process_next_pending_with_addendum`], with the team's `roster`: a
+/// person it lists is never dropped as a bot ([`dropped_as_bot`]).
+pub fn process_next_pending_for<G>(
+    db: &mut Db,
+    today: &str,
+    at: i64,
+    generate: &G,
+    addendum: &str,
+    roster: &[crate::people::Person],
+) -> Result<Option<String>>
+where
+    G: Fn(&str) -> Result<serde_json::Value>,
+{
     let Some((rel_path, content_hash)) = db.next_pending_extraction()? else {
         return Ok(None);
     };
-    extract_one_with_addendum(db, &rel_path, &content_hash, today, at, generate, addendum)?;
+    extract_one_for(db, &rel_path, &content_hash, today, at, generate, addendum, roster)?;
     Ok(Some(rel_path))
 }
 
@@ -1182,6 +1237,28 @@ mod tests {
         for person in ["Chris", "Ádám Liszkai", "AlpahSignalAI", "Claudette Ruiz", "Abbott", "ItsNeil17 / Neil"] {
             assert!(!is_bot_or_agent(person), "{person} is a person");
         }
+    }
+
+    /// A teammate the roster lists is never dropped as a bot at extraction,
+    /// however their name reads; a bot nobody lists still is.
+    #[test]
+    fn a_roster_person_named_like_a_bot_is_kept() {
+        let roster = vec![crate::people::Person {
+            id: "mabel".into(),
+            name: "Mabel Bot".into(),
+            emails: vec![],
+            aliases: vec!["claude".into()],
+        }];
+        let v = serde_json::json!({"entities": [
+            {"name": "Mabel Bot", "kind": "person"},
+            {"name": "Claude", "kind": "person"},
+            {"name": "Hytale Sync Bot", "kind": "person"}
+        ]});
+        let names = |ex: &Extraction| ex.entities.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+        assert!(names(&parse_delta_value(&v)).is_empty(), "no roster: all three read as bots");
+        assert_eq!(names(&parse_delta_value_for(&v, &roster)), vec!["Mabel Bot", "Claude"]);
+        let raw = serde_json::to_string(&v).unwrap();
+        assert_eq!(names(&parse_extraction_for(&raw, &roster).unwrap()), vec!["Mabel Bot", "Claude"]);
     }
 
     #[test]
