@@ -333,6 +333,16 @@ fn status_clause(status: &str) -> String {
     let cut = s.find([',', ';', '(', '—', '–']).unwrap_or(s.len());
     let s = s[..cut].trim();
     let s = s.split(" - ").next().unwrap_or(s).trim();
+    // An id keeps its capitals (`ruled D-336`) though the index stored the
+    // status lowercased.
+    let s = &s
+        .split(' ')
+        .map(|w| match w.split_once('-') {
+            Some((k, n)) if !k.is_empty() && k.len() <= 8 && k.chars().all(|c| c.is_ascii_alphabetic()) && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => w.to_ascii_uppercase(),
+            _ => w.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     if s.chars().count() <= LABEL_STATUS_MAX {
         s.to_string()
     } else {
@@ -460,6 +470,8 @@ mod tests {
         let retired = PageMeta { status: Some("superseded".into()), replaced_by: vec!["[[Rules]]".into()], ..Default::default() };
         assert_eq!(label_of("Ways-of-Working/Old.md", Some(&retired), Some(("closed", -W_CLOSED)), None), "record · superseded · replaced by [[Rules]]");
         assert_eq!(status_clause("an extraordinarily long status that runs on and on"), "an extraordinarily long status t…");
+        assert_eq!(status_clause("ruled d-336 (chris, 2026-10-01)"), "ruled D-336", "an id keeps its capitals");
+        assert_eq!(status_clause("in-progress"), "in-progress");
     }
 
     #[test]
