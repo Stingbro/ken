@@ -796,7 +796,7 @@ fn phase_kb_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
     // question's vector only when its index was built by the same model.
     let info: Vec<MemberInfo> = ms
         .iter()
-        .map(|(_, p, db)| MemberInfo { project_id: p.config.id, name: p.config.name.clone(), index_ready: db.vec_available(), last_activity: 0 })
+        .map(|(_, p, db)| MemberInfo { project_id: p.config.id, name: p.config.name.clone(), index_ready: db.vec_available(), last_activity: 0, knowledge_base: ken_core::registry::entry_of(p.config.id).is_some_and(|(_, k)| ken_core::routing::is_knowledge_base(&k)) })
         .collect();
     let shared = routing::workspace_vocabulary(ms.iter().map(|(_, _, db)| db));
     let types = ken_core::contenttype::parse_filter(std::env::var("KEN_EVAL_TYPES").ok().as_deref());
@@ -1299,7 +1299,7 @@ fn phase_look(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         .collect();
     let info: Vec<MemberInfo> = ms
         .iter()
-        .map(|(n, p, db)| MemberInfo { project_id: p.config.id, name: n.clone(), index_ready: db.vec_available(), last_activity: 0 })
+        .map(|(n, p, db)| MemberInfo { project_id: p.config.id, name: n.clone(), index_ready: db.vec_available(), last_activity: 0, knowledge_base: ken_core::registry::entry_of(p.config.id).is_some_and(|(_, k)| ken_core::routing::is_knowledge_base(&k)) })
         .collect();
     let (mut asked, mut found, mut named_only, mut not_there) = (0, 0, 0, 0);
     println!("# Ask Ken to look\n");
@@ -1383,7 +1383,7 @@ fn phase_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         .collect();
     let info: Vec<MemberInfo> = ms
         .iter()
-        .map(|(n, p, db)| MemberInfo { project_id: p.config.id, name: n.clone(), index_ready: db.vec_available(), last_activity: 0 })
+        .map(|(n, p, db)| MemberInfo { project_id: p.config.id, name: n.clone(), index_ready: db.vec_available(), last_activity: 0, knowledge_base: ken_core::registry::entry_of(p.config.id).is_some_and(|(_, k)| ken_core::routing::is_knowledge_base(&k)) })
         .collect();
     let handles: Vec<MemberDbHandle> = ms
         .iter()

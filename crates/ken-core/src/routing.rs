@@ -168,6 +168,17 @@ pub struct MemberInfo {
     /// whatever unit the caller is consistent with; this module only ever
     /// compares it to other members' values).
     pub last_activity: i64,
+    /// A team or wiki repo: the team's knowledge base. Searched on every
+    /// unnamed query, beside the capped members. Measured 2026-10-07: with
+    /// six members the cap of five dropped the team's wiki, and 0 of 31
+    /// questions answered by it reached `route_query`'s results.
+    pub knowledge_base: bool,
+}
+
+/// Whether a member of these kinds is the team's knowledge base
+/// ([`MemberInfo::knowledge_base`]).
+pub fn is_knowledge_base(kind: &[crate::registry::RepoKind]) -> bool {
+    kind.iter().any(|k| k.reads_entities())
 }
 
 /// Three-tier route planning (spec: "Three-tier route planning"). No I/O of
@@ -208,6 +219,8 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
 
     let mut ready: Vec<&MemberInfo> = members.iter().filter(|m| m.index_ready).collect();
     ready.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    // The knowledge base is always searched, outside the cap.
+    let knowledge: Vec<Uuid> = ready.iter().filter(|m| m.knowledge_base).map(|m| m.project_id).collect();
 
     if let Some(kg) = kg {
         if let Some((mut targets, matched_ids)) = kg_guided_targets(&normalized_query, members, kg) {
@@ -225,6 +238,11 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
                         targets.push(m.project_id);
                     }
                 }
+                for id in &knowledge {
+                    if !targets.contains(id) {
+                        targets.push(*id);
+                    }
+                }
                 return RoutePlan {
                     targets,
                     reason: RouteReason::KgEntities(matched_ids),
@@ -234,7 +252,8 @@ pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb
         }
     }
 
-    let targets = ready.into_iter().take(BROADCAST_CAP).map(|m| m.project_id).collect();
+    let mut targets = knowledge;
+    targets.extend(ready.into_iter().filter(|m| !m.knowledge_base).take(BROADCAST_CAP).map(|m| m.project_id));
     RoutePlan {
         targets,
         reason: RouteReason::Broadcast,
@@ -1006,6 +1025,7 @@ mod tests {
             name: name.to_string(),
             index_ready,
             last_activity,
+            knowledge_base: false,
         }
     }
 
@@ -1127,6 +1147,22 @@ mod tests {
         // Most-recent-activity first: activity == index, so 6,5,4,3,2.
         let expected: Vec<Uuid> = members.iter().rev().take(5).map(|m| m.project_id).collect();
         assert_eq!(plan.targets, expected);
+    }
+
+    #[test]
+    fn the_knowledge_base_is_searched_outside_the_cap() {
+        let mut members: Vec<MemberInfo> = (0..6)
+            .map(|i| member(Uuid::new_v4(), &format!("Repo {i}"), true, 10 + i))
+            .collect();
+        let mut wiki = member(Uuid::new_v4(), "Team-Docs", true, 0);
+        wiki.knowledge_base = true;
+        members.push(wiki.clone());
+        let plan = plan_route("can I merge my own pull request", &members, None);
+        assert_eq!(plan.targets.len(), 6, "five capped members plus the knowledge base");
+        assert_eq!(plan.targets[0], wiki.project_id, "the knowledge base first, though the least active");
+        // A member named in the query still narrows the search to it alone.
+        let named = plan_route("what does Repo 3 build", &members, None);
+        assert_eq!(named.targets, vec![members[3].project_id]);
     }
 
     #[test]

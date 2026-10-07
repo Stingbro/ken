@@ -1767,6 +1767,7 @@ folder in the Ken app first."
             name: entry.name.clone(),
             index_ready,
             last_activity,
+            knowledge_base: routing::is_knowledge_base(&entry.kind),
         });
     }
 

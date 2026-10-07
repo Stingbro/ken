@@ -9723,6 +9723,7 @@ async fn route_search(
         let mut dormant: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> =
             std::collections::HashMap::new();
         let mut members: Vec<routing::MemberInfo> = Vec::with_capacity(plan_snapshots.len());
+        let registry = ken_core::registry::Registry::load(&plan_base).ok();
         for (project_id, name, live) in &plan_snapshots {
             let handle: Option<Arc<Mutex<Db>>> = match live {
                 Some(db) => Some(db.clone()),
@@ -9751,11 +9752,16 @@ async fn route_search(
                 }
                 None => (false, 0),
             };
+            let knowledge_base = registry
+                .as_ref()
+                .and_then(|r| r.projects.iter().find(|e| e.id == *project_id))
+                .is_some_and(|e| routing::is_knowledge_base(&e.kind));
             members.push(routing::MemberInfo {
                 project_id: *project_id,
                 name: name.clone(),
                 index_ready,
                 last_activity,
+                knowledge_base,
             });
         }
 
