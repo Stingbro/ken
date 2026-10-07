@@ -685,6 +685,9 @@ fn phase_extract(base: &Path, parent: &Path, minutes: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
     let generate = |p: &str| local_llm::generate_json(p, Priority::Background);
     println!("# Entity extraction (local model, budget {minutes} min)\n\n| member | done / extractable | entities | edges | seconds per file |\n|---|---|---|---|---|");
+    // The team's roster, so a teammate named like a bot is kept, as in the app.
+    let roots: Vec<PathBuf> = members(parent)?.into_iter().map(|(_, p)| p.root).collect();
+    let roster = ken_core::people::roster_of(roots.iter().map(PathBuf::as_path));
     for (name, p) in members(parent)? {
         let mut db = Db::open(base, p.config.id)?;
         if db.extractable_file_count()? == 0 {
@@ -694,7 +697,7 @@ fn phase_extract(base: &Path, parent: &Path, minutes: u64) -> Result<()> {
         let mut files = 0;
         let t = Instant::now();
         while Instant::now() < deadline {
-            match knowledge_model::process_next_pending_with_addendum(&mut db, &today(), engine::now_epoch(), &generate, "") {
+            match knowledge_model::process_next_pending_for(&mut db, &today(), engine::now_epoch(), &generate, "", &roster) {
                 Ok(Some(path)) => {
                     files += 1;
                     eprintln!("  {name}: {path} ({:.0}s avg)", t.elapsed().as_secs_f64() / files as f64);

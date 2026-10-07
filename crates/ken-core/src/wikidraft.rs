@@ -68,11 +68,13 @@ pub const PAGES: &[(&str, &str)] = &[
     (
         "Current/Team.md",
         "how the team is structured: roles, who decides what, how work is handed off; \
-         roles and deciders only as CODEOWNERS, `people/` files or the repos' own docs name them",
+         roles and deciders only as CODEOWNERS, `people/` files or the repos' own docs name them; \
+         every person on the team's roster (`people/`) is listed, whatever git says",
     ),
     (
         "Current/Who-Does-What.md",
         "who owns each area and repo, and who to ask, from CODEOWNERS, `people/` files and what the repos' own docs say; \
+         every person on the team's roster (`people/`) gets a row; \
          git adds only a column of who has committed to each area recently (the recent contributors by folder), never an owner",
     ),
     (
@@ -342,19 +344,36 @@ pub fn is_bot(name: &str, email: &str) -> bool {
         || (e.contains("noreply") && local.contains("bot"))
 }
 
+/// A file's area one level down: its first two folders, or past a source
+/// set's root (`src/main/java/`, `src/main/resources/`, `src/test/kotlin/`)
+/// the two after it, as `a/b/`. None for a file less deep.
+fn second_level(path: &str) -> Option<String> {
+    let segs: Vec<&str> = path.split('/').collect();
+    let dirs = &segs[..segs.len().saturating_sub(1)];
+    let skip = match dirs {
+        ["src", _, lang, ..] if ["java", "kotlin", "scala", "groovy", "resources"].contains(lang) => 3,
+        _ => 0,
+    };
+    (dirs.len() >= skip + 2).then(|| format!("{}/", dirs[..skip + 2].join("/")))
+}
+
 /// Who has committed to each top-level folder in the last 90 days, as
-/// `folder/: Name (commits), …`, at most three a folder, most first. A
-/// commit identity the team's `roster` lists counts as that person, under
-/// their roster name, and is never dropped as a bot; any other is one person
-/// per email ([`crate::people::person_key`]), shown under the name they
-/// commit with most, bots and AI agents left out. The Shattered Realms draft
-/// listed one person's three identities as three people. This is a column of
-/// recent hands, never an owner: the 2026-10-06 draft read a whole-history
-/// shortlog and put the template's committers from before the team existed
-/// into the team's roles table.
+/// `folder/: Name (commits), …`, at most three a folder, most first; then
+/// each folder one level down ([`second_level`]) where someone not in its
+/// top-level row has at least 5% of its commits, so a person who owns one
+/// area shows up behind those who commit everywhere (Andrew's `data/spawns`
+/// work sat behind 1,615 commits under `src/` on 2026-10-06). A commit
+/// identity the team's `roster` lists counts as that person, under their
+/// roster name, and is never dropped as a bot; any other is one person per
+/// email ([`crate::people::person_key`]), shown under the name they commit
+/// with most, bots and AI agents left out. This is a column of recent hands,
+/// never an owner: the 2026-10-06 draft read a whole-history shortlog and
+/// put the template's committers from before the team existed into the
+/// team's roles table.
 pub fn recent_contributors(root: &Path, roster: &[crate::people::Person]) -> Option<String> {
     let text = git_text(root, &["log", "--since=90.days", "--no-merges", "--format=%x1e%aN%x1f%aE", "--name-only"])?;
     let mut counts: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
+    let mut counts_two: BTreeMap<String, HashMap<String, usize>> = BTreeMap::new();
     let mut names: HashMap<String, HashMap<String, usize>> = HashMap::new();
     for rec in text.split('\x1e').filter(|r| !r.trim().is_empty()) {
         let mut lines = rec.lines();
@@ -365,13 +384,17 @@ pub fn recent_contributors(root: &Path, roster: &[crate::people::Person]) -> Opt
             None => (crate::people::person_key(email), name.trim().to_string()),
         };
         *names.entry(key.clone()).or_default().entry(shown).or_default() += 1;
-        let areas: BTreeSet<String> = lines
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
+        let files: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).collect();
+        let areas: BTreeSet<String> = files
+            .iter()
             .map(|f| f.split_once('/').map_or_else(|| "(top-level files)".to_string(), |(a, _)| format!("{a}/")))
             .collect();
         for a in areas {
             *counts.entry(a).or_default().entry(key.clone()).or_default() += 1;
+        }
+        let deeper: BTreeSet<String> = files.iter().filter_map(|f| second_level(f)).collect();
+        for a in deeper {
+            *counts_two.entry(a).or_default().entry(key.clone()).or_default() += 1;
         }
     }
     let name_of = |k: &str| {
@@ -381,22 +404,40 @@ pub fn recent_contributors(root: &Path, roster: &[crate::people::Person]) -> Opt
             .map(|(n, _)| n.clone())
             .unwrap_or_default()
     };
-    let mut out = String::new();
-    for (area, people) in counts {
-        let mut ranked: Vec<(String, usize)> = people.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // The people of an area, most commits first, one row per name.
+    let ranked = |people: &HashMap<String, usize>| -> Vec<(String, usize)> {
+        let mut by_key: Vec<(&String, &usize)> = people.iter().collect();
+        by_key.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         let mut shown: Vec<(String, usize)> = Vec::new();
-        for (k, n) in ranked {
-            let name = name_of(&k);
+        for (k, n) in by_key {
+            let name = name_of(k);
             if !shown.iter().any(|(s, _)| *s == name) {
-                shown.push((name, n));
-            }
-            if shown.len() == 3 {
-                break;
+                shown.push((name, *n));
             }
         }
-        let row: Vec<String> = shown.iter().map(|(s, n)| format!("{s} ({n})")).collect();
-        out.push_str(&format!("{area}: {}\n", row.join(", ")));
+        shown
+    };
+    let row = |v: &[(String, usize)]| v.iter().map(|(s, n)| format!("{s} ({n})")).collect::<Vec<_>>().join(", ");
+    let mut out = String::new();
+    let mut top_rows: HashMap<String, Vec<String>> = HashMap::new();
+    for (area, people) in &counts {
+        let shown: Vec<(String, usize)> = ranked(people).into_iter().take(3).collect();
+        top_rows.insert(area.clone(), shown.iter().map(|(s, _)| s.clone()).collect());
+        out.push_str(&format!("{area}: {}\n", row(&shown)));
+    }
+    let mut deeper = String::new();
+    for (area, people) in &counts_two {
+        let total: usize = people.values().sum();
+        let top = area.split_once('/').map(|(a, _)| format!("{a}/")).unwrap_or_default();
+        let above = top_rows.get(&top).cloned().unwrap_or_default();
+        let shown: Vec<(String, usize)> = ranked(people).into_iter().filter(|(_, n)| n * 20 >= total).take(3).collect();
+        if shown.iter().any(|(s, _)| !above.contains(s)) {
+            deeper.push_str(&format!("{area}: {}\n", row(&shown)));
+        }
+    }
+    if !deeper.is_empty() {
+        out.push_str("\none level down, where someone not listed above has commits:\n");
+        out.push_str(&deeper);
     }
     (!out.is_empty()).then_some(out)
 }
@@ -2733,6 +2774,13 @@ pub fn page_sources(
     out.extend(per_repo.into_iter().zip(fair_shares(&sizes, PAGE_BUDGET)).flat_map(|(v, share)| within(v, share)));
     if people {
         out.extend(people_files(wiki_name, wiki));
+        if !roster.is_empty() {
+            let listed: Vec<String> = roster
+                .iter()
+                .map(|p| if p.aliases.is_empty() { format!("- {}", p.name) } else { format!("- {} (also {})", p.name, p.aliases.join(", ")) })
+                .collect();
+            out.push(Source { label: format!("{wiki_name}:(the team's roster, from people/)"), text: listed.join("\n") });
+        }
     }
     out
 }
@@ -4100,6 +4148,42 @@ name: Mabel Bot
         assert!(rows.contains("docs/: Mabel Bot (1)
 "), "the roster beats the bot list: {rows}");
         assert!(!rows.contains("Sync Bot"), "a bot not on the roster stays out: {rows}");
+    }
+
+    /// Someone who owns one area shows up one level down, behind those who
+    /// commit everywhere; and Team and Who Does What get the whole roster.
+    #[test]
+    fn an_area_owner_shows_one_level_down_and_the_roster_is_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        git_in(root, &["init", "-q"]);
+        let mut n = 0;
+        let mut commit = |who: &str, file: &str| {
+            n += 1;
+            write(root, &[(file, &n.to_string())]);
+            git_in(root, &["add", "-A"]);
+            git_in(root, &["commit", "-q", "--author", who, "-m", &format!("change {n}")]);
+        };
+        for i in 0..4 {
+            commit("Chris <chris@example.com>", &format!("src/main/java/dev/app/A{i}.java"));
+            commit("Stingbro <sting@example.com>", &format!("src/main/java/dev/app/B{i}.java"));
+            commit("AlpahSignalAI <alpha@example.com>", &format!("src/main/resources/Server/Item/C{i}.json"));
+        }
+        commit("Anjewist <andrew@example.com>", "src/main/resources/data/spawns/zone.json");
+        let rows = recent_contributors(root, &[]).unwrap();
+        assert!(rows.starts_with("src/: AlpahSignalAI (4), Chris (4), Stingbro (4)\n"), "{rows}");
+        assert!(rows.contains("src/main/resources/data/spawns/: Anjewist (1)\n"), "{rows}");
+        assert!(!rows.contains("src/main/java/dev/: "), "nobody new there: {rows}");
+        assert_eq!(second_level("src/main/resources/Server/Item/x.json").as_deref(), Some("src/main/resources/Server/Item/"));
+        assert_eq!(second_level("packages/schema/src/index.ts").as_deref(), Some("packages/schema/"));
+        assert_eq!(second_level("README.md"), None);
+
+        write(root, &[("people/andrew.md", "---\nid: andrew\nname: Andrew\naliases: [Anjewist]\n---\n"), ("people/chris.md", "---\nid: chris\nname: Chris\n---\n")]);
+        let roster = crate::people::roster(root);
+        let s = page_sources("Current/Team.md", root, "Wiki", &[("game".to_string(), root.to_path_buf())], &roster);
+        let listed = s.iter().find(|x| x.label == "Wiki:(the team's roster, from people/)").expect("the roster");
+        assert_eq!(listed.text, "- Andrew (also Anjewist)\n- Chris");
+        assert!(PAGES.iter().find(|(p, _)| *p == "Current/Who-Does-What.md").unwrap().1.contains("every person on the team's roster"));
     }
 
     /// Item 8: the index and START-HERE say what a repo is for once its page
