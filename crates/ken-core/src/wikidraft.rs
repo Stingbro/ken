@@ -163,10 +163,23 @@ fn read_plain(path: &Path) -> Option<String> {
     (!t.trim().is_empty()).then_some(t)
 }
 
+/// One line of text within `n` characters, cut at a character boundary
+/// with `…`: a line quoted as evidence, never a source.
+pub(crate) fn clip_line(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Run git in `root` and read what it prints as UTF-8, whatever the
 /// console's code page: on Windows a contributor's accented name came out
 /// garbled in the 2026-10-06 dry run. None when git fails.
-fn git_text(root: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_text(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
     let out = crate::proc::quiet(&mut cmd)
         .args(["-c", "i18n.logOutputEncoding=UTF-8", "-c", "core.quotePath=false"])
@@ -175,6 +188,29 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
         .output()
         .ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The lines `git grep -F` finds for `needle` in `root`'s code and data,
+/// docs left out, as `repo:path:line: text`, test files last, at most 40;
+/// with how many there were in all.
+pub(crate) fn grep_repo(repo: &str, root: &Path, needle: &str, ignore_case: bool) -> (usize, Vec<String>) {
+    let mut args = vec!["grep", "-n", "-I", "-F"];
+    if ignore_case {
+        args.push("-i");
+    }
+    args.extend(["-e", needle, "--", ".", ":!*.md", ":!*.mdx", ":!*.txt", ":!*.rst", ":!*.adoc"]);
+    let text = git_text(root, &args).unwrap_or_default();
+    let mut lines: Vec<(bool, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let (path, rest) = l.split_once(':')?;
+            let (n, body) = rest.split_once(':')?;
+            Some((crate::checkout::is_test_path(path), format!("{repo}:{path}:{n}: {}", clip_line(body.trim(), 200))))
+        })
+        .collect();
+    let count = lines.len();
+    lines.sort_by_key(|(test, _)| *test);
+    (count, lines.into_iter().take(40).map(|(_, l)| l).collect())
 }
 
 /// Every file git tracks in `root`, as `/`-separated paths.
@@ -1218,21 +1254,25 @@ fn build_files(root: &Path) -> Vec<(String, String)> {
 /// out of date ([`checkout_sources`]).
 pub const REGISTERS: &str = "(what the code registers, from its entry points)";
 pub const VALUES: &str = "(values in the checkout: build and data files)";
-/// Characters of one of them.
+/// Characters of one of them on a repo's page.
 const CHECKOUT_MAX: usize = 16_000;
+/// Characters of the values a team page that states values reads from one
+/// repo, every data file whole ([`crate::checkout::values`]).
+const TEAM_VALUES_MAX: usize = 40_000;
 
 /// What the checkout says now: what the code wires together at start-up
 /// ([`crate::checkout::registrations`]) when `wiring`, and the versions the
 /// build files pin with the values of the data files the briefs name
-/// ([`crate::checkout::values`]) when `values`. Wiring is never read for a
-/// reference repo: its code is the platform's, and large.
+/// ([`crate::checkout::values`]), within `values` characters, when it is
+/// given. Wiring is never read for a reference repo: its code is the
+/// platform's, and large.
 fn checkout_sources(
     name: &str,
     root: &Path,
     tracked: &[String],
     briefs: &[(String, Vec<Section>)],
     wiring: bool,
-    values: bool,
+    values: Option<usize>,
 ) -> Vec<Source> {
     let mut out = Vec::new();
     if wiring {
@@ -1240,13 +1280,19 @@ fn checkout_sources(
             out.push(Source { label: format!("{name}:{REGISTERS}"), text: t });
         }
     }
-    if values {
+    if let Some(budget) = values {
         let brief_text: String = briefs.iter().flat_map(|(_, secs)| secs.iter().map(|s| s.text.as_str())).collect();
-        if let Some(t) = crate::checkout::values(root, tracked, &brief_text) {
+        if let Some(t) = crate::checkout::values(root, tracked, &brief_text, budget) {
             out.push(Source { label: format!("{name}:{VALUES}"), text: t });
         }
     }
     out
+}
+
+/// Whether a source is one of [`checkout_sources`]: given whole or not at
+/// all, never cut.
+fn is_checkout(label: &str) -> bool {
+    label.ends_with(REGISTERS) || label.ends_with(VALUES)
 }
 
 /// The release-notes files read per version.
@@ -1303,7 +1349,7 @@ pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) ->
     let tracked = ls_files(root).unwrap_or_default();
     let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
     let push_checkout = pusher_of(REPO_BUDGET, CHECKOUT_MAX);
-    for s in checkout_sources(name, root, &tracked, &briefs, !reference, true) {
+    for s in checkout_sources(name, root, &tracked, &briefs, !reference, Some(CHECKOUT_MAX)) {
         push_checkout(s.label, s.text, &mut out);
     }
     let used: usize = out.iter().map(|s| s.text.len()).sum();
@@ -1623,21 +1669,53 @@ fn page_tokens(page: &str) -> Vec<(bool, usize, String)> {
 /// [`as_path`] reads as a path, a brace list once per path in it
 /// ([`expand_braces`]). `repos` are the repo names a citation may start with.
 pub fn named_paths(page: &str, repos: &[&str]) -> Vec<(Option<String>, String)> {
+    named_paths_at(page, repos).into_iter().map(|(r, p, _)| (r, p)).collect()
+}
+
+/// [`named_paths`], each with the line of the page it is first named on.
+fn named_paths_at(page: &str, repos: &[&str]) -> Vec<(Option<String>, String, usize)> {
     let mut names: Vec<&str> = repos.to_vec();
     // `Game-Tools` before `Game`, so a longer name is never cut short.
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-    let mut out: Vec<(Option<String>, String)> = Vec::new();
-    for (front, _, token) in page_tokens(page) {
+    let mut out: Vec<(Option<String>, String, usize)> = Vec::new();
+    for (front, at, token) in page_tokens(page) {
         for t in expand_braces(&token) {
             match as_path(&t, &names) {
-                Some(p) if !front || p.0.is_some() => out.push(p),
+                Some((r, p)) if !front || r.is_some() => out.push((r, p, at)),
                 _ => {}
             }
         }
     }
     let mut seen = HashSet::new();
-    out.retain(|p| seen.insert(p.clone()));
+    out.retain(|(r, p, _)| seen.insert((r.clone(), p.clone())));
     out
+}
+
+/// A path that stands for many by a placeholder: `tickets/SR-NNN.md`,
+/// `logs/XXXX.log`.
+fn is_placeholder_path(path: &str) -> bool {
+    path.split(['/', '-', '_', '.']).any(|seg| seg.len() >= 3 && (seg.chars().all(|c| c == 'N') || seg.chars().all(|c| c == 'X') || seg.chars().all(|c| c == 'n')))
+}
+
+/// Whether a line places what it names in a repo Ken did not read: a
+/// `../Other-Repo/` path, a vault or another repo named in words, or a
+/// repo-like name (`Team-Docs`, `sr-docs`) that is none of `repos`.
+fn names_unread_repo(line: &str, repos: &[&str]) -> bool {
+    let l = line.to_lowercase();
+    let above = line.split(|c: char| c.is_whitespace() || c == '`' || c == '(').any(|t| t.starts_with("../"));
+    if above || [" vault", "other repo", "another repo", "docs repo", "team repo"].iter().any(|k| l.contains(k)) {
+        return true;
+    }
+    let repo_like = |t: &str| {
+        let t = t.trim_matches(|c: char| !c.is_alphanumeric());
+        t.len() >= 4
+            && t.contains('-')
+            && t.chars().all(|c| c.is_alphanumeric() || c == '-')
+            && !repos.iter().any(|r| r.eq_ignore_ascii_case(t) || crate::workspace::member_leaf(r).eq_ignore_ascii_case(t))
+            && (t.split('-').filter(|p| p.starts_with(|c: char| c.is_uppercase())).count() >= 2
+                || ["docs", "wiki", "vault"].iter().any(|s| t.to_lowercase().ends_with(s)))
+    };
+    line.split('`').skip(1).step_by(2).any(repo_like) || line.split_whitespace().any(|w| repo_like(w) && w.trim_matches(|c: char| !c.is_alphanumeric()).split('-').count() >= 3)
 }
 
 /// One path a page names that no repo tracks.
@@ -1667,6 +1745,12 @@ pub struct Checked {
     pub paths: Vec<MissingPath>,
     pub names: Vec<String>,
     pub versions: Vec<StaleVersion>,
+    /// What the check cannot judge and left alone, each with why: a
+    /// front-matter key, an example name, a name on a line that says it is
+    /// gone, a range's bound, a glob, a path in a repo Ken did not read.
+    pub skipped: Vec<String>,
+    /// Ken's search of the checkout for each of `names`, in its order.
+    pub searched: Vec<String>,
 }
 
 impl Checked {
@@ -1676,10 +1760,10 @@ impl Checked {
 }
 
 /// One repo's tracked files, split into segments.
-struct Tracked {
-    name: String,
-    root: PathBuf,
-    files: Vec<Vec<String>>,
+pub(crate) struct Tracked {
+    pub(crate) name: String,
+    pub(crate) root: PathBuf,
+    pub(crate) files: Vec<Vec<String>>,
     /// Every folder name anywhere in the repo.
     folders: HashSet<String>,
     /// The names its code defines and uses ([`crate::checkout::names`]).
@@ -1687,7 +1771,10 @@ struct Tracked {
     /// The versions its build files pin.
     pins: Vec<crate::checkout::Pin>,
     /// Whether its code was read for names; a shallow one is searched.
-    deep: bool,
+    pub(crate) deep: bool,
+    /// Whether it is the team's library, the wiki itself: a page may name
+    /// its paths, but a path is never rewritten to one of them.
+    pub(crate) library: bool,
 }
 
 /// Whether segment `s` matches pattern segment `pat`, where `*`, `<name>`
@@ -1807,14 +1894,17 @@ impl Tracked {
 /// checked against.
 #[derive(Default)]
 pub struct PathCheck {
-    repos: Vec<Tracked>,
+    pub(crate) repos: Vec<Tracked>,
+    /// What `git grep` found for a needle in a repo, for the run.
+    #[allow(clippy::type_complexity)]
+    pub(crate) greps: std::cell::RefCell<HashMap<String, (usize, Vec<String>)>>,
 }
 
 impl PathCheck {
     /// Read from the checkouts: a reference repo's names are its files' and
     /// folders' only, since its code is the platform's and large.
     pub fn of(repos: &[(String, PathBuf)]) -> PathCheck {
-        let repos = repos
+        let tracked = repos
             .iter()
             .filter_map(|(name, root)| {
                 let tracked = ls_files(root)?;
@@ -1823,10 +1913,10 @@ impl PathCheck {
                 let deep = !crate::registry::kind_of(root).contains(&crate::registry::RepoKind::Reference);
                 let names = crate::checkout::names(root, &tracked, deep);
                 let pins = crate::checkout::pins(root, &tracked);
-                Some(Tracked { name: name.clone(), root: root.clone(), files, folders, names, pins, deep })
+                Some(Tracked { name: name.clone(), root: root.clone(), files, folders, names, pins, deep, library: false })
             })
             .collect();
-        PathCheck { repos }
+        PathCheck { repos: tracked, ..Default::default() }
     }
 
     /// The check with the team's library added for paths alone: a page may
@@ -1836,8 +1926,38 @@ impl PathCheck {
         let files: Vec<Vec<String>> = tracked.iter().map(|f| f.split('/').map(str::to_string).collect()).collect();
         let folders = files.iter().flat_map(|f| f[..f.len() - 1].iter().cloned()).collect();
         let names = crate::checkout::names(root, &tracked, false);
-        self.repos.push(Tracked { name: name.to_string(), root: root.to_path_buf(), files, folders, names, pins: Vec::new(), deep: true });
+        self.repos.push(Tracked {
+            name: name.to_string(),
+            root: root.to_path_buf(),
+            files,
+            folders,
+            names,
+            pins: Vec::new(),
+            deep: true,
+            library: true,
+        });
         self
+    }
+
+    /// Where `git grep -F` finds `needle` in the team's code repos (the
+    /// library and a reference repo left out), as `repo:path:line: text`:
+    /// at most `max` lines, and how many there were in all.
+    pub(crate) fn search(&self, needle: &str, max: usize) -> (usize, Vec<String>) {
+        let mut count = 0;
+        let mut out = Vec::new();
+        for t in self.repos.iter().filter(|t| t.deep && !t.library) {
+            let key = format!("{}\0false\0{needle}", t.name);
+            let hit = self.greps.borrow().get(&key).cloned();
+            let (n, lines) = hit.unwrap_or_else(|| {
+                let found = grep_repo(&t.name, &t.root, needle, false);
+                self.greps.borrow_mut().insert(key, found.clone());
+                found
+            });
+            count += n;
+            out.extend(lines);
+        }
+        out.truncate(max);
+        (count, out)
     }
 
     /// The paths `page` names that no repo has, each with where a file or
@@ -1847,12 +1967,38 @@ impl PathCheck {
     /// first segment is a folder the repo has somewhere, so `owner/repo` and
     /// branch names are left alone.
     pub fn missing(&self, page: &str, home: Option<&str>) -> Vec<MissingPath> {
+        self.paths_checked(page, home).0
+    }
+
+    /// [`PathCheck::missing`], and the paths left unchecked with why: a
+    /// placeholder (`tickets/SR-NNN.md`), and a bare path on a line that
+    /// places it in a repo Ken did not read (the docs vault's
+    /// `_meta/ticketcheck.py`, 2026-10-07). A missing path's match is never
+    /// the wiki's own page: the brief's `sr-docs/Engine/Reference/Vocabulary.md`
+    /// became the wiki's `Reference/Vocabulary.md`, and the page pointed at itself.
+    fn paths_checked(&self, page: &str, home: Option<&str>) -> (Vec<MissingPath>, Vec<String>) {
         if self.repos.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let names: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+        let lines: Vec<&str> = page.lines().collect();
+        let mut skipped: Vec<String> = Vec::new();
         let mut out = Vec::new();
-        for (repo, path) in named_paths(page, &names) {
+        for (repo, path, at) in named_paths_at(page, &names) {
+            let why = if is_placeholder_path(&path) {
+                Some("a pattern")
+            } else if repo.is_none() && names_unread_repo(lines.get(at).copied().unwrap_or_default(), &names) {
+                Some("in a repo Ken did not read")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                let line = format!("`{path}` ({why})");
+                if !skipped.contains(&line) {
+                    skipped.push(line);
+                }
+                continue;
+            }
             let mut scope: Vec<&Tracked> = self.repos.iter().filter(|t| repo.as_ref().is_none_or(|r| *r == t.name)).collect();
             scope.sort_by_key(|t| Some(t.name.as_str()) != home);
             let is_file = has_file_ext(&path);
@@ -1865,17 +2011,22 @@ impl PathCheck {
             if scope.iter().any(|t| t.has(&path, is_file) || t.untracked(&path)) {
                 continue;
             }
-            let mut now: Vec<String> =
-                scope.iter().flat_map(|t| t.lookup(&path, is_file).into_iter().map(move |p| format!("{}:{p}", t.name))).collect();
+            let mut now: Vec<String> = scope
+                .iter()
+                .filter(|t| !t.library)
+                .flat_map(|t| t.lookup(&path, is_file).into_iter().map(move |p| format!("{}:{p}", t.name)))
+                .collect();
             // A test fixture's copy is never what a page means when the real
             // file is there too.
             if now.iter().any(|p| !crate::checkout::is_test_path(p)) {
                 now.retain(|p| !crate::checkout::is_test_path(p));
             }
             now.truncate(5);
-            out.push(MissingPath { path, repo, now });
+            if !out.iter().any(|m: &MissingPath| m.path == path && m.repo == repo) {
+                out.push(MissingPath { path, repo, now });
+            }
         }
-        out
+        (out, skipped)
     }
 
     /// The names `page` writes as code ([`crate::checkout::as_symbol`]) that
@@ -1887,18 +2038,50 @@ impl PathCheck {
     /// drafted from the mod's brief on 2026-10-06, after the test audit had
     /// removed both.
     pub fn unknown_names(&self, page: &str) -> Vec<String> {
+        self.names_checked(page).0
+    }
+
+    /// [`PathCheck::unknown_names`], and what was left unchecked with why.
+    /// A name is known whole or inside a longer identifier
+    /// ([`crate::checkout::Names::has`]); never judged: a key of the page's
+    /// own front matter, a name a brief gives as an example (`MyComponent`,
+    /// `myConfig`, `FooBar`), and a name on a line that says it does not
+    /// exist (2026-10-07: `changed_by`, `MyComponent` and `stopServer` each
+    /// cost a correction call).
+    fn names_checked(&self, page: &str) -> (Vec<String>, Vec<String>) {
         if self.repos.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let repos: Vec<&str> = self.repos.iter().map(|r| r.name.as_str()).collect();
+        let keys = front_keys(page);
+        let lines: Vec<&str> = page.lines().collect();
         let mut out: Vec<String> = Vec::new();
-        for (front, _, token) in page_tokens(page) {
+        let mut skipped: Vec<String> = Vec::new();
+        let skip = |name: &str, why: &str, skipped: &mut Vec<String>| {
+            let line = format!("`{name}` ({why})");
+            if !skipped.contains(&line) {
+                skipped.push(line);
+            }
+        };
+        for (front, at, token) in page_tokens(page) {
             if front || as_path(&token, &repos).is_some() {
                 continue;
             }
             let Some((name, is_class)) = crate::checkout::as_symbol(&token) else { continue };
+            if keys.contains(&name) {
+                skip(&name, "a key of the page's front matter", &mut skipped);
+                continue;
+            }
+            if is_example_name(&name) {
+                skip(&name, "an example name", &mut skipped);
+                continue;
+            }
+            if says_absent(lines.get(at).copied().unwrap_or_default()) {
+                skip(&name, "on a line that says it does not exist", &mut skipped);
+                continue;
+            }
             let test = is_class && ["Test", "Tests", "Spec", "IT"].iter().any(|s| name.ends_with(s));
-            let known = self.repos.iter().any(|t| t.names.defined.contains(&name) || (!test && t.names.used.contains(&name)));
+            let known = self.repos.iter().any(|t| t.names.defined.contains(&name) || (!test && t.names.has(&name)));
             if !known && !out.contains(&name) {
                 out.push(name);
             }
@@ -1922,7 +2105,7 @@ impl PathCheck {
                 out.retain(|n| !hits.contains(n.as_str()));
             }
         }
-        out
+        (out, skipped)
     }
 
     /// The versions `page` states that a build file of some repo pins
@@ -1932,8 +2115,16 @@ impl PathCheck {
     /// Six pages carried the engine pin a dated note gave, `pre.3`, while
     /// `gradle.properties` said `pre.5` (2026-10-06).
     pub fn stale_versions(&self, page: &str) -> Vec<StaleVersion> {
+        self.versions_checked(page).0
+    }
+
+    /// [`PathCheck::stale_versions`], and the versions left unchecked: a
+    /// range's bound (`<0.8.0` in `>=0.7.0-pre.1 <0.8.0`) is no pin, and
+    /// cost a correction call on 2026-10-07.
+    fn versions_checked(&self, page: &str) -> (Vec<StaleVersion>, Vec<String>) {
         let pinned: HashSet<&str> = self.repos.iter().flat_map(|t| t.pins.iter().map(|p| p.value.as_str())).collect();
         let mut out: Vec<StaleVersion> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         let (mut in_front, mut fence) = (false, false);
         for (i, line) in page.lines().enumerate() {
             let t = line.trim();
@@ -1949,6 +2140,13 @@ impl PathCheck {
             }
             for written in crate::checkout::versions_in(line) {
                 if pinned.contains(written.as_str()) {
+                    continue;
+                }
+                if range_bound(line, &written) {
+                    let why = format!("`{written}` (a range's bound)");
+                    if !skipped.contains(&why) {
+                        skipped.push(why);
+                    }
                     continue;
                 }
                 let core = crate::checkout::version_core(&written);
@@ -1970,16 +2168,81 @@ impl PathCheck {
                 }
             }
         }
-        out
+        (out, skipped)
     }
 
     /// Everything [`PathCheck`] finds in the page at `page_path`. A page of
     /// history ([`is_history`]) names old versions on purpose, so its
     /// versions are not checked.
     pub fn check(&self, page_path: &str, page: &str, home: Option<&str>) -> Checked {
-        let versions = if is_history(page_path) { Vec::new() } else { self.stale_versions(page) };
-        Checked { paths: self.missing(page, home), names: self.unknown_names(page), versions }
+        let (versions, mut skipped) = if is_history(page_path) { (Vec::new(), Vec::new()) } else { self.versions_checked(page) };
+        let (paths, path_skips) = self.paths_checked(page, home);
+        let (names, name_skips) = self.names_checked(page);
+        skipped.extend(path_skips);
+        skipped.extend(name_skips);
+        let searched = names.iter().map(|n| search_line(self, n)).collect();
+        Checked { paths, names, versions, skipped, searched }
     }
+}
+
+/// The keys of a page's front matter: `changed_by`, `pin`, `sources`.
+fn front_keys(page: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut lines = page.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return out;
+    }
+    for l in lines.take_while(|l| l.trim_end() != "---") {
+        if l.starts_with([' ', '-', '\t']) {
+            continue;
+        }
+        if let Some((k, _)) = l.split_once(':') {
+            out.insert(k.trim().to_string());
+        }
+    }
+    out
+}
+
+/// A name a brief or a template gives as an example, not the team's code:
+/// `MyComponent`, `myConfig`, `FooBar`, `ExampleService`, `YourType`.
+fn is_example_name(name: &str) -> bool {
+    let parts = crate::checkout::ident_parts(name);
+    parts.first().is_some_and(|p| ["my", "your", "foo", "bar", "baz", "example", "sample", "some"].contains(&p.as_str()))
+}
+
+/// Whether a line says something is gone, removed or missing: the kind of
+/// line a correction wrote on 2026-10-07 for `kill_stats`, which
+/// `reset_kill_stats` still registered.
+pub(crate) fn says_gone(text: &str) -> bool {
+    let l = text.to_lowercase();
+    [
+        "is gone", "are gone", "no longer exist", "no longer in", "does not exist", "doesn't exist", "do not exist", "don't exist",
+        "no repo has", "was removed", "were removed", "has been removed", "have been removed", "was deleted", "were deleted",
+        "no longer has",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+/// Whether a line says the thing it names does not exist: "there is no
+/// `stopServer` task", "no such command", "is gone".
+fn says_absent(line: &str) -> bool {
+    let l = line.to_lowercase();
+    says_gone(line) || ["there is no ", "there are no ", "no such ", "not a task", "never existed"].iter().any(|k| l.contains(k))
+}
+
+/// Whether `version` stands in `line` as a range's bound: right after `<`,
+/// `>`, `=`, `^` or `~` (`>=0.7.0-pre.1 <0.8.0`).
+fn range_bound(line: &str, version: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = line[from..].find(version).map(|i| from + i) {
+        let before = line[..i].trim_end_matches(['v', 'V']).trim_end();
+        if before.ends_with(['<', '>', '=', '^', '~']) {
+            return true;
+        }
+        from = i + version.len();
+    }
+    false
 }
 
 /// The one call that corrects a drafted page: each path the checkout lacks
@@ -1999,22 +2262,89 @@ pub fn correction_prompt(page_path: &str, page: &str, found: &Checked) -> String
             s.push_str(&format!("- path `{}`{cited}: not there; a file or folder of that name is at {}\n", m.path, at.join(", ")));
         }
     }
-    for n in &found.names {
-        s.push_str(&format!("- name `{n}`: written as code, and no repo defines it, has a file of that name or uses it\n"));
+    for (n, search) in found.names.iter().zip(found.searched.iter().map(Some).chain(std::iter::repeat(None))) {
+        s.push_str(&format!("- name `{n}`: written as code, and no repo defines it, has a file of that name or uses it"));
+        if let Some(search) = search {
+            s.push_str(&format!("; {search}"));
+        }
+        s.push('\n');
     }
     for v in &found.versions {
         s.push_str(&format!("- version `{}`: `{}:{}` has `{} = {}`\n", v.written, v.repo, v.pin.file, v.pin.key, v.pin.value));
     }
     s.push_str(
         "\nCorrect the page: write each path where the code has it now, choosing by what the page says about it; a \
-         name the code no longer has, leave out or say it is gone; a version, write as the build file has it and cite \
-         the file. Kept as they are: a path the sources place outside these repos (another repo, the docs vault), a \
+         name the code no longer has, leave out, and say it is gone only when Ken's search above found no hits; a \
+         version, write as the build file has it and cite the file. Kept as they are: a path the sources place outside \
+         these repos (another repo, the docs vault), a \
          file the sources say something makes (a build, the server at run time, a person), a name that is a product, \
          a tool, an example or a word rather than the team's code, and a version the page gives as history. Change nothing else. \
          Reply with the whole corrected page, starting with `---`. No preamble, no code fences around it.\n\nTHE PAGE:\n",
     );
     s.push_str(page);
     s
+}
+
+/// Ken's search of the checkout for `name`, in words for a prompt and a log:
+/// `git grep -F` over the team's code repos, docs left out.
+fn search_line(check: &PathCheck, name: &str) -> String {
+    let repos: Vec<&str> = check.repos.iter().filter(|t| t.deep && !t.library).map(|t| t.name.as_str()).collect();
+    let (n, hits) = check.search(name, 3);
+    if n == 0 {
+        format!("Ken's search (`git grep -F {name}` over {}, docs left out): no hits", repos.join(", "))
+    } else {
+        format!("Ken's search (`git grep -F {name}` over {}): {n} lines, e.g. {}", repos.join(", "), hits.join(" · "))
+    }
+}
+
+/// `fixed`, a corrected page, with every line the correction made say that
+/// something is gone put back as `before` had it, unless Ken's search of
+/// the checkout finds nothing for each name the line says is gone: a row by
+/// its first cell, another line dropped. On 2026-10-07 a correction wrote
+/// that `kill_stats` "is gone: no repo has it now" while
+/// `reset_kill_stats` registered it. Each line put back or dropped, with
+/// the search, as (before, after, search).
+fn guard_absences(before: &str, fixed: &str, check: &PathCheck) -> (String, Vec<(String, String, String)>) {
+    let old: HashSet<&str> = before.lines().collect();
+    let repos: Vec<&str> = check.repos.iter().map(|t| t.name.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut undone = Vec::new();
+    for line in fixed.lines() {
+        if old.contains(line) || !says_gone(line) {
+            out.push(line.to_string());
+            continue;
+        }
+        let names: Vec<String> = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| as_path(t, &repos).is_none())
+            .filter_map(|t| crate::checkout::as_symbol(t).map(|(n, _)| n).or_else(|| (t.len() >= 4 && !t.contains(' ')).then(|| t.to_string())))
+            .collect();
+        let found: Vec<String> = names.iter().filter(|n| check.search(n, 1).0 > 0).map(|n| search_line(check, n)).collect();
+        if found.is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let first_cell = |l: &str| l.trim().trim_matches('|').split('|').next().map(|c| c.trim().to_string());
+        let original = line
+            .trim()
+            .starts_with('|')
+            .then(|| before.lines().find(|o| o.trim().starts_with('|') && first_cell(o) == first_cell(line)))
+            .flatten();
+        match original {
+            Some(o) => {
+                out.push(o.to_string());
+                undone.push((line.to_string(), o.to_string(), found.join("; ")));
+            }
+            None => undone.push((line.to_string(), String::new(), found.join("; "))),
+        }
+    }
+    let mut text = out.join("\n");
+    if fixed.ends_with('\n') {
+        text.push('\n');
+    }
+    (text, undone)
 }
 
 /// `page` with each backticked token and frontmatter item that `f` maps
@@ -2114,6 +2444,9 @@ fn check_paths(
         report.corrected.push(format!("{page_path}: `{from}` -> `{to}` (rewritten, one match)"));
     }
     let found = check.check(page_path, &text, home);
+    if !found.skipped.is_empty() {
+        report.corrected.push(format!("{page_path}: not checked: {}", found.skipped.join(", ")));
+    }
     if found.is_empty() {
         return text;
     }
@@ -2121,6 +2454,11 @@ fn check_paths(
     match generate(&correction_prompt(page_path, &text, &found)).and_then(|r| finish(&r)) {
         Ok(fixed) => {
             report.corrected.push(format!("{page_path}: sent back once for {listed}"));
+            let (fixed, undone) = guard_absences(&text, &fixed, check);
+            for (said, back, search) in undone {
+                let now = if back.is_empty() { "dropped".to_string() } else { format!("put back as `{back}`") };
+                report.corrected.push(format!("{page_path}: the correction wrote `{said}`; {now}, since {search}"));
+            }
             fixed
         }
         Err(e) => {
@@ -2250,7 +2588,8 @@ pub fn pin_sources(page: &str, heads: &HashMap<String, String>) -> String {
         }
         if in_front && bare.starts_with("pin:") && !cited.is_empty() {
             let value = bare["pin:".len()..].split(" #").next().unwrap_or_default().trim();
-            if value.is_empty() || value.contains("{{") {
+            // `""` and `''` are empty too: eight pages kept `pin: ""` on 2026-10-07.
+            if value.trim_matches(['"', '\'']).trim().is_empty() || value.contains("{{") {
                 let pin = match cited.as_slice() {
                     [one] => heads[*one].clone(),
                     many => many.iter().map(|r| format!("{r}@{}", heads[*r])).collect::<Vec<_>>().join(", "),
@@ -2795,7 +3134,8 @@ fn fair_shares(sizes: &[usize], budget: usize) -> Vec<usize> {
     out
 }
 
-/// `sources` in order while `budget` lasts, the last one clipped to fit.
+/// `sources` in order while `budget` lasts, the last one clipped to fit;
+/// a source of [`checkout_sources`] is never cut, but named with its size.
 fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
     let mut out = Vec::new();
     let mut used = 0;
@@ -2803,7 +3143,11 @@ fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
         if used >= budget {
             break;
         }
-        let text = clip(&s.text, budget - used);
+        let text = if is_checkout(&s.label) && used + s.text.len() > budget {
+            format!("(left out for room: {} characters; never cut)", s.text.len())
+        } else {
+            clip(&s.text, budget - used)
+        };
         used += text.len();
         out.push(Source { label: s.label, text });
     }
@@ -2837,7 +3181,7 @@ pub fn page_sources(
         if wiring || values {
             let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
             let tracked = ls_files(root).unwrap_or_default();
-            mine.extend(checkout_sources(name, root, &tracked, &briefs(root), wiring && !reference, values));
+            mine.extend(checkout_sources(name, root, &tracked, &briefs(root), wiring && !reference, values.then_some(TEAM_VALUES_MAX)));
         }
         match page {
             "Work/Releases.md" => {
@@ -4072,7 +4416,8 @@ mod tests {
             ```\nOldGoneTest 0.7.0-pre.1\n```\n";
         let found = check.check("Platform/Index.md", page, None);
         assert!(found.paths.is_empty(), "{:?}", found.paths);
-        assert_eq!(found.names, vec!["getInstance", "OneNameLineComposerTest"], "a comment naming a test is not the test");
+        // `getInstance` is inside `freezesGetInstance`; a comment naming a test is not the test.
+        assert_eq!(found.names, vec!["OneNameLineComposerTest"]);
         let v: Vec<(&str, &str)> = found.versions.iter().map(|v| (v.written.as_str(), v.pin.value.as_str())).collect();
         assert_eq!(v, vec![("0.7.0-pre.3", "0.7.0-pre.5")], "history in a release list is not a pin");
         let p = correction_prompt("Platform/Index.md", page, &found);
@@ -4080,7 +4425,7 @@ mod tests {
         assert!(p.contains("- version `0.7.0-pre.3`: `game:gradle.properties` has `hytale_version = 0.7.0-pre.5`"), "{p}");
         assert_eq!(
             found_list(&found),
-            "names `getInstance`, `OneNameLineComposerTest`; versions `0.7.0-pre.3` (game:gradle.properties hytale_version = 0.7.0-pre.5)"
+            "names `OneNameLineComposerTest`; versions `0.7.0-pre.3` (game:gradle.properties hytale_version = 0.7.0-pre.5)"
         );
     }
 
@@ -4464,5 +4809,63 @@ name: Mabel Bot
         })
         .unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// A pin a draft wrote as `""` is empty: Ken fills it.
+    #[test]
+    fn an_empty_pin_is_filled() {
+        let heads: HashMap<String, String> = [("app".to_string(), "0a1b2c3d4e5f".to_string())].into();
+        for empty in ["pin: \"\"   # the commit each repo's sources were read at", "pin: ''", "pin:"] {
+            let page = format!("---\ntitle: V\n{empty}\nsources:\n  - app:README.md\n---\n# V\n");
+            assert!(pin_sources(&page, &heads).contains("\npin: 0a1b2c3d4e5f\n"), "{empty}: {}", pin_sources(&page, &heads));
+        }
+    }
+
+    /// The name check finds a name inside a longer identifier, never
+    /// rewrites a path to the wiki's own page, and leaves alone what it
+    /// cannot judge, saying so; and a correction may say a thing is gone
+    /// only when Ken's search finds nothing.
+    #[test]
+    fn the_check_is_precise_and_says_what_it_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("game");
+        write(
+            &root,
+            &[
+                ("gradle.properties", "hytale_version = 0.7.0-pre.5\n"),
+                ("src/commands/ResetCommand.java", "class ResetCommand {\n  String NAME = \"reset_kill_stats\";\n}\n"),
+            ],
+        );
+        git_in(&root, &["init", "-q"]);
+        git_in(&root, &["add", "-A"]);
+        let wiki = d.path().join("Wiki");
+        write(&wiki, &[("Reference/Vocabulary.md", "# Vocabulary\n")]);
+        git_in(&wiki, &["init", "-q"]);
+        git_in(&wiki, &["add", "-A"]);
+        let check = PathCheck::of(&[("game".to_string(), root.clone())]).with_library("Wiki", &wiki);
+        let page = "---\ntitle: V\nchanged_by: \"\"\n---\n# V\n\
+            The ids say `kill_stats`; `changed_by` is set by a person; add `MyComponent` to `myConfig`.\n\
+            There is no `stopServer` task. The manifest takes `>=0.7.0-pre.1 <0.8.0`.\n\
+            The brief names the word map at `sr-docs/Engine/Reference/Vocabulary.md`.\n\
+            The docs vault's `_meta/ticketcheck.py` runs at G2; tickets are `tickets/SR-NNN.md`.\n";
+        let found = check.check("Reference/Vocabulary.md", page, None);
+        assert!(found.names.is_empty(), "{:?}", found.names);
+        assert!(found.versions.is_empty(), "{:?}", found.versions);
+        let paths: Vec<(&str, &[String])> = found.paths.iter().map(|m| (m.path.as_str(), m.now.as_slice())).collect();
+        assert_eq!(paths, vec![("sr-docs/Engine/Reference/Vocabulary.md", &[][..])], "never the wiki's own page");
+        for skipped in ["`changed_by` (a key of the page's front matter)", "`MyComponent` (an example name)", "`myConfig` (an example name)", "`stopServer` (on a line that says it does not exist)", "`0.8.0` (a range's bound)", "`_meta/ticketcheck.py` (in a repo Ken did not read)", "`tickets/SR-NNN.md` (a pattern)"] {
+            assert!(found.skipped.contains(&skipped.to_string()), "{skipped}: {:?}", found.skipped);
+        }
+        let (text, _) = rewrite_single_matches(page, &found.paths);
+        assert_eq!(text, page, "a path is never rewritten to the wiki itself");
+
+        // A correction that says `kill_stats` is gone is put back: Ken's
+        // search finds it; one that says `Gone` is gone stands.
+        let before = "# V\n\n| word | code's word |\n|---|---|\n| Chronicle | `kill_stats` `game:x:1` |\n| Old | `Gone` |\n";
+        let fixed = "# V\n\n| word | code's word |\n|---|---|\n| Chronicle | `kill_stats` is gone: no repo has it now |\n| Old | `GoneThing` is gone: no repo has it now |\n";
+        let (out, undone) = guard_absences(before, fixed, &check);
+        assert!(out.contains("| Chronicle | `kill_stats` `game:x:1` |") && out.contains("`GoneThing` is gone"), "{out}");
+        assert_eq!(undone.len(), 1);
+        assert!(undone[0].2.contains("git grep -F kill_stats") && undone[0].2.contains("game:src/commands/ResetCommand.java:2"), "{:?}", undone);
     }
 }

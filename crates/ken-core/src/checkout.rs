@@ -20,9 +20,13 @@ use crate::codemap::{map_file, Lang};
 /// Characters of [`registrations`] for one repo, and of one function in it.
 const WIRING_MAX: usize = 12_000;
 const ONE_FN_MAX: usize = 9_000;
-/// Characters of [`values`] for one repo, and of one data file in it.
-const VALUES_MAX: usize = 16_000;
-const ONE_FILE_MAX: usize = 800;
+/// Characters of one data file's values. A file is given whole or not at
+/// all: an 800-character cut on 2026-10-07 dropped Sword and Staff from
+/// `MobWeaponDamage.json`'s windups and three of six weapons from
+/// `WeaponChargeScaling.json`, and the page gave the cut set as the whole.
+pub const ONE_FILE_MAX: usize = 64_000;
+/// Characters of a data file read before any larger one.
+const SMALL_FILE: usize = 4_000;
 /// A file larger than this is not read for names or values.
 const MAX_BYTES: u64 = 1_000_000;
 
@@ -438,7 +442,8 @@ fn flatten(v: &serde_json::Value, at: &str, depth: usize, out: &mut Vec<String>)
     match v {
         Value::Object(m) if depth >= 3 || m.len() > 24 => {
             let keys: Vec<&str> = m.keys().take(5).map(String::as_str).collect();
-            out.push(format!("{name}: {} keys ({}{})", m.len(), keys.join(", "), if m.len() > 5 { ", …" } else { "" }));
+            let more = if m.len() > 5 { format!("; the first {} of {}, not the whole set", keys.len(), m.len()) } else { String::new() };
+            out.push(format!("{name}: {} keys ({}{more})", m.len(), keys.join(", ")));
         }
         Value::Object(m) => {
             for (k, x) in m {
@@ -454,8 +459,9 @@ fn flatten(v: &serde_json::Value, at: &str, depth: usize, out: &mut Vec<String>)
 }
 
 /// A data file's values: JSON and YAML flattened ([`flatten`]), anything
-/// else its lines, comments left out.
-fn file_values(rel: &str, text: &str) -> String {
+/// else its lines, comments left out; whole, or None when they pass
+/// [`ONE_FILE_MAX`].
+fn file_values(rel: &str, text: &str) -> Option<String> {
     let ext = rel.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     let value: Option<serde_json::Value> = match ext.as_str() {
         "json" | "jsonc" => serde_json::from_str(text).ok(),
@@ -470,7 +476,8 @@ fn file_values(rel: &str, text: &str) -> String {
         }
         None => text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with(['#', ';', '/'])).map(String::from).collect(),
     };
-    clip(&lines.join("\n"), ONE_FILE_MAX)
+    let all = lines.join("\n");
+    (all.len() <= ONE_FILE_MAX).then_some(all)
 }
 
 /// The values in the checkout, as the build and data files hold them now:
@@ -478,8 +485,10 @@ fn file_values(rel: &str, text: &str) -> String {
 /// ([`pins`]), then each data or config file the briefs (`brief_text`) name
 /// by file name, most named first, with its values ([`file_values`]): the
 /// counts, defaults and multipliers a brief quotes and the code has since
-/// changed. None when there is nothing to say.
-pub fn values(root: &Path, tracked: &[String], brief_text: &str) -> Option<String> {
+/// changed. Every file whole within `budget` characters; a file too big for
+/// [`ONE_FILE_MAX`] or for what is left is named with its size, never cut.
+/// None when there is nothing to say.
+pub fn values(root: &Path, tracked: &[String], brief_text: &str, budget: usize) -> Option<String> {
     let mut out = String::new();
     let pinned = pins(root, tracked);
     for file in tracked.iter().filter(|f| basename(f) == "gradle.properties") {
@@ -517,26 +526,41 @@ pub fn values(root: &Path, tracked: &[String], brief_text: &str) -> Option<Strin
     }
     let mut names: Vec<(String, (usize, usize))> = named.into_iter().collect();
     names.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.1 .1.cmp(&b.1 .1)));
-    let mut data = String::new();
+    let mut blocks: Vec<(&String, String)> = Vec::new();
+    let mut left_out: Vec<String> = Vec::new();
     for (name, _) in names {
         let files = tracked.iter().filter(|f| basename(f) == name && !f.starts_with("docs/")).take(3);
         for f in files {
             let Some(text) = read(root, f) else { continue };
-            let block = format!("{f}:\n{}\n", file_values(f, &text));
-            if out.len() + data.len() + block.len() > VALUES_MAX {
-                break;
+            match file_values(f, &text) {
+                Some(v) => blocks.push((f, format!("{f}:\n{v}\n"))),
+                None => left_out.push(format!("{f} ({} characters of values: too big to give whole)", text.len())),
             }
-            data.push_str(&block);
         }
-        if out.len() + data.len() >= VALUES_MAX {
-            break;
+    }
+    // The small files first, most named first, then the big ones while
+    // room is left: on 2026-10-07 four token files crowded out the
+    // 153 characters of `RarityScaling.json`.
+    let mut data = String::new();
+    for small in [true, false] {
+        for (f, block) in blocks.iter().filter(|(_, b)| (b.len() <= SMALL_FILE) == small) {
+            if out.len() + data.len() + block.len() > budget {
+                left_out.push(format!("{f} ({} characters of values: no room left)", block.len()));
+                continue;
+            }
+            data.push_str(block);
         }
     }
     if !data.is_empty() {
-        out.push_str("\ndata and config files the briefs name, as they are now:\n");
+        out.push_str("\ndata and config files the briefs name, as they are now, each whole:\n");
         out.push_str(&data);
     }
-    (!out.trim().is_empty()).then(|| clip(&out, VALUES_MAX))
+    if !left_out.is_empty() {
+        out.push_str("\nnamed by the briefs but not given here (never cut; read the file):\n");
+        out.push_str(&left_out.join("\n"));
+        out.push('\n');
+    }
+    (!out.trim().is_empty()).then_some(out)
 }
 
 // ------------------------------------------------------------------- names
@@ -561,6 +585,78 @@ fn is_text_for_names(rel: &str) -> bool {
             "groovy", "c", "h", "cpp", "hpp", "sh", "ps1", "cmd", "bat", "sql", "html", "css", "scss",
         ]
         .contains(&ext.as_str())
+}
+
+impl Names {
+    /// Whether the checkout has `name` whole or as a run of a longer
+    /// identifier's parts ([`inside_identifier`]): on 2026-10-07 the check
+    /// read `kill_stats` as missing while `reset_kill_stats` registered it,
+    /// and a correction call wrote that it was gone.
+    pub fn has(&self, name: &str) -> bool {
+        if self.defined.contains(name) || self.used.contains(name) {
+            return true;
+        }
+        let want = ident_parts(name).concat();
+        if want.len() < 4 {
+            return false;
+        }
+        self.used.iter().chain(&self.defined).any(|w| {
+            w.len() > name.len() && w.to_lowercase().replace(['_', '-'], "").contains(&want) && inside_identifier(w, name)
+        })
+    }
+}
+
+/// An identifier's parts, lowercased: split at `_` and `-` and at its camel
+/// humps, an acronym kept whole (`SRResetKillStats` is sr, reset, kill,
+/// stats).
+pub fn ident_parts(word: &str) -> Vec<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' || c == '-' {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| chars[j]);
+        let next = chars.get(i + 1).copied();
+        let hump = c.is_uppercase()
+            && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit() || (p.is_uppercase() && next.is_some_and(char::is_lowercase)));
+        if hump && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether `name` is `word` or a run of `word`'s parts ([`ident_parts`]):
+/// `kill_stats` is inside `reset_kill_stats` and `SRResetKillStatsCommand`,
+/// `kill` is not inside `skill`.
+pub fn inside_identifier(word: &str, name: &str) -> bool {
+    let want = ident_parts(name).concat();
+    if want.is_empty() {
+        return false;
+    }
+    let parts = ident_parts(word);
+    for i in 0..parts.len() {
+        let mut run = String::new();
+        for p in &parts[i..] {
+            run.push_str(p);
+            if run == want {
+                return true;
+            }
+            if run.len() >= want.len() {
+                break;
+            }
+        }
+    }
+    false
 }
 
 /// [`Names`] of a repo. `deep` reads the files (the code map and every
@@ -707,7 +803,7 @@ mod tests {
             ("src/main/resources/data/unnamed.json", r#"{"x": 1}"#),
         ]);
         let brief = "Rarity multiplies base stats (`RarityScaling.json`): Uncommon 1.2x.\nAdd the path to `data/mobs/mob_index.json`; see package.json.\n";
-        let v = values(d.path(), &tracked, brief).unwrap();
+        let v = values(d.path(), &tracked, brief, 16_000).unwrap();
         assert!(v.contains("hytale_version = 0.7.0-pre.5"), "{v}");
         assert!(v.contains("src/main/resources/data/equipment/RarityScaling.json:\nMultipliers."), "{v}");
         for line in ["\nMultipliers.Common = 1.0\n", "\nMultipliers.Uncommon = 1.1\n", "\nMultipliers.Mythic = 2.562\n"] {
@@ -747,5 +843,47 @@ mod tests {
         assert!(!n.used.contains("GhostInstaller"), "a doc's words are not the code's");
         let shallow = names(d.path(), &tracked, false);
         assert!(shallow.defined.contains("Game") && !shallow.defined.contains("startRound") && shallow.used.is_empty());
+    }
+
+    /// A name inside a longer identifier is the checkout's: `kill_stats` in
+    /// `reset_kill_stats`, never `kill` in `skill`.
+    #[test]
+    fn a_name_inside_a_longer_identifier_is_found() {
+        assert_eq!(ident_parts("SRResetKillStatsCommand"), vec!["sr", "reset", "kill", "stats", "command"]);
+        assert_eq!(ident_parts("reset_kill_stats"), vec!["reset", "kill", "stats"]);
+        assert!(inside_identifier("reset_kill_stats", "kill_stats"));
+        assert!(inside_identifier("SRResetKillStatsCommand", "kill_stats"));
+        assert!(inside_identifier("kill_stats", "kill_stats"));
+        assert!(!inside_identifier("skill_stats", "kill_stats"), "a part is whole");
+        assert!(!inside_identifier("reset_kill_statsx", "kill_stats"));
+        let (d, tracked) = repo(&[("src/Reset.java", "class Reset {\n  String NAME = \"reset_kill_stats\";\n}\n")]);
+        let n = names(d.path(), &tracked, true);
+        assert!(!n.used.contains("kill_stats"), "not a word of its own");
+        assert!(n.has("kill_stats") && n.has("Reset") && !n.has("kill_points"));
+    }
+
+    /// A data file is given whole, however long; one too big for the
+    /// budget is named with its size, never cut.
+    #[test]
+    fn values_give_each_data_file_whole_or_name_it() {
+        let weapons = ["BattleAxe", "Bow", "Crossbow", "Dagger", "Staff", "Sword"];
+        let charge: String = weapons
+            .iter()
+            .map(|w| format!("\"{w}\": {{\"AttackCycleTime\": 1, \"AttackReach\": 3.4, \"BarMaxHoldTime\": 1.35, \"KnockbackScale\": 1, \"Breakpoints\": [1, 2]}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let big = format!("{{\"Rows\": {{{}}}}}", (0..20).map(|i| format!("\"k{i}\": \"{}\"", "x".repeat(400))).collect::<Vec<_>>().join(", "));
+        let (d, tracked) = repo(&[
+            ("data/WeaponChargeScaling.json", &format!("{{\"ChargeScaling\": {{{charge}}}}}")),
+            ("data/Big.json", &big),
+        ]);
+        let brief = "Charge is in `WeaponChargeScaling.json`; see also `Big.json`.\n";
+        let v = values(d.path(), &tracked, brief, 4_000).unwrap();
+        assert!(v.len() > 800, "no 800-character cut: {v}");
+        for w in weapons {
+            assert!(v.contains(&format!("ChargeScaling.{w}.AttackCycleTime = 1")), "{w}: {v}");
+        }
+        assert!(!v.contains("[…]") && !v.contains("Rows.k0"), "never cut mid-way: {v}");
+        assert!(v.contains("data/Big.json (") && v.contains("no room left"), "a file left out is named: {v}");
     }
 }
