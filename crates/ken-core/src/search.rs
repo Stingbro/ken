@@ -145,9 +145,16 @@ pub fn merge_and_rerank(fts_hits: &[FtsHit], vec_hits: &[VecHit], query: &str) -
 }
 
 /// [`merge_and_rerank`] with meaning distances for keyword hits the KNN list
-/// missed (see [`rerank_with`]).
-pub fn merge_and_rerank_with(fts_hits: &[FtsHit], vec_hits: &[VecHit], query: &str, extra: &HashMap<String, f64>) -> Vec<HybridHit> {
-    rerank_with(query, merge_hits(fts_hits, vec_hits), vec_hits, extra)
+/// missed (see [`rerank_with`]) and each file's authority (see
+/// [`rerank_weighted`]).
+pub fn merge_and_rerank_with(
+    fts_hits: &[FtsHit],
+    vec_hits: &[VecHit],
+    query: &str,
+    extra: &HashMap<String, f64>,
+    authority: &HashMap<String, f64>,
+) -> Vec<HybridHit> {
+    rerank_weighted(query, merge_hits(fts_hits, vec_hits), vec_hits, extra, authority)
 }
 
 // --- Reranking (semantic-index S7b Condition C) -----------------------------
@@ -286,6 +293,20 @@ pub fn rerank(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit]) -> Vec<Hyb
 /// not only the few the KNN list happened to hold: a keyword winner outside
 /// the KNN top `k` used to lose to its neighbours inside it.
 pub fn rerank_with(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit], extra: &HashMap<String, f64>) -> Vec<HybridHit> {
+    rerank_weighted(query, hits, vec_hits, extra, &HashMap::new())
+}
+
+/// [`rerank_with`], each hit's score moved by its file's authority
+/// (`authority`: path → what it adds; a path absent is neutral). A rule or
+/// ruling rises, a closed ticket or a Research note sinks, inside its own
+/// repo, before the members are merged (`crate::authority`).
+pub fn rerank_weighted(
+    query: &str,
+    hits: Vec<HybridHit>,
+    vec_hits: &[VecHit],
+    extra: &HashMap<String, f64>,
+    authority: &HashMap<String, f64>,
+) -> Vec<HybridHit> {
     // Query words via the same stopword-aware tokenizer the FTS path uses, so
     // the reranker keys off exactly the terms search treated as significant.
     // Each word is matched by any of its forms: itself, its stem, its
@@ -356,7 +377,7 @@ pub fn rerank_with(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit], extra
             s += W_AGREEMENT;
         }
 
-        s
+        s + authority.get(&hit.path).copied().unwrap_or(0.0)
     };
 
     let mut scored: Vec<(f64, HybridHit)> = hits.into_iter().map(|h| (score(&h), h)).collect();
@@ -375,6 +396,22 @@ pub fn rerank_with(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit], extra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ruling rises and a closed ticket sinks by its authority; a path
+    /// with none (all code) keeps its score.
+    #[test]
+    fn authority_moves_a_hit_by_its_weight_and_leaves_the_rest() {
+        let hit = |path: &str| HybridHit { path: path.into(), chunk_id: 1, snippet: "who merges the pull request".into(), source: Source::Keyword, line: None, page: None, score: 0.0 };
+        let hits = vec![hit("tickets/SR-1.md"), hit("src/merge.rs"), hit("decisions/DECISIONS.md")];
+        let plain = rerank_with("merge pull request", hits.clone(), &[], &HashMap::new());
+        let weights: HashMap<String, f64> =
+            [("tickets/SR-1.md".to_string(), -1.25), ("decisions/DECISIONS.md".to_string(), 0.75)].into_iter().collect();
+        let weighted = rerank_weighted("merge pull request", hits, &[], &HashMap::new(), &weights);
+        let score = |list: &[HybridHit], p: &str| list.iter().find(|h| h.path == p).unwrap().score;
+        assert_eq!(weighted.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), vec!["src/merge.rs", "decisions/DECISIONS.md", "tickets/SR-1.md"], "a nudge: the file named for it still leads");
+        assert_eq!(score(&weighted, "src/merge.rs"), score(&plain, "src/merge.rs"), "code is neutral");
+        assert_eq!(score(&weighted, "tickets/SR-1.md"), score(&plain, "tickets/SR-1.md") - 1.25);
+    }
 
     #[test]
     fn camel_case_and_digits_split_into_parts() {

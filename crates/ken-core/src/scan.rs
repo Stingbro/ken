@@ -358,6 +358,9 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     let tiers: Vec<(String, crate::kenignore::Tier)> =
         on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
     db.set_file_tiers(&tiers)?;
+    // Each file's authority in search, from the index's frontmatter and the
+    // team file, for every file: a team file's new override reaches them all.
+    crate::authority::refresh(db, &project.root, None)?;
 
     if let Some(result) = control_query(db)? {
         db.set_index_control(&result)?;
@@ -609,6 +612,7 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
         }
         index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
         db.set_file_tiers(&[(rel.to_string(), tier)])?;
+        crate::authority::refresh(db, &project.root, Some(&[rel.to_string()]))?;
         // A page's aliases, or the Vocabulary page itself, may have changed.
         if rel.ends_with(".md") {
             crate::vocab::Vocabulary::rebuild(db)?;
@@ -809,6 +813,9 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
     }
 
     let pages_moved = stats.changed_paths.iter().any(|p| p.ends_with(".md"));
+    if !stats.changed_paths.is_empty() {
+        crate::authority::refresh(db, &project.root, Some(&stats.changed_paths))?;
+    }
     if !stats.changed_paths.is_empty() {
         if let Some(result) = control_query(db)? {
             db.set_index_control(&result)?;

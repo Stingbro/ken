@@ -9773,8 +9773,10 @@ async fn route_search(
                 targets: vec![id],
                 reason: routing::RouteReason::Named,
                 platform: routing::asks_about_platform(&query_for_plan),
+                knowledge: Vec::new(),
             },
             (None, Some(ids)) => routing::RoutePlan {
+                knowledge: members.iter().filter(|m| m.knowledge_base && ids.contains(&m.project_id)).map(|m| m.project_id).collect(),
                 targets: ids,
                 reason: routing::RouteReason::Named,
                 platform: routing::asks_about_platform(&query_for_plan),
