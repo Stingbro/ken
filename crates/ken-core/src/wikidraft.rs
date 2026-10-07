@@ -77,8 +77,9 @@ pub const PAGES: &[(&str, &str)] = &[
     ),
     (
         "Current/Feature-Status.md",
-        "each feature, from the changelog and the code that registers it, with the tests that name it and the commit read; \
-         whether it was used in the running product is a person's to say",
+        "each feature, from the changelog and the code that registers it (the source `(what the code registers…)`), with the tests \
+         that name it and the commit read; whether a user can reach it, what tests it and when it was checked are a person's to say: \
+         leave those cells empty and name them once in the To fill line",
     ),
     (
         "Conventions/Architecture.md",
@@ -112,7 +113,9 @@ pub const PAGES: &[(&str, &str)] = &[
     ),
     (
         "Reference/Systems.md",
-        "one row per system, from the code that registers it: its code and data paths, and the rulings (D-nnn) its code cites",
+        "one row per system, from the code that registers it (the source `(what the code registers…)`, one row per registration \
+         a source describes): its code and data paths, and the rulings (D-nnn) its code cites; the registrations no source \
+         describes are named on one line, with no row",
     ),
     (
         "Reference/Config-Map.md",
@@ -1240,6 +1243,8 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
          - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
          - A source labelled `repo:FILE:line` is the part of FILE that starts at that line; cite it by that label.\n\
+         - A source labelled `…:Repo-Map/<repo>.md` is Ken's own draft of that repo's page, a summary: cite the repo files it cites (its backticked `repo:path` labels), not the page.\n\
+         - A fact another page of the wiki owns (the source `(pages of this wiki, and the facts each owns)`) gets a link to that page, `[[Page]]`, not a restatement.\n\
          - The checkout outranks a doc. Sources labelled `{REGISTERS}` and `{VALUES}`, and the build files, say what the code is now; a brief, README or note says what was true when it was written. Write a version, default, count, class, test, command or list of what is registered only as the checkout has it, and cite the file it is in.\n\
          - When a doc and the checkout disagree on something the checkout can answer (a value, a name, a command, a path, a setting), write the checkout's answer and cite it; do not write that the sources disagree. Ask a person to rule only where the checkout cannot settle it, in one line, on the one page that owns the fact.\n\
          - People: write an owner, a role or a decider only where CODEOWNERS, a `people/` file or a repo's own docs name one. Never write a role nobody stated. The recent contributors from git say who has committed lately, nothing more. Never speculate whether two names are one person.\n\
@@ -2311,8 +2316,42 @@ pub fn removed_repos(db: &Db) -> Vec<String> {
     db.removed_repos().ok().flatten().and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
 }
 
+/// The facts each page owns: it states them, and every other page links to
+/// it for them. Round two restated the mod's purpose on nine pages and a
+/// stale engine pin on six, each with a citation that looked checked.
+pub const OWNS: &[(&str, &str)] = &[
+    ("Current/Project.md", "what the product is, who it is for, its goal and what is out of scope"),
+    ("Current/Team.md", "the roles, who decides what, who approves the protected paths, how work is handed off"),
+    ("Current/Who-Does-What.md", "who owns each repo and area, who to ask, and who has committed to each recently"),
+    ("Current/Feature-Status.md", "whether each feature is built and released"),
+    ("Conventions/Architecture.md", "how the repos fit together and which repo calls or imports which"),
+    ("Conventions/Code.md", "the code conventions, the lint and format rules, and the shared helpers"),
+    ("Conventions/Data-and-Config.md", "the data and config folders, their formats and the code that loads them"),
+    ("Conventions/Testing.md", "the test suites, how each is run, the gates and the fixtures"),
+    ("Conventions/Registries.md", "the registries and the start-up wiring order, and how to add to each"),
+    ("Platform/Index.md", "each platform or reference dependency, the version pinned and where the pin is"),
+    ("Work/Releases.md", "what changed in each release, the version tags and what is unreleased"),
+    ("Reference/Systems.md", "each system: what it does, its code and its data"),
+    ("Reference/Config-Map.md", "each config file and key, its default, the code that reads it and how it is reloaded"),
+    ("Reference/Build-and-Run.md", "how to build, run and test each repo, the toolchain versions, the run commands and the known build failures"),
+    ("Reference/Vocabulary.md", "the words that differ between the team, the code and the platform, and the renames"),
+    (START_HERE, "the traps that cost a newcomer the most time"),
+];
+
+/// What `page` owns ([`OWNS`]).
+fn owns(page: &str) -> &'static str {
+    OWNS.iter().find(|(p, _)| *p == page).map_or("", |(_, o)| o)
+}
+
+/// The team pages to draft, each purpose ending with what the page owns.
 fn team_pages() -> Vec<(String, String)> {
-    PAGES.iter().map(|(p, u)| (p.to_string(), u.to_string())).collect()
+    PAGES
+        .iter()
+        .map(|(p, u)| {
+            let purpose = format!("{u}. It owns {}; a fact another page owns gets a link to that page, never restated", owns(p));
+            (p.to_string(), purpose)
+        })
+        .collect()
 }
 
 /// Draft every page of [`PAGES`] the wiki does not already have, then file
@@ -2499,21 +2538,20 @@ fn fill_start_here(wiki: &Path, described: &[(String, String)]) -> Result<bool> 
     Ok(changed)
 }
 
-/// The repo pages and descriptions every team page is drafted from, each
-/// repo's share of [`SOURCE_BUDGET`] equal, then `extra`. What only one page
-/// needs is in [`page_sources`].
-pub fn team_sources(wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)], extra: &[Source]) -> Vec<Source> {
-    let share = (SOURCE_BUDGET * 2 / 3) / repos.len().max(1);
+/// What every team page is drafted from: each repo's description, the
+/// wiki's pages with the facts each owns ([`page_directory`]), so a page
+/// links rather than restates, then `extra`. The repo pages are no longer
+/// sent whole to every page: on 2026-10-06 that was 44% of all a draft sent.
+/// What one page needs, the repo pages' sections included, is in
+/// [`page_sources`].
+pub fn team_sources(wiki_name: &str, repos: &[(String, PathBuf)], extra: &[Source]) -> Vec<Source> {
     let mut out = Vec::new();
     for (name, root) in repos {
         if let Some(d) = crate::registry::description_of(root) {
             out.push(Source { label: format!("{name}:(what this repo is for, in the team's words)"), text: clip(&d, 2_000) });
         }
-        let page = repo_page(name);
-        if let Some(t) = read_text(&wiki.join(&page)) {
-            out.push(Source { label: format!("{wiki_name}:{page}"), text: clip(&t, share) });
-        }
     }
+    out.push(Source { label: format!("{wiki_name}:(pages of this wiki, and the facts each owns)"), text: page_directory(repos) });
     let used: usize = out.iter().map(|s| s.text.len()).sum();
     let mut left = SOURCE_BUDGET.saturating_sub(used);
     for s in extra {
@@ -2523,6 +2561,44 @@ pub fn team_sources(wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)], e
         let text = clip(&s.text, left.min(PER_FILE));
         left = left.saturating_sub(text.len());
         out.push(Source { label: s.label.clone(), text });
+    }
+    out
+}
+
+/// Characters of the Repo Map pages' sections one team page reads, all
+/// repos together.
+const REPO_SECTIONS_MAX: usize = 24_000;
+/// Where a Repo Map page's section that fits no page by its words goes.
+const REPO_SECTION_DEFAULT: &[&str] = &["Current/Project.md", "Conventions/Architecture.md"];
+
+/// The sections of the drafted Repo Map pages one team page needs: each
+/// `##` section goes to the two pages its words fit best ([`page_scores`]),
+/// and one that fits none to [`REPO_SECTION_DEFAULT`]; each repo an equal
+/// share of [`REPO_SECTIONS_MAX`]. Each cited at its line of the page.
+fn repo_page_sections(page: &str, wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)]) -> Vec<Source> {
+    let share = REPO_SECTIONS_MAX / repos.len().max(1);
+    let mut out = Vec::new();
+    for (name, _) in repos {
+        let rel = repo_page(name);
+        let Some(text) = read_plain(&wiki.join(&rel)) else { continue };
+        // Past the frontmatter, so its `sources:` are not a section.
+        let body_at = text.strip_prefix("---\n").and_then(|rest| rest.find("\n---\n")).map_or(0, |i| i + 9);
+        let skipped = text[..body_at].lines().count();
+        let mine: Vec<Source> = split_at(&text[body_at..], |l| l.starts_with("## "))
+            .into_iter()
+            .filter(|sec| {
+                let mut scores: Vec<(&str, usize)> =
+                    page_scores(&sec.heading, &sec.text).into_iter().filter(|(p, n)| *n > 0 && *p != START_HERE).collect();
+                scores.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                if scores.is_empty() {
+                    REPO_SECTION_DEFAULT.contains(&page)
+                } else {
+                    scores.iter().take(2).any(|(p, _)| *p == page)
+                }
+            })
+            .map(|sec| Source { label: part_label(wiki_name, &rel, sec.line + skipped), text: sec.text })
+            .collect();
+        out.extend(within(mine, share));
     }
     out
 }
@@ -2653,8 +2729,8 @@ pub fn page_sources(
         per_repo.push(mine);
     }
     let sizes: Vec<usize> = per_repo.iter().map(|v| v.iter().map(|s| s.text.len()).sum()).collect();
-    let mut out: Vec<Source> =
-        per_repo.into_iter().zip(fair_shares(&sizes, PAGE_BUDGET)).flat_map(|(v, share)| within(v, share)).collect();
+    let mut out: Vec<Source> = if page == START_HERE { Vec::new() } else { repo_page_sections(page, wiki, wiki_name, repos) };
+    out.extend(per_repo.into_iter().zip(fair_shares(&sizes, PAGE_BUDGET)).flat_map(|(v, share)| within(v, share)));
     if people {
         out.extend(people_files(wiki_name, wiki));
     }
@@ -2764,12 +2840,11 @@ const TRAPS_PLACEHOLDER: &str = "| {{the trap that costs a newcomer the most tim
 const TRAPS_MAX: usize = 8;
 
 /// The wiki's pages a drafted page can link to, one line each: the team
-/// pages of [`PAGES`] with what each is for, and each repo's Repo Map page.
+/// pages with the facts each owns ([`OWNS`]), and each repo's Repo Map page.
 pub fn page_directory(repos: &[(String, PathBuf)]) -> String {
     let mut out = String::new();
-    for (page, purpose) in PAGES {
-        let short = purpose.split([':', ';']).next().unwrap_or(purpose).trim();
-        out.push_str(&format!("- [[{}]] ({page}): {short}\n", stem(page.rsplit('/').next().unwrap_or(page))));
+    for (page, owned) in OWNS {
+        out.push_str(&format!("- [[{}]] ({page}): {owned}\n", stem(page.rsplit('/').next().unwrap_or(page))));
     }
     for (name, _) in repos {
         out.push_str(&format!("- [[{}]] ({}): what lives where in {name}, and how it is built\n", crate::workspace::member_leaf(name), repo_page(name)));
@@ -2903,7 +2978,7 @@ pub fn draft_team(
     }
     fill_start_here(wiki, &described)?;
     let extra = extra.map(gather_extra).unwrap_or_default();
-    let common = team_sources(wiki, wiki_name, repos, &extra);
+    let common = team_sources(wiki_name, repos, &extra);
     draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, &roster, today, &mut report, &mut generate, &check)?;
     draft_traps(wiki, wiki_name, repos, &roster, &mut report, &mut generate)?;
     cite_rulings(wiki, repos, today)?;
@@ -3073,14 +3148,14 @@ pub fn draft_added(
         }
     }
 
-    let common = team_sources(wiki, wiki_name, added, &[]);
+    let common = team_sources(wiki_name, added, &[]);
     for (page, change) in ON_ADD {
         let existing = fs::read_to_string(wiki.join(page)).ok();
         if may_draft(existing.as_deref()) {
             // Still missing or a template: draft it whole, from every repo.
             let purpose =
                 PAGES.iter().find(|(p, _)| p == page).map(|(_, u)| u.to_string()).unwrap_or_else(|| change.to_string());
-            let everything = team_sources(wiki, wiki_name, all, &[]);
+            let everything = team_sources(wiki_name, all, &[]);
             let pages = [(page.to_string(), purpose)];
             draft_team_pages(wiki, wiki_name, &pages, &everything, all, &roster, today, &mut report, &mut generate, &check)?;
             continue;
@@ -3461,11 +3536,36 @@ mod tests {
         // sections that serve the page: the README's opening says what the
         // project is, so Project gets it and the architecture page does not.
         let team = &prompts[2];
-        assert!(team.contains("=== Wiki:Repo-Map/Game.md ===") && team.contains("=== Wiki:Repo-Map/Tools.md ==="), "{team}");
+        assert!(team.contains("=== Wiki:Repo-Map/Game.md:7 ===") && team.contains("=== Wiki:Repo-Map/Tools.md:7 ==="), "{team}");
         let arch = prompts.iter().find(|p| p.contains("`Conventions/Architecture.md`")).unwrap();
         assert!(team.contains("=== Game:README.md ===") && !arch.contains("=== Game:README.md ==="));
         let index = fs::read_to_string(wiki.join("Repo-Map/Index.md")).unwrap();
         assert!(index.contains("| [[Game]] | (not said yet) |") && index.contains("| [[Tools]] |"));
+        // Every team page knows what each page owns, and its own share.
+        assert!(team.contains("=== Wiki:(pages of this wiki, and the facts each owns) ===") && team.contains("[[Vocabulary]] (Reference/Vocabulary.md): the words that differ"));
+        assert!(team.contains("It owns what the product is, who it is for"), "{team}");
+    }
+
+    /// One fact, one page: a team page reads only the Repo Map sections its
+    /// words fit, never every repo page whole.
+    #[test]
+    fn a_team_page_reads_only_the_repo_page_sections_it_needs() {
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Wiki");
+        let game = repo(d.path(), "Game", "# Game\n");
+        let page = "---\ntitle: Game\nsources:\n  - Game:README.md\n---\n# Game\n\nThe client.\n\n\
+            ## How it is built and run\n\nRun `./gradlew build`, then the server task. `Game:build.gradle.kts`\n\n\
+            ## Who owns it\n\nAna owns the repo; ask her. Owners are in CODEOWNERS. `Game:CODEOWNERS`\n";
+        write(&wiki, &[("Repo-Map/Game.md", page)]);
+        let repos = vec![game];
+        let labels = |p: &str| -> Vec<String> {
+            page_sources(p, &wiki, "Wiki", &repos, &[]).into_iter().map(|s| s.label).filter(|l| l.starts_with("Wiki:Repo-Map")).collect()
+        };
+        assert_eq!(labels("Reference/Build-and-Run.md"), vec!["Wiki:Repo-Map/Game.md:10"]);
+        assert_eq!(labels("Current/Who-Does-What.md"), vec!["Wiki:Repo-Map/Game.md:14"]);
+        assert_eq!(labels("Current/Project.md"), vec!["Wiki:Repo-Map/Game.md:6"], "the opening fits no page: Project and Architecture");
+        assert!(labels("Reference/Vocabulary.md").is_empty());
+        assert!(labels(START_HERE).is_empty());
     }
 
     #[test]
