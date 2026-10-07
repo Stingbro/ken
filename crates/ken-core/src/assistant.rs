@@ -174,6 +174,25 @@ pub fn oneshot(
     run_oneshot(binary, project_root, prompt, timeout, cancel, &["--permission-mode".into(), "acceptEdits".into()])
 }
 
+/// A session that only reads its prompt and answers it: no tools at all,
+/// and the `model` named (`opus`), else the CLI's default. For a judgement
+/// over text the prompt already holds (`supersede`).
+pub fn oneshot_answer(
+    binary: &Path,
+    project_root: &Path,
+    prompt: &str,
+    model: Option<&str>,
+    timeout: Duration,
+    cancel: &CancelToken,
+) -> Result<OneshotOutcome> {
+    let mut args: Vec<String> = vec!["--tools".into(), String::new()];
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
 /// [`oneshot`] that may also read `dirs`. Claude Code reads nothing outside
 /// the folder it runs from unless told, and a workspace's repos can sit
 /// anywhere (set-up keeps the workspace itself in Ken's app data).

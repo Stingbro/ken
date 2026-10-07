@@ -163,6 +163,16 @@ impl Roles {
         Roles { decisions: path("decisions"), people: path("people"), tickets: path("tickets"), overrides }
     }
 
+    /// Whether `rel_path` is the team's decisions log: the one the team
+    /// file names, else any page called `DECISIONS.md`.
+    pub fn is_decisions_log(&self, rel_path: &str) -> bool {
+        let path = rel_path.replace('\\', "/").to_ascii_lowercase();
+        match &self.decisions {
+            Some(d) => path == d.to_ascii_lowercase(),
+            None => path.rsplit('/').next() == Some("decisions.md"),
+        }
+    }
+
     /// Whether any override could reach a file that is not a page.
     pub fn has_overrides(&self) -> bool {
         !self.overrides.is_empty()
@@ -272,7 +282,19 @@ pub fn hit_label(db: &Db, rel_path: &str, chunk_text: Option<&str>) -> Result<Op
     }
     let meta = db.page_meta(rel_path)?;
     let stored = db.authority_of(rel_path)?;
-    Ok(Some(label_of(rel_path, meta.as_ref(), stored.as_ref().map(|(t, w)| (t.as_str(), *w)), chunk_text)))
+    let mut label = label_of(rel_path, meta.as_ref(), stored.as_ref().map(|(t, w)| (t.as_str(), *w)), chunk_text);
+    // What the supersede pass found: a later ruling over this entry, or the
+    // earlier ones this entry changes.
+    let entry = chunk_text
+        .and_then(crate::chunker::entry_line)
+        .and_then(crate::chunker::entry_start)
+        .map(|(id, _)| id)
+        .filter(|_| label.starts_with("ruling "));
+    if let Some(note) = entry.map(|id| crate::supersede::note(db, rel_path, &id)).transpose()?.flatten() {
+        label.push_str(" · ");
+        label.push_str(&note);
+    }
+    Ok(Some(label))
 }
 
 /// [`hit_label`] from what the index stored: the page's frontmatter and its

@@ -807,7 +807,7 @@ list_documents or search_knowledge to find valid paths.",
                 ("md", Some(_)) if pointed.is_some() => {
                     let bytes = std::fs::read(&abs)
                         .map_err(|e| format!("could not read {path:?}: {e}"))?;
-                    out.push_str(&section_text(&path, &String::from_utf8_lossy(&bytes), pointed.unwrap_or(1)));
+                    out.push_str(&section_text(&db, &path, &String::from_utf8_lossy(&bytes), pointed.unwrap_or(1)));
                 }
                 ("md" | "txt" | "code", Some(r)) => {
                     let bytes = std::fs::read(&abs)
@@ -945,8 +945,10 @@ fn address_line(args: &Value, fragment: Option<&str>) -> Option<i64> {
 const SECTION_CHARS: usize = 8_000;
 
 /// The section of a page (or the log entry) that `line` is in, numbered,
-/// cut at [`SECTION_CHARS`] with the cut said and where to read on.
-fn section_text(path: &str, text: &str, line: i64) -> String {
+/// cut at [`SECTION_CHARS`] with the cut said and where to read on. An entry
+/// a later one supersedes (`supersede`) says so under it, with the line to
+/// read.
+fn section_text(db: &Db, path: &str, text: &str, line: i64) -> String {
     let Some((a, b, name)) = ken_core::chunker::section_at(path, text, line.max(1) as usize) else {
         return numbered_lines(text, ((line - READ_BEFORE).max(1), line + READ_AFTER));
     };
@@ -985,6 +987,16 @@ fn section_text(path: &str, text: &str, line: i64) -> String {
     };
     for n in from..=to {
         out.push_str(&row(n));
+    }
+    if let Some(id) = name.as_deref().filter(|n| !n.starts_with('#')) {
+        let on = |p: &str| if p.is_empty() { String::new() } else { format!(" on {p}") };
+        let (by, of) = db.supersessions_of(path, id).unwrap_or_default();
+        for s in by {
+            out.push_str(&format!("[{} (line {}) {} this entry{}]\n", s.later, s.later_line, s.relation, on(&s.point)));
+        }
+        for s in of {
+            out.push_str(&format!("[this entry {} {} (line {}){}]\n", s.relation, s.earlier, s.earlier_line, on(&s.point)));
+        }
     }
     out
 }
@@ -3900,6 +3912,51 @@ mod tests {
         assert_eq!(text, "[lines 65-66 of 475]\n65: Grade lever 57.\n66: Grade lever 58.\n");
         let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65-L66"}));
         assert!(text.starts_with("[lines 65-66 of"), "{text}");
+    }
+
+    #[test]
+    fn a_superseded_entry_says_so_in_its_hit_and_when_read() {
+        let (_base, ra, _rb, mut server) = two_project_fixture();
+        std::fs::create_dir_all(ra.path().join("decisions")).unwrap();
+        let mut log = String::from("# DECISIONS\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        log.push_str("**D-410** · 2026-10-06 · anchors, tools — **ANCHORS ARE PLACED ONLY THROUGH THE TOOLS; THE MERGE FIX IS NOT BUILT.** Chris.\n\n");
+        for i in (1..=5).rev() {
+            log.push_str(&format!("**D-{:03}** · 2026-09-0{i} · lore — **THE MAP HAS {i} REGIONS.** Chris.\n\n", 380 + i));
+        }
+        log.push_str("**D-379** · 2026-10-05 · spawn anchors, world tool — **THE SERVER NEVER OVERWRITES SPAWN ANCHORS; BUILD THE MERGE.** Chris.\n");
+        std::fs::write(ra.path().join("decisions/DECISIONS.md"), &log).unwrap();
+        let project = Project::open(ra.path()).unwrap();
+        let mut db = Db::open(&server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        index_semantically(&project, &mut db);
+        let pair = ken_core::supersede::Supersession {
+            log: "decisions/DECISIONS.md".into(),
+            earlier: "D-379".into(),
+            later: "D-410".into(),
+            relation: "supersedes".into(),
+            point: "who writes anchors".into(),
+            evidence: "placed only through the tools".into(),
+            earlier_line: 19,
+            later_line: 7,
+            source: "judged".into(),
+        };
+        db.replace_supersessions("decisions/DECISIONS.md", &[pair]).unwrap();
+        drop(db);
+
+        // The search finds D-379 by its words; D-410 comes in just above it.
+        let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "server never overwrites spawn anchors merge", "project": "Atlas"}));
+        assert!(!is_err, "{text}");
+        let earlier = text.find("(ruling D-379 · 2026-10-05 · superseded by D-410 on who writes anchors)").expect(&text);
+        let later = text.find("(ruling D-410 · 2026-10-06 · supersedes D-379)").expect(&text);
+        assert!(later < earlier, "the later ruling ranks first: {text}");
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "server never overwrites spawn anchors merge"}));
+        assert!(text.contains("superseded by D-410 on who writes anchors"), "{text}");
+
+        let (text, _) = tool(&mut server, "read_document", json!({"path": "decisions/DECISIONS.md#L19", "project": "Atlas"}));
+        assert!(text.starts_with("[entry D-379: lines 19-19 of 19]"), "{text}");
+        assert!(text.ends_with("[D-410 (line 7) supersedes this entry on who writes anchors]\n"), "{text}");
+        let (text, _) = tool(&mut server, "read_document", json!({"path": "decisions/DECISIONS.md#L7", "project": "Atlas"}));
+        assert!(text.ends_with("[this entry supersedes D-379 (line 19) on who writes anchors]\n"), "{text}");
     }
 
     #[test]
