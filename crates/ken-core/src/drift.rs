@@ -9,8 +9,9 @@
 //! - **Decision check**: each decisions-log entry, measured from the date it
 //!   declares for itself, against the code it cites. Superseded entries are
 //!   skipped.
-//! - **Age rule**: a page not verified in thirty days is raised even when
-//!   nothing it cites moved.
+//! - **Age rule**: a page with a `sources:` list not verified in thirty days
+//!   is raised even when nothing it cites moved. A page with no sources (an
+//!   index, START-HERE) carries no `verified:` and is never raised.
 //!
 //! A sweep works from what changed: once per repo it asks git which files
 //! moved since the last sweep's commit, re-measures only the citations of
@@ -693,7 +694,10 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             run.business_pages += 1;
         }
         let date = meta.verified.clone().or_else(|| meta.updated.clone());
-        if !research {
+        // Only a page with a `sources:` list carries `verified:` (Chris's
+        // ruling): it says something a person checks against its sources.
+        // A navigation page (an index, START-HERE) has none and never ages.
+        if !research && !meta.sources.is_empty() {
             // Never verified: aged once it has gone unverified for as long
             // since it was written. A draft from today is waiting for its
             // first read, not stale; a new wiki is all such pages.
@@ -934,7 +938,10 @@ updated: {{date}}
         let hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
         assert_eq!(hits, vec![("Repo-Map/pinned.md", Severity::Judgment)], "only the pinned page: the dated one took today's commit in");
 
-        // Thirty-odd days on, still unverified: now it is aged.
+        // Thirty-odd days on, still unverified: now it is aged. A navigation
+        // page with no sources carries no `verified:` and never is.
+        fs::write(wiki.join("Repo-Map/Index.md"), "---\ntitle: Repo Map\nupdated: 2026-09-24\n---\n# Repo Map\n| [[app]] | the app |\n").unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
         let later = sweep(&project, &db, chrono_free_epoch("2026-10-30").unwrap()).unwrap();
         assert_eq!(later.aged, vec![("Repo-Map/app.md".to_string(), None), ("Repo-Map/pinned.md".to_string(), None)]);
     }
