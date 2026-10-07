@@ -5,7 +5,9 @@
 //! Confluence export, say), and drafts the pages the templates README says
 //! Ken drafts (Current, Conventions, Platform, Reference, the release notes),
 //! a Repo Map page for every repo and an architecture page for every code
-//! repo, for a person to review.
+//! repo, and START-HERE's Traps rows, for a person to review. Every part of
+//! every brief goes to one page; what the checkout says now (what the code
+//! wires at start-up, the versions and data values) outranks a doc.
 //!
 //! Four rules keep it honest:
 //! - A page a person wrote is never touched. A page is drafted only when it
@@ -14,8 +16,9 @@
 //!   age rule keeps raising it until someone reads it against its sources.
 //! - Every page names the sources it came from, in its frontmatter and
 //!   inline, as `repo:path` locators.
-//! - Every repo path a drafted page names is checked against what git
-//!   tracks, and a page naming one the checkout lacks goes back once.
+//! - Every repo path, code name and pinned version a drafted page states is
+//!   checked against the checkout; a path with one match is rewritten in
+//!   place, and a page with anything else wrong goes back once.
 //!
 //! The model call is passed in (`generate`), as for ingest.
 
