@@ -1233,13 +1233,15 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
     let mut s = format!(
         "You are drafting one page of a team's wiki, `{page}`, for a person to review. The page is: {purpose}.\n\n\
          Rules:\n\
-         - Use only what the sources below say. Where they say nothing, write `(not in the sources yet)` rather than guess.\n\
+         - Use only what the sources below say. Where they say nothing, leave the fact out: never write a row, a cell or a field that says something is unknown or not in the sources. Keep a template's table rows only where you have a source for the row's main column, and leave a cell empty when only it has none.\n\
+         - End the page with one line, `To fill: …`, naming once what a person should add that the sources do not say. Leave the line out when nothing is missing.\n\
          - Cite sources inline as their labels in backticks, e.g. `ken:README.md`, once at the end of each paragraph, list item or table row, for every source it used.\n\
          - Frontmatter: keep the template's keys; set `status: draft`; set `updated: {today}`; do NOT write a `verified:` line (a person verifies it later); list every source you used under `sources:` as its label.\n\
          - Plain words for a reader who has not seen the code. Tables where the template has them.\n\
          - A source labelled `(what this repo is for, in the team's words)` is the team's own description of that repo: use it to know what each repo is and how it is used.\n\
          - A source labelled `repo:FILE:line` is the part of FILE that starts at that line; cite it by that label.\n\
          - The checkout outranks a doc. Sources labelled `{REGISTERS}` and `{VALUES}`, and the build files, say what the code is now; a brief, README or note says what was true when it was written. Write a version, default, count, class, test, command or list of what is registered only as the checkout has it, and cite the file it is in.\n\
+         - When a doc and the checkout disagree on something the checkout can answer (a value, a name, a command, a path, a setting), write the checkout's answer and cite it; do not write that the sources disagree. Ask a person to rule only where the checkout cannot settle it, in one line, on the one page that owns the fact.\n\
          - People: write an owner, a role or a decider only where CODEOWNERS, a `people/` file or a repo's own docs name one. Never write a role nobody stated. The recent contributors from git say who has committed lately, nothing more. Never speculate whether two names are one person.\n\
          - Reply with the finished page only, in Markdown, starting with `---`. No preamble, no code fences around it.\n\n"
     );
@@ -1254,8 +1256,33 @@ pub fn prompt(page: &str, purpose: &str, template: Option<&str>, sources: &[Sour
     s
 }
 
+/// What a draft wrote for a fact it had no source for, before it was told
+/// to leave such a fact out: 738 of them on 2026-10-06, 138 on one page.
+const UNKNOWN: &[&str] = &["(not in the sources yet)", "not in the sources yet", "(not in the sources)"];
+
+/// A line of a drafted page with its unknowns taken out, or None when
+/// nothing would be left of it: a table row whose cells after the first are
+/// all unknown or empty, or a short line that is mostly an unknown.
+fn without_unknowns(line: &str) -> Option<String> {
+    if !UNKNOWN.iter().any(|u| line.contains(u)) {
+        return Some(line.to_string());
+    }
+    let strip = |t: &str| UNKNOWN.iter().fold(t.to_string(), |acc, u| acc.replace(u, ""));
+    let t = line.trim();
+    if t.starts_with('|') {
+        let cells: Vec<&str> = t.trim_matches('|').split('|').collect();
+        let empty = cells.iter().skip(1).all(|c| strip(c).trim().trim_matches(['.', '`', '*', '-']).trim().is_empty());
+        return (!empty).then(|| strip(line));
+    }
+    let left = strip(t);
+    let left = left.trim().trim_start_matches(['-', '*', '+']).trim();
+    (left.len() >= 80).then(|| strip(line))
+}
+
 /// The reply as a page: fences stripped, `status: draft` forced, any
-/// `verified:` line dropped (only a person sets it).
+/// `verified:` line dropped (only a person sets it), and what only says a
+/// fact is unknown taken out ([`without_unknowns`]): the prompt says to leave
+/// such a fact out, and a model does not always.
 pub fn finish(reply: &str) -> Result<String> {
     let mut t = reply.trim();
     if let Some(rest) = t.strip_prefix("```markdown").or_else(|| t.strip_prefix("```md")).or_else(|| t.strip_prefix("```")) {
@@ -1289,8 +1316,17 @@ pub fn finish(reply: &str) -> Result<String> {
             has_status = true;
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
+        // In the frontmatter an unknown is an empty value: `pin:` is Ken's
+        // to fill from the commit it read.
+        let line = if in_fm {
+            Some(UNKNOWN.iter().fold(line.to_string(), |acc, u| acc.replace(u, "")).trim_end().to_string())
+        } else {
+            without_unknowns(line)
+        };
+        if let Some(line) = line {
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
     if !closed {
         return Err(Error::Other("the draft's frontmatter was never closed".into()));
@@ -2023,11 +2059,19 @@ fn repo_heads(repos: &[(String, PathBuf)]) -> HashMap<String, String> {
 /// Pin each code citation in a page's `sources:` to the commit its repo
 /// was read at (`repo:path` → `repo@sha:path`). A draft dated today would
 /// otherwise take in every commit made later that same day, and a change
-/// right after drafting would never read as drift.
+/// right after drafting would never read as drift. A frontmatter `pin:` the
+/// draft left empty or a placeholder is Ken's to fill: the commit of each
+/// repo the sources cite, `sha` for one, `repo@sha, …` for several. The
+/// 2026-10-06 architecture pages said their pin was not in the sources.
 pub fn pin_sources(page: &str, heads: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(page.len() + 64);
     let mut in_front = false;
     let mut in_sources = false;
+    let cited: Vec<&String> = {
+        let mut repos: Vec<&String> = heads.keys().filter(|r| page_cites(page, r)).collect();
+        repos.sort();
+        repos
+    };
     for (i, line) in page.split_inclusive('\n').enumerate() {
         let bare = line.trim_end();
         if bare == "---" {
@@ -2035,6 +2079,18 @@ pub fn pin_sources(page: &str, heads: &HashMap<String, String>) -> String {
             in_sources = false;
             out.push_str(line);
             continue;
+        }
+        if in_front && bare.starts_with("pin:") && !cited.is_empty() {
+            let value = bare["pin:".len()..].split(" #").next().unwrap_or_default().trim();
+            if value.is_empty() || value.contains("{{") {
+                let pin = match cited.as_slice() {
+                    [one] => heads[*one].clone(),
+                    many => many.iter().map(|r| format!("{r}@{}", heads[*r])).collect::<Vec<_>>().join(", "),
+                };
+                let eol = &line[bare.len()..];
+                out.push_str(&format!("pin: {pin}{eol}"));
+                continue;
+            }
         }
         if in_front && !line.starts_with(' ') && !line.starts_with('-') {
             in_sources = bare.starts_with("sources:");
@@ -2053,6 +2109,33 @@ pub fn pin_sources(page: &str, heads: &HashMap<String, String>) -> String {
         out.push_str(pinned.as_deref().unwrap_or(line));
     }
     out
+}
+
+/// Whether a page's `sources:` cite `repo` (`repo:path` or `repo@sha:path`).
+fn page_cites(page: &str, repo: &str) -> bool {
+    let mut in_front = false;
+    let mut in_sources = false;
+    for (i, line) in page.lines().enumerate() {
+        let bare = line.trim_end();
+        if bare == "---" {
+            if !(i == 0 || in_front) {
+                break;
+            }
+            in_front = i == 0;
+            continue;
+        }
+        if !line.starts_with(' ') && !line.starts_with('-') {
+            in_sources = bare.starts_with("sources:");
+            continue;
+        }
+        let item = bare.trim_start().strip_prefix("- ").map(|x| x.trim_matches(['"', '\'']));
+        if let Some(item) = item.filter(|_| in_sources) {
+            if item.strip_prefix(repo).is_some_and(|rest| rest.starts_with(':') || rest.starts_with('@')) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Pin the sources of the pages just drafted (see [`pin_sources`]).
@@ -2281,7 +2364,8 @@ pub const KIND_PAGES: &[(crate::registry::RepoKind, &str, &str, &[&str], &str)] 
         "Conventions/Architecture-{}.md",
         &["{{Repo}}", "{{repo}}"],
         "one code repo's layers: each layer, the folder it lives in, what it holds and which layers it may call; \
-         what must never call what, and why where a source says; every pair of folders the code has importing each other, as a known gap; \
+         what must never call what, and why where a source says; as known gaps, a pair of folders that import each other only where a \
+         source states the rule it breaks, and otherwise one line with how many pairs import both ways and the five largest; \
          the checks that enforce a layer rule; and a mermaid diagram",
     ),
     (
@@ -3164,6 +3248,32 @@ mod tests {
             "only sources: entries of known repos, and never the text"
         );
         assert_eq!(pin_sources(&pinned, &heads), pinned, "pinning twice changes nothing");
+
+        // A pin the draft left empty is Ken's: the commit of each cited repo.
+        let heads: HashMap<String, String> = [("app".to_string(), "0a1b2c3d4e5f".to_string()), ("tools".to_string(), "99aa".to_string())].into();
+        let one = "---\ntitle: Arch\npin:          # the commit the sources were read at\nsources:\n  - app:README.md\n---\n# Arch\n";
+        assert!(pin_sources(one, &heads).contains("\npin: 0a1b2c3d4e5f\nsources:"), "{}", pin_sources(one, &heads));
+        let two = "---\ntitle: Systems\npin: {{commit}}\nsources:\n  - tools:src/a.ts\n  - app:README.md\n---\n# S\n";
+        assert!(pin_sources(two, &heads).contains("\npin: app@0a1b2c3d4e5f, tools@99aa\n"));
+        let set = "---\npin: 1234\nsources:\n  - app:README.md\n---\n";
+        assert!(pin_sources(set, &heads).contains("\npin: 1234\n"), "a pin already set stays");
+    }
+
+    /// A fact with no source is left out: the prompt says so, and what a
+    /// model writes anyway is taken out of the page.
+    #[test]
+    fn unknowns_are_left_out_of_a_draft() {
+        let p = prompt("Reference/Systems.md", "the systems", None, &[], "2026-10-06");
+        assert!(!p.contains("write `(not in the sources yet)`") && p.contains("leave the fact out") && p.contains("`To fill: …`"), "{p}");
+        assert!(p.contains("write the checkout's answer and cite it; do not write that the sources disagree"));
+        let reply = "---\ntitle: Systems\npin: (not in the sources yet)\n---\n# Systems\n\n| system | does | code |\n|---|---|---|\n\
+            | Quests | (not in the sources yet) | (not in the sources yet) |\n| Rifts | Runs a rift. | (not in the sources yet) |\n\n\
+            - Owner: (not in the sources yet)\n\nA long paragraph about the rift runs that says the timer is (not in the sources yet) and the rest is plain words.\n\
+            To fill: what each system does.\n";
+        let page = finish(reply).unwrap();
+        assert!(!page.contains("not in the sources"), "{page}");
+        assert!(page.contains("\npin:\n") && !page.contains("| Quests |") && page.contains("| Rifts | Runs a rift. |  |"), "{page}");
+        assert!(!page.contains("Owner:") && page.contains("says the timer is  and the rest") && page.contains("To fill: what each system does."), "{page}");
     }
 
     #[test]
