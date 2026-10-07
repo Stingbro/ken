@@ -12,9 +12,17 @@
 //! ```
 //!
 //! Phases: setup · index · embed · wiki · extract [minutes] · kg · ask
-//! <questions.tsv> · ingest <file> · pass · transcribe <file> · drift ·
-//! drift-change <member> <file> · ignore <member> · model <member> · sql
-//! <member> <query> · status. Each prints a Markdown report on stdout.
+//! <questions.tsv> · kb-ask <kb-questions.tsv> · chat <questions.tsv> ·
+//! ingest <file> · pass · transcribe <file> · drift · drift-change <member>
+//! <file> · ignore <member> · model <member> · sql <member> <query> · status.
+//! Each prints a Markdown report on stdout.
+//!
+//! Knowledge-base questions (`kb-ask`, and `chat` with `KEN_EVAL_FORMAT=kb`)
+//! are `question<TAB>answer<TAB>key facts<TAB>wiki pages<TAB>category`, the
+//! pages as `path:lines` in the knowledge base (`KEN_EVAL_KB`, a member,
+//! default `Shattered-Realms-Docs`) separated by `;`. Files the run keeps go
+//! under `KEN_EVAL_OUT` (default `<parent>/../eval-out`). `KEN_EVAL_MEMBERS`
+//! (comma-separated folder names) keeps `index` and `embed` to those members.
 //!
 //! It refuses to run without `KEN_DATA_DIR`, so it can never write into the
 //! app's own data.
@@ -78,6 +86,7 @@ fn main() {
         "chat" => phase_chat(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
+        "kb-ask" => phase_kb_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("kb-questions.tsv"))),
         "look" => phase_look(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "drift" => phase_drift(&base, &parent),
         "drift-change" => phase_drift_change(&base, &parent, &args[2], &args[3]),
@@ -129,6 +138,15 @@ fn members(parent: &Path) -> Result<Vec<(String, Project)>> {
             _ => None,
         })
         .collect())
+}
+
+/// Whether `index` and `embed` take this member: every one, unless
+/// `KEN_EVAL_MEMBERS` names some (a member added later, without walking the
+/// big repos again).
+fn selected(name: &str) -> bool {
+    let only = std::env::var("KEN_EVAL_MEMBERS").unwrap_or_default();
+    let names: Vec<&str> = only.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    names.is_empty() || names.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -227,7 +245,7 @@ fn tier_counts(base: &Path, id: uuid::Uuid) -> BTreeMap<i64, i64> {
 fn phase_index(base: &Path, parent: &Path) -> Result<()> {
     println!("# Index\n\n| member | kind | files in index | full / search-only | failed | chunks | queued for extraction | time |\n|---|---|---|---|---|---|---|---|");
     let reg = Registry::load(base)?;
-    for (name, p) in members(parent)? {
+    for (name, p) in members(parent)?.into_iter().filter(|(n, _)| selected(n)) {
         let t = Instant::now();
         let mut db = Db::open(base, p.config.id)?;
         let _ = db.refresh_stored_kinds();
@@ -259,7 +277,7 @@ fn phase_embed(base: &Path, parent: &Path) -> Result<()> {
     let mut emb = ken_core::embedder::installed_embedding_model()
         .ok_or_else(|| Error::Other("no embedding model installed under KEN_DATA_DIR/whisper".into()))?;
     println!("# Meaning index ({}, {} dims)\n\n| member | chunks | embedded | time |\n|---|---|---|---|", emb.model_id(), emb.dim());
-    for (name, p) in members(parent)? {
+    for (name, p) in members(parent)?.into_iter().filter(|(n, _)| selected(n)) {
         let t = Instant::now();
         let mut db = Db::open(base, p.config.id)?;
         let mut last = 0usize;
@@ -342,42 +360,66 @@ fn phase_wiki(base: &Path, parent: &Path) -> Result<()> {
 
 /// Ken's chat on each question (or `KEN_EVAL_ONLY`), headless: the chat's
 /// guide and Ken's MCP server over this evaluation's data, started in the
-/// team wiki with every member readable. Found when an expected file is in
-/// the answer (it cites `ken://<id>/<path>`).
+/// team wiki (or the member `KEN_EVAL_START`) with every member readable.
+/// Found when an expected file is in the answer (it cites `ken://<id>/<path>`).
+///
+/// Each answer is kept whole, with every tool call and what it returned, in
+/// `<KEN_EVAL_OUT>/<KEN_EVAL_LABEL>/` (label default `chat-full`, or
+/// `chat-mcp` with `KEN_EVAL_MCP_ONLY=1`): `qNN.answer.md`, `qNN.tools.jsonl`
+/// (one call a line: tool, input, files it returned or read),
+/// `qNN.events.jsonl` (the CLI's own stream) and `qNN.summary.json` (tools
+/// used, which knowledge-base pages came back, were read or cited, and the
+/// time). `KEN_EVAL_FORMAT=kb` reads the knowledge-base question file.
 fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(questions).map_err(|e| Error::Other(format!("{}: {e}", questions.display())))?;
-    let only: Vec<usize> =
-        std::env::var("KEN_EVAL_ONLY").unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect();
+    let kb = kb_format();
+    let qs = read_questions(questions, kb)?;
+    let only = only();
     let binary = ken_core::runner::discover_claude().ok_or_else(|| Error::Other("Claude Code not found".into()))?;
     let mcp = std::env::current_exe().map_err(|e| Error::Other(e.to_string()))?.parent().and_then(|d| d.parent()).map(|d| d.join("ken-mcp.exe")).filter(|p| p.exists())
         .ok_or_else(|| Error::Other("ken-mcp.exe not built next to the harness".into()))?;
-    let wiki = Project::open(&parent.join(wiki_name()))?;
+    let start = std::env::var("KEN_EVAL_START").ok().filter(|s| !s.is_empty()).unwrap_or_else(wiki_name);
+    let wiki = Project::open(&parent.join(&start))?;
     let cfg = base.join("chat-mcp").join("eval.json");
     std::fs::create_dir_all(cfg.parent().unwrap()).map_err(|e| Error::Other(e.to_string()))?;
     let config = serde_json::json!({"mcpServers": {"ken": {"command": mcp, "args": ["--project", wiki.root], "env": {"KEN_DATA_DIR": base}}}});
     std::fs::write(&cfg, config.to_string()).map_err(|e| Error::Other(e.to_string()))?;
-    let dirs: Vec<PathBuf> = members(parent)?.into_iter().map(|(_, p)| p.root.clone()).collect();
-    let cite: Vec<(String, uuid::Uuid)> = members(parent)?.into_iter().map(|(n, p)| (n, p.config.id)).collect();
+    let ms = members(parent)?;
+    let dirs: Vec<PathBuf> = ms.iter().map(|(_, p)| p.root.clone()).collect();
+    let cite: Vec<(String, uuid::Uuid)> = ms.iter().map(|(n, p)| (n.clone(), p.config.id)).collect();
+    let folders = Folders::new(&ms);
+    // KEN_EVAL_MCP_ONLY=1: Ken's MCP tools alone, no file tools, to
+    // measure what Ken's own search answers.
+    let look = std::env::var("KEN_EVAL_MCP_ONLY").map_or(true, |v| v != "1");
+    let label = std::env::var("KEN_EVAL_LABEL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| if look { "chat-full".into() } else { "chat-mcp".into() });
+    let out = out_root(parent).join(&label);
+    std::fs::create_dir_all(&out).map_err(|e| Error::io(&out, e))?;
+    let write = |name: String, body: &str| -> Result<()> {
+        let path = out.join(name);
+        std::fs::write(&path, body).map_err(|e| Error::io(&path, e))
+    };
+    let kb_prefix = format!("{}/", kb_member().to_lowercase());
+    let ken_wiki = format!("{}/", wiki_name().to_lowercase());
     let (mut asked, mut found, mut not_there) = (0, 0, 0);
-    println!("# Ken's chat\n\nstarted in `{}`, MCP `{}`\n", wiki_name(), mcp.display());
-    for (qi, line) in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).enumerate() {
-        let n = qi + 1;
-        if !only.is_empty() && !only.contains(&n) {
+    let (mut kb_used, mut exp_read, mut exp_cited) = (0, 0, 0);
+    println!("# Ken's chat\n\nstarted in `{start}`, MCP `{}`, file tools {look}, kept in `{}`\n", mcp.display(), out.display());
+    for q in &qs {
+        if !only.is_empty() && !only.contains(&q.n) {
             continue;
         }
-        let (q, expect) = line.split_once('\t').unwrap_or((line, ""));
-        let expects: Vec<String> = expect.split('|').filter(|e| !e.is_empty()).map(|e| e.to_lowercase()).collect();
+        let n = q.n;
         let t = Instant::now();
         // As the app sends a workspace turn: how to link each repo's files.
         let prompt = match ken_core::chat::build_cite_preamble(&cite) {
-            Some(c) => format!("{c}\n\n{q}"),
-            None => q.to_string(),
+            Some(c) => format!("{c}\n\n{}", q.text),
+            None => q.text.clone(),
         };
-        // KEN_EVAL_MCP_ONLY=1: Ken's MCP tools alone, no file tools, to
-        // measure what Ken's own search answers.
-        let look = std::env::var("KEN_EVAL_MCP_ONLY").map_or(true, |v| v != "1");
-        let outcome =
-            assistant::chat_oneshot_with(&binary, &wiki.root, &dirs, &cfg, &prompt, Duration::from_secs(300), &CancelToken::new(), look)?;
+        let (outcome, events) =
+            assistant::chat_oneshot_traced(&binary, &wiki.root, &dirs, &cfg, &prompt, Duration::from_secs(300), &CancelToken::new(), look)?;
+        let secs = t.elapsed().as_secs_f64();
+        let status = match &outcome {
+            assistant::OneshotOutcome::Completed(_) => "completed".to_string(),
+            other => format!("{other:?}"),
+        };
         let answer = match outcome {
             assistant::OneshotOutcome::Completed(t) => t,
             other => format!("(no answer: {other:?})"),
@@ -388,20 +430,455 @@ fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         for (name, id) in &cite {
             cited = cited.replace(&format!("ken://{id}/"), &format!("{name}/"));
         }
-        let lower = cited.to_lowercase();
-        let hit = expects.iter().any(|e| lower.contains(e));
+        let lower = cited.to_lowercase().replace("%20", " ");
+        let hit = q.expects.iter().any(|e| lower.contains(e));
         let missing = !hit && (lower.contains("isn't there") || lower.contains("not there") || lower.contains("could not find") || lower.contains("couldn't find"));
         asked += 1;
         found += usize::from(hit);
         not_there += usize::from(missing);
+
+        // What the turn did: each call, and the files it returned or read.
+        let calls = tool_calls(&events, &folders, &start);
+        let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+        let (mut returned, mut read): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for c in &calls {
+            *tools.entry(c["name"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+            for f in c["returned"].as_array().into_iter().flatten().filter_map(|f| f.as_str()) {
+                if !returned.iter().any(|r| r == f) {
+                    returned.push(f.to_string());
+                }
+            }
+            if let Some(f) = c["read"].as_str() {
+                if !read.iter().any(|r| r == f) {
+                    read.push(f.to_string());
+                }
+            }
+        }
+        let cited_files = folders.files_in(&answer);
+        let under = |files: &[String], prefix: &str| -> Vec<String> { files.iter().filter(|f| f.to_lowercase().starts_with(prefix)).cloned().collect() };
+        let expected = |files: &[String]| files.iter().any(|f| q.expects.iter().any(|e| f.to_lowercase().contains(e)));
+        let (kb_returned, kb_read, kb_cited) = (under(&returned, &kb_prefix), under(&read, &kb_prefix), under(&cited_files, &kb_prefix));
+        let used = !kb_read.is_empty() || !kb_cited.is_empty();
+        let (e_read, e_cited) = (expected(&read), expected(&cited_files) || hit);
+        kb_used += usize::from(used);
+        exp_read += usize::from(e_read);
+        exp_cited += usize::from(e_cited);
+        let result = events.iter().rev().find(|e| e["type"] == "result");
+        let summary = serde_json::json!({
+            "n": n,
+            "category": q.category,
+            "question": q.text,
+            "outcome": status,
+            "seconds": (secs * 10.0).round() / 10.0,
+            "duration_ms": result.and_then(|r| r["duration_ms"].as_u64()),
+            "num_turns": result.and_then(|r| r["num_turns"].as_u64()),
+            "cost_usd": result.and_then(|r| r["total_cost_usd"].as_f64()),
+            "file_tools": look,
+            "calls": calls.len(),
+            "tools": tools,
+            "expected": q.expects,
+            "expected_returned": expected(&returned),
+            "expected_read": e_read,
+            "expected_cited": e_cited,
+            "kb_used": used,
+            "kb_returned": kb_returned,
+            "kb_read": kb_read,
+            "kb_cited": kb_cited,
+            "ken_wiki_read": under(&read, &ken_wiki),
+            "other_read": read.iter().filter(|f| { let l = f.to_lowercase(); !l.starts_with(&kb_prefix) && !l.starts_with(&ken_wiki) }).collect::<Vec<_>>(),
+            "cited": cited_files,
+            "answer_chars": answer.chars().count(),
+        });
+        write(format!("q{n:02}.answer.md"), &answer)?;
+        write(format!("q{n:02}.tools.jsonl"), &calls.iter().map(|c| c.to_string() + "\n").collect::<String>())?;
+        write(format!("q{n:02}.events.jsonl"), &events.iter().map(|e| e.to_string() + "\n").collect::<String>())?;
+        write(format!("q{n:02}.summary.json"), &(serde_json::to_string_pretty(&summary).unwrap_or_default() + "\n"))?;
+
+        let verdict = if kb {
+            format!(
+                "wiki {} · expected page read {} · cited {}",
+                if used { "used" } else { "NOT USED" },
+                if e_read { "yes" } else { "no" },
+                if e_cited { "yes" } else { "no" }
+            )
+        } else if hit {
+            "FOUND".to_string()
+        } else if missing {
+            "SAID NOT THERE".to_string()
+        } else {
+            "MISSED".to_string()
+        };
+        let used_tools: Vec<String> = tools.iter().map(|(t, c)| format!("{} ×{c}", t.trim_start_matches("mcp__ken__"))).collect();
         println!(
-            "## Q{n}. {q}\n\n{} · {:.0}s · expected `{expect}`\n\n{}\n",
-            if hit { "FOUND" } else if missing { "SAID NOT THERE" } else { "MISSED" },
-            t.elapsed().as_secs_f64(),
+            "## Q{n}. {}\n\n{verdict} · {secs:.0}s · {status} · expected `{}`\n\ntools: {}\n\n{}\n\n_full answer: `q{n:02}.answer.md`_\n",
+            q.text,
+            q.expect_raw,
+            if used_tools.is_empty() { "none".to_string() } else { used_tools.join(", ") },
             short(&answer, 700)
         );
     }
-    println!("## Score\n\n{found} of {asked} answers name an expected file; {not_there} said it was not there.");
+    if kb {
+        println!("## Score\n\n{asked} asked: the knowledge base read or cited in {kb_used}; the expected page read in {exp_read}, cited in {exp_cited}; {not_there} said it was not there.");
+    } else {
+        println!("## Score\n\n{found} of {asked} answers name an expected file; {not_there} said it was not there.");
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------- knowledge base
+
+/// The knowledge base the KB questions are about: a member's folder name
+/// (`KEN_EVAL_KB`, default `Shattered-Realms-Docs`).
+fn kb_member() -> String {
+    std::env::var("KEN_EVAL_KB").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "Shattered-Realms-Docs".into())
+}
+
+/// Whether `chat` reads the knowledge-base question file (`KEN_EVAL_FORMAT=kb`).
+fn kb_format() -> bool {
+    std::env::var("KEN_EVAL_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("kb"))
+}
+
+/// The question numbers in `KEN_EVAL_ONLY` (e.g. `9,10,15`); empty for all.
+fn only() -> Vec<usize> {
+    std::env::var("KEN_EVAL_ONLY").unwrap_or_default().split(',').filter_map(|n| n.trim().parse().ok()).collect()
+}
+
+/// Where a run keeps its files: `KEN_EVAL_OUT`, else `eval-out` beside the
+/// evaluation's folder.
+fn out_root(parent: &Path) -> PathBuf {
+    match std::env::var_os("KEN_EVAL_OUT") {
+        Some(o) if !o.is_empty() => PathBuf::from(o),
+        _ => parent.parent().unwrap_or(parent).join("eval-out"),
+    }
+}
+
+/// One question, numbered as the file lists them (comment and blank lines
+/// not counted).
+struct Question {
+    n: usize,
+    text: String,
+    /// A right source contains one of these, as lowercase `member/path`.
+    expects: Vec<String>,
+    /// The expected column as written: paths, or the wiki pages.
+    expect_raw: String,
+    category: String,
+}
+
+/// The pages in a knowledge-base question's wiki column, `path:lines`
+/// separated by `;`, without their lines. `-` or `none` is no page (a
+/// question the knowledge base does not answer).
+fn wiki_pages(column: &str) -> Vec<String> {
+    column
+        .split(';')
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "-" && !p.eq_ignore_ascii_case("none"))
+        .map(|p| match p.rsplit_once(':') {
+            Some((path, lines)) if !lines.is_empty() && lines.chars().all(|c| c.is_ascii_digit() || c == '-' || c == ',') => path.trim().to_string(),
+            _ => p.to_string(),
+        })
+        .collect()
+}
+
+/// A question file: `question<TAB>expected|paths`, or with `kb` the
+/// knowledge-base format, whose expected files are its wiki pages in
+/// [`kb_member`].
+fn read_questions(path: &Path, kb: bool) -> Result<Vec<Question>> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error::Other(format!("{}: {e}", path.display())))?;
+    let member = kb_member();
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .enumerate()
+        .map(|(i, line)| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if kb {
+                let wiki = cols.get(3).copied().unwrap_or("");
+                Question {
+                    n: i + 1,
+                    text: cols[0].trim().to_string(),
+                    expects: wiki_pages(wiki).iter().map(|p| format!("{member}/{p}").to_lowercase()).collect(),
+                    expect_raw: wiki.trim().to_string(),
+                    category: cols.get(4).map(|c| c.trim().to_string()).unwrap_or_default(),
+                }
+            } else {
+                let expect = cols.get(1).copied().unwrap_or("");
+                Question {
+                    n: i + 1,
+                    text: cols[0].to_string(),
+                    expects: expect.split('|').filter(|e| !e.is_empty()).map(|e| e.to_lowercase()).collect(),
+                    expect_raw: expect.to_string(),
+                    category: String::new(),
+                }
+            }
+        })
+        .collect())
+}
+
+/// `ken://<project id>/`, as Ken's tools address a file.
+fn ken_address_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"ken://([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/").unwrap())
+}
+
+/// A file path at the start of the rest of a line: up to the first
+/// extension that a delimiter or the line's end follows, so a page name
+/// with spaces (`Feature Status.md#L12`) comes whole.
+fn path_head(rest: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r#"^(.+?\.[A-Za-z0-9]{1,8})(?:[:#)\]\s,;'"`>|*]|$)"#).unwrap());
+    re.captures(rest).map(|c| c[1].replace("%20", " "))
+}
+
+/// The workspace's members as a chat turn names them: by id in a ken://
+/// address, by folder or project name in a tool's `project`, by folder in a
+/// file tool's absolute path.
+struct Folders {
+    /// (folder name, project name, id, root with `/` and lowercase).
+    all: Vec<(String, String, uuid::Uuid, String)>,
+}
+
+impl Folders {
+    fn new(ms: &[(String, Project)]) -> Folders {
+        Folders {
+            all: ms
+                .iter()
+                .map(|(n, p)| {
+                    let root = p.root.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+                    (n.clone(), p.config.name.clone(), p.config.id, root)
+                })
+                .collect(),
+        }
+    }
+
+    /// The folder name for a member's folder name, project name or id.
+    fn named(&self, project: &str) -> Option<&str> {
+        let p = project.trim();
+        self.all
+            .iter()
+            .find(|(n, name, id, _)| n.eq_ignore_ascii_case(p) || name.eq_ignore_ascii_case(p) || id.to_string().eq_ignore_ascii_case(p))
+            .map(|(n, ..)| n.as_str())
+    }
+
+    /// Every file `text` names, as `member/path`, first mention first: ken://
+    /// addresses, absolute paths under a member, and `member/path` written out.
+    fn files_in(&self, text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |f: String| {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        };
+        for c in ken_address_re().captures_iter(text) {
+            let rest = text[c.get(0).unwrap().end()..].lines().next().unwrap_or("");
+            if let (Some(name), Some(path)) = (self.named(&c[1]), path_head(rest)) {
+                push(format!("{name}/{path}"));
+            }
+        }
+        // Byte offsets agree: an ASCII-only lowercase keeps every length.
+        let flat = text.replace('\\', "/");
+        let lower = flat.to_ascii_lowercase();
+        for (folder, name, _, root) in &self.all {
+            let needles = [format!("{root}/"), format!("{}/", folder.to_ascii_lowercase()), format!("{}/", name.to_ascii_lowercase())];
+            for needle in needles.iter() {
+                let mut from = 0;
+                while let Some(i) = lower[from..].find(needle.as_str()) {
+                    let at = from + i;
+                    let start = at + needle.len();
+                    // A name only where a path could begin, not inside a longer one.
+                    let clean = at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric() && !matches!(lower.as_bytes()[at - 1], b'-' | b'_' | b'.');
+                    if clean || needle.starts_with(root.as_str()) {
+                        if let Some(path) = path_head(flat[start..].lines().next().unwrap_or("")) {
+                            push(format!("{folder}/{path}"));
+                        }
+                    }
+                    from = start;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The text of a tool result's content: a string, or text blocks.
+fn result_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Every tool call in a chat turn's events, in order, each with the input
+/// it was given (query, path, project), whether it failed, the files its
+/// result named (`returned`) and the file it read (`read`, for
+/// read_document and Read). `start` is the member a read_document without a
+/// project reads from.
+fn tool_calls(events: &[serde_json::Value], folders: &Folders, start: &str) -> Vec<serde_json::Value> {
+    let mut results: HashMap<String, (bool, String)> = HashMap::new();
+    for e in events.iter().filter(|e| e["type"] == "user") {
+        for b in e["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+            let id = b["tool_use_id"].as_str().unwrap_or_default().to_string();
+            results.insert(id, (b["is_error"].as_bool().unwrap_or(false), result_text(&b["content"])));
+        }
+    }
+    let mut calls = Vec::new();
+    for e in events.iter().filter(|e| e["type"] == "assistant") {
+        for b in e["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
+            let name = b["name"].as_str().unwrap_or_default();
+            let input = &b["input"];
+            let field = |keys: &[&str]| keys.iter().find_map(|k| input[*k].as_str().map(str::to_string));
+            let path = field(&["path", "file_path", "folder"]);
+            let project = field(&["project"]);
+            let (is_error, text) = results.get(b["id"].as_str().unwrap_or_default()).cloned().unwrap_or((false, String::new()));
+            let read = match (name, &path) {
+                (n, Some(p)) if n.ends_with("read_document") => {
+                    if p.starts_with("ken://") {
+                        folders.files_in(p).into_iter().next()
+                    } else {
+                        let member = project.as_deref().and_then(|pr| folders.named(pr)).unwrap_or(start);
+                        Some(format!("{member}/{}", p.split('#').next().unwrap_or(p).trim_start_matches('/')))
+                    }
+                }
+                ("Read", Some(p)) => folders.files_in(p).into_iter().next(),
+                _ => None,
+            };
+            calls.push(serde_json::json!({
+                "seq": calls.len() + 1,
+                "name": name,
+                "input": input,
+                "query": field(&["query", "pattern"]),
+                "path": path,
+                "project": project,
+                "subagent": e["parent_tool_use_id"].as_str(),
+                "is_error": is_error,
+                "result_chars": text.chars().count(),
+                "returned": folders.files_in(&text),
+                "read": read,
+            }));
+        }
+    }
+    calls
+}
+
+/// Where each knowledge-base question's wiki page ranks, as Claude's tools
+/// would show it: in hybrid search of the knowledge base alone (what
+/// semantic_search on it returns, 20 deep), in keyword search of it, and in
+/// route_query's merge across the routed members (its default 10, then 30
+/// deep). Pages are counted once, at their best chunk. Writes
+/// `<KEN_EVAL_OUT>/kb-ask.tsv` for the grading script.
+fn phase_kb_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
+    const KB_DEPTH: usize = 20;
+    const ROUTE_LIMIT: usize = 10;
+    const ROUTE_DEEP: usize = 30;
+    let qs = read_questions(questions, true)?;
+    let mut emb = ken_core::embedder::installed_embedding_model();
+    let model = emb.as_ref().map(|e| e.model_id());
+    let kg = WorkspaceKgDb::open(parent).ok();
+    let ms: Vec<(String, Project, Db)> = members(parent)?
+        .into_iter()
+        .filter_map(|(n, p)| Db::open_read_only(base, p.config.id).ok().map(|db| (n, p, db)))
+        .collect();
+    let kb = kb_member();
+    let Some((_, _, kb_db)) = ms.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(&kb)) else {
+        return Err(Error::Other(format!("{kb} is not a member of this workspace; add it, index and embed it first")));
+    };
+    // As route_query: members by their project name, each searched with the
+    // question's vector only when its index was built by the same model.
+    let info: Vec<MemberInfo> = ms
+        .iter()
+        .map(|(_, p, db)| MemberInfo { project_id: p.config.id, name: p.config.name.clone(), index_ready: db.vec_available(), last_activity: 0 })
+        .collect();
+    let shared = routing::workspace_vocabulary(ms.iter().map(|(_, _, db)| db));
+    let types = ken_core::contenttype::parse_filter(std::env::var("KEN_EVAL_TYPES").ok().as_deref());
+    let pages = |paths: Vec<String>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in paths {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    };
+    let rank_in = |list: &[String], expects: &[String]| list.iter().position(|p| expects.iter().any(|e| p.to_lowercase().contains(e))).map(|r| r + 1);
+    let show = |r: Option<usize>| r.map_or("—".to_string(), |r| r.to_string());
+
+    let mut rows = vec!["n\tcategory\tkb_hybrid\tkb_keyword\troute\troute30\tkb_routed\troute_top5".to_string()];
+    let mut by_cat: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+    println!("# Knowledge-base questions: where the wiki page ranks\n\nknowledge base `{kb}` · meaning model {:?}\n", model);
+    for q in &qs {
+        let qv = emb.as_mut().and_then(|e| e.embed_query(&q.text).ok());
+        let fits = |db: &Db| model.is_some() && db.embed_model().ok().flatten() == model;
+        let kb_list = |v: Option<&[f32]>| -> Vec<String> {
+            pages(routing::search_member_of(kb_db, &q.text, v, KB_DEPTH, &types).unwrap_or_default().into_iter().map(|h| format!("{kb}/{}", h.path)).collect())
+        };
+        let kb_hybrid = kb_list(qv.as_deref().filter(|_| fits(kb_db)));
+        let kb_keyword = kb_list(None);
+        let plan = routing::plan_route(&q.text, &info, kg.as_ref());
+        let route = |limit: usize| -> Vec<String> {
+            let hits: Vec<routing::MemberHits> = plan
+                .targets
+                .iter()
+                .filter_map(|id| ms.iter().find(|(_, p, _)| p.config.id == *id))
+                .filter(|(_, _, db)| db.vec_available())
+                .map(|(n, p, db)| routing::MemberHits {
+                    project_id: p.config.id,
+                    member_name: n.clone(),
+                    status: routing::MemberStatus::Searched,
+                    hits: routing::search_member_of_with(db, &q.text, qv.as_deref().filter(|_| fits(db)), limit, &types, Some(&shared)).unwrap_or_default(),
+                })
+                .collect();
+            pages(routing::merge_routed(&plan, &hits, limit).results.iter().map(|r| format!("{}/{}", r.member_name, r.path)).collect())
+        };
+        let routed = route(ROUTE_LIMIT);
+        let deep = route(ROUTE_DEEP);
+        let kb_routed = plan.targets.iter().any(|id| ms.iter().any(|(n, p, _)| p.config.id == *id && n.eq_ignore_ascii_case(&kb)));
+        let (rh, rk, rr, rd) = (rank_in(&kb_hybrid, &q.expects), rank_in(&kb_keyword, &q.expects), rank_in(&routed, &q.expects), rank_in(&deep, &q.expects));
+        if !q.expects.is_empty() {
+            let c = by_cat.entry(q.category.clone()).or_default();
+            c.0 += 1;
+            c.1 += usize::from(rh.is_some_and(|r| r <= 5));
+            c.2 += usize::from(rr.is_some_and(|r| r <= 5));
+            c.3 += usize::from(rr.is_some());
+        }
+        let targets: Vec<&str> = plan.targets.iter().filter_map(|id| ms.iter().find(|(_, p, _)| p.config.id == *id)).map(|(n, _, _)| n.as_str()).collect();
+        println!(
+            "## Q{}. [{}] {}\n\nexpected `{}` · knowledge base hybrid {} · keyword {} · route_query {} (30 deep: {}) · routed to {:?}\n",
+            q.n,
+            q.category,
+            q.text,
+            q.expect_raw,
+            show(rh),
+            show(rk),
+            show(rr),
+            show(rd),
+            targets
+        );
+        for (i, p) in routed.iter().take(5).enumerate() {
+            println!("{}. `{p}`", i + 1);
+        }
+        println!();
+        let opt = |r: Option<usize>| if q.expects.is_empty() { "n/a".to_string() } else { r.map_or(String::new(), |r| r.to_string()) };
+        rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            q.n,
+            q.category,
+            opt(rh),
+            opt(rk),
+            opt(rr),
+            opt(rd),
+            kb_routed,
+            routed.iter().take(5).cloned().collect::<Vec<_>>().join(" ; ")
+        ));
+    }
+    println!("## By category (questions with a wiki page)\n\n| category | questions | kb hybrid top 5 | route_query top 5 | route_query top 10 |\n|---|---|---|---|---|");
+    for (cat, (n, h5, r5, r10)) in &by_cat {
+        println!("| {cat} | {n} | {h5} | {r5} | {r10} |");
+    }
+    let out = out_root(parent);
+    std::fs::create_dir_all(&out).map_err(|e| Error::io(&out, e))?;
+    let path = out.join("kb-ask.tsv");
+    std::fs::write(&path, rows.join("\n") + "\n").map_err(|e| Error::io(&path, e))?;
+    println!("\nwritten: `{}`", path.display());
     Ok(())
 }
 
