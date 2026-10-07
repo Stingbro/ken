@@ -13,7 +13,8 @@
 //! wall: a record that answers still beats a rule that barely matches.
 //!
 //! * **Rule** ([`W_RULE`]): the decisions log, rules and Ways-of-Working
-//!   pages, Platform pages, people pages, and any page `status: current`.
+//!   pages, Platform pages, people pages; and, by less ([`W_CURRENT`]), any
+//!   other page `status: current`.
 //! * **Reference** (0): every other page, and every file that is not a
 //!   Markdown page. All code is neutral, so code search does not move.
 //! * **Record** ([`W_RECORD`]): tickets, Research and ingested notes (dated
@@ -48,6 +49,12 @@ use crate::Result;
 /// What a rule or ruling adds to a hit's score: as much as a page's band
 /// did, a little under one filename word.
 pub const W_RULE: f64 = 0.75;
+/// What a page kept current (`status: current`) adds: less than a ruling.
+/// Measured 2026-10-07: at the full rule weight the reference pages kept
+/// current (280 in Shattered Realms' wiki) rose above the code that answers
+/// "which trigger-volume shapes does the engine support"; at this weight
+/// the 45 code questions lost nothing and the wiki questions kept the gain.
+pub const W_CURRENT: f64 = 0.2;
 /// What a record (a ticket, a Research note) gives up.
 pub const W_RECORD: f64 = 0.75;
 /// What a closed ticket or a retired page gives up.
@@ -172,12 +179,12 @@ impl Roles {
                 };
             }
         }
-        Authority::of(self.default_tier(&path, meta))
+        self.default_authority(&path, meta)
     }
 
-    fn default_tier(&self, path: &str, meta: Option<&PageMeta>) -> Tier {
+    fn default_authority(&self, path: &str, meta: Option<&PageMeta>) -> Authority {
         if !crate::chunker::is_markdown(path) {
-            return Tier::Reference;
+            return Authority::of(Tier::Reference);
         }
         let lower = path.to_ascii_lowercase();
         let dirs: Vec<&str> = lower.split('/').collect::<Vec<_>>().split_last().map(|(_, d)| d.to_vec()).unwrap_or_default();
@@ -191,21 +198,21 @@ impl Roles {
         };
         let status = meta.and_then(|m| m.status.as_deref()).map(status_word).unwrap_or_default();
         if meta.is_some_and(|m| m.retired()) {
-            return Tier::Closed;
+            return Authority::of(Tier::Closed);
         }
         let ticket = match &self.tickets {
             Some(_) => under(&self.tickets, "tickets"),
             None => crate::contenttype::of(path) == crate::contenttype::ContentType::Ticket,
         };
         if ticket {
-            return if CLOSED_STATUSES.contains(&status.as_str()) { Tier::Closed } else { Tier::Record };
+            return Authority::of(if CLOSED_STATUSES.contains(&status.as_str()) { Tier::Closed } else { Tier::Record });
         }
         let section = crate::pagemeta::section_of(path);
         if section == Some(Section::Research) || dirs.iter().any(|d| matches!(*d, "ingested" | "ingestion")) {
-            return Tier::Record;
+            return Authority::of(Tier::Record);
         }
         if status == "mirror" || meta.is_some_and(|m| m.generated) {
-            return Tier::Record;
+            return Authority::of(Tier::Record);
         }
         let decisions_log = match &self.decisions {
             Some(d) => lower == d.to_ascii_lowercase(),
@@ -215,11 +222,13 @@ impl Roles {
             || matches!(section, Some(Section::WaysOfWorking | Section::Platform))
             || dirs.contains(&"rules")
             || under(&self.people, "people")
-            || status == "current"
         {
-            return Tier::Rule;
+            return Authority::of(Tier::Rule);
         }
-        Tier::Reference
+        if status == "current" {
+            return Authority { tier: Tier::Rule, weight: W_CURRENT };
+        }
+        Authority::of(Tier::Reference)
     }
 }
 
@@ -287,6 +296,7 @@ mod tests {
         assert_eq!(tier("Ways-of-Working/Rules/never-weaken-a-test.md", None), Tier::Rule);
         assert_eq!(tier("people/chris.md", None), Tier::Rule);
         assert_eq!(tier("Engine/Reference/World Events.md", Some(meta("current"))), Tier::Rule);
+        assert_eq!(r.authority("Engine/Reference/World Events.md", Some(&meta("current"))).weight, W_CURRENT, "kept current, less than a ruling");
         assert_eq!(tier("Engine/Reference/Feature Status.md", Some(meta("reference, kept current"))), Tier::Reference);
         assert_eq!(tier("Design/Game/Design Law.md", None), Tier::Reference);
         assert_eq!(tier("tickets/SR-101.md", Some(meta("todo"))), Tier::Record);
