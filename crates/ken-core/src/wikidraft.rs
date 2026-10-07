@@ -558,11 +558,13 @@ fn pusher_of(budget: usize, each: usize) -> impl Fn(String, String, &mut Vec<Sou
 }
 
 /// One part of a Markdown file: the line its heading is on (1-based), the
-/// heading's words, and its text, heading included.
+/// heading's words, the heading of the `##` section it was split from (empty
+/// for a whole section), and its text, heading included.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub line: usize,
     pub heading: String,
+    pub parent: String,
     pub text: String,
 }
 
@@ -571,7 +573,7 @@ pub struct Section {
 /// when it has any words.
 fn split_at(text: &str, is_head: impl Fn(&str) -> bool) -> Vec<Section> {
     let mut out: Vec<Section> = Vec::new();
-    let mut cur = Section { line: 1, heading: String::new(), text: String::new() };
+    let mut cur = Section { line: 1, heading: String::new(), parent: String::new(), text: String::new() };
     let mut fence = false;
     for (i, line) in text.lines().enumerate() {
         let t = line.trim_start();
@@ -582,7 +584,7 @@ fn split_at(text: &str, is_head: impl Fn(&str) -> bool) -> Vec<Section> {
             if !cur.text.trim().is_empty() {
                 out.push(cur);
             }
-            cur = Section { line: i + 1, heading: line.trim_start_matches('#').trim().to_string(), text: String::new() };
+            cur = Section { line: i + 1, heading: line.trim_start_matches('#').trim().to_string(), parent: String::new(), text: String::new() };
         }
         cur.text.push_str(line);
         cur.text.push('\n');
@@ -593,9 +595,65 @@ fn split_at(text: &str, is_head: impl Fn(&str) -> bool) -> Vec<Section> {
     out
 }
 
-/// A brief split at its `##` headings; a `###` stays inside its section.
+/// `s` in parts of at most `max` characters, cut only at a blank line
+/// outside a code fence (or, for one paragraph longer than `max`, at a line
+/// end), each part starting at its own line and keeping the heading.
+fn split_paragraphs(s: Section, max: usize) -> Vec<Section> {
+    if s.text.len() <= max {
+        return vec![s];
+    }
+    let mut out: Vec<Section> = Vec::new();
+    let mut cur = String::new();
+    let (mut start, mut fence) = (s.line, false);
+    let mut cut_at: Option<usize> = None; // byte in `cur` after its last blank line
+    for (i, line) in s.text.lines().enumerate() {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            fence = !fence;
+        }
+        if cur.len() + line.len() + 1 > max && !cur.trim().is_empty() {
+            let at = cut_at.filter(|a| *a > 0).unwrap_or(cur.len());
+            let rest = cur.split_off(at);
+            out.push(Section { line: start, heading: s.heading.clone(), parent: s.parent.clone(), text: cur });
+            start = s.line + i - rest.lines().count();
+            cur = rest;
+            cut_at = None;
+        }
+        cur.push_str(line);
+        cur.push('\n');
+        if line.trim().is_empty() && !fence {
+            cut_at = Some(cur.len());
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(Section { line: start, heading: s.heading.clone(), parent: s.parent.clone(), text: cur });
+    }
+    out
+}
+
+/// A brief split at its `##` headings, a `###` inside its section. A section
+/// longer than [`SECTION_MAX`] is split again at its `###` headings, each
+/// part knowing its section's heading, and a part still longer at its blank
+/// lines: nothing is cut. On 2026-10-06 the mod's 45,929-character Common
+/// Gotchas and 20,979-character Key Architectural Patterns were each clipped
+/// to 12,000, 28% of its brief.
 pub fn brief_sections(text: &str) -> Vec<Section> {
-    split_at(text, |l| l.starts_with("## "))
+    let mut out = Vec::new();
+    for s in split_at(text, |l| l.starts_with("## ")) {
+        if s.text.len() <= SECTION_MAX {
+            out.push(s);
+            continue;
+        }
+        for mut part in split_at(&s.text, |l| l.starts_with("### ")) {
+            part.line += s.line - 1;
+            if part.line == s.line {
+                part.heading = s.heading.clone();
+            } else {
+                part.parent = s.heading.clone();
+            }
+            out.extend(split_paragraphs(part, SECTION_MAX));
+        }
+    }
+    out
 }
 
 /// Whether a line is a version's heading in a changelog: `#` to `###`, then
@@ -617,15 +675,17 @@ pub fn version_sections(text: &str) -> Vec<Section> {
     split_at(text, is_version_heading).into_iter().filter(|s| is_version_heading(s.text.lines().next().unwrap_or(""))).collect()
 }
 
-/// What a brief's section is about, which says which page it serves.
+/// What a brief's section is about, which says which pages it may serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Topic {
     /// How to build, run, test and deploy: the repo's page.
     Build,
     /// Layers, structure, patterns, systems: the architecture page.
     Architecture,
-    /// Glossaries, naming, gotchas: Vocabulary.
+    /// Glossaries, naming: Vocabulary.
     Vocabulary,
+    /// Gotchas, pitfalls, warnings: START-HERE's traps.
+    Traps,
     /// Team, owners, roles, reviews: Team and Who Does What.
     People,
     /// Releases and versions: Releases.
@@ -639,6 +699,7 @@ pub enum Topic {
 /// the first topic one of whose words begins a word of the heading (a word
 /// ending in a space must be the whole word).
 const TOPIC_WORDS: &[(Topic, &[&str])] = &[
+    (Topic::Traps, &["gotcha", "pitfall", "trap", "warning", "caveat", "footgun", "beware", "known issue", "lessons"]),
     (
         Topic::Build,
         &[
@@ -653,10 +714,7 @@ const TOPIC_WORDS: &[(Topic, &[&str])] = &[
             "system", "pipeline", "flow", "entry point", "config", "convention",
         ],
     ),
-    (
-        Topic::Vocabulary,
-        &["vocabulary", "glossary", "term", "naming", "names", "gotcha", "pitfall", "trap", "jargon", "words", "called", "spelling"],
-    ),
+    (Topic::Vocabulary, &["vocabulary", "glossary", "term", "naming", "names", "jargon", "words", "called", "spelling"]),
     (
         Topic::People,
         &["team", "people", "owner", "maintainer", "contributor", "contact", "role", "who ", "review", "governance", "decision"],
@@ -674,13 +732,145 @@ pub fn topic_of(heading: &str) -> Topic {
     if heading.trim().is_empty() {
         return Topic::Project;
     }
-    let lower = heading.to_lowercase();
-    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
-    let spaced = format!(" {} ", words.join(" "));
+    let spaced = spaced_words(heading);
     TOPIC_WORDS
         .iter()
         .find(|(_, keys)| keys.iter().any(|k| spaced.contains(&format!(" {k}"))))
         .map_or(Topic::Other, |(t, _)| *t)
+}
+
+/// `text` lowercased as ` word word … `, punctuation gone, for matching a
+/// word's start with `" {key}"`.
+fn spaced_words(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    format!(" {} ", words.join(" "))
+}
+
+/// START-HERE, whose Traps rows Ken drafts from the briefs' gotchas.
+pub const START_HERE: &str = "START-HERE.md";
+
+/// The pages a part of each topic may go to, the topic's own page first.
+const TOPIC_PAGES: &[(Topic, &[&str])] = &[
+    (Topic::Build, &["Reference/Build-and-Run.md", "Conventions/Testing.md"]),
+    (
+        Topic::Architecture,
+        &[
+            "Conventions/Architecture.md",
+            "Reference/Systems.md",
+            "Conventions/Registries.md",
+            "Conventions/Data-and-Config.md",
+            "Reference/Config-Map.md",
+            "Conventions/Code.md",
+            "Platform/Index.md",
+        ],
+    ),
+    (Topic::Vocabulary, &["Reference/Vocabulary.md"]),
+    (Topic::Traps, &[START_HERE]),
+    (Topic::People, &["Current/Team.md", "Current/Who-Does-What.md"]),
+    (Topic::Releases, &["Work/Releases.md"]),
+    (Topic::Project, &["Current/Project.md", "Current/Feature-Status.md"]),
+];
+
+/// The words that say which page a part fits best, beside its topic: a word
+/// of the heading counts ten times a word of the body.
+const PAGE_WORDS: &[(&str, &[&str])] = &[
+    ("Reference/Build-and-Run.md", &["build", "run", "install", "launch", "server", "gradle", "command", "script", "deploy", "environment", "prerequisite", "toolchain", "debug", "setup", "start"]),
+    ("Conventions/Testing.md", &["test", "fixture", "gate", "coverage", "suite", "ci ", "assert", "verif"]),
+    ("Conventions/Architecture.md", &["architect", "layer", "repo", "module", "package", "dependenc", "boundary", "structure", "import", "calls"]),
+    ("Reference/Systems.md", &["system", "service", "mechanic", "pipeline", "subsystem", "lifecycle"]),
+    ("Conventions/Registries.md", &["regist", "installer", "wiring", "wire", "route", "plugin", "hook"]),
+    ("Conventions/Data-and-Config.md", &["data", "json", "asset", "schema", "folder", "loader", "codec", "resource"]),
+    ("Reference/Config-Map.md", &["config", "key", "default", "setting", "option", "propert", "reload", "multiplier"]),
+    ("Conventions/Code.md", &["convention", "pattern", "style", "lint", "format", "helper", "util", "comment", "practice", "minimal"]),
+    ("Platform/Index.md", &["platform", "engine", "sdk", "upstream", "vendor", "librar", "api ", "version", "pin ", "pinned", "base game"]),
+    ("Reference/Vocabulary.md", &["vocabular", "glossar", "term", "word", "rename", "called", "spelling", "jargon", "alias"]),
+    (START_HERE, &["gotcha", "pitfall", "trap", "warning", "caveat", "never", "beware", "mistake", "lesson", "careful", "footgun", "avoid"]),
+    ("Current/Team.md", &["team", "people", "role", "decid", "review", "approv", "ruling", "contact", "who "]),
+    ("Current/Who-Does-What.md", &["owner", "owns", "area", "contributor", "maintain", "ask "]),
+    ("Work/Releases.md", &["release", "changelog", "tag", "patch note", "history", "ship"]),
+    ("Current/Project.md", &["overview", "about", "goal", "vision", "purpose", "product", "introduction", "scope"]),
+    ("Current/Feature-Status.md", &["feature", "status", "implemented", "built", "roadmap", "todo", "shipped", "progress"]),
+];
+
+/// How well a part fits each page of [`PAGE_WORDS`]: ten for each key that
+/// starts a word of its heading, one for each word of its body a key starts.
+fn page_scores(heading: &str, body: &str) -> Vec<(&'static str, usize)> {
+    let head = spaced_words(heading);
+    let words: Vec<String> = spaced_words(body).split(' ').filter(|w| !w.is_empty()).map(|w| format!(" {w} ")).collect();
+    PAGE_WORDS
+        .iter()
+        .map(|(page, keys)| {
+            let in_head = keys.iter().filter(|k| head.contains(&format!(" {k}"))).count();
+            let in_body = words.iter().filter(|w| keys.iter().any(|k| w.starts_with(&format!(" {k}")))).count();
+            (*page, in_head * 10 + in_body)
+        })
+        .collect()
+}
+
+/// The pages a part may go to, best first: its topic's pages ([`topic_of`]
+/// its heading, else its section's heading), ranked by [`page_scores`], the
+/// topic's own page on a tie; then every other page that scores, best
+/// first, for when those are full; and last START-HERE's traps. A part no
+/// topic claims ranks every page by its words, and goes to START-HERE when
+/// none scores: on 2026-10-06, 32% of the mod's `CLAUDE.md` (its four repos,
+/// where the base game's assets are, the energy word) had a heading no topic
+/// claimed and reached no page.
+fn rank_pages(s: &Section) -> Vec<&'static str> {
+    let topic = match topic_of(&s.heading) {
+        Topic::Other if !s.parent.is_empty() => topic_of(&s.parent),
+        t => t,
+    };
+    let scores = page_scores(&s.heading, &s.text);
+    let score = |p: &str| scores.iter().find(|(q, _)| *q == p).map_or(0, |(_, n)| *n);
+    let own: Vec<&'static str> = TOPIC_PAGES.iter().find(|(t, _)| *t == topic).map(|(_, p)| p.to_vec()).unwrap_or_default();
+    let mut ranked: Vec<&'static str> = own.clone();
+    ranked.sort_by_key(|p| std::cmp::Reverse(score(p)));
+    let mut others: Vec<(&'static str, usize)> = scores.iter().filter(|(p, n)| *n > 0 && !own.contains(p)).copied().collect();
+    others.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    ranked.extend(others.into_iter().map(|(p, _)| p));
+    if !ranked.contains(&START_HERE) {
+        ranked.push(START_HERE);
+    }
+    ranked
+}
+
+/// Every part of a repo's briefs, each sent to ONE team page: the first of
+/// [`rank_pages`] with room left in [`PAGE_BUDGET`]. Every part reaches a
+/// page while any has room, and none is sent twice, so one fact is drafted
+/// on one page.
+fn route_parts(name: &str, briefs: &[(String, Vec<Section>)]) -> BTreeMap<&'static str, Vec<Source>> {
+    let mut out: BTreeMap<&'static str, Vec<Source>> = BTreeMap::new();
+    let mut used: HashMap<&'static str, usize> = HashMap::new();
+    for (file, sections) in briefs {
+        for s in sections {
+            let Some(page) = rank_pages(s).into_iter().find(|p| used.get(p).copied().unwrap_or(0) + s.text.len() <= PAGE_BUDGET) else {
+                continue;
+            };
+            *used.entry(page).or_default() += s.text.len();
+            out.entry(page).or_default().push(Source { label: part_label(name, file, s.line), text: s.text.clone() });
+        }
+    }
+    out
+}
+
+/// The lines of a repo's briefs that tell of a word: a rename, what
+/// something is called, a spelling, an alias. For Vocabulary, whichever page
+/// their section went to; each line cited by its own line.
+fn word_lines(name: &str, briefs: &[(String, Vec<Section>)]) -> Option<String> {
+    const SIGNS: &[&str] = &["renamed", "rename", "is called", "are called", "the word", "spelled", "spelling", "a.k.a", "aka ", "alias", "formerly"];
+    let mut out = String::new();
+    for (file, sections) in briefs {
+        for s in sections {
+            for (i, line) in s.text.lines().enumerate() {
+                let lower = line.to_lowercase();
+                if SIGNS.iter().any(|k| lower.contains(k)) {
+                    out.push_str(&format!("{name}:{file}:{}: {}\n", s.line + i, clip(line.trim(), 600)));
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The briefs read by section, in this order, matched without regard to case.
@@ -2253,26 +2443,6 @@ pub fn team_sources(wiki: &Path, wiki_name: &str, repos: &[(String, PathBuf)], e
     out
 }
 
-/// The brief topics each team page reads, beside the repo pages.
-fn page_topics(page: &str) -> &'static [Topic] {
-    match page {
-        "Current/Project.md" => &[Topic::Project],
-        "Current/Feature-Status.md" => &[Topic::Project, Topic::Releases],
-        "Current/Team.md" | "Current/Who-Does-What.md" => &[Topic::People],
-        "Conventions/Architecture.md"
-        | "Conventions/Code.md"
-        | "Conventions/Data-and-Config.md"
-        | "Conventions/Registries.md"
-        | "Platform/Index.md"
-        | "Reference/Systems.md"
-        | "Reference/Config-Map.md" => &[Topic::Architecture],
-        "Conventions/Testing.md" | "Reference/Build-and-Run.md" => &[Topic::Build],
-        "Work/Releases.md" => &[Topic::Releases],
-        "Reference/Vocabulary.md" => &[Topic::Vocabulary],
-        _ => &[],
-    }
-}
-
 /// Which of what the checkout says now ([`checkout_sources`]) a team page
 /// reads, as (what the code registers, the values): the pages that list
 /// systems, features and registries take the wiring, one row per
@@ -2323,8 +2493,9 @@ fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
 /// newest and each version's own notes; for Team and Who Does What the
 /// CODEOWNERS, `people/` files (the wiki's too) and the recent contributors;
 /// for the architecture page the import map; for Project the newest version
-/// tags; then for every page the brief sections whose topic serves it
-/// ([`page_topics`]). `roster` is the team's ([`team_roster`]).
+/// tags; for Vocabulary the briefs' lines about words; then for every page
+/// the parts of the briefs routed to it ([`route_parts`]). `roster` is the
+/// team's ([`team_roster`]).
 pub fn page_sources(
     page: &str,
     wiki: &Path,
@@ -2385,9 +2556,16 @@ pub fn page_sources(
             }
             _ => {}
         }
-        let topics = page_topics(page);
+        // The parts of its briefs routed to this page, each to one page.
+        let briefs = briefs(root);
+        if page == "Reference/Vocabulary.md" {
+            if let Some(w) = word_lines(name, &briefs) {
+                push(format!("{name}:(lines of its briefs about words and names)"), w, &mut mine);
+            }
+        }
+        let routed = route_parts(name, &briefs).remove(page).unwrap_or_default();
         let left = PAGE_BUDGET.saturating_sub(used(&mine));
-        mine.extend(sections_for(name, &briefs(root), |t| topics.contains(&t), left));
+        mine.extend(within(routed, left));
         per_repo.push(mine);
     }
     let sizes: Vec<usize> = per_repo.iter().map(|v| v.iter().map(|s| s.text.len()).sum()).collect();
@@ -2492,10 +2670,130 @@ fn cite_rulings(wiki: &Path, repos: &[(String, PathBuf)], today: &str) -> Result
     crate::teamnew::write_cited_in_code(team, &code, today).map(|_| ())
 }
 
+// --- START-HERE's Traps rows: drafted from the briefs' gotchas. Set-up
+// fills the rest of START-HERE (its repo table); Ken writes only these rows,
+// and only while they are still the template's. -----------------------------
+
+/// The start of START-HERE's Traps row while it is the template's.
+const TRAPS_PLACEHOLDER: &str = "| {{the trap that costs a newcomer the most time";
+/// Rows of the Traps table Ken drafts at most.
+const TRAPS_MAX: usize = 8;
+
+/// The wiki's pages a drafted page can link to, one line each: the team
+/// pages of [`PAGES`] with what each is for, and each repo's Repo Map page.
+pub fn page_directory(repos: &[(String, PathBuf)]) -> String {
+    let mut out = String::new();
+    for (page, purpose) in PAGES {
+        let short = purpose.split([':', ';']).next().unwrap_or(purpose).trim();
+        out.push_str(&format!("- [[{}]] ({page}): {short}\n", stem(page.rsplit('/').next().unwrap_or(page))));
+    }
+    for (name, _) in repos {
+        out.push_str(&format!("- [[{}]] ({}): what lives where in {name}, and how it is built\n", crate::workspace::member_leaf(name), repo_page(name)));
+    }
+    out
+}
+
+/// The one call that drafts START-HERE's Traps rows.
+pub fn traps_prompt(directory: &str, sources: &[Source]) -> String {
+    let mut s = format!(
+        "You are filling one table of a team's wiki, the Traps table at the top of `{START_HERE}`: the traps that cost a \
+         newcomer the most time.\n\n\
+         Rules:\n\
+         - Use only the sources below: the gotchas, warnings and \"never\" rules of the team's own briefs. Pick at most \
+         {TRAPS_MAX}, the ones that cost a newcomer the most time: where the platform's content lives, a word the code spells \
+         differently, a step that fails without saying so, a file that must never be edited by hand.\n\
+         - One row each: `| trap | what happens | page |`. The trap and what happens in plain words, one line each; end the \
+         what-happens cell with the source's label in backticks. The page: a link from the list below to the page that holds \
+         it, or nothing when none does.\n\
+         - Where the code and a brief disagree, the code wins; leave out a trap the sources do not state.\n\
+         - Reply with the rows only, one per line, each starting and ending with `|`. No header, no preamble.\n\n\
+         PAGES OF THIS WIKI:\n{directory}\nSOURCES:\n"
+    );
+    for src in sources {
+        s.push_str(&format!("\n=== {} ===\n{}\n", src.label, src.text));
+    }
+    s
+}
+
+/// The Traps rows of a reply: lines that start and end with `|` and have
+/// three cells, never a header, a separator or a placeholder; at most
+/// [`TRAPS_MAX`].
+pub fn traps_rows(reply: &str) -> Vec<String> {
+    reply
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('|') && l.ends_with('|') && l.len() > 2)
+        .filter(|l| l[1..l.len() - 1].split('|').count() == 3)
+        .filter(|l| !l.contains("{{") && !l.contains("---") && !l.to_lowercase().starts_with("| trap |"))
+        .take(TRAPS_MAX)
+        .map(String::from)
+        .collect()
+}
+
+/// `start_here` with its Traps placeholder row replaced by `rows`; None
+/// when that row is gone (a person wrote the table) or there are no rows.
+/// Nothing else of the page changes.
+pub fn fill_traps(start_here: &str, rows: &[String]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(start_here.len());
+    let mut done = false;
+    for line in start_here.split_inclusive('\n') {
+        if !done && line.trim_start().starts_with(TRAPS_PLACEHOLDER) {
+            let eol = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            for r in rows {
+                out.push_str(r);
+                out.push_str(eol);
+            }
+            done = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    done.then_some(out)
+}
+
+/// Draft START-HERE's Traps rows, when it still has the template's row,
+/// from the parts of the briefs routed to it ([`page_sources`]): one call,
+/// the rows spliced in, the rest of the page as set-up wrote it.
+#[allow(clippy::too_many_arguments)]
+fn draft_traps(
+    wiki: &Path,
+    wiki_name: &str,
+    repos: &[(String, PathBuf)],
+    roster: &[crate::people::Person],
+    report: &mut DraftReport,
+    generate: &mut impl FnMut(&str) -> Result<String>,
+) -> Result<()> {
+    let path = wiki.join(START_HERE);
+    let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
+    if !text.lines().any(|l| l.trim_start().starts_with(TRAPS_PLACEHOLDER)) {
+        report.kept.push(START_HERE.to_string());
+        return Ok(());
+    }
+    let sources = page_sources(START_HERE, wiki, wiki_name, repos, roster);
+    if sources.is_empty() {
+        return Ok(());
+    }
+    report.sources.extend(sources.iter().map(|s| s.label.clone()));
+    let filled = generate(&traps_prompt(&page_directory(repos), &sources)).map(|r| fill_traps(&text, &traps_rows(&r)));
+    match filled {
+        Ok(Some(page)) => {
+            write_page(&path, &page)?;
+            report.drafted.push(START_HERE.to_string());
+        }
+        Ok(None) => report.failed.push((START_HERE.to_string(), "the reply had no Traps rows".into())),
+        Err(e) => report.failed.push((START_HERE.to_string(), e.to_string())),
+    }
+    Ok(())
+}
+
 /// Draft a team's wiki: a Repo Map page per repo (each from that repo
 /// alone) and its pages by kind, the Repo Map index, then the team pages of
-/// [`PAGES`] from the repo pages and descriptions, and the team repo's
-/// rulings cited in code ([`cite_rulings`]). `repos` are the team's repos,
+/// [`PAGES`] from the repo pages and descriptions, START-HERE's Traps rows
+/// ([`draft_traps`]), and the team repo's rulings cited in code
+/// ([`cite_rulings`]). `repos` are the team's repos,
 /// the wiki itself left out. The result is kept for the Team screen.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_team(
@@ -2523,6 +2821,7 @@ pub fn draft_team(
     let extra = extra.map(gather_extra).unwrap_or_default();
     let common = team_sources(wiki, wiki_name, repos, &extra);
     draft_team_pages(wiki, wiki_name, &team_pages(), &common, repos, &roster, today, &mut report, &mut generate, &check)?;
+    draft_traps(wiki, wiki_name, repos, &roster, &mut report, &mut generate)?;
     cite_rulings(wiki, repos, today)?;
     dedup_labels(&mut report.sources);
     pin_drafted(wiki, &report.drafted, repos)?;
@@ -3217,10 +3516,7 @@ mod tests {
         assert!(sections[3].text.contains("### Wiring order"), "a ### stays inside its section");
         assert!(sections[2].text.contains("## not a heading"), "never split inside a code fence");
         let topics: Vec<Topic> = headings.iter().map(|h| topic_of(h)).collect();
-        assert_eq!(
-            topics,
-            vec![Topic::Project, Topic::Other, Topic::Build, Topic::Architecture, Topic::Vocabulary, Topic::People]
-        );
+        assert_eq!(topics, vec![Topic::Project, Topic::Other, Topic::Build, Topic::Architecture, Topic::Traps, Topic::People]);
         assert_eq!(topic_of("Project Structure"), Topic::Architecture);
         assert_eq!(topic_of("Who decides"), Topic::People);
         assert_eq!(topic_of("Wholesale prices"), Topic::Other, "a whole word, not a prefix of one");
@@ -3246,7 +3542,10 @@ mod tests {
         let architecture = of("Conventions/Architecture.md");
         assert!(architecture.iter().any(|s| s.label == arch && s.text.contains("services never call systems")), "{architecture:?}");
         assert!(!architecture.iter().any(|s| s.text.contains("Ana decides")));
-        assert!(of("Reference/Vocabulary.md").iter().any(|s| s.text.contains("called Stamina")));
+        assert!(of(START_HERE).iter().any(|s| s.text.contains("called Stamina")), "a gotcha is a trap");
+        let vocabulary = of("Reference/Vocabulary.md");
+        let line = line_of("Energy is called Stamina in the engine.");
+        assert!(vocabulary.iter().any(|s| s.text.contains(&format!("Game:CLAUDE.md:{line}: Energy is called Stamina"))), "{vocabulary:?}");
         assert!(of("Current/Team.md").iter().any(|s| s.text.contains("Ana decides")));
         assert!(of("Current/Project.md").iter().any(|s| s.label == "Game:CLAUDE.md" && s.text.contains("tactics game")));
 
@@ -3621,5 +3920,90 @@ name: Mabel Bot
         assert!(index.contains("| [[Tools]] | In the team's own words, this repo is \"the authoring suite\""), "{index}");
         let start = fs::read_to_string(wiki.join("START-HERE.md")).unwrap();
         assert!(start.contains("| `Tools` | In the team's own words") && !start.contains("(not said yet)"), "{start}");
+    }
+
+    /// A long section is split at its `###` headings and then at blank lines,
+    /// never cut, each part at its own line; and every part of a brief goes
+    /// to exactly one page, a part no topic claims included.
+    #[test]
+    fn every_part_of_a_brief_reaches_one_page_and_long_sections_are_split() {
+        let gotchas: String = (0..6).map(|i| format!("### Trap {i}\n\n{}", "Never edit the generated manifest by hand.\n\n".repeat(60))).collect();
+        let rules = format!("## Binding rules\n\n{}", "A rule a change must follow, with its reason.\n\n".repeat(400));
+        let brief = format!(
+            "# Game\n\nA tactics game.\n\n## Common Gotchas\n\n{gotchas}{rules}## Four repos\n\n\
+             ### Where the base game's assets are\n\nThe engine's assets are in the platform jar.\n\n## Team\n\nAna decides balance.\n"
+        );
+        let parts = brief_sections(&brief);
+        assert!(parts.iter().all(|s| s.text.len() <= SECTION_MAX), "nothing over the cap");
+        assert_eq!(parts.iter().map(|s| s.text.as_str()).collect::<String>(), brief, "nothing cut, nothing repeated");
+        for s in &parts {
+            assert_eq!(brief.lines().nth(s.line - 1), s.text.lines().next(), "part at line {} starts there", s.line);
+        }
+        let trap = parts.iter().find(|s| s.heading == "Trap 3").unwrap();
+        assert_eq!(trap.parent, "Common Gotchas");
+        assert!(parts.iter().filter(|s| s.heading == "Binding rules").count() >= 2, "a long run of paragraphs is split at blank lines");
+
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("Game");
+        write(&root, &[("CLAUDE.md", &brief)]);
+        let repos = vec![("Game".to_string(), root.clone())];
+        let wiki = d.path().join("Wiki");
+        let mut reached: HashMap<String, Vec<&str>> = HashMap::new();
+        for page in PAGES.iter().map(|(p, _)| *p).chain([START_HERE]) {
+            for s in page_sources(page, &wiki, "Wiki", &repos, &[]) {
+                if s.label.starts_with("Game:CLAUDE.md") {
+                    reached.entry(s.label).or_default().push(page);
+                }
+            }
+        }
+        for s in &parts {
+            let label = part_label("Game", "CLAUDE.md", s.line);
+            let pages = reached.get(&label).cloned().unwrap_or_default();
+            assert_eq!(pages.len(), 1, "{label} ({}) went to {pages:?}", s.heading);
+        }
+        assert_eq!(reached[&part_label("Game", "CLAUDE.md", trap.line)], vec![START_HERE]);
+        let team = parts.iter().find(|s| s.heading == "Team").unwrap();
+        assert_eq!(reached[&part_label("Game", "CLAUDE.md", team.line)], vec!["Current/Team.md"]);
+    }
+
+    /// START-HERE's Traps rows are drafted from the briefs' gotchas and
+    /// spliced in; the rest of the page, set-up's repo table included, stays.
+    #[test]
+    fn start_here_gets_its_traps_rows_and_keeps_its_table() {
+        let reply = "Here are the rows:\n| trap | what happens | page |\n|---|---|---|\n\
+            | Base game assets live in the jar | A search of the repo finds nothing `Game:CLAUDE.md:7` | [[Platform]] |\n\
+            | {{a placeholder}} | x | y |\n| Energy is Stamina | Searching energy finds nothing `Game:CLAUDE.md:9` | [[Vocabulary]] |\n";
+        let rows = traps_rows(reply);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Wiki");
+        let covered = vec![crate::wikinew::Covered { name: "Game".into(), ..Default::default() }];
+        crate::wikinew::create(&wiki, "Realms", &covered, "2026-10-06").unwrap();
+        let before = fs::read_to_string(wiki.join(START_HERE)).unwrap();
+        let root = d.path().join("Game");
+        write(&root, &[("CLAUDE.md", "# Game\n\nA game.\n\n## Common Gotchas\n\n- The base game's assets live in the server jar.\n- Energy is Stamina in code.\n")]);
+        let repos = vec![("Game".to_string(), root)];
+        let mut db = Db::open_in_memory().unwrap();
+        let mut asked: Vec<String> = Vec::new();
+        let report = draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-10-06", 5, |p| {
+            asked.push(p.to_string());
+            Ok(if p.contains("the Traps table") { reply.to_string() } else { page("Drafted") })
+        })
+        .unwrap();
+        let traps = asked.iter().find(|p| p.contains("the Traps table")).expect("a traps call");
+        assert!(traps.contains("server jar") && traps.contains("[[Vocabulary]] (Reference/Vocabulary.md)"), "{traps}");
+        assert!(report.drafted.contains(&START_HERE.to_string()), "{report:?}");
+        let after = fs::read_to_string(wiki.join(START_HERE)).unwrap();
+        assert!(after.contains(&rows[0]) && after.contains(&rows[1]) && !after.contains("{{the trap that costs"), "{after}");
+        assert_eq!(after.replace(&format!("{}\n{}\n", rows[0], rows[1]), ""), before.lines().filter(|l| !l.starts_with(TRAPS_PLACEHOLDER)).map(|l| format!("{l}\n")).collect::<String>(), "nothing else changes");
+        // Filled once, kept after: a second draft asks nothing for it.
+        let mut again = 0;
+        draft_team(&wiki, "Wiki", &mut db, &repos, None, "2026-10-06", 6, |p| {
+            again += usize::from(p.contains("the Traps table"));
+            Ok(page("Drafted"))
+        })
+        .unwrap();
+        assert_eq!(again, 0);
     }
 }
