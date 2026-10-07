@@ -319,11 +319,18 @@ fn chat_args(project_root: &Path, dirs: &[std::path::PathBuf], mcp_config: &Path
     }
     let disallowed = if look { "Edit,MultiEdit,Write,NotebookEdit,Bash".to_string() } else { format!("Edit,MultiEdit,Write,NotebookEdit,Bash,{LOOK_TOOLS}") };
     let dirs: &[std::path::PathBuf] = if look { dirs } else { &[] };
+    // Without `look` the file tools are refused, and the guide's rule 4 still
+    // sends Claude to them: 45 refused calls over 32 questions, measured
+    // 2026-10-07. Say so up front.
+    let mut guide = crate::chat::KEN_GUIDE.replace('\n', " ");
+    if !look {
+        guide.push_str(" This turn has no file tools: Grep, Glob and Read are off. Search and read with Ken's tools only.");
+    }
     let mut args: Vec<String> = vec![
         "--permission-mode".into(),
         "default".into(),
         "--append-system-prompt".into(),
-        crate::chat::KEN_GUIDE.replace('\n', " "),
+        guide,
         "--mcp-config".into(),
         mcp_config.to_string_lossy().into_owned(),
         "--allowedTools".into(),

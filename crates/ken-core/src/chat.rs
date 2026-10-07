@@ -246,7 +246,11 @@ not do something, look in every repo of the workspace, and say which repo each f
 mcp__ken__ticket_list; add or change a task with mcp__ken__task_create and mcp__ken__task_update when they ask, and \
 say what you added. Your own task or todo tools are not their list. A ## Memories block at the top of a turn holds \
 the team's standing notes: follow them, and add one with mcp__ken__memory_write only when the person asks you to \
-remember something.";
+remember something.\n\
+7. On what the team decided, the team's wiki wins. Who decides, what was ruled and why, the rules and conventions, \
+how work moves and what something is called are in the team's wiki and decisions log: search them first and answer \
+from them, citing the page. A ruling there is settled. Never recommend against it or present the question as open; \
+when the code does not match a ruling, say the code differs from the ruling and cite both.";
 
 /// Ken's own MCP tools the chat may use without asking: they read Ken's
 /// index, open a file for the person when they asked, or keep the person's
