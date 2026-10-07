@@ -1052,20 +1052,53 @@ fn rank_pages(s: &Section) -> Vec<&'static str> {
     ranked
 }
 
-/// Every part of a repo's briefs, each sent to ONE team page: the first of
-/// [`rank_pages`] with room left in [`PAGE_BUDGET`]. Every part reaches a
-/// page while any has room, and none is sent twice, so one fact is drafted
-/// on one page.
+/// Pages one part of a brief goes to at most.
+const PART_PAGES: usize = 3;
+
+/// Every part of a repo's briefs, sent to every team page it fits, up to
+/// [`PART_PAGES`], each within [`PAGE_BUDGET`]: the first of [`rank_pages`]
+/// with room left, so every part reaches a page while any has room; then
+/// each other page whose words fit it at least half as well as the page it
+/// fits best ([`page_scores`]). One fact, one page is the drafting's rule,
+/// not the reading's: the page that owns a fact states it and the others
+/// link. Sent to one page only, on 2026-10-07 six pages thinned, Systems
+/// said no source described the registrations Feature-Status described from
+/// the same source, and Team lost who approves the mod's protected paths.
 fn route_parts(name: &str, briefs: &[(String, Vec<Section>)]) -> BTreeMap<&'static str, Vec<Source>> {
-    let mut out: BTreeMap<&'static str, Vec<Source>> = BTreeMap::new();
+    let parts: Vec<(&String, &Section)> = briefs.iter().flat_map(|(f, secs)| secs.iter().map(move |s| (f, s))).collect();
+    let mut sent: Vec<Vec<&'static str>> = vec![Vec::new(); parts.len()];
     let mut used: HashMap<&'static str, usize> = HashMap::new();
-    for (file, sections) in briefs {
-        for s in sections {
-            let Some(page) = rank_pages(s).into_iter().find(|p| used.get(p).copied().unwrap_or(0) + s.text.len() <= PAGE_BUDGET) else {
-                continue;
-            };
-            *used.entry(page).or_default() += s.text.len();
-            out.entry(page).or_default().push(Source { label: part_label(name, file, s.line), text: s.text.clone() });
+    let room = |page: &'static str, n: usize, used: &mut HashMap<&'static str, usize>| {
+        let fits = used.get(page).copied().unwrap_or(0) + n <= PAGE_BUDGET;
+        if fits {
+            *used.entry(page).or_default() += n;
+        }
+        fits
+    };
+    // Each part's best page first, for every part, then the others it
+    // fits while room is left: a second page never crowds out a first.
+    for (k, (_, s)) in parts.iter().enumerate() {
+        if let Some(page) = rank_pages(s).into_iter().find(|p| room(*p, s.text.len(), &mut used)) {
+            sent[k].push(page);
+        }
+    }
+    for (k, (_, s)) in parts.iter().enumerate() {
+        let scores = page_scores(&s.heading, &s.text);
+        let score = |p: &str| scores.iter().find(|(q, _)| *q == p).map_or(0, |(_, n)| *n);
+        let best = scores.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        for page in rank_pages(s) {
+            if sent[k].len() >= PART_PAGES || sent[k].is_empty() {
+                break;
+            }
+            if !sent[k].contains(&page) && score(page) > 0 && score(page) * 2 >= best && room(page, s.text.len(), &mut used) {
+                sent[k].push(page);
+            }
+        }
+    }
+    let mut out: BTreeMap<&'static str, Vec<Source>> = BTreeMap::new();
+    for (k, (file, s)) in parts.iter().enumerate() {
+        for page in &sent[k] {
+            out.entry(*page).or_default().push(Source { label: part_label(name, file, s.line), text: s.text.clone() });
         }
     }
     out
@@ -1076,12 +1109,30 @@ fn route_parts(name: &str, briefs: &[(String, Vec<Section>)]) -> BTreeMap<&'stat
 /// their section went to; each line cited by its own line.
 fn word_lines(name: &str, briefs: &[(String, Vec<Section>)]) -> Option<String> {
     const SIGNS: &[&str] = &["renamed", "rename", "is called", "are called", "the word", "spelled", "spelling", "a.k.a", "aka ", "alias", "formerly"];
+    lines_with(name, briefs, SIGNS)
+}
+
+/// The lines of a repo's briefs that name who decides, approves or owns
+/// something, whatever section they sit in, for Team and Who Does What: on
+/// 2026-10-07 the mod's protected paths, which need Chris's yes, sat in a
+/// build section, and Team wrote that all of his decisions were in Tools.
+fn decider_lines(name: &str, briefs: &[(String, Vec<Section>)]) -> Option<String> {
+    const SIGNS: &[&str] = &[
+        "decide", "decider", "decision", "approv", "sign off", "sign-off", "'s yes", "’s yes", "owner", " owns ", "protected", "must ask",
+        "permission", "rules on", "ruling", "review",
+    ];
+    lines_with(name, briefs, SIGNS)
+}
+
+/// Each line of a repo's briefs that names one of `signs`, cited by its
+/// own line, as `repo:FILE:line: text`.
+fn lines_with(name: &str, briefs: &[(String, Vec<Section>)], signs: &[&str]) -> Option<String> {
     let mut out = String::new();
     for (file, sections) in briefs {
         for s in sections {
             for (i, line) in s.text.lines().enumerate() {
                 let lower = line.to_lowercase();
-                if SIGNS.iter().any(|k| lower.contains(k)) {
+                if signs.iter().any(|k| lower.contains(k)) {
                     out.push_str(&format!("{name}:{file}:{}: {}\n", s.line + i, clip(line.trim(), 600)));
                 }
             }
@@ -1096,6 +1147,28 @@ const BRIEFS: &[&str] = &["CLAUDE.md", "AGENTS.md", "README.md", "README", "CONT
 /// Each brief of `root`, split into its sections.
 fn briefs(root: &Path) -> Vec<(String, Vec<Section>)> {
     top_files(root, BRIEFS).into_iter().filter_map(|(n, p)| read_plain(&p).map(|t| (n, brief_sections(&t)))).collect()
+}
+
+/// The folders whose Markdown is a repo's other docs.
+const DOC_DIRS: &[&str] = &["docs", "doc", "documentation"];
+
+/// A repo's other docs (up to ten Markdown files of each of [`DOC_DIRS`]),
+/// split by section like a brief, so a team page they fit reads them: on
+/// 2026-10-07 Tools' `docs/CODE-STANDARDS.md` reached only the repo pages,
+/// and Conventions/Code was four purpose sentences.
+fn doc_briefs(root: &Path) -> Vec<(String, Vec<Section>)> {
+    let mut out = Vec::new();
+    for dir in DOC_DIRS {
+        let mut docs: Vec<PathBuf> =
+            fs::read_dir(root.join(dir)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "md")).collect();
+        docs.sort();
+        for p in docs.into_iter().take(10) {
+            let Some(t) = read_plain(&p) else { continue };
+            let Some(file) = p.file_name().map(|f| format!("{dir}/{}", f.to_string_lossy())) else { continue };
+            out.push((file, brief_sections(&t)));
+        }
+    }
+    out
 }
 
 /// Every heading of the briefs with the line it is on: what each brief
@@ -1124,14 +1197,29 @@ fn part_label(name: &str, file: &str, line: usize) -> String {
 /// A repo's brief sections whose topic `pick` takes, in file order, each
 /// labelled by [`part_label`], while `budget` lasts.
 fn sections_for(name: &str, briefs: &[(String, Vec<Section>)], pick: impl Fn(Topic) -> bool, budget: usize) -> Vec<Source> {
+    parts_for(name, briefs, |s| pick(topic_of(&s.heading)), budget)
+}
+
+/// A repo's brief parts that `pick` takes, in file order, each labelled by
+/// [`part_label`], while `budget` lasts. A part is whole: one that does not
+/// fit is skipped for a later, smaller one. Only a part longer than
+/// [`SECTION_MAX`] (one paragraph with no blank line in it) is cut, and
+/// marked so.
+fn parts_for(name: &str, briefs: &[(String, Vec<Section>)], pick: impl Fn(&Section) -> bool, budget: usize) -> Vec<Source> {
     let mut out = Vec::new();
     let mut used = 0;
-    let picked = briefs.iter().flat_map(|(f, secs)| secs.iter().map(move |s| (f, s))).filter(|(_, s)| pick(topic_of(&s.heading)));
+    let picked = briefs.iter().flat_map(|(f, secs)| secs.iter().map(move |s| (f, s))).filter(|(_, s)| pick(s));
     for (file, s) in picked {
         if budget.saturating_sub(used) < 200 {
             break;
         }
-        let text = clip(&s.text, SECTION_MAX.min(budget - used));
+        let text = if s.text.len() > SECTION_MAX {
+            clip(&s.text, SECTION_MAX.min(budget - used))
+        } else if used + s.text.len() <= budget {
+            s.text.clone()
+        } else {
+            continue;
+        };
         used += text.len();
         out.push(Source { label: part_label(name, file, s.line), text });
     }
@@ -1339,13 +1427,24 @@ fn people_files(name: &str, root: &Path) -> Vec<Source> {
         .collect()
 }
 
+/// `source` pushed whole while `budget` characters last in all, else named
+/// with its size: a source of [`checkout_sources`] is never cut.
+fn push_whole(label: String, text: String, out: &mut Vec<Source>, budget: usize) {
+    let used: usize = out.iter().map(|s| s.text.len()).sum();
+    let text = if used + text.len() <= budget { text } else { format!("(left out for room: {} characters; never cut)", text.len()) };
+    out.push(Source { label, text });
+}
+
 /// What one repo's page is made from, in this order, clipped to
 /// [`REPO_BUDGET`]: its description; the outline of its briefs; its build
-/// files; the brief sections on building, structure and what it is; its
-/// layout and import map; INSTALL; its newest release notes; CODEOWNERS,
-/// `people/` and who has committed recently; its version tags; up to ten
-/// docs; then every other brief section, in order, while the budget lasts.
-/// `roster` is the team's ([`team_roster`]), for the recent contributors.
+/// files; the brief sections on building, structure and what it is, up to
+/// half the budget, ahead of what the checkout says now ([`checkout_sources`],
+/// each whole or left out); its layout and import map; INSTALL; its newest
+/// release notes; CODEOWNERS, `people/` and who has committed recently; its
+/// version tags; up to ten docs; then every other brief section, in order,
+/// while the budget lasts. On 2026-10-07 the checkout's sources came first
+/// and the brief's sections got what was left. `roster` is the team's
+/// ([`team_roster`]), for the recent contributors.
 pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     let push = pusher(REPO_BUDGET);
@@ -1361,15 +1460,13 @@ pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) ->
     for (file, summary) in build_files(root) {
         push(format!("{name}:{file}"), clip(&summary, BUILD_MAX), &mut out);
     }
+    let wants = [Topic::Build, Topic::Architecture, Topic::Project];
+    out.extend(sections_for(name, &briefs, |t| wants.contains(&t), REPO_BUDGET / 2));
     let tracked = ls_files(root).unwrap_or_default();
     let reference = crate::registry::index_of(root).0.contains(&crate::registry::RepoKind::Reference);
-    let push_checkout = pusher_of(REPO_BUDGET, CHECKOUT_MAX);
     for s in checkout_sources(name, root, &tracked, &briefs, !reference, Some(CHECKOUT_MAX)) {
-        push_checkout(s.label, s.text, &mut out);
+        push_whole(s.label, s.text, &mut out, REPO_BUDGET);
     }
-    let used: usize = out.iter().map(|s| s.text.len()).sum();
-    let wants = [Topic::Build, Topic::Architecture, Topic::Project];
-    out.extend(sections_for(name, &briefs, |t| wants.contains(&t), (REPO_BUDGET * 2 / 3).saturating_sub(used)));
     // The shape of the repo before its long docs, so a documentation-heavy
     // repo cannot crowd it out of the budget; each whole up to its own budget.
     let push_map = pusher_of(REPO_BUDGET, LAYOUT_BUDGET);
@@ -1422,6 +1519,52 @@ pub fn gather_repo(name: &str, root: &Path, roster: &[crate::people::Person]) ->
     // Everything else the briefs say, in order, while the budget lasts.
     let used: usize = out.iter().map(|s| s.text.len()).sum();
     out.extend(sections_for(name, &briefs, |t| !wants.contains(&t), REPO_BUDGET.saturating_sub(used)));
+    out
+}
+
+/// The team pages whose words make a brief's part one about a repo's layers.
+const LAYER_PAGES: &[&str] = &["Conventions/Architecture.md", "Conventions/Code.md", "Conventions/Registries.md", "Reference/Systems.md"];
+
+/// Whether a part of a brief is about layers, patterns, wiring or the
+/// rules of the code: its topic is architecture, or a page of
+/// [`LAYER_PAGES`] is among the pages it fits best.
+fn about_layers(s: &Section) -> bool {
+    let topic = match topic_of(&s.heading) {
+        Topic::Other if !s.parent.is_empty() => topic_of(&s.parent),
+        t => t,
+    };
+    if topic == Topic::Architecture {
+        return true;
+    }
+    let scores = page_scores(&s.heading, &s.text);
+    let best = scores.iter().map(|(_, n)| *n).max().unwrap_or(0);
+    best > 0 && scores.iter().any(|(p, n)| LAYER_PAGES.contains(p) && *n * 2 >= best)
+}
+
+/// What a code repo's layers page is made from, within [`REPO_BUDGET`]:
+/// its description and the outline of its briefs, then every part of its
+/// briefs about layers, patterns, wiring and rules ([`about_layers`]), in
+/// order, up to half the budget, then its import map, what its code
+/// registers and its layout from `map` (what its Repo Map page read), then
+/// its other brief parts while the budget lasts. On 2026-10-07 the mod's
+/// architecture page read the brief by budget in file order: its
+/// architecture sections start 56,000 characters in, and the page lost 9 of
+/// its 11 "may not" rules.
+pub fn layers_sources(name: &str, root: &Path, map: &[Source]) -> Vec<Source> {
+    let briefs = briefs(root);
+    let pick = |what: &str| map.iter().find(|s| s.label == format!("{name}:{what}")).cloned();
+    let mut out: Vec<Source> = ["(what this repo is for, in the team's words)", "(headings of its briefs, with their lines)"]
+        .iter()
+        .filter_map(|w| pick(w))
+        .collect();
+    out.extend(parts_for(name, &briefs, about_layers, REPO_BUDGET / 2));
+    for what in ["(imports between folders, from the code)", REGISTERS, "(layout)"] {
+        if let Some(s) = pick(what) {
+            push_whole(s.label, s.text, &mut out, REPO_BUDGET);
+        }
+    }
+    let used: usize = out.iter().map(|s| s.text.len()).sum();
+    out.extend(parts_for(name, &briefs, |s| !about_layers(s), REPO_BUDGET.saturating_sub(used)));
     out
 }
 
@@ -3221,15 +3364,33 @@ fn within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
     out
 }
 
+/// `sources` in order, each whole, while `budget` lasts: one that does not
+/// fit is skipped for a later, smaller one.
+fn whole_within(sources: Vec<Source>, budget: usize) -> Vec<Source> {
+    let mut used = 0;
+    sources
+        .into_iter()
+        .filter(|s| {
+            let fits = used + s.text.len() <= budget;
+            if fits {
+                used += s.text.len();
+            }
+            fits
+        })
+        .collect()
+}
+
 /// What one team page reads from the repos themselves, beside the repo
 /// pages, within [`PAGE_BUDGET`] shared fairly between the repos
 /// ([`fair_shares`]): for Releases the version tags, what landed since the
 /// newest and each version's own notes; for Team and Who Does What the
 /// CODEOWNERS, `people/` files (the wiki's too) and the recent contributors;
-/// for the architecture page the import map; for Project the newest version
-/// tags; for Vocabulary the briefs' lines about words; then for every page
-/// the parts of the briefs routed to it ([`route_parts`]). `roster` is the
-/// team's ([`team_roster`]).
+/// and the lines of the briefs that name who decides ([`decider_lines`]),
+/// with `.ken/gates.json` (its protected paths); for the architecture page
+/// the import map; for Project the newest version tags; for Vocabulary the
+/// briefs' lines about words; then for every page the parts of the briefs
+/// and the repo's other docs ([`doc_briefs`]) routed to it ([`route_parts`]).
+/// `roster` is the team's ([`team_roster`]).
 pub fn page_sources(
     page: &str,
     wiki: &Path,
@@ -3287,19 +3448,26 @@ pub fn page_sources(
                 if let Some(a) = recent_contributors(root, roster) {
                     push(format!("{name}:(recent contributors by folder, last 90 days, from git)"), a, &mut mine);
                 }
+                if let Some(t) = read_plain(&root.join(".ken").join("gates.json")) {
+                    push(format!("{name}:.ken/gates.json"), t, &mut mine);
+                }
+                if let Some(d) = decider_lines(name, &briefs(root)) {
+                    push(format!("{name}:(lines of its briefs about who decides)"), d, &mut mine);
+                }
             }
             _ => {}
         }
-        // The parts of its briefs routed to this page, each to one page.
-        let briefs = briefs(root);
+        // The parts of its briefs and other docs routed to this page.
+        let mut briefs = briefs(root);
         if page == "Reference/Vocabulary.md" {
             if let Some(w) = word_lines(name, &briefs) {
                 push(format!("{name}:(lines of its briefs about words and names)"), w, &mut mine);
             }
         }
+        briefs.extend(doc_briefs(root));
         let routed = route_parts(name, &briefs).remove(page).unwrap_or_default();
         let left = PAGE_BUDGET.saturating_sub(used(&mine));
-        mine.extend(within(routed, left));
+        mine.extend(whole_within(routed, left));
         per_repo.push(mine);
     }
     let sizes: Vec<usize> = per_repo.iter().map(|v| v.iter().map(|s| s.text.len()).sum()).collect();
@@ -3352,7 +3520,10 @@ fn draft_repo_pages(
                 report.sources.extend(read.iter().map(|s| s.label.clone()));
                 sources = Some(read);
             }
-            let sources = sources.as_deref().unwrap_or_default();
+            let map = sources.as_deref().unwrap_or_default();
+            // A layers page reads the briefs' parts about layers first.
+            let layered = page.starts_with("Conventions/Architecture-").then(|| layers_sources(name, root, map));
+            let sources = layered.as_deref().unwrap_or(map);
             draft_page(wiki, &page, purpose, blank.as_deref(), sources, today, report, generate, check)?;
         }
     }
@@ -4818,7 +4989,7 @@ name: Mabel Bot
 
     /// A long section is split at its `###` headings and then at blank lines,
     /// never cut, each part at its own line; and every part of a brief goes
-    /// to exactly one page, a part no topic claims included.
+    /// to at least one page and at most three, a part no topic claims included.
     #[test]
     fn every_part_of_a_brief_reaches_one_page_and_long_sections_are_split() {
         let gotchas: String = (0..6).map(|i| format!("### Trap {i}\n\n{}", "Never edit the generated manifest by hand.\n\n".repeat(60))).collect();
@@ -4853,7 +5024,7 @@ name: Mabel Bot
         for s in &parts {
             let label = part_label("Game", "CLAUDE.md", s.line);
             let pages = reached.get(&label).cloned().unwrap_or_default();
-            assert_eq!(pages.len(), 1, "{label} ({}) went to {pages:?}", s.heading);
+            assert!((1..=PART_PAGES).contains(&pages.len()), "{label} ({}) went to {pages:?}", s.heading);
         }
         assert_eq!(reached[&part_label("Game", "CLAUDE.md", trap.line)], vec![START_HERE]);
         let team = parts.iter().find(|s| s.heading == "Team").unwrap();
@@ -4901,6 +5072,56 @@ name: Mabel Bot
         })
         .unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// One fact, one page is the drafting's rule, not the reading's: a part
+    /// goes to every page it fits as well, the people pages read who decides
+    /// wherever a brief says it, a repo's other docs reach the team pages,
+    /// and a repo's layers page reads the parts about layers first.
+    #[test]
+    fn a_part_reaches_every_page_it_fits() {
+        let d = tempfile::tempdir().unwrap();
+        let filler = "The server boots from the jar and loads the world.\n\n".repeat(1_400); // ~73,000 characters
+        let brief = format!(
+            "# Game\n\nA tactics game.\n\n## Build and run\n\n{filler}## Running the server\n\n\
+             Paths no lane touches without Chris's yes: `run/`, `gradle.properties`.\n\n\
+             ## Registries, wiring and config keys\n\nEvery installer registers its systems and its config keys in setup(), in order.\n\
+             Config defaults are read once at start-up by each installer.\n"
+        );
+        let root = d.path().join("Game");
+        write(
+            &root,
+            &[
+                ("CLAUDE.md", &brief),
+                (".ken/gates.json", "{\"protected\": [\"run/\"], \"_protected_note\": \"Paths no lane touches without Chris's yes.\"}"),
+                ("docs/CODE-STANDARDS.md", "# Code standards\n\n## Style\n\nLint with the formatter; helpers live in `utils/`. Follow the style conventions.\n"),
+            ],
+        );
+        let briefs = vec![("CLAUDE.md".to_string(), brief_sections(&brief))];
+        let routed = route_parts("Game", &briefs);
+        let line_of = |h: &str| brief.lines().position(|l| l == h).unwrap() + 1;
+        let wiring = format!("Game:CLAUDE.md:{}", line_of("## Registries, wiring and config keys"));
+        let pages_of = |label: &str| -> Vec<&str> { routed.iter().filter(|(_, v)| v.iter().any(|s| s.label == label)).map(|(p, _)| *p).collect() };
+        let wired = pages_of(&wiring);
+        assert!(wired.contains(&"Conventions/Registries.md") && wired.contains(&"Reference/Config-Map.md"), "{wired:?}");
+        assert!(wired.len() <= PART_PAGES);
+
+        // Who decides reaches Team though it sits in a build section that
+        // fills Build and Run.
+        let repos = vec![("Game".to_string(), root.clone())];
+        let wiki = d.path().join("Wiki");
+        let team = page_sources("Current/Team.md", &wiki, "Wiki", &repos, &[]);
+        let who = team.iter().find(|s| s.label == "Game:(lines of its briefs about who decides)").expect("the decider lines");
+        assert!(who.text.contains(&format!("Game:CLAUDE.md:{}: Paths no lane touches without Chris's yes", line_of("Paths no lane touches without Chris's yes: `run/`, `gradle.properties`."))), "{}", who.text);
+        assert!(team.iter().any(|s| s.label == "Game:.ken/gates.json"), "the protected paths");
+        let code = page_sources("Conventions/Code.md", &wiki, "Wiki", &repos, &[]);
+        assert!(code.iter().any(|s| s.label.starts_with("Game:docs/CODE-STANDARDS.md") && s.text.contains("helpers live in")), "{code:?}");
+
+        // The layers page: the parts about layers before what the code registers.
+        let map = vec![Source { label: format!("Game:{REGISTERS}"), text: "GamePlugin.java:5 setup(): 3 statements".into() }];
+        let layers: Vec<String> = layers_sources("Game", &root, &map).into_iter().map(|s| s.label).collect();
+        let at = |l: &str| layers.iter().position(|x| x == l).unwrap_or_else(|| panic!("{l} in {layers:?}"));
+        assert!(at(&wiring) < at(&format!("Game:{REGISTERS}")), "{layers:?}");
     }
 
     /// A pin a draft wrote as `""` is empty: Ken fills it.
