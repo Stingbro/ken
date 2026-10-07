@@ -336,8 +336,10 @@ when you don't know the project, use route_query first.",
         json!({
             "name": "read_document",
             "description": "Read a document, or just some of its lines, after a search: the \
-way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> you get the \
-lines around n (10 before, 40 after), numbered — one cheap call. start_line/end_line pick other \
+way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> a Markdown page \
+gives the whole section n is in (its heading to the next heading of the same level; in a \
+decisions log, the entry), up to about 8,000 characters, and a code or text file the lines \
+around n (10 before, 40 after), numbered — one cheap call. start_line/end_line pick other \
 lines. With no line, the whole file comes back (up to 200 KB, so costly for a big file). Also \
 takes a project-relative path (with `project`). Binary formats (docx, xlsx, pptx, pdf, images) \
 return the text Ken's indexer extracted.",
@@ -781,6 +783,7 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
                 None => (path, None),
             };
             let range = line_range(args, fragment.as_deref());
+            let pointed = address_line(args, fragment.as_deref());
             let (project, note) = resolve_project(server, &named)?;
             // Validate before anything else so `..`/absolute paths are
             // refused outright, whatever the index says.
@@ -800,6 +803,12 @@ list_documents or search_knowledge to find valid paths.",
                 })?;
             let mut out = note.unwrap_or_default();
             match (row.kind.as_str(), range) {
+                // A page read from a hit's address: the section it is in.
+                ("md", Some(_)) if pointed.is_some() => {
+                    let bytes = std::fs::read(&abs)
+                        .map_err(|e| format!("could not read {path:?}: {e}"))?;
+                    out.push_str(&section_text(&path, &String::from_utf8_lossy(&bytes), pointed.unwrap_or(1)));
+                }
                 ("md" | "txt" | "code", Some(r)) => {
                     let bytes = std::fs::read(&abs)
                         .map_err(|e| format!("could not read {path:?}: {e}"))?;
@@ -913,6 +922,71 @@ fn line_range(args: &Value, fragment: Option<&str>) -> Option<(i64, i64)> {
             Some(((n - READ_BEFORE).max(1), n + READ_AFTER))
         }
     }
+}
+
+/// The line an address points at (`#L88`), when nothing else picks the
+/// lines: no `start_line`/`end_line`, and not a range (`#L88-L120`).
+fn address_line(args: &Value, fragment: Option<&str>) -> Option<i64> {
+    if args.get("start_line").is_some_and(|v| !v.is_null()) || args.get("end_line").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    let frag = fragment?.strip_prefix('L')?;
+    if frag.contains('-') {
+        return None;
+    }
+    frag.parse::<i64>().ok().filter(|n| *n >= 1)
+}
+
+/// About this many characters of a section read_document returns from an
+/// address. Partly-right answers missed a fact in the same section as the
+/// hit, just past the 50 lines an address used to give (Shattered Realms,
+/// 2026-10-07); a decisions log's 50 lines were 24,000 characters of
+/// other rulings.
+const SECTION_CHARS: usize = 8_000;
+
+/// The section of a page (or the log entry) that `line` is in, numbered,
+/// cut at [`SECTION_CHARS`] with the cut said and where to read on.
+fn section_text(path: &str, text: &str, line: i64) -> String {
+    let Some((a, b, name)) = ken_core::chunker::section_at(path, text, line.max(1) as usize) else {
+        return numbered_lines(text, ((line - READ_BEFORE).max(1), line + READ_AFTER));
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let what = match &name {
+        Some(n) if n.starts_with('#') => format!("section {:?}", n.trim_start_matches('#').trim()),
+        Some(id) => format!("entry {id}"),
+        None => "section".to_string(),
+    };
+    let row = |n: usize| format!("{n}: {}\n", lines[n - 1]);
+    let cost = |n: usize| row(n).chars().count();
+    let size: usize = (a..=b).map(cost).sum();
+    let (from, to) = if size <= SECTION_CHARS {
+        (a, b)
+    } else {
+        // From the section's start when the line is near it, else from a
+        // little above the line; as far as the cap allows, the line always.
+        let line = (line as usize).clamp(a, b);
+        let lead: usize = (a..=line).map(cost).sum();
+        let from = if lead <= SECTION_CHARS / 2 { a } else { line.saturating_sub(READ_BEFORE as usize).max(a) };
+        let (mut to, mut used) = (from, cost(from));
+        while to < b && (to < line || used + cost(to + 1) <= SECTION_CHARS) {
+            to += 1;
+            used += cost(to);
+        }
+        (from, to)
+    };
+    let mut out = match (from, to) == (a, b) {
+        true => format!("[{what}: lines {a}-{b} of {total}]\n"),
+        false => format!(
+            "[{what}: lines {a}-{b} of {total}; lines {from}-{to} shown, cut at {} characters: read on with start_line={}]\n",
+            SECTION_CHARS,
+            to + 1
+        ),
+    };
+    for n in from..=to {
+        out.push_str(&row(n));
+    }
+    out
 }
 
 /// Lines `a` to `b` of `text`, each led by its number, under a line saying
@@ -3781,6 +3855,51 @@ mod tests {
         let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": address}));
         assert!(!is_err, "{text}");
         assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
+    }
+
+    #[test]
+    fn read_document_reads_the_section_or_log_entry_an_address_is_in() {
+        let mut fx = fixture(true);
+        let mut page = String::from("---\ntitle: Law\n---\n\n# Law\n\n## Grades\n\n");
+        for i in 1..=60 {
+            page.push_str(&format!("Grade lever {i}.\n"));
+        }
+        page.push_str("\n## Health\n\nLast and least.\n\n## Long\n\n");
+        for i in 1..=400 {
+            page.push_str(&format!("A long line of the long section, number {i}, padded out.\n"));
+        }
+        std::fs::write(fx.root.join("Law.md"), &page).unwrap();
+        let mut log = String::from("# DECISIONS\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        for i in (1..=6).rev() {
+            log.push_str(&format!("**D-{i:03}** · 2026-10-06 · pets — **RULING {i}.** Chris.\n\n"));
+        }
+        std::fs::write(fx.root.join("DECISIONS.md"), &log).unwrap();
+        std::fs::write(fx.root.join("code.rs"), (1..=100).map(|i| format!("// line {i}\n")).collect::<String>()).unwrap();
+        let project = Project::open(&fx.root).unwrap();
+        let mut db = Db::open(&fx.server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        drop(db);
+
+        // Line 65 is the 57th of 60 levers: the whole section, not 10 lines before and 40 after.
+        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65"}));
+        assert!(!is_err, "{text}");
+        assert!(text.starts_with("[section \"Grades\": lines 7-68 of"), "{text}");
+        assert!(text.contains("\n9: Grade lever 1.\n") && text.ends_with("68: Grade lever 60.\n"), "{text}");
+        assert!(!text.contains("Health"), "{text}");
+        // A long section is cut at about 8,000 characters, and says where to read on.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L300"}));
+        assert!(text.contains("cut at 8000 characters: read on with start_line="), "{text}");
+        assert!(text.contains("\n300: A long line") && text.len() < 8_400, "{} characters", text.len());
+        // A decisions log: the entry.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "DECISIONS.md#L9"}));
+        assert_eq!(text, "[entry D-005: lines 9-9 of 18]\n9: **D-005** · 2026-10-06 · pets — **RULING 5.** Chris.\n");
+        // Code keeps the line window; an explicit range still wins.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "code.rs#L50"}));
+        assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65", "start_line": 65, "end_line": 66}));
+        assert_eq!(text, "[lines 65-66 of 475]\n65: Grade lever 57.\n66: Grade lever 58.\n");
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65-L66"}));
+        assert!(text.starts_with("[lines 65-66 of"), "{text}");
     }
 
     #[test]

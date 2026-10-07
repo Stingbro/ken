@@ -313,6 +313,87 @@ pub fn entry_topics(line: &str) -> Vec<String> {
         .collect()
 }
 
+/// The part of a Markdown page that holds line `line` (1-based): the entry
+/// it is in when the page is a log (a decisions log: that entry, to the next
+/// entry or heading), else its section, from the heading above it to the
+/// next heading of the same or a higher level. Lines before the first
+/// heading are a section of their own, unless they are only frontmatter:
+/// then the first heading's section is read with them. Headings inside a
+/// fenced code block or the frontmatter do not count.
+///
+/// Returns the first and last line (1-based, inclusive) and the heading or
+/// entry id that names it; None when `line` is past the end.
+pub fn section_at(rel_path: &str, text: &str, line: usize) -> Option<(usize, usize, Option<String>)> {
+    let lines: Vec<&str> = text.lines().collect();
+    if line == 0 || line > lines.len() {
+        return None;
+    }
+    let target = line - 1;
+    // The frontmatter's last line, and each line's heading level.
+    let front_end = (lines.first().map(|l| l.trim_end()) == Some("---"))
+        .then(|| lines.iter().skip(1).position(|l| matches!(l.trim_end(), "---" | "...")).map(|p| p + 1))
+        .flatten();
+    let mut level: Vec<Option<usize>> = vec![None; lines.len()];
+    let mut fence: Option<&str> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if front_end.is_some_and(|e| i <= e) {
+            continue;
+        }
+        let t = l.trim_start();
+        let mark = if t.starts_with("```") { Some("```") } else if t.starts_with("~~~") { Some("~~~") } else { None };
+        match (fence, mark) {
+            (Some(f), Some(m)) if f == m => fence = None,
+            (None, Some(m)) => fence = Some(m),
+            _ => {}
+        }
+        if fence.is_some() || mark.is_some() {
+            continue;
+        }
+        let hashes = t.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+            level[i] = Some(hashes);
+        }
+    }
+    let trim = |a: usize, mut b: usize| {
+        while b > a && lines[b].trim().is_empty() {
+            b -= 1;
+        }
+        b
+    };
+    if is_markdown(rel_path) && chunk_log(text, &IndexProfile::default_for(rel_path)).is_some() {
+        let start = (0..=target).rev().find(|&i| level[i].is_some() || entry_start(lines[i]).is_some());
+        if let Some(s) = start.filter(|&s| level[s].is_none()) {
+            let end = (s + 1..lines.len()).find(|&i| level[i].is_some() || entry_start(lines[i]).is_some()).unwrap_or(lines.len());
+            let id = entry_start(lines[s]).map(|(id, _)| id);
+            return Some((s + 1, trim(s, end - 1) + 1, id));
+        }
+    }
+    let section = |h: usize| {
+        let lv = level[h].unwrap_or(1);
+        let end = (h + 1..lines.len()).find(|&i| level[i].is_some_and(|l| l <= lv)).unwrap_or(lines.len());
+        (h, end - 1)
+    };
+    let (a, b, head) = match (0..=target).rev().find(|&i| level[i].is_some()) {
+        Some(h) => {
+            let (a, b) = section(h);
+            (a, b, Some(lines[h].trim().to_string()))
+        }
+        None => {
+            let first = (0..lines.len()).find(|&i| level[i].is_some());
+            let body = (front_end.map_or(0, |e| e + 1)..first.unwrap_or(lines.len())).any(|i| !lines[i].trim().is_empty());
+            match first {
+                Some(f) if !body => {
+                    let (_, b) = section(f);
+                    (0, b, Some(lines[f].trim().to_string()))
+                }
+                Some(f) => (0, f - 1, None),
+                None => (0, lines.len() - 1, None),
+            }
+        }
+    };
+    Some((a + 1, trim(a, b) + 1, head))
+}
+
 /// A Markdown file whose body is a run of entries, one chunk per entry, or
 /// None when it is not one (fewer than [`LOG_MIN_ENTRIES`] entries, or the
 /// entries hold less than [`LOG_MIN_SHARE`] of the text). An entry runs from
@@ -1048,6 +1129,27 @@ mod tests {
         for not in ["### 2026-10-06", "**Note** a bold word", "**D-12x** not an id", "## D-12abc", "D-12 not bold", "**d-12** lower case"] {
             assert_eq!(entry_start(not), None, "{not}");
         }
+    }
+
+    #[test]
+    fn a_line_reads_as_its_section_or_its_log_entry() {
+        let page = "---\ntitle: Grades\n---\n\n# Grades\n\nIntro.\n\n## Levers\n\nVariety first.\n\n```md\n# not a heading\n```\n\n### Detail\n\nWind-up.\n\n## Health\n\nLast and least.\n";
+        assert_eq!(section_at("Design/Law.md", page, 11), Some((9, 19, Some("## Levers".into()))), "to the next heading of its level, past a ###");
+        assert_eq!(section_at("Design/Law.md", page, 18), Some((17, 19, Some("### Detail".into()))));
+        assert_eq!(section_at("Design/Law.md", page, 14), Some((9, 19, Some("## Levers".into()))), "a # in a fence is not a heading");
+        assert_eq!(section_at("Design/Law.md", page, 2), Some((1, 23, Some("# Grades".into()))), "frontmatter alone reads on into the first section");
+        assert_eq!(section_at("Design/Law.md", page, 99), None);
+        let notes = "Preamble line.\n\n# Title\n\nBody.\n";
+        assert_eq!(section_at("Notes.md", notes, 1), Some((1, 1, None)));
+
+        let mut log = String::from("# DECISIONS\n\nThe record.\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        for i in (1..=6).rev() {
+            log.push_str(&format!("**D-{i:03}** · 2026-10-06 · pets — **RULING {i}.** Chris.\nA second line of ruling {i}.\n\n"));
+        }
+        // D-006 starts on line 9: its two lines, not the next entry.
+        assert_eq!(section_at("decisions/DECISIONS.md", &log, 10), Some((9, 10, Some("D-006".into()))));
+        assert_eq!(section_at("decisions/DECISIONS.md", &log, 12), Some((12, 13, Some("D-005".into()))));
+        assert_eq!(section_at("decisions/DECISIONS.md", &log, 3).map(|s| s.2), Some(Some("# DECISIONS".into())), "not an entry: its section");
     }
 
     #[test]
