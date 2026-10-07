@@ -55,8 +55,35 @@ pub fn parse_oneshot_output(stdout: &str) -> ParsedOutput {
             truncate(text, 2000)
         ));
     };
+    parse_output_value(&value, text)
+}
 
-    let event = match &value {
+/// The events of `--output-format stream-json --verbose` stdout, one JSON
+/// object a line, in order. A line that is not JSON (a warning the CLI
+/// printed) is skipped.
+pub fn parse_stream_events(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('{'))
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// [`parse_oneshot_output`] for stream-json stdout: the same terminal result,
+/// read from the events as the array shape is.
+pub fn parse_stream_output(stdout: &str) -> ParsedOutput {
+    let events = parse_stream_events(stdout);
+    if events.is_empty() {
+        return parse_oneshot_output(stdout);
+    }
+    parse_output_value(&serde_json::Value::Array(events), stdout.trim())
+}
+
+/// The terminal result in parsed output, either shape; `text` is what was
+/// received, quoted when it is unusable.
+fn parse_output_value(value: &serde_json::Value, text: &str) -> ParsedOutput {
+    let event = match value {
         serde_json::Value::Array(events) => {
             match events
                 .iter()
@@ -75,7 +102,7 @@ pub fn parse_oneshot_output(stdout: &str) -> ParsedOutput {
                 },
             }
         }
-        serde_json::Value::Object(_) => Some(&value),
+        serde_json::Value::Object(_) => Some(value),
         _ => None,
     };
     let Some(event) = event else {
@@ -255,6 +282,33 @@ pub fn chat_oneshot_with(
     cancel: &CancelToken,
     look: bool,
 ) -> Result<OneshotOutcome> {
+    let args = chat_args(project_root, dirs, mcp_config, look);
+    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+}
+
+/// [`chat_oneshot_with`] over `--output-format stream-json --verbose`, so
+/// every event comes back with the outcome: each tool call Claude made and
+/// what it returned, in order, for measuring how an answer was found. On a
+/// timeout the events are those printed before it.
+#[allow(clippy::too_many_arguments)]
+pub fn chat_oneshot_traced(
+    binary: &Path,
+    project_root: &Path,
+    dirs: &[std::path::PathBuf],
+    mcp_config: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    look: bool,
+) -> Result<(OneshotOutcome, Vec<serde_json::Value>)> {
+    let args = chat_args(project_root, dirs, mcp_config, look);
+    run_oneshot_events(binary, project_root, prompt, timeout, cancel, &args, true)
+}
+
+/// The access a headless chat turn gets: its guide, Ken's MCP server and the
+/// tools it may use without asking, and with `look` the read-only file tools
+/// over `dirs`.
+fn chat_args(project_root: &Path, dirs: &[std::path::PathBuf], mcp_config: &Path, look: bool) -> Vec<String> {
     let mut allowed: Vec<String> = crate::chat::KEN_MCP_ALLOWED
         .iter()
         .filter(|t| **t != "open_in_ken")
@@ -281,7 +335,7 @@ pub fn chat_oneshot_with(
         args.push("--add-dir".into());
         args.push(dir.to_string_lossy().into_owned());
     }
-    run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
+    args
 }
 
 fn run_oneshot(
@@ -292,17 +346,37 @@ fn run_oneshot(
     cancel: &CancelToken,
     access: &[String],
 ) -> Result<OneshotOutcome> {
+    run_oneshot_events(binary, project_root, prompt, timeout, cancel, access, false).map(|(outcome, _)| outcome)
+}
+
+/// [`run_oneshot`], with the session's events when `stream` (stream-json
+/// output); without it the events are empty.
+fn run_oneshot_events(
+    binary: &Path,
+    project_root: &Path,
+    prompt: &str,
+    timeout: Duration,
+    cancel: &CancelToken,
+    access: &[String],
+    stream: bool,
+) -> Result<(OneshotOutcome, Vec<serde_json::Value>)> {
     if !runner::is_executable(binary) {
-        return Ok(OneshotOutcome::Failed(
-            runner::MISSING_CLAUDE_HELP.to_string(),
+        return Ok((
+            OneshotOutcome::Failed(runner::MISSING_CLAUDE_HELP.to_string()),
+            Vec::new(),
         ));
     }
     let session_id = uuid::Uuid::new_v4().to_string();
     // The prompt goes in on stdin: on Windows an argument with a line break
     // cannot reach the `.cmd` launcher at all (see `proc::spawn_with_input`).
     let mut cmd = std::process::Command::new(binary);
-    cmd.args(["-p", "--output-format", "json"])
-        .args(access)
+    if stream {
+        // stream-json in print mode needs --verbose.
+        cmd.args(["-p", "--output-format", "stream-json", "--verbose"]);
+    } else {
+        cmd.args(["-p", "--output-format", "json"]);
+    }
+    cmd.args(access)
         .args(["--session-id", &session_id])
         .current_dir(project_root)
         .stdout(std::process::Stdio::piped())
@@ -310,22 +384,27 @@ fn run_oneshot(
     let child = crate::proc::spawn_with_input(&mut cmd, prompt)
         .map_err(|e| Error::Other(format!("spawn {}: {e}", binary.display())))?;
 
+    let events = |output: &str| if stream { parse_stream_events(output) } else { Vec::new() };
     let outcome = match drive_child(child, timeout, Duration::from_millis(100), cancel) {
-        DriveResult::Exited(status, output, stderr) => match parse_oneshot_output(&output) {
-            ParsedOutput::Success(text) if status.success() => OneshotOutcome::Completed(text),
-            // A good result event but a non-zero exit can't happen in
-            // practice; treat status as authoritative.
-            ParsedOutput::Success(_) => OneshotOutcome::Failed(with_stderr(
-                format!("the session exited with status {status:?}"),
-                &stderr,
-            )),
-            ParsedOutput::Error(msg) | ParsedOutput::Unusable(msg) => {
-                OneshotOutcome::Failed(with_stderr(msg, &stderr))
-            }
-        },
-        DriveResult::Cancelled => OneshotOutcome::Cancelled,
-        DriveResult::TimedOut(_) => OneshotOutcome::TimedOut,
-        DriveResult::WaitFailed(e) => OneshotOutcome::Failed(format!("wait failed: {e}")),
+        DriveResult::Exited(status, output, stderr) => {
+            let parsed = if stream { parse_stream_output(&output) } else { parse_oneshot_output(&output) };
+            let outcome = match parsed {
+                ParsedOutput::Success(text) if status.success() => OneshotOutcome::Completed(text),
+                // A good result event but a non-zero exit can't happen in
+                // practice; treat status as authoritative.
+                ParsedOutput::Success(_) => OneshotOutcome::Failed(with_stderr(
+                    format!("the session exited with status {status:?}"),
+                    &stderr,
+                )),
+                ParsedOutput::Error(msg) | ParsedOutput::Unusable(msg) => {
+                    OneshotOutcome::Failed(with_stderr(msg, &stderr))
+                }
+            };
+            (outcome, events(&output))
+        }
+        DriveResult::Cancelled => (OneshotOutcome::Cancelled, Vec::new()),
+        DriveResult::TimedOut(output) => (OneshotOutcome::TimedOut, events(&output)),
+        DriveResult::WaitFailed(e) => (OneshotOutcome::Failed(format!("wait failed: {e}")), Vec::new()),
     };
     Ok(outcome)
 }
@@ -550,6 +629,39 @@ mod tests {
             parse_oneshot_output(r#"{"is_error": false, "result": "done"}"#),
             ParsedOutput::Success("done".into())
         );
+    }
+
+    /// stream-json stdout: one event a line, tool calls and their results
+    /// between the init and the result.
+    const CLI_STREAM: &str = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"abc","tools":["Read"]}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__ken__route_query","input":{"query":"who decides"}}]}}"#,
+        "\n",
+        "a warning the CLI printed\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"1. doc people/README.md"}]}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Chris decides."}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"Chris decides.","duration_ms":900,"num_turns":2}"#,
+        "\n"
+    );
+
+    #[test]
+    fn stream_events_keep_every_json_line_in_order() {
+        let events = parse_stream_events(CLI_STREAM);
+        let types: Vec<&str> = events.iter().filter_map(|e| e.get("type").and_then(|t| t.as_str())).collect();
+        assert_eq!(types, ["system", "assistant", "user", "assistant", "result"]);
+        assert_eq!(events[1]["message"]["content"][0]["input"]["query"], "who decides");
+    }
+
+    #[test]
+    fn stream_output_reads_the_result_event() {
+        assert_eq!(parse_stream_output(CLI_STREAM), ParsedOutput::Success("Chris decides.".into()));
+        // Cut off before the result: the last assistant text, as for the array.
+        let cut: String = CLI_STREAM.lines().take(5).map(|l| format!("{l}\n")).collect();
+        assert_eq!(parse_stream_output(&cut), ParsedOutput::Success("Chris decides.".into()));
+        assert!(matches!(parse_stream_output("not json at all"), ParsedOutput::Unusable(_)));
     }
 
     #[test]
