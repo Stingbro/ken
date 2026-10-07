@@ -136,20 +136,25 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
         return Vec::new();
     }
 
-    let pieces = match profile.mode {
-        ChunkMode::Prose => chunk_prose(text, profile),
-        ChunkMode::Code => chunk_code(text, profile),
-        ChunkMode::Skip => Vec::new(),
+    // A log (a decisions log, a run of rulings) is cut one entry per chunk
+    // and is not held to the cap: every entry is its own answer.
+    let log = (profile.mode == ChunkMode::Prose && is_markdown(rel_path)).then(|| chunk_log(text, profile)).flatten();
+    let cap = if log.is_some() { LOG_CHUNK_CAP } else { CHUNK_CAP };
+    let pieces = match (log, profile.mode) {
+        (Some(entries), _) => entries,
+        (None, ChunkMode::Prose) => chunk_prose(text, profile),
+        (None, ChunkMode::Code) => chunk_code(text, profile),
+        (None, ChunkMode::Skip) => Vec::new(),
     };
     let mut pieces: Vec<(usize, String)> = pieces.into_iter().filter(|(_, p)| !p.trim().is_empty()).collect();
-    pieces.truncate(CHUNK_CAP);
+    pieces.truncate(cap);
     if profile.mode == ChunkMode::Code && rel_path.to_ascii_lowercase().ends_with(".json") {
         pieces = with_json_headers(rel_path, text, pieces);
     }
 
     pieces
         .into_iter()
-        .take(CHUNK_CAP)
+        .take(cap)
         .enumerate()
         .map(|(seq, (line, text))| {
             let token_est = (text.len() / 4).max(1);
@@ -168,6 +173,160 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
 fn hash_text(text: &str) -> String {
     let h = twox_hash::XxHash64::oneshot(0, text.as_bytes());
     format!("{h:016x}")
+}
+
+/// Whether `rel_path` is a Markdown page.
+pub(crate) fn is_markdown(rel_path: &str) -> bool {
+    let p = rel_path.to_ascii_lowercase();
+    p.ends_with(".md") || p.ends_with(".markdown") || p.ends_with(".mdx")
+}
+
+/// Most chunks a log-shaped file is cut into: one per entry, far past
+/// [`CHUNK_CAP`], only a guard against a pathological file. On 2026-10-07 the
+/// cap packed the 446 rulings of a 1,246-line decisions log into 200 chunks
+/// of two or three unrelated rulings each, and D-410's chunk began inside
+/// D-411.
+const LOG_CHUNK_CAP: usize = 5_000;
+/// Fewest entries that make a file a log.
+const LOG_MIN_ENTRIES: usize = 5;
+/// The share of a file's text its entries must hold for it to be a log: a
+/// page with a few bold ids among its prose is chunked as prose.
+const LOG_MIN_SHARE: f64 = 0.5;
+/// An entry longer than this, in bytes, is cut at its line ends.
+const LOG_ENTRY_MAX: usize = 12_000;
+/// Longest title an entry carries into the index's names.
+const LOG_TITLE_MAX: usize = 300;
+
+/// An entry's id and title when `line` starts one, else None: a bold id at
+/// the start of the line, also as a list item (`**D-123** · 2026-10-06 ·
+/// topics — **THE RULING.**`, its title the next bold span or else the rest
+/// of the line), or a heading that starts with an id (`## R-12: Title`). An
+/// id is a capital letter, up to seven more capitals or digits, a dash and
+/// digits (`D-123`, `SR-001`, `U-4`).
+pub fn entry_start(line: &str) -> Option<(String, String)> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        let h = t.trim_start_matches('#');
+        if !h.starts_with(' ') {
+            return None;
+        }
+        let h = h.trim_start();
+        let h = h.strip_prefix("**").unwrap_or(h);
+        let (id, rest) = take_id(h)?;
+        let rest = rest.strip_prefix("**").unwrap_or(rest);
+        if rest.chars().next().is_some_and(|c| c.is_alphanumeric()) {
+            return None;
+        }
+        return Some((id, entry_title(rest)));
+    }
+    let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
+    let (id, rest) = take_id(t.strip_prefix("**")?)?;
+    let rest = rest.strip_prefix("**")?;
+    let title = match rest.split_once("**") {
+        Some((_, after)) => after.split_once("**").map_or(after, |(bold, _)| bold),
+        None => rest,
+    };
+    Some((id, entry_title(title)))
+}
+
+/// `D-123` at the start of `s`, and what follows it.
+fn take_id(s: &str) -> Option<(String, &str)> {
+    let b = s.as_bytes();
+    if !b.first()?.is_ascii_uppercase() {
+        return None;
+    }
+    let mut i = 1;
+    while i < b.len() && i < 8 && (b[i].is_ascii_uppercase() || b[i].is_ascii_digit()) {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'-') {
+        return None;
+    }
+    let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 || digits > 6 {
+        return None;
+    }
+    let end = i + 1 + digits;
+    Some((s[..end].to_string(), &s[end..]))
+}
+
+/// A title without the punctuation around it, cut to [`LOG_TITLE_MAX`].
+fn entry_title(raw: &str) -> String {
+    let t = raw.trim_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '#' | ':' | '.' | '-' | '—' | '–' | '·' | '|'));
+    let mut end = t.len().min(LOG_TITLE_MAX);
+    while !t.is_char_boundary(end) {
+        end -= 1;
+    }
+    t[..end].trim_end().to_string()
+}
+
+/// Whether the page at `rel_path` with this text is chunked as a log, one
+/// entry per chunk.
+pub fn is_log(rel_path: &str, text: &str) -> bool {
+    is_markdown(rel_path) && chunk_log(text, &IndexProfile::default_for(rel_path)).is_some()
+}
+
+/// The entry a chunk of a log holds (id and title), read from its first
+/// lines: the chunk may start with the heading the entry sits under.
+pub fn chunk_entry(chunk_text: &str) -> Option<(String, String)> {
+    chunk_text.lines().filter(|l| !l.trim().is_empty()).take(3).find_map(entry_start)
+}
+
+/// A Markdown file whose body is a run of entries, one chunk per entry, or
+/// None when it is not one (fewer than [`LOG_MIN_ENTRIES`] entries, or the
+/// entries hold less than [`LOG_MIN_SHARE`] of the text). An entry runs from
+/// its first line to the next entry or heading, and carries the heading it
+/// sits under (`### 2026-10-06`) as its first line, as each piece of a long
+/// table carries the table's header. Text that is not an entry (the preamble,
+/// an index, a section of notes) is chunked as prose, as before.
+fn chunk_log(text: &str, profile: &IndexProfile) -> Option<Vec<(usize, String)>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let entries: Vec<bool> = lines.iter().map(|l| entry_start(l).is_some()).collect();
+    if entries.iter().filter(|e| **e).count() < LOG_MIN_ENTRIES {
+        return None;
+    }
+    let is_heading = |l: &str| l.trim_start().starts_with('#');
+    // (is an entry, first line index, end line index)
+    let mut regions: Vec<(bool, usize, usize)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let open_other = regions.last().is_some_and(|r| !r.0);
+        if entries[i] || (is_heading(line) && !open_other) || regions.is_empty() {
+            regions.push((entries[i], i, i + 1));
+        } else if let Some(r) = regions.last_mut() {
+            r.2 = i + 1;
+        }
+    }
+    let entry_bytes: usize = regions.iter().filter(|r| r.0).flat_map(|r| &lines[r.1..r.2]).map(|l| l.len() + 1).sum();
+    if (entry_bytes as f64) < LOG_MIN_SHARE * text.len() as f64 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut context: Option<&str> = None;
+    for (entry, a, b) in regions {
+        let body = lines[a..b].join("\n");
+        if entry {
+            let body = body.trim();
+            let with_context = |piece: &str| match context {
+                Some(h) => format!("{h}\n\n{piece}"),
+                None => piece.to_string(),
+            };
+            if body.len() > LOG_ENTRY_MAX {
+                out.extend(split_long_block(a + 1, body, LOG_ENTRY_MAX).into_iter().map(|(l, p)| (l, with_context(&p))));
+            } else {
+                out.push((a + 1, with_context(body)));
+            }
+            continue;
+        }
+        // Headings alone (`## THE LOG`, then `### 2026-10-06`) are context for
+        // the entries under them, not chunks of their own.
+        if lines[a..b].iter().any(|l| !l.trim().is_empty() && !is_heading(l)) {
+            out.extend(chunk_prose(&body, profile).into_iter().map(|(l, p)| (a + l, p)));
+        }
+        if let Some(h) = lines[a..b].iter().rev().find(|l| is_heading(l)) {
+            context = Some(h.trim());
+        }
+    }
+    Some(out)
 }
 
 /// Split text into paragraph/heading blocks: blank lines separate
@@ -797,6 +956,73 @@ mod tests {
         let profile = IndexProfile::default_for("a.yaml");
         let chunks = chunk_file("a.yaml", "Name: x\nDamage: 4\n", &profile);
         assert_eq!(chunks[0].text, "Name: x\nDamage: 4");
+    }
+
+    fn ruling(i: usize) -> String {
+        format!("**D-{i:03}** · 2026-10-06 · anchors, tools — **SPAWN ANCHORS RULE {i}.** Chris, in chat. Placed only through the tools, never the commands; case {i} of many, padded so two rulings would fill a chunk together.")
+    }
+
+    #[test]
+    fn a_decisions_log_is_one_entry_per_chunk_past_the_cap() {
+        let mut text = String::from("---\ntags: [decisions]\n---\n\n# DECISIONS\n\nThe permanent record of every ruling.\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        for i in (1..=300).rev() {
+            if i == 150 {
+                text.push_str("### 2026-10-05\n\n");
+            }
+            text.push_str(&ruling(i));
+            text.push_str("\n\n");
+        }
+        let chunks = chunk_file("decisions/DECISIONS.md", &text, &IndexProfile::default_for("x.md"));
+        let entries: Vec<&Chunk> = chunks.iter().filter(|c| c.text.contains("**D-")).collect();
+        assert_eq!(entries.len(), 300, "every ruling, past the cap of {CHUNK_CAP}");
+        for c in &entries {
+            assert_eq!(c.text.matches("**D-").count(), 1, "one ruling per chunk: {}", c.text);
+            let (id, title) = chunk_entry(&c.text).unwrap();
+            let line = text.lines().nth(c.line - 1).unwrap();
+            assert!(line.starts_with(&format!("**{id}**")), "cited at the ruling's own line: {line}");
+            assert!(title.starts_with("SPAWN ANCHORS RULE"), "{title}");
+        }
+        let d150 = entries.iter().find(|c| c.text.contains("**D-150**")).unwrap();
+        assert!(d150.text.starts_with("### 2026-10-05\n\n**D-150**"), "the heading it sits under: {}", d150.text);
+        assert!(entries.iter().find(|c| c.text.contains("**D-151**")).unwrap().text.starts_with("### 2026-10-06"));
+        let preamble = chunks.iter().position(|c| c.text.contains("The permanent record")).expect("the preamble is chunked as prose");
+        assert!(preamble < 3 && chunks[..preamble].iter().all(|c| !c.text.contains("**D-")), "{chunks:?}");
+        assert!(!chunks.iter().any(|c| c.text.trim() == "### 2026-10-05"), "a heading alone is context, not a chunk");
+        assert!(is_log("decisions/DECISIONS.md", &text) && !is_log("decisions/DECISIONS.txt", &text));
+    }
+
+    #[test]
+    fn a_heading_per_entry_log_and_its_titles() {
+        let mut text = String::from("# Research log\n\n");
+        for i in 1..=6 {
+            text.push_str(&format!("## R-{i}: Spike number {i}\n\nWhat the spike found, {i}.\n\nAnd a second paragraph.\n\n"));
+        }
+        let chunks = chunk_file("Research/LOG.md", &text, &IndexProfile::default_for("x.md"));
+        assert_eq!(chunks.len(), 6, "{chunks:?}");
+        assert_eq!(chunk_entry(&chunks[2].text), Some(("R-3".to_string(), "Spike number 3".to_string())));
+        assert!(chunks[0].text.starts_with("# Research log\n\n## R-1"), "{}", chunks[0].text);
+
+        assert_eq!(entry_start("- **SR-012** · done — **Bump the engine.**"), Some(("SR-012".into(), "Bump the engine".into())));
+        assert_eq!(entry_start("**U-4** undated: no second bold"), Some(("U-4".into(), "undated: no second bold".into())));
+        for not in ["### 2026-10-06", "**Note** a bold word", "**D-12x** not an id", "## D-12abc", "D-12 not bold", "**d-12** lower case"] {
+            assert_eq!(entry_start(not), None, "{not}");
+        }
+    }
+
+    /// Prose with a few bold ids, or a few entries in a long page, is chunked
+    /// exactly as before.
+    #[test]
+    fn a_page_that_is_not_a_log_is_chunked_as_prose() {
+        let profile = IndexProfile::default_for("x.md");
+        let prose: String = (0..40).map(|i| format!("Paragraph {i} of the design notes, long enough to pack a few to a chunk.\n\n")).collect();
+        let few = format!("{prose}{}\n\n{}\n\n", ruling(1), ruling(2));
+        let mut padded = "A long section of notes that is not a ruling at all, and outweighs them.\n\n".repeat(60);
+        padded.push_str(&(1..=6).map(ruling).collect::<Vec<_>>().join("\n\n"));
+        for text in [few, padded] {
+            let expected: Vec<String> = chunk_prose(&text, &profile).into_iter().map(|(_, t)| t).collect();
+            let got: Vec<String> = chunk_file("Design/Notes.md", &text, &profile).into_iter().map(|c| c.text).collect();
+            assert_eq!(got, expected);
+        }
     }
 
     #[test]
