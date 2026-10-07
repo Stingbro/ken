@@ -303,11 +303,12 @@ fn git_tags(root: &Path) -> Option<String> {
 }
 
 /// What landed after the newest version tag the checkout contains (`v1.2`,
-/// else `1.2`), as `date subject` lines, newest first; the recent commits
-/// when the repo has no version tag. The label says which. Only a version
-/// tag counts: a plain `describe --tags` picked
+/// else `1.2`), as `date subject` lines, newest first, every commit of the
+/// range; the last 200 commits when the repo has no version tag. The label
+/// says which. Only a version tag counts: a plain `describe --tags` picked
 /// `archive/ui-faction-profession-combat-2026-09-30` on 2026-10-06, and the
-/// Unreleased notes started five days late.
+/// Unreleased notes started five days late. A 200-commit cap then hid six of
+/// the ten days since `v0.0.15` (508 commits); [`clip_by_day`] keeps them.
 fn git_unreleased(root: &Path) -> Option<(String, String)> {
     let describe = |pattern: &str| {
         git_text(root, &["describe", "--tags", "--abbrev=0", "--match", pattern])
@@ -315,15 +316,62 @@ fn git_unreleased(root: &Path) -> Option<(String, String)> {
             .filter(|t| !t.is_empty())
     };
     let tag = describe("v[0-9]*").or_else(|| describe("[0-9]*"));
-    let range = tag.as_ref().map_or_else(|| "HEAD".to_string(), |t| format!("{t}..HEAD"));
-    let log = git_text(root, &["log", "--no-merges", "--date=short", "--format=%ad %s", "-n", "200", &range])
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())?;
+    let mut args = vec!["log", "--no-merges", "--date=short", "--format=%ad %s"];
+    let range = match &tag {
+        Some(t) => format!("{t}..HEAD"),
+        None => {
+            args.extend(["-n", "200"]);
+            "HEAD".to_string()
+        }
+    };
+    args.push(&range);
+    let log = git_text(root, &args).map(|l| l.trim().to_string()).filter(|l| !l.is_empty())?;
     let label = match &tag {
         Some(t) => format!("(changes since {t})"),
         None => "(recent changes, no tags)".to_string(),
     };
     Some((label, log))
+}
+
+/// Characters of what landed since the newest version tag, for Releases.
+const UNRELEASED_MAX: usize = 16_000;
+
+/// `log`, `date subject` lines newest first, within `budget`: each day its
+/// fair share ([`fair_shares`]), a day cut short ending with how many more
+/// it had, so every day since the tag is there however busy the newest was.
+fn clip_by_day(log: &str, budget: usize) -> String {
+    if log.len() <= budget {
+        return log.to_string();
+    }
+    let mut days: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in log.lines() {
+        let day = line.split(' ').next().unwrap_or_default();
+        match days.last_mut() {
+            Some((d, lines)) if *d == day => lines.push(line),
+            _ => days.push((day, vec![line])),
+        }
+    }
+    // Room for each day's "more" line comes off the top.
+    let room = budget.saturating_sub(days.len() * 40);
+    let sizes: Vec<usize> = days.iter().map(|(_, l)| l.iter().map(|x| x.len() + 1).sum()).collect();
+    let mut out = String::new();
+    for ((day, lines), share) in days.iter().zip(fair_shares(&sizes, room)) {
+        let mut used = 0;
+        let mut kept = 0;
+        for l in lines {
+            if used + l.len() + 1 > share {
+                break;
+            }
+            used += l.len() + 1;
+            kept += 1;
+            out.push_str(l);
+            out.push('\n');
+        }
+        if kept < lines.len() {
+            out.push_str(&format!("{day} (… {} more that day)\n", lines.len() - kept));
+        }
+    }
+    out
 }
 
 /// Bots and AI agents, by name or email: never a person to ask. Dependabot,
@@ -499,6 +547,73 @@ fn folders_below_source_root(code: &[&String], depth: usize) -> HashMap<String, 
         .collect()
 }
 
+/// The language a file's imports are read in: its code map language, and a
+/// Svelte or Vue component's as TypeScript (its `<script>` imports are).
+fn import_lang(path: &str) -> Option<crate::codemap::Lang> {
+    crate::codemap::Lang::of(path).or_else(|| (path.ends_with(".svelte") || path.ends_with(".vue")).then_some(crate::codemap::Lang::TypeScript))
+}
+
+/// The repo's own packages by the name its code imports them by, as (name,
+/// folder), longest name first: each package.json's `name` below the top,
+/// and each Cargo package's name with `-` as `_`.
+fn workspace_packages(root: &Path, files: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for f in files {
+        let Some((dir, file)) = f.rsplit_once('/') else { continue };
+        let name = match file {
+            "package.json" => read_plain(&root.join(f))
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from)),
+            "Cargo.toml" => read_plain(&root.join(f)).and_then(|t| {
+                toml_tables(&t, &["[package]"])
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("name").map(|r| r.trim_start().trim_start_matches('=').trim().trim_matches('"').replace('-', "_")))
+            }),
+            _ => None,
+        };
+        if let Some(n) = name.filter(|n| !n.is_empty()) {
+            out.push((n, dir.to_string()));
+        }
+    }
+    out.sort_by_key(|(n, _)| std::cmp::Reverse(n.len()));
+    out
+}
+
+/// The file an import of one of the repo's own packages by name lands on:
+/// `@app/schema` and `@app/schema/types` in a pnpm or npm workspace,
+/// `app_core::x` in a Cargo one. Its entry (`src/index.ts`, `index.js`,
+/// `src/lib/index.ts`, `src/lib.rs`), or the path under it, else its first
+/// code file: the import map counts folders, and the folder is known. The
+/// Tools import map missed 749 files that import a sibling package by name
+/// on 2026-10-06.
+fn resolve_package(target: &str, packages: &[(String, String)], files: &[String]) -> Option<String> {
+    let (dir, sub) = packages.iter().find_map(|(name, dir)| {
+        let rest = target.strip_prefix(name.as_str())?;
+        (rest.is_empty() || rest.starts_with('/') || rest.starts_with("::")).then(|| (dir, rest.trim_start_matches(['/', ':'])))
+    })?;
+    let exists = |p: &str| files.iter().any(|f| f == p);
+    let exts = ["ts", "tsx", "js", "mjs", "jsx", "svelte", "rs"];
+    let mut bases: Vec<String> = Vec::new();
+    if sub.is_empty() || sub.contains("::") || target.contains("::") {
+        bases.extend(["src/index", "index", "src/lib/index", "src/lib", "src/main"].iter().map(|b| format!("{dir}/{b}")));
+    } else {
+        for at in ["", "src/", "src/lib/"] {
+            bases.push(format!("{dir}/{at}{sub}"));
+            bases.push(format!("{dir}/{at}{sub}/index"));
+        }
+    }
+    for b in &bases {
+        if exists(b) && import_lang(b).is_some() {
+            return Some(b.clone());
+        }
+        if let Some(hit) = exts.iter().map(|e| format!("{b}.{e}")).find(|c| exists(c)) {
+            return Some(hit);
+        }
+    }
+    let prefix = format!("{dir}/");
+    files.iter().filter(|f| f.starts_with(&prefix) && import_lang(f).is_some()).min().cloned()
+}
+
 /// Which folders' code imports which, from the code itself: one line per
 /// pair, `from -> to (imports)`, most first, each folder named two levels
 /// below its source root. Then every pair that imports both ways, one level
@@ -507,7 +622,8 @@ fn folders_below_source_root(code: &[&String], depth: usize) -> HashMap<String, 
 /// repo whose docs never say. None for a repo with no mapped code.
 pub fn folder_imports(root: &Path) -> Option<String> {
     let files = ls_files(root)?;
-    let code: Vec<&String> = files.iter().filter(|f| crate::codemap::Lang::of(f).is_some()).collect();
+    let code: Vec<&String> = files.iter().filter(|f| import_lang(f).is_some()).collect();
+    let packages = workspace_packages(root, &files);
     let two = folders_below_source_root(&code, 2);
     let one = folders_below_source_root(&code, 1);
     let mut edges: HashMap<(String, String), usize> = HashMap::new();
@@ -515,13 +631,16 @@ pub fn folder_imports(root: &Path) -> Option<String> {
     // How many other files import each file: the hubs to start reading at.
     let mut importers: HashMap<String, HashSet<String>> = HashMap::new();
     for rel in &code {
-        let Some(lang) = crate::codemap::Lang::of(rel) else { continue };
+        let Some(lang) = import_lang(rel) else { continue };
         let Ok(text) = fs::read_to_string(root.join(rel)) else { continue };
         if text.len() > 1_000_000 {
             continue;
         }
+        // A component's imports resolve as its script's would.
+        let from = if crate::codemap::Lang::of(rel).is_none() { format!("{rel}.ts") } else { rel.to_string() };
         for target in crate::codemap::imports_of(lang, &text) {
-            let Some(to) = crate::codemap::resolve_import(rel, &target, &files) else { continue };
+            let resolved = crate::codemap::resolve_import(&from, &target, &files).or_else(|| resolve_package(&target, &packages, &files));
+            let Some(to) = resolved.filter(|t| import_lang(t).is_some()) else { continue };
             if &to != *rel {
                 importers.entry(to.clone()).or_default().insert(rel.to_string());
             }
@@ -2723,7 +2842,7 @@ pub fn page_sources(
                     push(format!("{name}:(version tags, newest first)"), t, &mut mine);
                 }
                 if let Some((label, log)) = git_unreleased(root) {
-                    push(format!("{name}:{label}"), clip(&log, PER_FILE), &mut mine);
+                    mine.push(Source { label: format!("{name}:{label}"), text: clip_by_day(&log, UNRELEASED_MAX) });
                 }
                 let left = PAGE_BUDGET.saturating_sub(used(&mine));
                 mine.extend(release_notes(name, root, usize::MAX, left));
@@ -3989,6 +4108,44 @@ mod tests {
         assert!(!map.contains("src/main/java/dev ->"), "never one folder for the whole tree: {map}");
     }
 
+    /// A workspace package imported by its name, from a script or a Svelte
+    /// component, counts as an import of its folder.
+    #[test]
+    fn the_import_map_resolves_workspace_packages_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write(
+            root,
+            &[
+                ("package.json", r#"{"name": "tools", "private": true}"#),
+                ("packages/schema/package.json", r#"{"name": "@t/schema"}"#),
+                ("packages/schema/src/index.ts", "export const x = 1;\n"),
+                ("packages/schema/src/types.ts", "export type T = number;\n"),
+                ("packages/ui/package.json", r#"{"name": "@t/ui"}"#),
+                ("packages/ui/src/lib/index.ts", "import { x } from '@t/schema';\n"),
+                ("apps/shell/src/routes/+page.svelte", "<script lang=\"ts\">\nimport { x } from '@t/schema';\nimport Button from '@t/ui';\n</script>\n"),
+                ("apps/shell/src/lib/load.ts", "import type { T } from '@t/schema/types';\nimport './helper';\n"),
+                ("apps/shell/src/lib/helper.ts", "export {};\n"),
+                ("crates/sr-jar/Cargo.toml", "[package]\nname = \"sr-jar\"\n"),
+                ("crates/sr-jar/src/lib.rs", "pub fn read() {}\n"),
+                ("apps/shell/src-tauri/src/main.rs", "use sr_jar::read;\nfn main() {}\n"),
+            ],
+        );
+        git_in(root, &["init", "-q"]);
+        git_in(root, &["add", "-A"]);
+        let map = folder_imports(root).expect("an import map");
+        for edge in [
+            "apps/shell/src/routes -> packages/schema/src (1)",
+            "apps/shell/src/lib -> packages/schema/src (1)",
+            "apps/shell/src/routes -> packages/ui/src/lib (1)",
+            "packages/ui/src/lib -> packages/schema/src (1)",
+            "apps/shell/src-tauri/src -> crates/sr-jar/src (1)",
+        ] {
+            assert!(map.contains(edge), "{edge}: {map}");
+        }
+        assert!(map.contains("packages/schema/src/index.ts (2)"), "the entry is the hub: {map}");
+    }
+
     /// Item 5: only version tags count, all of them, and a changelog is split
     /// by version.
     #[test]
@@ -4013,6 +4170,11 @@ mod tests {
         let (label, log) = git_unreleased(root).unwrap();
         assert_eq!(label, "(changes since v0.0.42)", "the newest version tag, never the newer archive tag");
         assert!(log.contains("add duels") && log.contains("fix the crossbow") && !log.contains("ship 0.0.42"));
+        // A busy range keeps every day, each cut short with a count.
+        let busy: String = (0..300).map(|i| format!("2026-10-05 change {i} on the busy day\n")).chain(["2026-09-27 the first change after the tag\n".to_string()]).collect();
+        let clipped = clip_by_day(busy.trim_end(), 2_000);
+        assert!(clipped.len() <= 2_000 && clipped.contains("2026-09-27 the first change after the tag"), "{clipped}");
+        assert!(clipped.contains("2026-10-05 (… ") && clipped.contains(" more that day)"), "{clipped}");
         let tags = git_tags(root).unwrap();
         assert_eq!(tags.lines().count(), 42, "every version tag");
         assert!(!tags.contains("archive/"));
