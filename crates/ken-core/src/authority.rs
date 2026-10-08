@@ -163,6 +163,16 @@ impl Roles {
         Roles { decisions: path("decisions"), people: path("people"), tickets: path("tickets"), overrides }
     }
 
+    /// Whether `rel_path` is the team's decisions log: the one the team
+    /// file names, else any page called `DECISIONS.md`.
+    pub fn is_decisions_log(&self, rel_path: &str) -> bool {
+        let path = rel_path.replace('\\', "/").to_ascii_lowercase();
+        match &self.decisions {
+            Some(d) => path == d.to_ascii_lowercase(),
+            None => path.rsplit('/').next() == Some("decisions.md"),
+        }
+    }
+
     /// Whether any override could reach a file that is not a page.
     pub fn has_overrides(&self) -> bool {
         !self.overrides.is_empty()
@@ -248,6 +258,118 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         return false;
     }
     builder.build().is_ok_and(|g| g.matched_path_or_any_parents(path, false).is_ignore())
+}
+
+// --- the label a hit carries -------------------------------------------------
+
+/// The longest `status:` a label repeats, in characters.
+const LABEL_STATUS_MAX: usize = 32;
+
+/// How much a hit counts, as one short line for whoever reads the results
+/// (kb-trust, 2026-10-07): the page's tier (`ruling`, `rule`, `current`,
+/// `reference`, `record`), its `status:` and its date. An entry of a
+/// decisions log carries its own id and date (`ruling D-410 · 2026-10-06`), a
+/// ticket says so (`ticket · cancelled · 2026-07-21`). Claude answered from a
+/// cancelled ticket over the roadmap page beside it, and from a ruling a later
+/// one had settled, because nothing on the hit line said which was which.
+///
+/// None for a file that is not a Markdown page: all code is neutral, and its
+/// kind tag already says what it is. `chunk_text` is the hit's chunk, when
+/// the caller has it: it names the log entry the hit is on.
+pub fn hit_label(db: &Db, rel_path: &str, chunk_text: Option<&str>) -> Result<Option<String>> {
+    if !crate::chunker::is_markdown(rel_path) {
+        return Ok(None);
+    }
+    let meta = db.page_meta(rel_path)?;
+    let stored = db.authority_of(rel_path)?;
+    let mut label = label_of(rel_path, meta.as_ref(), stored.as_ref().map(|(t, w)| (t.as_str(), *w)), chunk_text);
+    // What the supersede pass found: a later ruling over this entry, or the
+    // earlier ones this entry changes.
+    let entry = chunk_text
+        .and_then(crate::chunker::entry_line)
+        .and_then(crate::chunker::entry_start)
+        .map(|(id, _)| id)
+        .filter(|_| label.starts_with("ruling "));
+    if let Some(note) = entry.map(|id| crate::supersede::note(db, rel_path, &id)).transpose()?.flatten() {
+        label.push_str(" · ");
+        label.push_str(&note);
+    }
+    Ok(Some(label))
+}
+
+/// [`hit_label`] from what the index stored: the page's frontmatter and its
+/// authority (tier name, weight), None when neutral.
+pub fn label_of(rel_path: &str, meta: Option<&PageMeta>, stored: Option<(&str, f64)>, chunk_text: Option<&str>) -> String {
+    let tier = stored.and_then(|(t, _)| Tier::parse(t)).unwrap_or(Tier::Reference);
+    let weight = stored.map_or(0.0, |(_, w)| w);
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path).to_ascii_lowercase();
+    let entry = chunk_text.and_then(crate::chunker::entry_line);
+    let ruling = tier == Tier::Rule && (entry.is_some() || name == "decisions.md");
+    let ticket = matches!(tier, Tier::Record | Tier::Closed) && crate::contenttype::of(rel_path) == crate::contenttype::ContentType::Ticket;
+    let word = if ruling {
+        "ruling"
+    } else if ticket {
+        "ticket"
+    } else {
+        match tier {
+            Tier::Rule if (weight - W_CURRENT).abs() < 1e-9 => "current",
+            Tier::Rule => "rule",
+            Tier::Reference => "reference",
+            Tier::Record | Tier::Closed => "record",
+        }
+    };
+    let mut parts: Vec<String> = Vec::new();
+    match entry.filter(|_| ruling).and_then(crate::chunker::entry_start) {
+        Some((id, _)) => parts.push(format!("{word} {id}")),
+        None => parts.push(word.to_string()),
+    }
+    // A log entry is dated by its own head; the page's status is the log's.
+    if let Some(line) = entry.filter(|_| ruling) {
+        parts.extend(crate::chunker::entry_date(line));
+        return parts.join(" · ");
+    }
+    let meta = meta.cloned().unwrap_or_default();
+    if let Some(status) = meta.status.as_deref().map(status_clause).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(word)) {
+        parts.push(status);
+    }
+    let date = meta
+        .updated
+        .clone()
+        .or_else(|| meta.verified.as_ref().map(|v| format!("verified {v}")))
+        .or_else(|| (tier == Tier::Record).then(|| crate::pagemeta::date_in_name(rel_path)).flatten());
+    parts.extend(date);
+    if meta.retired() && !meta.replaced_by.is_empty() {
+        parts.push(format!("replaced by {}", meta.replaced_by.join(", ")));
+    }
+    if meta.generated {
+        parts.push("generated".into());
+    }
+    parts.join(" · ")
+}
+
+/// A `status:` cut to its first clause, for a label: `ruled D-336` for
+/// "ruled D-336 (Chris, 2026-10-01)", `reference` for "reference, kept
+/// current — 2026-09-25".
+fn status_clause(status: &str) -> String {
+    let s = status.trim().trim_matches('"');
+    let cut = s.find([',', ';', '(', '—', '–']).unwrap_or(s.len());
+    let s = s[..cut].trim();
+    let s = s.split(" - ").next().unwrap_or(s).trim();
+    // An id keeps its capitals (`ruled D-336`) though the index stored the
+    // status lowercased.
+    let s = &s
+        .split(' ')
+        .map(|w| match w.split_once('-') {
+            Some((k, n)) if !k.is_empty() && k.len() <= 8 && k.chars().all(|c| c.is_ascii_alphabetic()) && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => w.to_ascii_uppercase(),
+            _ => w.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if s.chars().count() <= LABEL_STATUS_MAX {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(LABEL_STATUS_MAX).collect::<String>().trim_end())
+    }
 }
 
 /// Work out and store the authority of the files in `db` (all of them, or
@@ -342,6 +464,48 @@ mod tests {
         assert_eq!(a("src/new.rs", None).weight, 0.0);
         assert!(r.has_overrides());
         assert!(!Roles::default().has_overrides());
+    }
+
+    #[test]
+    fn a_label_says_what_a_hit_is_and_how_fresh() {
+        let page = |status: Option<&str>, updated: Option<&str>| PageMeta {
+            status: status.map(Into::into),
+            updated: updated.map(Into::into),
+            ..Default::default()
+        };
+        let entry = "### 2026-10-06\n\n**D-410** · 2026-10-06 · anchors, tools — **SPAWN ANCHORS ARE PLACED ONLY THROUGH THE TOOLS.** Chris.";
+        assert_eq!(label_of("decisions/DECISIONS.md", None, Some(("rule", W_RULE)), Some(entry)), "ruling D-410 · 2026-10-06");
+        assert_eq!(label_of("decisions/DECISIONS.md", None, Some(("rule", W_RULE)), Some("# DECISIONS\n\nThe permanent record.")), "ruling");
+        assert_eq!(label_of("log/RULINGS.md", None, Some(("rule", W_RULE)), Some(entry)), "ruling D-410 · 2026-10-06", "a team's own log, by its entries");
+        let cancelled = page(Some("cancelled"), Some("2026-07-21"));
+        assert_eq!(label_of("tickets/SR-121.md", Some(&cancelled), Some(("closed", -W_CLOSED)), None), "ticket · cancelled · 2026-07-21");
+        let roadmap = page(Some("ruled D-336 (Chris, 2026-10-01)"), Some("2026-10-01"));
+        assert_eq!(label_of("Design/Game/ROADMAP-0.1.0.md", Some(&roadmap), None, None), "reference · ruled D-336 · 2026-10-01");
+        let current = page(Some("current"), Some("2026-10-07"));
+        assert_eq!(label_of("Current/Project.md", Some(&current), Some(("rule", W_CURRENT)), None), "current · 2026-10-07");
+        let kept = page(Some("reference, kept current — 2026-09-25"), Some("2026-10-07"));
+        assert_eq!(label_of("Engine/Reference/Feature Status.md", Some(&kept), None, None), "reference · 2026-10-07");
+        assert_eq!(label_of("Ways-of-Working/Lifecycle.md", None, Some(("rule", W_RULE)), Some("Docs lanes push main.")), "rule");
+        assert_eq!(label_of("Research/Ingested/Standup - 2026-09-12.md", None, Some(("record", -W_RECORD)), None), "record · 2026-09-12");
+        let verified = PageMeta { verified: Some("2026-09-20".into()), ..Default::default() };
+        assert_eq!(label_of("Design/Why.md", Some(&verified), None, None), "reference · verified 2026-09-20");
+        let retired = PageMeta { status: Some("superseded".into()), replaced_by: vec!["[[Rules]]".into()], ..Default::default() };
+        assert_eq!(label_of("Ways-of-Working/Old.md", Some(&retired), Some(("closed", -W_CLOSED)), None), "record · superseded · replaced by [[Rules]]");
+        assert_eq!(status_clause("an extraordinarily long status that runs on and on"), "an extraordinarily long status t…");
+        assert_eq!(status_clause("ruled d-336 (chris, 2026-10-01)"), "ruled D-336", "an id keeps its capitals");
+        assert_eq!(status_clause("in-progress"), "in-progress");
+    }
+
+    #[test]
+    fn hit_label_reads_the_index_and_skips_code() {
+        let mut db = Db::open_in_memory().unwrap();
+        for (p, kind) in [("tickets/SR-1.md", "md"), ("src/main.rs", "code")] {
+            db.upsert_file(p, kind, 1, 1, "indexed", None, "x").unwrap();
+        }
+        db.set_page_meta("tickets/SR-1.md", Some(&PageMeta { status: Some("done".into()), ..Default::default() })).unwrap();
+        refresh_with(&db, &Roles::default(), None).unwrap();
+        assert_eq!(hit_label(&db, "tickets/SR-1.md", None).unwrap().as_deref(), Some("ticket · done"));
+        assert_eq!(hit_label(&db, "src/main.rs", None).unwrap(), None);
     }
 
     #[test]

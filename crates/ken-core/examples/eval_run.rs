@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Phases: setup · index · embed · wiki · extract [minutes] · kg · ask
-//! <questions.tsv> · kb-ask <kb-questions.tsv> · chat <questions.tsv> ·
+//! <questions.tsv> · kb-ask <kb-questions.tsv> · supersede · chat <questions.tsv> ·
 //! ingest <file> · pass · transcribe <file> · drift · drift-change <member>
 //! <file> · ignore <member> · model <member> · sql <member> <query> · status.
 //! Each prints a Markdown report on stdout.
@@ -23,6 +23,12 @@
 //! default `Shattered-Realms-Docs`) separated by `;`. Files the run keeps go
 //! under `KEN_EVAL_OUT` (default `<parent>/../eval-out`). `KEN_EVAL_MEMBERS`
 //! (comma-separated folder names) keeps `index` and `embed` to those members.
+//!
+//! `supersede` runs the supersede pass on the knowledge base (`KEN_EVAL_KB`):
+//! one Claude call per cluster of rulings (`KEN_EVAL_MODEL`, default `opus`;
+//! `KEN_EVAL_WORKERS` calls at a time, default 3), the pairs stored in its
+//! index and written to `supersede.tsv`. `KEN_EVAL_DRY=1` only clusters, with
+//! no call; `KEN_SUPERSEDE_MIN`, `_NEIGHBOURS` and `_MAX` tune the clusters.
 //!
 //! It refuses to run without `KEN_DATA_DIR`, so it can never write into the
 //! app's own data.
@@ -87,6 +93,7 @@ fn main() {
         "kg" => phase_kg(&base, &parent),
         "ask" => phase_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "kb-ask" => phase_kb_ask(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("kb-questions.tsv"))),
+        "supersede" => phase_supersede(&base, &parent),
         "look" => phase_look(&base, &parent, Path::new(args.get(2).map(String::as_str).unwrap_or("questions.tsv"))),
         "drift" => phase_drift(&base, &parent),
         "drift-change" => phase_drift_change(&base, &parent, &args[2], &args[3]),
@@ -918,6 +925,101 @@ fn phase_kb_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
     let path = out.join("kb-ask.tsv");
     std::fs::write(&path, rows.join("\n") + "\n").map_err(|e| Error::io(&path, e))?;
     println!("\nwritten: `{}`", path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------- supersede
+
+/// The supersede pass on the knowledge base, as the app would run it: its
+/// decisions log's clusters, one Claude call each, the pairs stored in its
+/// index. Prints the cost (clusters, calls, prompt size) and every pair.
+fn phase_supersede(base: &Path, parent: &Path) -> Result<()> {
+    use ken_core::supersede;
+    let kb = kb_member();
+    let Some((_, project)) = members(parent)?.into_iter().find(|(n, _)| n.eq_ignore_ascii_case(&kb)) else {
+        return Err(Error::Other(format!("{kb} is not a member of this workspace")));
+    };
+    let db = Db::open(base, project.config.id)?;
+    let roles = ken_core::authority::Roles::of_repo(&project.root);
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let mut tuning = supersede::Tuning::default();
+    if let Some(v) = env("KEN_SUPERSEDE_MIN").and_then(|v| v.parse().ok()) {
+        tuning.min_score = v;
+    }
+    if let Some(v) = env("KEN_SUPERSEDE_NEIGHBOURS").and_then(|v| v.parse().ok()) {
+        tuning.neighbours = v;
+    }
+    if let Some(v) = env("KEN_SUPERSEDE_MAX").and_then(|v| v.parse().ok()) {
+        tuning.max_cluster = v;
+    }
+    let dry = env("KEN_EVAL_DRY").is_some_and(|v| v != "0");
+    let model = env("KEN_EVAL_MODEL").unwrap_or_else(|| "opus".into());
+    let workers: usize = env("KEN_EVAL_WORKERS").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let bin = ken_core::runner::discover_claude().ok_or_else(|| Error::Other("claude CLI not found".into()))?;
+    // An empty folder to answer from: the prompt holds everything, and the
+    // repo's own CLAUDE.md would only add to every call.
+    let root = out_root(parent).join("supersede-cwd");
+    std::fs::create_dir_all(&root).map_err(|e| Error::io(&root, e))?;
+    let judge = |prompt: &str| -> Result<String> {
+        let t = Instant::now();
+        let out = assistant::oneshot_answer(&bin, &root, prompt, Some(&model), Duration::from_secs(600), &CancelToken::new())?;
+        eprintln!("  claude: {} chars in, {:.0}s", prompt.len(), t.elapsed().as_secs_f64());
+        match out {
+            assistant::OneshotOutcome::Completed(text) => Ok(text),
+            other => Err(Error::Other(format!("claude: {other:?}"))),
+        }
+    };
+    let t = Instant::now();
+    let reports = supersede::run(&db, &roles, &tuning, (!dry).then_some(&judge as &supersede::Judge<'_>), workers)?;
+    println!(
+        "# Supersede pass on `{kb}`{}\n\ntuning: min score {}, {} neighbours, at most {} entries a cluster · model `{model}` · {workers} at a time\n",
+        if dry { " (dry run: no calls)" } else { "" },
+        tuning.min_score,
+        tuning.neighbours,
+        tuning.max_cluster
+    );
+    let mut rows = vec!["log\tearlier\tlater\trelation\tpoint\tevidence\tearlier_line\tlater_line\tsource".to_string()];
+    for r in &reports {
+        let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+        for c in &r.clusters {
+            *sizes.entry(c.len()).or_default() += 1;
+        }
+        let in_clusters: usize = r.clusters.iter().map(Vec::len).sum();
+        println!(
+            "## `{}`\n\n| entries | with a vector | in a cluster | clusters | sizes | calls | failed | prompt characters | marked in the log | pairs |\n|---|---|---|---|---|---|---|---|---|---|\n| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.log,
+            r.entries,
+            r.vectors,
+            in_clusters,
+            r.clusters.len(),
+            sizes.iter().map(|(s, n)| format!("{n}×{s}")).collect::<Vec<_>>().join(" "),
+            r.calls,
+            r.failed,
+            r.prompt_chars,
+            r.marked,
+            r.pairs.len()
+        );
+        println!("### Clusters\n");
+        for c in &r.clusters {
+            println!("- {}", c.join(", "));
+        }
+        println!("\n### Pairs\n\n| earlier | later | relation | point | source | evidence |\n|---|---|---|---|---|---|");
+        for s in &r.pairs {
+            println!("| {} (L{}) | {} (L{}) | {} | {} | {} | {} |", s.earlier, s.earlier_line, s.later, s.later_line, s.relation, s.point, s.source, short(&s.evidence, 140).replace('|', "/"));
+            rows.push(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", s.log, s.earlier, s.later, s.relation, s.point, s.evidence.replace(['\t', '\n'], " "), s.earlier_line, s.later_line, s.source));
+        }
+        println!();
+    }
+    if reports.is_empty() {
+        println!("No decisions log with dated entries in `{kb}`.");
+    }
+    if !dry {
+        let out = out_root(parent);
+        std::fs::create_dir_all(&out).map_err(|e| Error::io(&out, e))?;
+        let path = out.join("supersede.tsv");
+        std::fs::write(&path, rows.join("\n") + "\n").map_err(|e| Error::io(&path, e))?;
+        println!("written: `{}` · {:.0}s", path.display(), t.elapsed().as_secs_f64());
+    }
     Ok(())
 }
 

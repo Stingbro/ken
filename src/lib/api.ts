@@ -1176,6 +1176,9 @@ export interface HitPage {
   replacedBy: string[];
   /** 0 binding, 1 the rest, 2 evidence or no longer current. */
   band: number;
+  /** How much the hit counts, one short line: `ruling D-410 · 2026-10-06`,
+   *  `ticket · cancelled · 2026-07-21`, `current · 2026-10-07`. */
+  label: string | null;
 }
 
 export type RouteMemberStatus = "searched" | "index-building" | "unavailable";

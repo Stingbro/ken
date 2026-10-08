@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -735,6 +735,28 @@ impl Db {
                 "#,
             )?;
             crate::authority::refresh_with(self, &crate::authority::Roles::default(), None)?;
+        }
+        if version < 20 {
+            // kb-trust (2026-10-07): which later entry of a decisions log
+            // supersedes or refines which earlier one, and on what point
+            // (`supersede`). Written by the pass, never into the log itself.
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS supersessions (
+                    log_path     TEXT NOT NULL,
+                    earlier      TEXT NOT NULL,
+                    later        TEXT NOT NULL,
+                    relation     TEXT NOT NULL,
+                    point        TEXT NOT NULL,
+                    evidence     TEXT NOT NULL,
+                    earlier_line INTEGER NOT NULL,
+                    later_line   INTEGER NOT NULL,
+                    source       TEXT NOT NULL,
+                    made_at      INTEGER NOT NULL,
+                    PRIMARY KEY (log_path, earlier, later)
+                );
+                "#,
+            )?;
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -2703,6 +2725,117 @@ impl Db {
             }
         }
         Ok(Some(out))
+    }
+
+    /// A file's chunks (id, first line, text), in order.
+    pub fn chunks_of(&self, rel_path: &str) -> Result<Vec<(i64, Option<i64>, String)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT id, line, text FROM chunks WHERE path = ?1 ORDER BY seq")?;
+        let rows = stmt
+            .query_map(params![rel_path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The stored meaning vectors of `chunk_ids`, those that have one. Empty
+    /// without a meaning index.
+    pub fn chunk_vectors(&self, chunk_ids: &[i64]) -> Result<std::collections::HashMap<i64, Vec<f32>>> {
+        let mut out = std::collections::HashMap::new();
+        if !self.vec_available || chunk_ids.is_empty() || !table_exists(&self.conn, "vec_chunks")? {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare_cached("SELECT embedding FROM vec_chunks WHERE chunk_id = ?1")?;
+        for id in chunk_ids {
+            if let Some(blob) = stmt.query_row(params![id], |r| r.get::<_, Vec<u8>>(0)).optional()? {
+                let v: Vec<f32> = blob.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                out.insert(*id, v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Store a log's supersessions (`supersede`), replacing the ones the
+    /// last pass stored for it.
+    pub fn replace_supersessions(&self, log: &str, pairs: &[crate::supersede::Supersession]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM supersessions WHERE log_path = ?1", params![log])?;
+        let now = crate::engine::now_epoch();
+        for s in pairs {
+            tx.execute(
+                "INSERT OR REPLACE INTO supersessions
+                   (log_path, earlier, later, relation, point, evidence, earlier_line, later_line, source, made_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![log, s.earlier, s.later, s.relation, s.point, s.evidence, s.earlier_line, s.later_line, s.source, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the index holds any supersessions: false for an index made
+    /// before the pass, or opened read-only before it was upgraded.
+    pub fn has_supersessions(&self) -> Result<bool> {
+        if !table_exists(&self.conn, "supersessions")? {
+            return Ok(false);
+        }
+        Ok(self.conn.prepare_cached("SELECT 1 FROM supersessions LIMIT 1")?.exists([])?)
+    }
+
+    fn supersessions_where(&self, clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<crate::supersede::Supersession>> {
+        if !table_exists(&self.conn, "supersessions")? {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT log_path, earlier, later, relation, point, evidence, earlier_line, later_line, source
+               FROM supersessions {clause} ORDER BY log_path, later_line, earlier_line"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt
+            .query_map(args, |r| {
+                Ok(crate::supersede::Supersession {
+                    log: r.get(0)?,
+                    earlier: r.get(1)?,
+                    later: r.get(2)?,
+                    relation: r.get(3)?,
+                    point: r.get(4)?,
+                    evidence: r.get(5)?,
+                    earlier_line: r.get(6)?,
+                    later_line: r.get(7)?,
+                    source: r.get(8)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every stored supersession, or a log's.
+    pub fn supersessions(&self, log: Option<&str>) -> Result<Vec<crate::supersede::Supersession>> {
+        match log {
+            Some(l) => self.supersessions_where("WHERE log_path = ?1", &[&l]),
+            None => self.supersessions_where("", &[]),
+        }
+    }
+
+    /// The pairs that touch entry `id` of `log`: those that supersede it,
+    /// and those it supersedes.
+    pub fn supersessions_of(&self, log: &str, id: &str) -> Result<(Vec<crate::supersede::Supersession>, Vec<crate::supersede::Supersession>)> {
+        Ok((
+            self.supersessions_where("WHERE log_path = ?1 AND earlier = ?2", &[&log, &id])?,
+            self.supersessions_where("WHERE log_path = ?1 AND later = ?2", &[&log, &id])?,
+        ))
+    }
+
+    /// A file's stored authority (`authority`): its tier's name and the
+    /// score it adds. None when it is neutral, or for an index made before
+    /// authority was stored.
+    pub fn authority_of(&self, rel_path: &str) -> Result<Option<(String, f64)>> {
+        if !table_exists(&self.conn, "file_authority")? {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .prepare_cached("SELECT tier, weight FROM file_authority WHERE rel_path = ?1")?
+            .query_row(params![rel_path], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .optional()?)
     }
 
     /// Read the frontmatter of every indexed Markdown page that has no

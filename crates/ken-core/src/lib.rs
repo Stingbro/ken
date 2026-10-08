@@ -50,6 +50,7 @@ pub mod routing;
 pub mod scan;
 pub mod search;
 pub mod settings;
+pub mod supersede;
 pub mod setup;
 pub mod sync;
 pub mod tasks;

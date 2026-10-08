@@ -336,8 +336,10 @@ when you don't know the project, use route_query first.",
         json!({
             "name": "read_document",
             "description": "Read a document, or just some of its lines, after a search: the \
-way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> you get the \
-lines around n (10 before, 40 after), numbered — one cheap call. start_line/end_line pick other \
+way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> a Markdown page \
+gives the whole section n is in (its heading to the next heading of the same level; in a \
+decisions log, the entry), up to about 8,000 characters, and a code or text file the lines \
+around n (10 before, 40 after), numbered — one cheap call. start_line/end_line pick other \
 lines. With no line, the whole file comes back (up to 200 KB, so costly for a big file). Also \
 takes a project-relative path (with `project`). Binary formats (docx, xlsx, pptx, pdf, images) \
 return the text Ken's indexer extracted.",
@@ -750,12 +752,14 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
                 ));
                 for (i, hit) in hits.iter().enumerate() {
                     let snippet = hit.snippet.replace("<mark>", "**").replace("</mark>", "**");
+                    let label = ken_core::authority::hit_label(&db, &hit.rel_path, None).ok().flatten();
                     out.push_str(&format!(
-                        "\n{}. {} {} ({}) — {}",
+                        "\n{}. {} {} ({}){} — {}",
                         i + 1,
                         kind_tag(&hit.rel_path),
                         hit.rel_path,
                         ken_address(project.config.id, &hit.rel_path),
+                        label.map(|l| format!(" ({l})")).unwrap_or_default(),
                         snippet
                     ));
                 }
@@ -779,6 +783,7 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
                 None => (path, None),
             };
             let range = line_range(args, fragment.as_deref());
+            let pointed = address_line(args, fragment.as_deref());
             let (project, note) = resolve_project(server, &named)?;
             // Validate before anything else so `..`/absolute paths are
             // refused outright, whatever the index says.
@@ -798,6 +803,12 @@ list_documents or search_knowledge to find valid paths.",
                 })?;
             let mut out = note.unwrap_or_default();
             match (row.kind.as_str(), range) {
+                // A page read from a hit's address: the section it is in.
+                ("md", Some(_)) if pointed.is_some() => {
+                    let bytes = std::fs::read(&abs)
+                        .map_err(|e| format!("could not read {path:?}: {e}"))?;
+                    out.push_str(&section_text(&db, &path, &String::from_utf8_lossy(&bytes), pointed.unwrap_or(1)));
+                }
                 ("md" | "txt" | "code", Some(r)) => {
                     let bytes = std::fs::read(&abs)
                         .map_err(|e| format!("could not read {path:?}: {e}"))?;
@@ -913,6 +924,83 @@ fn line_range(args: &Value, fragment: Option<&str>) -> Option<(i64, i64)> {
     }
 }
 
+/// The line an address points at (`#L88`), when nothing else picks the
+/// lines: no `start_line`/`end_line`, and not a range (`#L88-L120`).
+fn address_line(args: &Value, fragment: Option<&str>) -> Option<i64> {
+    if args.get("start_line").is_some_and(|v| !v.is_null()) || args.get("end_line").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    let frag = fragment?.strip_prefix('L')?;
+    if frag.contains('-') {
+        return None;
+    }
+    frag.parse::<i64>().ok().filter(|n| *n >= 1)
+}
+
+/// About this many characters of a section read_document returns from an
+/// address. Partly-right answers missed a fact in the same section as the
+/// hit, just past the 50 lines an address used to give (Shattered Realms,
+/// 2026-10-07); a decisions log's 50 lines were 24,000 characters of
+/// other rulings.
+const SECTION_CHARS: usize = 8_000;
+
+/// The section of a page (or the log entry) that `line` is in, numbered,
+/// cut at [`SECTION_CHARS`] with the cut said and where to read on. An entry
+/// a later one supersedes (`supersede`) says so under it, with the line to
+/// read.
+fn section_text(db: &Db, path: &str, text: &str, line: i64) -> String {
+    let Some((a, b, name)) = ken_core::chunker::section_at(path, text, line.max(1) as usize) else {
+        return numbered_lines(text, ((line - READ_BEFORE).max(1), line + READ_AFTER));
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let what = match &name {
+        Some(n) if n.starts_with('#') => format!("section {:?}", n.trim_start_matches('#').trim()),
+        Some(id) => format!("entry {id}"),
+        None => "section".to_string(),
+    };
+    let row = |n: usize| format!("{n}: {}\n", lines[n - 1]);
+    let cost = |n: usize| row(n).chars().count();
+    let size: usize = (a..=b).map(cost).sum();
+    let (from, to) = if size <= SECTION_CHARS {
+        (a, b)
+    } else {
+        // From the section's start when the line is near it, else from a
+        // little above the line; as far as the cap allows, the line always.
+        let line = (line as usize).clamp(a, b);
+        let lead: usize = (a..=line).map(cost).sum();
+        let from = if lead <= SECTION_CHARS / 2 { a } else { line.saturating_sub(READ_BEFORE as usize).max(a) };
+        let (mut to, mut used) = (from, cost(from));
+        while to < b && (to < line || used + cost(to + 1) <= SECTION_CHARS) {
+            to += 1;
+            used += cost(to);
+        }
+        (from, to)
+    };
+    let mut out = match (from, to) == (a, b) {
+        true => format!("[{what}: lines {a}-{b} of {total}]\n"),
+        false => format!(
+            "[{what}: lines {a}-{b} of {total}; lines {from}-{to} shown, cut at {} characters: read on with start_line={}]\n",
+            SECTION_CHARS,
+            to + 1
+        ),
+    };
+    for n in from..=to {
+        out.push_str(&row(n));
+    }
+    if let Some(id) = name.as_deref().filter(|n| !n.starts_with('#')) {
+        let on = |p: &str| if p.is_empty() { String::new() } else { format!(" on {p}") };
+        let (by, of) = db.supersessions_of(path, id).unwrap_or_default();
+        for s in by {
+            out.push_str(&format!("[{} (line {}) {} this entry{}]\n", s.later, s.later_line, s.relation, on(&s.point)));
+        }
+        for s in of {
+            out.push_str(&format!("[this entry {} {} (line {}){}]\n", s.relation, s.earlier, s.earlier_line, on(&s.point)));
+        }
+    }
+    out
+}
+
 /// Lines `a` to `b` of `text`, each led by its number, under a line saying
 /// which of how many they are.
 fn numbered_lines(text: &str, (a, b): (i64, i64)) -> String {
@@ -968,12 +1056,13 @@ fn closest_passages(
     for (i, hit) in hits.iter().enumerate() {
         let (snippet, line) = short_hit(db, Some(&project.root), query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, EXCERPT_CHARS);
         out.push_str(&format!(
-            "\n{}. {} {} ({}{}) — {}",
+            "\n{}. {} {} ({}{}){} — {}",
             i + 1,
             kind_tag(&hit.path),
             hit.path,
             ken_address(project.config.id, &hit.path),
             line.map(|l| format!("#L{l}")).unwrap_or_default(),
+            hit.page.as_ref().and_then(page_note).map(|n| format!(" ({n})")).unwrap_or_default(),
             snippet.split_whitespace().collect::<Vec<_>>().join(" "),
         ));
     }
@@ -2331,10 +2420,17 @@ you. Pass assignee \"all\" to list every ticket."
     Ok(out)
 }
 
-/// What an agent must know before it trusts a page hit: that it is retired
-/// (and what replaces it), generated, dated evidence, or when a person last
-/// verified it.
+/// What an agent must know before it trusts a page hit: its label (`ruling
+/// D-410 · 2026-10-06`, `ticket · cancelled · 2026-07-21`), or for a hit
+/// without one, that it is retired (and what replaces it), generated, dated
+/// evidence, or when a person last verified it.
 fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
+    if let Some(label) = &p.label {
+        return Some(match p.generated {
+            true => format!("{label}: fix the generator, not the page"),
+            false => label.clone(),
+        });
+    }
     if p.retired {
         return Some(match p.replaced_by.is_empty() {
             true => "retired".to_string(),
@@ -3689,6 +3785,40 @@ mod tests {
     }
 
     #[test]
+    fn every_page_hit_says_what_it_is_and_how_fresh() {
+        let (_base, ra, _rb, mut server) = two_project_fixture();
+        std::fs::create_dir_all(ra.path().join("tickets")).unwrap();
+        std::fs::write(
+            ra.path().join("tickets/AT-7.md"),
+            "---\nstatus: cancelled\nupdated: 2026-07-21\n---\n# Companion pets\n\nCompanion pets that follow the player.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ra.path().join("decisions")).unwrap();
+        let mut log = String::from("# DECISIONS\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        for i in (1..=6).rev() {
+            log.push_str(&format!("**D-{i:03}** · 2026-10-0{i} · pets — **RULING {i} ON SADDLES.** Chris, in chat.\n\n"));
+        }
+        log.push_str("**D-007** · 2026-10-07 · pets — **COMPANION PETS FOLLOW THE PLAYER.** Chris, in chat.\n");
+        std::fs::write(ra.path().join("decisions/DECISIONS.md"), &log).unwrap();
+        let project = Project::open(ra.path()).unwrap();
+        let mut db = Db::open(&server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        index_semantically(&project, &mut db);
+        drop(db);
+
+        let (text, is_err) = tool(&mut server, "route_query", json!({"query": "companion pets follow the player"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("tickets/AT-7.md"), "{text}");
+        assert!(text.contains("(ticket · cancelled · 2026-07-21)"), "{text}");
+        assert!(text.contains("(ruling D-007 · 2026-10-07)"), "the entry's own id and date: {text}");
+        let (text, _) = tool(&mut server, "semantic_search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
+        assert!(text.contains("(ticket · cancelled · 2026-07-21)") && text.contains("(ruling D-007 · 2026-10-07)"), "{text}");
+        let (text, _) = tool(&mut server, "search_knowledge", json!({"query": "companion pets", "project": "Atlas"}));
+        assert!(text.contains("(ticket · cancelled · 2026-07-21) — "), "{text}");
+        assert!(text.contains("decisions/DECISIONS.md (ken://") && text.contains(") (ruling) — "), "the log as a whole: {text}");
+    }
+
+    #[test]
     fn search_knowledge_falls_back_to_the_closest_passages_for_a_question() {
         let mut fx = fixture(true);
         // No file has "owns", "cutover" and "date" together.
@@ -3737,6 +3867,96 @@ mod tests {
         let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": address}));
         assert!(!is_err, "{text}");
         assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
+    }
+
+    #[test]
+    fn read_document_reads_the_section_or_log_entry_an_address_is_in() {
+        let mut fx = fixture(true);
+        let mut page = String::from("---\ntitle: Law\n---\n\n# Law\n\n## Grades\n\n");
+        for i in 1..=60 {
+            page.push_str(&format!("Grade lever {i}.\n"));
+        }
+        page.push_str("\n## Health\n\nLast and least.\n\n## Long\n\n");
+        for i in 1..=400 {
+            page.push_str(&format!("A long line of the long section, number {i}, padded out.\n"));
+        }
+        std::fs::write(fx.root.join("Law.md"), &page).unwrap();
+        let mut log = String::from("# DECISIONS\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        for i in (1..=6).rev() {
+            log.push_str(&format!("**D-{i:03}** · 2026-10-06 · pets — **RULING {i}.** Chris.\n\n"));
+        }
+        std::fs::write(fx.root.join("DECISIONS.md"), &log).unwrap();
+        std::fs::write(fx.root.join("code.rs"), (1..=100).map(|i| format!("// line {i}\n")).collect::<String>()).unwrap();
+        let project = Project::open(&fx.root).unwrap();
+        let mut db = Db::open(&fx.server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        drop(db);
+
+        // Line 65 is the 57th of 60 levers: the whole section, not 10 lines before and 40 after.
+        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65"}));
+        assert!(!is_err, "{text}");
+        assert!(text.starts_with("[section \"Grades\": lines 7-68 of"), "{text}");
+        assert!(text.contains("\n9: Grade lever 1.\n") && text.ends_with("68: Grade lever 60.\n"), "{text}");
+        assert!(!text.contains("Health"), "{text}");
+        // A long section is cut at about 8,000 characters, and says where to read on.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L300"}));
+        assert!(text.contains("cut at 8000 characters: read on with start_line="), "{text}");
+        assert!(text.contains("\n300: A long line") && text.len() < 8_400, "{} characters", text.len());
+        // A decisions log: the entry.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "DECISIONS.md#L9"}));
+        assert_eq!(text, "[entry D-005: lines 9-9 of 18]\n9: **D-005** · 2026-10-06 · pets — **RULING 5.** Chris.\n");
+        // Code keeps the line window; an explicit range still wins.
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "code.rs#L50"}));
+        assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65", "start_line": 65, "end_line": 66}));
+        assert_eq!(text, "[lines 65-66 of 475]\n65: Grade lever 57.\n66: Grade lever 58.\n");
+        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65-L66"}));
+        assert!(text.starts_with("[lines 65-66 of"), "{text}");
+    }
+
+    #[test]
+    fn a_superseded_entry_says_so_in_its_hit_and_when_read() {
+        let (_base, ra, _rb, mut server) = two_project_fixture();
+        std::fs::create_dir_all(ra.path().join("decisions")).unwrap();
+        let mut log = String::from("# DECISIONS\n\n## THE LOG\n\n### 2026-10-06\n\n");
+        log.push_str("**D-410** · 2026-10-06 · anchors, tools — **ANCHORS ARE PLACED ONLY THROUGH THE TOOLS; THE MERGE FIX IS NOT BUILT.** Chris.\n\n");
+        for i in (1..=5).rev() {
+            log.push_str(&format!("**D-{:03}** · 2026-09-0{i} · lore — **THE MAP HAS {i} REGIONS.** Chris.\n\n", 380 + i));
+        }
+        log.push_str("**D-379** · 2026-10-05 · spawn anchors, world tool — **THE SERVER NEVER OVERWRITES SPAWN ANCHORS; BUILD THE MERGE.** Chris.\n");
+        std::fs::write(ra.path().join("decisions/DECISIONS.md"), &log).unwrap();
+        let project = Project::open(ra.path()).unwrap();
+        let mut db = Db::open(&server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        index_semantically(&project, &mut db);
+        let pair = ken_core::supersede::Supersession {
+            log: "decisions/DECISIONS.md".into(),
+            earlier: "D-379".into(),
+            later: "D-410".into(),
+            relation: "supersedes".into(),
+            point: "who writes anchors".into(),
+            evidence: "placed only through the tools".into(),
+            earlier_line: 19,
+            later_line: 7,
+            source: "judged".into(),
+        };
+        db.replace_supersessions("decisions/DECISIONS.md", &[pair]).unwrap();
+        drop(db);
+
+        // The search finds D-379 by its words; D-410 comes in just above it.
+        let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "server never overwrites spawn anchors merge", "project": "Atlas"}));
+        assert!(!is_err, "{text}");
+        let earlier = text.find("(ruling D-379 · 2026-10-05 · superseded by D-410 on who writes anchors)").expect(&text);
+        let later = text.find("(ruling D-410 · 2026-10-06 · supersedes D-379)").expect(&text);
+        assert!(later < earlier, "the later ruling ranks first: {text}");
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "server never overwrites spawn anchors merge"}));
+        assert!(text.contains("superseded by D-410 on who writes anchors"), "{text}");
+
+        let (text, _) = tool(&mut server, "read_document", json!({"path": "decisions/DECISIONS.md#L19", "project": "Atlas"}));
+        assert!(text.starts_with("[entry D-379: lines 19-19 of 19]"), "{text}");
+        assert!(text.ends_with("[D-410 (line 7) supersedes this entry on who writes anchors]\n"), "{text}");
+        let (text, _) = tool(&mut server, "read_document", json!({"path": "decisions/DECISIONS.md#L7", "project": "Atlas"}));
+        assert!(text.ends_with("[this entry supersedes D-379 (line 19) on who writes anchors]\n"), "{text}");
     }
 
     #[test]

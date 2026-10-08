@@ -99,11 +99,12 @@ pub fn of(path: &str) -> ContentType {
         return ContentType::Spec;
     }
     // A ticket: a work item in a tickets folder, or named like one (ABC-123).
-    let ticket_name = name
-        .split(['.', ' ', '_'])
-        .next()
-        .and_then(|head| head.split_once('-'))
-        .is_some_and(|(key, num)| {
+    // `ROADMAP-0.1.0.md` is a version, not ticket 0: it was tagged a ticket
+    // beside a real one, and a reader took both for tickets (2026-10-07).
+    let head = name.split(['.', ' ', '_']).next().unwrap_or("");
+    let version = name[head.len()..].strip_prefix('.').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
+    let ticket_name = !version
+        && head.split_once('-').is_some_and(|(key, num)| {
             !key.is_empty() && key.chars().all(|c| c.is_ascii_alphabetic()) && !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
         });
     if prose && (dir_mentions(TICKET_DIRS) || ticket_name) {
@@ -160,6 +161,8 @@ mod tests {
             ("research/2026-09-10-team-review.vtt", Meeting),
             ("05 Tickets/A1.1 — Migration branch + backend skeleton.md", Ticket),
             ("tickets/KEN-012.md", Ticket),
+            ("Design/Game/ROADMAP-0.1.0.md", Doc),
+            ("Design/SR-121.md", Ticket),
             ("BE_PACK/seed/data/ATT Op Model Dev V2.ods", Data),
             ("package.json", Config),
             ("BE_PACK/backend/alembic.ini", Config),
