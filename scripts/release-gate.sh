@@ -40,6 +40,14 @@ else
   fi
 fi
 
+# A release that ships no "What's new" entry ships an empty in-app dialog, so
+# the gate refuses it. This runs only on an actual release decision, and fails
+# loudly rather than downgrading should_release (a silent skip would look like
+# a successful pipeline that released nothing).
+if [ "$should_release" = "true" ]; then
+  bash "$(dirname "${BASH_SOURCE[0]}")/check-whats-new.sh" "$version"
+fi
+
 {
   echo "should_release=${should_release}"
   echo "version=${version}"

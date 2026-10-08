@@ -18,6 +18,14 @@ describe("preview size gate", () => {
     expect(previewFormat("nb.ipynb", "binary")).toBe("ipynb");
   });
 
+  it("gates .drawio at the default cap", () => {
+    // .drawio still indexes as "binary" on stale indexes, so it matches by extension.
+    expect(previewFormat("d/arch.drawio", "binary")).toBe("drawio");
+    expect(capForFormat("drawio")).toBe(PREVIEW_CAP_BYTES);
+    expect(isPreviewTooLarge("d/arch.drawio", "binary", PREVIEW_CAP_BYTES + 1)).toBe(true);
+    expect(isPreviewTooLarge("d/arch.drawio", "drawio", 1024)).toBe(false);
+  });
+
   it("does not gate formats that already stream or are cheap", () => {
     expect(previewFormat("photo.png", "image")).toBeNull();
     expect(previewFormat("doc.pdf", "pdf")).toBeNull();

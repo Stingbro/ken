@@ -1,0 +1,88 @@
+/* GitHub alerts (`> [!NOTE]` …) rendered inside the Milkdown editor.
+   Colors come from the Paper & Ink tokens in src/app.css so the banners flip
+   with the theme automatically; only "important" needs its own hue, a muted
+   violet mixed to sit in the same warm family as the rest of the palette. */
+
+.milkdown .github-alert {
+  --alert-color: var(--accent);
+  border-left: 3px solid var(--alert-color);
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
+  background: color-mix(in srgb, var(--alert-color) 7%, transparent);
+  padding: 12px;
+  margin: 12px 0;
+}
+
+.milkdown .github-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--alert-color);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+  margin-bottom: 6px;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+.milkdown .github-alert-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.milkdown .github-alert-icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+/* The body is the ProseMirror content hole: keep its first and last blocks
+   flush so the banner's padding is the only spacing. */
+.milkdown .github-alert-body > :first-child {
+  margin-top: 0;
+}
+
+.milkdown .github-alert-body > :last-child {
+  margin-bottom: 0;
+}
+
+.milkdown .github-alert[data-kind="note"] {
+  --alert-color: var(--accent);
+}
+
+.milkdown .github-alert[data-kind="tip"] {
+  --alert-color: var(--healthy);
+}
+
+.milkdown .github-alert[data-kind="important"] {
+  --alert-color: #7b5a82;
+}
+
+.milkdown .github-alert[data-kind="warning"] {
+  --alert-color: var(--needs-input);
+}
+
+.milkdown .github-alert[data-kind="caution"] {
+  --alert-color: var(--danger);
+}
+
+/* On the dark ground the tokens already lighten themselves; the tip and
+   important hues need the extra lift the *-text tokens give. */
+:root[data-theme="dark"] .milkdown .github-alert {
+  background: color-mix(in srgb, var(--alert-color) 12%, transparent);
+}
+
+:root[data-theme="dark"] .milkdown .github-alert[data-kind="tip"] {
+  --alert-color: var(--healthy-text);
+}
+
+:root[data-theme="dark"] .milkdown .github-alert[data-kind="important"] {
+  --alert-color: #b89bc0;
+}
+
+:root[data-theme="dark"] .milkdown .github-alert[data-kind="warning"] {
+  --alert-color: var(--needs-input-text);
+}

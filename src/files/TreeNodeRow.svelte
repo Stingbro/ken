@@ -7,8 +7,11 @@
   import CloudIcon from "@lucide/svelte/icons/cloud";
   import SquareArrowOutUpRight from "@lucide/svelte/icons/square-arrow-out-up-right";
   import Check from "@lucide/svelte/icons/check";
+  import CheckCheck from "@lucide/svelte/icons/check-check";
+  import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Pencil from "@lucide/svelte/icons/pencil";
   import FilePlus from "@lucide/svelte/icons/file-plus";
+  import Link from "@lucide/svelte/icons/link";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import { app } from "../lib/app.svelte";
@@ -33,6 +36,8 @@
   const isDropTarget = $derived(drag.over === node.relPath);
   // Unread = changed by someone/something else since the user last looked.
   const isUnread = $derived(!isFolder && app.isUnread(node.relPath));
+  // Ken could not read it, and the person has not said to ignore it.
+  const isFailed = $derived(node.file?.status === "failed" && !app.ignored.includes(node.relPath));
 
   // Auto-expand when a reveal request targets this folder or something inside it.
   $effect(() => {
@@ -56,6 +61,12 @@
     const y = e.clientY;
     const fav = app.isFavorite(node.relPath);
     const kind = isFolder ? "folder" : "file";
+    // A folder is worth marking only when something inside it is still unread.
+    const hasUnread =
+      isFolder &&
+      app.unread.some(
+        (p) => p === node.relPath || p.startsWith(node.relPath + "/"),
+      );
     const items: MenuEntry[] = [
       {
         label: isFolder ? "Expand" : "Open",
@@ -68,6 +79,15 @@
         icon: ExternalLink,
         onSelect: () => void api.openExternal(node.relPath),
       },
+      ...(!isFolder
+        ? ([
+            {
+              label: "Open containing folder",
+              icon: FolderOpen,
+              onSelect: () => void api.revealInFolder(node.relPath),
+            },
+          ] as MenuEntry[])
+        : []),
       "separator",
       ...(isFolder
         ? ([
@@ -87,6 +107,14 @@
                 treeEdit.beginCreate("new-folder", node.relPath);
               },
             },
+            {
+              label: "New link",
+              icon: Link,
+              onSelect: () => {
+                open = true;
+                treeEdit.beginCreate("new-link", node.relPath);
+              },
+            },
           ] as MenuEntry[])
         : []),
       {
@@ -101,6 +129,16 @@
               label: "Mark as viewed",
               icon: Check,
               onSelect: () => void app.markSeen(node.relPath),
+            },
+          ] as MenuEntry[])
+        : []),
+      ...(hasUnread
+        ? ([
+            "separator",
+            {
+              label: "Mark folder as viewed",
+              icon: CheckCheck,
+              onSelect: () => void app.markFolderSeen(node.relPath),
             },
           ] as MenuEntry[])
         : []),
@@ -199,7 +237,7 @@
     {/if}
   </button>
   {#if open && !node.excluded}
-    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-folder") && treeEdit.target === node.relPath}
+    {#if (treeEdit.mode === "new-document" || treeEdit.mode === "new-link" || treeEdit.mode === "new-folder") && treeEdit.target === node.relPath}
       <InlineNameRow indent={8 + (depth + 1) * 18} />
     {/if}
     {#each node.children as child (child.relPath)}
@@ -210,7 +248,7 @@
   <button
     class="row file"
     class:selected={app.openFile === node.relPath}
-    class:failed={node.file?.status === "failed"}
+    class:failed={isFailed}
     class:unread={isUnread}
     style:padding-left={`${8 + depth * 18 + 10}px`}
     draggable="true"
@@ -226,16 +264,16 @@
       }
     }}
     ondragend={() => drag.reset()}
-    title={node.file?.status === "failed"
-      ? `Not indexed — ${node.file.error ?? "unknown reason"}`
+    title={isFailed
+      ? `Could not read — ${node.file?.error ?? "no reason given"}`
       : node.file?.status === "cloud_only"
         ? "Stored online only — open it and Ken will download it"
         : node.relPath}
   >
     <FileGlyph kind={node.file?.kind ?? "binary"} size="sm" />
     <span class="name">{node.name}</span>
-    {#if node.file?.status === "failed"}
-      <span class="fail-dot" title={node.file.error ?? "not indexed"}></span>
+    {#if isFailed}
+      <span class="fail-mark" title={node.file?.error ?? "could not read"}>could not read</span>
     {:else if node.file?.status === "cloud_only"}
       <CloudIcon class="cloud-dot" size={12} strokeWidth={1.75} />
     {:else if isUnread}
@@ -297,13 +335,15 @@
     padding: 0 5px;
     flex: none;
   }
-  .fail-dot {
+  .fail-mark {
     margin-left: auto;
-    width: 6px;
-    height: 6px;
-    border-radius: 3px;
-    background: var(--danger);
     flex: none;
+    font-size: 10px;
+    color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+    border-radius: 4px;
+    padding: 0 5px;
+    white-space: nowrap;
   }
   /* Unread = changed by someone else. Name goes semibold and an accent dot
      trails it — distinct from the red failure dot and the grey cloud icon. */

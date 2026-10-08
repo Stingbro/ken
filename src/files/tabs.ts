@@ -71,6 +71,27 @@ export function closeOthers(state: TabState, path: string): TabState {
   return { tabs, active };
 }
 
+/** Close every non-pinned tab strictly to the right of `path`. */
+export function closeRight(state: TabState, path: string): TabState {
+  const idx = state.tabs.findIndex((t) => t.path === path);
+  if (idx < 0) return state;
+  const tabs = state.tabs.filter((t, i) => i <= idx || t.pinned);
+  const active =
+    state.active !== null && tabs.some((t) => t.path === state.active)
+      ? state.active
+      : path;
+  return { tabs, active };
+}
+
+/** Close everything except pinned tabs. */
+export function closeAll(state: TabState): TabState {
+  const tabs = state.tabs.filter((t) => t.pinned);
+  const active = tabs.some((t) => t.path === state.active)
+    ? state.active
+    : (tabs[0]?.path ?? null);
+  return { tabs, active };
+}
+
 export function setPinned(
   state: TabState,
   path: string,

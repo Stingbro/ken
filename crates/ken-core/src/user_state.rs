@@ -62,6 +62,21 @@ pub struct UserState {
     /// first run.
     #[serde(default)]
     pub baselined: bool,
+
+    /// When the baseline was taken (Unix seconds). A file the index finds
+    /// later that is older than this was there before: the first scan had
+    /// not reached it yet. Only a file never seen and newer than this is
+    /// unread for being new. 0 (state written before this field) keeps the
+    /// old rule: every file not seen is unread.
+    #[serde(default)]
+    pub baselined_at: i64,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn state_dir(base: &Path) -> PathBuf {
@@ -115,7 +130,10 @@ impl UserState {
         }
         index
             .iter()
-            .filter(|(rel, ver)| self.seen.get(rel) != Some(ver))
+            .filter(|(rel, ver)| match self.seen.get(rel) {
+                Some(seen) => seen != ver,
+                None => ver.1 >= self.baselined_at,
+            })
             .map(|(rel, _)| rel.clone())
             .collect()
     }
@@ -129,6 +147,7 @@ impl UserState {
         }
         self.snapshot(index);
         self.baselined = true;
+        self.baselined_at = now_secs();
         true
     }
 
@@ -150,7 +169,29 @@ impl UserState {
         let before = (self.seen.clone(), self.baselined);
         self.snapshot(index);
         self.baselined = true;
+        if self.baselined_at == 0 {
+            // A state from before `baselined_at`: from now, an old file the
+            // index reaches late is not new.
+            self.baselined_at = now_secs();
+        }
         (self.seen.clone(), self.baselined) != before
+    }
+
+    /// Mark every currently-indexed file under `prefix` seen (the folder-level
+    /// "mark as viewed"). `prefix` is a project-relative folder path; a file
+    /// matches when it IS the prefix or sits beneath `prefix/`, so a sibling
+    /// folder sharing a name stem (`notes-old/`) is never swept in. Unlike
+    /// `mark_all_seen` this doesn't touch `baselined` — a partial sweep is not
+    /// a clean whole-project snapshot. Returns whether anything changed.
+    pub fn mark_seen_under(&mut self, prefix: &str, index: &[(String, FileVersion)]) -> bool {
+        let under = prefix.to_string() + "/";
+        let mut changed = false;
+        for (rel, ver) in index {
+            if rel == prefix || rel.starts_with(&under) {
+                changed |= self.mark_seen(rel.clone(), *ver);
+            }
+        }
+        changed
     }
 
     /// Replace `seen` with exactly the index's current versions. Dropping files
@@ -284,6 +325,9 @@ mod tests {
 
     // ── unread tracking ───────────────────────────────────────────────────
     // Version pairs are (size, mtime); equality is the "unchanged" test.
+    /// An mtime after any baseline a test takes (2096).
+    const LATER: i64 = 4_000_000_000;
+
     fn idx(entries: &[(&str, i64, i64)]) -> Vec<(String, FileVersion)> {
         entries
             .iter()
@@ -319,9 +363,9 @@ mod tests {
         assert!(state.baseline(&idx(&[("a.md", 1, 100)])));
         // A second baseline (e.g. next activation) must NOT re-snapshot, or it
         // would silently mark everything seen and hide real changes.
-        assert!(!state.baseline(&idx(&[("a.md", 9, 900), ("b.md", 2, 200)])));
+        assert!(!state.baseline(&idx(&[("a.md", 9, 900), ("b.md", 2, LATER)])));
         // The first snapshot stands: a.md changed → unread, b.md added → unread.
-        let now = idx(&[("a.md", 9, 900), ("b.md", 2, 200)]);
+        let now = idx(&[("a.md", 9, 900), ("b.md", 2, LATER)]);
         assert_eq!(state.unread(&now), vec!["a.md".to_string(), "b.md".to_string()]);
     }
 
@@ -338,8 +382,18 @@ mod tests {
     fn added_file_after_baseline_is_unread() {
         let mut state = UserState::default();
         state.baseline(&idx(&[("a.md", 1, 100)]));
-        let now = idx(&[("a.md", 1, 100), ("new.md", 3, 300)]);
+        let now = idx(&[("a.md", 1, 100), ("new.md", 3, LATER)]);
         assert_eq!(state.unread(&now), vec!["new.md".to_string()]);
+    }
+
+    #[test]
+    fn an_old_file_the_first_scan_reached_late_is_not_unread() {
+        // Baselined while the first scan was still going: a file it reaches
+        // afterwards was there all along, so it is not new.
+        let mut state = UserState::default();
+        state.baseline(&idx(&[("a.md", 1, 100)]));
+        let now = idx(&[("a.md", 1, 100), ("late.md", 3, 300)]);
+        assert!(state.unread(&now).is_empty());
     }
 
     #[test]
@@ -356,13 +410,13 @@ mod tests {
     fn mark_seen_clears_a_single_unread() {
         let mut state = UserState::default();
         state.baseline(&idx(&[("a.md", 1, 100)]));
-        let now = idx(&[("a.md", 1, 100), ("new.md", 3, 300)]);
+        let now = idx(&[("a.md", 1, 100), ("new.md", 3, LATER)]);
         assert_eq!(state.unread(&now), vec!["new.md".to_string()]);
         // Opening new.md records its current version → no longer unread.
-        assert!(state.mark_seen("new.md", (3, 300)));
+        assert!(state.mark_seen("new.md", (3, LATER)));
         assert!(state.unread(&now).is_empty());
         // Re-marking the same version is a no-op.
-        assert!(!state.mark_seen("new.md", (3, 300)));
+        assert!(!state.mark_seen("new.md", (3, LATER)));
     }
 
     #[test]
@@ -381,11 +435,42 @@ mod tests {
     fn mark_all_seen_clears_everything() {
         let mut state = UserState::default();
         state.baseline(&idx(&[("a.md", 1, 100)]));
-        let now = idx(&[("a.md", 1, 150), ("b.md", 2, 200), ("c.md", 3, 300)]);
+        let now = idx(&[("a.md", 1, 150), ("b.md", 2, LATER), ("c.md", 3, LATER)]);
         assert_eq!(state.unread(&now).len(), 3);
         assert!(state.mark_all_seen(&now));
         assert!(state.unread(&now).is_empty());
         assert!(state.baselined);
+    }
+
+    #[test]
+    fn mark_seen_under_clears_only_that_folder() {
+        let mut state = UserState::default();
+        state.baseline(&idx(&[("notes/a.md", 1, 100)]));
+        let now = idx(&[
+            ("notes/a.md", 1, 150),
+            ("notes/sub/b.md", 2, LATER),
+            // Same stem, different folder — must NOT be swept in.
+            ("notes-old/c.md", 3, LATER),
+            ("other.md", 4, LATER),
+        ]);
+        assert_eq!(state.unread(&now).len(), 4);
+        assert!(state.mark_seen_under("notes", &now));
+        assert_eq!(
+            state.unread(&now),
+            vec!["notes-old/c.md".to_string(), "other.md".to_string()]
+        );
+        // Re-marking the same versions is a no-op.
+        assert!(!state.mark_seen_under("notes", &now));
+    }
+
+    #[test]
+    fn mark_seen_under_matches_the_prefix_itself() {
+        // A file path passed as the prefix marks just that file.
+        let mut state = UserState::default();
+        state.baseline(&idx(&[("a.md", 1, 100)]));
+        let now = idx(&[("a.md", 1, 150), ("b.md", 2, LATER)]);
+        assert!(state.mark_seen_under("a.md", &now));
+        assert_eq!(state.unread(&now), vec!["b.md".to_string()]);
     }
 
     #[test]

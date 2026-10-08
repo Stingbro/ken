@@ -8,6 +8,7 @@
   import Presentation from "@lucide/svelte/icons/presentation";
   import ImageIcon from "@lucide/svelte/icons/image";
   import NotebookText from "@lucide/svelte/icons/notebook-text";
+  import Link from "@lucide/svelte/icons/link";
   import Folder from "@lucide/svelte/icons/folder";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import { glyphFor } from "../lib/format";
@@ -31,6 +32,7 @@
     pdf: FileType,
     image: ImageIcon,
     ipynb: NotebookText,
+    url: Link,
     binary: File,
     folder: Folder,
     "folder-open": FolderOpen,

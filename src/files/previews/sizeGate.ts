@@ -12,7 +12,7 @@ export const PREVIEW_CAP_BYTES = 15 * 1024 * 1024;
  *  same-size synchronous workbook parse would not. */
 export const PPTX_CAP_BYTES = 50 * 1024 * 1024;
 
-export type PreviewFormat = "xlsx" | "docx" | "pptx" | "ipynb";
+export type PreviewFormat = "xlsx" | "docx" | "pptx" | "ipynb" | "drawio";
 
 /** Byte cap for a given capped format. pptx is the one exception (50 MB). */
 export function capForFormat(format: PreviewFormat): number {
@@ -20,11 +20,12 @@ export function capForFormat(format: PreviewFormat): number {
 }
 
 /** The capped format for a file, or null if this preview isn't size-gated.
- *  ipynb indexes as "binary", so it is matched by extension; the office kinds
- *  come straight from the backend classifier. */
+ *  ipynb and drawio index as "binary" on older indexes, so they are matched by
+ *  extension; the office kinds come straight from the backend classifier. */
 export function previewFormat(relPath: string, kind: string): PreviewFormat | null {
   const ext = relPath.split(".").pop()?.toLowerCase() ?? "";
   if (ext === "ipynb") return "ipynb";
+  if (ext === "drawio") return "drawio";
   if (kind === "xlsx") return "xlsx";
   if (kind === "docx") return "docx";
   if (kind === "pptx") return "pptx";

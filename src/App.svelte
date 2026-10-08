@@ -3,6 +3,8 @@
   import { app } from "./lib/app.svelte";
   import Shell from "./shell/Shell.svelte";
   import ProjectPicker from "./onboarding/ProjectPicker.svelte";
+  import ContextMenu from "./lib/ui/ContextMenu.svelte";
+  import ConfirmMenu from "./lib/ui/ConfirmMenu.svelte";
 
   let ready = $state(false);
 
@@ -35,6 +37,12 @@
 {:else}
   <ProjectPicker />
 {/if}
+
+<!-- Mounted exactly once, at the root: screens stay mounted but hidden when you
+     switch tabs, so a per-screen menu would end up inside a `display:none`
+     ancestor and never show. -->
+<ContextMenu />
+<ConfirmMenu />
 
 <style>
   .boot {

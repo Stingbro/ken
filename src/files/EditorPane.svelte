@@ -7,20 +7,33 @@
   import Search from "@lucide/svelte/icons/search";
   import { api, type FileRow } from "../lib/api";
   import type { HydrationProgress } from "../lib/api";
-  import { app } from "../lib/app.svelte";
+  import { app, forFocused } from "../lib/app.svelte";
+  import { chats } from "../lib/chats.svelte";
+  import EditReview from "../chat/EditReview.svelte";
   import { find } from "../lib/find.svelte";
   import FindBar from "./FindBar.svelte";
   import { isEditable, timeAgo } from "../lib/format";
   import { delimiterForPath } from "../lib/csv";
   import MarkdownEditor from "./MarkdownEditor.svelte";
+  import PageLinks from "./PageLinks.svelte";
+  import CodeMap from "./CodeMap.svelte";
   import PlainEditor from "./PlainEditor.svelte";
   import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
   import PreviewLoading from "./previews/PreviewLoading.svelte";
   import TooLargeNotice from "./previews/TooLargeNotice.svelte";
   import { isHtmlPath } from "./previews/html";
+  import { shortcut } from "../lib/platform";
+  import { toast } from "../lib/toast.svelte";
+  import { resolveRelativeHref, resolveWikiLink, type LinkClick } from "./markdown/wikiLinks";
+  import { memberLeaf } from "../lib/api";
 
   let { relPath }: { relPath: string } = $props();
+
+  // An edit Claude proposed to this file in chat, shown over the page as a
+  // diff to accept or deny; and the place a clicked citation asked for.
+  const pendingEdit = $derived(chats.pendingEditFor(relPath));
+  const revealHere = $derived(app.revealAt?.path === relPath ? app.revealAt : null);
 
   // .csv/.tsv get the grid editor even though the backend kind is "code"
   // (csv) or "binary" (tsv). Routed by extension, ahead of the plain editor.
@@ -55,6 +68,12 @@
 
   let mode = $state<"wysiwyg" | "plain">("wysiwyg");
   let dirty = $state(false);
+  // A PDF whose form fields can be filled in: the preview saves the file
+  // itself, so the pane reports "Editing…/Saved" and drops the read-only badge.
+  let formFillable = $state(false);
+  // A failed save, shown beside the save dot. Deliberately NOT loadError: that
+  // replaces the whole pane, which would throw away the half-filled form.
+  let saveError = $state<string | null>(null);
   let savedAt = $state<number | null>(null);
   let knownMtime = $state(0);
   let diskChanged = $state(false);
@@ -84,6 +103,18 @@
     meta !== null && (isEditable(meta.kind) || isCsv) && !tooLarge,
   );
   const kind = $derived(meta?.kind ?? "binary");
+  // Ken could not read this file: the reason, and Ignore to stop flagging it.
+  const failure = $derived(
+    meta?.status === "failed" && !app.ignored.includes(relPath) ? (meta.error ?? "no reason given") : null,
+  );
+
+  async function ignoreFailure() {
+    try {
+      await app.ignoreFile(relPath);
+    } catch (e) {
+      toast.error("Could not ignore the file", e);
+    }
+  }
   // Read-only = we know what the file is and it renders as a preview rather than
   // an editor: either not editable at all (PreviewPane — PDF/image/office/HTML
   // page), or text that's too big to edit. Suppressed until the file is resolved
@@ -95,7 +126,8 @@
       !downloading &&
       cloudError === null &&
       loadError === null &&
-      (!editable || (isHtml && !showSource)),
+      (!editable || (isHtml && !showSource)) &&
+      !formFillable,
   );
 
   onMount(async () => {
@@ -106,11 +138,14 @@
     // after it finishes.
     api
       .onHydrationProgress((ev) => {
+        if (!forFocused(ev.project_id)) return;
         if (ev.relPath === relPath) hydration = ev;
       })
       .then((u) => (unlistenHydration = u));
     await load();
-    unlisten = await api.onIndexUpdated(() => void checkDisk());
+    unlisten = await api.onIndexUpdated((stats) => {
+      if (forFocused(stats.project_id)) void checkDisk();
+    });
   });
 
   async function load(forceCloudDownload = false) {
@@ -118,6 +153,8 @@
     cloudError = null;
     hydration = null;
     needsCloudConfirm = false;
+    formFillable = false;
+    saveError = null;
     resolving = true;
     try {
       meta = await api.fileMeta(relPath);
@@ -217,14 +254,67 @@
     saveTimer = setTimeout(() => void doSave(), 800);
   }
 
+  // The repo this file was opened in. A save goes to the focused repo, so
+  // once focus moves (the Files menu, a citation) this pane saves nothing:
+  // two repos can hold the same path (every wiki has START-HERE.md).
+  const owner = app.focused;
+  /** Saves so far: the links panel reads the page's links again after each. */
+  let savedCount = $state(0);
+
+  /** A `[[link]]` in the page: open the page it names, in this repo. */
+  /** The workspace's repos by folder name, for repo names in code. */
+  function repoNamed(name: string) {
+    const n = name.toLowerCase();
+    return app.members.find((m) => !!m.id && memberLeaf(m.name).toLowerCase() === n) ?? null;
+  }
+
+  /** Follow a link in the page: a [[page]], a page or web address, or a
+   *  repo's name (opens that repo in Files). */
+  function openLink(link: LinkClick): boolean {
+    if (link.kind === "wiki") {
+      void openWikiLink(link.target);
+      return true;
+    }
+    if (link.kind === "repo") {
+      const m = repoNamed(link.name);
+      if (!m?.id) return false;
+      void app.focusMember(m.id, { stay: true });
+      return true;
+    }
+    const href = link.href;
+    if (/^(https?:|mailto:)/i.test(href)) {
+      void api.openWebUrl(href).catch((e) => toast.error("Could not open the link", e));
+      return true;
+    }
+    if (href.startsWith("ken://")) return false;
+    const page = resolveRelativeHref(href, relPath);
+    if (!page) return false;
+    if (app.files.some((f) => f.relPath === page)) app.openTab(page, true);
+    else toast.show(`No file at ${page} in this repo.`);
+    return true;
+  }
+
+  async function openWikiLink(target: string) {
+    // The index knows aliases (a page's frontmatter names it too); the file
+    // list covers a page indexed a moment ago.
+    const page =
+      (await api.resolvePageLink(relPath, target).catch(() => null)) ??
+      resolveWikiLink(target, relPath, app.files.map((f) => f.relPath));
+    if (page) app.openTab(page, true);
+    else toast.show(`No page named "${target.split("|")[0]}" in this repo.`);
+  }
+
   async function doSave() {
     if (!dirty || diskChanged) return;
+    if (app.focused !== owner) return;
     try {
       knownMtime = await api.saveFile(relPath, latest);
       dirty = false;
       savedAt = Date.now();
+      saveError = null;
+      savedCount += 1;
     } catch (e) {
-      loadError = `Couldn't save: ${e}`;
+      saveError = `Couldn't save: ${e}`;
     }
   }
 
@@ -263,11 +353,18 @@
        where this bar floats, and the conflict decision takes priority. -->
   {#if !diskChanged}
   <div class="actions">
-    {#if editable}
+    {#if editable || formFillable}
       <span class="save-state">
         <span class="sdot" class:dirty></span>
         {#if dirty}Editing…{:else if savedAt}Saved {timeAgo(Math.floor(savedAt / 1000))}{:else}Saved{/if}
       </span>
+      {#if saveError}
+        <span class="save-error" title={saveError}>Couldn't save</span>
+      {/if}
+      <!-- The editable branch below closes with its own separator. -->
+      {#if !editable}<span class="sep"></span>{/if}
+    {/if}
+    {#if editable}
       {#if meta?.kind === "md" && meta.size <= WYSIWYG_MAX}
         <span class="sep"></span>
         <button class="action" onclick={toggleMode}>
@@ -283,7 +380,7 @@
     {/if}
     <button
       class="action icon-only"
-      title="Find in document (⌘F)"
+      title="Find in document ({shortcut('mod+F')})"
       aria-label="Find in document"
       onclick={() => find.toggle()}
     >
@@ -319,6 +416,22 @@
       </span>
       <button class="btn btn-small" onclick={keepMine}>Keep my version</button>
       <button class="btn btn-small" onclick={reloadFromDisk}>Take the disk version</button>
+    </div>
+  {/if}
+
+  {#if failure}
+    <div class="failed" role="status">
+      <span class="fdot"></span>
+      <span class="ftext"><strong>Ken could not read this file.</strong> {failure}</span>
+      <button class="btn btn-small" title="Stop flagging this file (only for you)" onclick={() => void ignoreFailure()}>
+        Ignore
+      </button>
+    </div>
+  {/if}
+
+  {#if pendingEdit}
+    <div class="proposal">
+      <EditReview messageId={pendingEdit.messageId} proposal={pendingEdit.proposal} showOpen={false} />
     </div>
   {/if}
 
@@ -389,13 +502,40 @@
           onchange={onEdit}
         />
       {:else if mode === "wysiwyg" && meta?.kind === "md"}
-        <MarkdownEditor initial={content} onchange={onEdit} />
+        <MarkdownEditor
+          initial={content}
+          onchange={onEdit}
+          reveal={revealHere}
+          onlink={openLink}
+          isRepo={(name) => !!repoNamed(name)}
+        />
       {:else}
-        <PlainEditor initial={content} onchange={onEdit} />
+        <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} />
       {/if}
     {/key}
   {:else if meta}
-    <PreviewPane {relPath} {kind} {meta} />
+    <PreviewPane
+      {relPath}
+      {kind}
+      {meta}
+      onfillable={() => (formFillable = true)}
+      onchange={() => {
+        dirty = true;
+        app.makeTabPersistent(relPath); // filling a form promotes a preview tab
+      }}
+      onsaved={(mtime) => {
+        dirty = false;
+        savedAt = Date.now();
+        knownMtime = mtime;
+        saveError = null;
+      }}
+      onerror={(m) => (saveError = m)}
+    />
+  {/if}
+  {#if meta?.kind === "md"}
+    <PageLinks {relPath} refresh={reloadKey + savedCount} />
+  {:else if /\.(rs|py|pyi|jsx?|mjs|cjs|tsx?|mts|cts|go|java|cs)$/i.test(relPath)}
+    <CodeMap {relPath} refresh={reloadKey} />
   {/if}
 </div>
 
@@ -421,18 +561,14 @@
     align-items: center;
     gap: 4px;
     padding: 3px 6px;
-    background: var(--surface);
-    border: 1px solid var(--border);
+    /* Its own surface, a step of ink off the pane's `--surface`, with a real
+       edge: in the pane's colour (and faded) it disappeared into the page. */
+    background: color-mix(in srgb, var(--ink) 7%, var(--surface));
+    border: 1px solid var(--border-strong);
     border-radius: var(--radius-control);
-    box-shadow: var(--shadow-control);
+    box-shadow: var(--shadow-card);
     font-size: 11.5px;
     color: var(--ink-tertiary);
-    opacity: 0.82;
-    transition: opacity 0.12s ease;
-  }
-  .actions:hover,
-  .actions:focus-within {
-    opacity: 1;
   }
   .action {
     display: inline-flex;
@@ -448,7 +584,7 @@
     flex: none;
   }
   .action:hover {
-    background: var(--sunken);
+    background: color-mix(in srgb, var(--ink) 14%, var(--surface));
     color: var(--ink);
   }
   .action.icon-only {
@@ -470,6 +606,15 @@
   }
   /* Non-interactive metadata badge, styled to sit quietly alongside
      .save-state rather than read as a button. */
+  /* Sits beside the save dot rather than replacing the pane: the user keeps the
+     form they filled in and can retry by typing again. */
+  .save-error {
+    padding: 0 4px;
+    flex: none;
+    white-space: nowrap;
+    color: var(--danger);
+    font-size: 11.5px;
+  }
   .read-only {
     display: inline-flex;
     align-items: center;
@@ -489,6 +634,12 @@
   .sdot.dirty {
     background: var(--needs-input);
   }
+  .proposal {
+    margin: 10px 16px 0;
+    max-height: 45vh;
+    overflow: auto;
+    flex: none;
+  }
   .conflict {
     display: flex;
     align-items: center;
@@ -500,6 +651,37 @@
     border-radius: 10px;
     font-size: 12.5px;
     flex: none;
+  }
+  .failed {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    /* Below the floating action bar, which sits over the top right. */
+    margin: 46px 20px 0;
+    padding: 9px 14px;
+    background: color-mix(in srgb, var(--danger) 6%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+    border-radius: 10px;
+    font-size: 12.5px;
+    flex: none;
+  }
+  .fdot {
+    width: 7px;
+    height: 7px;
+    border-radius: 4px;
+    background: var(--danger);
+    flex: none;
+  }
+  .ftext {
+    flex: 1;
+    min-width: 0;
+    line-height: 1.5;
+    color: var(--ink-secondary);
+    overflow-wrap: anywhere;
+  }
+  .ftext strong {
+    color: var(--danger);
+    font-weight: 600;
   }
   .cdot {
     width: 8px;
