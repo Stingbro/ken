@@ -200,9 +200,11 @@ const LOG_TITLE_MAX: usize = 300;
 /// An entry's id and title when `line` starts one, else None: a bold id at
 /// the start of the line, also as a list item (`**D-123** · 2026-10-06 ·
 /// topics — **THE RULING.**`, its title the next bold span or else the rest
-/// of the line), or a heading that starts with an id (`## R-12: Title`). An
-/// id is a capital letter, up to seven more capitals or digits, a dash and
-/// digits (`D-123`, `SR-001`, `U-4`).
+/// of the line); a plain id followed by its date, the form the method's
+/// template writes (`D-001 - 2026-01-01 - topic - THE RULING.`, see
+/// [`plain_entry`]); or a heading that starts with an id (`## R-12: Title`).
+/// An id is a capital letter, up to seven more capitals or digits, a dash
+/// and digits (`D-123`, `SR-001`, `U-4`).
 pub fn entry_start(line: &str) -> Option<(String, String)> {
     let t = line.trim_start();
     if t.starts_with('#') {
@@ -220,13 +222,65 @@ pub fn entry_start(line: &str) -> Option<(String, String)> {
         return Some((id, entry_title(rest)));
     }
     let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
-    let (id, rest) = take_id(t.strip_prefix("**")?)?;
+    let Some(bold) = t.strip_prefix("**") else {
+        let (id, _, ruling) = plain_entry(t)?;
+        let title = match ruling.split_once("**") {
+            Some((_, after)) => after.split_once("**").map_or(after, |(bold, _)| bold),
+            None => ruling,
+        };
+        return Some((id, entry_title(title)));
+    };
+    let (id, rest) = take_id(bold)?;
     let rest = rest.strip_prefix("**")?;
     let title = match rest.split_once("**") {
         Some((_, after)) => after.split_once("**").map_or(after, |(bold, _)| bold),
         None => rest,
     };
     Some((id, entry_title(title)))
+}
+
+/// A plain entry line: an id, then ` · ` or ` - ` and the entry's date
+/// (`D-001 - 2026-01-01 - topic - THE RULING.`, or `D-001 · 2026-09-02 ·
+/// save format — Worlds save as region files.`). Returns the id, the head
+/// (the date and topics, up to the ruling) and the ruling: after ` — ` when
+/// the line has one, else after the third separator. The date right after
+/// the id is what tells an entry from a sentence that starts with an id.
+fn plain_entry(t: &str) -> Option<(String, &str, &str)> {
+    let (id, rest) = take_id(t)?;
+    let sep = [" · ", " - "].into_iter().find(|s| rest.starts_with(s))?;
+    crate::pagemeta::date_in(rest.get(sep.len()..sep.len() + 10)?)?;
+    let split = match rest.find(" — ") {
+        Some(i) => i + " — ".len(),
+        None => {
+            let mut at = 0;
+            for _ in 0..3 {
+                match rest[at..].find(sep) {
+                    Some(j) => at += j + sep.len(),
+                    None => {
+                        at = rest.len();
+                        break;
+                    }
+                }
+            }
+            at
+        }
+    };
+    Some((id, &rest[..split], &rest[split..]))
+}
+
+/// An entry line with the bold taken off its id, so `**D-410** · …` reads
+/// as `D-410 · …`: the parsers written for the template's plain form (the
+/// drift check, the vocabulary, ingest's next id) then read a bold log too.
+/// Any other line comes back as it was.
+pub fn unbold_id(line: &str) -> std::borrow::Cow<'_, str> {
+    let t = line.trim_start();
+    let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
+    if let Some((id, rest)) = t.strip_prefix("**").and_then(take_id) {
+        if let Some(rest) = rest.strip_prefix("**") {
+            return std::borrow::Cow::Owned(format!("{id}{rest}"));
+        }
+    }
+    std::borrow::Cow::Borrowed(line)
 }
 
 /// `D-123` at the start of `s`, and what follows it.
@@ -275,7 +329,13 @@ pub fn chunk_entry(chunk_text: &str) -> Option<(String, String)> {
 /// The line that starts the entry a chunk of a log holds (see
 /// [`chunk_entry`]).
 pub fn entry_line(chunk_text: &str) -> Option<&str> {
-    chunk_text.lines().filter(|l| !l.trim().is_empty()).take(3).find(|l| entry_start(l).is_some())
+    // A fence ends the search: what follows is an example, not an entry.
+    chunk_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .take_while(|l| !l.trim_start().starts_with("```"))
+        .find(|l| entry_start(l).is_some())
 }
 
 /// What an entry line carries between its id and its title: its date and
@@ -289,7 +349,10 @@ pub fn entry_head(line: &str) -> Option<&str> {
         return Some("");
     }
     let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
-    let (_, rest) = take_id(t.strip_prefix("**")?)?;
+    let Some(bold) = t.strip_prefix("**") else {
+        return plain_entry(t).map(|(_, head, _)| head);
+    };
+    let (_, rest) = take_id(bold)?;
     let rest = rest.strip_prefix("**")?;
     Some(rest.split("**").next().unwrap_or(rest))
 }
@@ -304,7 +367,10 @@ pub fn entry_date(line: &str) -> Option<String> {
 /// that are not a date, split at commas.
 pub fn entry_topics(line: &str) -> Vec<String> {
     let Some(head) = entry_head(line) else { return Vec::new() };
-    head.split('·')
+    // The template's plain form separates its fields with ` - `.
+    let parts: Vec<&str> = if head.contains('·') { head.split('·').collect() } else { head.split(" - ").collect() };
+    parts
+        .into_iter()
         .map(|p| p.trim_matches(|c: char| c.is_whitespace() || matches!(c, '—' | '–' | '-' | ':' | '|')))
         .filter(|p| !p.is_empty() && crate::pagemeta::date_in(p).is_none())
         .flat_map(|p| p.split(','))
@@ -403,7 +469,19 @@ pub fn section_at(rel_path: &str, text: &str, line: usize) -> Option<(usize, usi
 /// an index, a section of notes) is chunked as prose, as before.
 fn chunk_log(text: &str, profile: &IndexProfile) -> Option<Vec<(usize, String)>> {
     let lines: Vec<&str> = text.lines().collect();
-    let entries: Vec<bool> = lines.iter().map(|l| entry_start(l).is_some()).collect();
+    // A line in a fence is never an entry: the template's format example
+    // (`D-001 - 2026-01-01 - topic - …`) sits in one.
+    let mut in_fence = false;
+    let entries: Vec<bool> = lines
+        .iter()
+        .map(|l| {
+            if l.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                return false;
+            }
+            !in_fence && entry_start(l).is_some()
+        })
+        .collect();
     if entries.iter().filter(|e| **e).count() < LOG_MIN_ENTRIES {
         return None;
     }
@@ -1187,5 +1265,34 @@ mod tests {
         let chunks = chunk_file("a.txt", text, &profile);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].token_est, 10 / 4);
+    }
+
+    #[test]
+    fn the_templates_plain_entries_make_a_log_too() {
+        // The method's template writes `D-001 - date - topic - RULING.`, with
+        // its format example in a fence above the log.
+        let mut text = String::from("# Decisions\n\n## Entry Format\n\n```\nD-001 - 2026-01-01 - topic - THE RULING IN ONE BOLD SENTENCE.\n```\n\n## Log\n\n");
+        for i in 1..=6 {
+            text.push_str(&format!("D-00{i} - 2026-09-0{i} - saves, regions - RULING NUMBER {i}.\n  Why it was ruled, the traps around it and what it replaced: {i}.\n  sources: game:src/save.rs:{i}\n\n"));
+        }
+        let chunks = chunk_file("decisions/DECISIONS.md", &text, &IndexProfile::default_for("x.md"));
+        let entries: Vec<_> = chunks.iter().filter_map(|c| chunk_entry(&c.text)).collect();
+        assert_eq!(entries.len(), 6, "one chunk per ruling, the fenced example none: {chunks:?}");
+        assert_eq!(entries[2], ("D-003".to_string(), "RULING NUMBER 3".to_string()));
+        assert!(is_log("decisions/DECISIONS.md", &text));
+
+        let line = "D-003 - 2026-09-03 - saves, regions - RULING NUMBER 3.";
+        assert_eq!(entry_date(line).as_deref(), Some("2026-09-03"));
+        assert_eq!(entry_topics(line), vec!["saves", "regions"]);
+        let dot = "D-001 · 2026-09-02 · save format — Worlds save as region files.";
+        assert_eq!(entry_start(dot), Some(("D-001".into(), "Worlds save as region files".into())));
+        assert_eq!(entry_topics(dot), vec!["save format"]);
+        for not in ["D-12 not bold", "SR-121 - was cancelled", "D-4 - see the board, 2026-09-01"] {
+            assert_eq!(entry_start(not), None, "a sentence that starts with an id: {not}");
+        }
+
+        assert_eq!(unbold_id("**D-410** · 2026-10-06 · anchors — **X.**"), "D-410 · 2026-10-06 · anchors — **X.**");
+        assert_eq!(unbold_id("- **SR-12** · done"), "SR-12 · done");
+        assert_eq!(unbold_id("**Note** a bold word"), "**Note** a bold word");
     }
 }

@@ -385,6 +385,9 @@ pub fn parse_rulings(text: &str) -> Vec<Ruling> {
         if in_fence {
             continue;
         }
+        // `**D-410** · …` reads as `D-410 · …`.
+        let unbold = crate::chunker::unbold_id(t);
+        let t = unbold.trim();
         if t.starts_with("D-") && t[2..].starts_with(|c: char| c.is_ascii_digit()) {
             let sep = if t.contains(" · ") { " · " } else { " - " };
             let mut fields = t.split(sep);
@@ -1133,5 +1136,16 @@ updated: {{date}}
         assert_eq!(db.last_drift_run_at().unwrap(), Some(now));
         assert!(!due(&db, &project, now + 86_400).unwrap());
         assert!(due(&db, &project, now + 8 * 86_400).unwrap());
+    }
+
+    #[test]
+    fn a_bold_log_reads_like_a_plain_one() {
+        let log = "**D-410** · 2026-10-06 · anchors — **WRITTEN BY THE TOOLS.**\n  sources: game:src/a.rs:3\n\n\
+                   - **D-379** · 2026-10-05 · anchors — **THE SERVER NEVER OVERWRITES.** [SUPERSEDED BY D-410]\n";
+        let rs = parse_rulings(log);
+        assert_eq!(rs.len(), 2, "{rs:?}");
+        assert_eq!((rs[0].id.as_str(), rs[0].date.as_deref()), ("D-410", Some("2026-10-06")));
+        assert_eq!(rs[0].sources, vec!["game:src/a.rs:3".to_string()]);
+        assert!(!rs[0].superseded && rs[1].superseded && rs[1].id == "D-379");
     }
 }

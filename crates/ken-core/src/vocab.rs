@@ -193,7 +193,8 @@ pub fn parse_vocabulary(text: &str) -> Vec<Vec<String>> {
 
 /// Each decisions-log entry's topic and aliases, as one group. An entry
 /// starts with `D-nnn · date · topic — ruling` (`·` or ` - ` between
-/// fields); its `aliases:` line lists the other terms, comma separated.
+/// fields; the id may be bold); its `aliases:` line lists the other terms,
+/// comma separated.
 pub fn parse_decisions(text: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut current: Option<Vec<String>> = None;
@@ -207,7 +208,7 @@ pub fn parse_decisions(text: &str) -> Vec<Vec<String>> {
         if in_fence {
             continue;
         }
-        if let Some(topic) = entry_topic(t) {
+        if let Some(topic) = entry_topic(&crate::chunker::unbold_id(t)) {
             if let Some(g) = current.take() {
                 out.push(g);
             }
@@ -286,5 +287,11 @@ mod tests {
     fn alternatives_are_capped() {
         let v = Vocabulary::from_groups(vec![vec!["a1".into(), "b1".into(), "c1".into(), "d1".into(), "e1".into()]]);
         assert_eq!(v.alternatives("a1").len(), MAX_ALTERNATIVES);
+    }
+
+    #[test]
+    fn a_bold_decisions_entry_gives_its_topic_and_aliases() {
+        let log = "**D-410** · 2026-10-06 · anchors — **WRITTEN BY THE TOOLS.**\n  aliases: spawn points, markers\n";
+        assert_eq!(parse_decisions(log), vec![vec!["anchors".to_string(), "spawn points".to_string(), "markers".to_string()]]);
     }
 }

@@ -1129,15 +1129,18 @@ fn section_bullets(note: &str, heading: &str) -> Vec<String> {
 pub fn decisions_entry(log: &str, ruling: &str, decider: Option<&str>, date: &str, note_stem: &str) -> String {
     let next = log
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("D-"))
-        .filter_map(|r| r.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok())
+        .map(crate::chunker::unbold_id)
+        .filter_map(|l| l.trim().strip_prefix("D-").and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok()))
         .max()
         .unwrap_or(0)
         + 1;
     let topic: String = ruling.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+    // In the log's own style: a bold id when its entries have one.
+    let bold = log.lines().any(|l| crate::chunker::unbold_id(l).len() != l.len());
+    let id = if bold { format!("**D-{next:03}**") } else { format!("D-{next:03}") };
     let mut out = log.trim_end().to_string();
     out.push_str(&format!(
-        "\n\nD-{next:03} · {date} · {topic} — {ruling}\n  Why: said in the room; see the note.\n  sources: [[{note_stem}]]\n"
+        "\n\n{id} · {date} · {topic} — {ruling}\n  Why: said in the room; see the note.\n  sources: [[{note_stem}]]\n"
     ));
     if let Some(d) = decider {
         out.push_str(&format!("  decider: {d}\n"));
@@ -2690,5 +2693,12 @@ mod tests {
         .unwrap();
         assert!(asked.contains("set `kind: note`"));
         assert!(p.note.starts_with(&format!("{INGESTED}/Notes/2026-10/")), "the reply said meeting; the source says note: {}", p.note);
+    }
+
+    #[test]
+    fn a_bold_log_gets_its_next_entry_bold() {
+        let log = "# Decisions\n\n**D-410** · 2026-10-06 · anchors — **WRITTEN BY THE TOOLS.**\n";
+        let out = decisions_entry(log, "Anchors stay tool-written", None, "2026-10-08", "note");
+        assert!(out.contains("\n\n**D-411** · 2026-10-08 · Anchors stay tool-written — "), "{out}");
     }
 }

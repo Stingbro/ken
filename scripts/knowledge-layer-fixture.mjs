@@ -87,10 +87,22 @@ if (existsSync(vocab)) {
 }
 write(join(docs, "README.md"), "# Realms Docs\n\nThe wiki for Realms-Game.\n");
 mkdirSync(join(docs, ".obsidian"), { recursive: true });
+// Six rulings, so search cuts the log one ruling per chunk; D-006 reverses
+// D-003, and a cancelled ticket argues for D-003 again.
 write(
   join(docs, "_meta/DECISIONS.md"),
   "# Decisions\n\nD-001 · 2026-09-02 · save format — Worlds save as region files.\n" +
-    "  - \"regions, not one blob\" -\n  sources: Realms-Game:src/save.rs:2\n  aliases: world save, persistence\n",
+    "  - \"regions, not one blob\" -\n  sources: Realms-Game:src/save.rs:2\n  aliases: world save, persistence\n\n" +
+    "D-002 · 2026-09-03 · combat — Hits resolve at once, with no hit queue.\n  - \"no queue, hits land now\" -\n\n" +
+    "D-003 · 2026-09-04 · releases — We ship on Mondays. [SUPERSEDED BY D-006]\n  - \"Monday mornings, before standup\" -\n\n" +
+    "D-004 · 2026-09-05 · naming — The team says shard; the code says region.\n  - \"shard when we talk, region in code\" -\n\n" +
+    "D-005 · 2026-09-08 · backups — Keep the last three world backups.\n  - \"three, not ten\" -\n\n" +
+    "D-006 · 2026-09-20 · releases — We ship on Fridays, not Mondays.\n  - \"we ship on Friday, not Monday\" -\n  decider: Ana\n",
+);
+write(
+  join(docs, "tickets/RG-7.md"),
+  "---\nid: RG-7\ntitle: Ship on Mondays again\nstatus: cancelled\nupdated: 2026-09-21\n---\n" +
+    "# RG-7 Ship on Mondays again\n\nMove the release back to Monday mornings, before standup.\n",
 );
 write(
   join(docs, "Platform/Save.md"),

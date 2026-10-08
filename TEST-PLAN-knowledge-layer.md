@@ -4,7 +4,7 @@ One pass by hand, in the app, over a throwaway folder. Every check says what
 to do and what you should see. Mark each one ✓, ✗ (with what you saw instead),
 or skipped. Nothing here touches a real repo.
 
-Steps refer to the report "Ken at Level Two" and to `SESSION-HANDOFF.md`.
+Steps refer to the report "Ken at Level Two".
 
 ## 0. Before you start
 
@@ -440,6 +440,28 @@ keyword index over sections.
   digest. Opening Ken from the Start menu while it is in the tray brings the
   window back instead of a second copy. A screenshot in a repo is found by its
   text (OCR). Record a meeting captures you and the other side.
+
+## 20. The team's wiki answers first (MCP, and chat for the last two)
+
+The fixture's `_meta/DECISIONS.md` holds six rulings in the template's plain
+form; D-006 (ship on Fridays) reverses D-003 (ship on Mondays), and
+`tickets/RG-7.md`, cancelled, argues for Mondays again.
+
+- [ ] Through `ken-mcp`, `route_query` **when do we ship?** with no repo named:
+  `Realms-Docs` is searched although the question names no repo, and the hits
+  carry labels: D-006 reads `ruling D-006 · 2026-09-20`, RG-7 reads
+  `ticket · cancelled · 2026-09-21`. D-006 ranks above RG-7.
+- [ ] Each ruling is its own hit: the D-006 hit does not carry D-005's text.
+- [ ] `read_document` on the D-006 hit's address returns that whole entry, from
+  its `D-006` line to the line before the next entry, not a fixed window.
+- [ ] (needs `cargo run -p ken-core --example eval_run -- supersede` with
+  `KEN_EVAL_KB=Realms-Docs`; the app does not run the pass yet) After the pass,
+  the D-003 hit's label names D-006, and D-006 ranks ahead of it.
+- [ ] (needs Claude) In Ken's chat, ask **Should we move releases back to
+  Monday?** The answer cites D-006 as settled and does not recommend Monday;
+  it may mention RG-7 as cancelled.
+- [ ] (needs Claude) Ask **What do we call a region?** The answer gives
+  "shard" from D-004 or the Vocabulary page, and cites it.
 
 ## After
 
