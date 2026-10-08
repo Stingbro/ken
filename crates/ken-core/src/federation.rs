@@ -1412,7 +1412,7 @@ mod tests {
         assert!(pairs.iter().any(|(a, b)| [a.as_str(), b.as_str()] == ["Kyle Ahlstrom", "Kyle Alhstrom"] || [a.as_str(), b.as_str()] == ["Kyle Alhstrom", "Kyle Ahlstrom"]), "a typo is still asked: {pairs:?}");
     }
 
-    /// The roster says Stingbro and AlpahSignalAI are Chris Lee: the two
+    /// The roster says Stingbro and AlpahSignalAI are Chris Rowe: the two
     /// members' entities merge into him, under his roster name, and a roster
     /// person named like a bot is kept.
     #[test]
@@ -1433,15 +1433,15 @@ mod tests {
         let roster = vec![
             crate::people::Person {
                 id: "chris".into(),
-                name: "Chris Lee".into(),
-                emails: vec!["alpha.signal.ai@gmail.com".into()],
+                name: "Chris Rowe".into(),
+                emails: vec!["alpha@example.com".into()],
                 aliases: vec!["Stingbro".into(), "AlpahSignalAI".into()],
             },
             crate::people::Person { id: "mabel".into(), name: "Mabel Bot".into(), ..Default::default() },
         ];
         let plan = merge_snapshots(&[a.clone(), b.clone()], &roster, None, &CancelToken::new()).unwrap().unwrap();
         let names: Vec<(&str, &str)> = plan.clusters.iter().map(|c| (c.name.as_str(), c.kind.as_str())).collect();
-        assert_eq!(names, vec![("Chris Lee", "person"), ("Rift Studio", "topic"), ("Mabel Bot", "person"), ("Ana Ruiz", "person")]);
+        assert_eq!(names, vec![("Chris Rowe", "person"), ("Rift Studio", "topic"), ("Mabel Bot", "person"), ("Ana Ruiz", "person")]);
         let chris: Vec<&str> = plan.clusters[0].locals.iter().map(|(_, _, n)| n.as_str()).collect();
         assert_eq!(chris, vec!["Stingbro", "AlpahSignalAI"], "both members' names, one person");
         assert_eq!((plan.edges[0].src, plan.edges[0].dst), (0, 1), "edges follow the merged person");

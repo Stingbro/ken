@@ -5,7 +5,7 @@
 //! and exercise `.kenignore`. One phase per run, so each can be checked.
 //!
 //! ```text
-//! set KEN_DATA_DIR=C:\ken-eval\data      (required; never the app's own data)
+//! set KEN_DATA_DIR=<scratch>\data      (required; never the app's own data)
 //! set KEN_EVAL_TEAM=Payments             (the team; its new wiki is <team>-Wiki)
 //! set KEN_EVAL_EXTRA=Notes               (optional: a notes folder for the draft)
 //! cargo run --release -p ken-core --example eval_run -- <phase> <parent> [args]
@@ -19,8 +19,8 @@
 //!
 //! Knowledge-base questions (`kb-ask`, and `chat` with `KEN_EVAL_FORMAT=kb`)
 //! are `question<TAB>answer<TAB>key facts<TAB>wiki pages<TAB>category`, the
-//! pages as `path:lines` in the knowledge base (`KEN_EVAL_KB`, a member,
-//! default `Shattered-Realms-Docs`) separated by `;`. Files the run keeps go
+//! pages as `path:lines` in the knowledge base (`KEN_EVAL_KB`, a member's
+//! folder name, required) separated by `;`. Files the run keeps go
 //! under `KEN_EVAL_OUT` (default `<parent>/../eval-out`). `KEN_EVAL_MEMBERS`
 //! (comma-separated folder names) keeps `index` and `embed` to those members.
 //!
@@ -545,9 +545,9 @@ fn phase_chat(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
 // ------------------------------------------------------- knowledge base
 
 /// The knowledge base the KB questions are about: a member's folder name
-/// (`KEN_EVAL_KB`, default `Shattered-Realms-Docs`).
+/// (`KEN_EVAL_KB`); empty when unset, which the phases that need it refuse.
 fn kb_member() -> String {
-    std::env::var("KEN_EVAL_KB").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "Shattered-Realms-Docs".into())
+    std::env::var("KEN_EVAL_KB").unwrap_or_default().trim().to_string()
 }
 
 /// Whether `chat` reads the knowledge-base question file (`KEN_EVAL_FORMAT=kb`).
@@ -823,7 +823,7 @@ fn phase_kb_ask(base: &Path, parent: &Path, questions: &Path) -> Result<()> {
         .collect();
     let kb = kb_member();
     let Some((_, _, kb_db)) = ms.iter().find(|(n, _, _)| n.eq_ignore_ascii_case(&kb)) else {
-        return Err(Error::Other(format!("{kb} is not a member of this workspace; add it, index and embed it first")));
+        return Err(Error::Other(format!("knowledge base {kb:?} is not a member of this workspace: set KEN_EVAL_KB to its folder name, then add, index and embed it")));
     };
     // As route_query: members by their project name, each searched with the
     // question's vector only when its index was built by the same model.
@@ -937,7 +937,7 @@ fn phase_supersede(base: &Path, parent: &Path) -> Result<()> {
     use ken_core::supersede;
     let kb = kb_member();
     let Some((_, project)) = members(parent)?.into_iter().find(|(n, _)| n.eq_ignore_ascii_case(&kb)) else {
-        return Err(Error::Other(format!("{kb} is not a member of this workspace")));
+        return Err(Error::Other(format!("knowledge base {kb:?} is not a member of this workspace: set KEN_EVAL_KB to its folder name")));
     };
     let db = Db::open(base, project.config.id)?;
     let roles = ken_core::authority::Roles::of_repo(&project.root);

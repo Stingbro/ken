@@ -1234,7 +1234,7 @@ mod tests {
         ] {
             assert!(is_bot_or_agent(bot), "{bot} is a bot or agent");
         }
-        for person in ["Chris", "Ádám Liszkai", "AlpahSignalAI", "Claudette Ruiz", "Abbott", "ItsNeil17 / Neil"] {
+        for person in ["Chris", "Zoë Ångström", "AlpahSignalAI", "Claudette Ruiz", "Abbott", "PixelPat / Pat"] {
             assert!(!is_bot_or_agent(person), "{person} is a person");
         }
     }

@@ -5,9 +5,9 @@
 //! the workspace or the registry changes.
 //!
 //! ```text
-//! set KEN_DATA_DIR=C:\ken-eval\data      (required; never the app's own data)
+//! set KEN_DATA_DIR=<scratch>\data      (required; never the app's own data)
 //! cargo run --release -p ken-core --example add_member -- <parent> <member> <kind[,kind]> <team>
-//! cargo run --release -p ken-core --example add_member -- C:\ken-eval\sr Shattered-Realms-Docs team,wiki Shattered-Realms
+//! cargo run --release -p ken-core --example add_member -- <parent> Team-Docs team,wiki Team
 //! ```
 //!
 //! The member keeps the `.ken/project.json` it carries; one without gets its

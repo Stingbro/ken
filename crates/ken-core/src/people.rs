@@ -146,7 +146,7 @@ mod tests {
         write(
             root,
             "chris.md",
-            "---\nid: chris\nname: Chris\nemails: [14892384+Stingbro@users.noreply.github.com, nonameisavalibleatthemomment@gmail.com, alpha.signal.ai@gmail.com]\n\
+            "---\nid: chris\nname: Chris\nemails: [14892384+Stingbro@users.noreply.github.com, noname@example.com, alpha@example.com]\n\
              aliases:\n  - Stingbro\n  - AlpahSignalAI\npersona: Build   # for this team\n---\n\n# Chris\n",
         );
         write(root, "ana.md", "---\nid: ana\nemails: ana@example.com\n---\n");
@@ -165,7 +165,7 @@ mod tests {
         assert!(chris.commits_as("Someone", "Stingbro@users.noreply.github.com"));
         assert!(chris.commits_as("alpahsignalai", "other@example.com"));
         assert!(!chris.commits_as("Chrissy", "chrissy@example.com"));
-        assert!(chris.is_named("alpahsignalai") && chris.is_named("Alpha.Signal.AI@gmail.com") && chris.is_named("stingbro"));
+        assert!(chris.is_named("alpahsignalai") && chris.is_named("Alpha@Example.COM") && chris.is_named("stingbro"));
         assert!(!chris.is_named("Signal") && !chris.is_named(""));
         assert!(roster(&root.join("missing")).is_empty());
     }

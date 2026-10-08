@@ -26,7 +26,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("index") => index(Path::new(&args[1]), Path::new(&args[2])),
-        Some("ask") => ask(Path::new(&args[1]), Path::new(&args[2]), args.get(3).map(String::as_str).unwrap_or("Shattered-Realms")),
+        Some("ask") => ask(Path::new(&args[1]), Path::new(&args[2]), args.get(3).map(String::as_str).unwrap_or("repo")),
         _ => eprintln!("usage: words_probe index <repo> <index.db> | ask <index.db> <questions.tsv> [repo-name]"),
     }
 }

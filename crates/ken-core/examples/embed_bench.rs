@@ -2,7 +2,7 @@
 //! chunks from an index, and whether the two give the same vectors.
 //!
 //! ```text
-//! set KEN_DATA_DIR=C:\ken-eval\data
+//! set KEN_DATA_DIR=<scratch>\data
 //! cargo run --release -p ken-core --example embed_bench -- <index.db> [chunks]
 //! ```
 

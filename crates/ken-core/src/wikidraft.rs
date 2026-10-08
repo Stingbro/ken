@@ -4832,8 +4832,8 @@ mod tests {
             git_in(root, &["add", "-A"]);
             git_in(root, &["commit", "-q", "--author", who, "-m", &format!("change {n}")]);
         };
-        commit("Ádám Liszkai <adam@example.com>", "data/spawns/a.json");
-        commit("Ádám Liszkai <adam@example.com>", "data/spawns/b.json");
+        commit("Zoë Ångström <zoe@example.com>", "data/spawns/a.json");
+        commit("Zoë Ångström <zoe@example.com>", "data/spawns/b.json");
         commit("Chris <14892384+Stingbro@users.noreply.github.com>", "data/spawns/c.json");
         commit("Stingbro <99+stingbro@users.noreply.github.com>", "src/x.rs");
         commit("Chris <14892384+Stingbro@users.noreply.github.com>", "src/y.rs");
@@ -4842,7 +4842,7 @@ mod tests {
         commit("Hytale Sync Bot <sync@hytale.example>", "src/v.rs");
         commit("Cursor Agent <cursoragent@cursor.com>", "README.md");
         let rows = recent_contributors(root, &[]).unwrap();
-        assert!(rows.contains("data/: Ádám Liszkai (2), Chris (1)"), "UTF-8 names, most first: {rows}");
+        assert!(rows.contains("data/: Zoë Ångström (2), Chris (1)"), "UTF-8 names, most first: {rows}");
         assert!(rows.contains("src/: Chris (2)\n"), "one person per GitHub id, under the name used most: {rows}");
         assert!(!rows.contains("(top-level files)"), "a bot's only folder has no row: {rows}");
         for bot in ["dependabot", "Claude", "Sync Bot", "Cursor"] {
@@ -4876,8 +4876,8 @@ mod tests {
             git_in(root, &["commit", "-q", "--author", who, "-m", &format!("change {n}")]);
         };
         commit("Chris <14892384+Stingbro@users.noreply.github.com>", "src/a.rs");
-        commit("Stingbro <nonameisavalibleatthemomment@gmail.com>", "src/b.rs");
-        commit("AlpahSignalAI <alpha.signal.ai@gmail.com>", "src/c.rs");
+        commit("Stingbro <noname@example.com>", "src/b.rs");
+        commit("AlpahSignalAI <alpha@example.com>", "src/c.rs");
         commit("Ana Ruiz <ana@example.com>", "src/d.rs");
         commit("Mabel Bot <mabel@example.com>", "docs/e.md");
         commit("Hytale Sync Bot <sync@hytale.example>", "docs/f.md");
@@ -4894,8 +4894,8 @@ mod tests {
                     "people/chris.md",
                     "---
 id: chris
-name: Chris Lee
-emails: [14892384+Stingbro@users.noreply.github.com, nonameisavalibleatthemomment@gmail.com, alpha.signal.ai@gmail.com]
+name: Chris Rowe
+emails: [14892384+Stingbro@users.noreply.github.com, noname@example.com, alpha@example.com]
 aliases: [Stingbro, AlpahSignalAI]
 ---
 ",
@@ -4910,7 +4910,7 @@ name: Mabel Bot
         let roster = crate::people::roster(root);
         assert_eq!(roster.len(), 2);
         let rows = recent_contributors(root, &roster).unwrap();
-        assert!(rows.contains("src/: Chris Lee (3), Ana Ruiz (1)
+        assert!(rows.contains("src/: Chris Rowe (3), Ana Ruiz (1)
 "), "three identities, one person: {rows}");
         assert!(!rows.contains("AlpahSignalAI") && !rows.contains("Stingbro"), "{rows}");
         assert!(rows.contains("docs/: Mabel Bot (1)
