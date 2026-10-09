@@ -8,6 +8,7 @@ import "../src/app.css";
 import MarkdownEditor from "../src/files/MarkdownEditor.svelte";
 import ContextMenu from "../src/lib/ui/ContextMenu.svelte";
 import { drag } from "../src/files/dnd.svelte";
+import { installDropGuard } from "../src/lib/dropGuard";
 import { docDir, type AttachmentAdapter } from "../src/files/markdown/attachments";
 
 const params = new URLSearchParams(location.search);
@@ -22,8 +23,10 @@ const initial = await res.text();
 // App.svelte mounts the shared context menu once at the app root; the harness
 // has to do the same or the editor's right-click menus have nowhere to render.
 mount(ContextMenu, { target: document.body });
+// Likewise the window-level guard against stray OS file drops.
+installDropGuard(window);
 
-// Stand-in for `save_attachment` / `media_src`: "saved" files live in memory
+// Stand-in for `write_new_file` / `media_src`: "saved" files live in memory
 // as blob URLs, deduped like the backend (`name-1.png`), so pasted and dropped
 // files go through the same relative-path code as in the app.
 const saved = new Map<string, string>();

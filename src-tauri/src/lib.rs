@@ -1062,21 +1062,38 @@ fn save_file_bytes(
     finish_save(&app, &mut guard, &rel_path)
 }
 
-/// Save a file pasted or dropped into a Markdown document as a NEW file in the
-/// folder `x-dir` (project-relative, "" = root), named after `x-name`; returns
+/// Create a NEW folder `name` inside `dir_rel` ("" = root) for a folder dropped
+/// in from the OS; returns its project-relative path. A taken name is deduped
+/// (`Photos` → `Photos-1`) so a drop never merges into an existing folder.
+#[tauri::command]
+fn create_unique_folder(state: State<SharedState>, dir_rel: String, name: String) -> CmdResult<String> {
+    let guard = state.lock().unwrap();
+    let active = guard.active.as_ref().ok_or("no project open")?;
+    let dir = active.project.resolve(&dir_rel).map_err(err)?;
+    let created = ken_core::fsops::create_unique_dir(&dir, &name).map_err(err)?;
+    Ok(if dir_rel.is_empty() {
+        created
+    } else {
+        format!("{dir_rel}/{created}")
+    })
+}
+
+/// Save a file pasted or dropped into a Markdown document or the file tree as a
+/// NEW file in the folder `x-dir` (project-relative, "" = root), named after
+/// `x-name`; returns
 /// the project-relative path it landed at. The name is sanitized and deduped
 /// (`shot.png` → `shot-1.png`), never overwriting. The bytes come as the raw
 /// IPC body rather than a JSON number array (~4x smaller for a screenshot);
 /// the two strings ride in percent-encoded headers since header values are
 /// ASCII-only.
 #[tauri::command]
-fn save_attachment(
+fn write_new_file(
     app: AppHandle,
     state: State<SharedState>,
     request: tauri::ipc::Request<'_>,
 ) -> CmdResult<String> {
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
-        return Err("save_attachment expects the file bytes as a raw body".into());
+        return Err("write_new_file expects the file bytes as a raw body".into());
     };
     let header = |name: &str| -> CmdResult<String> {
         let value = request
@@ -5319,7 +5336,8 @@ pub fn run() {
             hydrate_file,
             save_file,
             save_file_bytes,
-            save_attachment,
+            write_new_file,
+            create_unique_folder,
             file_meta,
             extracted_text,
             get_ocr_regions,

@@ -16,6 +16,8 @@
     type MenuEntry,
   } from "../lib/ui/ContextMenu.svelte";
   import { canDrop, drag } from "./dnd.svelte";
+  import { hasFiles } from "./externalDrop";
+  import { importDrop } from "./treeDrop";
   import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
   import InlineNameRow from "./InlineNameRow.svelte";
@@ -89,15 +91,32 @@
 
   // Root drop zone — only the empty area of the tree (not rows).
   function onRootDragOver(e: DragEvent) {
+    // OS files over any spot no row claimed (the empty area, the "empty"
+    // notice) copy into the project root.
+    if (hasFiles(e.dataTransfer)) {
+      if (e.defaultPrevented) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      drag.over = "";
+      return;
+    }
     if (e.target !== e.currentTarget || !canDrop("")) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
     drag.over = "";
   }
   function onRootDragLeave(e: DragEvent) {
-    if (e.target === e.currentTarget && drag.over === "") drag.over = null;
+    const left = !(e.currentTarget as Node).contains(e.relatedTarget as Node | null);
+    if ((e.target === e.currentTarget || left) && drag.over === "") drag.over = null;
   }
   async function onRootDrop(e: DragEvent) {
+    if (hasFiles(e.dataTransfer)) {
+      if (e.defaultPrevented || !e.dataTransfer) return;
+      e.preventDefault();
+      drag.over = null;
+      void importDrop(e.dataTransfer, "");
+      return;
+    }
     if (e.target !== e.currentTarget || !canDrop("")) return;
     e.preventDefault();
     const from = drag.from;
