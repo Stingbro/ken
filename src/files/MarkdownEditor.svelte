@@ -6,8 +6,14 @@
   // Namespace import: Svelte reserves the `$` prefix, so `$prose` can only be
   // reached as a property.
   import * as milkdown from "@milkdown/kit/utils";
-  import { Plugin, PluginKey, TextSelection } from "@milkdown/kit/prose/state";
-  import type { Node as ProseNode } from "@milkdown/kit/prose/model";
+  import {
+    Plugin,
+    PluginKey,
+    TextSelection,
+    type Transaction,
+  } from "@milkdown/kit/prose/state";
+  import type { Node as ProseNode, Schema } from "@milkdown/kit/prose/model";
+  import { uploadConfig, type Uploader } from "@milkdown/kit/plugin/upload";
   import { Decoration, DecorationSet, type EditorView } from "@milkdown/kit/prose/view";
   import "@milkdown/crepe/theme/common/style.css";
   import "@milkdown/crepe/theme/frame.css";
@@ -44,11 +50,32 @@
   import { CURRENT_CLASS, MARK_CLASS } from "../lib/find-dom";
   import { MATCH_CAP, findTextMatches } from "../lib/find";
   import { find, type FindAdapter } from "../lib/find.svelte";
+  import { drag } from "./dnd.svelte";
+  import {
+    attachmentName,
+    docDir,
+    encodeHref,
+    isImageFile,
+    isImagePath,
+    relativeTo,
+    resolveSrc,
+    type AttachmentAdapter,
+  } from "./markdown/attachments";
 
   let {
     initial,
     onchange,
-  }: { initial: string; onchange: (markdown: string) => void } = $props();
+    relPath,
+    attachments,
+  }: {
+    initial: string;
+    onchange: (markdown: string) => void;
+    /** The document's project-relative path; links are written relative to it. */
+    relPath?: string;
+    /** Storage for pasted/dropped files. Without it (and `relPath`), Crepe's
+     *  stock behaviour applies. */
+    attachments?: AttachmentAdapter;
+  } = $props();
 
   let host: HTMLDivElement;
   let crepe: Crepe | undefined;
@@ -240,6 +267,138 @@
     }
   }
 
+  // --- Attachments ---------------------------------------------------------
+  // A pasted or dropped file is saved beside the document and linked with a
+  // relative, percent-encoded path, so the .md stays portable and renders on
+  // reload. Crepe's stock uploader writes `blob:` URLs that die with the page
+  // and silently drops anything that isn't an image.
+
+  /** Save `file` beside the document; the href to it, relative to the doc. */
+  async function saveBeside(adapter: AttachmentAdapter, docPath: string, file: File) {
+    const name = attachmentName(file, docPath, new Date());
+    const named = name === file.name ? file : new File([file], name, { type: file.type });
+    const saved = await adapter.save(named);
+    return { saved, href: encodeHref(relativeTo(docDir(docPath), saved)) };
+  }
+
+  /** An image node (Crepe's block image when present), else a paragraph with
+   *  the file name linked. Blocks, not bare text: plugin-upload splices the
+   *  result in with `replaceWith`, which needs whole nodes. */
+  function attachmentNode(schema: Schema, href: string, target: string, image: boolean) {
+    if (image) {
+      const imageType = schema.nodes["image-block"] ?? schema.nodes.image;
+      return imageType?.createAndFill({ src: href }) ?? null;
+    }
+    const label = target.slice(target.lastIndexOf("/") + 1);
+    const link = schema.marks.link.create({ href });
+    return schema.nodes.paragraph.create(null, schema.text(label, [link]));
+  }
+
+  const uploader: Uploader = async (files, schema) => {
+    const adapter = attachments;
+    const docPath = relPath;
+    if (!adapter || docPath === undefined) return [];
+    // One failed save must not sink the rest, and a rejection would leave
+    // plugin-upload's "Upload in progress" placeholder in the doc for good.
+    const settled = await Promise.allSettled(
+      Array.from(files).map(async (file) => {
+        const { saved, href } = await saveBeside(adapter, docPath, file);
+        return attachmentNode(schema, href, saved, isImageFile(file));
+      }),
+    );
+    const nodes: ProseNode[] = [];
+    for (const result of settled) {
+      if (result.status === "fulfilled" && result.value) nodes.push(result.value);
+      else if (result.status === "rejected") console.error("attachment save failed", result.reason);
+    }
+    return nodes;
+  };
+
+  /** The image block's own Upload button: same save, relative src back. */
+  async function uploadFromImageBlock(file: File): Promise<string> {
+    if (!attachments || relPath === undefined) return URL.createObjectURL(file);
+    return (await saveBeside(attachments, relPath, file)).href;
+  }
+
+  // Asset URLs for relative image srcs, per project path. Only successes are
+  // kept, so an image that appears on disk later still gets another try.
+  const resolved = new Map<string, string>();
+
+  /** Display URL for an image src: a document-relative path becomes a URL the
+   *  webview can load; anything else (http, data:, …) passes through. */
+  function proxyImageSrc(src: string): string | Promise<string> {
+    const adapter = attachments;
+    if (!adapter || relPath === undefined) return src;
+    const target = resolveSrc(relPath, src);
+    if (!target) return src;
+    const hit = resolved.get(target);
+    if (hit) return hit;
+    // The image component leaves the src unset if this rejects, so a failure
+    // degrades to the original src instead.
+    return Promise.resolve()
+      .then(() => adapter.resolve(target))
+      .then((url) => {
+        resolved.set(target, url);
+        return url;
+      })
+      .catch(() => src);
+  }
+
+  /**
+   * Insert a dropped node without leaving debris: a link goes inline at the
+   * drop point; a block image replaces an empty paragraph, or lands before or
+   * after the paragraph it was dropped in, rather than splitting it.
+   */
+  function insertDropped(tr: Transaction, pos: number, node: ProseNode): Transaction {
+    const target = tr.doc.resolve(pos);
+    const parent = target.parent;
+    const link = tr.doc.type.schema.marks.link;
+    // Not inside a code block: it takes no marks, so the link stays a block.
+    if (node.type.name === "paragraph" && parent.inlineContent && parent.type.allowsMarkType(link)) {
+      return tr.insert(pos, node.content);
+    }
+    if (node.isBlock && parent.isTextblock && target.depth > 0) {
+      if (parent.content.size === 0) {
+        return tr.replaceWith(target.before(), target.after(), node);
+      }
+      return tr.insert(target.parentOffset === 0 ? target.before() : target.after(), node);
+    }
+    return tr.replaceWith(pos, pos, node);
+  }
+
+  /**
+   * A file dragged in from Ken's own tree arrives as plain text (its path).
+   * Insert an image or a link to the existing file instead, relative to the
+   * document; nothing is copied. Drag state is left alone: the tree row's
+   * `dragend` resets it.
+   */
+  const treeDropPlugin = milkdown.$prose(
+    () =>
+      new Plugin({
+        key: new PluginKey("ken-tree-drop"),
+        props: {
+          // A DOM handler rather than `handleDrop`: Crepe's drop indicator
+          // claims every drop in `handleDrop` and would paste the path text.
+          handleDOMEvents: {
+            drop(view, event) {
+              const from = drag.from;
+              if (!from || drag.fromKind !== "file" || relPath === undefined) return false;
+              if (event.dataTransfer?.files.length) return false;
+              const at = view.posAtCoords({ left: event.clientX, top: event.clientY });
+              if (!at) return false;
+              const href = encodeHref(relativeTo(docDir(relPath), from));
+              const node = attachmentNode(view.state.schema, href, from, isImagePath(from));
+              if (!node) return false;
+              event.preventDefault();
+              view.dispatch(insertDropped(view.state.tr, at.pos, node).scrollIntoView());
+              view.focus();
+              return true;
+            },
+          },
+        },
+      }),
+  );
+
   onMount(async () => {
     crepe = new Crepe({
       root: host,
@@ -268,14 +427,28 @@
             addGithubAlertMenuGroup(builder);
           },
         },
+        // Covers inline images too: Crepe hands the same config to both.
+        [Crepe.Feature.ImageBlock]: {
+          onUpload: uploadFromImageBlock,
+          proxyDomURL: proxyImageSrc,
+        },
       },
     });
+    // After construction: Crepe installs its own (blob: URL) uploader in its
+    // constructor, and the last update wins. `enableHtmlFileUploader` stays
+    // off, so an image copied from a web page still pastes as HTML.
+    if (attachments && relPath !== undefined) {
+      crepe.editor.config((ctx) => {
+        ctx.update(uploadConfig.key, (prev) => ({ ...prev, uploader }));
+      });
+    }
     crepe.on((listener) => {
       listener.markdownUpdated((_ctx, markdown, prev) => {
         if (markdown !== prev) onchange(markdown);
       });
     });
     crepe.editor.use(findPlugin);
+    crepe.editor.use(treeDropPlugin);
     crepe.editor.use(githubAlertPlugins);
     crepe.editor.use(headingBackspace);
     crepe.editor.use(slashShortcutInputRule);

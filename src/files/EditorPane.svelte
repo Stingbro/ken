@@ -19,6 +19,7 @@
   import PreviewLoading from "./previews/PreviewLoading.svelte";
   import TooLargeNotice from "./previews/TooLargeNotice.svelte";
   import { isHtmlPath } from "./previews/html";
+  import { docDir, type AttachmentAdapter } from "./markdown/attachments";
 
   let { relPath }: { relPath: string } = $props();
 
@@ -218,6 +219,14 @@
     await doSave();
   }
 
+  // Files pasted or dropped into the Markdown editor are saved beside the
+  // document; relative image srcs render through the asset protocol.
+  const attachments: AttachmentAdapter = {
+    save: async (file) =>
+      api.saveAttachment(docDir(relPath), file.name, new Uint8Array(await file.arrayBuffer())),
+    resolve: (target) => api.mediaSrc(target),
+  };
+
   function onEdit(markdown: string) {
     latest = markdown;
     dirty = true;
@@ -405,7 +414,7 @@
           onchange={onEdit}
         />
       {:else if mode === "wysiwyg" && meta?.kind === "md"}
-        <MarkdownEditor initial={content} onchange={onEdit} />
+        <MarkdownEditor initial={content} onchange={onEdit} {relPath} {attachments} />
       {:else}
         <PlainEditor initial={content} onchange={onEdit} />
       {/if}

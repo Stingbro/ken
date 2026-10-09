@@ -1062,6 +1062,53 @@ fn save_file_bytes(
     finish_save(&app, &mut guard, &rel_path)
 }
 
+/// Save a file pasted or dropped into a Markdown document as a NEW file in the
+/// folder `x-dir` (project-relative, "" = root), named after `x-name`; returns
+/// the project-relative path it landed at. The name is sanitized and deduped
+/// (`shot.png` → `shot-1.png`), never overwriting. The bytes come as the raw
+/// IPC body rather than a JSON number array (~4x smaller for a screenshot);
+/// the two strings ride in percent-encoded headers since header values are
+/// ASCII-only.
+#[tauri::command]
+fn save_attachment(
+    app: AppHandle,
+    state: State<SharedState>,
+    request: tauri::ipc::Request<'_>,
+) -> CmdResult<String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("save_attachment expects the file bytes as a raw body".into());
+    };
+    let header = |name: &str| -> CmdResult<String> {
+        let value = request
+            .headers()
+            .get(name)
+            .ok_or_else(|| format!("missing {name} header"))?;
+        let value = value.to_str().map_err(err)?;
+        Ok(ken_core::drawio::percent_decode(value))
+    };
+    let dir_rel = header("x-dir")?;
+    let file_name = header("x-name")?;
+
+    let mut guard = state.lock().unwrap();
+    let active = guard.active.as_mut().ok_or("no project open")?;
+    // `resolve` keeps the folder inside the project; the name is reduced to a
+    // single sanitized component, so the file cannot land anywhere else.
+    let dir = active.project.resolve(&dir_rel).map_err(err)?;
+    let (mut file, name) = ken_core::fsops::create_unique_file(&dir, &file_name).map_err(err)?;
+    {
+        use std::io::Write;
+        file.write_all(bytes).map_err(err)?;
+    }
+    drop(file);
+    let rel_path = if dir_rel.is_empty() {
+        name
+    } else {
+        format!("{dir_rel}/{name}")
+    };
+    finish_save(&app, &mut guard, &rel_path)?;
+    Ok(rel_path)
+}
+
 #[tauri::command]
 fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<FileRowDto>> {
     let guard = state.lock().unwrap();
@@ -5272,6 +5319,7 @@ pub fn run() {
             hydrate_file,
             save_file,
             save_file_bytes,
+            save_attachment,
             file_meta,
             extracted_text,
             get_ocr_regions,
