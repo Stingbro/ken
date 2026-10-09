@@ -6,8 +6,8 @@ indexes everything, watches for changes, and makes every fact findable:
 full-text search with AI quick answers, AI-maintained structured documents,
 Claude chats, a daily digest, deep web research, a knowledge map and
 timeline, an MCP server for your agents, and Git/shared-drive sync with
-conflict review. Specs live in `openspec/` and
-`docs/superpowers/specs/`.
+conflict review. Specs live in `docs/superpowers/specs/`, and the
+knowledge layer's plan of record in `docs/knowledge-core/DECISIONS.md`.
 
 ## Install
 
@@ -113,6 +113,6 @@ project folder; the only thing Ken writes to your folder is `.ken/`
 
 ## Specs
 
-Specs are managed with [OpenSpec](https://github.com/Fission-AI/OpenSpec):
-`openspec list` shows active changes; each change carries its proposal,
-design, delta specs, and task list under `openspec/changes/`.
+Design specs are in `docs/superpowers/specs/`. The knowledge layer is
+planned in `docs/knowledge-core/DECISIONS.md`, which implements the
+Knowledge, Drift and Decisions pages of Ways of Working.
