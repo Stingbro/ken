@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+### Bug Fixes
+
+- Stop OS file drops navigating the window; import them into editor and tree
+- Save pasted/dropped files beside the document and link them
+
+### Chores
+
+- Bump version to 0.3.0
+- Ignore Impeccable hook cache and local config
+
+### Features
+
+- Lettered sub-lists and aligned checkboxes
+- List hierarchy, link styling, overlay contrast, backspace reset, slash shortcuts
 ## 0.2.1
 
 ### Bug Fixes
@@ -8,6 +24,7 @@
 
 ### Chores
 
+- V0.2.1 [skip ci]
 - Bump version to 0.2.1
 ## 0.2.0
 
