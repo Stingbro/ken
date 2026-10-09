@@ -1,4 +1,4 @@
-//! Your day (`docs/design/home-whitebox.html`, frames Y1 to Y1c): my tasks
+//! Your day: my tasks
 //! and the team's ticket files, read and written the same way by the app
 //! and `ken-mcp`.
 //!
