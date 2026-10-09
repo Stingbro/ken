@@ -134,7 +134,7 @@ fn decode_payload(payload: &str) -> Option<String> {
 
 /// Minimal %XX decoder (draw.io percent-encodes the XML before deflating).
 /// Invalid escapes pass through untouched; '+' is NOT a space in this scheme.
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
