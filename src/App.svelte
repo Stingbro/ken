@@ -5,8 +5,13 @@
   import ProjectPicker from "./onboarding/ProjectPicker.svelte";
   import ContextMenu from "./lib/ui/ContextMenu.svelte";
   import ConfirmMenu from "./lib/ui/ConfirmMenu.svelte";
+  import { installDropGuard } from "./lib/dropGuard";
 
   let ready = $state(false);
+
+  // A file dropped where nothing accepts it must not navigate the window to
+  // that file (WebKit's default) — see lib/dropGuard.ts.
+  onMount(() => installDropGuard(window));
 
   onMount(async () => {
     try {

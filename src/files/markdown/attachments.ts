@@ -2,10 +2,10 @@
 // saved beside the document and linked with a path relative to it, and a
 // relative image src in the document is resolved back to a project path for
 // display. Pure so vitest covers the policy; the editor and the backend
-// command (`save_attachment`, which sanitizes and dedupes) are thin shells.
+// command (`write_new_file`, which sanitizes and dedupes) are thin shells.
 
 /**
- * How the editor reaches storage. In the app: `save_attachment` + `media_src`;
+ * How the editor reaches storage. In the app: `write_new_file` + `media_src`;
  * the harness swaps in an in-memory fake. Without one the editor keeps Crepe's
  * stock behaviour.
  */

@@ -20,6 +20,8 @@
   import { openContextMenu, type MenuEntry } from "../lib/ui/ContextMenu.svelte";
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import { canDrop, drag, parentOf } from "./dnd.svelte";
+  import { dropFolderFor, hasFiles } from "./externalDrop";
+  import { importDrop } from "./treeDrop";
   import { treeEdit } from "./treeEdit.svelte";
   import FileGlyph from "./FileGlyph.svelte";
   import InlineNameRow from "./InlineNameRow.svelte";
@@ -181,9 +183,31 @@
     drag.reset();
   }
 
+  // --- Files dragged in from the OS ----------------------------------------
+  // Copied into the folder they land on: a folder row is its own folder, a
+  // file row its parent (which lights up), an excluded folder refuses. The
+  // row claims the event (preventDefault) so the tree's root zone doesn't.
+  const importFolder = $derived(
+    dropFolderFor({ relPath: node.relPath, isFolder, excluded: node.excluded }),
+  );
+  function onExternalOver(e: DragEvent) {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = importFolder === null ? "none" : "copy";
+    drag.over = importFolder;
+  }
+  function onExternalDrop(e: DragEvent) {
+    e.preventDefault();
+    drag.over = null;
+    if (importFolder !== null && e.dataTransfer) void importDrop(e.dataTransfer, importFolder);
+  }
+  function onExternalLeave() {
+    if (drag.over === importFolder) drag.over = null;
+  }
+
   // Folder drop-target handlers.
   const droppable = $derived(isFolder && !node.excluded);
   function onDragOver(e: DragEvent) {
+    if (hasFiles(e.dataTransfer)) return onExternalOver(e);
     if (!droppable || !canDrop(node.relPath)) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
@@ -193,6 +217,7 @@
     if (drag.over === node.relPath) drag.over = null;
   }
   function onDrop(e: DragEvent) {
+    if (hasFiles(e.dataTransfer)) return onExternalDrop(e);
     if (!droppable || !canDrop(node.relPath)) return;
     e.preventDefault();
     const from = drag.from;
@@ -262,6 +287,9 @@
       }
     }}
     ondragend={() => drag.reset()}
+    ondragover={(e) => hasFiles(e.dataTransfer) && onExternalOver(e)}
+    ondragleave={(e) => hasFiles(e.dataTransfer) && onExternalLeave()}
+    ondrop={(e) => hasFiles(e.dataTransfer) && onExternalDrop(e)}
     title={node.file?.status === "failed"
       ? `Not indexed — ${node.file.error ?? "unknown reason"}`
       : node.file?.status === "cloud_only"

@@ -12,7 +12,7 @@
     TextSelection,
     type Transaction,
   } from "@milkdown/kit/prose/state";
-  import type { Node as ProseNode, Schema } from "@milkdown/kit/prose/model";
+  import { Fragment, type Node as ProseNode, type Schema } from "@milkdown/kit/prose/model";
   import { uploadConfig, type Uploader } from "@milkdown/kit/plugin/upload";
   import { Decoration, DecorationSet, type EditorView } from "@milkdown/kit/prose/view";
   import "@milkdown/crepe/theme/common/style.css";
@@ -51,6 +51,7 @@
   import { MATCH_CAP, findTextMatches } from "../lib/find";
   import { find, type FindAdapter } from "../lib/find.svelte";
   import { drag } from "./dnd.svelte";
+  import { hasFiles } from "./externalDrop";
   import {
     attachmentName,
     docDir,
@@ -294,14 +295,15 @@
     return schema.nodes.paragraph.create(null, schema.text(label, [link]));
   }
 
-  const uploader: Uploader = async (files, schema) => {
+  /** Save `files` beside the document; the nodes to insert for those saved. */
+  async function importFiles(files: File[], schema: Schema): Promise<ProseNode[]> {
     const adapter = attachments;
     const docPath = relPath;
     if (!adapter || docPath === undefined) return [];
     // One failed save must not sink the rest, and a rejection would leave
     // plugin-upload's "Upload in progress" placeholder in the doc for good.
     const settled = await Promise.allSettled(
-      Array.from(files).map(async (file) => {
+      files.map(async (file) => {
         const { saved, href } = await saveBeside(adapter, docPath, file);
         return attachmentNode(schema, href, saved, isImageFile(file));
       }),
@@ -312,7 +314,56 @@
       else if (result.status === "rejected") console.error("attachment save failed", result.reason);
     }
     return nodes;
-  };
+  }
+
+  const uploader: Uploader = (files, schema) => importFiles(Array.from(files), schema);
+
+  // --- Drops around the text -------------------------------------------------
+  // ProseMirror only listens on its own element, so a file dropped in the
+  // margins or below the last line would otherwise reach nobody (and the
+  // window guard would refuse it). The whole pane accepts OS files: inside the
+  // text the uploader handles them (and cancels the event); anywhere else they
+  // land at the nearest document position.
+  let fileDragOver = $state(false);
+
+  function canImport(e: DragEvent): boolean {
+    return hasFiles(e.dataTransfer) && !!attachments && relPath !== undefined && !!view;
+  }
+
+  function onPaneDragOver(e: DragEvent) {
+    if (!canImport(e)) return;
+    e.preventDefault();
+    e.dataTransfer!.dropEffect = "copy";
+    fileDragOver = true;
+  }
+
+  function onPaneDragLeave(e: DragEvent) {
+    const pane = e.currentTarget as HTMLElement;
+    if (!pane.contains(e.relatedTarget as Node | null)) fileDragOver = false;
+  }
+
+  /** Nearest document position to a point, clamped into the text column;
+   *  the end of the document when even that finds nothing. */
+  function nearestPos(editorView: EditorView, x: number, y: number): number {
+    const rect = editorView.dom.getBoundingClientRect();
+    const left = Math.min(Math.max(x, rect.left + 1), rect.right - 1);
+    const top = Math.min(Math.max(y, rect.top + 1), rect.bottom - 1);
+    return editorView.posAtCoords({ left, top })?.pos ?? editorView.state.doc.content.size;
+  }
+
+  async function onPaneDrop(e: DragEvent) {
+    fileDragOver = false;
+    if (e.defaultPrevented || !canImport(e) || !view) return;
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer!.files);
+    const at = nearestPos(view, e.clientX, e.clientY);
+    const nodes = await importFiles(files, view.state.schema);
+    if (!view || nodes.length === 0) return;
+    // The document may have changed during the save; keep the spot in range.
+    const pos = Math.min(at, view.state.doc.content.size);
+    view.dispatch(insertDropped(view.state.tr, pos, nodes, false).scrollIntoView());
+    view.focus();
+  }
 
   /** The image block's own Upload button: same save, relative src back. */
   async function uploadFromImageBlock(file: File): Promise<string> {
@@ -345,25 +396,33 @@
   }
 
   /**
-   * Insert a dropped node without leaving debris: a link goes inline at the
-   * drop point; a block image replaces an empty paragraph, or lands before or
-   * after the paragraph it was dropped in, rather than splitting it.
+   * Insert dropped nodes without leaving debris: a single link goes inline at
+   * the drop point (unless `inline` is off, for drops in the margins); blocks
+   * replace an empty paragraph, or land before or after the paragraph they
+   * were dropped in, rather than splitting it.
    */
-  function insertDropped(tr: Transaction, pos: number, node: ProseNode): Transaction {
+  function insertDropped(
+    tr: Transaction,
+    pos: number,
+    nodes: ProseNode[],
+    inline = true,
+  ): Transaction {
     const target = tr.doc.resolve(pos);
     const parent = target.parent;
     const link = tr.doc.type.schema.marks.link;
+    const only = nodes.length === 1 ? nodes[0] : null;
     // Not inside a code block: it takes no marks, so the link stays a block.
-    if (node.type.name === "paragraph" && parent.inlineContent && parent.type.allowsMarkType(link)) {
-      return tr.insert(pos, node.content);
+    if (inline && only?.type.name === "paragraph" && parent.inlineContent && parent.type.allowsMarkType(link)) {
+      return tr.insert(pos, only.content);
     }
-    if (node.isBlock && parent.isTextblock && target.depth > 0) {
+    const content = Fragment.from(nodes);
+    if (nodes.every((n) => n.isBlock) && parent.isTextblock && target.depth > 0) {
       if (parent.content.size === 0) {
-        return tr.replaceWith(target.before(), target.after(), node);
+        return tr.replaceWith(target.before(), target.after(), content);
       }
-      return tr.insert(target.parentOffset === 0 ? target.before() : target.after(), node);
+      return tr.insert(target.parentOffset === 0 ? target.before() : target.after(), content);
     }
-    return tr.replaceWith(pos, pos, node);
+    return tr.replaceWith(pos, pos, content);
   }
 
   /**
@@ -390,7 +449,7 @@
               const node = attachmentNode(view.state.schema, href, from, isImagePath(from));
               if (!node) return false;
               event.preventDefault();
-              view.dispatch(insertDropped(view.state.tr, at.pos, node).scrollIntoView());
+              view.dispatch(insertDropped(view.state.tr, at.pos, [node]).scrollIntoView());
               view.focus();
               return true;
             },
@@ -487,7 +546,15 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="editor-scroll" onpointerdown={notePointer} onclick={maybeOpenLightbox}>
+<div
+  class="editor-scroll"
+  class:file-drop={fileDragOver}
+  onpointerdown={notePointer}
+  onclick={maybeOpenLightbox}
+  ondragover={onPaneDragOver}
+  ondragleave={onPaneDragLeave}
+  ondrop={onPaneDrop}
+>
   <div class="measure" bind:this={host}></div>
 </div>
 <ImageLightbox />
@@ -501,6 +568,13 @@
        pane rather than the 720px text column (`100cqw` below). The pane's own
        width comes from the flex parent, so inline-size containment is safe. */
     container-type: inline-size;
+  }
+  /* Files dragged in from the OS: the whole pane takes them. Same accent
+     treatment as a file-tree drop target. */
+  .editor-scroll.file-drop {
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
   }
   .measure {
     max-width: 720px;

@@ -223,7 +223,7 @@
   // document; relative image srcs render through the asset protocol.
   const attachments: AttachmentAdapter = {
     save: async (file) =>
-      api.saveAttachment(docDir(relPath), file.name, new Uint8Array(await file.arrayBuffer())),
+      api.writeNewFile(docDir(relPath), file.name, new Uint8Array(await file.arrayBuffer())),
     resolve: (target) => api.mediaSrc(target),
   };
 

@@ -84,6 +84,27 @@ pub fn create_unique_file(
     ))
 }
 
+/// Create a NEW folder named after `desired` (sanitized like an attachment)
+/// inside `dir`: `Photos`, then `Photos-1`, `Photos-2`… The name is taken
+/// whole (a folder has no extension), and `create_dir` fails atomically on an
+/// existing entry, so a dropped folder is never merged into one already there.
+/// Returns the name it was created under.
+pub fn create_unique_dir(dir: &std::path::Path, desired: &str) -> std::io::Result<String> {
+    let name = sanitize_attachment_name(desired);
+    for n in 0..10_000 {
+        let candidate = if n == 0 { name.clone() } else { format!("{name}-{n}") };
+        match std::fs::create_dir(dir.join(&candidate)) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("too many folders named like {name}"),
+    ))
+}
+
 /// Whether moving `from_rel` to `to_rel` would put a folder onto itself or
 /// inside its own subtree. Rel paths use '/' separators (the project-relative
 /// convention everywhere in Ken).
@@ -162,6 +183,20 @@ mod tests {
         let (_, name) = create_unique_file(dir.path(), "../escape.png").unwrap();
         assert_eq!(name, "escape.png");
         assert!(dir.path().join("escape.png").is_file());
+    }
+
+    #[test]
+    fn create_unique_dir_never_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Photos")).unwrap();
+        std::fs::write(dir.path().join("Photos-1"), b"a file, not a folder").unwrap();
+
+        assert_eq!(create_unique_dir(dir.path(), "Photos").unwrap(), "Photos-2");
+        assert!(dir.path().join("Photos-2").is_dir());
+        // Folder names keep their dots: no extension split.
+        assert_eq!(create_unique_dir(dir.path(), "v1.2").unwrap(), "v1.2");
+        assert_eq!(create_unique_dir(dir.path(), "v1.2").unwrap(), "v1.2-1");
+        assert_eq!(create_unique_dir(dir.path(), "../up").unwrap(), "up");
     }
 
     #[test]

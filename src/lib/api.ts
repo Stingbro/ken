@@ -525,14 +525,19 @@ export const api = {
   /** Overwrite a file with raw bytes (PDF form fills). Returns the new mtime like saveFile. */
   saveFileBytes: (relPath: string, bytes: Uint8Array) =>
     invoke<number>("save_file_bytes", { relPath, bytes: Array.from(bytes) }),
+  /** Create a NEW folder `name` in `dirRel` ("" = root), deduped (`Photos-1`)
+   *  so a dropped folder never merges into an existing one; resolves to its
+   *  project-relative path. */
+  createUniqueFolder: (dirRel: string, name: string) =>
+    invoke<string>("create_unique_folder", { dirRel, name }),
   /**
    * Save a pasted/dropped file as a new file in folder `dirRel` ("" = project
    * root). The backend sanitizes and dedupes the name, never overwriting;
    * resolves to the project-relative path it landed at. The bytes go as the
    * raw IPC body (no JSON number array), the strings as encoded headers.
    */
-  saveAttachment: (dirRel: string, fileName: string, bytes: Uint8Array) =>
-    invoke<string>("save_attachment", bytes, {
+  writeNewFile: (dirRel: string, fileName: string, bytes: Uint8Array) =>
+    invoke<string>("write_new_file", bytes, {
       headers: {
         "x-dir": encodeURIComponent(dirRel),
         "x-name": encodeURIComponent(fileName),
