@@ -1332,19 +1332,8 @@ export interface TeamDigest {
 
 export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
-  /** Draft the first wiki pages into workspace member `wiki` from every
-   *  member and an optional folder of documents. Background; Team lists the
-   *  result among its findings. Never touches a page a person wrote. */
-  draftWiki: (wiki: string, extra: string | null) => invoke<void>("draft_wiki", { wiki, extra }),
-  /** Whether Claude is drafting this wiki's pages now. */
-  wikiDrafting: (wiki: string) => invoke<boolean>("wiki_drafting", { wiki }),
-  /** A wiki's draft ended (done or failed): its member name. */
-  onWikiDrafted: (fn: (wiki: string) => void): Promise<UnlistenFn> => listen<string>("wiki-drafted", (e) => fn(e.payload)),
   /** The page a [[link]] names, by file name or frontmatter alias. */
   resolvePageLink: (from: string, target: string) => invoke<string | null>("resolve_page_link", { from, target }),
-  /** Repos joined: each team wiki covering them drafts their Repo Map pages
-   *  and proposes changes to kept pages. Returns the wikis being updated. */
-  wikiAddRepos: (members: string[]) => invoke<string[]>("wiki_add_repos", { members }),
   /** A team wiki from the bundled template, in a new or empty folder. */
   /** `holdsTeam`: the team has no team repo, so the new docs repo also holds
    *  its tickets, decisions, ideas and people (one repo of both kinds). */
@@ -1517,7 +1506,7 @@ export const api = {
   /** Take a repo out of the workspace (its folder and files stay). Its
    *  team wiki's link report names the pages that still cite it. */
   workspaceRemoveMember: (name: string) =>
-    invoke<{ members: MemberOverview[]; wiki: string | null; citingPages: number }>("workspace_remove_member", { name }),
+    invoke<{ members: MemberOverview[] }>("workspace_remove_member", { name }),
   /** Join an existing sibling folder to the open workspace. It lands
    *  dormant and opens on first focus. */
   workspaceAddMember: (folder: string) =>

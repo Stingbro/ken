@@ -1469,11 +1469,11 @@ pub fn proposals_from(db: &Db, note: &str) -> Result<Vec<crate::db::ReviewItemRo
         .list_open_review_items()?
         .into_iter()
         .filter(|it| {
-            it.kind == crate::wikidraft::PROPOSAL_KIND
+            it.kind == crate::proposal::PROPOSAL_KIND
                 && it
                     .payload
                     .as_deref()
-                    .and_then(|p| serde_json::from_str::<crate::wikidraft::Proposal>(p).ok())
+                    .and_then(|p| serde_json::from_str::<crate::proposal::Proposal>(p).ok())
                     .and_then(|p| p.from)
                     .as_deref()
                     == Some(note)
@@ -1486,11 +1486,11 @@ pub fn proposals_from(db: &Db, note: &str) -> Result<Vec<crate::db::ReviewItemRo
 /// all the open items again each time.
 pub fn proposal_counts(open: &[crate::db::ReviewItemRow]) -> std::collections::HashMap<String, usize> {
     let mut out = std::collections::HashMap::new();
-    for it in open.iter().filter(|it| it.kind == crate::wikidraft::PROPOSAL_KIND) {
+    for it in open.iter().filter(|it| it.kind == crate::proposal::PROPOSAL_KIND) {
         let from = it
             .payload
             .as_deref()
-            .and_then(|p| serde_json::from_str::<crate::wikidraft::Proposal>(p).ok())
+            .and_then(|p| serde_json::from_str::<crate::proposal::Proposal>(p).ok())
             .and_then(|p| p.from);
         if let Some(from) = from {
             *out.entry(from).or_insert(0) += 1;
@@ -1504,13 +1504,13 @@ pub fn proposal_counts(open: &[crate::db::ReviewItemRow]) -> std::collections::H
 pub fn withdraw(db: &mut Db, note: &str, now: i64) -> Result<usize> {
     let mut n = 0;
     for it in db.list_open_review_items()? {
-        if it.kind != crate::wikidraft::PROPOSAL_KIND {
+        if it.kind != crate::proposal::PROPOSAL_KIND {
             continue;
         }
         let from = it
             .payload
             .as_deref()
-            .and_then(|p| serde_json::from_str::<crate::wikidraft::Proposal>(p).ok())
+            .and_then(|p| serde_json::from_str::<crate::proposal::Proposal>(p).ok())
             .and_then(|p| p.from);
         if from.as_deref() == Some(note) {
             db.resolve_review_item(it.id, now)?;
@@ -1563,11 +1563,11 @@ pub fn follow_ups(
     targets: &Targets,
     mut generate: impl FnMut(&str) -> Result<String>,
 ) -> Result<FollowUps> {
-    use crate::wikidraft::{file_page_proposal, Proposal};
+    use crate::proposal::{file_page_proposal, Proposal};
     let from = Some(placement.note.clone());
     let mut out = FollowUps::default();
     let stem = placement.note.rsplit('/').next().unwrap_or(&placement.note).trim_end_matches(".md").to_string();
-    let source = [crate::wikidraft::Source { label: format!("[[{stem}]]"), text: note.to_string() }];
+    let source = [crate::proposal::Source { label: format!("[[{stem}]]"), text: note.to_string() }];
     let item = db.list_open_review_items()?.into_iter().find(|it| it.kind == REVIEW_KIND && it.source_ref == placement.note);
     let item_id = item.as_ref().map(|it| it.id);
     let mut card = item.and_then(|it| card_of(it.payload.as_deref()));
@@ -1587,7 +1587,7 @@ pub fn follow_ups(
             continue;
         }
         let reply = generate(&edit_prompt(page, &change.change, base, &stem, note, date))
-            .and_then(|r| crate::wikidraft::finish_update(&r, base));
+            .and_then(|r| crate::proposal::finish_update(&r, base));
         let Ok(Some(proposed)) = reply else { continue };
         let proposed = cite(&proposed, &stem);
         let on_disk = fs::read_to_string(root.join(page)).unwrap_or_default();
@@ -1628,8 +1628,8 @@ pub fn follow_ups(
             method.push(PageChange { path: new.path.clone(), change: format!("a new page: {}", new.purpose.trim()) });
             continue;
         }
-        let reply = generate(&crate::wikidraft::prompt(&new.path, &new.purpose, None, &source, date))
-            .and_then(|r| crate::wikidraft::finish(&r));
+        let reply = generate(&crate::proposal::page_prompt(&new.path, &new.purpose, &source, date))
+            .and_then(|r| crate::proposal::finish(&r));
         let Ok(proposed) = reply else { continue };
         let proposed = cite(&proposed, &stem);
         let path = root.join(&new.path);
@@ -1674,7 +1674,7 @@ pub fn follow_ups(
             // as it is then, so rulings from one note apply in any order.
             let proposed = decisions_entry(&text, ruling, decider.as_deref(), date, &stem);
             let p = Proposal {
-                append: Some(crate::wikidraft::RulingEntry {
+                append: Some(crate::proposal::RulingEntry {
                     ruling: ruling.clone(),
                     decider: decider.clone(),
                     date: date.to_string(),
@@ -2343,7 +2343,7 @@ mod tests {
         assert_eq!(done.rulings, 1);
         assert_eq!(done.tickets, vec!["RT-005", "RT-006"]);
         assert!(fs::read_to_string(r.root.join("Ways-of-Working/Sizes.md")).unwrap().contains("a size"), "a method page is never edited");
-        let waits: Vec<crate::wikidraft::Proposal> = proposals_from(&r.db, &r.placement.note)
+        let waits: Vec<crate::proposal::Proposal> = proposals_from(&r.db, &r.placement.note)
             .unwrap()
             .into_iter()
             .map(|i| serde_json::from_str(i.payload.as_deref().unwrap()).unwrap())
@@ -2356,13 +2356,13 @@ mod tests {
         let method = waits.iter().find(|p| p.page == "tickets/RT-005.md").unwrap();
         assert!(method.proposed.contains("type: process") && method.proposed.contains("`Ways-of-Working/Sizes.md`: a preset is effort"));
         assert!(method.proposed.contains("[[2026-09-24-standup]]") && method.proposed.contains("\n## What and Why\n"));
-        crate::wikidraft::apply(&r.root, method).unwrap();
+        crate::proposal::apply(&r.root, method).unwrap();
         assert!(r.team_repo.join("tickets/RT-005.md").exists(), "accept writes the ticket");
         let action = waits.iter().find(|p| p.page == "tickets/RT-006.md").unwrap();
         assert!(action.proposed.contains("assignee: Ben") && action.proposed.contains("Fix the save bug"));
         let ruling = waits.iter().find(|p| p.append.is_some()).unwrap();
         assert_eq!(ruling.page, TEAM_DECISIONS, "the team repo's log wins");
-        crate::wikidraft::apply(&r.root, ruling).unwrap();
+        crate::proposal::apply(&r.root, ruling).unwrap();
         assert!(fs::read_to_string(r.team_repo.join(TEAM_DECISIONS)).unwrap().contains("D-092 · 2026-09-24"));
 
         // Every write is on the card, so Undo has it after a restart.
@@ -2403,7 +2403,7 @@ mod tests {
         let ruling = proposals_from(&r.db, &r.placement.note)
             .unwrap()
             .into_iter()
-            .map(|i| serde_json::from_str::<crate::wikidraft::Proposal>(i.payload.as_deref().unwrap()).unwrap())
+            .map(|i| serde_json::from_str::<crate::proposal::Proposal>(i.payload.as_deref().unwrap()).unwrap())
             .find(|p| p.append.is_some())
             .unwrap();
         assert_eq!(ruling.page, "_meta/DECISIONS.md", "the wiki's log, as before");
@@ -2429,11 +2429,11 @@ mod tests {
         let held = proposals_from(&r.db, &r.placement.note)
             .unwrap()
             .into_iter()
-            .map(|i| serde_json::from_str::<crate::wikidraft::Proposal>(i.payload.as_deref().unwrap()).unwrap())
+            .map(|i| serde_json::from_str::<crate::proposal::Proposal>(i.payload.as_deref().unwrap()).unwrap())
             .find(|p| p.page == "Current/Project.md")
             .unwrap();
         assert_eq!(held.base, edited, "the diff is against the page as it is now");
-        crate::wikidraft::apply(&r.root, &held).unwrap();
+        crate::proposal::apply(&r.root, &held).unwrap();
     }
 
     #[test]

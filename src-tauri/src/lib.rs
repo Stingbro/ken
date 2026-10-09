@@ -7096,44 +7096,6 @@ fn start_ingest_passes(state: &SharedState) {
     }
 }
 
-/// Every workspace member as the wiki sees it: folder, kinds and team from
-/// the registry.
-fn wiki_team_members(guard: &AppState) -> CmdResult<Vec<ken_core::wikidraft::TeamMember>> {
-    let ws = guard.workspace.as_ref().ok_or("open the workspace first")?;
-    let reg = Registry::load(&guard.base_dir).map_err(err)?;
-    Ok(ws
-        .ws
-        .members
-        .iter()
-        .filter_map(|m| match &m.status {
-            ken_core::workspace::MemberStatus::Ok(p) => {
-                let entry = reg.entry_at(&p.root);
-                Some(ken_core::wikidraft::TeamMember {
-                    name: m.name.clone(),
-                    root: p.root.clone(),
-                    kind: entry.map(|e| e.kind.clone()).unwrap_or_default(),
-                    team: entry.and_then(|e| e.team.clone()),
-                })
-            }
-            _ => None,
-        })
-        .collect())
-}
-
-/// The wiki member's folder and project id.
-fn wiki_target(guard: &AppState, wiki: &str) -> CmdResult<(std::path::PathBuf, uuid::Uuid)> {
-    let ws = guard.workspace.as_ref().ok_or("open the workspace first")?;
-    ws.ws
-        .members
-        .iter()
-        .find(|m| m.name == wiki)
-        .and_then(|m| match &m.status {
-            ken_core::workspace::MemberStatus::Ok(p) => Some((p.root.clone(), p.config.id)),
-            _ => None,
-        })
-        .ok_or_else(|| format!("{wiki} is not a member of this workspace"))
-}
-
 /// One model call through the Claude CLI, run in the wiki's folder.
 /// Ken's generation policy: the on-device model embeds (meaning search) and
 /// nothing else. Everything that writes, extracts, judges or answers runs
@@ -7160,122 +7122,6 @@ fn claude_generate(
         ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
         ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
     }
-}
-
-/// The wikis whose first pages are being drafted, by member name.
-fn drafting() -> &'static Mutex<std::collections::HashSet<String>> {
-    static D: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    D.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-
-/// Whether Claude is drafting `wiki`'s pages now (Team shows it).
-#[tauri::command(async)]
-fn wiki_drafting(wiki: String) -> bool {
-    lock_tolerant(drafting()).contains(&wiki)
-}
-
-/// Draft the first wiki pages (item 4b) into the workspace member `wiki`,
-/// from its team's repos plus an optional folder of documents: a Repo Map
-/// page per repo, each from that repo alone, then the team pages from those
-/// pages. Runs in the background through the Claude CLI; the result shows
-/// on the Team screen (`team_overview`'s findings). Never touches a page a
-/// person wrote.
-#[tauri::command(async)]
-fn draft_wiki(app: AppHandle, state: State<SharedState>, wiki: String, extra: Option<String>) -> CmdResult<()> {
-    let (base, wiki_root, wiki_id, repos) = {
-        let guard = state.lock().unwrap();
-        let members = wiki_team_members(&guard)?;
-        let (root, id) = wiki_target(&guard, &wiki)?;
-        (guard.base_dir.clone(), root, id, ken_core::wikidraft::team_repos(&wiki, &members))
-    };
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
-    };
-    let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
-    if !lock_tolerant(drafting()).insert(wiki.clone()) {
-        return Err("Claude is already writing this wiki's pages.".into());
-    }
-    std::thread::spawn(move || {
-        // Cleared however the draft ends, and the screens told.
-        struct Done(AppHandle, String);
-        impl Drop for Done {
-            fn drop(&mut self) {
-                lock_tolerant(drafting()).remove(&self.1);
-                let _ = self.0.emit("review-changed", ());
-                let _ = self.0.emit("wiki-drafted", self.1.clone());
-            }
-        }
-        let _done = Done(app, wiki.clone());
-        let Ok(mut db) = Db::open(&base, wiki_id) else { return };
-        let dirs = repos.iter().map(|(_, root)| root.clone()).collect();
-        let generate = claude_generate(binary, wiki_root.clone(), dirs);
-        let extra = extra.as_deref().map(Path::new);
-        if let Err(e) = ken_core::wikidraft::draft_team(
-            &wiki_root,
-            &wiki_name,
-            &mut db,
-            &repos,
-            extra,
-            &local_date_today(),
-            engine::now_epoch(),
-            generate,
-        ) {
-            eprintln!("warning: first-wiki draft failed: {e}");
-        }
-    });
-    Ok(())
-}
-
-/// Repos joined the workspace: for each team wiki that covers any of them,
-/// draft their Repo Map pages and propose changes to the pages its people
-/// keep, in the background. Returns the wikis being updated.
-#[tauri::command(async)]
-fn wiki_add_repos(state: State<SharedState>, members: Vec<String>) -> CmdResult<Vec<String>> {
-    let (base, all) = {
-        let guard = state.lock().unwrap();
-        (guard.base_dir.clone(), wiki_team_members(&guard)?)
-    };
-    let mut by_wiki: std::collections::BTreeMap<String, Vec<(String, std::path::PathBuf)>> = Default::default();
-    for m in &members {
-        let Some(w) = ken_core::wikidraft::wiki_for(m, &all) else { continue };
-        if let Some(added) = all.iter().find(|x| &x.name == m) {
-            by_wiki.entry(w.name.clone()).or_default().push((added.name.clone(), added.root.clone()));
-        }
-    }
-    if by_wiki.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
-    };
-    let wikis: Vec<String> = by_wiki.keys().cloned().collect();
-    for (wiki, added) in by_wiki {
-        let (root, id) = {
-            let guard = state.lock().unwrap();
-            wiki_target(&guard, &wiki)?
-        };
-        let team = ken_core::wikidraft::team_repos(&wiki, &all);
-        let (base, binary) = (base.clone(), binary.clone());
-        let wiki_name = ken_core::workspace::member_leaf(&wiki).to_string();
-        std::thread::spawn(move || {
-            let Ok(mut db) = Db::open(&base, id) else { return };
-            let dirs = team.iter().map(|(_, root)| root.clone()).chain(added.iter().map(|(_, root)| root.clone())).collect();
-            let generate = claude_generate(binary, root.clone(), dirs);
-            if let Err(e) = ken_core::wikidraft::draft_added(
-                &root,
-                &wiki_name,
-                &mut db,
-                &added,
-                &team,
-                &local_date_today(),
-                engine::now_epoch(),
-                generate,
-            ) {
-                eprintln!("warning: wiki update for added repos failed: {e}");
-            }
-        });
-    }
-    Ok(wikis)
 }
 
 /// Create a team's wiki from the bundled Ways-of-Working template at `dir`
@@ -7334,9 +7180,9 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
         .list_open_review_items()
         .map_err(err)?
         .into_iter()
-        .find(|it| it.id == item_id && it.kind == ken_core::wikidraft::PROPOSAL_KIND)
+        .find(|it| it.id == item_id && it.kind == ken_core::proposal::PROPOSAL_KIND)
         .ok_or("no open proposal with that id")?;
-    let proposal: ken_core::wikidraft::Proposal =
+    let proposal: ken_core::proposal::Proposal =
         serde_json::from_str(item.payload.as_deref().unwrap_or("")).map_err(|_| "the card has no proposed change")?;
     // A ruling is written by its decider.
     if let Some(decider) = proposal.append.as_ref().and_then(|r| r.decider.as_deref()) {
@@ -7344,15 +7190,15 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
             return Err(format!("A ruling is written by its decider. Only {decider} can accept this one."));
         }
     }
-    match ken_core::wikidraft::apply(&active.project.root, &proposal) {
+    match ken_core::proposal::apply(&active.project.root, &proposal) {
         Ok(()) => {}
-        Err(ken_core::wikidraft::ApplyError::Changed) => {
+        Err(ken_core::proposal::ApplyError::Changed) => {
             return Err(format!(
                 "{} changed after Ken proposed this, so applying it would undo that edit. Discard it; the next repo added proposes again.",
                 proposal.page
             ))
         }
-        Err(ken_core::wikidraft::ApplyError::Io(e)) => return Err(e),
+        Err(ken_core::proposal::ApplyError::Io(e)) => return Err(e),
     }
     active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
     Ok(proposal.page)
@@ -7731,7 +7577,7 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
         .map_err(err)?
         .into_iter()
         .map(|it| {
-            let p: Option<ken_core::wikidraft::Proposal> = it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok());
+            let p: Option<ken_core::proposal::Proposal> = it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok());
             let (kind, page) = match &p {
                 Some(p) if p.append.is_some() => ("ruling", p.page.clone()),
                 Some(p) if p.root.is_some() => ("ticket", p.page.clone()),
@@ -8258,8 +8104,7 @@ struct TeamOverviewDto {
 #[serde(rename_all = "camelCase")]
 struct TeamFindingDto {
     /// From the sweep: `void` · `gone` · `changed` · `aged`. From the link
-    /// report: `missing-page` · `broken-link` · `ambiguous-name`. From the
-    /// drafts: `draft` · `draft-failed` · `proposal` · `repo-removed`.
+    /// report: `missing-page` · `broken-link` · `ambiguous-name`.
     kind: String,
     title: String,
     detail: String,
@@ -8273,7 +8118,7 @@ struct TeamFindingDto {
 
 /// The findings for the Team screen, from the wiki's index and its last
 /// sweep, at most 20 of each link-report kind.
-fn team_findings(wiki_id: &str, root: &Path, db: &Db, sweep: Option<&ken_core::drift::DriftRun>) -> Vec<TeamFindingDto> {
+fn team_findings(wiki_id: &str, db: &Db, sweep: Option<&ken_core::drift::DriftRun>) -> Vec<TeamFindingDto> {
     let mut out: Vec<TeamFindingDto> = Vec::new();
     let mut push = |kind: String, title: String, detail: String, path: String, item_id: Option<i64>| {
         out.push(TeamFindingDto { kind, title, detail, path, project_id: wiki_id.to_string(), item_id });
@@ -8287,14 +8132,6 @@ fn team_findings(wiki_id: &str, root: &Path, db: &Db, sweep: Option<&ken_core::d
         for f in ken_core::links::findings(&report, 20) {
             push(f.kind, f.title, f.detail, f.path, None);
         }
-    }
-    match ken_core::wikidraft::findings(root, db) {
-        Ok(found) => {
-            for f in found {
-                push(f.kind, f.title, f.detail, f.path, f.item_id);
-            }
-        }
-        Err(e) => eprintln!("warning: could not read the wiki's draft findings: {e}"),
     }
     out
 }
@@ -8410,29 +8247,11 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     let (mut rules, mut templates) = (Vec::new(), Vec::new());
     if let Some(w) = &wiki {
         let root = std::path::Path::new(&w.path);
-        let left = ken_core::wikidraft::placeholders_left(root);
-        if !left.is_empty() {
-            gaps.push(TeamGapDto {
-                repo: Some(w.name.clone()),
-                text: format!("The wiki has {} placeholder{} still to fill, first {}.", left.len(), if left.len() == 1 { "" } else { "s" }, left[0]),
-                open: left[0].split(':').next().map(str::to_string),
-            });
-        }
-        for r in &repos {
-            let page = ken_core::wikidraft::repo_page(&r.name);
-            if !root.join(&page).exists() {
-                gaps.push(TeamGapDto {
-                    repo: Some(r.name.clone()),
-                    text: format!("The wiki has no Repo Map page for {}.", r.name),
-                    open: Some("Repo-Map/Index.md".into()),
-                });
-            }
-        }
         if let Ok(id) = w.id.parse::<uuid::Uuid>() {
             if let Some(d) = dbs.get(&id) {
                 let db = lock_tolerant(d);
                 sweep = db.last_drift_run().ok().flatten();
-                findings = team_findings(&w.id, root, &db, sweep.as_ref());
+                findings = team_findings(&w.id, &db, sweep.as_ref());
             }
         }
         rules = pages_in(root, "Ways-of-Working/Rules");
@@ -11562,33 +11381,24 @@ fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<
     workspace_members_overview(state)
 }
 
-/// What removing a member did: the fresh roster, and the team wiki whose
-/// pages still cite it (listed on the Team screen).
+/// What removing a member did: the fresh roster. Pages that still cite the
+/// repo are lint's to report.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemovedMemberDto {
     members: Vec<MemberOverviewDto>,
-    /// The wiki whose pages cite it, and how many.
-    wiki: Option<String>,
-    citing_pages: usize,
 }
 
 /// Take a repo out of the open workspace: out of the manifest and its
 /// groups, its runtime closed. The folder, its files and its index stay; the
-/// repo stays in Ken's list. When the team it was on has a wiki, the Team
-/// screen lists the wiki's pages that still cite it.
+/// repo stays in Ken's list.
 #[tauri::command(async)]
 fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult<RemovedMemberDto> {
-    let (wiki, citing_pages) = {
+    {
         let mut guard = state.lock().unwrap();
         if !workspace_enabled(&guard.app_settings) {
             return Err(WORKSPACE_DISABLED_MSG.into());
         }
-        // The team's wiki, found before the member leaves the roster.
-        let team = wiki_team_members(&guard)?;
-        let wiki = ken_core::wikidraft::wiki_for(&name, &team).map(|w| w.name.clone());
-        let wiki_target = wiki.as_deref().and_then(|w| wiki_target(&guard, w).ok());
-        let base = guard.base_dir.clone();
         let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
         let id = ws.ws.members.iter().find(|m| m.name == name).and_then(|m| match &m.status {
             ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id),
@@ -11605,16 +11415,8 @@ fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult
                 guard.focused = guard.members.keys().next().copied();
             }
         }
-        let mut pages = 0;
-        if let Some((_, wiki_id)) = wiki_target {
-            if let Ok(mut db) = Db::open(&base, wiki_id) {
-                let repo = ken_core::workspace::member_leaf(&name);
-                pages = ken_core::wikidraft::record_removed_repo(&mut db, repo).map_err(err)?.unwrap_or(0);
-            }
-        }
-        (wiki.filter(|_| pages > 0), pages)
-    };
-    Ok(RemovedMemberDto { members: workspace_members_overview(state)?, wiki, citing_pages })
+    }
+    Ok(RemovedMemberDto { members: workspace_members_overview(state)? })
 }
 
 #[derive(Serialize)]
@@ -13312,8 +13114,6 @@ pub fn run() {
             ingest_undo_write,
             ingest_read_again,
             ingest_file,
-            draft_wiki,
-            wiki_add_repos,
             setup_create_wiki,
             setup_create_team_repo,
             apply_page_proposal,
@@ -13378,7 +13178,6 @@ pub fn run() {
             refresh_team_digest,
             team_digest_writing,
             resolve_page_link,
-            wiki_drafting,
             escalation_reply,
             ticket_set_status,
             workspace_groups,
@@ -13703,7 +13502,7 @@ mod ingest_record_tests {
     }
 
     #[test]
-    fn the_team_screen_reads_the_link_report_and_the_drafts_from_the_wiki() {
+    fn the_team_screen_reads_the_link_report_from_the_wiki() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         std::fs::create_dir_all(root.join("Current")).unwrap();
@@ -13712,8 +13511,7 @@ mod ingest_record_tests {
         let data = tempfile::tempdir().unwrap();
         let mut db = Db::open_at(&data.path().join("w.db")).unwrap();
         scan::scan(&project, &mut db).unwrap();
-        let found = team_findings("w1", root, &db, None);
+        let found = team_findings("w1", &db, None);
         assert!(found.iter().any(|f| f.kind == "missing-page" && f.path == "Current/Team.md" && f.project_id == "w1"), "{:?}", found.iter().map(|f| &f.title).collect::<Vec<_>>());
-        assert!(found.iter().all(|f| f.kind != "draft"), "nothing drafted by Ken yet");
     }
 }

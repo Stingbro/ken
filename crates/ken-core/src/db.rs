@@ -872,26 +872,6 @@ impl Db {
         self.meta_set("drift_cache", json)
     }
 
-    /// The last wiki draft's result (first draft or a repo added), as JSON
-    /// (see `wikidraft::Drafted`).
-    pub fn wiki_draft(&self) -> Result<Option<String>> {
-        self.meta_get("wiki_draft")
-    }
-
-    pub fn store_wiki_draft(&self, json: &str) -> Result<()> {
-        self.meta_set("wiki_draft", json)
-    }
-
-    /// Repos that left the team while the wiki still cited them, as JSON
-    /// (see `wikidraft::removed_repos`).
-    pub fn removed_repos(&self) -> Result<Option<String>> {
-        self.meta_get("removed_repos")
-    }
-
-    pub fn store_removed_repos(&self, json: &str) -> Result<()> {
-        self.meta_set("removed_repos", json)
-    }
-
     /// Start a batch: the writes that follow, until [`Db::commit_batch`],
     /// land as one transaction. Each write method's own savepoint nests
     /// inside it, so a scan pays one commit per batch, not several per file.

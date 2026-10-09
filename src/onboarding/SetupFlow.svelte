@@ -75,11 +75,6 @@
     step = "index";
   }
 
-  // A wiki made here gets its first pages drafted by Claude from the
-  // team's repos; a wiki repo picked has its missing pages filled when the
-  // person ticks it. Either may also read a folder of documents.
-  let fillExisting = $state<Record<string, boolean>>({});
-  let draftExtra = $state<string | null>(null);
 
   // The team repo (tickets, decisions, ideas): one picked, or a new one
   // from the method's template.
@@ -160,11 +155,6 @@
     }
   }
 
-  async function chooseExtra() {
-    const folder = await openDialog({ directory: true, title: "A folder of documents to read too (a Confluence export, say)" });
-    if (typeof folder === "string") draftExtra = folder;
-  }
-
   /** Pick one or more repos (a folder of repos stands for each inside it).
    *  The whole set is proposed again, so names stay unique; edits to rows
    *  already here are kept. */
@@ -213,10 +203,8 @@
       }
       // Then new wikis: each is laid down from the template and joins the
       // set-up as its team's wiki.
-      const drafts: string[] = [];
       for (const t of teams) {
         const c = wikiChoices[t];
-        if (c?.mode === "existing" && fillExisting[t]) drafts.push(c.member);
         if (c?.mode !== "new" || !c.parent) continue;
         // No team repo picked or made: the docs repo holds the tickets too.
         const holdsTeam = !all.some((r) => r.include && r.team === t && r.kind.includes("team"));
@@ -225,13 +213,8 @@
           (await api.setupCreateWiki(newWikiPath(c.parent, c.name), t, coveredRepos(all, t), all.map((r) => r.member), holdsTeam));
         created[t] = row;
         all = [...all.filter((r) => r.path !== row.path), row];
-        drafts.push(row.member);
       }
       await app.confirmSetupRepos(name.trim() || "Code", all);
-      // Drafting runs in the background with Claude; set-up is done either way.
-      for (const w of drafts) {
-        await api.draftWiki(w, draftExtra).catch((e) => toast.error("Could not start drafting the wiki's first pages", e));
-      }
       onclose();
     } catch (e) {
       error = String(e);
@@ -417,10 +400,6 @@
             </select>
           {/if}
         </span>
-        <label class="check-row">
-          <input type="checkbox" checked={!!fillExisting[t]} onchange={(e) => (fillExisting[t] = e.currentTarget.checked)} />
-          <span>Have Claude write the pages it is missing (a Repo Map page per repo, Current, Team)</span>
-        </label>
       {:else}
         <label class="check-row">
           <input type="checkbox" checked={c.mode === "new"} onchange={(e) => toggleNewWiki(t, e.currentTarget.checked)} />
@@ -443,21 +422,13 @@
           <p class="note">
             {#if c.parent}
               Ken makes <span class="mono">{newWikiPath(c.parent, c.name || `${t}-Wiki`)}</span> from the template,
-              with one git commit, then Claude writes its first pages from the team's repos: a Repo Map page
-              for each, then Current, Team and the architecture page. Each is marked draft and names its
-              sources. It stays on this computer; adding a remote and pushing is yours to do.
+              with one git commit. Its pages are written as sources are ingested. It stays on this computer;
+              adding a remote and pushing is yours to do.
             {:else}
               Choose where the wiki folder goes, or untick it to go without one for now.
             {/if}
           </p>
         {/if}
-      {/if}
-      {#if c.mode === "new" || (c.mode === "existing" && fillExisting[t])}
-        <div class="wiki-where">
-          <button class="btn btn-ghost" onclick={chooseExtra}>
-            {draftExtra ? `Also reading ${draftExtra.split(/[\\/]/).pop()}` : "Also read a folder of documents…"}
-          </button>
-        </div>
       {/if}
     </div>
   {/snippet}

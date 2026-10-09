@@ -47,7 +47,6 @@
       overview = await api.teamOverview(team);
       rail.setFindings(overview.findings?.length ?? 0);
       error = null;
-      if (overview.wiki) drafting = await api.wikiDrafting(overview.wiki.name).catch(() => false);
     } catch (e) {
       error = String(e);
     }
@@ -55,21 +54,6 @@
   $effect(() => {
     void team;
     void refresh();
-  });
-
-  /** Claude is writing the wiki's pages now. */
-  let drafting = $state(false);
-  $effect(() => {
-    let off: (() => void) | undefined;
-    void api
-      .onWikiDrafted((wiki) => {
-        if (wiki !== overview?.wiki?.name) return;
-        drafting = false;
-        toast.show("The wiki's pages are written. They are marked draft in Files, with their sources.");
-        void refresh();
-      })
-      .then((fn) => (off = fn));
-    return () => off?.();
   });
 
   /** An action on Team: `what` names it in the notice when it fails. */
@@ -142,8 +126,6 @@
       await app.confirmSetupRepos(name, rows, true);
       app.openTeam();
       await scope.refreshGroups();
-      // The wiki drafts each new repo's page and proposes the rest.
-      await api.wikiAddRepos(rows.map((r) => r.member)).catch((e) => toast.error("Could not update the wiki", e));
     });
   }
 
@@ -168,19 +150,6 @@
     const id = overview?.wiki?.id;
     if (!id) return;
     void run("sweep", "Could not run the sweep", () => api.runDriftNow(id));
-  }
-
-  // Claude writes the wiki's missing pages from the team's repos: a Repo
-  // Map page for each, Current, Team and the architecture page. A page a
-  // person wrote is left alone.
-  function draftPages() {
-    const name = overview?.wiki?.name;
-    if (!name) return;
-    void run("draft", "Could not start writing the wiki's pages", async () => {
-      await api.draftWiki(name, null);
-      drafting = true;
-      toast.show("Claude is writing the wiki's missing pages. It takes a few minutes; you can keep using Ken.");
-    });
   }
 
   function addRule() {
@@ -440,13 +409,10 @@
         {#if overview.wiki}
           <div class="actions">
             <button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button>
-            <button class="btn btn-ghost" disabled={busy !== null || drafting} onclick={draftPages}>
-              {busy === "draft" ? "Starting…" : drafting ? "Claude is writing the pages…" : "Write the missing pages with Claude"}
-            </button>
           </div>
         {/if}
 
-        <div class="divider">findings · drift, links, the first draft · {findings.length}</div>
+        <div class="divider">findings · drift, links · {findings.length}</div>
         {#each findings as f, i (i)}
           <div class="entry">
             <span class="tag">{findingLabel(f.kind)}</span>
