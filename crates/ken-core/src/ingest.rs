@@ -10,7 +10,7 @@
 //! escalations in the team repo, and my next steps on Your day. Each write is
 //! recorded on the source's card ([`Written`]) so a person can undo it.
 //! Four things wait instead: a ruling, for its decider; a change to
-//! Ways-of-Working, Conventions or a rule, as a ticket; an edit staging held
+//! a page in Rules, as a ticket; an edit staging held
 //! ([`rewrites_a_fifth`], or the page changed while the source was read);
 //! and an action, as a ticket. The source stays in `Raw/` until it is seen,
 //! and is not read again.
@@ -895,12 +895,12 @@ pub fn chat_source(stamp: &str, title: &str, chat_id: &str, me: Option<&str>, tu
 const OFF_LIMITS: [&str; 3] = ["Research/", "Templates/", "_meta/"];
 
 /// Sections a change to goes to the team as a ticket, never as a write:
-/// work and reviews are read against them. Ways-of-Working holds the rules
-/// (`Ways-of-Working/Rules/`).
-const METHOD: [&str; 2] = ["Ways-of-Working/", "Conventions/"];
+/// work and reviews are read against them. `Rules/` holds them; the older
+/// layout kept them in Ways-of-Working and Conventions.
+const METHOD: [&str; 3] = ["Rules/", "Ways-of-Working/", "Conventions/"];
 
-/// The decisions log in a team repo, which wins over the wiki's.
-pub const TEAM_DECISIONS: &str = "decisions/DECISIONS.md";
+/// Where the decisions log sits in a knowledge base.
+pub const TEAM_DECISIONS: &str = "Decisions/DECISIONS.md";
 
 /// Most existing pages and new pages one note may change.
 pub const MAX_PAGES: usize = 5;
@@ -916,8 +916,8 @@ fn may_propose(page: &str) -> bool {
         && !matches!(page, "START-HERE.md" | "CLAUDE.md" | "README.md")
 }
 
-/// A page of Ways-of-Working (its rules included) or Conventions: a change
-/// to it is a ticket.
+/// A page in Rules (or, in the older layout, Ways-of-Working or
+/// Conventions): a change to it is a ticket.
 pub fn is_method_page(page: &str) -> bool {
     METHOD.iter().any(|p| page.starts_with(p))
 }
@@ -980,12 +980,12 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str) -> String {
         "A note was just ingested into a team's wiki. Decide which existing pages it changes (something they say is \
          no longer true, or something they should now say) and which new pages it calls for (a topic nothing covers \
          yet). Only what the note itself supports; most notes change a few pages, many change none. What you name is \
-         written at once, citing the note; a change to Ways-of-Working or Conventions goes to the team as a ticket \
+         written at once, citing the note; a change to a page in Rules goes to the team as a ticket \
          instead, so name it the same way.\n\n\
          Reply with JSON only: {\"update\": [{\"path\": \"path\", \"change\": \"what changes, in one line\"}, …], \
          \"create\": [{\"path\": \"Section/Name.md\", \"purpose\": \"what the page is for\"}, …]}. \
-         Use paths from the list for updates; put a new page in the section it belongs to (Current, Platform, \
-         Design, Conventions, Ways-of-Working, Work, Reference). What is now true about the project or the team \
+         Use paths from the list for updates; put a new page in the section it belongs to (Current, Design, \
+         Reference, Reference/Platform, Rules). What is now true about the project or the team \
          changes its page in Current. At most 5 of each.\n\nPAGES IN THE WIKI:\n",
     );
     for (p, t) in pages {
@@ -1665,7 +1665,7 @@ pub fn follow_ups(
         let team_log = targets.team_repo.filter(|t| t.join(TEAM_DECISIONS).is_file());
         let (log_root, log) = match team_log {
             Some(t) => (Some(t.to_string_lossy().to_string()), TEAM_DECISIONS.to_string()),
-            None => (None, db.paths_named(&["decisions.md"])?.into_iter().next().unwrap_or_else(|| "_meta/DECISIONS.md".to_string())),
+            None => (None, db.paths_named(&["decisions.md"])?.into_iter().next().unwrap_or_else(|| TEAM_DECISIONS.to_string())),
         };
         let log_abs = log_root.as_deref().map(PathBuf::from).unwrap_or_else(|| root.to_path_buf()).join(&log);
         let text = fs::read_to_string(&log_abs).unwrap_or_else(|_| "# Decisions\n".to_string());
@@ -2272,7 +2272,7 @@ mod tests {
         let team_repo = team.path().join("Realms-Team");
         fs::create_dir_all(team_repo.join("tickets")).unwrap();
         fs::create_dir_all(team_repo.join("ideas")).unwrap();
-        fs::create_dir_all(team_repo.join("decisions")).unwrap();
+        fs::create_dir_all(team_repo.join("Decisions")).unwrap();
         fs::write(team_repo.join("tickets/RT-004.md"), "---\nid: RT-004\n---\n").unwrap();
         fs::write(team_repo.join("ideas/I-030.md"), "---\nid: I-030\n---\n").unwrap();
         fs::write(team_repo.join(TEAM_DECISIONS), "# Decisions\n\nD-091 · 2026-09-20 · x — y.\n").unwrap();

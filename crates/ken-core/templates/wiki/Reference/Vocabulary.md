@@ -1,18 +1,15 @@
 ---
 title: "Vocabulary"
-aliases: ["Vocabulary", "Glossary", "what do we call it", "what does the platform call it", "why does my search find nothing"]
+aliases: ["Vocabulary", "Glossary", "what do we call it", "what does the platform call it"]
 status: current
-audience: dev
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
-pin: "{{repo@sha for each repo the sources are in}}"   # the commit each repo's sources were read at
 sources:
-  - "{{repo:path of the code, config or doc that shows each row}}"
+  - "{{repo@sha:path of the code, config or doc that shows each row}}"
 ---
 
 # Vocabulary
 
-The words where a search misses: our word and the code's or the platform's word differ, one word means two things, or a name changed. Not here: what a system does → [[Systems]]; what a method word such as backlog, idea, escalation or ruling means → the method's manual, `docs/manual/` in the Ways of Working repo, and the team repo's folder READMEs.
+The words where a search misses: our word and the code's or the platform's word differ, one word means two things, or a name changed. Search tries these words too, so add a row when a search missed because of a word.
 
 [[#Words That Differ]] · [[#Words With Two Meanings]] · [[#Renames]]
 

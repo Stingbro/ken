@@ -75,45 +75,13 @@
     step = "index";
   }
 
-
-  // The team repo (tickets, decisions, ideas): one picked, or a new one
-  // from the method's template.
-  type TeamRepoChoice = { create: boolean; parent: string | null; name: string };
-  let teamRepoChoices = $state<Record<string, TeamRepoChoice>>({});
-  let createdTeamRepos = $state<Record<string, SetupRepoRow>>({});
-  const pickedTeamRepo = (t: string) => rows.find((r) => r.include && r.team === t && r.kind.includes("team")) ?? null;
-  $effect(() => {
-    const next: Record<string, TeamRepoChoice> = {};
-    const before = Object.keys(teamRepoChoices);
-    for (const t of teams) {
-      const was = teamRepoChoices[t] ?? (teams.length === 1 && before.length === 1 ? teamRepoChoices[before[0]] : undefined);
-      next[t] = was
-        ? { ...was, name: was.name === `${before[0]}-Team` ? `${t}-Team` : was.name }
-        : { create: true, parent: lastParent ?? commonParent(rows), name: `${t}-Team` };
-    }
-    if (JSON.stringify(next) !== JSON.stringify(teamRepoChoices)) teamRepoChoices = next;
-  });
-
-  async function chooseTeamRepoParent(team: string) {
-    const c = teamRepoChoices[team];
-    const folder = await openDialog({ directory: true, title: `Where the ${team} team repo goes`, defaultPath: c?.parent ?? undefined });
-    if (typeof folder === "string" && c) {
-      lastParent = folder;
-      teamRepoChoices[team] = { ...c, parent: folder };
-    }
-  }
-
-
   // The wiki is the team's: each team uses a wiki repo it picked, creates a
   // new one from the method's template, or has none for now.
   let wikiChoices = $state<Record<string, WikiChoice>>({});
   // Wikis already created this session, by team, so a retry after a failed
   // Confirm does not try to create the folder again.
   let created = $state<Record<string, SetupRepoRow>>({});
-  const choicesReady = $derived(
-    wikiChoicesReady(wikiChoices) &&
-      teams.every((t) => pickedTeamRepo(t) || !teamRepoChoices[t]?.create || (!!teamRepoChoices[t]?.parent && teamRepoChoices[t].name.trim().length > 0)),
-  );
+  const choicesReady = $derived(wikiChoicesReady(wikiChoices));
   $effect(() => {
     const parent = lastParent ?? commonParent(rows);
     const before = Object.keys(wikiChoices);
@@ -189,28 +157,14 @@
     error = null;
     try {
       let all = [...rows];
-      // New team repos first, so a new wiki's Start Here lists them.
-      for (const t of teams) {
-        const c = teamRepoChoices[t];
-        if (pickedTeamRepo(t) || !c?.create || !c.parent) continue;
-        const w = wikiChoices[t];
-        const wikiName = w?.mode === "new" ? w.name.trim() : w?.mode === "existing" ? w.member : null;
-        const row =
-          createdTeamRepos[t] ??
-          (await api.setupCreateTeamRepo(newWikiPath(c.parent, c.name), t, wikiName, all.map((r) => r.member), coveredRepos(all, t)));
-        createdTeamRepos[t] = row;
-        all = [...all.filter((r) => r.path !== row.path), row];
-      }
-      // Then new wikis: each is laid down from the template and joins the
-      // set-up as its team's wiki.
+      // New knowledge bases: each is laid down from the template and joins
+      // the set-up as its team's wiki, holding the tickets and decisions too.
       for (const t of teams) {
         const c = wikiChoices[t];
         if (c?.mode !== "new" || !c.parent) continue;
-        // No team repo picked or made: the docs repo holds the tickets too.
-        const holdsTeam = !all.some((r) => r.include && r.team === t && r.kind.includes("team"));
         const row =
           created[t] ??
-          (await api.setupCreateWiki(newWikiPath(c.parent, c.name), t, coveredRepos(all, t), all.map((r) => r.member), holdsTeam));
+          (await api.setupCreateWiki(newWikiPath(c.parent, c.name), t, coveredRepos(all, t), all.map((r) => r.member)));
         created[t] = row;
         all = [...all.filter((r) => r.path !== row.path), row];
       }
@@ -323,8 +277,6 @@
       {#if teams.length === 1}
         <h3>Wiki</h3>
         {@render wikiRow(teams[0])}
-        <h3>Team repo</h3>
-        {@render teamRepoRow(teams[0])}
       {/if}
     {:else}
       <p class="note">Repos with the same team name are one team, and each team keeps one wiki.</p>
@@ -346,8 +298,6 @@
       {#each teams as t (t)}
         <h3>{t}'s wiki</h3>
         {@render wikiRow(t)}
-        <h3>{t}'s team repo</h3>
-        {@render teamRepoRow(t)}
       {/each}
     {/if}
     <div>
@@ -426,45 +376,6 @@
               adding a remote and pushing is yours to do.
             {:else}
               Choose where the wiki folder goes, or untick it to go without one for now.
-            {/if}
-          </p>
-        {/if}
-      {/if}
-    </div>
-  {/snippet}
-
-  {#snippet teamRepoRow(t: string)}
-    {@const picked = pickedTeamRepo(t)}
-    {@const c = teamRepoChoices[t] ?? { create: false, parent: null, name: `${t}-Team` }}
-    <div class="wiki">
-      {#if picked}
-        <span class="note">Uses <span class="mono">{picked.member}</span>, the team repo you picked: tickets, decisions and escalations.</span>
-      {:else}
-        <label class="check-row">
-          <input type="checkbox" checked={c.create} onchange={(e) => (teamRepoChoices[t] = { ...c, create: e.currentTarget.checked })} />
-          <span>Create a team repo for {t} from the Ways of Working template</span>
-        </label>
-        {#if c.create}
-          <div class="wiki-where">
-            <input
-              class="input"
-              value={c.name}
-              aria-label="Folder name of the {t} team repo"
-              oninput={(e) => (teamRepoChoices[t] = { ...c, name: (e.currentTarget as HTMLInputElement).value })}
-            />
-            <span class="in">in</span>
-            <button class="btn where" title={c.parent ?? ""} onclick={() => chooseTeamRepoParent(t)}>
-              <FolderOpen size={14} strokeWidth={1.75} aria-hidden="true" />
-              <span class="where-path">{c.parent ?? "Choose a folder…"}</span>
-            </button>
-          </div>
-          <p class="note">
-            {#if c.parent}
-              Ken makes <span class="mono">{newWikiPath(c.parent, c.name || `${t}-Team`)}</span> with tickets, the
-              decisions log, the Ideas list, people and the method, and one git commit. Tickets are numbered
-              {t.replace(/[^A-Za-z0-9]/g, "").slice(0, 6).toUpperCase() || "TEAM"}-001 onwards.
-            {:else}
-              Choose where the team repo goes, or untick it to go without one for now.
             {/if}
           </p>
         {/if}

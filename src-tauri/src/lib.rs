@@ -7124,38 +7124,18 @@ fn claude_generate(
     }
 }
 
-/// Create a team's wiki from the bundled Ways-of-Working template at `dir`
-/// (a new or empty folder) and return its set-up row. Local only: a remote
-/// and a push are the person's step.
+/// Create a knowledge base from the bundled template at `dir` (a new or
+/// empty folder) and return its set-up row. It holds the tickets and the
+/// decisions log too. Local only: a remote and a push are the person's step.
 #[tauri::command]
 async fn setup_create_wiki(
     dir: String,
     team: String,
     repos: Vec<ken_core::wikinew::Covered>,
     taken: Vec<String>,
-    holds_team: Option<bool>,
 ) -> CmdResult<ken_core::setup::RepoRow> {
     tauri::async_runtime::spawn_blocking(move || {
-        ken_core::setup::create_wiki_with(Path::new(&dir), &team, &repos, &taken, &local_date_today(), holds_team.unwrap_or(false))
-            .map_err(err)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// Set-up's "Create a team repo": the method's team template at `dir`, its
-/// manifest naming the team's `repos` with their kinds.
-#[tauri::command]
-async fn setup_create_team_repo(
-    dir: String,
-    team: String,
-    wiki: Option<String>,
-    taken: Vec<String>,
-    repos: Option<Vec<ken_core::wikinew::Covered>>,
-) -> CmdResult<ken_core::setup::RepoRow> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let repos = repos.unwrap_or_default();
-        ken_core::setup::create_team_repo(Path::new(&dir), &team, wiki.as_deref(), &repos, &taken).map_err(err)
+        ken_core::setup::create_wiki(Path::new(&dir), &team, &repos, &taken, &local_date_today()).map_err(err)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -8254,7 +8234,11 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
                 findings = team_findings(&w.id, &db, sweep.as_ref());
             }
         }
-        rules = pages_in(root, "Ways-of-Working/Rules");
+        // The older layout kept the rules in Ways-of-Working/Rules.
+        rules = pages_in(root, "Rules");
+        if rules.is_empty() {
+            rules = pages_in(root, "Ways-of-Working/Rules");
+        }
         templates = pages_in(root, "Templates");
     }
     let ignores = std::fs::read_to_string(ws.root.join(".kenignore"))
@@ -8314,7 +8298,7 @@ fn team_save_ignores(state: State<SharedState>, lines: Vec<String>) -> CmdResult
     std::fs::write(ws.ws.root.join(".kenignore"), text).map_err(err)
 }
 
-/// A new rule in the team wiki's Ways-of-Working/Rules/, from the wiki's own
+/// A new rule in the knowledge base's Rules/, from its own
 /// rule template, named as the rule. Returns its path, to open and write.
 #[tauri::command(async)]
 fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> CmdResult<String> {
@@ -8334,7 +8318,7 @@ fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> Cm
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let rel = format!("Ways-of-Working/Rules/{slug}.md");
+    let rel = format!("Rules/{slug}.md");
     let path = root.join(&rel);
     if path.exists() {
         return Err(format!("{rel} is already there"));
@@ -13115,7 +13099,6 @@ pub fn run() {
             ingest_read_again,
             ingest_file,
             setup_create_wiki,
-            setup_create_team_repo,
             apply_page_proposal,
             sync_now,
             resolve_conflict,

@@ -1,0 +1,13 @@
+{
+  "team": "{{team_name}}",
+  "key": "{{KEY}}",
+  "_key_note": "Ticket ids are KEY-001, KEY-002 ... issued in order, never reused.",
+  "repos": {
+    "{{wiki_repo}}": { "kind": ["wiki", "team"], "base": "main" }
+  },
+  "_repos_note": "The sources this knowledge base covers. kind: code | reference, or wiki and team for this repo. base: the branch drift measures against. A reference repo may carry pin (the commit read) and upstream.",
+  "search": {
+    "weights": {}
+  },
+  "_search_note": "search.weights: a path pattern to a tier (binding, current, reference, record, superseded) or a number added to a hit's score; the longest pattern wins."
+}

@@ -1,13 +1,13 @@
-//! A new team wiki, laid down at set-up from the method's own template
-//! (Ways-of-Working `templates/wiki`, bundled into Ken so set-up works
-//! offline and every team starts from the same version).
+//! A new knowledge base, laid down at set-up from Ken's own template
+//! (`templates/wiki`, bundled so set-up works offline and every team starts
+//! from the same version). One repo holds the library, the decisions log, the
+//! tickets, `log.md` and the settings in `.ken/knowledge.json`.
 //!
-//! Only the facts Ken knows are filled in: the team's name, the wiki's own
-//! name, the team's repos with what each is for, and `updated:` dates. Every
-//! other `{{…}}` is left for a person or the first-wiki draft, and no
-//! `verified:` date is ever stamped: only a person reads a page against its
-//! sources. The folder becomes a git repo with one commit; publishing it
-//! (a remote, a push) is a person's step.
+//! Only the facts Ken knows are filled in: the team's name, the repo's own
+//! name, the ticket key, the repos it covers with what each is for, and
+//! `updated:` dates. Every other `{{…}}` stays for a person. The folder
+//! becomes a git repo with one commit; publishing it (a remote, a push) is a
+//! person's step.
 
 use std::fs;
 use std::path::Path;
@@ -17,75 +17,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-/// Which copy of the method's template is bundled.
-pub const TEMPLATE_SOURCE: &str = "Stingbro/Ways-of-Working templates/wiki @ 15afe07";
-
 macro_rules! template {
     ($($path:literal),* $(,)?) => {
         &[$(($path, include_str!(concat!("../templates/wiki/", $path)))),*]
     };
 }
 
-/// Every file of the template: (path in the wiki, text).
+/// Every file of the template: (path in the knowledge base, text).
 pub const TEMPLATE: &[(&str, &str)] = template![
+    ".ken/knowledge.json",
     "CLAUDE.md",
     "START-HERE.md",
-    "_meta/README.md",
-    "Conventions/Index.md",
-    "Conventions/Architecture.md",
-    "Conventions/Code.md",
-    "Conventions/Data-and-Config.md",
-    "Conventions/Registries.md",
-    "Conventions/Testing.md",
+    "log.md",
     "Current/Index.md",
-    "Current/Feature-Status.md",
     "Current/Project.md",
-    "Current/Roadmap.md",
-    "Current/Team.md",
-    "Current/Who-Does-What.md",
+    "Decisions/DECISIONS.md",
     "Design/Index.md",
-    "Design/Principles.md",
-    "Platform/Index.md",
     "Reference/Index.md",
-    "Reference/Build-and-Run.md",
-    "Reference/Config-Map.md",
-    "Reference/How-tos.md",
-    "Reference/How-tos/.gitkeep",
-    "Reference/Systems.md",
-    "Reference/Systems/.gitkeep",
+    "Reference/Platform/.gitkeep",
     "Reference/Vocabulary.md",
     "Research/Index.md",
-    "Research/Findings/.gitkeep",
     "Research/Ingestion/Index.md",
     "Research/Ingestion/Ingested/.gitkeep",
     "Research/Ingestion/Raw/.gitkeep",
+    "Rules/Index.md",
     "Templates/Index.md",
-    "Templates/Convention.md",
-    "Templates/Dependency.md",
     "Templates/Design-Note.md",
+    "Templates/Feature-Status.md",
     "Templates/Finding.md",
     "Templates/How-to.md",
-    "Templates/Incident.md",
     "Templates/Ingested-note.md",
-    "Templates/Repo-Architecture.md",
+    "Templates/Platform.md",
+    "Templates/Roadmap.md",
     "Templates/Rule.md",
-    "Templates/System.md",
-    "Ways-of-Working/Ways-of-Working.md",
-    "Ways-of-Working/Agents/Index.md",
-    "Ways-of-Working/Lifecycle.md",
-    "Ways-of-Working/Research-Ladder.md",
-    "Ways-of-Working/Rules.md",
-    "Ways-of-Working/Rules/write-for-the-altitude-like-teammates-talking.md",
-    "Work/Index.md",
-    "Work/Incidents.md",
-    "Work/Incidents/.gitkeep",
-    "Work/Releases.md",
+    "Templates/Ticket.md",
+    "tickets/README.md",
 ];
 
-/// A repo the new wiki covers: its name in the workspace and what it is for,
-/// and, when set-up knows them, its kinds and folder (for the team manifest:
-/// on 2026-10-06 its code and reference entries stayed `{{placeholders}}`
-/// though Ken had registered all four repos).
+/// Where the settings live in a knowledge base.
+pub const KNOWLEDGE_FILE: &str = ".ken/knowledge.json";
+
+/// A repo the new knowledge base covers: its name in the workspace and what it
+/// is for, and, when set-up knows them, its kinds and folder.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Covered {
     pub name: String,
@@ -102,6 +75,24 @@ pub(crate) fn is_copy_template(path: &str) -> bool {
     path.starts_with("Templates/") && path != "Templates/Index.md"
 }
 
+/// A ticket key from the team's name: the initials of its words when it has
+/// two or more (`Shattered-Realms` → SR), else its first six letters and
+/// digits; in upper case, TEAM when it has none.
+pub fn ticket_key(team: &str) -> String {
+    let words: Vec<&str> = team.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let k: String = if words.len() >= 2 {
+        words.iter().filter_map(|w| w.chars().next()).collect()
+    } else {
+        team.chars().filter(|c| c.is_ascii_alphanumeric()).take(6).collect()
+    };
+    let k = k.to_uppercase();
+    if k.is_empty() {
+        "TEAM".into()
+    } else {
+        k
+    }
+}
+
 fn one_line(s: &str) -> String {
     let s = s.split_whitespace().collect::<Vec<_>>().join(" ").replace('|', "/");
     if s.is_empty() {
@@ -111,45 +102,87 @@ fn one_line(s: &str) -> String {
     }
 }
 
+/// What git says about a repo: the branch it is on (None on no branch), its
+/// HEAD, its `origin` URL.
+fn repo_facts(dir: &Path) -> (Option<String>, Option<String>, Option<String>) {
+    let git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        let out = crate::proc::quiet(&mut cmd).args(args).current_dir(dir).output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !s.is_empty()).then_some(s)
+    };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD");
+    (branch, git(&["rev-parse", "HEAD"]), crate::setup::origin_url(dir))
+}
+
+/// The `repos` entries for `.ken/knowledge.json`: this knowledge base, then
+/// each covered repo with its kind, the branch it is on, and for a reference
+/// repo the commit read and its `origin`.
+fn knowledge_repos(wiki: &str, repos: &[Covered]) -> String {
+    use crate::registry::RepoKind;
+    use serde_json::{json, Value};
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
+    let mut entries = vec![format!("    {}: {}", q(wiki), json!({ "kind": ["wiki", "team"], "base": "main" }))];
+    for r in repos.iter().filter(|r| r.name != wiki) {
+        let kinds: Vec<Value> = r.kind.iter().map(|k| serde_json::to_value(k).unwrap_or(Value::Null)).collect();
+        let kind = match kinds.as_slice() {
+            [] => json!("code"),
+            [one] => one.clone(),
+            _ => Value::Array(kinds),
+        };
+        let (branch, head, origin) = r.path.as_deref().map(repo_facts).unwrap_or_default();
+        let mut entry = serde_json::Map::new();
+        entry.insert("kind".into(), kind);
+        entry.insert("base".into(), json!(branch.unwrap_or_else(|| "main".into())));
+        if r.kind.contains(&RepoKind::Reference) {
+            if let Some(h) = head {
+                entry.insert("pin".into(), json!(h));
+            }
+            if let Some(o) = origin {
+                entry.insert("upstream".into(), json!(o));
+            }
+        }
+        entries.push(format!("    {}: {}", q(&r.name), Value::Object(entry)));
+    }
+    entries.join(",\n")
+}
+
 /// One template file with what Ken knows filled in.
 pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], today: &str) -> String {
-    // The section on how the system works is named `Domain` until the team
-    // names it after its own subject.
-    let mut t = text.replace("{{team_name}}", team).replace("{{wiki_repo}}", wiki).replace("{{Domain}}", "Domain");
+    let key = ticket_key(team);
+    let mut t = text.replace("{{KEY}}", &key);
+    if path == KNOWLEDGE_FILE {
+        // The one `repos` line of the template becomes every repo's entry.
+        let line = t.lines().find(|l| l.trim_start().starts_with("\"{{wiki_repo}}\"")).map(str::to_string);
+        if let Some(line) = line {
+            t = t.replace(&line, &knowledge_repos(wiki, repos));
+        }
+        // Inside JSON strings: escaped, the quotes the template already has.
+        let inner = |s: &str| {
+            let quoted = serde_json::to_string(s).unwrap_or_default();
+            quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"')).unwrap_or(&quoted).to_string()
+        };
+        return t.replace("{{team_name}}", &inner(team)).replace("{{wiki_repo}}", &inner(wiki));
+    }
+    t = t.replace("{{team_name}}", team).replace("{{wiki_repo}}", wiki);
     if !is_copy_template(path) {
-        // `updated:` only; a `verified:` date is a person's.
         t = t
             .lines()
-            .map(|l| {
-                if l.trim_start().starts_with("updated:") {
-                    l.replacen("{{date}}", today, 1)
-                } else {
-                    l.to_string()
-                }
-            })
+            .map(|l| if l.trim_start().starts_with("updated:") { l.replacen("{{date}}", today, 1) } else { l.to_string() })
             .collect::<Vec<_>>()
             .join("\n")
             + if text.ends_with('\n') { "\n" } else { "" };
-        // A page with frontmatter but no date would read as unverified for
-        // ever from the first sweep; it was written today.
-        let head_end = t.strip_prefix("---\n").and_then(|rest| rest.find("\n---").map(|i| i + 4));
-        if let Some(end) = head_end {
-            if !t[..end].lines().any(|l| l.trim_start().starts_with("updated:")) {
-                t.insert_str(4, &format!("updated: {today}\n"));
-            }
-        }
     }
     if path == "START-HERE.md" {
-        // The repo table: this wiki, then each of the team's repos.
-        let mut rows = format!("| `{wiki}` | this repo · the library |\n");
-        for r in repos {
+        // The repo table: this knowledge base, then each repo it covers.
+        let mut rows = format!("| `{wiki}` | this repo · the knowledge base |\n");
+        for r in repos.iter().filter(|r| r.name != wiki) {
             rows.push_str(&format!("| `{}` | {} |\n", r.name, one_line(&r.description)));
         }
         let mut out = String::new();
         let mut replaced = false;
         for line in t.lines() {
-            let placeholder_row = line.starts_with("| `{{") || (line.starts_with(&format!("| `{wiki}`")) && !replaced);
-            if placeholder_row {
+            if line.starts_with(&format!("| `{wiki}` |")) {
                 if !replaced {
                     out.push_str(&rows);
                     replaced = true;
@@ -178,19 +211,13 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
     }
 }
 
-/// Lay a new wiki down at `dir` (missing or empty) for `team`, covering
-/// `repos`, then make it a git repo with one commit. Refuses a folder that
-/// already holds anything, so it can never write over a person's files.
+/// Lay a new knowledge base down at `dir` (missing or empty) for `team`,
+/// covering `repos`, then make it a git repo with one commit. Refuses a
+/// folder that already holds anything, so it never writes over a person's
+/// files.
 pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<()> {
-    create_with(dir, team, repos, today, false)
-}
-
-/// [`create`], and with `team_parts` the team template's folders too
-/// (tickets, decisions, ideas, people, the team manifest): a team with no
-/// team repo keeps its tickets in its docs repo, as one repo of both kinds.
-pub fn create_with(dir: &Path, team: &str, repos: &[Covered], today: &str, team_parts: bool) -> Result<()> {
     if dir.exists() && fs::read_dir(dir).map_err(|e| Error::io(dir, e))?.next().is_some() {
-        return Err(Error::Other(format!("{} is not empty; pick a new folder for the wiki", dir.display())));
+        return Err(Error::Other(format!("{} is not empty; pick a new folder for the knowledge base", dir.display())));
     }
     let wiki = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "wiki".into());
     for (path, text) in TEMPLATE {
@@ -202,21 +229,7 @@ pub fn create_with(dir: &Path, team: &str, repos: &[Covered], today: &str, team_
         let text = text.replace("\r\n", "\n");
         fs::write(&dest, fill(path, &text, team, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
     }
-    if team_parts {
-        for (path, text) in crate::teamnew::TEMPLATE {
-            let dest = dir.join(path);
-            if dest.exists() {
-                continue;
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
-            }
-            let text = text.replace("\r\n", "\n");
-            let filled = crate::teamnew::fill(path, &text, team, &wiki, Some(&wiki), repos);
-            fs::write(&dest, filled).map_err(|e| Error::io(&dest, e))?;
-        }
-    }
-    git_commit_all(dir, &format!("Start the {team} wiki from the Ways-of-Working template"))
+    git_commit_all(dir, &format!("Start the {team} knowledge base from Ken's template"))
 }
 
 /// `git init` in `dir` and one commit of everything in it. The person's own
@@ -242,13 +255,36 @@ pub(crate) mod tests {
         ]
     }
 
+    fn template(path: &str) -> &'static str {
+        TEMPLATE.iter().find(|(p, _)| *p == path).unwrap().1
+    }
+
     #[test]
-    fn start_here_lists_this_wiki_and_the_teams_repos() {
-        let text = TEMPLATE.iter().find(|(p, _)| *p == "START-HERE.md").unwrap().1;
-        let t = fill("START-HERE.md", text, "Realms", "Realms-Wiki", &repos(), "2026-09-25");
-        assert!(t.contains("The Realms library: the traps"));
-        assert!(t.contains("| `Realms-Wiki` | this repo · the library |\n| `Game` | The game client. Built nightly. |\n| `Tools` | (not said yet) |"));
-        assert!(!t.contains("{{team_repo}}") && !t.contains("{{code_repo}}"));
+    fn start_here_lists_this_knowledge_base_and_its_repos() {
+        let t = fill("START-HERE.md", template("START-HERE.md"), "Realms", "Realms-Wiki", &repos(), "2026-09-25");
+        assert!(t.contains("The Realms knowledge base"));
+        assert!(t.contains(
+            "| `Realms-Wiki` | this repo · the knowledge base |\n| `Game` | The game client. Built nightly. |\n| `Tools` | (not said yet) |"
+        ));
+        assert!(!t.contains("{{wiki_repo}}"));
+    }
+
+    #[test]
+    fn the_knowledge_file_names_every_repo_and_is_json() {
+        let t = fill(KNOWLEDGE_FILE, template(KNOWLEDGE_FILE), "Shattered Realms", "SR-Wiki", &repos(), "2026-09-25");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_eq!(v["team"], "Shattered Realms");
+        assert_eq!(v["key"], "SR");
+        assert_eq!(v["repos"]["SR-Wiki"]["kind"], serde_json::json!(["wiki", "team"]));
+        assert_eq!(v["repos"]["Game"]["kind"], "code");
+        assert!(v["repos"]["Tools"].is_object());
+    }
+
+    #[test]
+    fn ticket_keys_come_from_the_teams_initials() {
+        assert_eq!(ticket_key("Shattered-Realms"), "SR");
+        assert_eq!(ticket_key("ken"), "KEN");
+        assert_eq!(ticket_key("--"), "TEAM");
     }
 
     /// Every file under `templates/<dir>`, as a path inside it, sorted.
@@ -281,26 +317,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn updated_is_dated_and_verified_never_is() {
-        let undated = fill("Ways-of-Working/Agents/Index.md", "---
-title: \"Agents\"
----
-# Agents
-", "T", "W", &[], "2026-09-28");
-        assert_eq!(undated, "---
-updated: 2026-09-28
-title: \"Agents\"
----
-# Agents
-", "an undated page is dated today");
-        let copy = "---
-title: \"{{Area}}\"
----
-";
-        assert_eq!(fill("Templates/How-to.md", copy, "T", "W", &[], "2026-09-28"), copy, "a copy template is left as it is");
-        let text = "---\nupdated: {{date}}\nverified: {{date}}      # a person\n---\n";
-        let t = fill("Current/Project.md", text, "T", "W", &[], "2026-09-25");
-        assert_eq!(t, "---\nupdated: 2026-09-25\nverified: {{date}}      # a person\n---\n");
+    fn updated_is_dated_and_copy_templates_keep_placeholders() {
+        let text = "---\nupdated: {{date}}\n---\n";
+        assert_eq!(fill("Current/Project.md", text, "T", "W", &[], "2026-09-25"), "---\nupdated: 2026-09-25\n---\n");
         assert_eq!(fill("Templates/How-to.md", text, "T", "W", &[], "2026-09-25"), text, "a template to copy keeps its placeholders");
     }
 

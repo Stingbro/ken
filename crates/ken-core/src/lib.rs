@@ -56,7 +56,6 @@ pub mod transcript;
 pub mod user_state;
 pub mod vocab;
 pub mod watch;
-pub mod teamnew;
 pub mod wikinew;
 pub mod workspace;
 pub mod workspace_kg_db;

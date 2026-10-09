@@ -22,7 +22,7 @@
 //! * **Closed** ([`W_CLOSED`]): a ticket that is done or cancelled, and a
 //!   page retired or superseded.
 //!
-//! A team overrides them in its team file, `.wright/team.json`:
+//! A team overrides them in its settings, `.ken/knowledge.json`:
 //!
 //! ```json
 //! "search": {
@@ -133,10 +133,11 @@ enum Override {
 }
 
 impl Roles {
-    /// The roles in `<root>/.wright/team.json`; the defaults when it is
-    /// missing or unreadable.
+    /// The roles in `<root>/.ken/knowledge.json` (or the older
+    /// `.wright/team.json`); the defaults when neither is there or readable.
     pub fn of_repo(root: &Path) -> Roles {
-        std::fs::read_to_string(root.join(".wright").join("team.json"))
+        std::fs::read_to_string(root.join(crate::wikinew::KNOWLEDGE_FILE))
+            .or_else(|_| std::fs::read_to_string(root.join(".wright").join("team.json")))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
             .map(|v| Roles::from_team_json(&v))
@@ -229,7 +230,7 @@ impl Roles {
             None => name == "decisions.md",
         };
         if decisions_log
-            || matches!(section, Some(Section::WaysOfWorking | Section::Platform))
+            || matches!(section, Some(Section::Rules | Section::Decisions))
             || dirs.contains(&"rules")
             || under(&self.people, "people")
         {

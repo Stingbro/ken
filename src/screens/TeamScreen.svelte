@@ -428,7 +428,7 @@
           <p class="note">{overview.wiki ? "Nothing found." : "No wiki, so nothing to check."}</p>
         {/each}
 
-        <div class="divider">rules · Ways-of-Working/Rules · {overview.rules.length}</div>
+        <div class="divider">rules · Rules · {overview.rules.length}</div>
         {#each overview.rules as r (r.path)}
           <button class="page" onclick={() => openInWiki(r.path)}>{r.title}</button>
         {:else}

@@ -1334,15 +1334,10 @@ export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   /** The page a [[link]] names, by file name or frontmatter alias. */
   resolvePageLink: (from: string, target: string) => invoke<string | null>("resolve_page_link", { from, target }),
-  /** A team wiki from the bundled template, in a new or empty folder. */
-  /** `holdsTeam`: the team has no team repo, so the new docs repo also holds
-   *  its tickets, decisions, ideas and people (one repo of both kinds). */
-  setupCreateWiki: (dir: string, team: string, repos: CoveredRepo[], taken: string[], holdsTeam = false) =>
-    invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken, holdsTeam }),
-  /** Set-up's "Create a team repo": the method's team template at `dir`,
-   *  its manifest naming the team's `repos` with their kinds. */
-  setupCreateTeamRepo: (dir: string, team: string, wiki: string | null, taken: string[], repos: CoveredRepo[] = []) =>
-    invoke<SetupRepoRow>("setup_create_team_repo", { dir, team, wiki, taken, repos }),
+  /** A knowledge base from the bundled template, in a new or empty folder;
+   *  it holds the tickets and the decisions log too. */
+  setupCreateWiki: (dir: string, team: string, repos: CoveredRepo[], taken: string[]) =>
+    invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken }),
   /** Apply a proposed page change; returns the page written. */
   applyPageProposal: (itemId: number, projectId: string | null = null) =>
     invoke<string>("apply_page_proposal", { itemId, projectId }),

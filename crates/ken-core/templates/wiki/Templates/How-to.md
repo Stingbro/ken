@@ -1,18 +1,15 @@
 ---
 title: "{{How to Do the Thing}}"
-aliases: ["{{How to Do the Thing}}", "{{how do I do the thing}}", "{{where is the thing configured}}"]   # the questions people type · a name link never resolves by title
+aliases: ["{{How to Do the Thing}}", "{{how do I do the thing}}"]
 status: current
-audience: dev
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
-pin: {{commit}}         # the commit the sources were read at
-sources:                # with none, the Docs drift check never flags this page and it vouches for nothing
-  - "{{repo:path of each file a step touches}}"
+sources:
+  - "{{repo@sha:path of each file a step touches}}"
 ---
 
 # {{How to Do the Thing}}
 
-How to {{do the thing}}, step by step, and what goes wrong. Not here: {{the page that explains why it works this way}}.
+How to {{do the thing}}, step by step, and what goes wrong.
 
 [[#When You Need This]] · [[#Steps]] · [[#Failures]]
 

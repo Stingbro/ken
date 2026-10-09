@@ -254,7 +254,7 @@
           <div class="card-title">What waits for you</div>
           <ul class="rules">
             <li>A ruling, in the words of the person who decides it. Only they can accept it.</li>
-            <li>A change to Ways-of-Working, Conventions or a rule. It becomes a ticket.</li>
+            <li>A change to a page in Rules. It becomes a ticket.</li>
             <li>An edit that rewrites more than a fifth of a page, or lands on a page someone changed while Ken was reading.</li>
             <li>An action. It becomes a ticket once accepted.</li>
           </ul>

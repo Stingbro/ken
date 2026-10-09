@@ -135,10 +135,12 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
     let mut kind = Vec::new();
     let mut ev = Vec::new();
     let library: Vec<&str> = [
-        ("_meta/DECISIONS.md", "_meta/DECISIONS.md"),
+        ("Decisions/DECISIONS.md", "a decisions log"),
+        ("_meta/DECISIONS.md", "a decisions log"),
         ("DECISIONS.md", "a decisions log"),
         (".obsidian", "an Obsidian vault"),
         ("Research/Ingestion", "Research/Ingestion"),
+        ("Rules", "a Rules section"),
         ("Ways-of-Working", "a Ways-of-Working section"),
         ("Current", "a Current section"),
         ("Reference/Vocabulary.md", "a Vocabulary page"),
@@ -150,10 +152,15 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
     .filter(|(p, _)| dir.join(p).exists())
     .map(|(_, e)| e)
     .collect();
-    // A team repo says so with its manifest. A folder name is not evidence:
-    // a code repo can keep a `tickets/README.md` pointing at where tickets
-    // moved, and that one file made it a team repo read in full.
-    let team: Vec<&str> = if dir.join(".wright").join("team.json").is_file() { vec![".wright/team.json"] } else { Vec::new() };
+    // A repo that holds the tickets says so with its settings file. A folder
+    // name is not evidence: a code repo can keep a `tickets/README.md`
+    // pointing at where tickets moved, and that one file made it a team repo
+    // read in full.
+    let team: Vec<&str> = [crate::wikinew::KNOWLEDGE_FILE, ".wright/team.json"]
+        .into_iter()
+        .filter(|f| dir.join(f).is_file())
+        .take(1)
+        .collect();
     let mut code: Vec<String> = crate::profiler::REPO_MARKERS
         .iter()
         .copied()
@@ -666,62 +673,23 @@ pub fn propose_repos(picked: &[PathBuf], taken: &[String]) -> Result<Proposal> {
     })
 }
 
-/// Create a team's wiki at `dir` from the bundled template (see
-/// [`crate::wikinew`]), covering `repos`, and return its set-up row: a wiki
-/// on `team`, read for entities. `taken` are names already in use.
+/// Create a team's knowledge base at `dir` from the bundled template (see
+/// [`crate::wikinew`]), covering `repos`, and return its set-up row: one repo
+/// that is the library and holds the tickets and the decisions log, on `team`.
+/// `taken` are names already in use.
 pub fn create_wiki(dir: &Path, team: &str, repos: &[crate::wikinew::Covered], taken: &[String], today: &str) -> Result<RepoRow> {
-    create_wiki_with(dir, team, repos, taken, today, false)
-}
-
-/// [`create_wiki`]; with `holds_team` the wiki is also the team repo (the
-/// team has no team repo of its own): it gets the team template's folders and
-/// both kinds, so tickets, decisions and people live in the docs repo.
-pub fn create_wiki_with(
-    dir: &Path,
-    team: &str,
-    repos: &[crate::wikinew::Covered],
-    taken: &[String],
-    today: &str,
-    holds_team: bool,
-) -> Result<RepoRow> {
-    crate::wikinew::create_with(dir, team, repos, today, holds_team)?;
+    crate::wikinew::create(dir, team, repos, today)?;
     let mut row = propose_repos(&[dir.to_path_buf()], taken)?
         .rows
         .into_iter()
         .next()
         .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
     row.include = true;
-    row.kind = if holds_team { vec![RepoKind::Team, RepoKind::Wiki] } else { vec![RepoKind::Wiki] };
+    row.kind = vec![RepoKind::Team, RepoKind::Wiki];
     row.team = Some(team.to_string());
     row.index = IndexState::Entities;
-    row.description = format!("The {team} team's wiki: what is true now, how the team works, and what lives where in each repo.");
-    row.evidence.insert(0, "created at set-up from the Ways-of-Working template".into());
-    Ok(row)
-}
-
-/// Create a team's team repo at `dir` from the bundled template (see
-/// [`crate::teamnew`]) and return its set-up row: a team repo on `team`,
-/// read for entities. `wiki` is the team wiki's name, when it has one;
-/// `repos` the team's other repos, named in its manifest.
-pub fn create_team_repo(
-    dir: &Path,
-    team: &str,
-    wiki: Option<&str>,
-    repos: &[crate::wikinew::Covered],
-    taken: &[String],
-) -> Result<RepoRow> {
-    crate::teamnew::create(dir, team, wiki, repos)?;
-    let mut row = propose_repos(&[dir.to_path_buf()], taken)?
-        .rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
-    row.include = true;
-    row.kind = vec![RepoKind::Team];
-    row.team = Some(team.to_string());
-    row.index = IndexState::Entities;
-    row.description = format!("The {team} team's tickets, decisions, ideas and people.");
-    row.evidence.insert(0, "created at set-up from the Ways-of-Working template".into());
+    row.description = format!("The {team} knowledge base: what was decided and why, what is true now, and the tickets.");
+    row.evidence.insert(0, "created at set-up from Ken's template".into());
     Ok(row)
 }
 
@@ -802,22 +770,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_docs_repo_with_no_team_repo_holds_the_tickets_too() {
+    fn the_knowledge_base_holds_the_tickets_and_the_decisions_log() {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("Realms-Wiki");
-        let row = create_wiki_with(&dir, "Realms", &[], &[], "2026-10-06", true).unwrap();
+        let row = create_wiki(&dir, "Realms", &[], &[], "2026-10-06").unwrap();
         assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
-        for f in ["tickets/TICKET.md", "decisions/DECISIONS.md", "people/README.md", ".wright/team.json", "Current/Project.md"] {
+        for f in ["tickets/README.md", "Decisions/DECISIONS.md", ".ken/knowledge.json", "Current/Project.md", "log.md"] {
             assert!(dir.join(f).exists(), "{f}");
         }
-        // One entry of both kinds, not the docs repo twice (2026-10-06).
-        let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join(".wright/team.json")).unwrap()).unwrap();
-        assert_eq!(manifest["repos"]["Realms-Wiki"]["kind"], serde_json::json!(["team", "wiki"]));
-        let text = fs::read_to_string(dir.join(".wright/team.json")).unwrap();
-        assert_eq!(text.matches("\"Realms-Wiki\": {").count(), 1, "{text}");
-        let alone = create_wiki(&parent.path().join("Other-Wiki"), "Other", &[], &[], "2026-10-06").unwrap();
-        assert_eq!(alone.kind, vec![RepoKind::Wiki]);
-        assert!(!parent.path().join("Other-Wiki/tickets").exists());
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join(".ken/knowledge.json")).unwrap()).unwrap();
+        assert_eq!(settings["repos"]["Realms-Wiki"]["kind"], serde_json::json!(["wiki", "team"]));
     }
 
     #[test]
@@ -839,8 +802,8 @@ mod tests {
         fs::write(d.path().join("build.gradle.kts"), "").unwrap();
         let (kind, _) = detect(d.path());
         assert_eq!(kind, vec![RepoKind::Code]);
-        fs::create_dir_all(d.path().join(".wright")).unwrap();
-        fs::write(d.path().join(".wright/team.json"), "{}").unwrap();
+        fs::create_dir_all(d.path().join(".ken")).unwrap();
+        fs::write(d.path().join(".ken/knowledge.json"), "{}").unwrap();
         assert!(detect(d.path()).0.contains(&RepoKind::Team));
     }
     use std::process::Command;
@@ -1047,7 +1010,7 @@ mod tests {
         let covered = vec![crate::wikinew::Covered { name: "Game".into(), description: "The client.".into(), ..Default::default() }];
         let row = create_wiki(&dir, "Realms", &covered, &["Game".into()], "2026-09-25").unwrap();
         assert_eq!(row.member, "Realms-Wiki");
-        assert_eq!(row.kind, vec![RepoKind::Wiki]);
+        assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
         assert_eq!(row.team.as_deref(), Some("Realms"));
         assert_eq!(row.index, IndexState::Entities);
         assert!(row.include && row.has_git);

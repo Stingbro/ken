@@ -193,29 +193,27 @@ pub fn date_in(text: &str) -> Option<String> {
     (0..text.len().saturating_sub(9)).find_map(|i| text.get(i..).and_then(date))
 }
 
-/// The library's top-level sections (docs-system, "Sections").
+/// The knowledge base's top-level sections. Folders from the older layout
+/// still map in: Ways-of-Working and Conventions are Rules, Platform is
+/// Reference, Work is Current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Section {
-    WaysOfWorking,
-    Platform,
-    Conventions,
-    Design,
-    Work,
-    Reference,
+    Rules,
+    Decisions,
     Current,
+    Design,
+    Reference,
     Research,
 }
 
 impl Section {
     pub fn name(self) -> &'static str {
         match self {
-            Section::WaysOfWorking => "Ways-of-Working",
-            Section::Platform => "Platform",
-            Section::Conventions => "Conventions",
-            Section::Design => "Design",
-            Section::Work => "Work",
-            Section::Reference => "Reference",
+            Section::Rules => "Rules",
+            Section::Decisions => "Decisions",
             Section::Current => "Current",
+            Section::Design => "Design",
+            Section::Reference => "Reference",
             Section::Research => "Research",
         }
     }
@@ -223,7 +221,7 @@ impl Section {
 
 /// The section a page sits in: the first folder in its path named for one.
 /// Only Markdown pages have one, so a code repo's `Reference/` folder of
-/// sources is not mistaken for the library's.
+/// sources is not mistaken for the knowledge base's.
 pub fn section_of(rel_path: &str) -> Option<Section> {
     let path = rel_path.replace('\\', "/");
     if !(path.ends_with(".md") || path.ends_with(".markdown")) {
@@ -232,13 +230,11 @@ pub fn section_of(rel_path: &str) -> Option<Section> {
     let mut dirs: Vec<&str> = path.split('/').collect();
     dirs.pop();
     dirs.into_iter().find_map(|d| match d.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
-        "ways-of-working" => Some(Section::WaysOfWorking),
-        "platform" => Some(Section::Platform),
-        "conventions" => Some(Section::Conventions),
+        "rules" | "ways-of-working" | "conventions" => Some(Section::Rules),
+        "decisions" => Some(Section::Decisions),
+        "current" | "work" => Some(Section::Current),
         "design" => Some(Section::Design),
-        "work" => Some(Section::Work),
-        "reference" => Some(Section::Reference),
-        "current" => Some(Section::Current),
+        "reference" | "platform" => Some(Section::Reference),
         "research" => Some(Section::Research),
         _ => None,
     })
@@ -290,8 +286,8 @@ pub fn audience_at(db: &crate::db::Db, path: &str) -> Option<&'static str> {
 }
 
 /// A page's audience: its frontmatter `audience:` when it says, else its
-/// section. Current, Design and Work are business; Conventions, Platform and
-/// Reference are dev; Ways-of-Working is the method. Research is evidence
+/// section. Current, Design and Decisions are business; Rules and Reference
+/// are dev. Research is evidence
 /// for everyone and has none, nor does a page outside the sections.
 pub fn audience_of(section: Option<Section>, meta: Option<&PageMeta>) -> Option<Audience> {
     match meta.and_then(|m| m.audience.as_deref()) {
@@ -301,9 +297,8 @@ pub fn audience_of(section: Option<Section>, meta: Option<&PageMeta>) -> Option<
         _ => {}
     }
     match section? {
-        Section::Current | Section::Design | Section::Work => Some(Audience::Business),
-        Section::Conventions | Section::Platform | Section::Reference => Some(Audience::Dev),
-        Section::WaysOfWorking => Some(Audience::Method),
+        Section::Current | Section::Design | Section::Decisions => Some(Audience::Business),
+        Section::Rules | Section::Reference => Some(Audience::Dev),
         Section::Research => None,
     }
 }
@@ -314,7 +309,7 @@ pub fn band(section: Option<Section>, meta: Option<&PageMeta>) -> u8 {
     let retired_or_generated = meta.is_some_and(|m| m.retired() || m.generated);
     if retired_or_generated || section == Some(Section::Research) {
         2
-    } else if matches!(section, Some(Section::WaysOfWorking | Section::Platform)) {
+    } else if matches!(section, Some(Section::Rules | Section::Decisions)) {
         0
     } else {
         1
@@ -415,8 +410,11 @@ mod tests {
 
     #[test]
     fn sections_come_from_the_folder_and_only_for_pages() {
-        assert_eq!(section_of("Ways-of-Working/Rules.md"), Some(Section::WaysOfWorking));
-        assert_eq!(section_of("docs/Platform/Engine.md"), Some(Section::Platform));
+        assert_eq!(section_of("Rules/Never-weaken-a-test.md"), Some(Section::Rules));
+        assert_eq!(section_of("Ways-of-Working/Rules.md"), Some(Section::Rules), "the older name");
+        assert_eq!(section_of("docs/Platform/Engine.md"), Some(Section::Reference), "the older name");
+        assert_eq!(section_of("Reference/Platform/Engine.md"), Some(Section::Reference));
+        assert_eq!(section_of("Decisions/DECISIONS.md"), Some(Section::Decisions));
         assert_eq!(section_of("Research/Ingestion/Ingested/Standup.md"), Some(Section::Research));
         assert_eq!(section_of("Reference/config.rs"), None, "not a page");
         assert_eq!(section_of("README.md"), None);
@@ -426,12 +424,12 @@ mod tests {
     fn bands_put_binding_first_and_evidence_last() {
         let current = PageMeta { status: Some("current".into()), ..Default::default() };
         let retired = PageMeta { status: Some("retired".into()), ..Default::default() };
-        assert_eq!(band(Some(Section::WaysOfWorking), Some(&current)), 0);
-        assert_eq!(band(Some(Section::Platform), None), 0);
+        assert_eq!(band(Some(Section::Rules), Some(&current)), 0);
+        assert_eq!(band(Some(Section::Decisions), None), 0);
         assert_eq!(band(Some(Section::Current), Some(&current)), 1);
         assert_eq!(band(None, None), 1, "a code file is ranked on its merits");
         assert_eq!(band(Some(Section::Research), None), 2);
-        assert_eq!(band(Some(Section::WaysOfWorking), Some(&retired)), 2, "retired beats binding");
+        assert_eq!(band(Some(Section::Rules), Some(&retired)), 2, "retired beats binding");
     }
 
     #[test]
@@ -462,7 +460,7 @@ mod tests {
         assert_eq!(audience_of(section_of("Current/Project.md"), None), Some(Audience::Business));
         assert_eq!(audience_of(section_of("Work/Releases.md"), None), Some(Audience::Business));
         assert_eq!(audience_of(section_of("Conventions/Architecture.md"), None), Some(Audience::Dev));
-        assert_eq!(audience_of(section_of("Ways-of-Working/Rules.md"), None), Some(Audience::Method));
+        assert_eq!(audience_of(section_of("Rules/Naming.md"), None), Some(Audience::Dev));
         assert_eq!(audience_of(section_of("Research/spike.md"), None), None);
         let says = parse("---
 audience: Business

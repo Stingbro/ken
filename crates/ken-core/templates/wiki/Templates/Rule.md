@@ -1,18 +1,15 @@
 ---
 title: "{{The Rule as a Sentence}}"
-aliases: ["{{The Rule as a Sentence}}", "{{the-rule-as-a-sentence}}", "{{the question someone asks before breaking it}}"]
+aliases: ["{{The Rule as a Sentence}}", "{{the question someone asks before breaking it}}"]
 status: current
-audience: method
 updated: {{date}}
-verified:               # the date a person read this page against its sources · empty until then · never stamped in bulk
-pin: {{commit}}         # the commit the sources were read at
 sources:
-  - "{{repo:path, ticket id or [[incident page]] that shows the incident}}"
+  - "{{the ticket, note or repo@sha:path that shows the incident}}"
 ---
 
 # {{The Rule as a Sentence}}
 
-{{The rule, in one imperative line. The filename is the rule too, so it reads as one in a backlink.}}
+{{The rule, in one imperative line. Its short form goes in CLAUDE.md too.}}
 
 [[#Incident]] · [[#Symptom]]
 
