@@ -3,11 +3,9 @@
   // "new" mode it is an empty title with the cursor in it; Enter adds the
   // task and the panel stays open on it.
   import { onMount, tick } from "svelte";
-  import { api, type DayTask, type DayTaskPatch } from "../lib/api";
+  import type { DayTask, DayTaskPatch } from "../lib/api";
   import { day, memberNames } from "../lib/day.svelte";
-  import { families } from "../lib/families.svelte";
-  import { linkLabel, localToday, repeatChoices, sendBody, splitTicketLink, stampLabel } from "../lib/day";
-  import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
+  import { linkLabel, localToday, repeatChoices, splitTicketLink, stampLabel } from "../lib/day";
   import X from "@lucide/svelte/icons/x";
   import Check from "@lucide/svelte/icons/check";
   import DatePicker from "../lib/ui/DatePicker.svelte";
@@ -170,66 +168,6 @@
     else pendingLinks = pendingLinks.filter((x) => x !== l);
   }
 
-  // ── For: me, or send to a teammate through the team inbox ──────────
-
-  type Mate = { key: string; familyId: string; memberId: string; label: string };
-  let mates = $state<Mate[]>([]);
-  let sendTo = $state("");
-  let sending = $state(false);
-
-  $effect(() => {
-    const conns = families.connections;
-    if (conns.length === 0) {
-      mates = [];
-      return;
-    }
-    void Promise.all(
-      conns.map(async (c) => {
-        const manifest = await api.familyManifestGet(c.connection.familyId).catch(() => null);
-        return (manifest?.members ?? [])
-          .filter((m) => m.id !== c.connection.memberId)
-          .map((m) => ({
-            key: `${c.connection.familyId}:${m.id}`,
-            familyId: c.connection.familyId,
-            memberId: m.id,
-            label: conns.length > 1 ? `${m.name || m.id} (${c.connection.name})` : m.name || m.id,
-          }));
-      }),
-    ).then((lists) => (mates = lists.flat()));
-  });
-
-  const mate = $derived(mates.find((m) => m.key === sendTo) ?? null);
-
-  function confirmSend(e: MouseEvent) {
-    const to = mate;
-    if (!task || !to) return;
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    openConfirm(r.left, r.bottom + 4, {
-      title: `Send to ${to.label}?`,
-      body: "It goes to their inbox and leaves your list.",
-      confirmLabel: "Send",
-      onConfirm: () => void send(to),
-    });
-  }
-
-  async function send(to: Mate) {
-    const t = task;
-    if (!t || sending) return;
-    sending = true;
-    error = null;
-    try {
-      // The inbox carries a title and a body; the rest goes in the body.
-      await api.familySend(to.familyId, to.memberId, "task", title.trim() || t.title, sendBody({ ...t, description }));
-      clearTimers();
-      await day.remove(t.id);
-      sendTo = "";
-    } catch (e) {
-      error = String(e);
-    } finally {
-      sending = false;
-    }
-  }
-
   // ── Footer ──────────────────────────────────────────────────────────
 
   function who(by: string | null): string {
@@ -349,22 +287,6 @@
       <button class="chip ghost" onclick={() => (linkOpen = true)}>+ link</button>
     {/if}
   </div>
-
-  {#if task && !task.inbox}
-    <div class="field">
-      <span class="label">For</span>
-      <span class="chip on">me</span>
-      {#if mates.length > 0}
-        <select class="send" bind:value={sendTo} aria-label="Send to a teammate" disabled={sending}>
-          <option value="">send to a teammate</option>
-          {#each mates as m (m.key)}<option value={m.key}>{m.label}</option>{/each}
-        </select>
-        {#if mate}
-          <button class="btn btn-small" disabled={sending} onclick={confirmSend}>Send</button>
-        {/if}
-      {/if}
-    </div>
-  {/if}
 
   <textarea
     class="desc"
@@ -542,9 +464,6 @@
   }
   .x:hover {
     color: var(--ink);
-  }
-  .send {
-    color: var(--ink-tertiary) !important;
   }
   .desc {
     flex: 1;

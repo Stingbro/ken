@@ -2,9 +2,8 @@
 //! and the team's ticket files, read and written the same way by the app
 //! and `ken-mcp`.
 //!
-//! A **task** is one markdown file in a task home: the workspace home
-//! (`.ken-workspace/tasks/`, where new tasks go) or my board in a family
-//! (where an accepted inbox task lands). Tasks live in your own folder,
+//! A **task** is one markdown file in the workspace's task home
+//! (`.ken-workspace/tasks/`). Tasks live in your own folder,
 //! never inside a team repo, so a repo's `.ken/tasks/` is not read. Writes go
 //! through `tasks.rs`'s byte-faithful patch core: only the keys a change
 //! names are rewritten, and unknown keys, comments and line endings survive.
@@ -1490,26 +1489,22 @@ mod tests {
     }
 
     #[test]
-    fn scan_reads_the_workspace_home_and_my_board_and_dedupes() {
+    fn scan_reads_the_workspace_home_but_not_its_archive() {
         let dir = tempdir().unwrap();
         let ws = dir.path().join("ws");
-        let board = dir.path().join("families/FAM1/members/mem-1/board");
-        fs::create_dir_all(&board).unwrap();
-        fs::write(board.join("a.md"), "---\nid: a\ntitle: Accepted\nstatus: backlog\nfrom: dee\n---\n").unwrap();
-        fs::write(board.join("b.md"), "---\nid: dup\ntitle: Board copy\n---\n").unwrap();
-        fs::create_dir_all(board.join("archive/2026-09")).unwrap();
-        fs::write(board.join("archive/2026-09/c.md"), "---\nid: c\ntitle: Archived\n---\n").unwrap();
-        create_task(&ws, &DayTaskInput { title: "New".into(), ..Default::default() }, &stamp(BY_YOU), Some("dup")).unwrap();
-        let homes = [TaskHome::Workspace { workspace_root: &ws }, TaskHome::Family { board_dir: &board }];
-        let all = scan(&homes, TODAY);
+        let home = crate::tasks::workspace_tasks_dir(&ws);
+        fs::create_dir_all(home.join("archive/2026-09")).unwrap();
+        fs::write(home.join("a.md"), "---\nid: a\ntitle: Written by hand\nstatus: backlog\nfrom: dee\n---\n").unwrap();
+        fs::write(home.join("archive/2026-09/c.md"), "---\nid: c\ntitle: Archived\n---\n").unwrap();
+        create_task(&ws, &DayTaskInput { title: "New".into(), ..Default::default() }, &stamp(BY_YOU), Some("n")).unwrap();
+        let all = scan(&[TaskHome::Workspace { workspace_root: &ws }], TODAY);
         assert_eq!(all.len(), 2, "archive is a subfolder, not read");
-        assert_eq!(find(&all, "dup").unwrap().title, "New", "first home wins");
         let a = find(&all, "a").unwrap();
         assert_eq!(a.state, DayTaskState::Open);
         assert_eq!(a.from.as_deref(), Some("dee"));
-        assert_eq!(a.address_rel_path(), "members/mem-1/board/a.md");
+        assert_eq!(a.address_rel_path(), "tasks/a.md");
         let moved = archive_task(a, TODAY).unwrap();
-        assert!(moved.ends_with("members/mem-1/board/archive/2026-10/a.md"), "{}", moved.display());
+        assert!(moved.ends_with("tasks/archive/2026-10/a.md"), "{}", moved.display());
     }
 
     #[test]

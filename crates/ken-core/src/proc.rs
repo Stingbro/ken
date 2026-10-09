@@ -7,9 +7,9 @@
 //! gives the child a hidden console instead, which its own children (node,
 //! ken-mcp) inherit. PTY spawns (ConPTY) need none of this.
 //!
-//! This lives in its own module rather than in `sync.rs` because
-//! `family_sync.rs` and the two downstream crates need it too, and none of
-//! them should have to depend on the sync engine to spawn a quiet child.
+//! This lives in its own module rather than in `sync.rs` because the two
+//! downstream crates need it too, and neither should have to depend on the
+//! sync engine to spawn a quiet child.
 
 use std::process::Command;
 

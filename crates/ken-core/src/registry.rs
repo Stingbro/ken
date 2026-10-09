@@ -186,13 +186,13 @@ pub fn index_of(root: &Path) -> (Vec<RepoKind>, Option<IndexState>) {
         .unwrap_or_default()
 }
 
-/// A repo nobody has said the kind of yet: registered, a git repo, and not
-/// a team-inbox clone. Ken reads none of it until a person sets its kind, so
-/// a repo is never indexed on a guess (a code repo with no kind is read for
-/// entities in full). Ken's own folders (the workspace memory) are not git
-/// repos and are read as before.
+/// A repo nobody has said the kind of yet: registered and a git repo. Ken
+/// reads none of it until a person sets its kind, so a repo is never indexed
+/// on a guess (a code repo with no kind is read for entities in full). Ken's
+/// own folders (the workspace memory) are not git repos and are read as
+/// before.
 pub fn awaits_kind(root: &Path) -> bool {
-    if !root.join(".git").exists() || root.join("family.json").exists() {
+    if !root.join(".git").exists() {
         return false;
     }
     default_base_dir()

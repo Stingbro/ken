@@ -53,7 +53,6 @@ function task(over: Partial<DayTask> = {}): DayTask {
     updated: null,
     created: null,
     relPath: "tasks/t1.md",
-    inbox: null,
     ...over,
   };
 }

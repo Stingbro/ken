@@ -1,6 +1,6 @@
 // The Inbox (the Briefing design): one list of everything waiting on you,
-// sorted by who it is from. People: tasks and messages a teammate sent through
-// the team inbox. Ken: what an ingest waits on (rulings, tickets, held page
+// sorted by who it is from. People: escalations raised to you. Ken: what an
+// ingest waits on (rulings, tickets, held page
 // edits), what the wiki's checks found, and questions Ken asked in a chat.
 // Sync & files: edit conflicts and files Ken could not read. Home's "Needs
 // you" is the top of this list and the sidebar count is its length. Resolving
@@ -9,15 +9,12 @@ import {
   api,
   type ConflictItem,
   type DayEscalation,
-  type FamilyConnectionDto,
-  type FamilyInboxItem,
   type IngestProposal,
   type RawSource,
   type TeamFinding,
 } from "./api";
 import { app } from "./app.svelte";
 import { scope } from "./scope.svelte";
-import { families } from "./families.svelte";
 import { conflicts } from "./conflicts.svelte";
 import { chats } from "./chats.svelte";
 import { day } from "./day.svelte";
@@ -29,7 +26,6 @@ export type InboxGroup = "people" | "ken" | "sync";
 export type InboxTone = "attn" | "danger" | "accent" | "ink";
 
 export type InboxSource =
-  | { type: "family"; familyId: string; item: FamilyInboxItem }
   | { type: "proposal"; proposal: IngestProposal; cardId: number; note: string; projectId: string }
   | { type: "finding"; finding: TeamFinding & { itemId?: number | null } }
   | { type: "conflict"; conflict: ConflictItem }
@@ -68,32 +64,6 @@ function epoch(s: string | null | undefined): number | null {
 
 function leaf(path: string): string {
   return path.split("/").pop() || path;
-}
-
-/** The family items that wait on me: unread or seen tasks and messages. */
-export function familyItems(groups: { connection: FamilyConnectionDto; items: FamilyInboxItem[] }[]): InboxItem[] {
-  const out: InboxItem[] = [];
-  for (const g of groups) {
-    const familyId = g.connection.connection.familyId;
-    for (const item of g.items) {
-      if (item.malformed) continue;
-      if (item.status !== "unread" && item.status !== "seen") continue;
-      const task = item.kind === "task";
-      out.push({
-        id: `family:${familyId}:${item.id}`,
-        group: "people",
-        kind: task ? "Task" : item.kind === "notification" ? "Notice" : "Message",
-        tone: task ? "attn" : "accent",
-        from: item.from || "A teammate",
-        title: item.title || (task ? "A task" : "A message"),
-        short: item.body.split("\n").find((l) => l.trim())?.trim() ?? "",
-        when: epoch(item.created),
-        where: null,
-        source: { type: "family", familyId, item },
-      });
-    }
-  }
-  return out;
 }
 
 /** An escalation addressed to me: a decision someone raised to its owner. */
@@ -213,7 +183,7 @@ class InboxStore {
   /** Everything waiting on you, in Inbox order. */
   get items(): InboxItem[] {
     const doneIds = new Set(this.done.map((d) => d.id));
-    const people = [...familyItems(families.trayGroups), ...day.escalations.map(escalationItem)];
+    const people = day.escalations.map(escalationItem);
     const sync = [
       ...conflicts.items.map(conflictItem),
       ...app.failedFiles.map((f) => failedItem(f.relPath, f.error ?? null)),
@@ -254,7 +224,6 @@ class InboxStore {
   async subscribe() {
     if (this.subscribed) return;
     this.subscribed = true;
-    void families.init();
     await api.onReviewChanged(() => {
       this.queue();
       void this.refreshFindings();

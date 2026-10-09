@@ -6,7 +6,6 @@
   import { scope } from "../lib/scope.svelte";
   import { api } from "../lib/api";
   import { inbox, type InboxGroup, type InboxItem } from "../lib/inbox.svelte";
-  import { families } from "../lib/families.svelte";
   import { conflicts } from "../lib/conflicts.svelte";
   import { chats } from "../lib/chats.svelte";
   import { openInRepo } from "../lib/day.svelte";
@@ -34,7 +33,6 @@
 
   let busy = $state(false);
   let reply = $state("");
-  let replying = $state(false);
   /** Answering an escalation: a reply in its thread, or the answer that
    *  resolves it. */
   let escMode = $state<"reply" | "resolve" | null>(null);
@@ -51,7 +49,6 @@
       doneNote = { ...doneNote, [item.id]: note };
       inbox.resolved(item);
       inbox.select(item.id);
-      replying = false;
       reply = "";
     } catch (e) {
       toast.error("That did not go through", e);
@@ -64,17 +61,6 @@
   function actions(item: InboxItem): { label: string; run: () => void; primary?: boolean }[] {
     const s = item.source;
     switch (s.type) {
-      case "family": {
-        const id = s.item.id;
-        if (s.item.kind === "task") {
-          return [
-            { label: "Accept", primary: true, run: () => void act(item, () => families.acceptTask(s.familyId, id), "Accepted. It is on your list.") },
-            { label: "Not mine", run: () => void act(item, () => families.setItemStatus(s.familyId, id, "archived"), "Sent back as not yours.") },
-            { label: "Reply", run: () => (replying = true) },
-          ];
-        }
-        return [{ label: "Mark as read", primary: true, run: () => void act(item, () => families.setItemStatus(s.familyId, id, "archived"), "Marked as read.") }];
-      }
       case "proposal": {
         const p = s.proposal;
         const apply = { label: p.kind === "page" || p.kind === "new page" ? "Apply" : "Accept", primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), p.kind === "ruling" ? "Accepted. It is in the decisions log." : p.kind === "ticket" ? "Accepted. The ticket is written." : "Applied. The page cites the note.") };
@@ -123,12 +109,6 @@
     }
   }
 
-  async function sendReply(item: InboxItem) {
-    const s = item.source;
-    if (s.type !== "family" || !reply.trim()) return;
-    await act(item, () => families.pushBack(s.familyId, s.item.id, reply.trim()), "Your reply was sent.");
-  }
-
   async function sendEscalation(item: InboxItem) {
     const s = item.source;
     if (s.type !== "escalation" || !reply.trim() || !escMode) return;
@@ -161,7 +141,6 @@
 
   function selectItem(id: string) {
     inbox.select(id);
-    replying = false;
     escMode = null;
     reply = "";
   }
@@ -222,14 +201,7 @@
           From {sel.from}{when(sel) ? ` · ${when(sel)}` : ""}{sel.where ? ` · ${sel.where.split("/").pop()}` : ""}
         </div>
 
-        {#if sel.source.type === "family"}
-          {#if sel.source.item.body.trim()}
-            <p class="body">{sel.source.item.body}</p>
-          {/if}
-          {#if sel.source.item.task?.due}
-            <p class="t-small">Target {sel.source.item.task.due}</p>
-          {/if}
-        {:else if sel.source.type === "proposal"}
+        {#if sel.source.type === "proposal"}
           {#if sel.source.proposal.body.trim()}
             <p class="body">{sel.source.proposal.body}</p>
           {/if}
@@ -264,9 +236,6 @@
             {doneNote[sel.id] ?? "Done."}
           </div>
         {:else}
-          {#if replying && sel.source.type === "family"}
-            <textarea class="textarea" bind:value={reply} rows="3" placeholder="Reply to {sel.from}…"></textarea>
-          {/if}
           {#if escMode && sel.source.type === "escalation"}
             <textarea
               class="textarea"
@@ -276,10 +245,7 @@
             ></textarea>
           {/if}
           <div class="acts">
-            {#if replying && sel.source.type === "family"}
-              <button class="btn btn-primary" disabled={busy || !reply.trim()} onclick={() => sel && void sendReply(sel)}>Send reply</button>
-              <button class="btn btn-ghost" onclick={() => (replying = false)}>Cancel</button>
-            {:else if escMode && sel.source.type === "escalation"}
+            {#if escMode && sel.source.type === "escalation"}
               <button class="btn btn-primary" disabled={busy || !reply.trim()} onclick={() => sel && void sendEscalation(sel)}>
                 {escMode === "resolve" ? "Resolve" : "Send reply"}
               </button>

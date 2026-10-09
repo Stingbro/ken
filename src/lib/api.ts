@@ -1250,7 +1250,7 @@ export interface DayTask {
   repeat: string | null;
   /** Ticket ids, ken:// or member-relative file paths, or repo names. */
   links: string[];
-  /** The sender, for a task accepted from the team inbox. */
+  /** Who the task came from, when its file says. */
   from: string | null;
   /** The body, markdown. */
   description: string;
@@ -1259,8 +1259,6 @@ export interface DayTask {
   created: string | null;
   /** Relative to the workspace root. */
   relPath: string;
-  /** Set only for a pending inbox task (not yet accepted). */
-  inbox: { familyId: string; itemId: string } | null;
 }
 
 /** Mirrors the Rust `DayTicketDto`: one open ticket file assigned to me. */
@@ -1330,126 +1328,6 @@ export interface TeamDigest {
   generatedAt: number;
   body: string;
   sources: string[];
-}
-
-// ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
-
-/** Mirrors the Rust `FamilyConnection` (camelCase) — one saved connection's
- *  settings half; live sync status comes separately in
- *  `FamilyConnectionDto.state`. */
-export interface FamilyConnection {
-  familyId: string;
-  name: string;
-  remoteUrl: string;
-  memberId: string;
-  liveSync: boolean;
-  pollIntervalSecs: number;
-  attachedWorkspaceId: string | null;
-}
-
-/** Mirrors `ken_core::family_sync::ConnectionState` (`#[serde(tag = "state",
- *  rename_all = "camelCase")]`) — externally tagged on a `state` field, with
- *  each non-unit variant's own fields sitting alongside it. `Conflict` and
- *  `Unavailable` are terminal-until-a-human-acts (see design.md D1/D7):
- *  `Conflict` offers `familyResolveConflict`, `Unavailable` offers nothing. */
-export type FamilyConnectionState =
-  | { state: "idle" }
-  | { state: "syncing" }
-  | { state: "conflict"; detail: string }
-  | { state: "error"; detail: string }
-  | { state: "unavailable"; reason: string };
-
-/** Mirrors `FamilyConnectionDto` — one connection's settings plus its live
- *  `SyncEngine` state, as `familyList`/`familyCreate`/`familyJoin` return it. */
-export interface FamilyConnectionDto {
-  connection: FamilyConnection;
-  state: FamilyConnectionState;
-}
-
-/** Mirrors `ken_core::family_sync::IntegrateOutcome`
- *  (`#[serde(tag = "outcome", rename_all = "camelCase")]`). */
-export type FamilyIntegrateOutcome =
-  | { outcome: "upToDate" }
-  | { outcome: "fastForward"; commits: number }
-  | { outcome: "rebased"; commits: number }
-  | { outcome: "conflict"; detail: string };
-
-/** Mirrors `ken_core::family_sync::PushOutcome` (same tagging convention). */
-export type FamilyPushOutcome =
-  | { outcome: "upToDate" }
-  | { outcome: "pushed"; commits: number }
-  | { outcome: "nonFastForward"; detail: string }
-  | { outcome: "failed"; detail: string };
-
-/** Mirrors `ken_core::family_sync::SyncReport` — one poll/sync-now cycle's
- *  outcome, the payload behind the tray badge and the settings page's "last
- *  sync" line. */
-export interface FamilySyncReport {
-  state: FamilyConnectionState;
-  ran: boolean;
-  integrated: FamilyIntegrateOutcome | null;
-  pushed: FamilyPushOutcome | null;
-  pushRetried: boolean;
-}
-
-/** The `family-sync` app event — emitted after every poll tick and every
- *  on-demand command that touches a connection's transport. `unreadInboxCount`
- *  is THIS device's own inbox count for that family (task 2.3's diff-able
- *  count, not a stateful server-side delta). */
-export interface FamilySyncEvent {
-  familyId: string;
-  report: FamilySyncReport;
-  unreadInboxCount: number;
-}
-
-/** Mirrors `ken_core::family::FamilyMember`. */
-export interface FamilyMember {
-  id: string;
-  name: string;
-}
-
-/** Mirrors `ken_core::family::FamilyManifest` (plain field names, no
- *  camelCase rename needed — every field is already a single lowercase
- *  word). */
-export interface FamilyManifest {
-  id: string;
-  name: string;
-  template: number;
-  members: FamilyMember[];
-}
-
-export type FamilyInboxKind = "task" | "message" | "notification";
-export type FamilyInboxStatus = "unread" | "seen" | "accepted" | "archived";
-
-/** Mirrors `ken_core::family::InboxTaskPayload` (`#[serde(default)]`, plain
- *  field names). */
-export interface FamilyInboxTaskPayload {
-  title: string;
-  project: string;
-  tags: string[];
-  due: string;
-  kind: string;
-}
-
-/** Mirrors `ken_core::family::InboxItem` (camelCase). `kind`/`status` are
- *  `null` when the file's raw value is outside the vocabulary —
- *  `kindRaw`/`statusRaw` always carry what was actually on disk, and
- *  `malformed` marks a file whose frontmatter block couldn't be parsed at
- *  all (D4: "shown raw in the tray, never crash, never be rewritten"). */
-export interface FamilyInboxItem {
-  id: string;
-  kind: FamilyInboxKind | null;
-  kindRaw: string;
-  from: string;
-  status: FamilyInboxStatus | null;
-  statusRaw: string;
-  created: string;
-  updated: string;
-  title: string;
-  task: FamilyInboxTaskPayload | null;
-  body: string;
-  malformed: boolean;
-  fileName: string;
 }
 
 export const api = {
@@ -2093,75 +1971,4 @@ export const api = {
     listen<{ team: string | null; message: string | null }>("team-digest-error", (e) =>
       fn(e.payload?.team ?? null, e.payload?.message ?? ""),
     ),
-
-  // ---- ken-families (ken-families change, task 4.1/4.2/4.3) ----
-  /** Scaffold + commit a brand-new family repo whose remote is `remoteUrl`
-   *  (an empty repo the user already created on their git host); the
-   *  creator becomes the family's first — and owner — member. Rejects with
-   *  a friendly message when `git` is unavailable. */
-  familyCreate: (name: string, memberName: string, remoteUrl: string) =>
-    invoke<FamilyConnectionDto>("family_create", { name, memberName, remoteUrl }),
-  /** Clone an existing family. Pass `existingMemberId` when you're already
-   *  in the manifest, or `newMemberName` to be appended (join appends,
-   *  never rewrites — D2). */
-  familyJoin: (remoteUrl: string, existingMemberId?: string, newMemberName?: string) =>
-    invoke<FamilyConnectionDto>("family_join", { remoteUrl, existingMemberId, newMemberName }),
-  /** Every saved connection with its live sync state. */
-  familyList: () => invoke<FamilyConnectionDto[]>("family_list"),
-  /** The full manifest (member roster, owner, template version) for one
-   *  connection — a settings-page convenience read. */
-  familyManifestGet: (familyId: string) => invoke<FamilyManifest>("family_manifest_get", { familyId }),
-  /** Forget a connection (stops its poller, drops the cached engine,
-   *  detaches the pseudo-member). Never deletes the on-disk clone. */
-  familyRemove: (familyId: string) => invoke<void>("family_remove", { familyId }),
-  /** Toggle live sync for one connection; starts/stops its poller. */
-  familySetLiveSync: (familyId: string, liveSync: boolean) =>
-    invoke<void>("family_set_live_sync", { familyId, liveSync }),
-  /** Change one connection's poll interval in seconds (clamped server-side
-   *  to design.md D1's 30s–30min bounds). */
-  familySetPollInterval: (familyId: string, secs: number) =>
-    invoke<void>("family_set_poll_interval", { familyId, secs }),
-  /** Run the fetch → rebase-integrate → push cycle on demand ("Sync now"). */
-  familySyncNow: (familyId: string) => invoke<FamilySyncReport>("family_sync_now", { familyId }),
-  /** Clear a `Conflict` state after the user has resolved the clone by
-   *  hand (D1: "never auto-resolve"). No-op on any other state. */
-  familyResolveConflict: (familyId: string) => invoke<void>("family_resolve_conflict", { familyId }),
-  /** Attach a connection to a workspace — the clone joins search as a
-   *  `kind: family` member once that workspace is open. */
-  familyAttachWorkspace: (familyId: string, workspaceId: string) =>
-    invoke<void>("family_attach_workspace", { familyId, workspaceId }),
-  /** Detach a connection from its workspace; drops the pseudo-member if
-   *  it's currently resident. */
-  familyDetachWorkspace: (familyId: string) => invoke<void>("family_detach_workspace", { familyId }),
-  /** This device's own inbox for one family (`members/<me>/inbox/`). */
-  familyInboxList: (familyId: string) => invoke<FamilyInboxItem[]>("family_inbox_list", { familyId }),
-  /** Patch one inbox item's status — `seen`/`archived` only;
-   *  `accepted` is reserved for `familyAcceptTask`. */
-  familySetItemStatus: (familyId: string, itemId: string, status: FamilyInboxStatus) =>
-    invoke<FamilyInboxItem>("family_set_item_status", { familyId, itemId, status }),
-  /** Accept a `task` inbox item (D4's acceptance gate): mints a new board
-   *  task in `members/<me>/board/` and marks the inbox item `accepted`, in
-   *  one commit. The ONLY way an incoming task can ever enter the board —
-   *  there is no auto-accept path anywhere in this API. */
-  familyAcceptTask: (familyId: string, itemId: string) =>
-    invoke<DayTask>("family_accept_task", { familyId, itemId }),
-  /** Push back on an inbox item: creates a new message item in the
-   *  SENDER's inbox (lane rule 2) and leaves the original item's status
-   *  untouched — call `familySetItemStatus` separately if you also want to
-   *  mark the original seen/archived. */
-  familyPushBack: (familyId: string, itemId: string, note: string) =>
-    invoke<void>("family_push_back", { familyId, itemId, note }),
-  /** Send a task, message or notification to a teammate's inbox from the
-   *  app (the MCP's family_send, without an agent). Delivery, not assignment. */
-  familySend: (
-    familyId: string,
-    to: string,
-    kind: "task" | "message" | "notification",
-    title: string,
-    body: string,
-  ) => invoke<void>("family_send", { familyId, to, kind, title, body }),
-  /** `family-sync`: emitted after every poll tick and every on-demand
-   *  command that touches a connection's transport. App-global — a family connection has no single owning project. */
-  onFamilySync: (fn: (ev: FamilySyncEvent) => void): Promise<UnlistenFn> =>
-    listen<FamilySyncEvent>("family-sync", (e) => fn(e.payload)),
 };

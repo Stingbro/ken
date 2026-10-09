@@ -1,6 +1,5 @@
 <script lang="ts">
   import TeamScreen from "./TeamScreen.svelte";
-  import TeamInbox from "../team/TeamInbox.svelte";
   import type { SettingsSection } from "../lib/app.svelte";
   // Settings: what is yours (You), what is this computer's (This machine),
   // Ken's features, the connector for agents, and About. Each repo's own
@@ -239,7 +238,6 @@
             changed at once shows in the Inbox under Sync &amp; files, with both versions side by side.
           </p>
         </div>
-        <TeamInbox />
       </section>
     {/if}
 

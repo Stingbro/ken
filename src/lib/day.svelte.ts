@@ -53,8 +53,6 @@ class DayStore {
 
   today = $state(localToday());
   panel = $state<DayPanel | null>(null);
-  /** The inbox task an Accept/Not mine/Reply is running for, by id. */
-  busy = $state<string | null>(null);
 
   private initDone = false;
   private midnightTimer: ReturnType<typeof setTimeout> | undefined;
@@ -340,36 +338,6 @@ class DayStore {
     if (this.panel !== p || list === null) return;
     const task = list.find((t) => t.id === p.id);
     this.panel = task ? { ...p, task } : null;
-  }
-
-  // ── A task from a teammate, not yet accepted ────────────────────────
-
-  private async inboxAction(task: DayTask, run: (familyId: string, itemId: string) => Promise<unknown>) {
-    if (!task.inbox) return;
-    this.busy = task.id;
-    try {
-      const out = await run(task.inbox.familyId, task.inbox.itemId);
-      // Accept answers with the new task; show it before the read lands.
-      if (out && typeof out === "object" && "id" in out && this.state) {
-        this.state = { ...this.state, tasks: this.state.tasks.filter((t) => t.id !== task.id) };
-        this.replace(out as DayTask, true);
-      }
-      await this.refreshState();
-    } finally {
-      this.busy = null;
-    }
-  }
-
-  accept(task: DayTask) {
-    return this.inboxAction(task, (f, i) => api.familyAcceptTask(f, i));
-  }
-
-  notMine(task: DayTask) {
-    return this.inboxAction(task, (f, i) => api.familySetItemStatus(f, i, "archived"));
-  }
-
-  reply(task: DayTask, note: string) {
-    return this.inboxAction(task, (f, i) => api.familyPushBack(f, i, note));
   }
 }
 

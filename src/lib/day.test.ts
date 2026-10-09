@@ -7,7 +7,6 @@ import {
   orderTasks,
   repeatChoices,
   repeatText,
-  sendBody,
   shortTarget,
   splitTicketLink,
   taskDetail,
@@ -198,18 +197,5 @@ describe("escalationDetail", () => {
   });
   it("leaves out what the file does not say", () => {
     expect(escalationDetail({ raisedBy: "", ticket: null, blocks: null, raised: null, repo: "att-team" })).toBe("att-team");
-  });
-});
-
-describe("sendBody", () => {
-  it("adds target, repeat and links under the description", () => {
-    expect(
-      sendBody({ description: "Check the totals.", target: "2026-10-02", repeat: "weekly:tue", links: ["ATT-014", "a/b.md"] }),
-    ).toBe("Check the totals.\n\nTarget: 2026-10-02\nRepeat: Tuesdays\nLinks: ATT-014, a/b.md");
-  });
-
-  it("is the description alone when there is nothing else", () => {
-    expect(sendBody({ description: "Hi", target: null, repeat: null, links: [] })).toBe("Hi");
-    expect(sendBody({ description: "", target: "2026-10-02", repeat: null, links: [] })).toBe("Target: 2026-10-02");
   });
 });

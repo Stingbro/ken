@@ -1,6 +1,5 @@
-//! Task files (`.ken-workspace/tasks/` and my board in each family): the
-//! byte-faithful frontmatter core that Your day (`day.rs`), the team inbox
-//! (`family.rs`) and `ken-mcp` share. The old task board (columns, goals,
+//! Task files (`.ken-workspace/tasks/`): the byte-faithful frontmatter core
+//! that Your day (`day.rs`) and `ken-mcp` share. The old task board (columns, goals,
 //! rollover) is gone; what is left here is the file format's plumbing and
 //! the patch core it was built on. Reading a task is `day::parse_task`.
 //!
@@ -80,14 +79,13 @@ pub fn archive_dir(home_dir: &Path, year_month: &str) -> PathBuf {
     home_dir.join(ARCHIVE_SUBDIR).join(year_month)
 }
 
-/// Which home a task file lives in: the workspace home, or my board in a
-/// family (`<family-clone>/members/<member-id>/board/`). Load-bearing for
-/// archive pathing and the `ken://` address.
+/// Which home a task file lives in. Load-bearing for archive pathing and the
+/// `ken://` address. One home today, the workspace's; kept as a type so the
+/// address and archive code say what they assume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HomeKind {
     Workspace,
-    Family,
 }
 
 /// A task home to scan. Borrowed like `memory::MemoryScope` so callers
@@ -97,27 +95,18 @@ pub enum TaskHome<'a> {
     Workspace {
         workspace_root: &'a Path,
     },
-    /// A family board. The caller resolves `<clone>/members/<member-id>/
-    /// board` (`family::board_dir`) since the clone root lives in app data,
-    /// keyed by a family id this module does not know about.
-    Family {
-        board_dir: &'a Path,
-    },
 }
 
 impl<'a> TaskHome<'a> {
     pub fn tasks_dir(&self) -> PathBuf {
         match self {
             TaskHome::Workspace { workspace_root } => workspace_tasks_dir(workspace_root),
-            // Files live directly under `members/<id>/board/`.
-            TaskHome::Family { board_dir } => board_dir.to_path_buf(),
         }
     }
 
     pub fn kind(&self) -> HomeKind {
         match self {
             TaskHome::Workspace { .. } => HomeKind::Workspace,
-            TaskHome::Family { .. } => HomeKind::Family,
         }
     }
 }
@@ -150,22 +139,11 @@ impl TaskKind {
     }
 }
 
-/// Path of a task file relative to the member root that owns its home —
-/// the tail of its `ken://` address. A family board's `home_dir` is always
-/// `<clone-root>/members/<member-id>/board`, so the member id is the name
-/// of its parent directory, and `family::board_rel` composes the same
-/// `members/<id>/board` shape every caller uses.
-pub fn home_rel_path(home: HomeKind, home_dir: &Path, file_name: &str) -> String {
+/// Path of a task file relative to the root that owns its home — the tail of
+/// its `ken://` address.
+pub fn home_rel_path(home: HomeKind, _home_dir: &Path, file_name: &str) -> String {
     match home {
         HomeKind::Workspace => format!("{TASKS_SUBDIR}/{file_name}"),
-        HomeKind::Family => {
-            let member_id = home_dir
-                .parent()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            format!("{}/{file_name}", crate::family::board_rel(&member_id))
-        }
     }
 }
 
@@ -1014,12 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn family_board_paths_carry_the_member_id() {
-        let board = Path::new("/data/families/FAM1/members/mem-1/board");
-        let home = TaskHome::Family { board_dir: board };
-        assert_eq!(home.tasks_dir(), board);
-        assert_eq!(home.kind(), HomeKind::Family);
-        assert_eq!(home_rel_path(HomeKind::Family, board, "01J0-x.md"), "members/mem-1/board/01J0-x.md");
+    fn workspace_task_paths_sit_under_tasks() {
         assert_eq!(home_rel_path(HomeKind::Workspace, Path::new("/w/.ken-workspace/tasks"), "a.md"), "tasks/a.md");
     }
 

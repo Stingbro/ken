@@ -259,9 +259,8 @@ record.";
 /// Ken's own MCP tools the chat may use without asking: they read Ken's
 /// index, open a file for the person when they asked, or keep the person's
 /// own list and Ken's memory when they ask (each write is dated and says who
-/// made it). Sending to a teammate through the team inbox is declined in
-/// chat: the person does that in Ken.
-pub const KEN_MCP_ALLOWED: [&str; 21] = [
+/// made it).
+pub const KEN_MCP_ALLOWED: [&str; 19] = [
     "history",
     "find_definition",
     "find_usages",
@@ -280,8 +279,6 @@ pub const KEN_MCP_ALLOWED: [&str; 21] = [
     "ticket_list",
     "memory_write",
     "journal_append",
-    "family_list",
-    "family_inbox",
     "open_in_ken",
 ];
 
@@ -1327,7 +1324,6 @@ mod tests {
         for tool in named {
             assert!(KEN_MCP_ALLOWED.contains(&tool), "{tool} is named in the guide but not allowed");
         }
-        assert!(!KEN_MCP_ALLOWED.contains(&"family_send"), "sending to a teammate stays with the person");
     }
 
     #[test]

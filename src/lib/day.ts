@@ -241,17 +241,3 @@ export function stampLabel(stamp: string | null | undefined, today: string = loc
       : date;
   return time ? `${label} ${time}` : label;
 }
-
-/** What a task sent to a teammate carries in its body: the description,
- *  then its target, repeat and links, one per line. The inbox has no
- *  fields for those. */
-export function sendBody(task: Pick<DayTask, "description" | "target" | "repeat" | "links">): string {
-  const lines: string[] = [];
-  if (task.target) lines.push(`Target: ${task.target}`);
-  const rep = repeatText(task.repeat);
-  if (rep) lines.push(`Repeat: ${rep}`);
-  if (task.links.length > 0) lines.push(`Links: ${task.links.join(", ")}`);
-  const desc = task.description.trim();
-  if (lines.length === 0) return desc;
-  return desc ? `${desc}\n\n${lines.join("\n")}` : lines.join("\n");
-}

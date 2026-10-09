@@ -122,7 +122,6 @@
   const panelOpen = $derived(day.panel !== null && (day.panel.mode === "new" || day.panelTask !== null));
 
   function openTask(task: DayTask) {
-    if (task.inbox) return;
     day.openTask(task.id);
   }
 
@@ -247,25 +246,18 @@
         {#each day.tasks as task (task.relPath + ":" + task.id)}
           {@const done = task.state === "done"}
           <div class="row" class:sel={selectedId === task.id} class:done>
-            {#if task.inbox}
-              <span class="k-check pending" title="Sent by {task.from ?? 'a teammate'}; accept it first"></span>
-            {:else}
-              <button
-                class="k-check"
-                class:on={done}
-                aria-label={done ? "Mark open" : "Mark done"}
-                onclick={() => void run(day.toggle(task), "Could not change the task")}
-              >
-                {#if done}<Check size={11} strokeWidth={3} />{/if}
-              </button>
-            {/if}
-            <button class="rmain plain" onclick={() => openTask(task)} disabled={!!task.inbox}>
-              <span class="rtitle">{task.title}</span>
-              <span class="rdetail" class:from={!!task.inbox}>{task.inbox ? `from ${task.from ?? "a teammate"}` : taskDetail(task)}</span>
+            <button
+              class="k-check"
+              class:on={done}
+              aria-label={done ? "Mark open" : "Mark done"}
+              onclick={() => void run(day.toggle(task), "Could not change the task")}
+            >
+              {#if done}<Check size={11} strokeWidth={3} />{/if}
             </button>
-            {#if task.inbox}
-              <button class="btn btn-primary btn-small" onclick={() => void run(day.accept(task), "Could not accept the task")}>Accept</button>
-            {/if}
+            <button class="rmain plain" onclick={() => openTask(task)}>
+              <span class="rtitle">{task.title}</span>
+              <span class="rdetail">{taskDetail(task)}</span>
+            </button>
             <span class="due {dueClass(task.target, done)}">{dueLabel(task.target)}</span>
           </div>
         {/each}

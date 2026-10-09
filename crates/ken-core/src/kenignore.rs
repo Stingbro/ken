@@ -246,7 +246,6 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
 ///
 /// - `memory::workspace_builtin_rules()` — the workspace pseudo-member
 ///   (ken-memory 1.6).
-/// - `family::family_builtin_rules()` — a family clone (ken-families 1.6).
 ///
 /// What does belong here is a rule global to every project: archives. An
 /// archive or disk image answers no question by its name and Ken cannot

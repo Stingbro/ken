@@ -21,8 +21,6 @@ use uuid::Uuid;
 use ken_core::day;
 use ken_core::db::Db;
 use ken_core::embedder::Embedder;
-use ken_core::family::{self, FamilyManifest, InboxKind, InboxTaskPayload, Lane, NewInboxItem};
-use ken_core::family_sync::{self, ConnectionState, GitTransport, PendingWrite, SyncEngine, SystemGit};
 use ken_core::memory;
 use ken_core::profiler::{self, ProjectProfile};
 use ken_core::project::Project;
@@ -528,8 +526,7 @@ today's workspace journal. A recurring task marked done is done for today only."
                     "description": { "type": "string", "description": "Replaces the description." },
                     "repeat": { "type": "string", "description": "daily, weekdays, weekly:<mon..sun>, monthly:<1-31>, or \"\" for none." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Replaces the links." },
-                    "state": { "type": "string", "enum": ["open", "done"] },
-                    "as": { "type": "string", "description": "Only for a task on a family board when this device's member identity for that family isn't configured: your member id (from family_list)." }
+                    "state": { "type": "string", "enum": ["open", "done"] }
                 },
                 "required": ["id"]
             }
@@ -561,68 +558,6 @@ how many of the user's tasks link to it. Read-only: tickets are edited as files.
                     "assignee": { "type": "string", "enum": ["me", "all"], "description": "Default me." },
                     "state": { "type": "string", "enum": ["open", "all"], "description": "Default open." }
                 }
-            }
-        }));
-    }
-
-    // The team inbox (a family repo): always listed.
-    {
-        tools.push(json!({
-            "name": "family_list",
-            "description": "List this device's Ken family connections — \
-each connection's name and id, its members, which member you are (if \
-configured), and its local sync state (commits ahead/behind the remote, \
-whether the working tree is dirty, whether a rebase is stuck). Call this \
-first to get the family/member ids family_inbox and family_send need.",
-            "inputSchema": { "type": "object", "properties": {} }
-        }));
-        tools.push(json!({
-            "name": "family_inbox",
-            "description": "List items in your own inbox for one Ken \
-family connection (or every connection this device has a known identity \
-for, if `family` is omitted) — each item's id, kind (task/message/\
-notification), status (unread/seen/accepted/archived), sender, and title. \
-Read-only: calling this never changes an item's status.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "family": { "type": "string", "description": "Family name or id, from family_list. Omitted: every family connection with a known identity." },
-                    "as": { "type": "string", "description": "Override which family member's inbox to read, when this device's identity for the family isn't already configured — a member id from family_list." }
-                }
-            }
-        }));
-        tools.push(json!({
-            "name": "family_send",
-            "description": "Deliver a task, message, or notification into \
-a teammate's inbox in a Ken family repo: creates exactly one new file \
-under their members/<id>/inbox/ and pushes it — the only cross-member \
-write Ken's write lanes allow (never an edit of anything the recipient \
-already owns). Delivery is not assignment or acceptance, and there is no \
-auto-accept: a task item becomes a Your \
-day task only when the recipient accepts it in their Inbox; a message \
-waits, unread, until they read it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "family": { "type": "string", "description": "Family name or id, from family_list." },
-                    "to": { "type": "string", "description": "Recipient member id, from family_list." },
-                    "kind": { "type": "string", "enum": ["task", "message", "notification"] },
-                    "title": { "type": "string", "description": "Short title/subject line." },
-                    "body": { "type": "string", "description": "Free-form markdown body — the message text, or task context/brief." },
-                    "task": {
-                        "type": "object",
-                        "description": "Only meaningful when \"kind\" is \"task\" — the brief the recipient's accept flow copies onto a fresh board task. Defaults to \"title\"/kind \"human\" when omitted on a task item.",
-                        "properties": {
-                            "title": { "type": "string" },
-                            "project": { "type": "string" },
-                            "tags": { "type": "array", "items": { "type": "string" } },
-                            "due": { "type": "string", "description": "Due date, e.g. YYYY-MM-DD." },
-                            "kind": { "type": "string", "enum": ["human", "ai"] }
-                        }
-                    },
-                    "as": { "type": "string", "description": "Override which family member is sending, when this device's identity for the family isn't already configured — a member id from family_list." }
-                },
-                "required": ["family", "to", "kind", "title"]
             }
         }));
     }
@@ -718,9 +653,6 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "task_list" => task_list_tool(server, args),
         "task_update" => task_update_tool(server, args),
         "ticket_list" => ticket_list_tool(server, args),
-        "family_list" => family_list_tool(server),
-        "family_inbox" => family_inbox_tool(server, args),
-        "family_send" => family_send_tool(server, args),
         "search_knowledge" => {
             let query = require_str(args, "query")?;
             let limit = args
@@ -2099,62 +2031,25 @@ fn journal_append_tool(server: &Server, args: &Value) -> Result<String, String> 
 // The file logic is `ken_core::day`, the same core the app's Your day
 // commands use, so a task written here reads the same there.
 
-/// One member's board within one family connection, as a task home.
-/// Every member's board is scanned so `task_update` can find a task by id,
-/// but only this device's own board is listed, and `family_authorize_write`
-/// (via `family::lane_check`) refuses a write to anyone else's.
-#[derive(Debug, Clone)]
-struct FamilyBoardHome {
-    family_id: Uuid,
-    family_name: String,
-    clone_root: PathBuf,
-    /// Whose board this home scans.
-    member_id: String,
-    /// This device's own member id in the family, if known.
-    my_member_id: Option<String>,
-    /// `family::board_dir(&clone_root, &member_id)`.
-    board_dir: PathBuf,
-}
-
-impl FamilyBoardHome {
-    fn is_mine(&self) -> bool {
-        self.my_member_id.as_deref() == Some(self.member_id.as_str())
-    }
-}
-
-/// The task homes for one call, owned so borrowed `TaskHome`s can be built
-/// from them: the workspace home (where new tasks go) and the boards of
-/// the families attached to this workspace. A repo's own `.ken/tasks/` is
-/// not a home (tasks live in your own folder, not in a team repo).
+/// The task home for one call: the workspace home, where every task lives.
+/// A repo's own `.ken/tasks/` is not a home (tasks live in your own folder,
+/// not in a team repo).
 struct TaskHomes {
     workspace_root: PathBuf,
-    family_boards: Vec<FamilyBoardHome>,
 }
 
 impl TaskHomes {
-    fn homes(&self, only_mine: bool) -> Vec<tasks::TaskHome<'_>> {
-        let mut out = vec![tasks::TaskHome::Workspace { workspace_root: &self.workspace_root }];
-        for fb in self.family_boards.iter().filter(|fb| !only_mine || fb.is_mine()) {
-            out.push(tasks::TaskHome::Family { board_dir: &fb.board_dir });
-        }
-        out
+    fn homes(&self) -> Vec<tasks::TaskHome<'_>> {
+        vec![tasks::TaskHome::Workspace { workspace_root: &self.workspace_root }]
     }
 
-    fn scan(&self, today: &str, only_mine: bool) -> Vec<day::DayTask> {
-        day::scan(&self.homes(only_mine), today)
+    fn scan(&self, today: &str) -> Vec<day::DayTask> {
+        day::scan(&self.homes(), today)
     }
 
-    fn family_origin(&self, task: &day::DayTask) -> Option<&FamilyBoardHome> {
-        self.family_boards.iter().find(|fb| fb.board_dir == task.home_dir)
-    }
-
-    /// The `ken://` host for a task: the family id for a board task, else
-    /// the workspace pseudo-host.
-    fn host_for(&self, task: &day::DayTask) -> String {
-        match self.family_origin(task) {
-            Some(fb) => fb.family_id.to_string(),
-            None => memory::WORKSPACE_ADDRESS_ID.to_string(),
-        }
+    /// The `ken://` host for a task: the workspace pseudo-host.
+    fn host_for(&self, _task: &day::DayTask) -> String {
+        memory::WORKSPACE_ADDRESS_ID.to_string()
     }
 
     fn address_for(&self, task: &day::DayTask) -> String {
@@ -2162,58 +2057,8 @@ impl TaskHomes {
     }
 }
 
-/// Is this family one Your day reads for workspace `workspace_id`? The
-/// app's `day_families` rule: a connection saved in settings
-/// (`familyConnections`) that is attached to this workspace or to none. A
-/// clone on disk with no saved connection is not read.
-fn family_attached_to(settings: &AppSettings, family_id: &str, dir_name: &str, workspace_id: Option<Uuid>) -> bool {
-    let Some(conns) = settings.extra.get("familyConnections").and_then(Value::as_array) else {
-        return false;
-    };
-    conns.iter().filter_map(Value::as_object).any(|c| {
-        let id_matches = c
-            .get("familyId")
-            .and_then(Value::as_str)
-            .is_some_and(|v| v.eq_ignore_ascii_case(family_id) || v.eq_ignore_ascii_case(dir_name));
-        let attached = match c.get("attachedWorkspaceId") {
-            None | Some(Value::Null) => true,
-            Some(v) => v
-                .as_str()
-                .and_then(|s| s.parse::<Uuid>().ok())
-                .is_some_and(|id| Some(id) == workspace_id),
-        };
-        id_matches && attached
-    })
-}
-
 fn resolve_task_homes(server: &Server) -> Result<TaskHomes, String> {
-    let workspace_root = resolve_workspace_root(server)?;
-    let workspace_id = Registry::load(&server.base_dir).ok().and_then(|r| r.last_workspace);
-    let settings = AppSettings::load(&server.base_dir);
-    let mut family_boards = Vec::new();
-    for conn in discover_family_connections(server) {
-        if conn.manifest.check_supported().is_err() {
-            continue; // "needs a newer Ken": no sync, ingest, or write (spec)
-        }
-        if !family_attached_to(&settings, &conn.manifest.id.to_string(), &conn.dir_name, workspace_id) {
-            continue; // attached to another workspace, or no longer connected
-        }
-        for member in &conn.manifest.members {
-            let board_dir = family::board_dir(&conn.clone_root, &member.id);
-            if !board_dir.is_dir() {
-                continue;
-            }
-            family_boards.push(FamilyBoardHome {
-                family_id: conn.manifest.id,
-                family_name: conn.manifest.name.clone(),
-                clone_root: conn.clone_root.clone(),
-                member_id: member.id.clone(),
-                my_member_id: conn.my_member_id.clone(),
-                board_dir,
-            });
-        }
-    }
-    Ok(TaskHomes { workspace_root, family_boards })
+    Ok(TaskHomes { workspace_root: resolve_workspace_root(server)? })
 }
 
 /// `(today, now)` for a task read or write, in local time like the app's
@@ -2270,9 +2115,7 @@ fn task_create_tool(server: &Server, args: &Value) -> Result<String, String> {
 }
 
 /// `task_update`: change a task by id, `updated_by: mcp`. Marking it done
-/// appends the one-line journal entry (memory is built in). A task on a
-/// family board is lane-checked before anything touches disk, then
-/// committed and pushed.
+/// appends the one-line journal entry (memory is built in).
 fn task_update_tool(server: &Server, args: &Value) -> Result<String, String> {
     let id = require_str(args, "id")?;
     let state = match args.get("state").and_then(Value::as_str) {
@@ -2289,24 +2132,14 @@ fn task_update_tool(server: &Server, args: &Value) -> Result<String, String> {
         links: str_list(args, "links"),
         state,
     };
-    let as_arg = opt_str(args, "as");
     let (today, now) = task_clock();
     let homes = resolve_task_homes(server)?;
-    let all = homes.scan(&today, false);
+    let all = homes.scan(&today);
     let task = day::find(&all, &id)
         .ok_or_else(|| format!("no task with id {id:?} — task_list shows the ids"))?
         .clone();
     let stamp = day::Stamp { today: &today, now: &now, by: day::BY_MCP };
-
-    let mut sync_note = String::new();
-    match homes.family_origin(&task).cloned() {
-        Some(fb) => {
-            let (identity, rel_path) = family_authorize_write(&fb, &task.file_name(), as_arg.as_deref())?;
-            day::update_task(&task, &patch, &stamp).map_err(|e| e.to_string())?;
-            sync_note = push_family_board_write(&fb, &identity, &rel_path, &task.path);
-        }
-        None => day::update_task(&task, &patch, &stamp).map_err(|e| e.to_string())?,
-    }
+    day::update_task(&task, &patch, &stamp).map_err(|e| e.to_string())?;
 
     let raw = std::fs::read_to_string(&task.path).map_err(|e| format!("task was updated but could not be re-read: {e}"))?;
     let updated = day::parse_task(&task.path, task.home, &raw, &today);
@@ -2325,12 +2158,10 @@ fn task_update_tool(server: &Server, args: &Value) -> Result<String, String> {
             Err(e) => msg.push_str(&format!(" (warning: could not write the journal entry: {e})")),
         }
     }
-    msg.push_str(&sync_note);
     Ok(msg)
 }
 
-/// `task_list`: the user's tasks (their own family board only), open by
-/// default.
+/// `task_list`: the user's tasks, open by default.
 fn task_list_tool(server: &Server, args: &Value) -> Result<String, String> {
     let state = match args.get("state").and_then(Value::as_str).map(str::trim) {
         None | Some("") | Some("open") => Some(day::DayTaskState::Open),
@@ -2347,7 +2178,7 @@ fn task_list_tool(server: &Server, args: &Value) -> Result<String, String> {
     let q = day::TaskQuery { state, target_before, linked: opt_str(args, "linked") };
     let (today, _) = task_clock();
     let homes = resolve_task_homes(server)?;
-    let all = homes.scan(&today, true);
+    let all = homes.scan(&today);
     let hits = day::query(&all, &q);
     if hits.is_empty() {
         return Ok("No tasks match.".to_string());
@@ -2473,477 +2304,8 @@ fn kg_routing_enabled(_app_settings: &AppSettings) -> bool {
     true
 }
 
-// --- ken-families tools (tasks 3.1-3.4) ---
-//
-// `family.rs`/`family_sync.rs` (section 1, another session, already
-// landed) own every decision that matters for safety: `lane_check` is what
-// actually refuses a cross-lane write, `commit_paths` is the only write
-// path, and `SyncEngine` is the only state machine that talks to git. This
-// layer's job is thin: discover what family clones exist on this device,
-// figure out which manifest member this device is, and turn that into
-// three read/write tools plus two extra homes for the existing task tools.
-
-/// One family connection this device knows about, discovered from disk
-/// (see `discover_family_connections`'s doc comment for why: task 2.1's
-/// settings-backed connection store had not landed in `src-tauri` as of
-/// this layer, confirmed by grepping `src-tauri/src/lib.rs` for
-/// "family"/"families" — zero hits — so this can't read it. `family.json`
-/// itself has no "who am I" field (it's the *shared*, synced manifest,
-/// identical in every member's clone), so identity is resolved separately
-/// per connection — see `my_member_id`'s doc comment).
-struct FamilyConnection {
-    /// The `families/<dir>` folder name under this device's app data
-    /// (design D1: `<app data>/ken/families/<family-id>/`) — usually the
-    /// manifest's own id as a string, but matched loosely by
-    /// `find_family_connection` (id, name, or this folder name) since
-    /// nothing enforces the two staying in sync on disk.
-    dir_name: String,
-    clone_root: PathBuf,
-    manifest: FamilyManifest,
-    /// This device's member id in this family, if it could be resolved —
-    /// see `settings_member_id` (best-effort, forward-compatible with
-    /// task 2.1's eventual settings shape) and its single-member fallback
-    /// in `discover_family_connections`. `None` means a tool that needs to
-    /// write (family_send, a family-board task_update) must
-    /// be given an explicit `as` argument instead.
-    my_member_id: Option<String>,
-}
-
-/// `<base_dir>/families` — `base_dir` is already `<app data>/ken`
-/// (`registry::default_base_dir`), so this is exactly design D1's
-/// `<app data>/ken/families/`.
-fn families_root(server: &Server) -> PathBuf {
-    server.base_dir.join("families")
-}
-
-/// Every family connection this device has a local clone for.
-///
-/// **Judgment call, recorded honestly**: task 2.1 (the settings-backed
-/// connection store — remote URL, my member id, live-sync, attached
-/// workspace) has not landed in `src-tauri` as of this layer (verified by
-/// grep: no "family"/"families" hits anywhere under `src-tauri/src/`, nor
-/// in `settings.rs`/`features.rs`). Rather than block on that session or
-/// invent a second, competing store, this discovers connections the robust
-/// way available right now: scan `<base_dir>/families/*/family.json`
-/// directly. Every directory with a loadable manifest is a connection.
-/// This also means "attached to workspace" (D6, which gates *search
-/// indexing*, task 2.5 — a different concern from these MCP tools) isn't
-/// checked here: every on-disk connection contributes to family_list,
-/// family_inbox, family_send, and the task-tool board homes, regardless of
-/// any future attachment flag. When 2.1 lands, `settings_member_id` below
-/// already probes a couple of plausible future shapes for the identity
-/// half; the discovery half (which connections exist) would only need to
-/// prefer the settings list's `clonePath`s over this scan if their shapes
-/// ever disagree, which they should not (both describe the same disk
-/// state D1 defines).
-fn discover_family_connections(server: &Server) -> Vec<FamilyConnection> {
-    let root = families_root(server);
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    let settings = AppSettings::load(&server.base_dir);
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Ok(manifest) = FamilyManifest::load(&path) else {
-            continue; // not a family clone (or unreadable) — skip, don't error the whole scan
-        };
-        let dir_name = entry.file_name().to_string_lossy().into_owned();
-        let my_member_id = settings_member_id(&settings, &manifest.id.to_string(), &dir_name).or_else(|| {
-            // No identity on record anywhere: a family with exactly one
-            // member is unambiguous (the solo/just-created case) — assume
-            // that member is this device. A multi-member family with no
-            // recorded identity stays `None` until an `as` argument or
-            // task 2.1's store supplies one.
-            match manifest.members.as_slice() {
-                [only] => Some(only.id.clone()),
-                _ => None,
-            }
-        });
-        out.push(FamilyConnection { dir_name, clone_root: path, manifest, my_member_id });
-    }
-    out.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name).then(a.dir_name.cmp(&b.dir_name)));
-    out
-}
-
-/// Best-effort, forward-compatible lookup for "which member am I in this
-/// family" from `settings.json`'s passthrough `extra` map, in case task
-/// 2.1's connection store has landed by the time this runs. Its exact
-/// shape isn't known to this layer (it's owned by a parallel session), so
-/// this tolerantly probes a few plausible key/field names rather than
-/// assuming one; anything that doesn't match falls through to `None`, and
-/// `discover_family_connections`'s single-member fallback (or an explicit
-/// `as` argument) takes over from there.
-fn settings_member_id(settings: &AppSettings, family_id: &str, dir_name: &str) -> Option<String> {
-    for list_key in ["familyConnections", "families", "family_connections"] {
-        let Some(arr) = settings.extra.get(list_key).and_then(Value::as_array) else {
-            continue;
-        };
-        for conn in arr {
-            let Some(obj) = conn.as_object() else { continue };
-            let id_matches = ["familyId", "family_id", "id"].iter().any(|k| {
-                obj.get(*k)
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| v.eq_ignore_ascii_case(family_id) || v.eq_ignore_ascii_case(dir_name))
-            });
-            if !id_matches {
-                continue;
-            }
-            for member_key in ["myMemberId", "my_member_id", "memberId", "member_id", "member"] {
-                if let Some(m) = obj.get(member_key).and_then(Value::as_str) {
-                    let m = m.trim();
-                    if !m.is_empty() {
-                        return Some(m.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Resolve the `family` tool argument (name or id, matched case-
-/// insensitively against a connection's manifest id, manifest name, or its
-/// `families/<dir>` folder name) to one connection.
-fn find_family_connection(server: &Server, family_arg: &str) -> Result<FamilyConnection, String> {
-    let conns = discover_family_connections(server);
-    conns
-        .into_iter()
-        .find(|c| {
-            c.dir_name.eq_ignore_ascii_case(family_arg)
-                || c.manifest.id.to_string().eq_ignore_ascii_case(family_arg)
-                || c.manifest.name.eq_ignore_ascii_case(family_arg)
-        })
-        .ok_or_else(|| {
-            let names: Vec<String> =
-                discover_family_connections(server).iter().map(|c| c.manifest.name.clone()).collect();
-            let available = if names.is_empty() {
-                "No family connections were found on this device.".to_string()
-            } else {
-                format!("Known families: {}.", names.join(", "))
-            };
-            format!("No family connection matches {family_arg:?}. {available}")
-        })
-}
-
-/// Which member this call acts as for `conn`: the connection's resolved
-/// identity when there is one; only without one, an explicit `as`
-/// argument (validated against the manifest); else a clear error telling
-/// the caller how to supply one (family_list's members list is where to
-/// find valid ids).
-fn resolve_family_identity(conn: &FamilyConnection, as_arg: Option<&str>) -> Result<String, String> {
-    // A configured identity wins: `as` is only for a device that has none.
-    if let Some(me) = &conn.my_member_id {
-        return Ok(me.clone());
-    }
-    if let Some(explicit) = as_arg {
-        let explicit = explicit.trim();
-        if !conn.manifest.has_member(explicit) {
-            return Err(format!(
-                "\"{explicit}\" is not a member of family \"{}\". Members: {}.",
-                conn.manifest.name,
-                conn.manifest.member_ids().join(", ")
-            ));
-        }
-        return Ok(explicit.to_string());
-    }
-    Err(format!(
-        "This device's member identity in family \"{}\" is not configured yet. \
-Pass \"as\" with one of this family's member ids ({}) to say who you are.",
-        conn.manifest.name,
-        conn.manifest.member_ids().join(", ")
-    ))
-}
-
 fn opt_str(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
-}
-
-/// Task 3.4's enforcement point: may this device, acting as `identity`
-/// (`fb.my_member_id`, or an explicit `as` argument only when none is
-/// configured), write to
-/// `fb`'s board? Delegates to `family::lane_check` itself — the same
-/// function `commit_paths` runs on every real family commit — so a claim
-/// aimed at a teammate's board is refused by the lane rules, not by a
-/// separate check this function could get out of sync with. Returns the
-/// resolved identity and the write's repo-relative path on success, so
-/// callers don't recompute either.
-fn family_authorize_write(
-    fb: &FamilyBoardHome,
-    file_name: &str,
-    as_arg: Option<&str>,
-) -> Result<(String, String), String> {
-    // A configured identity is who this device is; `as` only fills the gap
-    // when none is configured, so it cannot be used to write as someone else.
-    let identity = fb.my_member_id.clone().or_else(|| as_arg.map(str::to_string)).ok_or_else(|| {
-        format!(
-            "cannot write to family \"{}\"'s board — this device's member identity for that \
-family isn't configured yet; pass \"as\" with your member id",
-            fb.family_name
-        )
-    })?;
-    let rel_path = format!("{}/{file_name}", family::board_rel(&fb.member_id));
-    family::lane_check(&identity, &rel_path, false)
-        .map_err(|v| format!("refused: {v} (family \"{}\")", fb.family_name))?;
-    Ok((identity, rel_path))
-}
-
-/// Commit and push a family board write that already landed on disk (task
-/// 3.4's "the completion is pushed for teammates to see"). Best-effort by
-/// design: the local file write already succeeded and is the operation's
-/// actual result, so any git failure here becomes a warning suffix on the
-/// tool's success message rather than failing the call — the same posture
-/// `task_update_tool` takes with journal-write failures.
-fn push_family_board_write(fb: &FamilyBoardHome, identity: &str, rel_path: &str, path: &Path) -> String {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => return format!(" (warning: written locally; could not read it back to sync: {e})"),
-    };
-    let mut git = match SystemGit::open(&fb.clone_root) {
-        Ok(g) => g,
-        Err(e) => return format!(" (warning: written locally; could not open the family clone to sync: {e})"),
-    };
-    let lane = Lane::member(identity);
-    let mut engine = SyncEngine::new();
-    if let Err(e) =
-        engine.commit(&mut git, &lane, &[PendingWrite::new(rel_path.to_string(), content)], "Ken: board update")
-    {
-        return format!(" (warning: written locally; could not commit to the family clone: {e})");
-    }
-    let report = engine.poll(&mut git);
-    match report.state {
-        ConnectionState::Idle => " Synced to the family remote.".to_string(),
-        other => format!(" (warning: committed locally but not pushed yet — {other:?}; will retry on the next sync)"),
-    }
-}
-
-fn parse_inbox_task_payload(v: &Value) -> Result<InboxTaskPayload, String> {
-    let obj = v.as_object().ok_or_else(|| "\"task\" must be an object".to_string())?;
-    let get_str = |k: &str| obj.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let tags: Vec<String> = obj
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let kind = get_str("kind");
-    Ok(InboxTaskPayload {
-        title: get_str("title"),
-        project: get_str("project"),
-        tags,
-        due: get_str("due"),
-        kind: if kind.is_empty() { "human".to_string() } else { kind },
-    })
-}
-
-/// `family_list` (task 3.1): every connection this device knows about, its
-/// members, this device's identity in it (if resolved), and its local sync
-/// state. Deliberately reads local git state only (`head_status` —
-/// ahead/behind/dirty/rebase) and never fetches: a list call should be
-/// cheap and side-effect-free, unlike family_send's deliver-and-push.
-fn family_list_tool(server: &Server) -> Result<String, String> {
-    let conns = discover_family_connections(server);
-    if conns.is_empty() {
-        return Ok("No family connections found on this device.".to_string());
-    }
-    let mut out = format!("{} family connection{}:\n", conns.len(), if conns.len() == 1 { "" } else { "s" });
-    for c in &conns {
-        out.push_str(&format!("\n{} (id {})\n", c.manifest.name, c.manifest.id));
-        if let Err(unsupported) = c.manifest.check_supported() {
-            out.push_str(&format!("  unavailable: {unsupported}\n"));
-            continue;
-        }
-        let identity = c.my_member_id.as_deref().unwrap_or("unknown — pass \"as\" to family_inbox/family_send");
-        out.push_str(&format!("  you are: {identity}\n"));
-        let members: Vec<String> = c
-            .manifest
-            .members
-            .iter()
-            .map(|m| {
-                let you = if Some(m.id.as_str()) == c.my_member_id.as_deref() { " (you)" } else { "" };
-                format!("{}{you}", m.id)
-            })
-            .collect();
-        out.push_str(&format!("  members: {}\n", members.join(", ")));
-        out.push_str(&format!("  clone: {}\n", c.clone_root.display()));
-        match family_sync::git_available() {
-            Err(reason) => out.push_str(&format!("  sync: unavailable — git is not usable ({reason})\n")),
-            Ok(_) => match SystemGit::open(&c.clone_root).and_then(|g| g.head_status()) {
-                Ok(status) => out.push_str(&format!(
-                    "  sync: {} ahead, {} behind, {}{}\n",
-                    status.ahead,
-                    status.behind,
-                    if status.dirty { "dirty" } else { "clean" },
-                    if status.rebase_in_progress { ", rebase in progress" } else { "" }
-                )),
-                Err(e) => out.push_str(&format!("  sync: could not read local git status ({e})\n")),
-            },
-        }
-    }
-    Ok(out)
-}
-
-/// `family_inbox` (task 3.2): this device's own inbox items for one family
-/// (or every family with a resolved identity, if `family` is omitted).
-/// Read-only by design — surfacing an item and marking it `seen`/
-/// `accepted`/`archived` are separate, deliberate actions (D4), not a side
-/// effect of listing.
-fn family_inbox_tool(server: &Server, args: &Value) -> Result<String, String> {
-    let family_arg = opt_str(args, "family");
-    let as_arg = opt_str(args, "as");
-
-    let targets: Vec<FamilyConnection> = match &family_arg {
-        Some(f) => vec![find_family_connection(server, f)?],
-        None => discover_family_connections(server),
-    };
-    if targets.is_empty() {
-        return Ok("No family connections found on this device.".to_string());
-    }
-
-    let mut out = String::new();
-    for conn in &targets {
-        if let Err(unsupported) = conn.manifest.check_supported() {
-            out.push_str(&format!("{}: unavailable — {unsupported}\n", conn.manifest.name));
-            continue;
-        }
-        let identity = match resolve_family_identity(conn, as_arg.as_deref()) {
-            Ok(id) => id,
-            Err(e) => {
-                // A specific `family` argument that can't resolve an
-                // identity is the caller's problem to fix; omitted `family`
-                // just skips connections we don't know our identity in.
-                if family_arg.is_some() {
-                    return Err(e);
-                }
-                out.push_str(&format!("{}: {e}\n", conn.manifest.name));
-                continue;
-            }
-        };
-        let dir = family::inbox_dir(&conn.clone_root, &identity);
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        files.sort();
-        if files.is_empty() {
-            out.push_str(&format!("{} (\"{identity}\"): inbox is empty.\n", conn.manifest.name));
-            continue;
-        }
-        out.push_str(&format!(
-            "{} (\"{identity}\") — {} item{}:\n",
-            conn.manifest.name,
-            files.len(),
-            if files.len() == 1 { "" } else { "s" }
-        ));
-        for path in &files {
-            let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let raw = std::fs::read_to_string(path).unwrap_or_default();
-            let item = family::parse_inbox_item(&file_name, &raw);
-            out.push_str(&format!(
-                "\n  {} [{}, {}] from {} — \"{}\"{}",
-                item.id,
-                item.kind.map(|k| k.as_str()).unwrap_or(item.kind_raw.as_str()),
-                item.status.map(|s| s.as_str()).unwrap_or(item.status_raw.as_str()),
-                if item.from.is_empty() { "unknown" } else { &item.from },
-                item.title,
-                if item.malformed { " (malformed — shown as-is)" } else { "" }
-            ));
-        }
-        out.push('\n');
-    }
-    if out.trim().is_empty() {
-        return Ok("No family connections with a known identity on this device — pass \"as\" or \
-\"family\" explicitly, or configure identity in Families settings."
-            .to_string());
-    }
-    Ok(out)
-}
-
-/// `family_send` (task 3.3): deliver one item into `to`'s inbox. **Locked
-/// (design D4 / spec "no auto-accept in v1"): this is delivery, not
-/// assignment.** The write is exactly lane rule 2 — one new file under
-/// `members/<to>/inbox/`, nothing else touched — enforced by
-/// `commit_paths`/`lane_check`, not by this function's own care. After the
-/// commit, `SyncEngine::poll` fetches, integrates, and pushes so the item
-/// actually reaches the recipient's next sync; a push failure degrades to
-/// a warning (the commit already happened locally and the next sync will
-/// retry it), matching `push_family_board_write`'s posture.
-fn family_send_tool(server: &Server, args: &Value) -> Result<String, String> {
-    let family_arg = require_str(args, "family")?;
-    let to = require_str(args, "to")?;
-    let kind_arg = require_str(args, "kind")?;
-    let title = require_str(args, "title")?;
-    let body = args.get("body").and_then(Value::as_str).unwrap_or("").to_string();
-    let as_arg = opt_str(args, "as");
-
-    let kind = InboxKind::parse(&kind_arg)
-        .ok_or_else(|| format!("invalid \"kind\" {kind_arg:?} — use task, message, or notification"))?;
-    let task = match args.get("task") {
-        Some(v) if !v.is_null() => Some(parse_inbox_task_payload(v)?),
-        _ => None,
-    };
-
-    let conn = find_family_connection(server, &family_arg)?;
-    conn.manifest.check_supported().map_err(|e| e.to_string())?;
-    if !conn.manifest.has_member(&to) {
-        return Err(format!(
-            "\"{to}\" is not a member of family \"{}\". Members: {}.",
-            conn.manifest.name,
-            conn.manifest.member_ids().join(", ")
-        ));
-    }
-    let sender = resolve_family_identity(&conn, as_arg.as_deref())?;
-
-    let id = tasks::new_ulid();
-    let (today, time_hhmm) = today_and_time_utc();
-    let created = format!("{today}T{time_hhmm}:00Z");
-    let new = NewInboxItem {
-        id: Some(id.clone()),
-        kind: Some(kind),
-        from: sender.clone(),
-        title: title.clone(),
-        body,
-        task,
-    };
-    let content = family::render_inbox_item(&new, &id, &created);
-    let file_name = family::inbox_item_file_name(&id, kind, &title);
-    let rel_path = format!("{}/{file_name}", family::inbox_rel(&to));
-
-    let mut git = SystemGit::open(&conn.clone_root)
-        .map_err(|e| format!("could not open the family clone at {}: {e}", conn.clone_root.display()))?;
-    let lane = Lane::member(&sender);
-    let mut engine = SyncEngine::new();
-    engine
-        .commit(
-            &mut git,
-            &lane,
-            &[PendingWrite::new(rel_path.clone(), content)],
-            &format!("Ken: deliver {} to {to}", kind.as_str()),
-        )
-        .map_err(|e| format!("could not deliver to \"{to}\"'s inbox: {e}"))?;
-    let report = engine.poll(&mut git);
-
-    let mut msg = format!(
-        "Delivered a new {} item to \"{to}\"'s inbox in family \"{}\" ({rel_path}). This only \
-places the item in {to}'s inbox — delivery is not assignment or acceptance. {to} (or their Ken) \
-must accept a task item in their Inbox (there is no auto-accept) before it becomes a task on their list; a message just \
-waits, unread, until {to} reads it.",
-        kind.as_str(),
-        conn.manifest.name
-    );
-    match report.state {
-        ConnectionState::Idle => msg.push_str(" Pushed to the family remote."),
-        other => msg.push_str(&format!(
-            " (warning: committed locally but not yet pushed — {other:?}; it will sync on the next poll)"
-        )),
-    }
-    Ok(msg)
 }
 
 /// Which project does this call target? Scoped servers always answer with
@@ -3333,7 +2695,7 @@ mod tests {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list", "family_list", "family_inbox", "family_send"]
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
         );
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
@@ -3632,10 +2994,7 @@ mod tests {
                 "task_create",
                 "task_update",
                 "task_list",
-                "ticket_list",
-                "family_list",
-                "family_inbox",
-                "family_send"
+                "ticket_list"
             ]
         );
         for t in tools {
@@ -4329,109 +3688,9 @@ mod tests {
         assert_eq!(civil_from_days(10957), (2000, 1, 1));
     }
 
-    // --- ken-families tools (tasks 3.1-3.4) ---
-
-    /// A server with no family connections on disk — enough for the
-    /// tool-list tests, which never touch `families/`.
-    fn family_flag_fixture() -> (tempfile::TempDir, Server) {
-        let base = tempfile::tempdir().unwrap();
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
-        (base, server)
-    }
-
-    /// A real family connection: `<base>/families/<id>/` is a genuine git
-    /// clone of a local bare "remote", scaffolded via
-    /// `family::scaffold_family` and committed through
-    /// `Lane::bootstrap()` — the exact shape "Create family" produces in
-    /// production (D2/1.7). Two members: `"owner"` (this device — task 2.1's
-    /// settings store doesn't exist yet, so `discover_family_connections`'s
-    /// single-member fallback can't apply here; tests that need "owner" as
-    /// the resolved identity pass `as: "owner"` explicitly, exactly like a
-    /// caller would before that store lands) and `"sarah"` (a teammate,
-    /// used for the lane-refusal test). Returns `None` — never panics — when
-    /// `git` isn't usable in the sandbox, mirroring
-    /// `family_sync::system_git_drives_a_real_local_clone`'s own skip.
-    fn family_fixture(
-        with_tasks_workspace: bool,
-    ) -> Option<(tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, Server, Uuid, PathBuf)> {
-        if family_sync::git_available().is_err() {
-            return None;
-        }
-        let base = tempfile::tempdir().unwrap();
-        let remote_dir = tempfile::tempdir().unwrap();
-        let ws_parent = tempfile::tempdir().unwrap();
-        let bare = remote_dir.path().join("family.git");
-
-        let init = std::process::Command::new("git")
-            .args(["init", "--bare", "--initial-branch=main"])
-            .arg(&bare)
-            .output();
-        match init {
-            Ok(o) if o.status.success() => {}
-            _ => return None,
-        }
-
-        let family_id = Uuid::new_v4();
-        let clone_root = base.path().join("families").join(family_id.to_string());
-        std::fs::create_dir_all(clone_root.parent().unwrap()).unwrap();
-        let clone_ok = std::process::Command::new("git")
-            .args(family_sync::clone_config_args())
-            .args(["clone", "--"])
-            .arg(&bare)
-            .arg(&clone_root)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !clone_ok {
-            return None;
-        }
-
-        let mut git = SystemGit::new(&clone_root, "origin", "main");
-        git.identity =
-            Some(family_sync::GitIdentity { name: "Ken Test".into(), email: "ken@example.invalid".into() });
-        if git.configure_clone().is_err() {
-            return None;
-        }
-
-        let members = vec![family::FamilyMember::new("owner", "Owner"), family::FamilyMember::new("sarah", "Sarah")];
-        let scaffold = family::scaffold_family("Test Family", family_id, &members).unwrap();
-        let writes: Vec<PendingWrite> =
-            scaffold.iter().map(|f| PendingWrite::new(f.rel_path.clone(), f.content.clone())).collect();
-        git.commit_paths(&Lane::bootstrap(), &writes, "Create family").unwrap();
-        git.push().unwrap();
-
-        let mut registry = Registry::default();
-        if with_tasks_workspace {
-            let workspace = ken_core::workspace::Workspace::create(ws_parent.path(), "WS", &[]).unwrap();
-            registry.add_workspace(&workspace, None, 0);
-            registry.last_workspace = Some(workspace.config.id);
-            // The app's saved connection: this device is "owner", attached
-            // to no workspace (so every workspace reads it).
-            let mut settings = AppSettings::default();
-            settings.extra.insert(
-                "familyConnections".into(),
-                json!([{
-                    "familyId": family_id.to_string(),
-                    "name": "Test Family",
-                    "remoteUrl": bare.to_string_lossy(),
-                    "memberId": "owner",
-                    "attachedWorkspaceId": null,
-                }]),
-            );
-            settings.save(base.path()).unwrap();
-        }
-        registry.save(base.path()).unwrap();
-
-
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
-        Some((base, remote_dir, ws_parent, server, family_id, clone_root))
-    }
-
     #[test]
     fn tool_list_is_fixed_with_no_flags() {
-        // The task and team-inbox tools are always there: kenTasks and
-        // kenFamilies are gone.
+        // The task tools are always there: kenTasks is gone.
         let mut fx = fixture(true);
         let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         let names: Vec<_> = reply["result"]["tools"]
@@ -4442,180 +3701,8 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list", "family_list", "family_inbox", "family_send"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"],
         );
-
-        // No family connection on this device: an answer, not a flag error.
-        let (text, is_err) = tool(&mut fx.server, "family_list", json!({}));
-        assert!(!is_err, "{text}");
-        assert!(text.contains("No family connections"), "{text}");
-    }
-
-    #[test]
-    fn family_tools_appear_with_valid_schemas_when_flag_on() {
-        let (_base, mut server) = family_flag_fixture();
-        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        let tools = reply["result"]["tools"].as_array().unwrap();
-        let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        for n in ["family_list", "family_inbox", "family_send"] {
-            assert!(names.contains(&n), "{names:?}");
-        }
-        let fl = tools.iter().find(|t| t["name"] == "family_list").unwrap();
-        assert_eq!(fl["inputSchema"]["type"], "object");
-        let fi = tools.iter().find(|t| t["name"] == "family_inbox").unwrap();
-        assert!(fi["inputSchema"]["properties"]["family"].is_object());
-        let fs = tools.iter().find(|t| t["name"] == "family_send").unwrap();
-        assert_eq!(fs["inputSchema"]["required"], json!(["family", "to", "kind", "title"]));
-        assert!(fs["inputSchema"]["properties"]["task"]["properties"]["due"].is_object());
-        for t in tools {
-            assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
-            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
-        }
-        // LOCKED (design D4 / spec "no auto-accept in v1"): family_send's
-        // own description must say delivery is not assignment/acceptance.
-        let fs_desc = fs["description"].as_str().unwrap();
-        assert!(fs_desc.contains("not assignment"), "{fs_desc}");
-        assert!(fs_desc.to_lowercase().contains("no auto-accept"), "{fs_desc}");
-    }
-
-    #[test]
-    fn family_send_lands_a_new_file_in_the_recipient_inbox() {
-        let Some((_base, remote, _ws, mut server, _family_id, clone_root)) = family_fixture(false) else {
-            eprintln!("skipping: no usable git in this sandbox");
-            return;
-        };
-
-        let (text, is_err) = tool(
-            &mut server,
-            "family_send",
-            json!({
-                "family": "Test Family",
-                "to": "sarah",
-                "kind": "task",
-                "title": "Review the sync loop",
-                "body": "Please double-check the retry logic.",
-                "as": "owner"
-            }),
-        );
-        assert!(!is_err, "{text}");
-        assert!(text.contains("not assignment"), "{text}");
-        assert!(text.contains("no auto-accept") || text.contains("There is no auto-accept"), "{text}");
-
-        // The scaffold's `.gitkeep` marker (1.7) is also in this folder —
-        // only the new `.md` item is this test's concern.
-        let inbox_dir = clone_root.join("members/sarah/inbox");
-        let entries: Vec<_> = std::fs::read_dir(&inbox_dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-            .collect();
-        assert_eq!(entries.len(), 1, "exactly one new file should land in sarah's inbox");
-        let raw = std::fs::read_to_string(entries[0].path()).unwrap();
-        let file_name = entries[0].file_name().to_string_lossy().into_owned();
-        let item = family::parse_inbox_item(&file_name, &raw);
-        assert!(!item.malformed, "{raw}");
-        assert_eq!(item.kind, Some(family::InboxKind::Task));
-        assert_eq!(item.status, Some(family::InboxStatus::Unread));
-        assert_eq!(item.from, "owner");
-        assert_eq!(item.title, "Review the sync loop");
-
-        // And it was actually pushed to the "remote" — a fresh clone of the
-        // bare repo this fixture still holds a handle to sees it.
-        let verify_dir = clone_root.parent().unwrap().join("verify-clone");
-        let cloned = std::process::Command::new("git")
-            .args(["clone", "--"])
-            .arg(remote.path().join("family.git"))
-            .arg(&verify_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(cloned, "push should have reached the bare remote");
-        assert!(verify_dir.join("members/sarah/inbox").join(&file_name).is_file());
-    }
-
-    #[test]
-    fn task_update_lane_refuses_a_foreign_board_write_but_allows_own_board() {
-        let Some((_base, _remote, _ws, mut server, family_id, clone_root)) = family_fixture(true) else {
-            eprintln!("skipping: no usable git in this sandbox");
-            return;
-        };
-
-        // Seed one task file directly on each member's board — bypassing
-        // family_send/accept entirely, since this test is only about
-        // task_update's write-lane enforcement, not the acceptance flow.
-        let seed = |member: &str, id: &str, title: &str| {
-            let dir = clone_root.join(format!("members/{member}/board"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let content = format!(
-                "---\nid: {id}\ntitle: {title}\nstatus: backlog\nkind: human\nassignee: {member}\n\
-project: ''\ntags: []\nboard: main\ncreated: '2026-08-01'\nupdated: '2026-08-01'\n---\n\nBody.\n"
-            );
-            std::fs::write(dir.join(format!("{id}-task.md")), content).unwrap();
-        };
-        seed("sarah", "01SARAHTASK", "Sarah's task");
-        seed("owner", "01OWNERTASK", "Owner's task");
-
-        // task_list lists only this device's own board, so sarah's task is
-        // never shown as one of "your" tasks.
-        let (list_text, list_err) = tool(&mut server, "task_list", json!({}));
-        assert!(!list_err, "{list_text}");
-        assert!(!list_text.contains("Sarah's task"), "{list_text}");
-        let _ = family_id;
-
-        // A change aimed at sarah's board, acting as owner, is refused by
-        // the lane rules — not merely discouraged: the file on disk must be
-        // byte-for-byte untouched afterward.
-        let sarah_path = clone_root.join("members/sarah/board/01SARAHTASK-task.md");
-        let before = std::fs::read_to_string(&sarah_path).unwrap();
-        let (bad_text, bad_err) = tool(
-            &mut server,
-            "task_update",
-            json!({"id": "01SARAHTASK", "state": "done", "as": "owner"}),
-        );
-        assert!(bad_err, "{bad_text}");
-        assert!(bad_text.contains("refused"), "{bad_text}");
-        let after = std::fs::read_to_string(&sarah_path).unwrap();
-        assert_eq!(before, after, "a lane-refused write must not touch the file");
-
-        // The same call against owner's own board succeeds, writes only the
-        // given keys, and pushes.
-        let (ok_text, ok_err) = tool(
-            &mut server,
-            "task_update",
-            json!({"id": "01OWNERTASK", "state": "done", "as": "owner"}),
-        );
-        assert!(!ok_err, "{ok_text}");
-        let owner_path = clone_root.join("members/owner/board/01OWNERTASK-task.md");
-        let owner_raw = std::fs::read_to_string(&owner_path).unwrap();
-        assert!(owner_raw.contains("status: done"), "{owner_raw}");
-        assert!(owner_raw.contains("kind: human"), "{owner_raw}");
-        assert!(owner_raw.contains("title: \"Owner's task\"") || owner_raw.contains("title: Owner's task"), "{owner_raw}");
-        assert!(ok_text.contains("Journal entry recorded."), "{ok_text}");
-
-        // Done again: no state change, so no second journal entry.
-        let (again, again_err) = tool(&mut server, "task_update", json!({"id": "01OWNERTASK", "state": "done"}));
-        assert!(!again_err, "{again}");
-        assert!(!again.contains("Journal entry recorded."), "{again}");
-
-        // This device is "owner" (configured): `as` cannot make it sarah.
-        let (as_text, as_err) = tool(
-            &mut server,
-            "task_update",
-            json!({"id": "01SARAHTASK", "state": "done", "as": "sarah"}),
-        );
-        assert!(as_err, "{as_text}");
-        assert!(as_text.contains("refused"), "{as_text}");
-        assert_eq!(before, std::fs::read_to_string(&sarah_path).unwrap());
-
-        // A family attached to another workspace is not read.
-        let mut settings = AppSettings::load(&server.base_dir);
-        settings.extra["familyConnections"][0]["attachedWorkspaceId"] = json!(Uuid::new_v4().to_string());
-        settings.save(&server.base_dir).unwrap();
-        let (list_text, _) = tool(&mut server, "task_list", json!({"state": "all"}));
-        assert!(!list_text.contains("Owner's task"), "{list_text}");
-        let (gone, gone_err) = tool(&mut server, "task_update", json!({"id": "01OWNERTASK", "state": "open"}));
-        assert!(gone_err && gone.contains("no task with id"), "{gone}");
     }
 
     #[test]
