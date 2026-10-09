@@ -17,6 +17,21 @@
 
 # What's New
 
+## 0.3.0 — 2026-10-09
+
+### Files
+
+- **Drop files from Finder**: drag files or whole folders onto the files panel to copy them into the folder you drop on. Existing files are never overwritten, and a dropped file can no longer replace the whole window.
+
+### Editor
+
+- **Pasted and dropped files**: images and other files pasted or dropped into a document are saved next to it and linked with a relative Markdown path, so they still show after you reopen it. Dragging a file in from the files panel links to it in place.
+- **Lettered sub-lists**: numbered lists nested in numbered lists show as a., b., then i., and typing `a. ` or `1) ` starts that style of list.
+- **List hierarchy**: bullets cycle disc, circle and square by depth, list numbers match the text size, and checkboxes line up with the first line of their item.
+- **Slash shortcuts**: shortcuts now apply on Enter as well as Space, and `/hr`, `/ul`, `/ol`, `/task`, `/checklist` and `/table` are new; `/todo` works again.
+- **Backspace reset**: Backspace in an empty list item or heading turns it back into a plain paragraph.
+- **Links and menus**: links, including table-of-contents entries, use the accent colour with an underline, and editor menus and toolbars are easier to read in both themes.
+
 ## 0.2.1 — 2026-09-22
 
 ### Updates
