@@ -441,11 +441,6 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .chip.on {
-    color: var(--accent-deep);
-    border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-  }
   .chip.ghost {
     background: transparent;
     color: var(--ink-tertiary);

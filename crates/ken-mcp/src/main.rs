@@ -13,7 +13,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -2212,7 +2211,7 @@ you. Pass assignee \"all\" to list every ticket."
             .to_string());
     }
     let (today, _) = task_clock();
-    let tasks_all = resolve_task_homes(server).map(|h| h.scan(&today, true)).unwrap_or_default();
+    let tasks_all = resolve_task_homes(server).map(|h| h.scan(&today)).unwrap_or_default();
 
     let mut found: Vec<(day::Ticket, String, Uuid)> = Vec::new();
     for m in &ws.members {
@@ -2532,45 +2531,10 @@ fn floor_char_boundary_at(bytes: &[u8], at: usize) -> usize {
 /// own, not a correctness bug.
 /// Today and the time of day on this computer's clock (`YYYY-MM-DD`,
 /// `HH:MM`): what the journal and memories are dated with, the same day the
-/// app calls today. A team inbox item's `created` stays in UTC
-/// ([`today_and_time_utc`]), because teammates read it in other zones.
+/// app calls today.
 fn local_today_and_time() -> (String, String) {
     let now = chrono::Local::now();
     (now.format("%Y-%m-%d").to_string(), now.format("%H:%M").to_string())
-}
-
-fn today_and_time_utc() -> (String, String) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    let hh = secs_of_day / 3600;
-    let mm = (secs_of_day % 3600) / 60;
-    (format!("{y:04}-{m:02}-{d:02}"), format!("{hh:02}:{mm:02}"))
-}
-
-/// Inverse of `ken_core::memory`'s private `days_from_civil` — Howard
-/// Hinnant's public-domain `civil_from_days`
-/// (https://howardhinnant.github.io/date_algorithms.html), converting a
-/// day count since 1970-01-01 back to a proleptic-Gregorian `(y, m, d)`.
-/// Not exported from `ken-core` (that module only ever needs the forward
-/// direction, to diff two caller-supplied `YYYY-MM-DD` dates for the
-/// archive roll) — duplicated here in miniature for this one caller rather
-/// than made `pub` there.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 #[cfg(test)]
@@ -3676,16 +3640,6 @@ mod tests {
         let (text, is_err) = tool(&mut server, "ticket_list", json!({}));
         assert!(!is_err, "{text}");
         assert!(!text.contains("ATT-014 —"), "{text}");
-    }
-
-    /// Cross-checked by hand against Howard Hinnant's reference algorithm at
-    /// two independently verified anchors: day 0 is the Unix epoch itself,
-    /// and day 10957 is 2000-01-01 (30 years incl. 7 leap days: 1972, 76,
-    /// 80, 84, 88, 92, 96 — 1970-01-01 + 30*365 + 7 = 10957).
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(10957), (2000, 1, 1));
     }
 
     #[test]
