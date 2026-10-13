@@ -14,6 +14,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - `ocr`: an unused attribute.
   - `src-tauri/src/lib.rs`: an unused `profile` field.
   - `svelte-check`: 8 warnings.
+- **A fresh checkout:** run `scripts\win-build.cmd sidecar` once before the Rust check, or the app's build script stops on the missing `ken-mcp` binary.
 - **Tests:** don't run test binaries or anything that spawns shells without asking first. Endpoint security on the dev machine flags it.
 
 ## Done
@@ -24,50 +25,36 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - `pagemeta::Section` is {Rules, Decisions, Current, Design, Reference, Research}. Legacy folders still map: ways-of-working and conventions → Rules, platform → Reference, work → Current.
   - `Roles::of_repo` reads `.ken/knowledge.json`, falling back to `.wright/team.json`.
   - Ingest writes rulings to `Decisions/DECISIONS.md`, and new rules go in `Rules/`.
+- **Slice 2a: five tiers and the nudges removed** (`5373ec3`). Decisions 23, 24.
+  - `authority::Tier` is {Binding, Current, Reference, Record, Superseded}, with weights +0.75 / +0.4 / 0 / −0.5 / −1.25.
+    - Done and closed tickets are Record.
+    - Cancelled, wontfix, duplicate and rejected tickets are Superseded.
+    - Notes (`Inbox/`, `Ingested/`, `notes/`) and drafts are Record.
+  - The people role is gone. The legacy names `rule` and `closed` parse as binding and superseded.
+  - A page hit's label is `kind · tier · date`: `decision D-410 · binding · 2026-10-06`, `ticket · superseded · 2026-07-21`.
+    - A ruling marked `[SUPERSEDED BY]`, or found superseded by the pass, reads superseded.
+    - A ticket's own status is no longer on the label.
+    - A code hit has no label yet; its role comes in slice 5.
+    - The chat guide, the MCP tests and `api.ts` use the new form.
+  - Removed: the band fallback and tie-break, the staleness and template nudges, `query_intent`, `find_symbols`, `follow_links` and `W_REFERENCE_ASSET`. The blob penalty stays.
+  - Index time:
+    - `Templates/` is a built-in exclusion.
+    - Minified code and data (a line over 2,000 characters with under 3% whitespace) are searchable by name only.
+  - The compile check is clean apart from the known warnings.
+  - `npm run check` was not run: the worktree had no `node_modules`, and the only frontend change is a doc comment.
 
-## Next: slice 2a, five tiers and the nudges removed (23, 24)
+## Next: slice 2b, routing (20)
 
 Nothing has been edited yet.
 
-- [ ] **`crates/ken-core/src/authority.rs`**
-  - [ ] Add the `Tier` enum {Binding, Current, Reference, Record, Superseded}, with weights +0.75 / +0.4 / 0 / −0.5 / −1.25.
-    - Binding: live rulings and `Rules/`.
-    - Current: Current and Design pages with `status: current`.
-    - Reference: other pages and code.
-    - Record: tickets open and done, notes, Research, drafts, generated or mirror pages.
-    - Superseded: superseded rulings, retired pages, cancelled tickets.
-  - [ ] Remove the people role from `Roles`.
-  - [ ] Parse the legacy tier names: rule → binding, closed → superseded.
-  - [ ] Split `CLOSED_STATUSES`:
-    - cancelled, wontfix, duplicate and rejected tickets → Superseded;
-    - done and closed tickets → Record.
-  - [ ] Teams override the tier by path in `.ken/knowledge.json`.
-  - [ ] Add a `label_of` that returns `kind · tier or role · date` (17).
-  - [ ] Update the tests.
-- [ ] **`crates/ken-core/src/routing.rs` and `search.rs`**, remove:
-  - [ ] band fallback and `band_bonus`;
-  - [ ] stale and template hygiene;
-  - [ ] `intent_bonus` and `query_intent`;
-  - [ ] `find_symbols` (W_SYMBOL);
-  - [ ] `follow_links` (W_LINK);
-  - [ ] `W_REFERENCE_ASSET`;
-  - [ ] the band tie-break in `merge_routed`.
-
-  Keep the blob hygiene, unless the index-time exclusion below covers it.
-- [ ] **Score = base + tier.**
-  - Base: filename/title 3.0, path 1.0, snippet 0.5, all × coverage.
-  - Plus 1.5 × meaning, plus 0.75 when keyword and meaning both find the chunk.
-- [ ] **Index time:** exclude `Templates/` and minified text.
-- [ ] Note: "where is `get_current_user`" loses its jump to the definition until slice 6 adds symbol matching on plain words.
+- [ ] Every question searches every source, merged once, and a named repo narrows it.
+- [ ] Reference repos join only for platform questions, when named, or when nothing else answers.
+- [ ] Drop the graph planner, the 5-repo cap and the library-share rule.
+- [ ] Report a slow or building repo instead of dropping it.
+- [ ] Retire the file-level `search` index and its ranker (15).
 
 ## Later slices
 
-- [ ] **2b, routing (20):**
-  - Every question searches every source, merged once, and a named repo narrows it.
-  - Reference repos join only for platform questions, when named, or when nothing else answers.
-  - Drop the graph planner, the 5-repo cap and the library-share rule.
-  - Report a slow or building repo instead of dropping it.
-  - Retire the file-level `search` index and its ranker (15).
 - [ ] **3, frontmatter (5):**
   - Six keys: `title`, `aliases`, `status`, `updated`, `sources` and `checked`, plus an optional `reviewed_by`.
   - Drop `audience` (and `Audience` in `pagemeta.rs`), `lens`, `changed_by`, `pin` and `verified`.
