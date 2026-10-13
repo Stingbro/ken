@@ -462,30 +462,20 @@ pub fn search_member_with(
             }
         }
     }
-    // Each file's authority (`crate::authority`): rules and rulings count for
-    // more, tickets and dated evidence for less, inside this member's own
-    // ranking. An index from before authority was stored ranks by the page's
-    // band instead, as it did.
+    // Score = base plus tier (decision 24): word matches, meaning and
+    // agreement, plus each file's tier (`crate::authority`), inside this
+    // member's own ranking.
     let paths: Vec<String> = fts_hits.iter().map(|h| h.path.clone()).chain(vec_hits.iter().map(|h| h.path.clone())).collect();
-    let authority = db.authority_weights(&paths)?;
-    let mut hits = search::merge_and_rerank_with(&fts_hits, &vec_hits, query, &extra, authority.as_ref().unwrap_or(&HashMap::new()));
+    let authority = db.authority_weights(&paths)?.unwrap_or_default();
+    let mut hits = search::merge_and_rerank_with(&fts_hits, &vec_hits, query, &extra, &authority);
     for hit in &mut hits {
         hit.line = db.chunk_line(hit.chunk_id)?;
         hit.page = crate::pagemeta::hit_page(&hit.path, db.page_meta(&hit.path)?);
-    }
-    // Binding and verified pages count for more, evidence and pages no longer
-    // current for less: a nudge on relevance, not a wall. A strict band order
-    // put a generic process page that barely matched above the page that
-    // answers the question.
-    let intent = query_intent(query);
-    let now = crate::engine::now_epoch();
-    for hit in &mut hits {
-        let band = if authority.is_some() { 0.0 } else { band_bonus(hit) };
-        hit.score += band + hygiene(hit, now) + intent_bonus(intent, &hit.path);
+        if machine_written(&hit.snippet) {
+            hit.score -= W_BLOB;
+        }
     }
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-    follow_links(db, &mut hits)?;
-    find_symbols(db, query, intent, &mut hits)?;
     // A ruling a later one supersedes is shown under it (`supersede`).
     crate::supersede::lead_with_successors(db, &mut hits)?;
     // Each page hit says what it is and how fresh: a ruling and its date, a
@@ -498,208 +488,9 @@ pub fn search_member_with(
     Ok(hits)
 }
 
-/// What a definition of a symbol the query names adds: as much as a file
-/// name match, so "where is get_current_user" leads with its definition.
-pub const W_SYMBOL: f64 = 3.5;
-
-/// The code map as a signal: a query that names a symbol (a word shaped
-/// like an identifier: `snake_case`, `camelCase`, `Type::name`) puts where it
-/// is defined among the hits, at its line. Plain words are left to the text
-/// layers: looked up as symbols, "where", "and" and "set" each pulled five
-/// unrelated definitions to the top with a file name's weight.
-fn find_symbols(db: &Db, query: &str, intent: Option<Intent>, hits: &mut Vec<HybridHit>) -> Result<()> {
-    if intent == Some(Intent::Prose) {
-        return Ok(());
-    }
-    let identifier = |w: &str| {
-        w.contains('_') || w.contains("::") || w.chars().zip(w.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase())
-    };
-    let words: Vec<String> = query
-        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
-        .map(|w| w.trim_matches(':').to_string())
-        .filter(|w| w.len() >= 3)
-        .filter(|w| identifier(w))
-        .filter(|w| !crate::db::significant_tokens(w).is_empty())
-        .collect();
-    let mut changed = false;
-    for word in words.iter().take(4) {
-        let name = word.rsplit("::").next().unwrap_or(word);
-        for def in db.code_symbols(Some(name), None, Some(true), 5)? {
-            changed = true;
-            if let Some(hit) = hits.iter_mut().find(|h| h.path == def.path) {
-                hit.score += W_SYMBOL;
-                hit.line = Some(def.line);
-            } else if let Some((chunk_id, text)) = db.chunk_at_line(&def.path, def.line)? {
-                hits.push(HybridHit {
-                    path: def.path.clone(),
-                    chunk_id,
-                    snippet: text,
-                    source: search::Source::Keyword,
-                    line: Some(def.line),
-                    page: None,
-                    score: W_SYMBOL,
-                });
-            }
-        }
-    }
-    if changed {
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-    }
-    Ok(())
-}
-
-/// What a page linked with a top hit adds: the wiki's own "see also".
-pub const W_LINK: f64 = 0.4;
-/// Pages the top hits link to or from, joined when search missed them.
-const LINKED_ADDED: usize = 3;
-
-/// The wiki's links as a signal: pages linked to or from the best page hits
-/// rank a little higher, and a few the search missed join at the end
-/// ("Permit to Build" beside the Change Order that names it). Pages only;
-/// the text layers already found everything else.
-fn follow_links(db: &Db, hits: &mut Vec<HybridHit>) -> Result<()> {
-    let is_page = |p: &str| p.ends_with(".md") || p.ends_with(".markdown");
-    let top: Vec<String> = hits.iter().filter(|h| is_page(&h.path)).take(3).map(|h| h.path.clone()).collect();
-    if top.is_empty() {
-        return Ok(());
-    }
-    let links = db.all_page_links()?;
-    if links.is_empty() {
-        return Ok(());
-    }
-    let resolver = crate::links::Resolver::from_db(db)?;
-    let mut neighbours: Vec<String> = Vec::new();
-    for (from, link) in &links {
-        let to = resolver.resolve(link);
-        let from_top = top.contains(from);
-        for t in &to {
-            let other = if from_top && !top.contains(t) {
-                Some(t.clone())
-            } else if top.contains(t) && !top.contains(from) {
-                Some(from.clone())
-            } else {
-                None
-            };
-            if let Some(o) = other.filter(|o| !neighbours.contains(o)) {
-                neighbours.push(o);
-            }
-        }
-    }
-    // A "see also" never passes the page that points to it: a linked page
-    // rises among the rest, up to just under the lowest of the top pages.
-    let ceiling = hits
-        .iter()
-        .filter(|h| top.contains(&h.path))
-        .map(|h| h.score)
-        .fold(f64::INFINITY, f64::min)
-        - 1e-6;
-    let mut added = 0;
-    for n in &neighbours {
-        if let Some(hit) = hits.iter_mut().find(|h| &h.path == n) {
-            hit.score = (hit.score + W_LINK).min(ceiling.max(hit.score));
-        } else if added < LINKED_ADDED {
-            if let Some((chunk_id, text)) = db.first_chunk(n)? {
-                added += 1;
-                hits.push(HybridHit {
-                    path: n.clone(),
-                    chunk_id,
-                    snippet: text,
-                    source: search::Source::Keyword,
-                    line: db.chunk_line(chunk_id)?,
-                    page: crate::pagemeta::hit_page(n, db.page_meta(n)?),
-                    score: W_LINK,
-                });
-            }
-        }
-    }
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-    Ok(())
-}
-
-/// What a question is after, read from its words: how code works, or what
-/// people wrote and decided. A nudge toward those kinds, never a filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    Code,
-    Prose,
-}
-
-const CODE_WORDS: &[&str] = &[
-    "implement", "implemented", "implementation", "function", "method", "class", "struct", "trait", "interface",
-    "defined", "definition", "declared", "call", "calls", "called", "caller", "callers", "returns", "endpoint",
-    "handler", "module", "import", "imports", "variable", "compile", "exception", "stacktrace", "code", "api",
-];
-const PROSE_WORDS: &[&str] = &[
-    "who", "when", "why", "decided", "decision", "decisions", "meeting", "owner", "owns", "deadline", "budget",
-    "fee", "cost", "agreed", "policy", "roadmap", "milestone", "status", "plan", "contract", "client",
-];
-
-/// The [`Intent`] a query shows, if it shows one clearly. An identifier in
-/// the query (`get_user`, `LlmGateway`, `app::core`, `auth.py`) counts as code.
-pub fn query_intent(query: &str) -> Option<Intent> {
-    let words: Vec<&str> = query.split(|c: char| c.is_whitespace() || matches!(c, '?' | ',' | '"')).filter(|w| !w.is_empty()).collect();
-    let lower = |w: &str| w.to_lowercase();
-    let identifier = words.iter().any(|w| {
-        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '.');
-        w.contains("::")
-            || w.contains("()")
-            || (w.contains('_') && w.len() > 3)
-            || w.chars().zip(w.chars().skip(1)).any(|(a, b)| a.is_lowercase() && b.is_uppercase())
-            || [".rs", ".py", ".ts", ".tsx", ".js", ".go", ".java", ".cs"].iter().any(|e| w.ends_with(e))
-    });
-    let code = identifier || words.iter().any(|w| CODE_WORDS.contains(&lower(w).as_str()));
-    let prose = words.iter().any(|w| PROSE_WORDS.contains(&lower(w).as_str()));
-    match (code, prose) {
-        (true, false) => Some(Intent::Code),
-        (false, true) => Some(Intent::Prose),
-        _ => None,
-    }
-}
-
-/// What a hit's kind adds when it is the kind the question is after.
-pub const W_INTENT: f64 = 0.5;
-
-fn intent_bonus(intent: Option<Intent>, path: &str) -> f64 {
-    use crate::contenttype::ContentType as T;
-    match (intent, crate::contenttype::of(path)) {
-        (Some(Intent::Code), T::Code | T::Test) => W_INTENT,
-        (Some(Intent::Prose), T::Doc | T::Meeting | T::Spec | T::Ticket) => W_INTENT,
-        _ => 0.0,
-    }
-}
-
 /// Machine-written text (an inlined search index, a data dump in one line)
 /// matches everything a little and answers nothing: well under any real hit.
 pub const W_BLOB: f64 = 1.5;
-/// A page verified this long ago counts a little less.
-pub const STALE_DAYS: i64 = 180;
-pub const W_STALE: f64 = 0.25;
-
-/// A page still titled with a `{{placeholder}}` is a template to copy: it
-/// reads like every question and answers none.
-pub const W_TEMPLATE: f64 = 2.0;
-
-/// What text that no person wrote, a template, and a page long unchecked,
-/// take off.
-fn hygiene(hit: &HybridHit, now: i64) -> f64 {
-    let mut s = 0.0;
-    if machine_written(&hit.snippet) {
-        s -= W_BLOB;
-    }
-    if hit.page.as_ref().and_then(|p| p.title.as_deref()).is_some_and(|t| t.contains("{{")) {
-        s -= W_TEMPLATE;
-    }
-    let stale = hit
-        .page
-        .as_ref()
-        .and_then(|p| p.verified.as_deref())
-        .and_then(|v| crate::drift::days_between(v, now))
-        .is_some_and(|d| d > STALE_DAYS);
-    if stale {
-        s -= W_STALE;
-    }
-    s
-}
 
 /// One very long line, or a long chunk with almost no line breaks: written
 /// by a tool, not a person.
@@ -749,15 +540,6 @@ pub fn workspace_vocabulary<'a>(dbs: impl IntoIterator<Item = &'a Db>) -> crate:
     crate::vocab::Vocabulary::merged(vocabs.iter())
 }
 
-/// What a reference repo's asset gives up when the question is about the
-/// team's own work: less than one filename word. On 2026-10-06 the JSON
-/// headers and the `names` column put the game's own `Weapon_Shield_Copper.json`
-/// and `Coins.json` above the mod's code for "how much stamina does it cost to
-/// take a hit while holding up a weapon or shield" and "how many coins do you
-/// get for breaking an item down": an asset named for a question's nouns
-/// matches it in name only.
-pub const W_REFERENCE_ASSET: f64 = 2.0;
-
 /// Words that put a question on the platform rather than on the team's own
 /// work.
 const PLATFORM_WORDS: &[&str] =
@@ -769,28 +551,6 @@ pub fn asks_about_platform(query: &str) -> bool {
     let words: String = query.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { ' ' }).collect();
     let words = format!(" {} ", words.split_whitespace().collect::<Vec<_>>().join(" "));
     PLATFORM_WORDS.iter().any(|w| words.contains(&format!(" {w} ")))
-}
-
-/// Whether `path`, in a repo of `kinds`, is a reference repo's asset (its
-/// JSON, YAML and data files) that `plan` does not ask about: a question
-/// that names the repo, or the platform, wants them as much as anything.
-fn reference_asset(plan: &RoutePlan, kinds: &[crate::registry::RepoKind], path: &str) -> bool {
-    use crate::contenttype::ContentType as T;
-    kinds.contains(&crate::registry::RepoKind::Reference)
-        && !plan.platform
-        && plan.reason != RouteReason::Named
-        && matches!(crate::contenttype::of(path), T::Config | T::Data)
-}
-
-/// What a page's band adds to its relevance: less than one filename word.
-pub const W_BAND: f64 = 0.75;
-
-fn band_bonus(hit: &HybridHit) -> f64 {
-    match hit.page.as_ref().map_or(1, |p| p.band) {
-        0 => W_BAND,
-        2 => -W_BAND,
-        _ => 0.0,
-    }
 }
 
 /// A handle `execute_plan` needs to search one planned target: identity plus
@@ -987,21 +747,18 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     page: hit.page.clone(),
                     kg_breadcrumbs: breadcrumbs.clone(),
                 },
-                hit.score - if reference_asset(plan, &kinds, &hit.path) { W_REFERENCE_ASSET } else { 0.0 },
+                hit.score,
                 knowledge,
             ));
         }
     }
     // Relevance leads across members: every member scores on the same scale
-    // (the page band already folded in), so the best answer wins whichever
+    // (each file's tier already folded in), so the best answer wins whichever
     // repo holds it. Rank-only fusion gave each repo's first hit the same
     // weight: a code repo's best guess at a contract question tied the
-    // contract. The band breaks ties between unscored hits; then RRF, the
-    // plan's order and the member's own rank.
-    let band = |h: &RoutedHit| h.page.as_ref().map_or(1, |p| p.band);
+    // contract. Ties fall to RRF, the plan's order and the member's own rank.
     candidates.sort_by(|a, b| {
         b.4.total_cmp(&a.4)
-            .then(band(&a.3).cmp(&band(&b.3)))
             .then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
@@ -1363,40 +1120,6 @@ mod tests {
         assert_eq!(report.results[4].path, "b/three.md");
     }
 
-    /// A query naming a function leads with where it is defined, at its line.
-    #[test]
-    fn a_symbol_the_query_names_leads_with_its_definition() {
-        use crate::project::Project;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("app")).unwrap();
-        std::fs::write(dir.path().join("app/auth.py"), "import jwt\n\n\ndef get_current_user(token):\n    return jwt.decode(token)\n").unwrap();
-        std::fs::write(dir.path().join("notes.md"), "# Notes\n\nWe talked about get current user flows a lot, current user this, current user that.\n").unwrap();
-        let project = Project::create(dir.path(), "T").unwrap();
-        let mut db = Db::open_in_memory().unwrap();
-        crate::scan::scan(&project, &mut db).unwrap();
-        let hits = search_member(&db, "where is get_current_user defined", None, 8).unwrap();
-        assert_eq!(hits.first().map(|h| (h.path.as_str(), h.line)), Some(("app/auth.py", Some(4))), "{hits:?}");
-    }
-
-    /// A page the query's words never reach still comes back when the page
-    /// that answers links to it.
-    #[test]
-    fn a_page_linked_from_the_answer_comes_with_it() {
-        use crate::project::Project;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Change Order.md"), "# Change Order\n\nBuild starts once the [[Permit]] is issued.\n").unwrap();
-        std::fs::write(dir.path().join("Permit.md"), "# Permit\n\nIssued by the client's office by July 17.\n").unwrap();
-        std::fs::write(dir.path().join("Other.md"), "# Other\n\nUnrelated notes.\n").unwrap();
-        let project = Project::create(dir.path(), "T").unwrap();
-        let mut db = Db::open_in_memory().unwrap();
-        crate::scan::scan(&project, &mut db).unwrap();
-        let hits = search_member(&db, "when does build start", None, 8).unwrap();
-        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
-        assert_eq!(paths.first(), Some(&"Change Order.md"), "{paths:?}");
-        assert!(paths.contains(&"Permit.md"), "the linked page joins: {paths:?}");
-        assert!(!paths.contains(&"Other.md"), "{paths:?}");
-    }
-
     /// A ruling outranks the closed ticket that says the same, a team file
     /// can turn that around, and code keeps the score it had.
     #[test]
@@ -1427,52 +1150,14 @@ mod tests {
     }
 
     #[test]
-    fn a_template_page_ranks_under_a_page_that_answers() {
-        use crate::project::Project;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("RULE.md"),
-            "---\ntitle: \"{{the-rule-as-a-sentence}}\"\n---\n# {{The rule}}\n\nWhat the client pays when the rule is broken, and the fee for fixing it.\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("SOW.md"), "---\ntitle: SOW\n---\n# SOW\n\nThe client pays a fixed fee of $400,000.\n").unwrap();
-        let project = Project::create(dir.path(), "T").unwrap();
-        let mut db = Db::open_in_memory().unwrap();
-        crate::scan::scan(&project, &mut db).unwrap();
-        let hits = search_member(&db, "what fee does the client pay", None, 8).unwrap();
-        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
-        assert_eq!(paths.first(), Some(&"SOW.md"), "{paths:?}");
-    }
-
-    #[test]
-    fn a_question_says_what_it_is_after_and_machine_text_is_spotted() {
-        assert_eq!(query_intent("How is the token validated in the auth handler?"), Some(Intent::Code));
-        assert_eq!(query_intent("where is get_current_user defined"), Some(Intent::Code));
-        assert_eq!(query_intent("what does LlmGateway.chat return"), Some(Intent::Code));
-        assert_eq!(query_intent("who decided the release date"), Some(Intent::Prose));
-        assert_eq!(query_intent("what is the fee in the contract"), Some(Intent::Prose));
-        assert_eq!(query_intent("tell me about the save format"), None);
-        assert_eq!(query_intent("who calls the save function"), None, "both: no nudge");
-
+    fn machine_text_is_spotted() {
         assert!(machine_written(&format!("const SEARCH = [{}];", "{\"a\":1},".repeat(300))));
         assert!(!machine_written("fn save() {\n    write();\n}\n"));
         assert!(!machine_written(&"A person wrote this line.\n".repeat(80)));
     }
 
-    /// Relevance decides across members: a strong hit in the second repo
-    /// beats a weak first hit in the first, whatever the plan's order.
     #[test]
-    fn a_reference_repos_assets_yield_unless_the_question_is_about_the_platform() {
-        use crate::registry::RepoKind;
-        let plan = |platform, reason| RoutePlan { targets: vec![], reason, platform, knowledge: vec![] };
-        let asked = plan(false, RouteReason::Broadcast);
-        let shield = "HytaleAssets/Server/Item/Items/Weapon/Shield/Weapon_Shield_Copper.json";
-        assert!(reference_asset(&asked, &[RepoKind::Reference], shield));
-        assert!(!reference_asset(&asked, &[RepoKind::Reference], "server/core/HytaleServerConfig.java"), "its code competes as before");
-        assert!(!reference_asset(&asked, &[RepoKind::Code], "src/main/resources/Server/Item/Items/Coins/Bronze_Coin.json"), "the team's own assets");
-        assert!(!reference_asset(&plan(true, RouteReason::Broadcast), &[RepoKind::Reference], shield), "a platform question");
-        assert!(!reference_asset(&plan(false, RouteReason::Named), &[RepoKind::Reference], shield), "the question names the repo");
-
+    fn a_question_about_the_platform_is_spotted() {
         assert!(asks_about_platform("Does the engine have a boss health bar?"));
         assert!(asks_about_platform("How do we add our own pins to the game's built-in minimap?"));
         assert!(asks_about_platform("Which shapes does it support out of the box?"));
@@ -1481,6 +1166,8 @@ mod tests {
         assert!(plan_route("does the engine have flags", &[], None).platform);
     }
 
+    /// Relevance decides across members: a strong hit in the second repo
+    /// beats a weak first hit in the first, whatever the plan's order.
     #[test]
     fn scored_hits_merge_by_relevance_across_members() {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
@@ -1727,42 +1414,6 @@ mod tests {
 
         // KG-routed plan: breadcrumb present and well-formed.
         assert_eq!(result.kg_breadcrumbs, vec!["kg://42".to_string()]);
-    }
-
-    /// Across members, a binding page outranks a better-scoring Research
-    /// note or retired page; within a band the RRF order holds.
-    #[test]
-    fn binding_pages_lead_the_merged_list_across_members() {
-        use crate::pagemeta::{hit_page, PageMeta};
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false, knowledge: vec![] };
-        let paged = |path: &str, id: i64, meta: Option<PageMeta>| HybridHit {
-            page: hit_page(path, meta),
-            ..hit(path, id)
-        };
-        let retired = PageMeta { status: Some("retired".into()), ..Default::default() };
-        let member_hits = vec![
-            MemberHits {
-                project_id: a,
-                member_name: "A".into(),
-                status: MemberStatus::Searched,
-                hits: vec![paged("Research/old.md", 1, None), paged("Current/Project.md", 2, None)],
-            },
-            MemberHits {
-                project_id: b,
-                member_name: "B".into(),
-                status: MemberStatus::Searched,
-                hits: vec![
-                    paged("Ways-of-Working/Old-rules.md", 3, Some(retired)),
-                    paged("Ways-of-Working/Rules.md", 4, None),
-                ],
-            },
-        ];
-        let order: Vec<String> = merge_routed(&plan, &member_hits, 10).results.into_iter().map(|h| h.path).collect();
-        assert_eq!(
-            order,
-            vec!["Ways-of-Working/Rules.md", "Current/Project.md", "Research/old.md", "Ways-of-Working/Old-rules.md"]
-        );
     }
 
     #[test]

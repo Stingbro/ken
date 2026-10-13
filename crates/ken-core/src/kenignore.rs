@@ -247,16 +247,17 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
 /// - `memory::workspace_builtin_rules()` — the workspace pseudo-member
 ///   (ken-memory 1.6).
 ///
-/// What does belong here is a rule global to every project: archives. An
-/// archive or disk image answers no question by its name and Ken cannot
-/// read inside it, so it is not indexed; a user `!*.zip` line brings the
-/// names back. Media is not listed: Ken transcribes video. Secrets are not
+/// What does belong here is a rule global to every project: archives,
+/// what a tool writes, and page templates. An archive or disk image answers
+/// no question by its name and Ken cannot read inside it, so it is not
+/// indexed; a user `!*.zip` line brings the names back. Media is not listed: Ken transcribes video. Secrets are not
 /// a rule at all but a hard ignore ([`is_secret_name`]), so no `!` line can
 /// bring them back.
 pub fn built_in_rule_sets() -> Vec<Rule> {
     ARCHIVE_PATTERNS
         .iter()
         .chain(GENERATED_PATTERNS)
+        .chain(TEMPLATE_PATTERNS)
         .map(|p| Rule { tier: Tier::Ignore, pattern: (*p).into() })
         .collect()
 }
@@ -268,6 +269,11 @@ const GENERATED_PATTERNS: &[&str] = &[
     "*.min.js", "*.min.css", "*.map", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock",
     "uv.lock", "Gemfile.lock", "composer.lock",
 ];
+
+/// A knowledge base's page templates: copied to write a page, never an
+/// answer. Each reads like every question (`{{the rule as a sentence}}`) and
+/// answers none.
+const TEMPLATE_PATTERNS: &[&str] = &["Templates/"];
 
 const ARCHIVE_PATTERNS: &[&str] = &["*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.tgz", "*.iso", "*.jar"];
 
@@ -619,6 +625,10 @@ mod tests {
         }
         assert_eq!(classify("src/app.js", false, &[&built]), Tier::Full);
         assert_eq!(classify("package.json", false, &[&built]), Tier::Full);
+        // The knowledge base's page templates.
+        assert_eq!(classify("Templates/Rule.md", false, &[&built]), Tier::Ignore);
+        assert_eq!(classify("Templates", true, &[&built]), Tier::Ignore);
+        assert_eq!(classify("Rules/Templates and forms.md", false, &[&built]), Tier::Full);
     }
 
     #[test]

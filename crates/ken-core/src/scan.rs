@@ -472,6 +472,16 @@ pub fn control_query(db: &Db) -> Result<Option<crate::db::ControlResult>> {
     }))
 }
 
+/// Whether `text` is minified: a line over 2,000 characters with almost no
+/// spaces in it. Only code and data are checked; a page's long paragraph is
+/// prose, however long its lines.
+pub fn minified(text: &str) -> bool {
+    text.lines().any(|l| {
+        let n = l.chars().count();
+        n > 2000 && (l.chars().filter(|c| c.is_whitespace()).count() as f64) < 0.03 * n as f64
+    })
+}
+
 /// Index a single file (already known to exist and be included). Returns the
 /// status stored.
 fn index_one(
@@ -503,6 +513,9 @@ fn index_one(
         Ok(out) if kind == FileKind::Drawio && out.text.trim().is_empty() => {
             (STATUS_METADATA_ONLY, None, out.text)
         }
+        // Minified code or data (a bundle, a one-line dump) matches many
+        // searches a little and answers none: searchable by name only.
+        Ok(out) if kind == FileKind::Code && minified(&out.text) => (STATUS_METADATA_ONLY, None, out.text),
         Ok(out) if kind.has_content() => (STATUS_INDEXED, None, out.text),
         Ok(out) => (STATUS_METADATA_ONLY, None, out.text),
         Err(e) => (STATUS_FAILED, Some(e.to_string()), String::new()),
@@ -1811,5 +1824,14 @@ mod tests {
         fs::create_dir_all(root.join("moved-in")).unwrap();
         fs::write(root.join("moved-in/x.md"), "# X\n").unwrap();
         assert!(scan_paths(&project, &mut db, &["moved-in".to_string()]).unwrap().is_none());
+    }
+
+    #[test]
+    fn minified_code_is_found_and_prose_is_not() {
+        let bundle = format!("!function(){{{}}}();", "var a=1;b=2;".repeat(400));
+        assert!(minified(&bundle));
+        assert!(minified(&format!("[{}]", "{\"id\":1,\"name\":\"x\"},".repeat(200))));
+        assert!(!minified("fn save() {\n    write();\n}\n"));
+        assert!(!minified(&"A person wrote this sentence in one long paragraph. ".repeat(60)), "a long line of prose has spaces");
     }
 }

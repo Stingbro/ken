@@ -2250,8 +2250,8 @@ you. Pass assignee \"all\" to list every ticket."
     Ok(out)
 }
 
-/// What an agent must know before it trusts a page hit: its label (`ruling
-/// D-410 · 2026-10-06`, `ticket · cancelled · 2026-07-21`), or for a hit
+/// What an agent must know before it trusts a page hit: its label (`decision
+/// D-410 · binding · 2026-10-06`, `ticket · superseded · 2026-07-21`), or for a hit
 /// without one, that it is retired (and what replaces it), generated, dated
 /// evidence, or when a person last verified it.
 fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
@@ -3132,13 +3132,13 @@ mod tests {
         let (text, is_err) = tool(&mut server, "route_query", json!({"query": "companion pets follow the player"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("tickets/AT-7.md"), "{text}");
-        assert!(text.contains("(ticket · cancelled · 2026-07-21)"), "{text}");
-        assert!(text.contains("(ruling D-007 · 2026-10-07)"), "the entry's own id and date: {text}");
+        assert!(text.contains("(ticket · superseded · 2026-07-21)"), "{text}");
+        assert!(text.contains("(decision D-007 · binding · 2026-10-07)"), "the entry's own id and date: {text}");
         let (text, _) = tool(&mut server, "semantic_search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
-        assert!(text.contains("(ticket · cancelled · 2026-07-21)") && text.contains("(ruling D-007 · 2026-10-07)"), "{text}");
+        assert!(text.contains("(ticket · superseded · 2026-07-21)") && text.contains("(decision D-007 · binding · 2026-10-07)"), "{text}");
         let (text, _) = tool(&mut server, "search_knowledge", json!({"query": "companion pets", "project": "Atlas"}));
-        assert!(text.contains("(ticket · cancelled · 2026-07-21) — "), "{text}");
-        assert!(text.contains("decisions/DECISIONS.md (ken://") && text.contains(") (ruling) — "), "the log as a whole: {text}");
+        assert!(text.contains("(ticket · superseded · 2026-07-21) — "), "{text}");
+        assert!(text.contains("decisions/DECISIONS.md (ken://") && text.contains(") (decision · binding) — "), "the log as a whole: {text}");
     }
 
     #[test]
@@ -3269,8 +3269,8 @@ mod tests {
         // The search finds D-379 by its words; D-410 comes in just above it.
         let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "server never overwrites spawn anchors merge", "project": "Atlas"}));
         assert!(!is_err, "{text}");
-        let earlier = text.find("(ruling D-379 · 2026-10-05 · superseded by D-410 on who writes anchors)").expect(&text);
-        let later = text.find("(ruling D-410 · 2026-10-06 · supersedes D-379)").expect(&text);
+        let earlier = text.find("(decision D-379 · superseded · 2026-10-05 · superseded by D-410 on who writes anchors)").expect(&text);
+        let later = text.find("(decision D-410 · binding · 2026-10-06 · supersedes D-379)").expect(&text);
         assert!(later < earlier, "the later ruling ranks first: {text}");
         let (text, _) = tool(&mut server, "route_query", json!({"query": "server never overwrites spawn anchors merge"}));
         assert!(text.contains("superseded by D-410 on who writes anchors"), "{text}");
