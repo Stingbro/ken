@@ -313,9 +313,6 @@ pub struct HitPage {
     pub generated: bool,
     /// Legacy: what replaces a retired page, when it says.
     pub replaced_by: Vec<String>,
-    /// How much the hit counts, in one short line (`authority::hit_label`):
-    /// filled by the search that has the index, None until then.
-    pub label: Option<String>,
 }
 
 /// The page facts for a hit on `rel_path`, or None when it is not a
@@ -339,7 +336,6 @@ pub fn hit_page(rel_path: &str, meta: Option<PageMeta>) -> Option<HitPage> {
         checked,
         dated,
         replaced_by: meta.replaced_by,
-        label: None,
     })
 }
 

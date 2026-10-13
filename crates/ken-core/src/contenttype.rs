@@ -1,6 +1,7 @@
 //! What a file is for: code, a test, a spec, a doc, config, data, a design,
-//! a meeting note or a ticket. Every search hit carries one as a tag, and a
-//! search can keep only some ("code only", "specs and docs").
+//! a meeting note, a ticket, a decision or a note (knowledge-core decision
+//! 17). Every search hit's label starts with one, and a search can keep only
+//! some ("code only", "specs and docs").
 //!
 //! Worked out from the path alone, so it needs no index column and holds on
 //! every existing index at once. Rules run most specific first: a
@@ -21,9 +22,15 @@ pub enum ContentType {
     Design,
     Meeting,
     Ticket,
+    /// The decisions log (`Decisions/DECISIONS.md`), or a page in a
+    /// `decisions` folder.
+    Decision,
+    /// A note ingest wrote, or a source waiting to be read: a page in
+    /// `Inbox/`, `Ingested/`, `Ingestion/` or `notes/`.
+    Note,
 }
 
-pub const ALL: [ContentType; 9] = [
+pub const ALL: [ContentType; 11] = [
     ContentType::Code,
     ContentType::Test,
     ContentType::Spec,
@@ -33,6 +40,8 @@ pub const ALL: [ContentType; 9] = [
     ContentType::Design,
     ContentType::Meeting,
     ContentType::Ticket,
+    ContentType::Decision,
+    ContentType::Note,
 ];
 
 impl ContentType {
@@ -47,6 +56,8 @@ impl ContentType {
             ContentType::Design => "design",
             ContentType::Meeting => "meeting",
             ContentType::Ticket => "ticket",
+            ContentType::Decision => "decision",
+            ContentType::Note => "note",
         }
     }
 
@@ -71,6 +82,8 @@ const SPEC_DIRS: &[&str] = &["openspec", "specs", "spec", "rfc", "rfcs", "adr", 
 const TEST_DIRS: &[&str] = &["test", "tests", "__tests__", "e2e", "spec", "specs", "testing", "fixtures"];
 const MEETING_WORDS: &[&str] = &["meeting", "meetings", "standup", "stand-up", "transcript", "transcripts", "minutes", "retro"];
 const TICKET_DIRS: &[&str] = &["tickets", "issues", "backlog", "stories", "epics"];
+const DECISION_DIRS: &[&str] = &["decisions"];
+const NOTE_DIRS: &[&str] = &["inbox", "ingested", "ingestion", "notes"];
 
 /// The content type of a project-relative path.
 pub fn of(path: &str) -> ContentType {
@@ -89,6 +102,15 @@ pub fn of(path: &str) -> ContentType {
         || [".test.", ".spec.", "_test.", "_spec.", ".tests."].iter().any(|m| name.contains(m));
     if program && (test_name || in_dir(TEST_DIRS)) {
         return ContentType::Test;
+    }
+    // The decisions log, wherever it sits, and the pages beside it.
+    if prose && (name == "decisions.md" || in_dir(DECISION_DIRS)) {
+        return ContentType::Decision;
+    }
+    // A note: what ingest wrote from a source, or a source waiting for it.
+    // A meeting note there is a note first: it is the record ingest made.
+    if prose && in_dir(NOTE_DIRS) {
+        return ContentType::Note;
     }
     // A meeting: a transcript or a note about one.
     if matches!(ext, "vtt" | "srt") || (prose && (dir_mentions(MEETING_WORDS) || MEETING_WORDS.iter().any(|w| name.contains(w)))) {
@@ -173,6 +195,14 @@ mod tests {
             ("README.md", Doc),
             ("04 References/SOW.md", Doc),
             ("docs/manual/drift.html", Doc),
+            ("Decisions/DECISIONS.md", Decision),
+            ("wiki/decisions.md", Decision),
+            ("Decisions/Archive-2025.md", Decision),
+            ("Research/Ingestion/Ingested/2026-09/Standup - 2026-09-12.md", Note),
+            ("Inbox/call with Ana.txt", Note),
+            ("notes/spike.md", Note),
+            ("Research/Ingestion/Raw/kickoff.vtt", Meeting),
+            ("src/decisions/log.rs", Code),
         ];
         for (path, want) in cases {
             assert_eq!(of(path), want, "{path}");
@@ -183,6 +213,7 @@ mod tests {
     fn a_filter_parses_leniently_and_any_means_all() {
         assert_eq!(parse_filter(Some("code")), vec![Code]);
         assert_eq!(parse_filter(Some("Spec, doc")), vec![Spec, Doc]);
+        assert_eq!(parse_filter(Some("decision,note")), vec![Decision, Note]);
         assert!(parse_filter(Some("any")).is_empty());
         assert!(parse_filter(Some("nonsense")).is_empty());
         assert!(parse_filter(None).is_empty());

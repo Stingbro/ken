@@ -251,8 +251,8 @@ remember something.\n\
 how work moves and what something is called are in the team's wiki and decisions log: search them first and answer \
 from them, citing the page. A ruling there is settled. Never recommend against it or present the question as open; \
 when the code does not match a ruling, say the code differs from the ruling and cite both. Every hit from Ken's \
-search carries a label: its kind, its tier and its date (decision D-410 · binding · 2026-10-06, doc · current, \
-ticket · superseded). The tiers run binding, current, reference, record, superseded, and you weigh hits by them: a \
+search carries one label: its kind, its tier (for code, its role) and its date (decision D-410 · binding · \
+2026-10-06, doc · current, ticket · superseded, code · service · 2026-10-01). The tiers run binding, current, reference, record, superseded, and you weigh hits by them: a \
 later ruling over an earlier one on the same point (a hit marked superseded by a later ruling holds only where that \
 ruling does not reach), a binding ruling or rule over a ticket or note, and a current page over a record.";
 
@@ -1307,7 +1307,7 @@ mod tests {
     #[test]
     fn the_guide_says_how_to_weigh_a_hits_label() {
         let guide = KEN_GUIDE.replace('\n', " ");
-        for word in ["carries a label", "a later ruling over an earlier one", "over a ticket or note", "a current page over a record"] {
+        for word in ["carries one label", "a later ruling over an earlier one", "over a ticket or note", "a current page over a record"] {
             assert!(guide.contains(word), "{word}");
         }
     }

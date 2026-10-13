@@ -73,6 +73,10 @@ pub struct HybridHit {
     /// For a Markdown page: its section, freshness and whether it is still
     /// current (`pagemeta::hit_page`). Filled with `line`.
     pub page: Option<crate::pagemeta::HitPage>,
+    /// What the hit is and how much it counts, one short line for every hit
+    /// (`authority::hit_label`, knowledge-core decision 17): `kind · tier or
+    /// role · date`. Filled with `line`; None before that.
+    pub label: Option<String>,
     /// How well it answers the query ([`rerank`]'s score, its file's tier
     /// included): the same scale in every member, so hits from
     /// different repos merge by relevance rather than by repo.
@@ -111,6 +115,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             source,
             line: None,
             page: None,
+            label: None,
             score: 0.0,
         });
     }
@@ -129,6 +134,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             source: Source::Semantic,
             line: None,
             page: None,
+            label: None,
             score: 0.0,
         });
     }
@@ -401,7 +407,7 @@ mod tests {
     /// with none (all code) keeps its score.
     #[test]
     fn authority_moves_a_hit_by_its_weight_and_leaves_the_rest() {
-        let hit = |path: &str| HybridHit { path: path.into(), chunk_id: 1, snippet: "who merges the pull request".into(), source: Source::Keyword, line: None, page: None, score: 0.0 };
+        let hit = |path: &str| HybridHit { path: path.into(), chunk_id: 1, snippet: "who merges the pull request".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 };
         let hits = vec![hit("tickets/SR-1.md"), hit("src/merge.rs"), hit("decisions/DECISIONS.md")];
         let plain = rerank_with("merge pull request", hits.clone(), &[], &HashMap::new());
         let weights: HashMap<String, f64> =
@@ -434,8 +440,8 @@ mod tests {
     #[test]
     fn a_question_word_meets_a_camel_case_file_name() {
         let hits = vec![
-            HybridHit { path: "docs/notes.md".into(), chunk_id: 1, snippet: "weapon notes".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
-            HybridHit { path: "data/WeaponBases.json".into(), chunk_id: 2, snippet: "{}".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
+            HybridHit { path: "docs/notes.md".into(), chunk_id: 1, snippet: "weapon notes".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
+            HybridHit { path: "data/WeaponBases.json".into(), chunk_id: 2, snippet: "{}".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
         ];
         let out = rerank("where are the weapon base stats", hits, &[]);
         assert_eq!(out[0].path, "data/WeaponBases.json");
@@ -444,8 +450,8 @@ mod tests {
     #[test]
     fn a_keyword_hit_outside_the_knn_list_still_gets_its_meaning_score() {
         let hits = vec![
-            HybridHit { path: "a.rs".into(), chunk_id: 1, snippet: "x".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
-            HybridHit { path: "b.rs".into(), chunk_id: 2, snippet: "x".into(), source: Source::Keyword, line: None, page: None, score: 0.0 },
+            HybridHit { path: "a.rs".into(), chunk_id: 1, snippet: "x".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
+            HybridHit { path: "b.rs".into(), chunk_id: 2, snippet: "x".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
         ];
         let extra: HashMap<String, f64> = [("b.rs".to_string(), 0.3)].into_iter().collect();
         let out = rerank_with("zzz", hits, &[], &extra);
@@ -579,6 +585,7 @@ mod tests {
             source,
             line: None,
             page: None,
+            label: None,
             score: 0.0,
         }
     }

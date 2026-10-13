@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -110,34 +110,85 @@ pub struct OcrRegionRow {
     pub bbox: [f32; 4],
 }
 
-/// File-level index counts for one project (see [`Db::file_health_counts`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FileHealthCounts {
-    pub total: i64,
+/// One source's index health, the one health line (knowledge-core
+/// decision 19): files indexed, failed or skipped; how much of the meaning
+/// index is built; how the controls did; whether the embedding model is
+/// missing. Counting queries only, so it is cheap on a large index (see
+/// [`Db::index_health`]). Background reading for entities is not part of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexHealth {
+    /// Every file row.
+    pub files: i64,
+    /// Read in full: their text is searchable.
+    pub indexed: i64,
+    /// Could not be read.
     pub failed: i64,
+    /// Searchable by name only: minified, binary, a cloud placeholder, a
+    /// video with no transcript yet.
+    pub skipped: i64,
     /// Waiting to be indexed.
     pub queued: i64,
     /// Cut at the per-file chunk cap: their end is not searchable
     /// (`chunker::CHUNK_CAP`, knowledge-core decision 16).
     pub capped: i64,
+    /// Passages in the keyword index.
+    pub chunks: i64,
+    /// Passages with a meaning vector, of `chunks`.
+    pub embedded: i64,
+    /// Controls that found their file near the top on the last run, of
+    /// `controls_total` (`controls`).
+    pub controls_passed: i64,
+    pub controls_total: i64,
+    /// The embedding model is not installed, so meaning search is off. The
+    /// index cannot know this; the caller sets it.
+    pub model_missing: bool,
 }
 
-/// Extraction health for one project (see [`Db::index_health`]).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IndexHealth {
-    /// Read for entities, of `extractable`.
-    pub analyzed: i64,
-    pub extractable: i64,
-    /// Queued, not read yet.
-    pub pending: i64,
-    /// Errored, with attempts left.
-    pub retrying: i64,
-    /// Errored three times: will not be tried again until the file changes.
-    pub failed: i64,
-    /// Searchable only (a code or reference repo, a `~` line): never read
-    /// for entities, on purpose.
-    pub skipped: i64,
+impl IndexHealth {
+    /// Another source's health added to this one: counts summed, the model
+    /// missing if it is missing for either.
+    pub fn add(&mut self, other: &IndexHealth) {
+        self.files += other.files;
+        self.indexed += other.indexed;
+        self.failed += other.failed;
+        self.skipped += other.skipped;
+        self.queued += other.queued;
+        self.capped += other.capped;
+        self.chunks += other.chunks;
+        self.embedded += other.embedded;
+        self.controls_passed += other.controls_passed;
+        self.controls_total += other.controls_total;
+        self.model_missing |= other.model_missing;
+    }
+
+    /// The one health line: `412 indexed, 3 failed, 10 skipped · meaning
+    /// 80% built · controls 4 of 5 passing · 2 too long to index whole`.
+    /// The parts that are nothing are left out, except the controls, which
+    /// say when there are none.
+    pub fn line(&self) -> String {
+        let mut files = format!("{} indexed", self.indexed);
+        for (n, what) in [(self.failed, "failed"), (self.skipped, "skipped"), (self.queued, "queued")] {
+            if n > 0 {
+                files.push_str(&format!(", {n} {what}"));
+            }
+        }
+        let mut parts = vec![files];
+        if self.model_missing {
+            parts.push("meaning search off: the embedding model is missing".into());
+        } else if self.chunks > 0 {
+            let pct = (self.embedded.clamp(0, self.chunks) * 100) / self.chunks;
+            parts.push(if pct >= 100 { "meaning built".into() } else { format!("meaning {pct}% built") });
+        }
+        parts.push(match self.controls_total {
+            0 => "no controls".into(),
+            t => format!("controls {} of {t} passing", self.controls_passed),
+        });
+        if self.capped > 0 {
+            parts.push(format!("{} too long to index whole", self.capped));
+        }
+        parts.join(" · ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -819,6 +870,27 @@ impl Db {
                 params![Self::REINDEX_SENTINEL_MTIME],
             )?;
         }
+        if version < 24 {
+            // knowledge-core decisions 17 and 18: a code file's role is
+            // stored with it (`coderole`), and goes in its chunks' names
+            // field and embedded header; a page's frontmatter title and
+            // aliases go in its chunks' names field instead of the query
+            // rewrites. The keyword index is filled again so every chunk's
+            // names carry its page's title and aliases. Roles are worked out
+            // by the next scan, which drops the vectors of the code files
+            // that gain one, so the next semantic rebuild embeds them again.
+            // The stored vocabulary is dropped, so the next search or scan
+            // builds it without page aliases. Tests leave the index on the
+            // next scan: a built-in rule now ignores them
+            // (`kenignore::built_in_rule_sets`), and a scan removes what is
+            // ignored. Controls run after the next rebuild.
+            let has: bool = self.conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'role'")?.exists([])?;
+            if !has {
+                self.conn.execute_batch("ALTER TABLE files ADD COLUMN role TEXT;")?;
+            }
+            self.conn.execute_batch("DELETE FROM meta WHERE key = 'vocabulary';")?;
+            self.rebuild_chunks_fts()?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -866,14 +938,20 @@ impl Db {
         {
             let mut read = tx.prepare(
                 "SELECT c.id, c.path, c.text, c.title, c.symbol, s.summary
-                   FROM chunks c LEFT JOIN chunk_summaries s ON s.content_hash = c.content_hash",
+                   FROM chunks c LEFT JOIN chunk_summaries s ON s.content_hash = c.content_hash
+                  ORDER BY c.path",
             )?;
             let mut write = tx.prepare("INSERT INTO chunks_fts(rowid, text, names, title) VALUES (?1, ?2, ?3, ?4)")?;
             let mut rows = read.query([])?;
+            // A file's extra names are read once for all its chunks.
+            let mut extra: (String, Vec<String>) = (String::new(), Vec::new());
             while let Some(row) = rows.next()? {
                 let (id, path, text): (i64, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
                 let (title, symbol, summary): (String, Option<String>, Option<String>) = (row.get(3)?, row.get(4)?, row.get(5)?);
-                write.execute(params![id, text, fts_names(&path, symbol.as_deref(), &text), fts_title(&title, summary.as_deref())])?;
+                if extra.0 != path {
+                    extra = (path.clone(), names_extra(&tx, &path)?);
+                }
+                write.execute(params![id, text, fts_names(&path, symbol.as_deref(), &text, &extra.1), fts_title(&title, summary.as_deref())])?;
             }
         }
         tx.commit()?;
@@ -1035,6 +1113,9 @@ impl Db {
         };
 
         let mut changed = Vec::new();
+        // The page's title and aliases and the file's role, in every
+        // chunk's names field (`names_extra`).
+        let extra = names_extra(&tx, path)?;
         for chunk in chunks {
             let seq = chunk.seq as i64;
             let unchanged = matches!(existing.get(&seq), Some((_, hash)) if hash == &chunk.content_hash);
@@ -1090,7 +1171,7 @@ impl Db {
                     params![
                         id,
                         chunk.text,
-                        fts_names(path, chunk.symbol.as_deref(), &chunk.text),
+                        fts_names(path, chunk.symbol.as_deref(), &chunk.text, &extra),
                         fts_title(&chunk.title, summary.as_deref())
                     ],
                 )?;
@@ -1436,12 +1517,14 @@ impl Db {
               WHERE c.path = ?1 {missing}
               ORDER BY c.seq"
         );
+        let role = self.file_role(path)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![path], |r| {
                 let (id, text, title): (i64, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
                 let (symbol, summary): (Option<String>, Option<String>) = (r.get(3)?, r.get(4)?);
-                Ok((id, crate::chunker::embed_text(path, &title, symbol.as_deref(), summary.as_deref(), &text)))
+                let embed = crate::chunker::embed_text(path, &title, symbol.as_deref(), role.as_deref(), summary.as_deref(), &text);
+                Ok((id, embed))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -1646,6 +1729,7 @@ impl Db {
             };
             let mut write = tx.prepare("UPDATE chunks_fts SET names = ?2 WHERE rowid = ?1")?;
             for (id, path, mut text, symbol) in moved {
+                let extra = names_extra(&tx, &path)?;
                 let old = format!("{from}{}", &path[to.len()..]);
                 if text == old {
                     let c = crate::chunker::name_chunk(&path);
@@ -1659,7 +1743,7 @@ impl Db {
                         tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
                     }
                 }
-                write.execute(params![id, fts_names(&path, symbol.as_deref(), &text)])?;
+                write.execute(params![id, fts_names(&path, symbol.as_deref(), &text, &extra)])?;
             }
         }
 
@@ -1889,35 +1973,37 @@ impl Db {
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?)
     }
 
-    /// Index health in counts, for Your day: every file row, the failed
-    /// ones, and the files still waiting to be indexed (a `pending` file
-    /// row, or a file whose OCR text is still queued), and the files cut at
-    /// the per-file chunk cap. Counting queries only, so it is cheap on a
-    /// large index. Extraction backlog is a
-    /// separate number ([`Db::index_health`]).
-    pub fn file_health_counts(&self) -> Result<FileHealthCounts> {
-        let (total, failed, pending, capped): (i64, i64, i64, i64) = self.conn.query_row(
+    /// The index as an instrument: the one health line (knowledge-core
+    /// decision 19, [`IndexHealth`]). An index that has stopped reading
+    /// still answers searches, with thin results and no error; these
+    /// numbers are how anyone can tell. `model_missing` is left false for
+    /// the caller to set.
+    pub fn index_health(&self) -> Result<IndexHealth> {
+        let (files, indexed, failed, skipped, queued, capped): (i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT COUNT(*),
+                    COALESCE(SUM(status = 'indexed'), 0),
                     COALESCE(SUM(status = 'failed'), 0),
+                    COALESCE(SUM(status IN ('metadata_only', 'cloud_only')), 0),
                     COALESCE(SUM(status = 'pending'), 0),
                     COALESCE(SUM(chunk_capped <> 0), 0)
                FROM files",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
-        // Queued is what waits to be read for entities (the white box's 8c:
-        // "files queued for entities"), the same pending + retrying count the
-        // Map's health line uses, plus anything not yet indexed.
-        let extraction: i64 = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM extractions
-                  WHERE status = 'pending' OR (status = 'error' AND attempts < ?1)",
-                params![MAX_EXTRACTION_ATTEMPTS],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        Ok(FileHealthCounts { total, failed, queued: pending + extraction, capped })
+        let controls = crate::controls::stored(self);
+        Ok(IndexHealth {
+            files,
+            indexed,
+            failed,
+            skipped,
+            queued,
+            capped,
+            chunks: self.chunk_count()?,
+            embedded: self.vector_count()?,
+            controls_passed: controls.iter().filter(|c| c.passed).count() as i64,
+            controls_total: controls.len() as i64,
+            model_missing: false,
+        })
     }
 
     /// Count of files whose content is actually in the index (status
@@ -2456,31 +2542,6 @@ impl Db {
         Ok(true)
     }
 
-    /// The index as an instrument (docs-system: "the tool shows index health:
-    /// pending, failed and skipped extractions"). An index that has stopped
-    /// extracting still answers searches, with thin results and no error;
-    /// these numbers are how anyone can tell.
-    pub fn index_health(&self) -> Result<IndexHealth> {
-        let count = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
-        let (analyzed, extractable) = self.extraction_coverage()?;
-        Ok(IndexHealth {
-            analyzed,
-            extractable,
-            pending: count("SELECT COUNT(*) FROM extractions WHERE status = 'pending'")?,
-            retrying: self.conn.query_row(
-                "SELECT COUNT(*) FROM extractions WHERE status = 'error' AND attempts < ?1",
-                params![MAX_EXTRACTION_ATTEMPTS],
-                |r| r.get(0),
-            )?,
-            failed: self.extraction_failed_count()?,
-            skipped: count(
-                "SELECT COUNT(*) FROM files f
-                  WHERE f.status = 'indexed' AND f.tier <> 0
-                    AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)",
-            )?,
-        })
-    }
-
     /// The oldest `pending` file (insertion order via implicit rowid) and the
     /// hash to stamp when it completes.
     pub fn next_pending_extraction(&self) -> Result<Option<(String, String)>> {
@@ -2617,8 +2678,19 @@ impl Db {
         )?)
     }
 
-    /// Store (or, with None, forget) what a page's frontmatter says.
+    /// Store (or, with None, forget) what a page's frontmatter says. A
+    /// change of title or aliases writes the page's chunks' names again,
+    /// since they carry them (`names_extra`).
     pub fn set_page_meta(&self, rel_path: &str, meta: Option<&crate::pagemeta::PageMeta>) -> Result<()> {
+        let before = names_extra(&self.conn, rel_path)?;
+        self.write_page_meta(rel_path, meta)?;
+        if names_extra(&self.conn, rel_path)? != before {
+            self.refresh_chunk_names(rel_path)?;
+        }
+        Ok(())
+    }
+
+    fn write_page_meta(&self, rel_path: &str, meta: Option<&crate::pagemeta::PageMeta>) -> Result<()> {
         let Some(m) = meta else {
             self.conn.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
             return Ok(());
@@ -2644,6 +2716,92 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// Write the names field of every chunk of `path` again, from its
+    /// stored text, symbol and extra names ([`names_extra`]).
+    pub fn refresh_chunk_names(&self, path: &str) -> Result<()> {
+        let extra = names_extra(&self.conn, path)?;
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = self.conn.prepare("SELECT id, text, symbol FROM chunks WHERE path = ?1")?;
+            let rows = stmt.query_map(params![path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut write = self.conn.prepare("UPDATE chunks_fts SET names = ?2 WHERE rowid = ?1")?;
+        for (id, text, symbol) in rows {
+            write.execute(params![id, fts_names(path, symbol.as_deref(), &text, &extra)])?;
+        }
+        Ok(())
+    }
+
+    /// The names field of each chunk of `path`, in order.
+    #[cfg(test)]
+    pub fn chunk_names(&self, path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.names FROM chunks c JOIN chunks_fts f ON f.rowid = c.id WHERE c.path = ?1 ORDER BY c.seq",
+        )?;
+        let rows = stmt.query_map(params![path], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every indexed file's path.
+    pub fn indexed_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT rel_path FROM files WHERE status = 'indexed' ORDER BY rel_path")?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// A code file's stored role (`coderole`), None when it has none.
+    pub fn file_role(&self, rel_path: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT role FROM files WHERE rel_path = ?1", params![rel_path], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten())
+    }
+
+    /// Store the files' roles (`coderole::refresh`). A file whose role
+    /// changed has its chunks' names written again and their vectors
+    /// dropped, since the role is in both. Returns the paths that changed.
+    pub fn set_file_roles(&self, rows: &[(String, Option<String>)]) -> Result<Vec<String>> {
+        let mut changed = Vec::new();
+        let tx = self.conn.unchecked_transaction()?;
+        let vec_exists = table_exists(&tx, "vec_chunks")?;
+        for (path, role) in rows {
+            let stored: Option<Option<String>> =
+                tx.query_row("SELECT role FROM files WHERE rel_path = ?1", params![path], |r| r.get(0)).optional()?;
+            let Some(stored) = stored else { continue };
+            if stored == *role {
+                continue;
+            }
+            tx.execute("UPDATE files SET role = ?2 WHERE rel_path = ?1", params![path, role])?;
+            changed.push(path.clone());
+        }
+        for path in &changed {
+            let extra = names_extra(&tx, path)?;
+            let chunks: Vec<(i64, String, Option<String>)> = {
+                let mut stmt = tx.prepare("SELECT id, text, symbol FROM chunks WHERE path = ?1")?;
+                let rows = stmt.query_map(params![path], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for (id, text, symbol) in chunks {
+                tx.execute("UPDATE chunks_fts SET names = ?2 WHERE rowid = ?1", params![id, fts_names(path, symbol.as_deref(), &text, &extra)])?;
+                if vec_exists {
+                    tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// The last controls run (`controls`), as JSON.
+    pub fn control_results(&self) -> Result<Option<String>> {
+        self.meta_get("controls")
+    }
+
+    pub fn store_control_results(&self, json: &str) -> Result<()> {
+        self.meta_set("controls", json)
     }
 
     /// The indexed files whose authority is worked out (`authority`): the
@@ -2828,7 +2986,9 @@ impl Db {
     /// Read the frontmatter of every indexed Markdown page that has no
     /// `page_meta` row, from its stored text (no file read). Pages indexed
     /// before frontmatter was read get theirs on the next open. Returns how
-    /// many pages had frontmatter.
+    /// many pages had frontmatter. The chunks' names are not written again
+    /// here: this runs inside migrations older than the columns that needs,
+    /// and the v24 migration fills the keyword index from these rows.
     pub fn backfill_page_meta(&self) -> Result<usize> {
         let rows: Vec<(String, String)> = {
             let mut stmt = self.conn.prepare(
@@ -2844,7 +3004,7 @@ impl Db {
         let mut n = 0;
         for (rel, text) in rows {
             if let Some(meta) = crate::pagemeta::parse(&text) {
-                self.set_page_meta(&rel, Some(&meta))?;
+                self.write_page_meta(&rel, Some(&meta))?;
                 n += 1;
             }
         }
@@ -3108,18 +3268,6 @@ impl Db {
             out.extend(rows);
         }
         Ok(out)
-    }
-
-    /// Every page's frontmatter title and aliases (pages that have aliases).
-    pub fn page_aliases(&self) -> Result<Vec<(Option<String>, Vec<String>)>> {
-        let mut stmt = self.conn.prepare("SELECT title, aliases FROM page_meta WHERE aliases <> '[]'")?;
-        let rows = stmt
-            .query_map([], |r| {
-                let aliases: String = r.get(1)?;
-                Ok((r.get::<_, Option<String>>(0)?, serde_json::from_str(&aliases).unwrap_or_default()))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
     }
 
     /// What a page's frontmatter said when it was last indexed.
@@ -4173,6 +4321,25 @@ const W_NAMES_ANY: f64 = 0.25;
 /// is about backoff even when its own sentences never say the word.
 const W_TITLE: f64 = 2.5;
 
+/// The names a file gives every one of its chunks, beyond its path: a
+/// page's frontmatter title and aliases (decision 18: they feed the names
+/// field, not the query rewrites) and a code file's role (decision 17). Read
+/// from what the index stored; a database from before either was kept reads
+/// as none.
+fn names_extra(conn: &Connection, path: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let page: Option<(Option<String>, String)> = conn
+        .query_row("SELECT title, aliases FROM page_meta WHERE rel_path = ?1", params![path], |r| Ok((r.get(0)?, r.get(1)?)))
+        .ok();
+    if let Some((title, aliases)) = page {
+        out.extend(title.filter(|t| !t.trim().is_empty()));
+        out.extend(serde_json::from_str::<Vec<String>>(&aliases).unwrap_or_default().into_iter().filter(|a| !a.trim().is_empty()));
+    }
+    let role: Option<String> = conn.query_row("SELECT role FROM files WHERE rel_path = ?1", params![path], |r| r.get(0)).ok().flatten();
+    out.extend(role);
+    Ok(out)
+}
+
 /// The `title` column of a chunk's keyword row: its title (breadcrumb or
 /// doc comment) and its one-line summary, when it has one.
 fn fts_title(title: &str, summary: Option<&str>) -> String {
@@ -4206,8 +4373,10 @@ const NAME_WORD_MAX: usize = 64;
 /// fifty times in the code still counts once here.
 ///
 /// A code chunk's symbol (`Store.open`, or `save, load` for packed
-/// definitions) is named here too, each name and its parts.
-fn fts_names(rel_path: &str, symbol: Option<&str>, chunk_text: &str) -> String {
+/// definitions) is named here too, each name and its parts, and so are the
+/// file's `extra` names ([`names_extra`]): a page's frontmatter title and
+/// aliases, a code file's role (knowledge-core decisions 17 and 18).
+fn fts_names(rel_path: &str, symbol: Option<&str>, chunk_text: &str, extra: &[String]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |w: &str| {
@@ -4221,7 +4390,18 @@ fn fts_names(rel_path: &str, symbol: Option<&str>, chunk_text: &str) -> String {
         .flat_map(|s| s.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-')))
         .filter(|w| !w.is_empty())
         .map(str::to_string);
-    let named = path_tokens(rel_path).split(' ').map(str::to_string).chain(symbols).chain(declared).collect::<Vec<_>>();
+    let extra_words = extra
+        .iter()
+        .flat_map(|e| e.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-')))
+        .filter(|w| !w.is_empty() && !is_stopword(w))
+        .map(str::to_string);
+    let named = path_tokens(rel_path)
+        .split(' ')
+        .map(str::to_string)
+        .chain(symbols)
+        .chain(extra_words)
+        .chain(declared)
+        .collect::<Vec<_>>();
     for word in &named {
         add(word);
         add(&crate::search::stem(&word.to_lowercase()));
@@ -4576,7 +4756,7 @@ mod tests {
 
     #[test]
     fn fts_names_split_compound_names_and_keep_them_whole() {
-        let names = fts_names("data/equipment/WeaponBases.json", None, "{ \"CritMultiplier\": 1.5, \"MAX_ROWS\": 7, \"plain\": \"aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgZW5jb2RlZCBkYXRhIHRoYXQgaXMgbG9uZw\" }");
+        let names = fts_names("data/equipment/WeaponBases.json", None, "{ \"CritMultiplier\": 1.5, \"MAX_ROWS\": 7, \"plain\": \"aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgZW5jb2RlZCBkYXRhIHRoYXQgaXMgbG9uZw\" }", &[]);
         let words: Vec<&str> = names.split(' ').collect();
         for want in ["data", "equipment", "WeaponBases", "Weapon", "Bases", "bas", "json", "Crit", "Multiplier", "MAX", "ROWS", "row"] {
             assert!(words.contains(&want), "{want} in {names}");
@@ -4703,7 +4883,7 @@ mod tests {
         }
         let chunked = crate::chunker::Chunked { chunks: vec![chunk(0, "plain words", "h0")], capped: true };
         db.store_chunked("notes.md", &chunked, crate::kenignore::Tier::Full).unwrap();
-        assert_eq!(db.file_health_counts().unwrap().capped, 1, "a file cut at the cap is counted");
+        assert_eq!(db.index_health().unwrap().capped, 1, "a file cut at the cap is counted");
     }
 
     #[test]
@@ -5515,7 +5695,7 @@ mod tests {
         assert_eq!(db.next_pending_extraction().unwrap(), None);
         assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
         assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
-        assert_eq!(db.index_health().unwrap().failed, 1);
+        assert_eq!(db.extraction_failed_count().unwrap(), 1);
 
         // An edit gives the new content the full three tries, not one.
         db.enqueue_extraction_if_changed("b.md", "hb-edited").unwrap();
@@ -5524,8 +5704,8 @@ mod tests {
             .query_row("SELECT attempts FROM extractions WHERE rel_path = 'b.md'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(attempts, 0);
-        let h = db.index_health().unwrap();
-        assert_eq!((h.failed, h.pending), (0, 1));
+        assert_eq!(db.extraction_failed_count().unwrap(), 0);
+        assert_eq!(db.next_pending_extraction().unwrap().map(|(p, _)| p).as_deref(), Some("b.md"));
     }
 
     #[test]
@@ -5684,17 +5864,64 @@ mod tests {
     }
 
     #[test]
-    fn file_health_counts_count_files_failed_and_waiting() {
+    fn index_health_is_one_line_of_counts() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.file_health_counts().unwrap(), FileHealthCounts::default());
+        assert_eq!(db.index_health().unwrap(), IndexHealth::default());
         db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
+        db.upsert_chunks("a.md", &[chunk(0, "alpha", "h0"), chunk(1, "beta", "h1")], crate::kenignore::Tier::Full).unwrap();
         db.upsert_file("b.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
         db.upsert_file("c.png", "image", 1, 1, "metadata_only", None, "").unwrap();
         db.upsert_file("d.md", "md", 1, 1, "pending", None, "").unwrap();
-        // OCR backlog is not counted; the extraction backlog is.
+        // Neither the OCR nor the extraction backlog is counted.
         assert!(db.enqueue_ocr_if_changed("c.png", "h1").unwrap());
         assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
-        assert_eq!(db.file_health_counts().unwrap(), FileHealthCounts { total: 4, failed: 1, queued: 2, capped: 0 });
+        db.store_control_results(r#"[{"question":"q","expect":"a.md","rank":1,"passed":true},{"question":"r","expect":"z.md","rank":null,"passed":false}]"#)
+            .unwrap();
+        let h = db.index_health().unwrap();
+        assert_eq!(
+            h,
+            IndexHealth {
+                files: 4,
+                indexed: 1,
+                failed: 1,
+                skipped: 1,
+                queued: 1,
+                capped: 0,
+                chunks: 2,
+                embedded: 0,
+                controls_passed: 1,
+                controls_total: 2,
+                model_missing: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_health_line_says_what_matters_and_adds_up() {
+        let mut h = IndexHealth { indexed: 412, failed: 3, chunks: 1000, embedded: 800, controls_passed: 4, controls_total: 5, capped: 2, ..Default::default() };
+        assert_eq!(h.line(), "412 indexed, 3 failed · meaning 80% built · controls 4 of 5 passing · 2 too long to index whole");
+        h.add(&IndexHealth { indexed: 8, chunks: 0, model_missing: true, ..Default::default() });
+        assert_eq!(h.indexed, 420);
+        assert_eq!(h.line(), "420 indexed, 3 failed · meaning search off: the embedding model is missing · controls 4 of 5 passing · 2 too long to index whole");
+        assert_eq!(IndexHealth { indexed: 1, chunks: 1, embedded: 1, ..Default::default() }.line(), "1 indexed · meaning built · no controls");
+    }
+
+    #[test]
+    fn a_pages_title_and_aliases_and_a_files_role_are_in_its_names() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("Reference/Regions.md", "md", 1, 1, "indexed", None, "x").unwrap();
+        db.upsert_chunks("Reference/Regions.md", &[chunk(0, "How the map is cut up.", "h0")], crate::kenignore::Tier::Full).unwrap();
+        let meta = crate::pagemeta::PageMeta { title: Some("World regions".into()), aliases: vec!["shard layout".into()], ..Default::default() };
+        db.set_page_meta("Reference/Regions.md", Some(&meta)).unwrap();
+        let names = db.chunk_names("Reference/Regions.md").unwrap().join(" ");
+        assert!(names.contains("shard") && names.contains("layout") && names.contains("regions"), "{names}");
+        assert_eq!(db.search_chunks_fts("shard layout", 5).unwrap().len(), 1, "an alias finds its page through the names field");
+
+        db.upsert_file("src/Pay.java", "code", 1, 1, "indexed", None, "class Pay {}").unwrap();
+        db.upsert_chunks("src/Pay.java", &[chunk(0, "class Pay {}", "h1")], crate::kenignore::Tier::Full).unwrap();
+        assert_eq!(db.set_file_roles(&[("src/Pay.java".into(), Some("billing".into()))]).unwrap(), vec!["src/Pay.java".to_string()]);
+        assert!(db.chunk_names("src/Pay.java").unwrap()[0].contains("billing"));
+        assert!(db.chunks_missing_vectors("src/Pay.java").unwrap()[0].1.starts_with("src/Pay.java (billing)"), "the role is in the embedded header");
     }
 
     fn seeded() -> Db {

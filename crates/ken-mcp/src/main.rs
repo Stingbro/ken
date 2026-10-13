@@ -341,8 +341,9 @@ size, and modification time — optionally only those under a folder.",
             "name": "list_projects",
             "description": "List the Ken projects registered on this machine \
 — name, folder path, and whether the folder is currently available — each \
-with its search readiness (how far its meaning search has got) and, if it \
-has one, its one-line `.ken/index-profile.json` summary.",
+with its index health in one line (files indexed, failed or skipped; how far \
+its meaning search has got; its controls; whether the embedding model is \
+missing) and, if it has one, its one-line `.ken/index-profile.json` summary.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ];
@@ -378,7 +379,7 @@ search uses Ken's installed embedding model; without it the answer says it was k
                 "properties": {
                     "query": { "type": "string", "description": "A question or search terms." },
                     "limit": { "type": "integer", "description": "Maximum hits to return (default 10)." },
-                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
+                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket, decision, note (or any, the default). Every hit is labelled with its kind either way." },
                     "project": project_arg
                 },
                 "required": ["query"]
@@ -401,7 +402,7 @@ Ken's installed embedding model; without it the answer says it was keyword only.
                 "properties": {
                     "query": { "type": "string", "description": "A question or search terms. A project's name in it narrows the search to that project." },
                     "limit": { "type": "integer", "description": "Maximum merged hits to return (default 10)." },
-                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
+                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket, decision, note (or any, the default). Every hit is labelled with its kind either way." },
                 },
                 "required": ["query"]
             }
@@ -911,14 +912,12 @@ folder in the Ken app first."
             if s.available { "" } else { " (folder currently missing)" }
         ));
         if s.available {
-            let readiness = match Db::open_read_only(&server.base_dir, s.entry.id) {
-                Ok(db) => match routing::meaning_status(&db) {
-                    MemberStatus::Building { embedded, chunks } => {
-                        format!("keyword search ready, meaning search {}% built", percent(embedded, chunks))
-                    }
-                    _ if db.semantic_built_at().ok().flatten().is_some() => "keyword and meaning search ready".to_string(),
-                    _ => "keyword search ready".to_string(),
-                },
+            // The one health line (knowledge-core decision 19).
+            let readiness = match Db::open_read_only(&server.base_dir, s.entry.id).and_then(|db| db.index_health()) {
+                Ok(mut h) => {
+                    h.model_missing = ken_core::embedder::selected_profile().is_none();
+                    h.line()
+                }
                 Err(_) => "no index yet".to_string(),
             };
             out.push_str(&format!(" — {readiness}"));
@@ -1020,14 +1019,14 @@ fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
             out.push_str(&format!(
                 "\n{}. {} {}{} ({}{}) [{}]",
                 i + 1,
-                kind_tag(&hit.path),
+                hit_tag(&hit.path, hit.label.as_deref()),
                 hit.path,
                 line.map(|l| format!(":{l}")).unwrap_or_default(),
                 ken_address(project.config.id, &hit.path),
                 line.map(|l| format!("#L{l}")).unwrap_or_default(),
                 source_label(hit.source),
             ));
-            if let Some(note) = hit.page.as_ref().and_then(page_note) {
+            if let Some(note) = hit.page.as_ref().and_then(|p| page_note(p, hit.label.is_some())) {
                 out.push_str(&format!(" ({note})"));
             }
             out.push_str(&indented(&snippet));
@@ -1334,9 +1333,14 @@ fn fetch_for(types: &[ken_core::contenttype::ContentType], limit: usize) -> usiz
     }
 }
 
-/// A hit's kind as its tag in a result line: `[code]`.
-fn kind_tag(path: &str) -> String {
-    format!("[{}]", ken_core::contenttype::of(path).as_str())
+/// A hit's tag in a result line: its label, one per hit
+/// (`[code · service · 2026-10-01]`, `[decision D-410 · binding · 2026-10-06]`,
+/// knowledge-core decision 17), else its kind (`[code]`).
+fn hit_tag(path: &str, label: Option<&str>) -> String {
+    match label.filter(|l| !l.is_empty()) {
+        Some(l) => format!("[{l}]"),
+        None => format!("[{}]", ken_core::contenttype::of(path).as_str()),
+    }
 }
 
 // --- short hits and meaning search ---
@@ -1733,13 +1737,13 @@ fn format_execution_report(report: &routing::ExecutionReport, members: &[MemberI
         out.push_str(&format!(
             "\n{}. {} {} ({}{}) [{}]",
             i + 1,
-            kind_tag(&hit.path),
+            hit_tag(&hit.path, hit.label.as_deref()),
             hit.locator,
             hit.address,
             hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
             source_label(hit.source),
         ));
-        if let Some(note) = hit.page.as_ref().and_then(page_note) {
+        if let Some(note) = hit.page.as_ref().and_then(|p| page_note(p, hit.label.is_some())) {
             out.push_str(&format!(" ({note})"));
         }
         out.push_str(&indented(&hit.snippet));
@@ -2045,16 +2049,14 @@ you. Pass assignee \"all\" to list every ticket."
     Ok(out)
 }
 
-/// What an agent must know before it trusts a page hit: its label (`decision
-/// D-410 · binding · 2026-10-06`, `ticket · superseded · 2026-07-21`), or for a hit
-/// without one, that it is superseded (and what replaces it, when an older
-/// page says), generated, dated evidence, or when the check last re-read it.
-fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
-    if let Some(label) = &p.label {
-        return Some(match p.generated {
-            true => format!("{label}: fix the generator, not the page"),
-            false => label.clone(),
-        });
+/// What an agent must know before it trusts a page hit, beyond its label
+/// ([`hit_tag`]): that an older generated page is fixed at its generator.
+/// For a hit without a label, that it is superseded (and what replaces it,
+/// when an older page says), generated, dated evidence, or when the check
+/// last re-read it.
+fn page_note(p: &ken_core::pagemeta::HitPage, labelled: bool) -> Option<String> {
+    if labelled {
+        return p.generated.then(|| "generated: fix the generator, not the page".to_string());
     }
     if p.retired {
         return Some(match p.replaced_by.is_empty() {
@@ -2551,10 +2553,10 @@ mod tests {
         let mut fx = fixture(true);
         let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing"}));
         assert!(!is_err, "{text}");
-        assert!(text.contains("[meeting] notes/meeting.md"), "a meeting note tagged: {text}");
+        assert!(text.contains("[note · ") && text.contains("] notes/meeting.md"), "a note labelled with its kind: {text}");
         let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "code"}));
         assert!(!text.contains("notes/meeting.md"), "code only: {text}");
-        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "meeting,doc"}));
+        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "note,doc"}));
         assert!(text.contains("notes/meeting.md"), "{text}");
     }
 
@@ -2947,10 +2949,10 @@ mod tests {
         let (text, is_err) = tool(&mut server, "route_query", json!({"query": "companion pets follow the player"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("tickets/AT-7.md"), "{text}");
-        assert!(text.contains("(ticket · superseded · 2026-07-21)"), "{text}");
-        assert!(text.contains("(decision D-007 · binding · 2026-10-07)"), "the entry's own id and date: {text}");
+        assert!(text.contains("[ticket · superseded · 2026-07-21]"), "{text}");
+        assert!(text.contains("[decision D-007 · binding · 2026-10-07]"), "the entry's own id and date: {text}");
         let (text, _) = tool(&mut server, "semantic_search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
-        assert!(text.contains("(ticket · superseded · 2026-07-21)") && text.contains("(decision D-007 · binding · 2026-10-07)"), "{text}");
+        assert!(text.contains("[ticket · superseded · 2026-07-21]") && text.contains("[decision D-007 · binding · 2026-10-07]"), "{text}");
     }
 
     #[test]
@@ -3063,8 +3065,8 @@ mod tests {
         // The search finds D-379 by its words; D-410 comes in just above it.
         let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "server never overwrites spawn anchors merge", "project": "Atlas"}));
         assert!(!is_err, "{text}");
-        let earlier = text.find("(decision D-379 · superseded · 2026-10-05 · superseded by D-410 on who writes anchors)").expect(&text);
-        let later = text.find("(decision D-410 · binding · 2026-10-06 · supersedes D-379)").expect(&text);
+        let earlier = text.find("[decision D-379 · superseded · 2026-10-05 · superseded by D-410 on who writes anchors]").expect(&text);
+        let later = text.find("[decision D-410 · binding · 2026-10-06 · supersedes D-379]").expect(&text);
         assert!(later < earlier, "the later ruling ranks first: {text}");
         let (text, _) = tool(&mut server, "route_query", json!({"query": "server never overwrites spawn anchors merge"}));
         assert!(text.contains("superseded by D-410 on who writes anchors"), "{text}");
@@ -3085,7 +3087,7 @@ mod tests {
         settings.save(&fx.server.base_dir).unwrap();
         let (text, is_err) = tool(&mut fx.server, "list_projects", json!({}));
         assert!(!is_err, "{text}");
-        assert!(text.contains("search ready"), "{text}");
+        assert!(text.contains(" indexed") && text.contains("controls"), "the health line: {text}");
     }
 
     // --- ken-memory (task 3.2) ---

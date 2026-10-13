@@ -11,15 +11,25 @@ export interface ProjectInfo {
   ingestRunner?: "hidden-tui" | "headless";
 }
 
-/** The team's index in figures: repos indexed of all, files queued, files
- *  failed, and files cut at the per-file chunk cap (their end is not
- *  searchable). */
+/** The team's index in one health line (mirrors `TeamIndexHealthDto` and
+ *  `db::IndexHealth`): repos indexed of all, then their files indexed,
+ *  failed, skipped (name only) and queued; passages and how many have a
+ *  meaning vector; controls passing of all; whether the embedding model is
+ *  missing; files cut at the per-file chunk cap. */
 export interface IndexHealth {
+  reposIndexed: number;
+  repos: number;
+  files: number;
   indexed: number;
-  total: number;
-  queued: number;
   failed: number;
+  skipped: number;
+  queued: number;
   capped: number;
+  chunks: number;
+  embedded: number;
+  controlsPassed: number;
+  controlsTotal: number;
+  modelMissing: boolean;
 }
 
 /** A repo's index state: not indexed, searchable only, read for entities. */
@@ -289,7 +299,18 @@ export interface DriftRun {
 }
 
 /** What a file is for (`contenttype::of`); every search hit carries one. */
-export type ContentType = "code" | "test" | "spec" | "doc" | "config" | "data" | "design" | "meeting" | "ticket";
+export type ContentType =
+  | "code"
+  | "test"
+  | "spec"
+  | "doc"
+  | "config"
+  | "data"
+  | "design"
+  | "meeting"
+  | "ticket"
+  | "decision"
+  | "note";
 
 /** One definition in a code file's outline. Lines are 1-based. */
 export interface CodeSymbol {
@@ -1099,6 +1120,10 @@ export interface RoutedHit {
   locator: string;
   /** Present for a Markdown page. */
   page: HitPage | null;
+  /** One label per hit, `kind · tier or role · date`
+   *  (`decision D-410 · binding · 2026-10-06`, `ticket · superseded · 2026-07-21`,
+   *  `code · service · 2026-10-01`). */
+  label: string | null;
 }
 
 /** What a hit on a wiki page carries (mirrors `pagemeta::HitPage`). */
@@ -1115,10 +1140,6 @@ export interface HitPage {
   generated: boolean;
   /** Legacy, read only: what an older retired page names as its successor. */
   replacedBy: string[];
-  /** What the hit is and how much it counts, one short line: its kind, tier
-   *  and date (`decision D-410 · binding · 2026-10-06`,
-   *  `ticket · superseded · 2026-07-21`, `doc · current · 2026-10-07`). */
-  label: string | null;
 }
 
 /** `building`: searched by keyword while its meaning index is built.

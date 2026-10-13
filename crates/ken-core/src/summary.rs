@@ -9,11 +9,43 @@
 //! Claude writes them, never the local model, in batches of many chunks per
 //! call. The app runs [`summarize_next`] in the background for a
 //! knowledge-base repo (kind team or wiki), on the global background pace,
-//! and the `backgroundExtraction` flag switches it off. The generator stays
-//! this small on purpose: slice 11 folds it into the build queue.
+//! and the `backgroundExtraction` flag switches it off. On top of the pace,
+//! at most [`MAX_CALLS_PER_HOUR`] calls are made in any hour, across the app
+//! ([`take_call`]). The generator stays this small on purpose: slice 11
+//! folds it into the build queue and its throttle replaces the cap.
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::db::Db;
 use crate::Result;
+
+/// Most summary calls to Claude in any rolling hour, across the app. The
+/// first pass over a knowledge base of 5,000 chunks is about 125 calls;
+/// at this cap it takes about six hours instead of running back to back.
+pub const MAX_CALLS_PER_HOUR: usize = 20;
+
+/// When the calls of the last hour were made.
+static CALLS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+
+/// Whether a summary call may be made now; when it may, it is counted.
+/// False once [`MAX_CALLS_PER_HOUR`] calls were made in the last hour.
+pub fn take_call() -> bool {
+    take_call_at(&CALLS, Instant::now())
+}
+
+fn take_call_at(calls: &Mutex<VecDeque<Instant>>, now: Instant) -> bool {
+    let mut calls = calls.lock().unwrap_or_else(|e| e.into_inner());
+    while calls.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(3600)) {
+        calls.pop_front();
+    }
+    if calls.len() >= MAX_CALLS_PER_HOUR {
+        return false;
+    }
+    calls.push_back(now);
+    true
+}
 
 /// Most chunks one Claude call summarizes.
 pub const BATCH_CHUNKS: usize = 40;
@@ -200,6 +232,17 @@ mod tests {
         // Nothing waits now: no call.
         let mut never = |_: &str| -> Result<String> { panic!("no chunk waits") };
         assert_eq!(summarize_next(&mut db, &mut never, 6).unwrap(), None);
+    }
+
+    #[test]
+    fn at_most_twenty_calls_in_any_hour() {
+        let calls = Mutex::new(VecDeque::new());
+        let start = Instant::now();
+        for _ in 0..MAX_CALLS_PER_HOUR {
+            assert!(take_call_at(&calls, start));
+        }
+        assert!(!take_call_at(&calls, start + Duration::from_secs(1800)), "the hour is full");
+        assert!(take_call_at(&calls, start + Duration::from_secs(3600)), "an hour on, the first calls have left the window");
     }
 
     #[test]

@@ -241,7 +241,9 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     // kenignore (D2): built-ins first, user `.kenignore` appended last so a
     // `!` line can override them. Loaded once per scan, not per file —
     // `classify` is pure and re-parsing per path would be wasted work. The
-    // repo's kind sits between them: it sets the whole repo's state.
+    // repo's kind sits between them: it sets the whole repo's state. The
+    // built-ins leave tests out (knowledge-core decision 17), so a test file
+    // indexed before is removed below like any other newly ignored path.
     let built_in_rules = crate::kenignore::built_in_rule_sets();
     let kind_rules = crate::kenignore::kind_rules_for(&project.root);
     let user_rules = project.kenignore_rules();
@@ -361,10 +363,23 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     // Each file's authority in search, from the index's frontmatter and the
     // team file, for every file: a team file's new override reaches them all.
     crate::authority::refresh(db, &project.root, None)?;
+    // Each code file's role, from the repo's role rules and the built-in
+    // core, for every file: a new rule reaches them all (decision 17).
+    crate::coderole::refresh(db, &project.root)?;
 
     // The team's words for search, rebuilt when a page may have changed.
     if !stats.changed_paths.is_empty() || db.stored_vocabulary()?.is_none() {
         crate::vocab::Vocabulary::rebuild(db)?;
+    }
+
+    // The controls, by keyword, while this source has no meaning index:
+    // that is how it is searched until one is built, and the rebuild runs
+    // them with meaning after (decision 19).
+    if db.semantic_built_at()?.is_none() && (!stats.changed_paths.is_empty() || db.control_results()?.is_none()) {
+        let controls = crate::controls::for_source(&project.root);
+        if let Err(e) = crate::controls::run_and_store(db, &controls, &mut |_| None) {
+            eprintln!("controls: {e}");
+        }
     }
 
     // The link report is read live, on the Team screen (`links::findings`).
@@ -604,7 +619,9 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
         index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
         db.set_file_tiers(&[(rel.to_string(), tier)])?;
         crate::authority::refresh(db, &project.root, Some(&[rel.to_string()]))?;
-        // A page's aliases, or the Vocabulary page itself, may have changed.
+        let role = crate::coderole::RoleRules::for_repo(&project.root).role_of(rel);
+        db.set_file_roles(&[(rel.to_string(), role)])?;
+        // The Vocabulary page or the decisions log may have changed.
         if rel.ends_with(".md") {
             crate::vocab::Vocabulary::rebuild(db)?;
         }
@@ -806,6 +823,9 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
     let pages_moved = stats.changed_paths.iter().any(|p| p.ends_with(".md"));
     if !stats.changed_paths.is_empty() {
         crate::authority::refresh(db, &project.root, Some(&stats.changed_paths))?;
+        let rules = crate::coderole::RoleRules::for_repo(&project.root);
+        let roles: Vec<(String, Option<String>)> = stats.changed_paths.iter().map(|p| (p.clone(), rules.role_of(p))).collect();
+        db.set_file_roles(&roles)?;
     }
     if pages_moved || db.stored_vocabulary()?.is_none() {
         crate::vocab::Vocabulary::rebuild(db)?;
@@ -1566,21 +1586,29 @@ mod tests {
     }
 
     #[test]
-    fn index_health_counts_the_queue() {
+    fn index_health_counts_what_the_scan_read_and_runs_the_controls() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("START-HERE.md"), "---\ntitle: Start here\n---\n# Start here\nRead this first.\n").unwrap();
         fs::write(dir.path().join("notes.md"), "Notes that mention start once.\n").unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
-        fs::write(dir.path().join(".kenignore"), "~src/\n").unwrap();
+        fs::create_dir_all(dir.path().join("src/services")).unwrap();
+        fs::write(dir.path().join("src/services/pay.rs"), "fn pay() {}\n").unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests/pay_test.rs"), "fn it_pays() {}\n").unwrap();
+        fs::create_dir_all(dir.path().join(".ken")).unwrap();
+        fs::write(
+            dir.path().join(".ken/knowledge.json"),
+            r#"{ "controls": [ { "question": "read this first", "expect": "START-HERE.md" } ] }"#,
+        )
+        .unwrap();
         let project = Project::create(dir.path(), "Health").unwrap();
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
 
         let h = db.index_health().unwrap();
-        assert_eq!(h.pending, 2, "both pages queued");
-        assert_eq!(h.skipped, 1, "src/ is searchable only");
-        assert_eq!((h.failed, h.retrying), (0, 0));
+        assert_eq!((h.files, h.indexed, h.failed), (3, 3, 0), "tests are not indexed");
+        assert!(db.get_file("tests/pay_test.rs").unwrap().is_none());
+        assert_eq!(db.file_role("src/services/pay.rs").unwrap().as_deref(), Some("service"));
+        assert_eq!((h.controls_passed, h.controls_total), (1, 1), "run by keyword while there is no meaning index");
     }
 
     /// A file cut at the per-file chunk cap is counted in index health, and
@@ -1596,10 +1624,10 @@ mod tests {
         let project = Project::create(dir.path(), "Cap").unwrap();
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
-        assert_eq!(db.file_health_counts().unwrap().capped, 1);
-        // What is embedded starts with the path and the symbol.
+        assert_eq!(db.index_health().unwrap().capped, 1);
+        // What is embedded starts with the path, the symbol and the role.
         let (_, embed) = db.chunks_missing_vectors("store.py").unwrap().remove(0);
-        assert!(embed.starts_with("store.py › open_store"), "the chunk names what it holds: {embed}");
+        assert!(embed.starts_with("store.py › open_store (store)"), "the chunk names what it holds: {embed}");
     }
 
     #[test]

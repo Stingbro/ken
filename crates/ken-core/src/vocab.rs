@@ -4,15 +4,22 @@
 //! used the wrong word, add a row"; decisions: "Every entry carries all the
 //! terms anyone might search by").
 //!
-//! Three sources, all read from what the index already stores:
+//! Two sources only (knowledge-core decision 18), both read from what the
+//! index already stores:
 //! - the Vocabulary page's word tables (our word ↔ the platform's word, and
 //!   old name ↔ new name);
-//! - each decisions-log entry's topic and `aliases:` line;
-//! - each page's frontmatter title and `aliases`.
+//! - each decisions-log entry's topic and `aliases:` line.
+//!
+//! A page's frontmatter title and `aliases` are not rewrites: they are in
+//! the names field of the page's own chunks (`db::names_extra`), so they
+//! find that page and nothing else.
 //!
 //! Keyword search requires every word, so an alias is not appended to the
 //! query; it yields an alternative query with the matched phrase swapped,
 //! which the caller runs alongside the original.
+//!
+//! Ingest and drift add rows to the Renames table when they see a name
+//! change ([`add_rename`]).
 
 use crate::db::Db;
 use crate::Result;
@@ -28,8 +35,7 @@ pub struct Vocabulary {
 }
 
 impl Vocabulary {
-    /// Build from a project's index: its Vocabulary and DECISIONS pages and
-    /// every page's frontmatter aliases.
+    /// Build from a project's index: its Vocabulary and DECISIONS pages.
     pub fn from_db(db: &Db) -> Result<Vocabulary> {
         let mut groups = Vec::new();
         for path in db.paths_named(&["vocabulary.md"])? {
@@ -42,19 +48,12 @@ impl Vocabulary {
                 groups.extend(parse_decisions(&text));
             }
         }
-        for (title, aliases) in db.page_aliases()? {
-            let mut g: Vec<String> = title.into_iter().chain(aliases).collect();
-            g.retain(|p| !p.trim().is_empty());
-            if g.len() > 1 {
-                groups.push(g);
-            }
-        }
         Ok(Vocabulary::from_groups(groups))
     }
 
     /// Build from the index and store it, so searches read one row instead
-    /// of every page's aliases: at tens of thousands of files, building it
-    /// per search made search time grow with the repo. A scan calls this.
+    /// of the pages: at tens of thousands of files, building it per search
+    /// made search time grow with the repo. A scan calls this.
     pub fn rebuild(db: &Db) -> Result<Vocabulary> {
         let v = Vocabulary::from_db(db)?;
         let json = serde_json::to_string(&v.groups).map_err(|e| crate::Error::Other(e.to_string()))?;
@@ -237,9 +236,93 @@ fn entry_topic(line: &str) -> Option<String> {
     (!is_placeholder(topic)).then(|| topic.to_string())
 }
 
+/// The Vocabulary page of a knowledge base, as the template lays it down.
+pub const VOCABULARY_PAGE: &str = "Reference/Vocabulary.md";
+
+/// `page` with a row added to its Renames table: `old` became `new`, `since`
+/// (a ruling id, a commit or a date). None when the page already has that
+/// rename. A page with no Renames table gets one at the end. Placeholder
+/// rows (`{{old}}`) are left as they are.
+pub fn with_rename(page: &str, old: &str, new: &str, since: &str) -> Option<String> {
+    let cell = |s: &str| s.trim().replace('|', "/");
+    let (old, new, since) = (cell(old), cell(new), cell(since));
+    if old.is_empty() || new.is_empty() || old.eq_ignore_ascii_case(&new) {
+        return None;
+    }
+    let pair = vec![old.clone(), new.clone()];
+    if parse_vocabulary(page).iter().any(|g| g.len() == 2 && g[0].eq_ignore_ascii_case(&pair[0]) && g[1].eq_ignore_ascii_case(&pair[1])) {
+        return None;
+    }
+    let row = format!("| {old} | {new} | {since} | |");
+    let lines: Vec<&str> = page.lines().collect();
+    // The Renames table: its header row, then the last row of the table.
+    let header = lines.iter().position(|l| {
+        cells(l).is_some_and(|c| c.len() >= 2 && c[0].eq_ignore_ascii_case("old name") && c[1].eq_ignore_ascii_case("new name"))
+    });
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    match header {
+        Some(h) => {
+            let mut end = h;
+            while end + 1 < lines.len() && cells(lines[end + 1]).is_some() {
+                end += 1;
+            }
+            out.insert(end + 1, row);
+        }
+        None => {
+            if out.last().is_some_and(|l| !l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push("## Renames".into());
+            out.push(String::new());
+            out.push("| old name | new name | since | still under the old name |".into());
+            out.push("|---|---|---|---|".into());
+            out.push(row);
+        }
+    }
+    Some(out.join("\n") + "\n")
+}
+
+/// Add a rename row to the Vocabulary page of the knowledge base at
+/// `kb_root` ([`with_rename`]); ingest and drift call this when they see a
+/// name change (knowledge-core decision 18). Returns whether the page
+/// changed. The caller commits it with the rest of its run.
+pub fn add_rename(kb_root: &std::path::Path, old: &str, new: &str, since: &str) -> Result<bool> {
+    let path = kb_root.join(VOCABULARY_PAGE);
+    let page = std::fs::read_to_string(&path).unwrap_or_default();
+    let Some(text) = with_rename(&page, old, new, since) else {
+        return Ok(false);
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| crate::Error::io(dir, e))?;
+    }
+    std::fs::write(&path, text).map_err(|e| crate::Error::io(&path, e))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rename_row_joins_the_renames_table_once() {
+        let page = "# Vocabulary\n\n## Renames\n\n| old name | new name | since | still under the old name |\n|---|---|---|---|\n| {{old}} | {{new}} | {{since}} | |\n\n## Words With Two Meanings\n";
+        let once = with_rename(page, "Guild", "Clan", "D-014").unwrap();
+        assert!(once.contains("| {{old}} | {{new}} | {{since}} | |\n| Guild | Clan | D-014 | |\n\n## Words With Two Meanings"), "{once}");
+        assert_eq!(parse_vocabulary(&once), vec![vec!["Guild".to_string(), "Clan".to_string()]]);
+        assert!(with_rename(&once, "guild", "clan", "D-015").is_none(), "already there");
+        assert!(with_rename(&once, "Clan", "clan", "x").is_none(), "not a rename");
+        let fresh = with_rename("# Vocabulary\n", "shard", "region", "2026-10-13").unwrap();
+        assert!(fresh.ends_with("## Renames\n\n| old name | new name | since | still under the old name |\n|---|---|---|---|\n| shard | region | 2026-10-13 | |\n"), "{fresh}");
+    }
+
+    #[test]
+    fn page_aliases_are_not_rewrites() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("Reference/Regions.md", "md", 1, 1, "indexed", None, "x").unwrap();
+        let meta = crate::pagemeta::PageMeta { title: Some("World regions".into()), aliases: vec!["shard layout".into()], ..Default::default() };
+        db.set_page_meta("Reference/Regions.md", Some(&meta)).unwrap();
+        assert!(Vocabulary::from_db(&db).unwrap().groups.is_empty(), "a page's aliases feed its names field, not the rewrites");
+    }
 
     #[test]
     fn word_tables_pair_our_word_with_the_platforms() {

@@ -248,19 +248,49 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
 ///   (ken-memory 1.6).
 ///
 /// What does belong here is a rule global to every project: archives,
-/// what a tool writes, and page templates. An archive or disk image answers
-/// no question by its name and Ken cannot read inside it, so it is not
-/// indexed; a user `!*.zip` line brings the names back. Media is not listed: Ken transcribes video. Secrets are not
-/// a rule at all but a hard ignore ([`is_secret_name`]), so no `!` line can
-/// bring them back.
+/// what a tool writes, page templates and tests. An archive or disk image
+/// answers no question by its name and Ken cannot read inside it, so it is
+/// not indexed; a user `!*.zip` line brings the names back. Media is not
+/// listed: Ken transcribes video. Secrets are not a rule at all but a hard
+/// ignore ([`is_secret_name`]), so no `!` line can bring them back.
 pub fn built_in_rule_sets() -> Vec<Rule> {
     ARCHIVE_PATTERNS
         .iter()
         .chain(GENERATED_PATTERNS)
         .chain(TEMPLATE_PATTERNS)
+        .chain(TEST_PATTERNS)
         .map(|p| Rule { tier: Tier::Ignore, pattern: (*p).into() })
         .collect()
 }
+
+/// Tests are not indexed by default (knowledge-core decision 17): a test
+/// restates the code it checks in a hundred near-copies, and outranked the
+/// code it tests. Test folders, and test files named the way each language
+/// names them (the ones `contenttype` calls a test). A team brings them
+/// back with a `!` line in `.kenignore` (`!tests/`, `!*.test.ts`), which
+/// the user's rules, folded last, win with. A file already indexed leaves
+/// the index on the next scan, like any other newly ignored path.
+const TEST_PATTERNS: &[&str] = &[
+    "test/",
+    "tests/",
+    "__tests__/",
+    "e2e/",
+    "*.test.[jt]s",
+    "*.test.[jt]sx",
+    "*.test.mjs",
+    "*.spec.[jt]s",
+    "*.spec.[jt]sx",
+    "*_test.go",
+    "*_test.py",
+    "test_*.py",
+    "*_test.rs",
+    "*_spec.rb",
+    "*Test.java",
+    "*Tests.java",
+    "*Test.kt",
+    "*Tests.cs",
+    "*Test.cs",
+];
 
 /// Files a tool writes and no one reads for meaning: minified bundles,
 /// source maps, lockfiles. They match many searches a little and answer none.
@@ -629,6 +659,31 @@ mod tests {
         assert_eq!(classify("Templates/Rule.md", false, &[&built]), Tier::Ignore);
         assert_eq!(classify("Templates", true, &[&built]), Tier::Ignore);
         assert_eq!(classify("Rules/Templates and forms.md", false, &[&built]), Tier::Full);
+    }
+
+    #[test]
+    fn tests_are_not_indexed_and_a_user_line_brings_them_back() {
+        let built = built_in_rule_sets();
+        for path in [
+            "crates/ken-core/tests/qa_probe.rs",
+            "src/lib/citation.test.ts",
+            "src/__tests__/App.tsx",
+            "FE/e2e/live-run.spec.ts",
+            "BE/backend/tests/unit/test_auth.py",
+            "pkg/store/store_test.go",
+            "app/models/user_spec.rb",
+            "src/test/java/WorldTest.java",
+            "Game.Tests/SaveTests.cs",
+        ] {
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignore, "{path}");
+        }
+        for path in ["src/lib/citation.ts", "src/contest.rs", "docs/testing-strategy.md", "openspec/specs/mcp/spec.md", "src/Latest.java"] {
+            assert_eq!(classify(path, false, &[&built]), Tier::Full, "{path}");
+        }
+        let user = parse("!tests/\n!*.test.ts\n");
+        assert_eq!(classify("crates/ken-core/tests/qa_probe.rs", false, &[&built, &user]), Tier::Full);
+        assert_eq!(classify("src/lib/citation.test.ts", false, &[&built, &user]), Tier::Full);
+        assert_eq!(classify("pkg/store/store_test.go", false, &[&built, &user]), Tier::Ignore, "only what the line names");
     }
 
     #[test]

@@ -240,7 +240,7 @@ fn status_word(status: &str) -> String {
 }
 
 /// Whether gitignore-style `pattern` matches `path` (or a folder it sits in).
-fn glob_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
     let mut builder = ignore::gitignore::GitignoreBuilder::new("");
     if builder.add_line(None, pattern).is_err() {
         return false;
@@ -250,21 +250,27 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 
 // --- the label a hit carries -------------------------------------------------
 
-/// What a hit is and how much it counts, as one short line (decision 17): its
-/// kind, its tier and its date. An entry of the decisions log is a decision
+/// What a hit is and how much it counts, as one short line (decision 17):
+/// `kind · tier or role · date`. An entry of the decisions log is a decision
 /// with its own id and date (`decision D-410 · binding · 2026-10-06`), and
 /// one its entry marks `[SUPERSEDED BY …]` reads superseded; a cancelled
 /// ticket reads `ticket · superseded · 2026-07-21`. Claude answered from a
 /// cancelled ticket over the roadmap page beside it, and from a ruling a
 /// later one had settled, because nothing on the hit line said which was
-/// which.
+/// which. A file that is not a page says its role when it has one, else its
+/// tier, and the day it last changed: `code · service · 2026-10-01`,
+/// `config · reference · 2026-09-14` ([`file_label`]).
 ///
-/// None for a file that is not a Markdown page: code is neutral, and its kind
-/// tag already says what it is. `chunk_text` is the hit's chunk, when the
-/// caller has it: it names the log entry the hit is on.
+/// `chunk_text` is the hit's chunk, when the caller has it: it names the log
+/// entry the hit is on. None for a path the index does not hold.
 pub fn hit_label(db: &Db, rel_path: &str, chunk_text: Option<&str>) -> Result<Option<String>> {
     if !crate::chunker::is_markdown(rel_path) {
-        return Ok(None);
+        let Some(file) = db.get_file(rel_path)? else {
+            return Ok(None);
+        };
+        let stored = db.authority_of(rel_path)?;
+        let role = db.file_role(rel_path)?;
+        return Ok(Some(file_label(rel_path, role.as_deref(), stored.as_ref().map(|(t, w)| (t.as_str(), *w)), file.mtime)));
     }
     let meta = db.page_meta(rel_path)?;
     let stored = db.authority_of(rel_path)?;
@@ -299,8 +305,7 @@ pub fn label_of(rel_path: &str, meta: Option<&PageMeta>, stored: Option<(&str, f
         parts.extend(crate::chunker::entry_date(line));
         return parts.join(" · ");
     }
-    let name = rel_path.rsplit('/').next().unwrap_or(rel_path).to_ascii_lowercase();
-    let kind = if tier == Tier::Binding && name == "decisions.md" { "decision" } else { crate::contenttype::of(rel_path).as_str() };
+    let kind = crate::contenttype::of(rel_path).as_str();
     let meta = meta.cloned().unwrap_or_default();
     let date = meta
         .updated
@@ -309,6 +314,20 @@ pub fn label_of(rel_path: &str, meta: Option<&PageMeta>, stored: Option<(&str, f
         .or_else(|| matches!(tier, Tier::Record | Tier::Superseded).then(|| crate::pagemeta::date_in_name(rel_path)).flatten());
     let mut parts = vec![kind.to_string(), tier.name().to_string()];
     parts.extend(date);
+    parts.join(" · ")
+}
+
+/// [`hit_label`] for a file that is not a page: its kind, its role (else its
+/// tier) and the day it last changed on disk, from its stored mtime (UTC). A
+/// file with no stored time (a sentinel the index uses to read it again)
+/// has no date.
+pub fn file_label(rel_path: &str, role: Option<&str>, stored: Option<(&str, f64)>, mtime: i64) -> String {
+    let tier = stored.and_then(|(t, _)| Tier::parse(t)).unwrap_or(Tier::Reference);
+    let middle = role.map(str::trim).filter(|r| !r.is_empty()).map(str::to_string).unwrap_or_else(|| tier.name().to_string());
+    let mut parts = vec![crate::contenttype::of(rel_path).as_str().to_string(), middle];
+    if mtime > 0 {
+        parts.push(crate::day::date_of_epoch(mtime));
+    }
     parts.join(" · ")
 }
 
@@ -435,21 +454,34 @@ mod tests {
         let current = page(Some("current"), Some("2026-10-07"));
         assert_eq!(label_of("Current/Project.md", Some(&current), Some(("current", W_CURRENT)), None), "doc · current · 2026-10-07");
         assert_eq!(label_of("Rules/Lifecycle.md", None, binding, Some("Docs lanes push main.")), "doc · binding");
-        assert_eq!(label_of("Research/Ingested/Standup - 2026-09-12.md", None, Some(("record", -W_RECORD)), None), "meeting · record · 2026-09-12");
+        assert_eq!(label_of("Research/Ingested/Standup - 2026-09-12.md", None, Some(("record", -W_RECORD)), None), "note · record · 2026-09-12");
+        assert_eq!(label_of("Decisions/Archive-2025.md", None, binding, None), "decision · binding", "the kind is read from the path");
         let checked = PageMeta { checked: crate::pagemeta::Checked::parse("2026-09-20 f00218c"), ..Default::default() };
         assert_eq!(label_of("Design/Why.md", Some(&checked), None, None), "doc · reference · 2026-09-20");
     }
 
     #[test]
-    fn hit_label_reads_the_index_and_skips_code() {
+    fn a_code_label_says_its_role_else_its_tier() {
+        // 2026-10-01 12:00 UTC.
+        let at = 1_790_856_000;
+        assert_eq!(file_label("src/pay/PayService.java", Some("service"), None, at), "code · service · 2026-10-01");
+        assert_eq!(file_label("src/main.rs", None, None, at), "code · reference · 2026-10-01");
+        assert_eq!(file_label("src/legacy/old.rs", None, Some(("record", -W_RECORD)), at), "code · record · 2026-10-01");
+        assert_eq!(file_label("config/app.yaml", None, None, -1), "config · reference", "no stored time, no date");
+    }
+
+    #[test]
+    fn hit_label_reads_the_index_for_pages_and_code() {
         let mut db = Db::open_in_memory().unwrap();
-        for (p, kind) in [("tickets/SR-1.md", "md"), ("src/main.rs", "code")] {
-            db.upsert_file(p, kind, 1, 1, "indexed", None, "x").unwrap();
+        for (p, kind) in [("tickets/SR-1.md", "md"), ("src/services/pay.rs", "code")] {
+            db.upsert_file(p, kind, 1, 1_790_856_000, "indexed", None, "x").unwrap();
         }
         db.set_page_meta("tickets/SR-1.md", Some(&PageMeta { status: Some("done".into()), ..Default::default() })).unwrap();
         refresh_with(&db, &Roles::default(), None).unwrap();
+        crate::coderole::refresh_with(&db, &crate::coderole::RoleRules::default()).unwrap();
         assert_eq!(hit_label(&db, "tickets/SR-1.md", None).unwrap().as_deref(), Some("ticket · record"));
-        assert_eq!(hit_label(&db, "src/main.rs", None).unwrap(), None);
+        assert_eq!(hit_label(&db, "src/services/pay.rs", None).unwrap().as_deref(), Some("code · service · 2026-10-01"));
+        assert_eq!(hit_label(&db, "src/gone.rs", None).unwrap(), None);
     }
 
     #[test]

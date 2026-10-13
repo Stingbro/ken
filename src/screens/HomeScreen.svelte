@@ -161,10 +161,21 @@
   }
   const reading = $derived(inbox.reading);
   const indexLine = $derived.by(() => {
+    // The one health line (knowledge-core decision 19).
     const h = day.health;
     if (!h) return "";
-    const parts = [h.indexed >= h.total ? `All ${h.total} ${h.total === 1 ? "folder" : "folders"} indexed` : `${h.indexed} of ${h.total} folders indexed`];
-    if (h.queued > 0) parts.push(`${h.queued} not in the map yet`);
+    const repos = h.reposIndexed >= h.repos ? `All ${h.repos} ${h.repos === 1 ? "folder" : "folders"} indexed` : `${h.reposIndexed} of ${h.repos} folders indexed`;
+    const files = [`${h.indexed} ${h.indexed === 1 ? "file" : "files"}`];
+    if (h.failed > 0) files.push(`${h.failed} failed`);
+    if (h.skipped > 0) files.push(`${h.skipped} by name only`);
+    if (h.queued > 0) files.push(`${h.queued} queued`);
+    const parts = [repos, files.join(", ")];
+    if (h.modelMissing) parts.push("meaning search off: the embedding model is missing");
+    else if (h.chunks > 0) {
+      const pct = Math.floor((Math.min(h.embedded, h.chunks) * 100) / h.chunks);
+      parts.push(pct >= 100 ? "meaning built" : `meaning ${pct}% built`);
+    }
+    parts.push(h.controlsTotal > 0 ? `controls ${h.controlsPassed} of ${h.controlsTotal} passing` : "no controls");
     if (h.capped > 0) parts.push(`${h.capped} ${h.capped === 1 ? "file" : "files"} too long to index whole`);
     return parts.join(" · ");
   });

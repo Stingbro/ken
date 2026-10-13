@@ -5,7 +5,9 @@
   "repos": {
     "{{wiki_repo}}": { "kind": ["wiki", "team"], "base": "main" }
   },
-  "_repos_note": "The sources this knowledge base covers. kind: code | reference, or wiki and team for this repo. base: the branch drift measures against. A reference repo may carry pin (the commit read) and upstream.",
+  "_repos_note": "The sources this knowledge base covers. kind: code | reference, or wiki and team for this repo. base: the branch drift measures against. A reference repo may carry pin (the commit read) and upstream. A code repo may carry roles: a path pattern to a role, such as \"src/net/**\": \"protocol\", proposed when the repo is added; the longest pattern wins, and a file no rule names gets a built-in role (service, controller, repository ...).",
+  "controls": [],
+  "_controls_note": "A few known questions per source, each with the file it must return near the top: { \"question\": \"how are worlds saved\", \"expect\": \"src/world/Save.java\", \"source\": \"Game\" }. No source means this repo. Proposed when a source is added, run after every rebuild, counted in the health line.",
   "search": {
     "weights": {}
   },

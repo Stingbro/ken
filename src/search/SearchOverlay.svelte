@@ -65,6 +65,8 @@
     memberName: string | null;
     /** What the file is for: code, spec, doc, … */
     contentType: ContentType;
+    /** One label per hit: `kind · tier or role · date`. */
+    label: string | null;
   }
 
   let results = $state<DisplayHit[]>([]);
@@ -275,6 +277,7 @@
       projectId: h.projectId,
       memberName: all ? h.memberName : null,
       contentType: h.contentType,
+      label: h.label,
     }));
     searched = true;
     selected = 0;
@@ -290,6 +293,8 @@
     { v: "doc", label: "Docs" },
     { v: "meeting", label: "Meetings" },
     { v: "ticket", label: "Tickets" },
+    { v: "decision", label: "Decisions" },
+    { v: "note", label: "Notes" },
     { v: "config", label: "Config" },
     { v: "data", label: "Data" },
     { v: "design", label: "Design" },
@@ -480,8 +485,8 @@
             <span class="meta">
               <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
               <span class="path mono" title={hit.path}>{hit.path.split("/").pop() || hit.path}</span>
-              {#if hit.contentType}
-                <span class="tag tag-kind" title="What this file is">{hit.contentType}</span>
+              {#if hit.label || hit.contentType}
+                <span class="tag tag-kind" title="What this file is, how much it counts and when it last changed">{hit.label ?? hit.contentType}</span>
               {/if}
               {#if hit.memberName}
                 <span class="tag tag-member" title={hit.path}>{hit.memberName}</span>

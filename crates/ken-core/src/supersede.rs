@@ -551,6 +551,7 @@ pub fn lead_with_successors(db: &Db, hits: &mut Vec<crate::search::HybridHit>) -
                 source: hit.source,
                 line: Some(line),
                 page: hit.page.clone(),
+                label: None,
                 score: above,
             });
         }

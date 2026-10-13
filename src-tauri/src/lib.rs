@@ -2203,7 +2203,9 @@ fn setup_confirm(
     let base = state.lock().unwrap().base_dir.clone();
     let ws = ken_core::setup::confirm(&base, Path::new(&parent), &name, &rows, &ignores, &local_date_today())
         .map_err(err)?;
-    open_workspace_inner(&app, state.inner(), ws)
+    let overview = open_workspace_inner(&app, state.inner(), ws)?;
+    analyze_new_sources(&app, state.inner());
+    Ok(overview)
 }
 
 /// Set-up from repos picked one by one, wherever they are: a row per repo
@@ -2242,7 +2244,63 @@ fn setup_confirm_repos(
         (guard.base_dir.clone(), root)
     };
     let ws = ken_core::setup::confirm_repos(&base, &root, &name, &rows).map_err(err)?;
-    open_workspace_inner(&app, state.inner(), ws)
+    let overview = open_workspace_inner(&app, state.inner(), ws)?;
+    analyze_new_sources(&app, state.inner());
+    Ok(overview)
+}
+
+/// How long the repo analysis of one source may take.
+const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The repo analysis (knowledge-core decisions 17 and 19), when sources are
+/// added: for each source of the open workspace whose kind is said, whose
+/// knowledge base lists it and which has no analysis saved yet, one Claude
+/// call over its file list proposes its role rules and controls, saved in
+/// the knowledge base's `.ken/knowledge.json` for a person to edit. Without
+/// Claude nothing is asked and the built-in core roles apply. In the
+/// background; a source whose settings changed is scanned again so its
+/// roles apply.
+fn analyze_new_sources(app: &AppHandle, state: &SharedState) {
+    let (base, sources): (PathBuf, Vec<Project>) = {
+        let guard = lock_tolerant(state);
+        let sources = match guard.workspace.as_ref() {
+            Some(ws) => ws
+                .ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        (guard.base_dir.clone(), sources)
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(binary) = ken_core::runner::discover_claude() else {
+            return;
+        };
+        for project in sources {
+            let kinds = ken_core::registry::kind_of(&project.root);
+            if kinds.is_empty() {
+                continue;
+            }
+            let root = project.root.clone();
+            let mut generate = |prompt: &str| -> ken_core::Result<String> {
+                match ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, ANALYSIS_TIMEOUT, &CancelToken::new())? {
+                    ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+                    other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
+                }
+            };
+            match ken_core::repo_analysis::analyze_and_save(&project.root, &kinds, &mut generate) {
+                Ok(true) => rescan_member(&app, &base, &project),
+                Ok(false) => {}
+                Err(e) => eprintln!("repo analysis of {}: {e}", project.config.name),
+            }
+        }
+    });
 }
 
 /// Say what a repo is for, in a person's words; the first-wiki draft reads it.
@@ -2336,6 +2394,9 @@ fn set_project_kind(
         });
         rescan_member(&app, &guard.base_dir, &member.project);
     }
+    drop(guard);
+    // A repo given its kind is a source added: analyse it once.
+    analyze_new_sources(&app, state.inner());
     Ok(registry.statuses())
 }
 
@@ -8802,6 +8863,9 @@ struct RoutedHitDto {
     page: Option<ken_core::pagemeta::HitPage>,
     /// What the file is for (`contenttype::of`).
     content_type: &'static str,
+    /// One label per hit: `kind · tier or role · date`
+    /// (`authority::hit_label`).
+    label: Option<String>,
 }
 
 impl From<routing::RoutedHit> for RoutedHitDto {
@@ -8823,6 +8887,7 @@ impl From<routing::RoutedHit> for RoutedHitDto {
             line: h.line,
             locator: h.locator,
             page: h.page,
+            label: h.label,
         }
     }
 }
@@ -10304,19 +10369,18 @@ fn write_team_digest(
 
 // ---------- index health for a team ----------
 
-/// Index health for Your day: how many of the team's repos have an index
-/// with files in it, how many files wait to be indexed, how many files
-/// failed to index, and how many were cut at the per-file chunk cap
-/// (`Db::file_health_counts`: counting queries only). The extraction
-/// backlog is not part of it.
+/// The one health line for Your day (knowledge-core decision 19): how many
+/// of the team's repos have an index with files in it, and their health
+/// summed (`Db::index_health`: counting queries only): files indexed,
+/// failed or skipped, meaning built, controls passing, whether the
+/// embedding model is missing, files cut at the chunk cap.
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct TeamIndexHealthDto {
-    indexed: usize,
-    total: usize,
-    queued: i64,
-    failed: usize,
-    capped: i64,
+    repos_indexed: usize,
+    repos: usize,
+    #[serde(flatten)]
+    health: ken_core::db::IndexHealth,
 }
 
 #[tauri::command(async)]
@@ -10330,25 +10394,22 @@ fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<Te
             .filter_map(|r| guard.members.get(&r.id).map(|m| (r.id, m.search_db.clone())))
             .collect()
     };
-    let mut out = TeamIndexHealthDto { total: repos.len(), ..Default::default() };
+    let mut out = TeamIndexHealthDto { repos: repos.len(), ..Default::default() };
     for r in &repos {
-        let counts = match live.get(&r.id) {
-            // The index lock is held for the counting query only.
-            Some(db) => lock_tolerant(db).file_health_counts().ok(),
-            None if db_path(&base_dir, r.id).exists() => {
-                Db::open_read_only(&base_dir, r.id).ok().and_then(|db| db.file_health_counts().ok())
-            }
+        let health = match live.get(&r.id) {
+            // The index lock is held for the counting queries only.
+            Some(db) => lock_tolerant(db).index_health().ok(),
+            None if db_path(&base_dir, r.id).exists() => Db::open_read_only(&base_dir, r.id).ok().and_then(|db| db.index_health().ok()),
             None => None,
         };
-        if let Some(c) = counts {
-            if c.total > 0 {
-                out.indexed += 1;
+        if let Some(h) = health {
+            if h.files > 0 {
+                out.repos_indexed += 1;
             }
-            out.failed += c.failed.max(0) as usize;
-            out.queued += c.queued;
-            out.capped += c.capped;
+            out.health.add(&h);
         }
     }
+    out.health.model_missing = ken_core::embedder::selected_profile().is_none();
     Ok(out)
 }
 
@@ -11208,6 +11269,11 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
     };
     if !wait_for_extraction_slot(stop) {
         return SummaryTick::Stopped;
+    }
+    // At most twenty summary calls in any hour across the app, until slice
+    // 11's throttle replaces the cap. A full hour is quiet, not a failure.
+    if !ken_core::summary::take_call() {
+        return SummaryTick::Idle;
     }
     let mut generate = |prompt: &str| -> ken_core::Result<String> {
         match ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, SUMMARY_TIMEOUT, &CancelToken::new())? {

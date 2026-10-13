@@ -200,8 +200,8 @@ pub fn search_member_with(
     shared: Option<&Vocabulary>,
 ) -> Result<Vec<HybridHit>> {
     let mut fts_hits = db.search_chunks_fts(query, limit)?;
-    // The team's other words for what was asked (Vocabulary page, decisions
-    // aliases, page aliases): each alternative phrasing runs as its own
+    // The team's other words for what was asked (the Vocabulary page and the
+    // decisions log's aliases): each alternative phrasing runs as its own
     // keyword search, its new chunks after the original's.
     let own = Vocabulary::cached(db)?;
     let vocab = match shared {
@@ -270,12 +270,11 @@ pub fn search_member_with(
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     // A ruling a later one supersedes is shown under it (`supersede`).
     crate::supersede::lead_with_successors(db, &mut hits)?;
-    // Each page hit says what it is and how fresh: a ruling and its date, a
-    // ticket and its status (`authority::hit_label`).
+    // Every hit says what it is, how much it counts and how fresh: a ruling
+    // and its date, a ticket and its tier, a code file and its role
+    // (`authority::hit_label`).
     for hit in &mut hits {
-        if let Some(page) = hit.page.as_mut() {
-            page.label = crate::authority::hit_label(db, &hit.path, Some(&hit.snippet))?;
-        }
+        hit.label = crate::authority::hit_label(db, &hit.path, Some(&hit.snippet))?;
     }
     Ok(hits)
 }
@@ -433,6 +432,8 @@ pub struct RoutedHit {
     /// For a Markdown page: section, checked or evidence date, and whether
     /// it is superseded.
     pub page: Option<crate::pagemeta::HitPage>,
+    /// `kind · tier or role · date` (`authority::hit_label`).
+    pub label: Option<String>,
 }
 
 /// How one source's search went, as reported beside the results.
@@ -549,6 +550,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     line: hit.line,
                     locator: locator(&mh.member_name, &hit.path, hit.line, sha.as_deref(), wiki),
                     page: hit.page.clone(),
+                    label: hit.label.clone(),
                 },
             ));
         }
@@ -607,6 +609,7 @@ mod tests {
             source: Source::Keyword,
             line: None,
             page: None,
+            label: None,
             score: 0.0,
         }
     }

@@ -106,12 +106,12 @@ pub fn rebuild_semantic_index_with_profile(
     db.ensure_vec_chunks(embedder.dim())?;
 
     // kenignore (D2/D3): tier is classified once per file here, against the
-    // same rule sets scan.rs uses: the repo's kind, then the user's
-    // `.kenignore`. The global built-ins are empty (see
-    // `kenignore::built_in_rule_sets`).
+    // same rule sets scan.rs uses: the built-ins (archives, generated files,
+    // templates, tests), the repo's kind, then the user's `.kenignore`.
+    let built_in_rules = crate::kenignore::built_in_rule_sets();
     let kind_rules = crate::kenignore::kind_rules_for(&project.root);
     let user_rules = project.kenignore_rules();
-    let rule_sets: &[&[crate::kenignore::Rule]] = &[&kind_rules, &user_rules];
+    let rule_sets: &[&[crate::kenignore::Rule]] = &[&built_in_rules, &kind_rules, &user_rules];
 
     // Chunks still to embed, gathered across files.
     let mut pending_ids: Vec<i64> = Vec::new();
@@ -186,6 +186,13 @@ pub fn rebuild_semantic_index_with_profile(
     db.set_embed_model(&embedder.model_id())?;
     db.set_embed_dim(embedder.dim())?;
     db.set_semantic_built_at(now_epoch())?;
+    // The controls, through the real pipeline with meaning, after every
+    // rebuild (knowledge-core decision 19). A failure is reported, never a
+    // failed rebuild.
+    let controls = crate::controls::for_source(&project.root);
+    if let Err(e) = crate::controls::run_and_store(db, &controls, &mut |q| embedder.embed_query(q).ok()) {
+        eprintln!("controls: {e}");
+    }
     Ok(true)
 }
 

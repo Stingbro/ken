@@ -295,12 +295,17 @@ pub fn chunk_hash(title: &str, symbol: Option<&str>, text: &str) -> String {
 /// chunk's own text. A code chunk's header is its path and symbol, then its
 /// doc comment (`title`); a prose chunk's is its breadcrumb (`title`). Its
 /// one-line summary (`summary`, retrieval only) follows when it has one. A
-/// chunk with none of these is embedded as its text alone. A code role
-/// joins the header once roles exist (slice 5).
-pub fn embed_text(path: &str, title: &str, symbol: Option<&str>, summary: Option<&str>, text: &str) -> String {
+/// chunk with none of these is embedded as its text alone. A code file's
+/// role (`coderole`) follows its path and symbol in brackets:
+/// `src/pay/Pay.java › Pay.settle (service)`.
+pub fn embed_text(path: &str, title: &str, symbol: Option<&str>, role: Option<&str>, summary: Option<&str>, text: &str) -> String {
     let mut head: Vec<String> = Vec::new();
-    if let Some(s) = symbol.filter(|s| !s.is_empty()) {
-        head.push(format!("{path} › {s}"));
+    let role = role.map(str::trim).filter(|r| !r.is_empty());
+    match (symbol.filter(|s| !s.is_empty()), role) {
+        (Some(s), Some(r)) => head.push(format!("{path} › {s} ({r})")),
+        (Some(s), None) => head.push(format!("{path} › {s}")),
+        (None, Some(r)) => head.push(format!("{path} ({r})")),
+        (None, None) => {}
     }
     if !title.trim().is_empty() {
         head.push(title.trim().to_string());
@@ -1767,12 +1772,17 @@ mod tests {
 
     #[test]
     fn the_embedded_text_has_the_header_and_the_shown_text_does_not() {
-        assert_eq!(embed_text("a.md", "", None, None, "Body."), "Body.", "nothing to add");
-        assert_eq!(embed_text("a.md", "Payments › Retries", None, None, "Three times."), "Payments › Retries\n\nThree times.");
+        assert_eq!(embed_text("a.md", "", None, None, None, "Body."), "Body.", "nothing to add");
+        assert_eq!(embed_text("a.md", "Payments › Retries", None, None, None, "Three times."), "Payments › Retries\n\nThree times.");
         assert_eq!(
-            embed_text("src/store.rs", "Opens the store.", Some("Store.open"), Some("Opens a store from disk."), "fn open() {}"),
+            embed_text("src/store.rs", "Opens the store.", Some("Store.open"), None, Some("Opens a store from disk."), "fn open() {}"),
             "src/store.rs › Store.open\nOpens the store.\nOpens a store from disk.\n\nfn open() {}"
         );
+        assert_eq!(
+            embed_text("src/pay/PayService.java", "", Some("PayService.settle"), Some("service"), None, "void settle() {}"),
+            "src/pay/PayService.java › PayService.settle (service)\n\nvoid settle() {}"
+        );
+        assert_eq!(embed_text("src/util.py", "", None, Some("util"), None, "x = 1"), "src/util.py (util)\n\nx = 1");
         // A chunk with no title or symbol keeps the hash it had before titles.
         assert_eq!(chunk_hash("", None, "Body."), hash_text("Body."));
         assert_ne!(chunk_hash("A › B", None, "Body."), chunk_hash("A › C", None, "Body."), "a new breadcrumb is a new embedding");
