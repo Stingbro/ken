@@ -65,47 +65,55 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
     - OCR text is chunked when it lands (`mark_ocr_done`).
     - A move (`rename_prefix`) moves the chunks, their keyword rows' path words, page facts, tiers, links and the code map.
     - A reindex drops the chunks of files that are gone (`drop_orphan_chunks`), keeping the vectors of the rest.
-  - Lost: a file with no text (a cloud placeholder, a failed, binary or minified file) is no longer found by its name alone.
+  - Lost: a file with no text (a cloud placeholder, a failed, binary or minified file) is no longer found by its name alone. Restored in slice 3.
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
   - Not run: any test, and the app. The v21 migration rewrites `contents` once (`DROP COLUMN`) on first open, which may take a moment on a large index.
+- **Slice 3: frontmatter, six keys** (`3a018a1`). Decision 5, with two carry-overs from 2b the lead decided.
+  - `pagemeta::PageMeta` reads `title`, `aliases`, `status`, `updated`, `sources` and `checked`, plus an optional `reviewed_by`.
+    - `checked` is `pagemeta::Checked`, a date and a commit. The one written form is `checked: 2026-10-13 f00218c`; `@` or a comma between them also reads, and a date alone is a check with no commit.
+    - `status` is draft | current | superseded. `retired` and `deprecated` still read as superseded. A ticket keeps its own statuses (decision 8). `date` still reads as `updated`.
+    - A list of reviewers reads as one line (`Ana, Ben`).
+  - Dropped: `audience` everywhere (the type and helpers, `HitPage.audience`, `route_search`'s argument and fetch widening, the MCP property and `audience_arg`, the overlay's reader buttons, drift's business-page split and `DriftRun.business_pages`, `audience: business` in the note template); `verified` (it is not read at all now: an old stamp counts for nothing until a check writes `checked`); `HitPage.band` and `pagemeta::band`. `lens`, `changed_by` and `pin` were never read; only a test names them, to show they are ignored.
+  - Drift, the part this slice needs: every page with sources is measured alike. A checked page is pinned at its checked commit where the cited repo has it, else at the last commit on its checked date. A page never checked keeps its citations' own `repo@sha` pins, else its `updated` date. The age rule and its finding say "checked"; the Team tag is "unchecked".
+  - Schema v22 makes `page_meta` again (`checked`, `reviewed_by`; no `verified`, `audience`), fills it from the stored text, and refreshes the tiers. The table and that fill moved out of v14 and v19, which no longer touch it.
+  - Proposals drop `checked:`, `reviewed_by:` and `verified:` from a draft. The ingest edit prompt keeps `checked:` and `reviewed_by:` lines.
+  - Templates: `Finding.md` and `Ingested-note.md` say `status: current`. The note's `source:` became a `sources:` link (`[[Research/Ingestion/Ingested/…/file]]`), which `finish_note` writes; who was there moved into the body as a `Present:` line, read by `ingest::present_of` (the older frontmatter key still reads) for `kind_of` and the card. The template README lists the six keys.
+  - Carry-over 1: a file with no readable text (a cloud placeholder, a failed, binary, minified or empty file) has one chunk holding its path (`chunker::name_chunk`), so the names column and the path rerank find it by name again.
+    - Its own chunks replace it when it gains text (scan or OCR), and it goes with the file. A move rewrites its text to the new path.
+    - The semantic rebuild now walks every file: indexed ones are chunked again, the rest keep their chunks and only have them embedded, so the embedded count can reach the chunk count.
+  - Carry-over 2: `replaced_by`, `superseded_by` and `generated` are read as legacy keys, never written and not offered in templates or the UI, so older pages keep their rank and label.
+  - Choices:
+    - `checked`'s commit is one sha for the page. A page citing several repos is pinned at that commit only in the repo that has it; the others fall back to the checked date.
+    - `kind:` on a note (set by the ingest prompt, read by `kind_of` and the card) is not one of the six keys. It stays until slice 7 reworks ingest.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
+  - Not run: any test, and the app. The v22 migration rebuilds `page_meta` and the tiers once on first open, from stored text.
 
-## Next: slice 3, frontmatter (5)
+## Open for Chris
+
+- **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
+
+## Next: slice 4, chunking (16)
 
 Nothing has been edited yet.
 
-- [ ] `pagemeta.rs` `PageMeta`: six keys, `title`, `aliases`, `status`, `updated`, `sources` and `checked`, plus an optional `reviewed_by`.
-  - `status` is draft | current | superseded. Older values still read: `retired` and `deprecated` as superseded.
-  - `checked` is a date and a sha, written by the check that re-read the page. Pick one written form (say `checked: 2026-10-13 f00218c`) and parse both parts.
-  - Decide what happens to the keys the six leave out but code reads today: `generated` (`HitPage.generated`, the Record tier in `authority.rs`), `replaced_by`/`superseded_by` (decision 7: a retired page names its successor), and `date` (read as `updated`). Simplest: keep reading them as legacy and stop writing them; note the choice.
-- [ ] Drop `audience` everywhere:
-  - `pagemeta.rs`: `PageMeta.audience`, `Audience`, `audience_of`, `audience_at`, `suits`, `HitPage.audience`.
-  - `src-tauri/src/lib.rs`: `route_search`'s `audience` argument, `RouteFanOut.audience` and the `fetch` widening.
-  - `crates/ken-mcp/src/main.rs`: `audience_arg`, the `audience` property on `semantic_search` and `route_query`, and `fetch_for`'s audience case.
-  - `src/lib/api.ts`: `Audience` and `routeSearch`'s `audience`; `src/search/SearchOverlay.svelte`: the READERS row.
-  - `drift.rs`: the business-page split (decision 28 drops the audience split); every page with sources is measured alike.
-  - `Templates/Ingested-note.md`: `audience: business`.
-- [ ] `verified` becomes `checked`:
-  - `HitPage.verified` (and `api.ts` `HitPage`), the label's date in `authority::hit_label`, the MCP `page_note` ("verified …").
-  - `drift.rs` takes a page's pin from `checked`'s sha, else its date as now. The rest of drift is slice 8.
-  - `proposal.rs` drops `checked:` from a proposed page, as it dropped `verified:`.
-  - The ingest edit prompt (`ingest.rs`, "leave any `verified:` line") names `checked:`.
-- [ ] Remove `HitPage.band` and `pagemeta::band`: nothing ranks by them since 2a (23). Also the `authority_weights` doc comment that mentions band, and `band` in `api.ts` `HitPage`.
-- [ ] `db.rs` `page_meta` table (schema v22): add `checked` and `reviewed_by`, drop `verified` and `audience` (and whatever the legacy choice above retires); `set_page_meta` and `page_meta` follow.
-- [ ] Templates (`crates/ken-core/templates/wiki/Templates/`): only the six keys, plus `reviewed_by` where it fits.
-  - `Finding.md` and `Ingested-note.md` say `status: evidence`, not one of the three. Use `current`: the Research section already makes them record.
-  - `Ingested-note.md` also has `source:` and `present:`: fold the first into `sources:`, and move who was there into the body.
-  - `Ticket.md` keeps its own frontmatter (id, status, type, assignee; decision 8).
-- [ ] `lens`, `changed_by` and `pin` are not read anywhere; only a test fixture (`pagemeta.rs`, the `changed_by:` page) names one. Drop them from fixtures.
-- [ ] Tests to update: `pagemeta.rs`, `scan.rs` (the `verified:` Rules page), `routing.rs` (`a_scan_alone_makes_chunks_searchable…` asserts `verified`), `authority.rs` (the `checked` label test), `proposal.rs`, `drift.rs`, and the MCP label tests.
+- [ ] Code chunks by definition (`chunker.rs` `chunk_code` is line blocks today):
+  - Cut a code file at the definitions the code index already parses (`codemap::map_file`, `code_symbols` with `line`, `end_line`, `docs`). The scan has the map before it chunks; pass it in rather than parsing twice.
+  - Each chunk carries its enclosing symbol and line range. Store the symbol on the chunk (a `symbol` column on `chunks`, or in the names field); `line` stays the start.
+  - Line blocks only where there is no grammar (`codemap::Lang::of` is None). JSON keeps its key-outline headers (`with_json_headers`).
+  - A definition longer than the chunk size is cut at line ends inside it, each part keeping the symbol.
+- [ ] Code chunk fields: path, symbol, doc comment and role. Path and symbol go in the names field (`db::fts_names` already takes path words and declared names); the doc comment goes in the title field below. Role is empty until slice 5 and must not block it.
+- [ ] Heading breadcrumb on every prose chunk (`chunk_prose`, `chunk_log`): page title (frontmatter `title`, else the first `# `) › the headings above the chunk.
+  - Embedded with the chunk: prepend the breadcrumb to the text that is embedded, not to the text shown as the snippet. Decide whether that means a separate embed-text or storing it in the new column and joining at embed time (`engine.rs`, `chunks_missing_vectors`).
+  - A new FTS5 column `title` on `chunks_fts`, weighted about 2–3× the body in `bm25(chunks_fts, …)` (`search_chunks_fts`, `W_NAMES_ANY`). Schema v23 remakes `chunks_fts` (`rebuild_chunks_fts`) and marks prose files for one re-read, as v16 and v17 did.
+- [ ] One-line summaries for wiki pages, notes, decisions and tickets only (not code), cached by chunk `content_hash`, used for retrieval only (in the title field or embed text, never shown as the snippet).
+  - They need a model. Decide the writer (the Claude CLI at write time, or the local model in the background throttle of decision 34) and keep it off by default until the throttle exists; the slice can land the table and the hook with no writer.
+- [ ] Report the per-file chunk cap in index health: count files cut at `CHUNK_CAP` (200) or `LOG_CHUNK_CAP`, and carry the count in `IndexHealth` / `file_health_counts` and the health line (`api.ts` follows).
+- [ ] Re-chunking keeps vectors where text is unchanged (`upsert_chunks` diffs by hash); the breadcrumb changes every prose chunk's embed text once, so the first rebuild after v23 re-embeds them. Say so in the migration comment.
+- [ ] Tests to update or add: `chunker.rs` (code by definition, breadcrumbs, the cap), `db.rs` (`fts_names`, the title column and its weight, the v23 migration), `engine.rs` (embed text), `routing.rs` (a breadcrumb or symbol hit ranks), `scan.rs` (the cap count).
+
 
 ## Later slices
 
-- [ ] **4, chunking (16):**
-  - Code chunks by definition from the code index parse.
-  - A heading breadcrumb title field weighted about 2–3×.
-  - Code chunk fields: path, symbol, doc comment and role.
-  - One-line summaries for pages, notes, decisions and tickets, cached by chunk hash.
-  - Report the chunk cap in index health.
 - [ ] **5, kinds and roles (17, 18, 19):**
   - Add the `decision` and `note` kinds.
   - Tests are not indexed by default.
@@ -128,6 +136,7 @@ Nothing has been edited yet.
   - One ruling entry format.
   - The note headings and where each goes.
   - Cut: idea files, escalation files, Your day tasks, method-change tickets, "me" matching.
+  - A note's `kind:` frontmatter (set by the ingest prompt, read by `kind_of` and the card) is not one of decision 5's keys: fold it into the kind folder or the body.
 - [ ] **8, drift, lint and supersession (25, 28–30):**
   - Drift runs on each default-branch move, plus a weekly age rule.
   - It stamps `checked`, or re-reads and fixes. A ruling becomes a finding.
