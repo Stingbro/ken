@@ -27,7 +27,7 @@ export function glyphFor(kind: string): GlyphStyle {
 }
 
 /** Mirrors `FileKind::from_path` (crates/ken-core/src/extract.rs) so hit
- *  sources that don't carry a `kind` field (e.g. `hybrid_search`) can still
+ *  sources that don't carry a `kind` field (e.g. `route_search`) can still
  *  pick a glyph. Keep this extension table in lockstep with the Rust match. */
 export function kindForPath(path: string): string {
   const dot = path.lastIndexOf(".");

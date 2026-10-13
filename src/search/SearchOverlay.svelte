@@ -7,8 +7,8 @@
     type ContentType,
     type KindFilter,
     type QuickAnswer,
-    type HybridHit,
     type RoutePlan,
+    type RouteSearchResult,
     type RoutedSearchStateEvent,
   } from "../lib/api";
   import { app, forFocused } from "../lib/app.svelte";
@@ -30,13 +30,10 @@
   let input: HTMLInputElement;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  // "All projects" scope (workspace task 4.4 / kg-routing task 4.2): the
-  // toggle is visible only in Workspace mode (`app.workspace` set).
-  // `kgRoutingEnabled` upgrades the scope from `workspace`'s FTS fan-out to
-  // `kgRouting`'s routed hybrid search — "same UI slot, richer results"
-  // (kg-routing proposal). Single-project mode never renders the toggle and
-  // `run()`'s project-scope branch is untouched, so that path (and its
-  // `hybridSearch` call) stays byte-identical to before this change.
+  // Two scopes, one search (knowledge-core decisions 15 and 20): "This repo"
+  // is a routed search pinned to the focused member, and the team scope is a
+  // routed search over every source. The toggle is visible only in Workspace
+  // mode (`app.workspace` set).
   type Scope = "project" | "all";
   // ONE scope, shared with Home's picker (`scope.svelte.ts`). This used to
   // be local state, which meant the overlay and Home could disagree — set
@@ -52,30 +49,23 @@
       ? "all"
       : "project",
   );
-  // Routed search is built in (no longer the kgRouting flag).
-  const kgRoutingEnabled = true;
   /** Narrow the all-projects scope to one member (ken-home-workspace
-   *  3.3). `null` = every member. Routed search pins the plan to this id
-   *  and skips the KG entirely — same result shape either way. */
+   *  3.3). `null` = every member. Routed search pins the plan to this id;
+   *  same result shape either way. */
   let pinnedMember = $state<string | null>(null);
 
-  /** One results row, normalized from whichever endpoint answered the query
-   *  (`hybrid_search`, `search_all_projects`, or `route_search`) so the
-   *  template has a single rendering path regardless of scope. */
+  /** One results row from `route_search`, whichever scope asked. */
   interface DisplayHit {
     key: string;
     path: string;
     snippet: string;
-    /** `"keyword"` | `"semantic"` | `"both"` | `null` — the all-projects
-     *  keyword fan-out doesn't track this. */
-    source: string | null;
-    /** Only meaningful for single-project hybrid search. */
-    tier: number | null;
-    projectId: string | null;
+    /** `"keyword"` | `"semantic"` | `"both"`. */
+    source: string;
+    projectId: string;
+    /** Shown in the team scope only: in "This repo" every hit is its own. */
     memberName: string | null;
-    kgBreadcrumbs: string[];
     /** What the file is for: code, spec, doc, … */
-    contentType: ContentType | null;
+    contentType: ContentType;
   }
 
   let results = $state<DisplayHit[]>([]);
@@ -106,10 +96,10 @@
     }
     app.openAt(c.path, { line: c.line, anchor: c.anchor });
   }
-  /** Per-member coverage caveats for the current all-projects search — a
-   *  dormant/missing/invalid member (keyword fan-out) or an index-building/
-   *  unavailable one (routed) — so a short result list doesn't read as
-   *  "nothing there" when it's really "not every member was searched". */
+  /** What a short result list may be missing: a source still building its
+   *  meaning index, one that could not be searched, a slow one, and the
+   *  reference repos held back. A building or slow source is searched and
+   *  reported, never dropped (decision 20). */
   let coverageNotes = $state<string[]>([]);
   let routedPlan = $state<RoutePlan | null>(null);
   let routedProgress = $state<RoutedSearchStateEvent | null>(null);
@@ -117,12 +107,30 @@
   const planLine = $derived.by(() => {
     if (!routedPlan) return null;
     const n = routedPlan.targets.length;
-    const projects = `${n} project${n === 1 ? "" : "s"}`;
-    if (routedPlan.reason.type === "named") return `Routed directly to ${projects}`;
-    if (routedPlan.reason.type === "kgEntities")
-      return `Routed via the knowledge graph to ${projects}`;
-    return `Searched ${projects} (no direct or knowledge-graph match)`;
+    const projects = `${n} source${n === 1 ? "" : "s"}`;
+    if (routedPlan.reason === "named") return `Narrowed to ${projects}`;
+    return `Searched ${projects}`;
   });
+
+  function coverage(res: RouteSearchResult): string[] {
+    const notes: string[] = [];
+    for (const s of res.memberStatus) {
+      if (s.status === "unavailable") {
+        notes.push(`${s.memberName}: not searched, its index did not open`);
+      } else if (s.status === "building") {
+        const pct = s.chunks ? Math.floor(((s.embedded ?? 0) * 100) / s.chunks) : 0;
+        notes.push(`${s.memberName}: keyword only, meaning search ${pct}% built`);
+      }
+      if (s.slow) notes.push(`${s.memberName}: slow, ${(s.millis / 1000).toFixed(1)} s`);
+    }
+    const held = res.plan.reserve.filter((id) => !res.memberStatus.some((s) => s.projectId === id));
+    if (held.length) {
+      notes.push(
+        `${held.length} reference repo${held.length === 1 ? "" : "s"} held back: searched for platform questions, when named, or when nothing else answers`,
+      );
+    }
+    return notes;
+  }
 
   // Quick answer: additive, never blocking the instant matches. Answers
   // are cached per query for this overlay's lifetime; stale ones are
@@ -223,20 +231,6 @@
   // (and would return firehose results); guard the dispatch entirely.
   const MIN_SEARCH_LEN = 2;
 
-  function fromHybrid(found: HybridHit[]): DisplayHit[] {
-    return found.map((h) => ({
-      key: h.path,
-      path: h.path,
-      snippet: h.snippet,
-      source: h.source,
-      tier: h.tier,
-      projectId: null,
-      memberName: null,
-      kgBreadcrumbs: [],
-      contentType: h.contentType,
-    }));
-  }
-
   async function run() {
     const q = query.trim();
     if (q.length < MIN_SEARCH_LEN) {
@@ -260,75 +254,29 @@
   }
 
   async function search(q: string) {
-
-    if (scope === "all" && app.workspace) {
-      routedProgress = null;
-      if (kgRoutingEnabled) {
-        // The shared scope store wins when it is narrowing (a group, or a
-        // project chosen on Home); `pinnedMember` is the overlay's own
-        // in-place narrowing for a single query.
-        const res = await api.routeSearch(
-          q,
-          30,
-          pinnedMember ?? sharedScope.projectId,
-          sharedScope.groupName,
-          audience,
-          kinds,
-        );
-        if (q !== query.trim()) return; // stale
-        searchError = null;
-        routedPlan = res.plan;
-        coverageNotes = res.memberStatus
-          .filter((s) => s.status !== "searched")
-          .map(
-            (s) =>
-              `${s.memberName}: ${s.status === "index-building" ? "still indexing" : "unavailable"}`,
-          );
-        results = res.results.map((h) => ({
-          key: `${h.projectId}:${h.chunkId}`,
-          path: h.path,
-          snippet: h.snippet,
-          source: h.source,
-          tier: null,
-          projectId: h.projectId,
-          memberName: h.memberName,
-          kgBreadcrumbs: h.kgBreadcrumbs,
-          contentType: h.contentType,
-        }));
-      } else {
-        routedPlan = null;
-        const res = await api.searchAllProjects(q, 30, audience, kinds);
-        if (q !== query.trim()) return;
-        searchError = null;
-        coverageNotes = res.memberStatus
-          .filter((s) => s.status !== "searched")
-          .map((s) => `${s.memberName}: ${s.status}`);
-        results = res.results.map((h) => ({
-          key: `${h.projectId}:${h.relPath}`,
-          path: h.relPath,
-          snippet: h.snippet,
-          source: null,
-          tier: null,
-          projectId: h.projectId,
-          memberName: h.memberName,
-          kgBreadcrumbs: [],
-          contentType: h.contentType,
-        }));
-      }
-      searched = true;
-      selected = 0;
-      return;
-    }
-
-    // Project scope — unchanged from before the workspace/kg-routing scope
-    // toggle existed.
-    routedPlan = null;
-    coverageNotes = [];
-    const found = await api.hybridSearch(q, 30, audience, kinds);
+    // The team scope is every source unless narrowed: the shared scope store
+    // wins when it is (a group, or a project chosen on Home), and
+    // `pinnedMember` is the overlay's own narrowing for one query. "This
+    // repo" is the focused member alone.
+    const all = scope === "all" && !!app.workspace;
+    routedProgress = null;
+    const res = all
+      ? await api.routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, audience, kinds)
+      : await api.routeSearch(q, 30, app.focused, null, audience, kinds);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
     searchError = null;
-    results = fromHybrid(found);
+    routedPlan = res.plan;
+    coverageNotes = coverage(res);
+    results = res.results.map((h) => ({
+      key: `${h.projectId}:${h.chunkId}`,
+      path: h.path,
+      snippet: h.snippet,
+      source: h.source,
+      projectId: h.projectId,
+      memberName: all ? h.memberName : null,
+      contentType: h.contentType,
+    }));
     searched = true;
     selected = 0;
   }
@@ -441,7 +389,7 @@
       <button class="scope-btn" class:active={scope === "all"} onclick={() => setScope("all")}>
         {teamName}
       </button>
-      {#if scope === "all" && kgRoutingEnabled}
+      {#if scope === "all"}
         <!-- Narrowing within all-projects: pins routing to one member,
              including one that is dormant. -->
         <select
@@ -527,18 +475,16 @@
     </div>
   {/if}
 
-  {#if scope === "all" && searched}
+  {#if scope === "all" && searched && routedPlan}
     <div class="scope-info">
-      {#if routedPlan}
-        <span class="scope-chip routed">routed</span>
-        <span class="plan-line">{planLine}</span>
-      {:else}
-        <span class="scope-chip keyword">keyword</span>
-      {/if}
+      <span class="scope-chip routed">routed</span>
+      <span class="plan-line">{planLine}</span>
       {#if routedProgress && routedProgress.state === "searching"}
         <span class="progress">searching {routedProgress.done}/{routedProgress.total}…</span>
       {/if}
     </div>
+  {/if}
+  {#if searched}
     {#each coverageNotes as note}
       <div class="coverage-note">{note}</div>
     {/each}
@@ -569,15 +515,6 @@
               {#if hit.source === "semantic" || hit.source === "both"}
                 <span class="tag tag-semantic" title="Matched by meaning, not just keywords">semantic</span>
               {/if}
-              {#if hit.tier === 1}
-                <span
-                  class="tag tag-search-only"
-                  title="Kept searchable by .kenignore but excluded from AI answers and the knowledge map"
-                >search-only</span>
-              {/if}
-              {#each hit.kgBreadcrumbs as crumb}
-                <span class="tag tag-kg" title="Routed via this knowledge-graph entity">{crumb}</span>
-              {/each}
             </span>
           </span>
           {#if i === selected}
@@ -850,10 +787,6 @@
     color: var(--ink-secondary);
     font-weight: 700;
     text-transform: none;
-  }
-  .tag-kg {
-    color: var(--accent-deep);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
   }
   .enter {
     font-size: 11px;

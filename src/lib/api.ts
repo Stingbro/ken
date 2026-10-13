@@ -368,31 +368,6 @@ export interface FileRow {
   backgroundEligible: boolean;
 }
 
-export interface SearchHit {
-  relPath: string;
-  kind: string;
-  status: string;
-  snippet: string;
-  rank: number;
-}
-
-/** A hit from `hybrid_search` (keyword FTS + semantic, merged). `source` is
- *  `"keyword"`, `"semantic"`, or `"both"`. `tier` mirrors `chunks.tier`:
- *  `0` = full, `1` = search-only, `null` = unexpected lookup failure (treat
- *  as no badge, same as `0`). */
-export interface HybridHit {
-  contentType: ContentType;
-  path: string;
-  chunkId: number;
-  snippet: string;
-  source: string;
-  tier: number | null;
-  /** The line the chunk starts on, when known. */
-  line: number | null;
-  /** Present for a Markdown page. */
-  page: HitPage | null;
-}
-
 /** Mirrors the Rust `SemanticIndexStateEvent` internally-tagged enum
  *  (`#[serde(tag = "state", rename_all = "camelCase")]`) exactly — each
  *  variant carries only the fields that enum case has. `project_id` is set
@@ -1093,57 +1068,22 @@ export type MemberStatusEvent =
   | { status: "active"; name: string; project_id: string }
   | { status: "dormant"; name: string; project_id: string };
 
-/** One `search_all_projects` hit (`AllProjectsHitDto`, task 3.3) — a plain
- *  `SearchHit` labeled with its owning member. */
-export interface AllProjectsHit extends SearchHit {
-  projectId: string;
-  memberName: string;
-  contentType: ContentType;
-}
+// ---- routed search (knowledge-core decision 20) ----
 
-export type AllProjectsMemberSearchStatus =
-  | "searched"
-  | "dormant"
-  | "missing"
-  | "invalid";
-
-/** One member's outcome in `search_all_projects` — honest per-member
- *  coverage, mirroring `RouteSearchResult`'s `memberStatus`. */
-export interface AllProjectsMemberStatus {
-  projectId: string | null;
-  memberName: string;
-  status: AllProjectsMemberSearchStatus;
-}
-
-/** Mirrors `SearchAllProjectsDto` — the all-projects keyword fan-out's
- *  return shape. */
-export interface SearchAllProjectsResult {
-  results: AllProjectsHit[];
-  memberStatus: AllProjectsMemberStatus[];
-}
-
-// ---- kg-routing (kg-routing change, task 4.1) ----
-
-/** Mirrors the Rust `RouteReasonDto` internally-tagged enum
- *  (`#[serde(tag = "type", rename_all = "camelCase")]`) — why `plan_route`
- *  picked its targets. */
-export type RouteReason =
-  | { type: "named" }
-  | { type: "kgEntities"; entityIds: number[] }
-  | { type: "broadcast" };
-
-/** Mirrors `RoutePlanDto` — `targets` are stringified project ids. */
+/** Mirrors `RoutePlanDto`: the sources searched (project ids), why, and the
+ *  reference repos held back. */
 export interface RoutePlan {
   targets: string[];
-  reason: RouteReason;
+  /** `named`: the question named them, or the person chose them. `every`:
+   *  every source but the reference repos held back. */
+  reason: "named" | "every";
+  /** Reference repos held back: searched only when nothing else answered,
+   *  and then in `memberStatus` too. */
+  reserve: string[];
 }
 
-/** Mirrors `RoutedHitDto` — one merged, cited hit from `route_search`.
- *  `source` is `"keyword"` | `"semantic"` | `"both"` (same vocabulary as
- *  `HybridHit.source`); `kgBreadcrumbs` is `kg://<entity-id>` per entity
- *  that selected the plan (plan-level, not per-hit — see the Rust doc
- *  comment on `RoutedHitDto`), empty unless the plan's reason was
- *  `kgEntities`. */
+/** Mirrors `RoutedHitDto`: one merged, cited hit from `route_search`.
+ *  `source` is `"keyword"` | `"semantic"` | `"both"`. */
 export interface RoutedHit {
   contentType: ContentType;
   path: string;
@@ -1160,7 +1100,6 @@ export interface RoutedHit {
   locator: string;
   /** Present for a Markdown page. */
   page: HitPage | null;
-  kgBreadcrumbs: string[];
 }
 
 /** What a hit on a wiki page carries (mirrors `pagemeta::HitPage`). */
@@ -1182,18 +1121,25 @@ export interface HitPage {
   label: string | null;
 }
 
-export type RouteMemberStatus = "searched" | "index-building" | "unavailable";
+/** `building`: searched by keyword while its meaning index is built.
+ *  `unavailable`: its index did not open. */
+export type RouteMemberStatus = "searched" | "building" | "unavailable";
 
-/** Mirrors `MemberStatusEntryDto` — one member's outcome in a `route_search`
- *  call. */
+/** Mirrors `MemberStatusEntryDto`: how one source's search went. */
 export interface RouteMemberStatusEntry {
   projectId: string;
   memberName: string;
   status: RouteMemberStatus;
+  /** While building: the passages with a meaning vector so far, of `chunks`. */
+  embedded: number | null;
+  chunks: number | null;
+  /** How long its search took; `slow` from two seconds. */
+  millis: number;
+  slow: boolean;
 }
 
-/** Mirrors `RouteSearchDto` — `route_search`'s return shape: the plan, the
- *  cross-member RRF-merged cited results, and per-member coverage. */
+/** Mirrors `RouteSearchDto`: `route_search`'s return shape. The plan, the
+ *  results merged once by relevance, and how each source's search went. */
 export interface RouteSearchResult {
   plan: RoutePlan;
   results: RoutedHit[];
@@ -1443,13 +1389,6 @@ export const api = {
   focusProject: (id: string) => invoke<void>("focus_project", { id }),
   /** Close the open workspace, tearing down every member's runtime. */
   closeWorkspace: () => invoke<void>("close_workspace"),
-  /** Keyword FTS fan-out over every ACTIVE workspace member, merged by
-   *  round-robin rank-position interleave and labeled per hit (design D6 —
-   *  BM25 scores aren't comparable across corpora). Requires `workspace`;
-   *  upgrades to `routeSearch` when `kgRouting` is also on (kg-routing
-   *  proposal: "same UI slot, richer results"). */
-  searchAllProjects: (query: string, limit = 30, audience: Audience = null, types: KindFilter = null) =>
-    invoke<SearchAllProjectsResult>("search_all_projects", { query, limit, audience, types }),
   forgetProject: (id: string) => invoke<void>("forget_project", { id }),
   /** Workspaces opened recently, newest first. */
   listRecentWorkspaces: () => invoke<RecentWorkspace[]>("list_recent_workspaces"),
@@ -1464,19 +1403,11 @@ export const api = {
    *  each path prefixed with the member's folder name. Same shape as
    *  getTree, so FileTree renders it unchanged. */
   getTreeAll: () => invoke<TreeData>("get_tree_all"),
-  /** Keyword FTS merged with semantic (when the `semanticIndex` feature is
-   *  on for the project); transparently degrades to FTS-only results when
-   *  it's off. */
-  /** `audience` "business" keeps only pages written for readers who never
-   *  see code (Current, Design, Work, or `audience: business`); "dev" keeps
-   *  everything else but the method pages, code included; null is any. */
-  hybridSearch: (query: string, limit = 30, audience: Audience = null, types: KindFilter = null) =>
-    invoke<HybridHit[]>("hybrid_search", { query, limit, audience, types }),
-  /** Route `query` across every open workspace member (kg-routing task 4.1):
-   *  plan (Named/KG-guided/Broadcast), fan out hybrid search over the
-   *  targets, merge with cross-member RRF, and return cited `ken://`/
-   *  `kg://` addresses. Requires `kgRouting`. Progress rides
-   *  `routed-search-state`. */
+  /** Search the workspace's sources, merged once by relevance (knowledge-core
+   *  decisions 15 and 20): every source, or only one the query names; a
+   *  reference repo only for a platform question, when named, or when nothing
+   *  else answers. `scope` pins one member (the "This repo" search) and
+   *  `group` a named group. Progress rides `routed-search-state`. */
   routeSearch: (
     query: string,
     limit = 30,

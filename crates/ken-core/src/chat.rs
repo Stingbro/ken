@@ -224,7 +224,7 @@ repo's ken:// address (each turn lists them), never a project-relative path; wri
 Never open files or switch the person's screen yourself; a link \
 is how they go there.\n\
 3. Search with Ken first. Ken's tools (mcp__ken__route_query across the workspace, mcp__ken__semantic_search in one \
-project, mcp__ken__kg_search over the knowledge graph, mcp__ken__search_knowledge, mcp__ken__read_document) search \
+project, mcp__ken__kg_search over the knowledge graph, mcp__ken__read_document) search \
 the team's wiki, docs and code with Ken's own ranking and return ken:// addresses to cite. For code, navigate like an \
 IDE: mcp__ken__find_definition to go to a symbol, mcp__ken__find_usages for every use and its callers, \
 mcp__ken__file_outline to drill into a file, mcp__ken__related_files for what it imports and what imports it; then \
@@ -260,13 +260,12 @@ ruling does not reach), a binding ruling or rule over a ticket or note, and a cu
 /// index, open a file for the person when they asked, or keep the person's
 /// own list and Ken's memory when they ask (each write is dated and says who
 /// made it).
-pub const KEN_MCP_ALLOWED: [&str; 19] = [
+pub const KEN_MCP_ALLOWED: [&str; 18] = [
     "history",
     "find_definition",
     "find_usages",
     "file_outline",
     "related_files",
-    "search_knowledge",
     "read_document",
     "list_documents",
     "list_projects",

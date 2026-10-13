@@ -153,14 +153,13 @@ fn scoped_server_full_session() {
         .collect();
     assert_eq!(
         names,
-        ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
+        ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
     );
 
-    // search finds seeded content, marks stripped to bold.
-    let (text, is_err) = client.tool("search_knowledge", json!({ "query": "billing cutover" }));
+    // search finds seeded content.
+    let (text, is_err) = client.tool("semantic_search", json!({ "query": "billing cutover" }));
     assert!(!is_err, "{text}");
     assert!(text.contains("notes/meeting.md"), "{text}");
-    assert!(text.contains("**billing**"), "{text}");
     assert!(!text.contains("<mark>"), "{text}");
 
     // read_document round-trips the file content.
@@ -196,7 +195,7 @@ fn unscoped_server_requires_project() {
     client.notify("notifications/initialized");
 
     // Without a project → helpful error naming the registered projects.
-    let (text, is_err) = client.tool("search_knowledge", json!({ "query": "billing" }));
+    let (text, is_err) = client.tool("semantic_search", json!({ "query": "billing" }));
     assert!(is_err, "{text}");
     assert!(text.contains("Available projects: Atlas"), "{text}");
 
@@ -209,7 +208,7 @@ fn unscoped_server_requires_project() {
 
     // With the project named, the same call works.
     let (text, is_err) =
-        client.tool("search_knowledge", json!({ "query": "billing", "project": "Atlas" }));
+        client.tool("semantic_search", json!({ "query": "billing", "project": "Atlas" }));
     assert!(!is_err, "{text}");
     assert!(text.contains("notes/meeting.md"), "{text}");
 }

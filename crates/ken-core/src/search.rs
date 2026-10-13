@@ -73,8 +73,8 @@ pub struct HybridHit {
     /// For a Markdown page: its section, freshness and whether it is still
     /// current (`pagemeta::hit_page`). Filled with `line`.
     pub page: Option<crate::pagemeta::HitPage>,
-    /// How well it answers the query ([`rerank`]'s score, then the page
-    /// band's adjustment): the same scale in every member, so hits from
+    /// How well it answers the query ([`rerank`]'s score, its file's tier
+    /// included): the same scale in every member, so hits from
     /// different repos merge by relevance rather than by repo.
     pub score: f64,
 }

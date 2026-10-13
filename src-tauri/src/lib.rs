@@ -11,7 +11,7 @@ use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
 use ken_core::cloud;
 use ken_core::db::{
     db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, EdgeRow, EntityRow, EventRow,
-    FileRow, SearchHit,
+    FileRow,
 };
 use ken_core::digest;
 use ken_core::embedder::Embedder;
@@ -50,7 +50,7 @@ enum TerminalHandle {
 struct MemberRuntime {
     project: Project,
     db: Db,
-    /// Dedicated read-only connection for `search`, on its OWN mutex so a
+    /// Dedicated read-only connection for search, on its OWN mutex so a
     /// keystroke's query never contends on the global `AppState` lock (which
     /// every other command and the background workers hold). WAL lets this
     /// reader run concurrently with the writers and still see their commits.
@@ -58,7 +58,7 @@ struct MemberRuntime {
     _watch: WatchHandle,
     /// Live on/off handle for the semantic-index build step: `Some` while
     /// `semanticIndex` is on and the model loaded, so
-    /// `set_project_feature("semanticIndex", ..)` and `hybrid_search` can
+    /// `set_project_feature("semanticIndex", ..)` and `route_search` can
     /// read/toggle it.
     semantic_embedder: Arc<Mutex<Option<Box<dyn Embedder + Send>>>>,
     /// Cancel token for an in-flight `rebuild_semantic_index` spawned by
@@ -1521,14 +1521,9 @@ fn federated_kg_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool
     true
 }
 
-fn kg_routing_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
-    true
-}
-
 /// Display label given to the workspace pseudo-member's `Project::name`
 /// (ken-memory task 2.1) — shows up wherever a member's name flows through
-/// unchanged (route_search's `MemberInfo::name`, `search_all_projects`'
-/// hand-added roster entry below).
+/// unchanged (route_search's `MemberInfo::name`, say).
 const WORKSPACE_MEMORY_LABEL: &str = "Workspace Memory";
 
 /// Namespace prefix for a dismissed distillation candidate's slug inside the
@@ -1660,42 +1655,6 @@ struct WorkspaceOverviewDto {
     /// Focused member's project id, if any.
     focused: Option<String>,
     members: Vec<WorkspaceMemberDto>,
-}
-
-/// One hit in `search_all_projects` (task 3.3): a member's `SearchHit`
-/// labeled with its owning project id + name so the ⌘K "All projects" list
-/// can badge and route it.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AllProjectsHitDto {
-    project_id: String,
-    member_name: String,
-    /// What the file is for: code, test, spec, doc, config, data, design,
-    /// meeting or ticket (`contenttype::of`).
-    content_type: &'static str,
-    #[serde(flatten)]
-    hit: SearchHit,
-}
-
-/// One member's outcome in `search_all_projects` (task 3.3) — the honest
-/// per-member status list, mirroring `route_search`'s `member_status`.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AllProjectsMemberStatusDto {
-    /// `Some` for resolvable members; `None` for missing/invalid.
-    project_id: Option<String>,
-    member_name: String,
-    /// `"searched"` (active, FTS ran) | `"dormant"` (skipped, not resident) |
-    /// `"missing"` | `"invalid"`.
-    status: &'static str,
-}
-
-/// `search_all_projects` return shape (task 3.3).
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchAllProjectsDto {
-    results: Vec<AllProjectsHitDto>,
-    member_status: Vec<AllProjectsMemberStatusDto>,
 }
 
 /// Build the workspace overview (task 3.2). Snapshots each member's facts and
@@ -2351,283 +2310,6 @@ fn close_workspace(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     Ok(())
 }
 
-/// Adapt `route_search`'s output into `search_all_projects`'s existing wire
-/// shape (kg-routing task 2.2), so the flag-guarded delegation below is
-/// invisible to the frontend's `SearchAllProjectsDto` contract.
-/// `routing::RoutedHit` is chunk-level and carries no `kind`/`status`/BM25
-/// `rank` — those are `SearchHit`'s FILE-level fields — so this fills them
-/// in rather than leaving the adapted shape half-empty:
-///   - `relPath` = the hit's `path` (already forward-slash normalized).
-///   - `kind` = `ken_core::extract::FileKind::from_path(rel_path).as_str()`,
-///     the same pure, DB-free extension classifier `scan.rs` uses to set
-///     `files.kind` in the first place — the real value, not a guess, and no
-///     extra per-hit DB round trip.
-///   - `status` = `"indexed"` always: provably correct, not a placeholder —
-///     a `RoutedHit` only exists because `search_chunks_fts`/
-///     `semantic_search` matched a row in `chunks`, which is only ever
-///     populated for indexed files.
-///   - `rank` = the hit's 0-based position in the already-merged (RRF) list.
-///     Not a real BM25 score (design forbids comparing raw scores across
-///     members) but keeps the FTS branch's "lower = better" convention for
-///     anything downstream that sorts by it.
-///   - `snippet` = the hit's chunk text as-is. Unlike the FTS branch's
-///     `<mark>`-highlighted snippet, this carries no highlight spans —
-///     `routing::RoutedHit`/`HybridHit` don't carry them at this layer (the
-///     same limitation `hybrid_search`'s own DTO already has).
-///
-/// `member_status`: `route_search`'s per-member outcomes map onto the
-/// existing vocabulary (`"searched"` → `"searched"`; `"index-building"`/
-/// `"unavailable"` → `"dormant"`, the closest existing meaning — "this
-/// member contributed nothing to this search" — since the DTO has no room
-/// to say *why*). Workspace members the routing layer never sees at all —
-/// `missing`/`invalid` manifest entries, which never enter `AppState::
-/// members` — are appended from the manifest roster (`manifest_extras`) so
-/// the list stays complete for those two categories.
-///
-/// Known gap (see final report): an active/resident member that simply
-/// wasn't in the route plan's targets (e.g. a `Named`/`KgEntities` plan that
-/// picked 1-3 of N open members) does not appear in the adapted
-/// `member_status` at all — neither `"searched"` nor `"dormant"` fits
-/// ("dormant" means not-resident, which is false here), and the plan that
-/// WOULD explain the omission (`RouteSearchDto::plan`) has no field to ride
-/// in on `SearchAllProjectsDto`. Not fixed here to avoid widening a DTO the
-/// frontend already depends on without sign-off.
-fn adapt_route_search_to_all_projects(
-    dto: RouteSearchDto,
-    manifest_extras: Vec<AllProjectsMemberStatusDto>,
-) -> SearchAllProjectsDto {
-    let results = dto
-        .results
-        .into_iter()
-        .enumerate()
-        .map(|(i, hit)| {
-            let kind = ken_core::extract::FileKind::from_path(std::path::Path::new(&hit.path))
-                .as_str()
-                .to_string();
-            AllProjectsHitDto {
-                content_type: ken_core::contenttype::of(&hit.path).as_str(),
-                project_id: hit.project_id,
-                member_name: hit.member_name,
-                hit: SearchHit {
-                    rel_path: hit.path,
-                    kind,
-                    status: "indexed".to_string(),
-                    snippet: hit.snippet,
-                    rank: i as f64,
-                },
-            }
-        })
-        .collect();
-
-    let mut member_status: Vec<AllProjectsMemberStatusDto> = dto
-        .member_status
-        .into_iter()
-        .map(|s| {
-            let status = match s.status {
-                "searched" => "searched",
-                _ => "dormant",
-            };
-            AllProjectsMemberStatusDto {
-                project_id: Some(s.project_id),
-                member_name: s.member_name,
-                status,
-            }
-        })
-        .collect();
-    member_status.extend(manifest_extras);
-
-    SearchAllProjectsDto { results, member_status }
-}
-
-/// All-projects keyword search (task 3.3): fan `query` out over every ACTIVE
-/// member's FTS index, interleave the results round-robin by rank position
-/// (design D6: BM25 scores aren't comparable across corpora, so merge by
-/// each member's rank *position*, not raw score), and label every hit with
-/// its member. Dormant members are skipped and reported in `member_status`
-/// (honest per-member list, mirroring `route_search`). Flag-gated (task 3.4).
-///
-/// Follows the `search`/`hybrid_search` lock-audit template: clone each
-/// member's read-only `search_db` Arc under a brief lock, release the global
-/// guard, then run the FTS on the blocking pool so a query never serializes
-/// against other commands or the background workers.
-///
-/// kg-routing task 2.2 — the ONE flag-guarded call site: when `kgRouting`
-/// also resolves true, this delegates to `route_search` (reusing its plan +
-/// concurrent fan-out + RRF merge + `routed-search-state` events) and adapts
-/// the result into this command's existing DTO shape via
-/// `adapt_route_search_to_all_projects`, above. Everything from `let
-/// (actives, roster) = {` onward is the original path, untouched — flag off
-/// (or `kgRouting` off) runs it exactly as before, byte-identical.
-#[tauri::command]
-async fn search_all_projects(
-    app: AppHandle,
-    state: State<'_, SharedState>,
-    query: String,
-    limit: Option<usize>,
-    audience: Option<String>,
-    types: Option<String>,
-) -> CmdResult<SearchAllProjectsDto> {
-    let limit = limit.unwrap_or(30);
-    let wanted = ken_core::contenttype::parse_filter(types.as_deref());
-
-    let routed = {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-        kg_routing_enabled(&guard.app_settings)
-    };
-    if routed {
-        // `route_search` only ever sees `AppState::members` (currently
-        // open/active projects) — it has no concept of a workspace
-        // manifest's `missing`/`invalid` entries, so those two categories
-        // are read separately here and appended, keeping `member_status` as
-        // complete as the FTS branch's for those cases (see the adapter
-        // function's doc for the one case that's still lossy).
-        let manifest_extras: Vec<AllProjectsMemberStatusDto> = {
-            let guard = state.lock().unwrap();
-            let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-            ws.ws
-                .members
-                .iter()
-                .filter_map(|m| match &m.status {
-                    ken_core::workspace::MemberStatus::Missing => Some(AllProjectsMemberStatusDto {
-                        project_id: None,
-                        member_name: m.name.clone(),
-                        status: "missing",
-                    }),
-                    ken_core::workspace::MemberStatus::Invalid(_) => Some(AllProjectsMemberStatusDto {
-                        project_id: None,
-                        member_name: m.name.clone(),
-                        status: "invalid",
-                    }),
-                    ken_core::workspace::MemberStatus::Ok(_) => None,
-                })
-                .collect()
-        };
-        // No scope: this caller is the all-projects search by definition.
-        let dto = route_search(app, state, query, Some(limit), None, None, audience, types).await?;
-        return Ok(adapt_route_search_to_all_projects(dto, manifest_extras));
-    }
-
-    let (actives, roster) = {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-        let mut actives: Vec<(uuid::Uuid, String, Arc<Mutex<Db>>)> = Vec::new();
-        let mut roster: Vec<AllProjectsMemberStatusDto> = Vec::new();
-        for m in &ws.ws.members {
-            match &m.status {
-                ken_core::workspace::MemberStatus::Ok(p) => {
-                    let pid = p.config.id;
-                    if let Some(rt) = guard.members.get(&pid) {
-                        actives.push((pid, m.name.clone(), rt.search_db.clone()));
-                        roster.push(AllProjectsMemberStatusDto {
-                            project_id: Some(pid.to_string()),
-                            member_name: m.name.clone(),
-                            status: "searched",
-                        });
-                    } else {
-                        roster.push(AllProjectsMemberStatusDto {
-                            project_id: Some(pid.to_string()),
-                            member_name: m.name.clone(),
-                            status: "dormant",
-                        });
-                    }
-                }
-                ken_core::workspace::MemberStatus::Missing => roster.push(AllProjectsMemberStatusDto {
-                    project_id: None,
-                    member_name: m.name.clone(),
-                    status: "missing",
-                }),
-                ken_core::workspace::MemberStatus::Invalid(_) => roster.push(AllProjectsMemberStatusDto {
-                    project_id: None,
-                    member_name: m.name.clone(),
-                    status: "invalid",
-                }),
-            }
-        }
-        // ken-memory task 2.1: the pseudo-member is deliberately never in
-        // `ws.ws.members` (kept out of the manifest/member list), so the
-        // loop above can never find it. Fold it into the FTS fan-out
-        // directly from `AppState::members` when resident — this is the one
-        // fan-out path that doesn't already reach it for free the way
-        // `route_search` does (it iterates `guard.members` directly with no
-        // filtering, so needs no change here).
-        {
-            if let Some(pseudo_id) = memory_pseudo_member_id(&guard) {
-                if let Some(rt) = guard.members.get(&pseudo_id) {
-                    actives.push((pseudo_id, WORKSPACE_MEMORY_LABEL.to_string(), rt.search_db.clone()));
-                    roster.push(AllProjectsMemberStatusDto {
-                        project_id: Some(pseudo_id.to_string()),
-                        member_name: WORKSPACE_MEMORY_LABEL.to_string(),
-                        status: "searched",
-                    });
-                }
-            }
-        }
-        (actives, roster)
-    };
-
-    // Each active member's FTS, off the global lock on the blocking pool,
-    // all members at once: twenty repos cost the slowest one, not the sum.
-    let q = query.clone();
-    let per_member: Vec<(String, String, Vec<SearchHit>)> =
-        tauri::async_runtime::spawn_blocking(move || {
-            std::thread::scope(|s| {
-                let handles: Vec<_> = actives
-                    .into_iter()
-                    .map(|(pid, name, db)| {
-                        let q = &q;
-                        let audience = audience.as_deref();
-                        let wanted = &wanted;
-                        s.spawn(move || {
-                            let db = db.lock().unwrap();
-                            let by_reader = audience.is_some_and(|a| !a.is_empty() && a != "any");
-                            let fetch = if !wanted.is_empty() { limit * 5 } else if by_reader { limit * 3 } else { limit };
-                            let mut hits = db.search(q, fetch).unwrap_or_default();
-                            if by_reader || !wanted.is_empty() {
-                                hits.retain(|h| {
-                                    ken_core::contenttype::is_wanted(&h.rel_path, wanted)
-                                        && ken_core::pagemeta::suits(audience, ken_core::pagemeta::audience_at(&db, &h.rel_path))
-                                });
-                                hits.truncate(limit);
-                            }
-                            (pid.to_string(), name, hits)
-                        })
-                    })
-                    .collect();
-                handles.into_iter().filter_map(|h| h.join().ok()).collect()
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Round-robin rank interleave: position 0 of every member, then 1, … up
-    // to `limit`. Each member's hits are already rank-ordered by `Db::search`.
-    let mut results: Vec<AllProjectsHitDto> = Vec::new();
-    let max_len = per_member.iter().map(|(_, _, h)| h.len()).max().unwrap_or(0);
-    'outer: for i in 0..max_len {
-        for (pid, name, hits) in &per_member {
-            if let Some(hit) = hits.get(i) {
-                results.push(AllProjectsHitDto {
-                    content_type: ken_core::contenttype::of(&hit.rel_path).as_str(),
-                    project_id: pid.clone(),
-                    member_name: name.clone(),
-                    hit: hit.clone(),
-                });
-                if results.len() >= limit {
-                    break 'outer;
-                }
-            }
-        }
-    }
-
-    Ok(SearchAllProjectsDto { results, member_status: roster })
-}
-
 /// Say what a repo is for: its kinds and team. Kept in the local registry,
 /// never in the repo. Sync follows the kind unless `project.json` sets it,
 /// and the dot is refreshed at once for an open member.
@@ -2946,140 +2628,6 @@ fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
     folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     folders.dedup_by(|a, b| a.rel_path == b.rel_path);
     Ok(TreeData { files, folders })
-}
-
-#[tauri::command]
-async fn search(
-    state: State<'_, SharedState>,
-    query: String,
-    limit: Option<usize>,
-) -> CmdResult<Vec<SearchHit>> {
-    // Hold the global lock only long enough to clone the Arc (microseconds),
-    // then release it so the FTS query runs on the dedicated read-only handle
-    // without serializing against every other command and background worker.
-    let search_db = {
-        let guard = state.lock().unwrap();
-        member(&guard, None)?.search_db.clone()
-    };
-    // Run the (potentially expensive — a short/common query can touch many
-    // rows) DB work on the blocking pool. As a synchronous command this ran on
-    // the main thread and could freeze the whole UI event loop; offloading
-    // keeps IPC responsive.
-    tauri::async_runtime::spawn_blocking(move || {
-        let db = search_db.lock().unwrap();
-        db.search(&query, limit.unwrap_or(30)).map_err(err)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-/// One path-grouped hit from `hybrid_search`. Mirrors `ken_core::search::HybridHit`
-/// but adds `tier` (kenignore task 2.4, so the frontend can badge search-only
-/// hits) and serializes `source` as a lowercase string instead of a Rust enum.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HybridSearchHitDto {
-    path: String,
-    chunk_id: i64,
-    snippet: String,
-    source: &'static str,
-    /// `0` = Full, `1` = SearchOnly (matches `chunks.tier` / `kenignore::Tier`
-    /// minus `Ignore`, which never has a row to badge). `None` if the chunk
-    /// row's tier couldn't be looked up (shouldn't normally happen for a hit
-    /// that came from the chunks tables themselves).
-    tier: Option<i64>,
-    /// The line the chunk starts on, when known.
-    line: Option<i64>,
-    /// For a Markdown page: section, freshness, retired or generated.
-    page: Option<ken_core::pagemeta::HitPage>,
-    /// What the file is for (`contenttype::of`).
-    content_type: &'static str,
-}
-
-/// Chunk-level hybrid (keyword + semantic) search (semantic-index task 2.2).
-/// Always runs FTS. Also runs a KNN pass — merged in via
-/// `ken_core::search::merge_and_rerank`: "B4 FTS-priority fill" (FTS hits keep
-/// their order and snippet; KNN only fills in paths FTS missed) followed by a
-/// deterministic precision rerank (filename/path/snippet token matches,
-/// semantic proximity, agreement bonus) — the KNN pass only runs
-/// when the project's `semanticIndex` flag is on, the DB actually has a
-/// vector index (`vec_available`), and a live embedder is installed; in any
-/// other case this transparently degrades to the exact plain-FTS results
-/// `search` would give, per the proposal's "flag off ... → exact current FTS
-/// path" requirement. Every hit is annotated with its stored `chunks.tier`
-/// (kenignore task 2.4) so the frontend can badge search-only matches.
-#[tauri::command]
-async fn hybrid_search(
-    state: State<'_, SharedState>,
-    query: String,
-    limit: Option<usize>,
-    audience: Option<String>,
-    types: Option<String>,
-) -> CmdResult<Vec<HybridSearchHitDto>> {
-    let limit = limit.unwrap_or(30);
-    let wanted = ken_core::contenttype::parse_filter(types.as_deref());
-    let (search_db, semantic_on, embedder_slot) = {
-        let guard = state.lock().unwrap();
-        let active = member(&guard, None)?;
-        (
-            active.search_db.clone(),
-            semantic_index_enabled(&guard.app_settings, &active.project),
-            active.semantic_embedder.clone(),
-        )
-    };
-
-    // Embedding the query needs `&mut` on the embedder and can call into a
-    // local model, so it's kept off the async executor same as the DB work
-    // below — do both inside the one `spawn_blocking` closure.
-    tauri::async_runtime::spawn_blocking(move || {
-        let db = search_db.lock().unwrap();
-
-        let query_vec = if semantic_on && db.vec_available() {
-            let mut guard = embedder_slot.lock().unwrap();
-            guard
-                .as_deref_mut()
-                .and_then(|embedder| embedder.embed_query(&query).ok())
-        } else {
-            None
-        };
-        // The one shared composition (keyword + semantic, vocabulary
-        // alternatives, lines, page facts and bands), same as workspace
-        // search and the MCP.
-        // Item 2b: keep what suits the reader chosen (business, dev, any),
-        // reading further down the ranking so a filter still fills the page.
-        let filtered = audience.as_deref().is_some_and(|a| !a.is_empty() && a != "any");
-        let fetch = if filtered { limit * 3 } else { limit };
-        let mut merged = ken_core::routing::search_member_of(&db, &query, query_vec.as_deref(), fetch, &wanted).map_err(err)?;
-        merged.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
-        merged.truncate(limit);
-        let chunk_ids: Vec<i64> = merged.iter().map(|h| h.chunk_id).collect();
-        let tiers = db.chunk_tiers(&chunk_ids).map_err(err)?;
-
-        Ok(merged
-            .into_iter()
-            .map(|h| {
-                let tier = tiers.get(&h.chunk_id).copied();
-                let content_type = ken_core::contenttype::of(&h.path).as_str();
-                let source = match h.source {
-                    hybrid_search_mod::Source::Keyword => "keyword",
-                    hybrid_search_mod::Source::Semantic => "semantic",
-                    hybrid_search_mod::Source::Both => "both",
-                };
-                HybridSearchHitDto {
-                    path: h.path,
-                    chunk_id: h.chunk_id,
-                    snippet: h.snippet,
-                    source,
-                    tier,
-                    line: h.line,
-                    content_type,
-                    page: h.page,
-                }
-            })
-            .collect())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Flip a per-project boolean feature flag. The flag must be registered and
@@ -5359,7 +4907,7 @@ fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
         "Set up the Ken MCP server so you can search this team's knowledge base.\n\n\
 Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
 server binary, ken-mcp, runs on demand over stdio. Its tools: search (route_query \
-across the workspace, semantic_search, search_knowledge, kg_search), reading \
+across the workspace, semantic_search in one project, kg_search), reading \
 (read_document, list_documents, list_projects), code navigation (find_definition, \
 find_usages, file_outline, related_files), history, the person's Your day tasks and \
 tickets (task_list, ticket_list). It never edits the person's files. Four tools \
@@ -6660,9 +6208,9 @@ async fn quick_answer(
     query: String,
 ) -> CmdResult<bool> {
     // Hold the global lock only long enough to clone the read-only handle + the
-    // supersede counter (microseconds), then release it so the FTS query and the
-    // per-source excerpt reads run on the dedicated read-only handle off the lock
-    // (mirrors the `search` command), never freezing the UI event loop.
+    // supersede counter (microseconds), then release it so the search and the
+    // per-source excerpt reads run on the dedicated read-only handle off the lock,
+    // never freezing the UI event loop.
     let (search_db, root, project_id, qa_gen, claude) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
@@ -6675,27 +6223,26 @@ async fn quick_answer(
         )
     };
 
-    // The same meaningful-term tokenization `Db::search` now uses internally
+    // The same meaningful-term tokenization the keyword search uses
     // (alphanumeric split minus English stopwords, with as-you-type guards), so
     // each excerpt centers on a term the search actually ranked on ("operating",
     // "model") rather than a stopword ("what", "the").
     let tokens = ken_core::db::significant_tokens(&query);
 
-    // Search + build a ~350-char paragraph excerpt per hit on the blocking pool
-    // (richer grounding than the ~12-token FTS snippet); fall back to the FTS
-    // snippet when a source has no stored content (binary / OCR-pending).
+    // Search through the one pipeline (knowledge-core decision 15), by
+    // keyword, and build a ~350-char paragraph excerpt per hit on the blocking
+    // pool (richer grounding than the hit's chunk alone); fall back to the
+    // chunk's text when a source has no stored content to excerpt.
     let query_for_search = query.clone();
     let sources: Vec<(String, String)> = tauri::async_runtime::spawn_blocking(
         move || -> CmdResult<Vec<(String, String)>> {
             let db = search_db.lock().unwrap();
-            let hits = db.search(&query_for_search, 8).map_err(err)?;
+            let hits = routing::search_member(&db, &query_for_search, None, 8).map_err(err)?;
             Ok(hits
                 .into_iter()
                 .map(|hit| {
-                    let text = db.excerpt(&hit.rel_path, &tokens, 350).unwrap_or_else(|| {
-                        hit.snippet.replace("<mark>", "").replace("</mark>", "")
-                    });
-                    (hit.rel_path, text)
+                    let text = db.excerpt(&hit.path, &tokens, 350).unwrap_or(hit.snippet);
+                    (hit.path, text)
                 })
                 .collect())
         },
@@ -9205,55 +8752,42 @@ fn workspace_kg_search(
     Ok(hits)
 }
 
-/// `RoutePlan` DTO for `route_search` (kg-routing task 2.1). `targets` are
-/// stringified `Uuid`s (matches every other project-id DTO field in this
-/// file, e.g. `WorkspaceKgOverviewDto::project_id`); `reason` self-tags so
-/// the frontend can switch on `reason.type`.
+/// `route_search`'s plan: the sources searched (stringified ids), why, and
+/// the reference repos held back.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RoutePlanDto {
     targets: Vec<String>,
-    reason: RouteReasonDto,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-enum RouteReasonDto {
-    Named,
-    /// `entityIds`: the global entity ids (`kg.sqlite`) that selected these
-    /// targets — same ids the merged hits' `kgBreadcrumbs` are built from.
-    KgEntities { entity_ids: Vec<i64> },
-    Broadcast,
-}
-
-impl From<&routing::RouteReason> for RouteReasonDto {
-    fn from(r: &routing::RouteReason) -> Self {
-        match r {
-            routing::RouteReason::Named => RouteReasonDto::Named,
-            routing::RouteReason::KgEntities(ids) => RouteReasonDto::KgEntities { entity_ids: ids.clone() },
-            routing::RouteReason::Broadcast => RouteReasonDto::Broadcast,
-        }
-    }
+    /// `"named"` (the question named them, or the person chose them) or
+    /// `"every"`.
+    reason: &'static str,
+    /// Reference repos held back: searched only when nothing else answered,
+    /// and then listed in `memberStatus` too.
+    reserve: Vec<String>,
 }
 
 impl From<&routing::RoutePlan> for RoutePlanDto {
     fn from(p: &routing::RoutePlan) -> Self {
         RoutePlanDto {
             targets: p.targets.iter().map(|id| id.to_string()).collect(),
-            reason: (&p.reason).into(),
+            reason: match p.reason {
+                routing::RouteReason::Named => "named",
+                routing::RouteReason::Every => "every",
+            },
+            reserve: p.reserve.iter().map(|id| id.to_string()).collect(),
         }
     }
 }
 
-/// One merged, cited hit (kg-routing task 2.1). Mirrors `routing::RoutedHit`
-/// with the same string-source/camelCase conventions `HybridSearchHitDto`
-/// (semantic-index task 2.2) already uses for `source`.
+/// One merged, cited hit. Mirrors `routing::RoutedHit`, with `source` as a
+/// word.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RoutedHitDto {
     path: String,
     chunk_id: i64,
     snippet: String,
+    /// `"keyword"`, `"semantic"` or `"both"`.
     source: &'static str,
     project_id: String,
     member_name: String,
@@ -9266,10 +8800,6 @@ struct RoutedHitDto {
     /// For a Markdown page: section, verified or evidence date, retired or
     /// generated, and what replaces it.
     page: Option<ken_core::pagemeta::HitPage>,
-    /// `kg://<entity-id>` per entity that selected this hit's plan; empty
-    /// unless the plan's reason was `KgEntities` (routing.rs module doc: "KG
-    /// breadcrumbs are plan-level, not per-hit").
-    kg_breadcrumbs: Vec<String>,
     /// What the file is for (`contenttype::of`).
     content_type: &'static str,
 }
@@ -9293,41 +8823,48 @@ impl From<routing::RoutedHit> for RoutedHitDto {
             line: h.line,
             locator: h.locator,
             page: h.page,
-            kg_breadcrumbs: h.kg_breadcrumbs,
         }
     }
 }
 
-/// One member's outcome in a `route_search` call (kg-routing task 2.1).
+/// How one source's search went in a `route_search` call.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MemberStatusEntryDto {
     project_id: String,
     member_name: String,
-    /// `"searched"` | `"index-building"` | `"unavailable"` — spec's exact
-    /// per-member status vocabulary ("Fan-out hybrid search with rank-only
-    /// merge").
+    /// `"searched"`, `"building"` (searched by keyword while its meaning
+    /// index is built) or `"unavailable"` (its index would not open).
     status: &'static str,
+    /// While building: the passages with a meaning vector so far, of
+    /// `chunks`.
+    embedded: Option<i64>,
+    chunks: Option<i64>,
+    /// How long its search took; `slow` from `routing::SLOW_MILLIS`.
+    millis: u64,
+    slow: bool,
 }
 
 impl From<&routing::MemberStatusEntry> for MemberStatusEntryDto {
     fn from(s: &routing::MemberStatusEntry) -> Self {
-        let status = match s.status {
-            routing::MemberStatus::Searched => "searched",
-            routing::MemberStatus::IndexBuilding => "index-building",
-            routing::MemberStatus::Unavailable => "unavailable",
+        let (status, embedded, chunks) = match s.status {
+            routing::MemberStatus::Searched => ("searched", None, None),
+            routing::MemberStatus::Building { embedded, chunks } => ("building", Some(embedded), Some(chunks)),
+            routing::MemberStatus::Unavailable => ("unavailable", None, None),
         };
         MemberStatusEntryDto {
             project_id: s.project_id.to_string(),
             member_name: s.member_name.clone(),
             status,
+            embedded,
+            chunks,
+            millis: s.millis,
+            slow: s.slow(),
         }
     }
 }
 
-/// `route_search`'s return shape (kg-routing task 2.1 / proposal: "returning
-/// `{ plan, results, member_status }`"), mirroring `routing::ExecutionReport`
-/// field-for-field.
+/// `route_search`'s return shape, mirroring `routing::ExecutionReport`.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RouteSearchDto {
@@ -9346,11 +8883,9 @@ impl From<routing::ExecutionReport> for RouteSearchDto {
     }
 }
 
-/// Payload for the `routed-search-state` event (kg-routing task 2.1),
-/// mirroring `WorkspaceKgStateEvent`'s tag shape AND its "app-global, not
-/// `emit_member`" choice: a routed search spans every planned member at
-/// once (like a workspace-KG build), so it has no single owning `project_id`
-/// to scope the event to. `{"state":"planning"}`,
+/// Payload for the `routed-search-state` event, app-global rather than
+/// `emit_member`: a routed search spans every source at once, so it has no
+/// single owning project. `{"state":"planning"}`,
 /// `{"state":"searching","done":1,"total":3}`, `{"state":"done"}`.
 #[derive(Clone, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
@@ -9360,13 +8895,9 @@ enum RoutedSearchStateEvent {
     Done,
 }
 
-/// One workspace member's handles needed to plan and run a routed search
-/// (kg-routing task 2.1) — snapshotted under the state lock, then used after
-/// it's dropped so planning/embedding/searching never hold the global lock.
-/// Mirrors `hybrid_search`'s own "clone the `Arc<Mutex<Db>>`, release the
-/// guard, do the real work off it" discipline — the "search_db/spawn_blocking
-/// pattern (lock-audit template)" this task's brief names — generalized to
-/// every open member instead of just the focused one.
+/// One workspace member's handles needed to plan and run a routed search,
+/// snapshotted under the state lock and used after it is dropped, so
+/// planning, embedding and searching never hold the global lock.
 struct RouteMemberSnapshot {
     project_id: uuid::Uuid,
     name: String,
@@ -9382,45 +8913,81 @@ struct RouteMemberSnapshot {
     embedder_slot: Option<Arc<Mutex<Option<Box<dyn Embedder + Send>>>>>,
 }
 
-/// Route a query across every open workspace member and return the merged,
-/// cited results (kg-routing task 2.1): plan with `routing::plan_route`
-/// (KG-guided tier only when `federatedKg` is also on; Named/Broadcast
-/// otherwise — design D1's "soft dependency"), fan out `routing::
-/// search_member` per target concurrently on the blocking pool, merge with
-/// `routing::merge_routed`. Emits `routed-search-state` (`planning` →
-/// `searching m/n` → `done`) as an app-global event — see
-/// `RoutedSearchStateEvent`'s doc for why not `emit_member`.
+/// What every source's search in one `route_search` shares: the open
+/// indexes, the names, the query and its vector, the filters and the
+/// vocabulary.
+struct RouteFanOut {
+    app: AppHandle,
+    dbs: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>>,
+    names: std::collections::HashMap<uuid::Uuid, String>,
+    query: String,
+    query_vec: Option<Vec<f32>>,
+    /// Hits read from each source before the reader filter, and kept after.
+    fetch: usize,
+    limit: usize,
+    wanted: Vec<ken_core::contenttype::ContentType>,
+    audience: Option<String>,
+    vocab: Arc<ken_core::vocab::Vocabulary>,
+    done: Arc<AtomicUsize>,
+}
+
+impl RouteFanOut {
+    /// Search `ids` at once, each on its own blocking task
+    /// (`routing::search_target`), and emit `searching done/total` as each
+    /// finishes. A source whose index did not open is reported unavailable.
+    async fn run(&self, ids: &[uuid::Uuid], total: usize) -> CmdResult<Vec<routing::MemberHits>> {
+        let mut handles = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let name = self.names.get(&id).cloned().unwrap_or_default();
+            let db = self.dbs.get(&id).cloned();
+            let (query, query_vec, wanted) = (self.query.clone(), self.query_vec.clone(), self.wanted.clone());
+            let (audience, vocab, done, app) = (self.audience.clone(), self.vocab.clone(), self.done.clone(), self.app.clone());
+            let (fetch, limit) = (self.fetch, self.limit);
+            handles.push(tauri::async_runtime::spawn_blocking(move || {
+                let guard = db.as_ref().map(|db| db.lock().unwrap());
+                let mut found =
+                    routing::search_target(id, &name, guard.as_deref(), &query, query_vec.as_deref(), fetch, &wanted, Some(&vocab));
+                drop(guard);
+                // Item 2b: keep what suits the reader chosen (business, dev, any).
+                found.hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
+                found.hits.truncate(limit);
+                let done = done.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = app.emit("routed-search-state", RoutedSearchStateEvent::Searching { done, total });
+                found
+            }));
+        }
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.await.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+}
+
+/// Search the workspace's sources and return the merged, cited results
+/// (knowledge-core decisions 15 and 20). `routing::plan_route` picks the
+/// sources: every one, less the reference repos it holds back, or only those
+/// the question names. Each is searched at once on the blocking pool, the
+/// held-back reference repos only when nothing answered, and
+/// `routing::merge_routed` merges the hits once. A source still building its
+/// meaning index is searched by keyword and reported; a slow one is waited
+/// for and reported. Emits `routed-search-state` (`planning`, `searching
+/// m/n`, `done`).
 ///
-/// Targets come from the **workspace manifest** (`Workspace::members`,
-/// `MemberStatus::Ok` only), not from whatever happens to be open this
-/// session (ken-home-workspace 2.1 — this replaces kg-routing's original
-/// `AppState::members` stand-in, which existed only because `workspace.rs`
-/// hadn't shipped yet). A resident member is searched through its live
-/// handle; a dormant one has a short-lived `Db::open(base, project_id)`
-/// opened for the query and dropped after, which does not activate it,
-/// start any watcher, or evict a resident. `Missing`/`Invalid` members are
-/// never targets — they surface in the members overview instead. With no
-/// workspace open (single-project mode) this falls back to `AppState::
-/// members` exactly as before.
+/// Sources come from the **workspace manifest** (`Workspace::members`,
+/// `MemberStatus::Ok` only). A resident member is searched through its live
+/// handle; a dormant one through an index opened for the query and dropped
+/// after, which activates nothing. With no workspace open the open projects
+/// are the sources.
 ///
-/// `scope` pins the search to one member: planning short-circuits to that
-/// single target without consulting the KG, and the result shape is
-/// identical to an unpinned search so the UI renders one thing.
+/// `scope` pins the search to one member and `group` to a named group's
+/// members: a plan the person chose, with nothing held back. The app's
+/// "This repo" search is this with `scope` set to the focused member.
 ///
-/// The query is embedded exactly once (design: "the query is embedded once
-/// and reused across all member KNN searches") via the focused member's
-/// `semantic_embedder` slot when a member is focused, else the first open
-/// member's — every open member's slot loads the same local embedding
-/// model, so any one is representative; the resulting vector (or `None` if
-/// embedding is unavailable) is cloned into every per-member search.
-/// `MemberInfo::index_ready`/`last_activity` (kg-routing ken-core task 1.1's
-/// doc comment) are read here from what `MemberRuntime` actually tracks:
-/// `index_ready` = `Db::vec_available()` (same readiness signal
-/// `hybrid_search` gates its KNN pass on); `last_activity` = the most recent
-/// `finished_at` across that member's `fresh` ingest runs (`features/
-/// multi-project/README.md`'s "recent activity ... most recent ingest
-/// completion timestamp" contract), via the existing `Db::runs_with_status`
-/// read — no new `Db` method needed.
+/// The query is embedded once, with the focused member's embedder (any
+/// resident member's otherwise: every slot loads the same local model), and
+/// the vector is used for every source. With every member dormant there is
+/// no embedder and the search is keyword only.
 #[tauri::command]
 async fn route_search(
     app: AppHandle,
@@ -9440,11 +9007,8 @@ async fn route_search(
     let fetch = if filtered { limit * 3 } else { limit };
 
     let group_targets: Option<Vec<uuid::Uuid>>;
-    let (base_dir, kg_root, kg_enabled, embedder_slot, snapshots) = {
+    let (base_dir, embedder_slot, snapshots) = {
         let guard = state.lock().unwrap();
-        if !kg_routing_enabled(&guard.app_settings) {
-            return Err("kgRouting flag is off".into());
-        }
         // Manifest members when a workspace is open, so a member that has
         // never been focused this session is still searchable; the open
         // projects otherwise (single-project mode).
@@ -9487,8 +9051,7 @@ async fn route_search(
             }
         }
         // A group scope resolves to its members' ids, which become the
-        // plan's targets directly — `RoutePlan.targets` is already a list,
-        // so a group needs no special search path.
+        // plan's targets directly.
         group_targets = match (&group, guard.workspace.as_ref()) {
             (Some(name), Some(ws)) => {
                 let ids: Vec<uuid::Uuid> = ws
@@ -9513,217 +9076,81 @@ async fn route_search(
             (Some(_), None) => return Err("no workspace open".into()),
             (None, _) => None,
         };
-        // Every member's slot loads the same embedding model, so any
-        // resident one is representative — but with every member dormant
-        // there is none, and the search runs FTS-only rather than failing.
         let embedder_slot = guard
             .focused
             .and_then(|id| snapshots.iter().find(|s| s.project_id == id))
             .and_then(|s| s.embedder_slot.clone())
             .or_else(|| snapshots.iter().find_map(|s| s.embedder_slot.clone()));
-        (
-            guard.base_dir.clone(),
-            workspace_kg_root(&guard),
-            federated_kg_enabled(&guard.app_settings),
-            embedder_slot,
-            snapshots,
-        )
+        (guard.base_dir.clone(), embedder_slot, snapshots)
     };
 
     let _ = app.emit("routed-search-state", RoutedSearchStateEvent::Planning);
 
-    // Plan + embed on the blocking pool: `plan_route`'s KG read and
-    // `embed_query` can both touch disk / the local model.
+    // Plan and embed on the blocking pool: opening a dormant member's index
+    // and embedding the query both touch disk or the local model.
     let query_for_plan = query.clone();
-    let plan_snapshots: Vec<(uuid::Uuid, String, Option<Arc<Mutex<Db>>>)> = snapshots
-        .iter()
-        .map(|s| (s.project_id, s.name.clone(), s.search_db.clone()))
-        .collect();
-    let plan_base = base_dir.clone();
-    let (plan, members, query_vec, dormant_dbs) = tauri::async_runtime::spawn_blocking(move || {
-        // Dormant members are opened ONCE here and reused by the fan-out
-        // below. Opening again per search would double the per-member cost
-        // the D5 latency budget is measured against.
-        let mut dormant: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> =
-            std::collections::HashMap::new();
-        let mut members: Vec<routing::MemberInfo> = Vec::with_capacity(plan_snapshots.len());
-        let registry = ken_core::registry::Registry::load(&plan_base).ok();
-        for (project_id, name, live) in &plan_snapshots {
-            let handle: Option<Arc<Mutex<Db>>> = match live {
+    let (plan, names, dbs, query_vec) = tauri::async_runtime::spawn_blocking(move || {
+        // Dormant members are opened once here and reused by the fan-out.
+        let registry = Registry::load(&base_dir).ok();
+        let mut dbs: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = std::collections::HashMap::new();
+        let mut members: Vec<routing::MemberInfo> = Vec::with_capacity(snapshots.len());
+        for s in &snapshots {
+            let handle = match &s.search_db {
                 Some(db) => Some(db.clone()),
-                None => match Db::open(&plan_base, *project_id) {
-                    Ok(db) => {
-                        let arc = Arc::new(Mutex::new(db));
-                        dormant.insert(*project_id, arc.clone());
-                        Some(arc)
-                    }
-                    // An index that won't open is simply not ready: the
-                    // Broadcast tier filters it out at plan time, and a
-                    // KG-guided pick still reports `Unavailable` below
-                    // rather than failing the whole search.
-                    Err(_) => None,
-                },
+                None => Db::open(&base_dir, s.project_id).ok().map(|db| Arc::new(Mutex::new(db))),
             };
-            let (index_ready, last_activity) = match &handle {
-                Some(db) => {
-                    let db = db.lock().unwrap();
-                    let last = db
-                        .runs_with_status("fresh")
-                        .ok()
-                        .and_then(|rows| rows.iter().filter_map(|r| r.finished_at).max())
-                        .unwrap_or(0);
-                    (db.vec_available(), last)
-                }
-                None => (false, 0),
-            };
-            let knowledge_base = registry
-                .as_ref()
-                .and_then(|r| r.projects.iter().find(|e| e.id == *project_id))
-                .is_some_and(|e| routing::is_knowledge_base(&e.kind));
-            members.push(routing::MemberInfo {
-                project_id: *project_id,
-                name: name.clone(),
-                index_ready,
-                last_activity,
-                knowledge_base,
-            });
-        }
-
-        // A pinned scope never consults the KG (design D3) — there is
-        // nothing to plan when the targets are already named. A group is
-        // the same case with more than one target.
-        let plan = match (scope, group_targets) {
-            (Some(id), _) => routing::RoutePlan {
-                targets: vec![id],
-                reason: routing::RouteReason::Named,
-                platform: routing::asks_about_platform(&query_for_plan),
-                knowledge: Vec::new(),
-            },
-            (None, Some(ids)) => routing::RoutePlan {
-                knowledge: members.iter().filter(|m| m.knowledge_base && ids.contains(&m.project_id)).map(|m| m.project_id).collect(),
-                targets: ids,
-                reason: routing::RouteReason::Named,
-                platform: routing::asks_about_platform(&query_for_plan),
-            },
-            (None, None) => {
-                let kg = if kg_enabled {
-                    ken_core::workspace_kg_db::WorkspaceKgDb::open(&kg_root).ok()
-                } else {
-                    None
-                };
-                routing::plan_route(&query_for_plan, &members, kg.as_ref())
+            if let Some(db) = handle {
+                dbs.insert(s.project_id, db);
             }
+            let reference = registry
+                .as_ref()
+                .and_then(|r| r.projects.iter().find(|e| e.id == s.project_id))
+                .is_some_and(|e| routing::is_reference(&e.kind));
+            members.push(routing::MemberInfo { project_id: s.project_id, name: s.name.clone(), reference });
+        }
+        let plan = match (scope, group_targets) {
+            (Some(id), _) => routing::RoutePlan::chosen(vec![id]),
+            (None, Some(ids)) => routing::RoutePlan::chosen(ids),
+            (None, None) => routing::plan_route(&query_for_plan, &members),
         };
-
         let query_vec = embedder_slot.as_ref().and_then(|slot| {
             let mut guard = slot.lock().unwrap();
             guard.as_deref_mut().and_then(|e| e.embed_query(&query_for_plan).ok())
         });
-
-        (plan, members, query_vec, dormant)
+        let names = members.into_iter().map(|m| (m.project_id, m.name)).collect();
+        (plan, names, dbs, query_vec)
     })
     .await
     .map_err(|e| e.to_string())?;
 
-    let total = plan.targets.len();
-    let _ = app.emit(
-        "routed-search-state",
-        RoutedSearchStateEvent::Searching { done: 0, total },
-    );
-
-    let ready_by_id: std::collections::HashMap<uuid::Uuid, bool> =
-        members.iter().map(|m| (m.project_id, m.index_ready)).collect();
-    let name_by_id: std::collections::HashMap<uuid::Uuid, String> =
-        members.iter().map(|m| (m.project_id, m.name.clone())).collect();
-    // Resident handles plus the dormant ones opened during planning. A
-    // member absent from this map (its index wouldn't open) falls through
-    // to the `Unavailable` arm below.
-    let mut db_by_id: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = snapshots
-        .into_iter()
-        .filter_map(|s| s.search_db.map(|db| (s.project_id, db)))
-        .collect();
-    db_by_id.extend(dormant_dbs);
     // One vocabulary for the whole search: the team wiki's Vocabulary page
     // and decisions aliases widen the search in every repo, not only the wiki.
-    let shared_vocab = {
-        let vocabs: Vec<ken_core::vocab::Vocabulary> = db_by_id
+    let vocab = {
+        let vocabs: Vec<ken_core::vocab::Vocabulary> = dbs
             .values()
             .filter_map(|db| db.lock().ok().and_then(|g| ken_core::vocab::Vocabulary::cached(&g).ok()))
             .collect();
         Arc::new(ken_core::vocab::Vocabulary::merged(vocabs.iter()))
     };
+    let fan_out = RouteFanOut {
+        app: app.clone(),
+        dbs,
+        names,
+        query,
+        query_vec,
+        fetch,
+        limit,
+        wanted,
+        audience,
+        vocab,
+        done: Arc::new(AtomicUsize::new(0)),
+    };
 
-    // Concurrent fan-out (design D5: "per-member searches run concurrently"):
-    // every target's search is its own `spawn_blocking` task, started before
-    // any is awaited, so they run in parallel on the blocking pool rather
-    // than one after another.
-    let done_counter = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::with_capacity(total);
-    for target_id in plan.targets.clone() {
-        let name = name_by_id.get(&target_id).cloned().unwrap_or_default();
-        let index_ready = ready_by_id.get(&target_id).copied().unwrap_or(false);
-        let db = db_by_id.get(&target_id).cloned();
-        let query = query.clone();
-        let query_vec = query_vec.clone();
-        let counter = done_counter.clone();
-        let ev_app = app.clone();
-        let audience = audience.clone();
-        let wanted = wanted.clone();
-        let shared_vocab = shared_vocab.clone();
-        handles.push(tauri::async_runtime::spawn_blocking(
-            move || -> routing::MemberHits {
-                let result = if let Some(db) = db {
-                    if !index_ready {
-                        routing::MemberHits {
-                            project_id: target_id,
-                            member_name: name,
-                            status: routing::MemberStatus::IndexBuilding,
-                            hits: Vec::new(),
-                        }
-                    } else {
-                        let db = db.lock().unwrap();
-                        match routing::search_member_of_with(&db, &query, query_vec.as_deref(), fetch, &wanted, Some(&shared_vocab)) {
-                            Ok(mut hits) => routing::MemberHits {
-                                hits: {
-                                    hits.retain(|h| {
-                                        ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience))
-                                    });
-                                    hits.truncate(limit);
-                                    hits
-                                },
-                                project_id: target_id,
-                                member_name: name,
-                                status: routing::MemberStatus::Searched,
-                            },
-                            Err(_) => routing::MemberHits {
-                                project_id: target_id,
-                                member_name: name,
-                                status: routing::MemberStatus::Unavailable,
-                                hits: Vec::new(),
-                            },
-                        }
-                    }
-                } else {
-                    routing::MemberHits {
-                        project_id: target_id,
-                        member_name: name,
-                        status: routing::MemberStatus::Unavailable,
-                        hits: Vec::new(),
-                    }
-                };
-                let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                let _ = ev_app.emit(
-                    "routed-search-state",
-                    RoutedSearchStateEvent::Searching { done, total },
-                );
-                result
-            },
-        ));
-    }
-
-    let mut member_hits = Vec::with_capacity(handles.len());
-    for h in handles {
-        member_hits.push(h.await.map_err(|e| e.to_string())?);
+    let total = plan.targets.len();
+    let _ = app.emit("routed-search-state", RoutedSearchStateEvent::Searching { done: 0, total });
+    let mut member_hits = fan_out.run(&plan.targets, total).await?;
+    if routing::needs_reserve(&plan, &member_hits) {
+        member_hits.extend(fan_out.run(&plan.reserve, total + plan.reserve.len()).await?);
     }
 
     let report = routing::merge_routed(&plan, &member_hits, limit);
@@ -13003,7 +12430,6 @@ pub fn run() {
             focus_project,
             discover_workspace_candidates,
             close_workspace,
-            search_all_projects,
             forget_project,
             list_recent_workspaces,
             forget_workspace,
@@ -13013,8 +12439,6 @@ pub fn run() {
             set_folder_selection,
             get_tree,
             get_tree_all,
-            search,
-            hybrid_search,
             set_project_feature,
             set_global_feature,
             list_features,
@@ -13304,10 +12728,10 @@ mod tests {
         assert!(db.get_file("Meetings-old/stale.md").unwrap().is_some(), "sibling untouched");
 
         let paths: Vec<String> = db
-            .search("zebra", 10)
+            .search_chunks_fts("zebra", 10)
             .unwrap()
             .into_iter()
-            .map(|h| h.rel_path)
+            .map(|h| h.path)
             .collect();
         assert!(paths.contains(&"Archive/Meetings/kickoff.md".to_string()), "got {paths:?}");
         assert!(paths.contains(&"Archive/Meetings/Q3/review.md".to_string()), "got {paths:?}");

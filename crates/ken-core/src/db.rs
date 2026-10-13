@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -110,17 +110,6 @@ pub struct OcrRegionRow {
     pub bbox: [f32; 4],
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchHit {
-    pub rel_path: String,
-    pub kind: String,
-    pub status: String,
-    /// Snippet with `<mark>` tags around matched terms.
-    pub snippet: String,
-    pub rank: f64,
-}
-
 /// File-level index counts for one project (see [`Db::file_health_counts`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileHealthCounts {
@@ -146,22 +135,6 @@ pub struct IndexHealth {
     /// Searchable only (a code or reference repo, a `~` line): never read
     /// for entities, on purpose.
     pub skipped: i64,
-    /// The last rebuild's control query, if one has run.
-    pub control: Option<ControlResult>,
-}
-
-/// One control query: a known page searched by its title, which must come
-/// back first. When it does not, the index answers but cannot be trusted.
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ControlResult {
-    pub page: String,
-    pub query: String,
-    /// What ranked first instead, when it was not `page`.
-    pub top: Option<String>,
-    pub ok: bool,
-    /// Unix seconds.
-    pub at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -758,6 +731,29 @@ impl Db {
                 "#,
             )?;
         }
+        if version < 21 {
+            // knowledge-core decision 15: one index, one ranker. The
+            // file-level `search` index, its triggers and the file-name
+            // column it read go; the chunk index (`chunks_fts`) answers every
+            // search. The title-query control that read it goes too
+            // (decision 19).
+            self.conn.execute_batch(
+                r#"
+                DROP TRIGGER IF EXISTS contents_ai;
+                DROP TRIGGER IF EXISTS contents_ad;
+                DROP TRIGGER IF EXISTS contents_au;
+                DROP TABLE IF EXISTS search;
+                DELETE FROM meta WHERE key = 'index_control';
+                "#,
+            )?;
+            let has_name: bool = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('contents') WHERE name = 'name'")?
+                .exists([])?;
+            if has_name {
+                self.conn.execute_batch("ALTER TABLE contents DROP COLUMN name;")?;
+            }
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -1134,17 +1130,14 @@ impl Db {
         Ok(out)
     }
 
-    /// Chunk-level FTS5 search over `chunks_fts`, joined back to `chunks`
-    /// for the owning path/text — the chunk-grain counterpart to
-    /// `semantic_search`, added for task 1.8 so hybrid search (this crate's
-    /// tests today; the src-tauri `hybrid_search` command, task 2.2,
-    /// eventually) has a ready-made `Vec<FtsHit>` to feed into
-    /// `search::merge_hits` alongside `semantic_search`'s KNN hits. Reuses
-    /// the same tokenize/stopword/prefix-match query building as the
-    /// file-grain `search()` above. Returns up to `k` hits, each the best
-    /// chunk of a different file, ordered best-first (by BM25 rank); returns
-    /// an empty `Vec` (never errors) for an empty/stopword-only query,
-    /// `k == 0`, or a pre-v12 DB where `chunks_fts` doesn't exist yet.
+    /// Keyword search over the chunk index (`chunks_fts`), the only keyword
+    /// index (knowledge-core decision 15): the keyword half of
+    /// `routing::search_member`, beside `semantic_search`'s meaning half.
+    /// Query words are tokenized with stopwords dropped and the last word
+    /// matched as a prefix. Returns up to `k` hits, each the best chunk of a
+    /// different file, ordered best-first (by BM25 rank); returns an empty
+    /// `Vec` (never errors) for an empty/stopword-only query, `k == 0`, or a
+    /// pre-v12 DB where `chunks_fts` doesn't exist yet.
     pub fn search_chunks_fts(&self, query: &str, k: usize) -> Result<Vec<FtsHit>> {
         if k == 0 {
             return Ok(Vec::new());
@@ -1208,30 +1201,6 @@ impl Db {
         Ok(hits)
     }
 
-    /// Chunk-tier lookup for a set of chunk ids (kenignore task 2.4): the
-    /// src-tauri `hybrid_search` command uses this to badge each hit with
-    /// its `chunks.tier` (ken-core's `kenignore::Tier` numeric values — `0`
-    /// = Full, `1` = SearchOnly; `Ignore` rows are never stored) without
-    /// recomputing classification itself. Ids not found in `chunks` are
-    /// simply absent from the returned map.
-    pub fn chunk_tiers(&self, chunk_ids: &[i64]) -> Result<std::collections::HashMap<i64, i64>> {
-        let mut out = std::collections::HashMap::new();
-        if chunk_ids.is_empty() {
-            return Ok(out);
-        }
-        let placeholders = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT id, tier FROM chunks WHERE id IN ({placeholders})");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(chunk_ids.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (id, tier) = row?;
-            out.insert(id, tier);
-        }
-        Ok(out)
-    }
-
     /// Total row count in `chunks` (semantic-index task 2.4's ~50k guardrail
     /// check). A cheap `COUNT(*)`, meant to be called once after each
     /// build/incremental update — not per search.
@@ -1273,8 +1242,8 @@ impl Db {
     }
 
     /// Insert or update a file's index entry. `text` is the extracted
-    /// content (empty for metadata-only/failed files); `name` is the
-    /// filename tokenized for name search.
+    /// content (empty for metadata-only/failed files). Search reads the
+    /// file's chunks, which the caller writes (`upsert_chunks`).
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_file(
         &mut self,
@@ -1286,7 +1255,6 @@ impl Db {
         error: Option<&str>,
         text: &str,
     ) -> Result<()> {
-        let name = name_tokens(rel_path);
         let tx = self.conn.savepoint()?;
         tx.execute(
             r#"INSERT INTO files (rel_path, kind, size, mtime, status, error)
@@ -1300,24 +1268,11 @@ impl Db {
             params![rel_path],
             |r| r.get(0),
         )?;
-        let existing: bool = tx
-            .query_row(
-                "SELECT 1 FROM contents WHERE file_id = ?1",
-                params![file_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if existing {
-            tx.execute(
-                "UPDATE contents SET text = ?2, name = ?3 WHERE file_id = ?1",
-                params![file_id, text, name],
-            )?;
-        } else {
-            tx.execute(
-                "INSERT INTO contents (file_id, text, name) VALUES (?1, ?2, ?3)",
-                params![file_id, text, name],
-            )?;
-        }
+        tx.execute(
+            "INSERT INTO contents (file_id, text) VALUES (?1, ?2)
+             ON CONFLICT(file_id) DO UPDATE SET text = ?2",
+            params![file_id, text],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1332,8 +1287,6 @@ impl Db {
             )
             .ok();
         if let Some(id) = file_id {
-            // Delete contents first so the FTS delete trigger fires, then
-            // the file row.
             tx.execute("DELETE FROM contents WHERE file_id = ?1", params![id])?;
             tx.execute("DELETE FROM files WHERE id = ?1", params![id])?;
             strip_file(&tx, rel_path)?;
@@ -1407,13 +1360,11 @@ impl Db {
     /// `docs` move.
     ///
     /// Tables covered: `files`, `extractions`, `ocr_regions`, `ocr_pending`,
-    /// `events.source`, `entities.sources` (a JSON array) and the file-valued
-    /// `review_items.source_ref` kinds. `contents` is keyed by `file_id`, not by
-    /// path, so its rows need no move — only the FTS `name` tokens of a row
-    /// whose *basename* changed are rebuilt, and the `contents` update trigger
-    /// carries that into the `search` index (which stores no path of its own:
-    /// it is an external-content table over `contents`, joined back to `files`
-    /// by rowid at query time).
+    /// `events.source`, `entities.sources` (a JSON array), the file-valued
+    /// `review_items.source_ref` kinds, and what search reads by path: the
+    /// chunks (with the path words in their keyword row, `fts_names`), page
+    /// facts, tiers, page links and the code map. `contents` is keyed by
+    /// `file_id`, not by path, so its rows need no move.
     pub fn rename_prefix(&mut self, from_rel: &str, to_rel: &str) -> Result<usize> {
         let from = from_rel.trim_matches('/').to_string();
         let to = to_rel.trim_matches('/').to_string();
@@ -1428,20 +1379,17 @@ impl Db {
         let tx = self.conn.transaction()?;
 
         // Which rows are moving, and where to. Needed up front because the
-        // basename-dependent FTS `name` and the JSON `entities.sources` can't be
-        // rewritten by a single UPDATE.
-        let pairs: Vec<(i64, String, String)> = {
+        // JSON `entities.sources` can't be rewritten by a single UPDATE.
+        let pairs: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, rel_path FROM files
+                "SELECT rel_path FROM files
                  WHERE rel_path = ?1 OR rel_path LIKE ?2 ESCAPE '\\'",
             )?;
-            let rows = stmt.query_map(params![from, like], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows = stmt.query_map(params![from, like], |r| r.get::<_, String>(0))?;
             rows.map(|r| {
-                r.map(|(id, old)| {
+                r.map(|old| {
                     let new = format!("{to}{}", &old[from.len()..]);
-                    (id, old, new)
+                    (old, new)
                 })
             })
             .collect::<std::result::Result<_, _>>()?
@@ -1454,29 +1402,31 @@ impl Db {
         // A move refuses an existing destination on disk, but the index can
         // still hold a stale row there (a path deleted outside the app, say).
         // Clear the destination first so the UNIQUE/PK constraints can't trip.
-        for (table, col) in [
-            ("files", "rel_path"),
-            ("extractions", "rel_path"),
-            ("ocr_regions", "rel_path"),
-            ("ocr_pending", "rel_path"),
-        ] {
+        let to_like = format!("{}/%", like_escape(&to));
+        let stale_chunks: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+            let rows = stmt.query_map(params![to, to_like], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let vec_exists = table_exists(&tx, "vec_chunks")?;
+        for id in &stale_chunks {
+            tx.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![id])?;
+            if vec_exists {
+                tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+            }
+        }
+        for (table, col) in PATH_KEYED.iter().filter(|(table, _)| *table != "events") {
             tx.execute(
                 &format!(
                     "DELETE FROM {table}
                      WHERE {col} = ?1 OR {col} LIKE ?2 ESCAPE '\\'"
                 ),
-                params![to, format!("{}/%", like_escape(&to))],
+                params![to, to_like],
             )?;
         }
 
         // The bulk of the work: one prefix rewrite per path-keyed table.
-        for (table, col) in [
-            ("files", "rel_path"),
-            ("extractions", "rel_path"),
-            ("ocr_regions", "rel_path"),
-            ("ocr_pending", "rel_path"),
-            ("events", "source"),
-        ] {
+        for (table, col) in PATH_KEYED {
             tx.execute(
                 &format!(
                     "UPDATE {table} SET {col} = ?1 || substr({col}, ?2)
@@ -1494,22 +1444,22 @@ impl Db {
             params![to, cut, from, like],
         )?;
 
-        // FTS name tokens: only rows whose basename actually changed (a folder
-        // move leaves every child's filename alone, so this is usually a no-op).
-        for (id, old, new) in &pairs {
-            let (old_name, new_name) = (name_tokens(old), name_tokens(new));
-            if old_name != new_name {
-                tx.execute(
-                    "UPDATE contents SET name = ?2 WHERE file_id = ?1",
-                    params![id, new_name],
-                )?;
+        // A chunk's keyword row holds its path's words (`fts_names`), so the
+        // moved chunks' rows are written again with the new path.
+        {
+            let mut moved = tx.prepare("SELECT id, path, text FROM chunks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+            let mut write = tx.prepare("UPDATE chunks_fts SET names = ?2 WHERE rowid = ?1")?;
+            let mut rows = moved.query(params![to, to_like])?;
+            while let Some(row) = rows.next()? {
+                let (id, path, text): (i64, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
+                write.execute(params![id, fts_names(&path, &text)])?;
             }
         }
 
         // `entities.sources` is a JSON array of rel_paths, so it needs a
         // decode/rewrite/encode rather than SQL string surgery.
         let renames: std::collections::HashMap<&str, &str> =
-            pairs.iter().map(|(_, o, n)| (o.as_str(), n.as_str())).collect();
+            pairs.iter().map(|(o, n)| (o.as_str(), n.as_str())).collect();
         let ent_rows: Vec<(i64, String)> = {
             let mut stmt = tx.prepare("SELECT id, sources FROM entities")?;
             let rows = stmt.query_map([], |r| {
@@ -1684,167 +1634,6 @@ impl Db {
         Ok(rows)
     }
 
-    /// Ranked full-text search. Query is treated as-you-type: all terms
-    /// required, last term matched as a prefix. Filename matches are
-    /// boosted over body matches, and a second query-time pass matches
-    /// filenames by case-insensitive substring (every token must appear
-    /// somewhere in the rel_path) so partial names like "roadmap" still
-    /// find `Q3RoadmapFinal.docx`; both passes are merged and deduped.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let tokens = query_tokens(query);
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Drop stopwords before building any pass (FTS, phrase, filename LIKE) so
-        // question-form queries don't pay for intersecting their giant posting
-        // lists — the last (prefix) token and pure-stopword queries are preserved
-        // by `significant_token_list`.
-        let tokens = significant_token_list(&tokens);
-        let fts_query = build_fts_query(&tokens);
-        let mut stmt = self.conn.prepare(
-            r#"SELECT f.rel_path, f.kind, f.status,
-                      snippet(search, 0, '<mark>', '</mark>', '…', 12),
-                      bm25(search, 1.0, 4.0), f.mtime
-               FROM search JOIN files f ON f.id = search.rowid
-               WHERE search MATCH ?1
-               ORDER BY bm25(search, 1.0, 4.0)
-               LIMIT ?2"#,
-        )?;
-        // `mtimes` carries each hit's file mtime (unix seconds) out of the query
-        // rows so the recency blend can be applied after all passes merge,
-        // without widening `SearchHit` (the frontend never needs it).
-        let mut mtimes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        let mut hits: Vec<SearchHit> = stmt
-            .query_map(params![fts_query, limit as i64], |r| {
-                let rel_path: String = r.get(0)?;
-                let mtime: i64 = r.get(5)?;
-                Ok((
-                    SearchHit {
-                        rel_path,
-                        kind: r.get(1)?,
-                        status: r.get(2)?,
-                        snippet: r.get(3)?,
-                        rank: r.get(4)?,
-                    },
-                    mtime,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|(h, m)| {
-                mtimes.insert(h.rel_path.clone(), m);
-                h
-            })
-            .collect();
-        drop(stmt);
-
-        // Phrase boost: for multi-token queries, docs where the tokens occur as
-        // an adjacent phrase are the strongest lexical matches. A second MATCH
-        // pass with an FTS5 phrase query ("tok1 tok2 …") finds them; each such
-        // rel_path gets `PHRASE_BONUS` shaved off its rank. A phrase match always
-        // contains every token, so it is already a subset of the main pass — we
-        // only ever adjust ranks here, never introduce new hits.
-        if tokens.len() >= 2 {
-            let phrase_query = format!("\"{}\"", tokens.join(" "));
-            let mut pstmt = self.conn.prepare(
-                r#"SELECT f.rel_path FROM search JOIN files f ON f.id = search.rowid
-                   WHERE search MATCH ?1
-                   ORDER BY bm25(search, 1.0, 4.0)
-                   LIMIT ?2"#,
-            )?;
-            let phrase_paths: std::collections::HashSet<String> = pstmt
-                .query_map(params![phrase_query, limit as i64], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<_, _>>()?;
-            drop(pstmt);
-            for hit in hits.iter_mut() {
-                if phrase_paths.contains(&hit.rel_path) {
-                    hit.rank -= PHRASE_BONUS;
-                }
-            }
-        }
-
-        // Filename pass: every token as a case-insensitive substring of the
-        // rel_path. Catches what FTS name tokens can't — mid-word matches
-        // and non-final prefixes.
-        let lowered: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
-        let clauses = vec!["lower(rel_path) LIKE ? ESCAPE '\\'"; lowered.len()].join(" AND ");
-        // Bound the scan: without a LIMIT a short/common token (e.g. a single
-        // char) scans and returns the whole `files` table, which — combined with
-        // this running synchronously on the command thread — froze the UI. We
-        // only ever keep `limit` results anyway, so cap the scan there.
-        let sql = format!(
-            "SELECT rel_path, kind, status, mtime FROM files WHERE {clauses} LIMIT {limit}"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let patterns: Vec<String> = lowered
-            .iter()
-            .map(|t| format!("%{}%", like_escape(t)))
-            .collect();
-        let name_rows: Vec<(String, String, String, i64)> = stmt
-            .query_map(rusqlite::params_from_iter(&patterns), |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-
-        // Merge in O(n) via a rel_path -> index map instead of an O(n²) linear
-        // scan of `hits` per name row.
-        let mut index: std::collections::HashMap<String, usize> = hits
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h.rel_path.clone(), i))
-            .collect();
-        for (rel_path, kind, status, mtime) in name_rows {
-            let rank = name_match_rank(&rel_path, query);
-            mtimes.entry(rel_path.clone()).or_insert(mtime);
-            match index.get(&rel_path) {
-                Some(&i) => {
-                    // Both passes hit: keep the better rank, and the content
-                    // snippet unless it's empty (metadata-only/failed files).
-                    let hit = &mut hits[i];
-                    if rank < hit.rank {
-                        hit.rank = rank;
-                    }
-                    if hit.snippet.is_empty() {
-                        hit.snippet = name_snippet(&rel_path, &lowered);
-                    }
-                }
-                None => {
-                    let snippet = name_snippet(&rel_path, &lowered);
-                    index.insert(rel_path.clone(), hits.len());
-                    hits.push(SearchHit {
-                        snippet,
-                        rel_path,
-                        kind,
-                        status,
-                        rank,
-                    });
-                }
-            }
-        }
-        // Recency blend: fold a small, bounded (magnitude ≤ RECENCY_MAX) negative
-        // offset from exponential mtime decay into every rank, so a recent file
-        // edges out an equally-scored stale one. RECENCY_MAX is far smaller than
-        // the gaps between the synthetic filename tiers (−2 / −50 / −100), so an
-        // exact/prefix filename match still dominates any content hit regardless
-        // of how recent the content is.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        for hit in hits.iter_mut() {
-            let mtime = mtimes.get(&hit.rel_path).copied().unwrap_or(0);
-            hit.rank += recency_bonus(mtime, now_secs);
-        }
-        hits.sort_by(|a, b| {
-            a.rank
-                .partial_cmp(&b.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.rel_path.cmp(&b.rel_path))
-        });
-        hits.truncate(limit);
-        Ok(hits)
-    }
-
     /// Drop all indexed data (schema stays). Used by reindex.
     pub fn clear(&mut self) -> Result<()> {
         let tx = self.conn.savepoint()?;
@@ -1867,6 +1656,24 @@ impl Db {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Drop the chunks of every path no longer in `files`: what a reindex
+    /// ([`Self::clear`], then a scan) leaves behind of a file that is gone.
+    /// The chunks of files still there keep their vectors. Returns how many
+    /// paths were dropped.
+    pub fn drop_orphan_chunks(&mut self) -> Result<usize> {
+        let paths: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT path FROM chunks WHERE path NOT IN (SELECT rel_path FROM files)")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for path in &paths {
+            self.delete_chunks(path)?;
+        }
+        Ok(paths.len())
     }
 
     pub fn file_count(&self) -> Result<i64> {
@@ -2462,16 +2269,7 @@ impl Db {
                   WHERE f.status = 'indexed' AND f.tier <> 0
                     AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)",
             )?,
-            control: self
-                .meta_get("index_control")?
-                .and_then(|s| serde_json::from_str(&s).ok()),
         })
-    }
-
-    /// Record the last control query's result (see `scan::control_query`).
-    pub fn set_index_control(&self, result: &ControlResult) -> Result<()> {
-        let json = serde_json::to_string(result).map_err(|e| crate::Error::Other(e.to_string()))?;
-        self.meta_set("index_control", &json)
     }
 
     /// The oldest `pending` file (insertion order via implicit rowid) and the
@@ -3407,8 +3205,8 @@ impl Db {
     ///
     /// The recognized text is also merged into `contents` (appended to whatever
     /// the base extractor produced — empty EXIF for images, the sparse text
-    /// layer for scanned PDFs), which fires the FTS trigger so the file becomes
-    /// searchable by its OCR'd words. Because a content change re-runs
+    /// layer for scanned PDFs) and chunked, so the file becomes searchable by
+    /// its OCR'd words. Because a content change re-runs
     /// `index_one` (rewriting `contents` to the fresh base text) *before*
     /// re-enqueuing OCR, this append never accumulates stale text across
     /// versions.
@@ -3441,47 +3239,36 @@ impl Db {
                 params![rel_path, r.page, r.text, r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3]],
             )?;
         }
-        // Merge the recognized text into `contents` so search picks it up.
+        // Merge the recognized text into `contents`, and below into the
+        // file's chunks, so search picks it up.
         let ocr_text: String = regions
             .iter()
             .map(|r| r.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        let mut merged_text: Option<(String, i64)> = None;
         if !ocr_text.trim().is_empty() {
-            let file_id: Option<i64> = tx
+            let file: Option<(i64, i64)> = tx
                 .query_row(
-                    "SELECT id FROM files WHERE rel_path = ?1",
+                    "SELECT id, tier FROM files WHERE rel_path = ?1",
                     params![rel_path],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .ok();
-            if let Some(id) = file_id {
-                let existing: Option<(String, String)> = tx
-                    .query_row(
-                        "SELECT text, name FROM contents WHERE file_id = ?1",
-                        params![id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
+            if let Some((id, tier)) = file {
+                let existing: Option<String> = tx
+                    .query_row("SELECT text FROM contents WHERE file_id = ?1", params![id], |r| r.get(0))
                     .ok();
-                match existing {
-                    Some((base, _name)) => {
-                        let merged = if base.trim().is_empty() {
-                            ocr_text
-                        } else {
-                            format!("{base}\n{ocr_text}")
-                        };
-                        tx.execute(
-                            "UPDATE contents SET text = ?2 WHERE file_id = ?1",
-                            params![id, merged],
-                        )?;
-                    }
-                    None => {
-                        tx.execute(
-                            "INSERT INTO contents (file_id, text, name) VALUES (?1, ?2, ?3)",
-                            params![id, ocr_text, name_tokens(rel_path)],
-                        )?;
-                    }
-                }
+                let merged = match existing {
+                    Some(base) if !base.trim().is_empty() => format!("{base}\n{ocr_text}"),
+                    _ => ocr_text,
+                };
+                tx.execute(
+                    "INSERT INTO contents (file_id, text) VALUES (?1, ?2)
+                     ON CONFLICT(file_id) DO UPDATE SET text = ?2",
+                    params![id, merged],
+                )?;
+                merged_text = Some((merged, tier));
             }
         }
         tx.execute(
@@ -3490,6 +3277,17 @@ impl Db {
             params![rel_path, content_hash],
         )?;
         tx.commit()?;
+        // The chunk index is the only search index (knowledge-core decision
+        // 15), so the recognized words are chunked like any file's text.
+        if let Some((text, tier)) = merged_text {
+            let tier = if tier == crate::kenignore::Tier::SearchOnly as i64 {
+                crate::kenignore::Tier::SearchOnly
+            } else {
+                crate::kenignore::Tier::Full
+            };
+            let chunks = crate::chunker::chunk_file(rel_path, &text, &crate::chunker::IndexProfile::default_for(rel_path));
+            self.upsert_chunks(rel_path, &chunks, tier)?;
+        }
         Ok(())
     }
 
@@ -4070,22 +3868,27 @@ fn strip_file(conn: &Connection, rel_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Filename tokens for the `name` FTS column: stem + extension with
-/// separators spaced out ("Meeting-Notes_Jul8.md" → "Meeting Notes Jul8 md").
-fn name_tokens(rel_path: &str) -> String {
-    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    file_name
-        .replace(['-', '_', '.', '—'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+/// The tables a move rewrites by path (`Db::rename_prefix`), each with its
+/// path column. A stale row at the destination is cleared first in every one
+/// but `events`, which is history.
+const PATH_KEYED: [(&str, &str); 11] = [
+    ("files", "rel_path"),
+    ("extractions", "rel_path"),
+    ("ocr_regions", "rel_path"),
+    ("ocr_pending", "rel_path"),
+    ("events", "source"),
+    ("chunks", "path"),
+    ("page_meta", "rel_path"),
+    ("file_authority", "rel_path"),
+    ("page_links", "from_path"),
+    ("code_symbols", "path"),
+    ("code_imports", "path"),
+];
 
 /// Relative-path tokens for FTS index augmentation: the *whole* path (every
 /// segment, not just the filename), separators spaced out
 /// ("src/local_llm.rs" → "src local_llm rs" → "src local llm rs" after
-/// separator-splitting). Distinct from `name_tokens`, which only tokenizes
-/// the last path segment.
+/// separator-splitting).
 fn path_tokens(rel_path: &str) -> String {
     rel_path
         .replace(['/', '\\', '-', '_', '.', '—'], " ")
@@ -4305,7 +4108,8 @@ fn build_chunk_query(tokens: &[String], any: bool) -> String {
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            // The as-you-type prefix as in `build_fts_query`.
+            // The last word is an as-you-type prefix once it has two
+            // letters: a one-letter prefix matches most of the index.
             let word = if !any && i == last && t.chars().count() >= 2 { format!("\"{t}\" *") } else { format!("\"{t}\"") };
             let lower = t.to_lowercase();
             let stem = crate::search::stem(&lower);
@@ -4319,111 +4123,6 @@ fn build_chunk_query(tokens: &[String], any: bool) -> String {
     // FTS5 ANDs bare phrases side by side, but a bracketed group needs
     // the word.
     terms.join(if any { " OR " } else { " AND " })
-}
-
-/// Build an FTS5 query from tokens: each quoted, all ANDed, last token as
-/// prefix for as-you-type feel.
-fn build_fts_query(tokens: &[String]) -> String {
-    let last = tokens.len().saturating_sub(1);
-    let parts: Vec<String> = tokens
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            // Only apply the as-you-type prefix (`*`) once the last token is at
-            // least two chars. A 1-char prefix like `a*` matches a huge share of
-            // the index, turning a single keystroke into a near-full scan; match
-            // the char exactly instead until a second char narrows it.
-            if i == last && t.chars().count() >= 2 {
-                format!("\"{t}\" *")
-            } else {
-                format!("\"{t}\"")
-            }
-        })
-        .collect();
-    parts.join(" ")
-}
-
-// Synthetic ranks for filename matches, on the bm25 scale (lower = better).
-// Exact and prefix basename matches outrank any realistic content score; a
-// plain substring match beats weak content hits (bm25 near zero) but yields
-// to strongly relevant content.
-const NAME_RANK_EXACT: f64 = -100.0;
-const NAME_RANK_PREFIX: f64 = -50.0;
-const NAME_RANK_SUBSTRING: f64 = -2.0;
-
-// Rank shaved off a doc whose query tokens occur as an adjacent phrase. Big
-// enough to lift a true phrase match over docs with the same tokens scattered,
-// small enough to stay well inside the gap to the filename tiers so filename
-// dominance is untouched.
-const PHRASE_BONUS: f64 = 5.0;
-
-// Recency blend. `RECENCY_MAX` bounds the (negative) bonus a file can earn from
-// being fresh; `RECENCY_TAU_DAYS` is the exponential decay constant. At ~1 week
-// old the bonus is still ~−2.7 (near the −RECENCY_MAX floor), and by ~1 year it
-// has decayed to essentially 0 — a recent file wins ties without ever
-// overpowering the filename tiers (RECENCY_MAX ≪ 48, the smallest tier gap).
-const RECENCY_MAX: f64 = 3.0;
-const RECENCY_TAU_DAYS: f64 = 60.0;
-
-/// Bounded negative recency offset for a file modified at `mtime` (unix
-/// seconds), given `now_secs`. Exponential decay on age: −`RECENCY_MAX` for a
-/// just-touched file, smoothly approaching 0 as the file ages. Future/clock-skew
-/// mtimes clamp to age 0 (max freshness).
-fn recency_bonus(mtime: i64, now_secs: i64) -> f64 {
-    let age_days = (now_secs - mtime).max(0) as f64 / 86_400.0;
-    -RECENCY_MAX * (-age_days / RECENCY_TAU_DAYS).exp()
-}
-
-/// Rank a filename match: exact basename (with or without extension) first,
-/// then basename prefix, then plain substring-in-path.
-fn name_match_rank(rel_path: &str, raw_query: &str) -> f64 {
-    let base = rel_path.rsplit('/').next().unwrap_or(rel_path).to_lowercase();
-    let stem = base.rsplit_once('.').map(|(s, _)| s.to_string()).unwrap_or_else(|| base.clone());
-    let q = raw_query.trim().to_lowercase();
-    if base == q || stem == q {
-        NAME_RANK_EXACT
-    } else if base.starts_with(&q) {
-        NAME_RANK_PREFIX
-    } else {
-        NAME_RANK_SUBSTRING
-    }
-}
-
-/// Snippet for a filename hit: the basename with each matched token wrapped
-/// in `<mark>` — the same shape content snippets have, so the UI renders it
-/// unchanged. Tokens that only matched in the directory part stay unmarked.
-fn name_snippet(rel_path: &str, lowered_tokens: &[String]) -> String {
-    let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
-    let lower = base.to_lowercase();
-    // Lowercasing can shift byte offsets for exotic Unicode; skip marking
-    // rather than risk splitting a char.
-    if lower.len() != base.len() {
-        return base.to_string();
-    }
-    let mut ranges: Vec<(usize, usize)> = lowered_tokens
-        .iter()
-        .filter_map(|t| lower.find(t.as_str()).map(|i| (i, i + t.len())))
-        .collect();
-    ranges.sort_unstable();
-    let mut out = String::new();
-    let mut pos = 0;
-    for (start, end) in ranges {
-        if start < pos {
-            continue; // overlaps a previous mark; keep it simple
-        }
-        let (Some(before), Some(hit)) = (base.get(pos..start), base.get(start..end)) else {
-            return base.to_string();
-        };
-        out.push_str(before);
-        out.push_str("<mark>");
-        out.push_str(hit);
-        out.push_str("</mark>");
-        pos = end;
-    }
-    match base.get(pos..) {
-        Some(rest) => out + rest,
-        None => base.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -5164,7 +4863,7 @@ mod tests {
         // An image indexes as metadata-only with no content — not searchable yet.
         db.upsert_file("scans/receipt.png", "image", 500, 1, "metadata_only", None, "")
             .unwrap();
-        assert!(db.search("espresso", 5).unwrap().is_empty());
+        assert!(db.search_chunks_fts("espresso", 5).unwrap().is_empty());
 
         assert!(db.enqueue_ocr_if_changed("scans/receipt.png", "h1").unwrap());
         assert_eq!(
@@ -5188,10 +4887,10 @@ mod tests {
         assert_eq!(regions[0].text, "espresso machine");
         assert_eq!(regions[0].bbox, [0.1, 0.2, 0.3, 0.05]);
         assert!(db
-            .search("espresso", 5)
+            .search_chunks_fts("espresso", 5)
             .unwrap()
             .iter()
-            .any(|h| h.rel_path == "scans/receipt.png"));
+            .any(|h| h.path == "scans/receipt.png"));
     }
 
     #[test]
@@ -5686,78 +5385,6 @@ mod tests {
     }
 
     #[test]
-    fn search_finds_and_highlights() {
-        let db = seeded();
-        let hits = db.search("billing cutover", 10).unwrap();
-        assert_eq!(hits.len(), 2);
-        assert!(hits[0].snippet.contains("<mark>"));
-    }
-
-    /// A cloud placeholder is indexed with empty text but must remain findable by
-    /// name: `upsert_file` writes name tokens into FTS even for contentless rows,
-    /// and the query-time rel_path LIKE pass catches mid-word fragments. This
-    /// pins the guarantee scan.rs relies on ("Name-searchable; content arrives
-    /// when the user opens the file").
-    #[test]
-    fn cloud_only_rows_are_name_searchable() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file(
-            "meetings/Standup Recording 06.15.mp4",
-            "video",
-            999,
-            0,
-            crate::scan::STATUS_CLOUD_ONLY,
-            None,
-            "",
-        )
-        .unwrap();
-        // Whole-token match via the FTS name column.
-        let hits = db.search("standup", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].status, crate::scan::STATUS_CLOUD_ONLY);
-        // Mid-word fragment via the filename substring pass.
-        let hits = db.search("cording", 10).unwrap();
-        assert_eq!(hits.len(), 1, "filename LIKE pass must catch mid-word fragments");
-    }
-
-    #[test]
-    fn search_prefix_as_you_type() {
-        let db = seeded();
-        let hits = db.search("cutov", 10).unwrap();
-        assert!(!hits.is_empty(), "prefix of last token should match");
-    }
-
-    #[test]
-    fn single_char_query_is_bounded_and_fast() {
-        // A 1-char query must never scan/return the whole index. Seed many
-        // files that all contain the char in both name and body, then assert the
-        // result honors `limit` (both the FTS LIMIT and the filename-scan LIMIT).
-        let mut db = Db::open_in_memory().unwrap();
-        for i in 0..50 {
-            db.upsert_file(
-                &format!("area/alpha-{i}.md"),
-                "md",
-                1,
-                1,
-                "indexed",
-                None,
-                "alpha and more alpha",
-            )
-            .unwrap();
-        }
-        let hits = db.search("a", 5).unwrap();
-        assert!(hits.len() <= 5, "1-char query must respect limit: {}", hits.len());
-        assert!(!hits.is_empty(), "1-char query should still return matches");
-    }
-
-    fn now_secs() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-    }
-
-    #[test]
     fn excerpt_centers_on_match_and_trims_word_boundaries() {
         let mut db = Db::open_in_memory().unwrap();
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa \
@@ -5799,185 +5426,31 @@ mod tests {
     }
 
     #[test]
-    fn phrase_match_ranks_above_scattered_tokens() {
-        let mut db = Db::open_in_memory().unwrap();
-        // A: long doc containing the exact phrase "quick brown" (weaker bm25 on
-        // its own). B: short doc with both tokens but never adjacent in order.
-        db.upsert_file(
-            "a.md", "md", 1, 1, "indexed", None,
-            "In the morning report the quick brown metric rose sharply across \
-             every regional division and subteam over the quarter.",
-        )
-        .unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "brown then quick").unwrap();
-        let hits = db.search("quick brown", 10).unwrap();
-        assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!(hits[0].rel_path, "a.md", "phrase doc must rank first: {hits:?}");
-    }
-
-    #[test]
-    fn recency_breaks_ties_between_equal_content_matches() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Identical content → identical bm25. Names chosen so the alphabetical
-        // tie-break would put the *old* file first; recency must override that.
-        db.upsert_file("aaa-old.md", "md", 1, 1, "indexed", None, "unicorn stampede").unwrap();
-        db.upsert_file("zzz-new.md", "md", 1, now_secs(), "indexed", None, "unicorn stampede")
-            .unwrap();
-        let hits = db.search("unicorn", 10).unwrap();
-        assert_eq!(hits.len(), 2, "{hits:?}");
-        assert_eq!(hits[0].rel_path, "zzz-new.md", "recent file must win the tie: {hits:?}");
-    }
-
-    #[test]
-    fn exact_filename_match_beats_recent_content_regardless_of_recency() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Old file whose *name* exactly matches the query, unrelated content.
-        db.upsert_file("budget.md", "md", 1, 1, "indexed", None, "quarterly figures").unwrap();
-        // Fresh file whose *content* matches the query.
-        db.upsert_file("notes.md", "md", 1, now_secs(), "indexed", None, "the budget was revised")
-            .unwrap();
-        let hits = db.search("budget", 10).unwrap();
-        assert_eq!(
-            hits[0].rel_path, "budget.md",
-            "exact filename match must dominate even a brand-new content match: {hits:?}"
-        );
-        // And its rank stays at the exact-name tier (recency barely perturbs an
-        // old file, and never enough to close the gap to content ranks anyway).
-        assert!(hits[0].rank <= NAME_RANK_EXACT + 0.001, "{hits:?}");
-    }
-
-    #[test]
-    fn stopwords_dropped_so_question_form_still_matches() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Content lacks "what"/"is"/"the" entirely; the pre-stopword AND query
-        // would exclude it. After filtering, only the content words remain.
-        db.upsert_file(
-            "brief.md", "md", 1, 1, "indexed", None,
-            "Operating model for our AI pilot program spans several teams.",
-        )
-        .unwrap();
-        let hits = db
-            .search("what is the operating model for the ai pilot", 10)
-            .unwrap();
-        assert!(
-            hits.iter().any(|h| h.rel_path == "brief.md"),
-            "question-form query should still find the content doc: {hits:?}"
-        );
-        // The filter keeps exactly the content-bearing tokens (last token kept).
+    fn significant_tokens_drop_stopwords_but_keep_a_last_or_lone_one() {
         assert_eq!(
             significant_tokens("what is the operating model for the ai pilot"),
             vec!["operating", "model", "ai", "pilot"],
         );
-    }
-
-    #[test]
-    fn last_stopword_token_is_never_dropped() {
-        let mut db = Db::open_in_memory().unwrap();
-        // "the" is a stopword, but as the sole/last token it must survive so its
-        // as-you-type prefix still reaches "theme.txt".
-        db.upsert_file("theme.txt", "txt", 1, 1, "indexed", None, "themes and motifs").unwrap();
+        // The last word is kept for its as-you-type prefix.
         assert_eq!(significant_tokens("the"), vec!["the"]);
-        let hits = db.search("the", 10).unwrap();
-        assert!(
-            hits.iter().any(|h| h.rel_path == "theme.txt"),
-            "sole stopword token must still prefix-match: {hits:?}"
-        );
-    }
-
-    #[test]
-    fn pure_stopword_query_is_kept_verbatim() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("q.md", "md", 1, 1, "indexed", None, "what is the plan").unwrap();
-        // All tokens are stopwords → filter would gut the query, so it is kept
-        // unchanged and still matches as before.
+        // A question of stopwords only is kept whole.
         assert_eq!(significant_tokens("what is"), vec!["what", "is"]);
-        let hits = db.search("what is", 10).unwrap();
-        assert!(
-            hits.iter().any(|h| h.rel_path == "q.md"),
-            "pure-stopword query must still return results: {hits:?}"
-        );
     }
 
+    /// The file-level `search` index and its file-name column are gone
+    /// (knowledge-core decision 15): every search reads the chunk index.
     #[test]
-    fn failed_file_findable_by_name() {
-        let db = seeded();
-        let hits = db.search("contract", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].rel_path, "vendor/Contract v3.pdf");
-        assert_eq!(hits[0].status, "failed");
-    }
-
-    #[test]
-    fn filename_substring_matches_without_content_hit() {
-        let mut db = seeded();
-        // "roadmap" is neither a name token (camelCase stays one token) nor
-        // in the content — only the substring pass can find this.
-        db.upsert_file("plans/Q3RoadmapFinal.docx", "docx", 300, 1, "indexed", None,
-            "Milestones for the third quarter.")
-            .unwrap();
-        let hits = db.search("roadmap", 10).unwrap();
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].rel_path, "plans/Q3RoadmapFinal.docx");
-        // Snippet is the basename with the match marked.
-        assert_eq!(hits[0].snippet, "Q3<mark>Roadmap</mark>Final.docx");
-    }
-
-    #[test]
-    fn filename_match_is_case_insensitive() {
-        let mut db = seeded();
-        db.upsert_file("plans/Q3RoadmapFinal.docx", "docx", 300, 1, "indexed", None, "")
-            .unwrap();
-        for q in ["ROADMAP", "q3roadmap", "RoadMapFin"] {
-            let hits = db.search(q, 10).unwrap();
-            assert!(
-                hits.iter().any(|h| h.rel_path == "plans/Q3RoadmapFinal.docx"),
-                "query {q:?} should match by filename: {hits:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn exact_basename_match_outranks_weak_content_hits() {
-        let mut db = seeded();
-        db.upsert_file("finance/budget.md", "md", 50, 1, "indexed", None,
-            "Numbers for the quarter.")
-            .unwrap();
-        db.upsert_file("notes/long-doc.md", "md", 5000, 1, "indexed", None,
-            "A long meandering note that mentions the budget once in passing.")
-            .unwrap();
-        let hits = db.search("budget", 10).unwrap();
-        assert!(hits.len() >= 2, "{hits:?}");
-        assert_eq!(hits[0].rel_path, "finance/budget.md", "{hits:?}");
-        assert_eq!(hits[0].rank, NAME_RANK_EXACT);
-    }
-
-    #[test]
-    fn name_and_content_match_dedupes_to_one_hit() {
-        let mut db = seeded();
-        db.upsert_file("finance/budget.md", "md", 50, 1, "indexed", None,
-            "The budget was approved on Friday.")
-            .unwrap();
-        let hits = db.search("budget", 10).unwrap();
-        let count = hits.iter().filter(|h| h.rel_path == "finance/budget.md").count();
-        assert_eq!(count, 1, "{hits:?}");
-        // The better (filename) rank wins; the content snippet is kept.
-        assert_eq!(hits[0].rank, NAME_RANK_EXACT);
-        assert!(hits[0].snippet.contains("<mark>budget</mark>"), "{hits:?}");
-    }
-
-    #[test]
-    fn multi_token_filename_query_requires_all_tokens() {
-        let mut db = seeded();
-        db.upsert_file("plans/Q3RoadmapFinal.docx", "docx", 300, 1, "indexed", None, "")
-            .unwrap();
-        // Both tokens appear in the rel_path (one in the folder, one in the
-        // basename) — hit. A token that appears nowhere — no hit.
-        assert!(db
-            .search("plans roadmap", 10)
+    fn the_file_level_search_index_is_gone() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!table_exists(&db.conn, "search").unwrap());
+        assert!(table_exists(&db.conn, "chunks_fts").unwrap());
+        let has_name = db
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('contents') WHERE name = 'name'")
             .unwrap()
-            .iter()
-            .any(|h| h.rel_path == "plans/Q3RoadmapFinal.docx"));
-        assert!(db.search("roadmap missing", 10).unwrap().is_empty());
+            .exists([])
+            .unwrap();
+        assert!(!has_name);
     }
 
     #[test]
@@ -5986,8 +5459,8 @@ mod tests {
         db.upsert_file("notes/meeting-jul-8.md", "md", 120, 2, "indexed", None,
             "Entirely new content about rollback rehearsal.")
             .unwrap();
-        assert!(db.search("rollback", 10).unwrap().len() == 1);
-        assert!(db.search("attendees", 10).unwrap().is_empty());
+        let text = db.get_text("notes/meeting-jul-8.md").unwrap().unwrap();
+        assert!(text.contains("rollback") && !text.contains("Attendees"), "{text}");
         assert_eq!(db.file_count().unwrap(), 3);
     }
 
@@ -6013,12 +5486,27 @@ mod tests {
     }
 
     #[test]
-    fn remove_file_removes_from_search() {
+    fn remove_file_removes_its_text_and_chunks() {
         let mut db = seeded();
+        db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan owns billing cutover", "h0")], crate::kenignore::Tier::Full)
+            .unwrap();
+        assert!(!db.search_chunks_fts("Natarajan", 10).unwrap().is_empty());
         db.remove_file("knowledge/People.md").unwrap();
-        let hits = db.search("Natarajan", 10).unwrap();
-        assert!(hits.is_empty());
+        assert!(db.search_chunks_fts("Natarajan", 10).unwrap().is_empty());
+        assert!(db.get_text("knowledge/People.md").unwrap().is_none());
         assert_eq!(db.file_count().unwrap(), 2);
+    }
+
+    /// A reindex clears `files` and scans again: the chunks of a file that is
+    /// gone go with it, and the chunks of a file still there stay.
+    #[test]
+    fn orphan_chunks_are_dropped() {
+        let mut db = seeded();
+        db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan", "h0")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("ghost.md", &[chunk(0, "ghost content", "h1")], crate::kenignore::Tier::Full).unwrap();
+        assert_eq!(db.drop_orphan_chunks().unwrap(), 1);
+        assert!(db.search_chunks_fts("ghost", 5).unwrap().is_empty());
+        assert!(!db.search_chunks_fts("Natarajan", 5).unwrap().is_empty());
     }
 
     #[test]
@@ -6030,8 +5518,8 @@ mod tests {
     }
 
     /// Renaming a folder rewrites every keyed row to the new prefix in place:
-    /// no content is dropped, FTS keeps finding the same text at the new path,
-    /// and a sibling folder that merely *starts with* the same characters
+    /// no content is dropped, the chunk index keeps finding the same text at
+    /// the new path, and a sibling folder that merely *starts with* the same characters
     /// (`docs2/` vs `docs/`) is left completely alone.
     #[test]
     fn rename_prefix_rewrites_subtree_and_leaves_string_siblings_alone() {
@@ -6039,6 +5527,9 @@ mod tests {
         db.upsert_file("docs/a.md", "md", 10, 1, "indexed", None, "alpha widget").unwrap();
         db.upsert_file("docs/deep/b.md", "md", 20, 2, "indexed", None, "beta widget").unwrap();
         db.upsert_file("docs2/c.md", "md", 30, 3, "indexed", None, "gamma widget").unwrap();
+        for (path, text) in [("docs/a.md", "alpha widget"), ("docs/deep/b.md", "beta widget"), ("docs2/c.md", "gamma widget")] {
+            db.upsert_chunks(path, &[chunk(0, text, path)], crate::kenignore::Tier::Full).unwrap();
+        }
         db.enqueue_extraction_if_changed("docs/a.md", "h1").unwrap();
         db.enqueue_extraction_if_changed("docs2/c.md", "h3").unwrap();
         db.enqueue_ocr_if_changed("docs/deep/b.md", "h2").unwrap();
@@ -6068,14 +5559,16 @@ mod tests {
         assert!(db.get_file("docs2/c.md").unwrap().is_some());
         assert_eq!(db.file_count().unwrap(), 3, "nothing was dropped");
 
-        // Search still finds the same content, now reported at the new path.
-        let hits = db.search("widget", 10).unwrap();
-        let paths: Vec<&str> = hits.iter().map(|h| h.rel_path.as_str()).collect();
+        // Search still finds the same content, now reported at the new path,
+        // and finds it by the new path's words.
+        let hits = db.search_chunks_fts("widget", 10).unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert!(paths.contains(&"Archive/docs/a.md"), "got {paths:?}");
         assert!(paths.contains(&"Archive/docs/deep/b.md"), "got {paths:?}");
         assert!(paths.contains(&"docs2/c.md"), "got {paths:?}");
         assert!(!paths.iter().any(|p| p.starts_with("docs/")), "got {paths:?}");
-        assert!(!db.search("alpha", 10).unwrap().is_empty(), "content still searchable");
+        let by_folder = db.search_chunks_fts("archive alpha", 10).unwrap();
+        assert_eq!(by_folder.first().map(|h| h.path.as_str()), Some("Archive/docs/a.md"), "{by_folder:?}");
 
         // Side tables follow the rename; the sibling's queue row does not move.
         assert!(db.get_ocr_regions("Archive/docs/deep/b.md").unwrap().len() == 1);
@@ -6091,21 +5584,22 @@ mod tests {
         assert_eq!(pending, vec!["Archive/docs/a.md".to_string(), "docs2/c.md".to_string()]);
     }
 
-    /// A single file rename goes through the same call: the row moves AND its
-    /// FTS `name` tokens are rebuilt from the new basename.
+    /// A single file rename goes through the same call: the row moves, and
+    /// so do its chunks, found by the new name and no longer by the old.
     #[test]
-    fn rename_prefix_renames_a_single_file_and_its_name_tokens() {
+    fn rename_prefix_renames_a_single_file_and_its_chunks() {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_file("notes/kickoff.md", "md", 10, 1, "indexed", None, "body text").unwrap();
+        db.upsert_chunks("notes/kickoff.md", &[chunk(0, "body text", "h0")], crate::kenignore::Tier::Full).unwrap();
 
         assert_eq!(db.rename_prefix("notes/kickoff.md", "notes/launch-plan.md").unwrap(), 1);
         assert!(db.get_file("notes/kickoff.md").unwrap().is_none());
         assert!(db.get_file("notes/launch-plan.md").unwrap().is_some());
 
-        let hits = db.search("launch", 10).unwrap();
+        let hits = db.search_chunks_fts("launch", 10).unwrap();
         assert_eq!(hits.len(), 1, "findable by the new name");
-        assert_eq!(hits[0].rel_path, "notes/launch-plan.md");
-        assert!(db.search("kickoff", 10).unwrap().is_empty(), "old name is gone");
+        assert_eq!(hits[0].path, "notes/launch-plan.md");
+        assert!(db.search_chunks_fts("kickoff", 10).unwrap().is_empty(), "old name is gone");
     }
 
     #[test]
@@ -6128,7 +5622,7 @@ mod tests {
 
         db.clear().unwrap();
         assert_eq!(db.file_count().unwrap(), 0);
-        assert!(db.search("billing", 10).unwrap().is_empty());
+        assert!(db.get_text("knowledge/People.md").unwrap().is_none());
         // From scratch: OCR regions and queue are gone too.
         assert!(db.get_ocr_regions("scan.png").unwrap().is_empty());
         assert!(db.next_pending_ocr().unwrap().is_none());
@@ -6144,7 +5638,7 @@ mod tests {
         let db = seeded();
         // FTS5 syntax characters must not panic or error.
         for q in ["\"unbalanced", "a AND OR NOT", "col:x", "(((", "*", "  "] {
-            let _ = db.search(q, 10).unwrap();
+            let _ = db.search_chunks_fts(q, 10).unwrap();
         }
     }
 
@@ -6170,7 +5664,6 @@ mod tests {
         }
         let ro = Db::open_read_only(base, id).unwrap();
         assert_eq!(ro.file_count().unwrap(), 1);
-        assert_eq!(ro.search("billing", 5).unwrap().len(), 1);
         assert!(ro.get_text("notes/a.md").unwrap().is_some());
         // SQLite itself refuses writes on this handle.
         assert!(ro
@@ -6181,13 +5674,13 @@ mod tests {
         assert!(Db::open_read_only(base, Uuid::new_v4()).is_err());
     }
 
-    // The search command opens its read-only handle once at project activation,
-    // while the writer keeps indexing. This asserts the structural guarantee the
-    // fix relies on: a WAL reader opened BEFORE a write still sees that write
-    // once committed, and returns the same hits the writer would. (The freedom
-    // from lock contention this buys is structural — it can't be unit-tested.)
+    // Search opens its read-only handle once at project activation, while
+    // the writer keeps indexing. This asserts the structural guarantee that
+    // relies on: a WAL reader opened BEFORE a write still sees that write
+    // once committed. (The freedom from lock contention this buys is
+    // structural; it can't be unit-tested.)
     #[test]
-    fn read_only_search_sees_writes_committed_after_it_opened() {
+    fn read_only_handle_sees_writes_committed_after_it_opened() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         let id = Uuid::new_v4();
@@ -6198,17 +5691,17 @@ mod tests {
 
         // Reader opened while the writer is still live, before the next commit.
         let reader = Db::open_read_only(base, id).unwrap();
-        assert_eq!(reader.search("billing", 5).unwrap().len(), 1);
+        assert!(reader.get_text("notes/a.md").unwrap().is_some());
 
         // A freshly-indexed file must be findable through the same reader.
         writer
             .upsert_file("notes/b.md", "md", 20, 2, "indexed", None, "quarterly forecast")
             .unwrap();
-        let via_reader = reader.search("forecast", 5).unwrap();
-        let via_writer = writer.search("forecast", 5).unwrap();
+        writer.upsert_chunks("notes/b.md", &[chunk(0, "quarterly forecast", "h0")], crate::kenignore::Tier::Full).unwrap();
+        let via_reader = reader.search_chunks_fts("forecast", 5).unwrap();
+        let via_writer = writer.search_chunks_fts("forecast", 5).unwrap();
         assert_eq!(via_reader.len(), 1);
-        let paths = |hits: &[SearchHit]| hits.iter().map(|h| h.rel_path.clone()).collect::<Vec<_>>();
-        assert_eq!(paths(&via_reader), paths(&via_writer));
+        assert_eq!(via_reader, via_writer);
     }
 
     /// A chat created before schema v13 must read back as `scope: None`

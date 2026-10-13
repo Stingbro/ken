@@ -156,14 +156,14 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
     let reply = match method {
         "initialize" => rpc_result(&id, initialize_result(&params)),
         "ping" => rpc_result(&id, json!({})),
-        "tools/list" => rpc_result(&id, json!({ "tools": tool_definitions(server) })),
+        "tools/list" => rpc_result(&id, json!({ "tools": tool_definitions() })),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             // Any tool the server lists is dispatched: the list and the
             // dispatch cannot drift apart (open_in_ken once was listed and
             // refused).
-            let listed = tool_definitions(server)
+            let listed = tool_definitions()
                 .as_array()
                 .is_some_and(|tools| tools.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)));
             if listed {
@@ -223,16 +223,10 @@ fn tool_content(outcome: Result<String, String>) -> Value {
     }
 }
 
-/// kg-routing (task 3.4) adds `kg_search`/`semantic_search`/`route_query` to
-/// this list, gated on the `kgRouting` flag (spec: "With kgRouting off
-/// these tools SHALL be absent from the tool list"). `list_projects`
-/// deliberately does NOT move behind that gate even though design.md names
-/// it as one of kg-routing's four new tools — it already existed,
-/// unconditionally, before this change (see the final report's
-/// "Conflicts"), and removing it when the flag is off would violate task
-/// 5.2's "MCP tool list byte-identical to pre-feature behavior". Its
-/// *content* still gets flag-scoped enrichment — see `list_projects` below.
-fn tool_definitions(server: &Server) -> Value {
+/// The tools this server lists. Search is one pipeline (knowledge-core
+/// decision 15): `route_query` over every source and `semantic_search` in
+/// one, both through `routing`.
+fn tool_definitions() -> Value {
     let project_arg = json!({
         "type": "string",
         "description": "Which Ken project to use — a project name or folder \
@@ -311,26 +305,6 @@ it uses. For how a module fits in and what depends on it.",
             }
         }),
         json!({
-            "name": "search_knowledge",
-            "description": "Whole-file keyword search in ONE Ken project: best for an exact \
-name, term or phrase you expect in a file. Files holding every word come first, one line each \
-(path, ken:// address and a short excerpt with matched words in **bold**; cheap, about 200 \
-characters a hit). When no file has every word it says so and gives the closest passages \
-instead (any word, and meaning when Ken's embedding model is installed). For a question, or \
-when you don't know the project, use route_query first.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search terms." },
-                    "limit": { "type": "integer", "description": "Maximum hits to return (default 20)." },
-                    "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
-                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
-                    "project": project_arg
-                },
-                "required": ["query"]
-            }
-        }),
-        json!({
             "name": "read_document",
             "description": "Read a document, or just some of its lines, after a search: the \
 way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> a Markdown page \
@@ -366,15 +340,14 @@ size, and modification time — optionally only those under a folder.",
         json!({
             "name": "list_projects",
             "description": "List the Ken projects registered on this machine \
-— name, folder path, and whether the folder is currently available. When \
-workspace routing (the kgRouting feature flag) is on, each project also \
-shows its search readiness and, if it has one, its one-line \
-`.ken/index-profile.json` summary.",
+— name, folder path, and whether the folder is currently available — each \
+with its search readiness (how far its meaning search has got) and, if it \
+has one, its one-line `.ken/index-profile.json` summary.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ];
 
-    if kg_routing_enabled(&AppSettings::load(&server.base_dir)) {
+    {
         tools.push(json!({
             "name": "kg_search",
             "description": "Search the workspace knowledge graph — entity \
@@ -382,8 +355,8 @@ names and summaries merged across every project's own knowledge model — and \
 return kg:// ids. Use this to find out which project(s) know about a topic \
 before calling semantic_search on one of them directly; for a one-shot \
 answer where you don't need to see the entities first, call route_query \
-instead. If the federatedKg flag is off, this returns an explanation rather \
-than an error — semantic_search and route_query keep working without it.",
+instead. When the graph is off, this returns an explanation rather than an \
+error; semantic_search and route_query keep working without it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -415,9 +388,11 @@ search uses Ken's installed embedding model; without it the answer says it was k
         tools.push(json!({
             "name": "route_query",
             "description": "START HERE to find where something is, or what the team knows \
-about a question, in plain words. Searches every Ken project that matters (a project the \
-query names, else those the workspace knowledge graph points to, else all of them) by \
-keyword and by meaning, and returns one merged ranked list. Each hit is short — repo:path:line \
+about a question, in plain words. Searches every Ken project of the workspace (only the \
+one the query names, when it names one; a reference repo only for a question about the \
+platform, when named, or when nothing else answers) by keyword and by meaning, and returns \
+one merged ranked list, with any project still building its meaning index or slow to \
+answer said so. Each hit is short — repo:path:line \
 to cite, ken:// address, kind, and about 300 characters around the best-matching lines — so \
 ten hits cost about 6,000 characters. For more of a hit call read_document with its ken:// \
 address (the #L line included): the lines around it, one cheap call. Meaning search uses \
@@ -425,7 +400,7 @@ Ken's installed embedding model; without it the answer says it was keyword only.
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "A question or search terms — also matched against project names for direct routing." },
+                    "query": { "type": "string", "description": "A question or search terms. A project's name in it narrows the search to that project." },
                     "limit": { "type": "integer", "description": "Maximum merged hits to return (default 10)." },
                     "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
@@ -652,51 +627,6 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
         "task_list" => task_list_tool(server, args),
         "task_update" => task_update_tool(server, args),
         "ticket_list" => ticket_list_tool(server, args),
-        "search_knowledge" => {
-            let query = require_str(args, "query")?;
-            let limit = args
-                .get("limit")
-                .and_then(|l| l.as_u64())
-                .map(|l| l.clamp(1, 200) as usize)
-                .unwrap_or(20);
-            let (project, note) = resolve_project(server, args)?;
-            let db = open_index(server, &project)?;
-            let audience = audience_arg(args);
-            let types = types_arg(args);
-            let mut hits = db
-                .search(&query, fetch_for(audience.as_deref(), &types, limit))
-                .map_err(|e| format!("search failed: {e}"))?;
-            hits.retain(|h| {
-                ken_core::contenttype::is_wanted(&h.rel_path, &types)
-                    && ken_core::pagemeta::suits(audience.as_deref(), ken_core::pagemeta::audience_at(&db, &h.rel_path))
-            });
-            hits.truncate(limit);
-            let mut out = note.unwrap_or_default();
-            if hits.is_empty() {
-                out.push_str(&closest_passages(server, &db, &project, &query, limit, audience.as_deref(), &types)?);
-            } else {
-                out.push_str(&format!(
-                    "{} result{} for {query:?} in project \"{}\":\n",
-                    hits.len(),
-                    if hits.len() == 1 { "" } else { "s" },
-                    project.config.name
-                ));
-                for (i, hit) in hits.iter().enumerate() {
-                    let snippet = hit.snippet.replace("<mark>", "**").replace("</mark>", "**");
-                    let label = ken_core::authority::hit_label(&db, &hit.rel_path, None).ok().flatten();
-                    out.push_str(&format!(
-                        "\n{}. {} {} ({}){} — {}",
-                        i + 1,
-                        kind_tag(&hit.rel_path),
-                        hit.rel_path,
-                        ken_address(project.config.id, &hit.rel_path),
-                        label.map(|l| format!(" ({l})")).unwrap_or_default(),
-                        snippet
-                    ));
-                }
-            }
-            Ok(out)
-        }
         "read_document" => {
             let path = require_str(args, "path")?;
             // A ken://<project id>/<path>#L12 address, as search returns it,
@@ -728,7 +658,7 @@ fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String
                 .ok_or_else(|| {
                     format!(
                         "{path:?} is not in project \"{}\"'s index. Use \
-list_documents or search_knowledge to find valid paths.",
+list_documents or route_query to find valid paths.",
                         project.config.name
                     )
                 })?;
@@ -952,54 +882,6 @@ fn numbered_lines(text: &str, (a, b): (i64, i64)) -> String {
     out
 }
 
-/// search_knowledge when no file holds every word: the passages
-/// semantic_search would give (any word, ranked by how many match, and by
-/// meaning when the model is installed), one per file, in search_knowledge's
-/// own line shape. All-words found the right file for 1 of 45 natural
-/// questions (Shattered Realms eval, 2026-10-06).
-fn closest_passages(
-    server: &Server,
-    db: &Db,
-    project: &Project,
-    query: &str,
-    limit: usize,
-    audience: Option<&str>,
-    types: &[ken_core::contenttype::ContentType],
-) -> Result<String, String> {
-    let qv = query_vector(server, query);
-    let mut hits = routing::search_member_of(db, query, vector_for(db, &qv), fetch_for(audience, types, limit) * 2, types)
-        .map_err(|e| format!("search failed: {e}"))?;
-    hits.retain(|h| ken_core::pagemeta::suits(audience, h.page.as_ref().and_then(|p| p.audience)));
-    let mut seen = std::collections::HashSet::new();
-    hits.retain(|h| seen.insert(h.path.clone()));
-    hits.truncate(limit);
-    let name = &project.config.name;
-    if hits.is_empty() {
-        return Ok(format!("No matches for {query:?} in project \"{name}\". {LOOK_YOURSELF}"));
-    }
-    let mut out = format!(
-        "No file in project \"{name}\" has every word of {query:?}; the {} closest passage{} instead (any word{}):\n",
-        hits.len(),
-        if hits.len() == 1 { "" } else { "s" },
-        if qv.is_ok() { ", and meaning" } else { "" },
-    );
-    out.push_str(&keyword_only_note(&qv));
-    for (i, hit) in hits.iter().enumerate() {
-        let (snippet, line) = short_hit(db, Some(&project.root), query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, EXCERPT_CHARS);
-        out.push_str(&format!(
-            "\n{}. {} {} ({}{}){} — {}",
-            i + 1,
-            kind_tag(&hit.path),
-            hit.path,
-            ken_address(project.config.id, &hit.path),
-            line.map(|l| format!("#L{l}")).unwrap_or_default(),
-            hit.page.as_ref().and_then(page_note).map(|n| format!(" ({n})")).unwrap_or_default(),
-            snippet.split_whitespace().collect::<Vec<_>>().join(" "),
-        ));
-    }
-    Ok(out)
-}
-
 fn require_str(args: &Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -1018,12 +900,6 @@ fn list_projects(server: &Server) -> Result<String, String> {
 folder in the Ken app first."
             .to_string());
     }
-    // Readiness + profile enrichment (task 3.1) is gated on `kgRouting` so a
-    // flag-off caller's output is byte-identical to this tool's
-    // pre-kg-routing behavior (spec 5.2) — see `tool_definitions`'s doc
-    // comment on why `list_projects` itself stays unconditionally present
-    // rather than moving behind the flag like the other three tools.
-    let enrich = kg_routing_enabled(&AppSettings::load(&server.base_dir));
     let mut out = format!(
         "{} Ken project{}:\n",
         statuses.len(),
@@ -1036,11 +912,16 @@ folder in the Ken app first."
             s.entry.path.display(),
             if s.available { "" } else { " (folder currently missing)" }
         ));
-        if enrich && s.available {
+        if s.available {
             let readiness = match Db::open_read_only(&server.base_dir, s.entry.id) {
-                Ok(db) if db.vector_count().unwrap_or(0) > 0 => "keyword and meaning search ready",
-                Ok(_) => "keyword search ready",
-                Err(_) => "no index yet",
+                Ok(db) => match routing::meaning_status(&db) {
+                    MemberStatus::Building { embedded, chunks } => {
+                        format!("keyword search ready, meaning search {}% built", percent(embedded, chunks))
+                    }
+                    _ if db.semantic_built_at().ok().flatten().is_some() => "keyword and meaning search ready".to_string(),
+                    _ => "keyword search ready".to_string(),
+                },
+                Err(_) => "no index yet".to_string(),
             };
             out.push_str(&format!(" — {readiness}"));
             if profiler::profile_path(&s.entry.path).is_file() {
@@ -1068,15 +949,9 @@ fn kg_search(server: &Server, args: &Value) -> Result<String, String> {
         .and_then(|l| l.as_u64())
         .map(|l| l.clamp(1, 200) as usize)
         .unwrap_or(50);
-    let app_settings = AppSettings::load(&server.base_dir);
-    if !kg_routing_enabled(&app_settings) {
-        return Err("kg_search requires the kgRouting feature flag, which is off.".into());
-    }
-    if !federated_kg_enabled(&app_settings) {
-        return Ok("The workspace knowledge graph is off (enable the \
-\"workspace\" and \"federatedKg\" feature flags in Ken's settings) — \
-kg_search has nothing to search yet. semantic_search and route_query still \
-work without it (route_query just skips straight to broadcasting)."
+    if !federated_kg_enabled(&AppSettings::load(&server.base_dir)) {
+        return Ok("The workspace knowledge graph is off, so kg_search has \
+nothing to search yet. semantic_search and route_query work without it."
             .to_string());
     }
     let kg = WorkspaceKgDb::open(&kg_root(server))
@@ -1110,10 +985,10 @@ work without it (route_query just skips straight to broadcasting)."
     Ok(out)
 }
 
-/// Single-member hybrid search (task 3.3): `routing::search_member_of`, the
-/// same keyword + meaning composition src-tauri's `hybrid_search` command
-/// uses, with the question embedded by the app's own model when it is
-/// installed ([`query_vector`]) and keyword only, said in one line, when not.
+/// One project's search: `routing::search_member_of`, the same pipeline
+/// route_query and the app use, with the question embedded by the app's own
+/// model when it is installed ([`query_vector`]) and keyword only, said in
+/// one line, when not.
 fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
     let query = require_str(args, "query")?;
     let limit = args
@@ -1121,10 +996,6 @@ fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
         .and_then(|l| l.as_u64())
         .map(|l| l.clamp(1, 200) as usize)
         .unwrap_or(ROUTE_LIMIT);
-    if !kg_routing_enabled(&AppSettings::load(&server.base_dir)) {
-        return Err("semantic_search requires the kgRouting feature flag, which is off. Use search_knowledge instead."
-            .into());
-    }
     let (project, note) = resolve_project(server, args)?;
     let db = open_index(server, &project)?;
     let audience = audience_arg(args);
@@ -1487,11 +1358,6 @@ fn kind_tag(path: &str) -> String {
 /// Realms eval, 2026-10-06), and read_document gives the rest on request.
 const SNIPPET_CHARS: usize = 300;
 
-/// search_knowledge's fallback excerpts stay one short line like its
-/// whole-file hits: at 300 characters its answers grew from a median 1,947
-/// to 14,819 characters over five repos (Shattered Realms eval, 2026-10-06).
-const EXCERPT_CHARS: usize = 160;
-
 /// Lines read_document shows before and after a single line it is pointed
 /// at (`#L88`), so reading around a hit is one call of about 50 lines.
 const READ_BEFORE: i64 = 10;
@@ -1728,11 +1594,12 @@ fn keyword_only_note(qv: &QueryVector) -> String {
 /// 2026-10-06), so ten cost about 6,000, where eight whole chunks took 17,660.
 const ROUTE_LIMIT: usize = 10;
 
-/// Route + fan-out + merge (task 3.4): `routing::plan_route`, then a
-/// per-target `routing::search_member_of_with`, then `routing::merge_routed`
-/// — `execute_plan`'s own loop, written out so each member gets the query
-/// vector only when its index was built by the same model ([`vector_for`]).
-/// The question is embedded once for every member; hits are cut short last.
+/// Search every source and merge the hits once (knowledge-core decision
+/// 20): `routing::plan_route` picks the sources, `routing::search_target`
+/// searches each with the question's vector when its index was built by the
+/// same model ([`vector_for`]), the held-back reference repos only when
+/// nothing else answered, and `routing::merge_routed` merges. The question is
+/// embedded once; hits are cut short last.
 fn route_query(server: &Server, args: &Value) -> Result<String, String> {
     let query = require_str(args, "query")?;
     let limit = args
@@ -1740,10 +1607,6 @@ fn route_query(server: &Server, args: &Value) -> Result<String, String> {
         .and_then(|l| l.as_u64())
         .map(|l| l.clamp(1, 200) as usize)
         .unwrap_or(ROUTE_LIMIT);
-    let app_settings = AppSettings::load(&server.base_dir);
-    if !kg_routing_enabled(&app_settings) {
-        return Err("route_query requires the kgRouting feature flag, which is off.".into());
-    }
     let registry = Registry::load(&server.base_dir)
         .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
     if registry.projects.is_empty() {
@@ -1752,10 +1615,9 @@ folder in the Ken app first."
             .to_string());
     }
 
-    // Open every registered, present project's index once — reused both to
-    // build `plan_route`'s `MemberInfo` metadata and, for whichever targets
-    // the plan picks, the actual search (avoids opening each DB twice).
-    // Missing folders are excluded outright: not real routing candidates.
+    // Every registered project of the open workspace whose folder is there is
+    // a source. Each index is opened once; one that will not open is
+    // searched as unavailable and reported.
     let mut members: Vec<MemberInfo> = Vec::new();
     let mut dbs: HashMap<Uuid, Db> = HashMap::new();
     let inside = in_open_workspace(server, &registry);
@@ -1763,107 +1625,39 @@ folder in the Ken app first."
         if !entry.path.is_dir() || !inside(&entry.path) {
             continue;
         }
-        let (index_ready, last_activity) = match Db::open_read_only(&server.base_dir, entry.id) {
-            Ok(db) => {
-                let ready = db.vec_available();
-                // `features/multi-project/README.md`: "recent activity ...
-                // the member's most recent ingest completion timestamp" —
-                // the existing `ingest_runs` table already tracks exactly
-                // this (`Db::runs_with_status`), so no new state is needed.
-                // Same computation src-tauri's `route_search` command uses
-                // for the same field (lib.rs, `RouteMemberSnapshot`).
-                let last_activity = db
-                    .runs_with_status("fresh")
-                    .ok()
-                    .and_then(|rows| rows.iter().filter_map(|r| r.finished_at).max())
-                    .unwrap_or(0);
-                dbs.insert(entry.id, db);
-                (ready, last_activity)
-            }
-            Err(_) => (false, 0),
-        };
+        if let Ok(db) = Db::open_read_only(&server.base_dir, entry.id) {
+            dbs.insert(entry.id, db);
+        }
         members.push(MemberInfo {
             project_id: entry.id,
             name: entry.name.clone(),
-            index_ready,
-            last_activity,
-            knowledge_base: routing::is_knowledge_base(&entry.kind),
+            reference: routing::is_reference(&entry.kind),
         });
     }
 
-    let kg = federated_kg_enabled(&app_settings)
-        .then(|| WorkspaceKgDb::open(&kg_root(server)).ok())
-        .flatten();
-    let plan = routing::plan_route(&query, &members, kg.as_ref());
+    let plan = routing::plan_route(&query, &members);
     let audience = audience_arg(args);
     let types = types_arg(args);
     // One vocabulary for the whole search (the team wiki's widens every repo).
     let shared_vocab = routing::workspace_vocabulary(dbs.values());
-    let qv = if plan.targets.is_empty() { Err("nothing to search".to_string()) } else { query_vector(server, &query) };
-
-    let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
-    for &project_id in &plan.targets {
-        let Some(info) = members.iter().find(|m| m.project_id == project_id) else {
-            member_hits.push(MemberHits {
-                project_id,
-                member_name: String::new(),
-                status: MemberStatus::Unavailable,
-                hits: Vec::new(),
-            });
-            continue;
-        };
-        if !info.index_ready {
-            // Mirrors `execute_plan`: not-ready is skipped and reported, not
-            // FTS-searched anyway (routing.rs D5 / spec "Fan-out hybrid
-            // search"). `index_ready = db.vec_available()` (below) is
-            // exactly the signal src-tauri's own `route_search` command
-            // uses for the same field (see its doc comment, lib.rs ~6204:
-            // "same readiness signal `hybrid_search` gates its KNN pass
-            // on") — matched for cross-surface consistency, not derived
-            // independently. Caveat worth flagging: `vec_available()` is a
-            // per-connection "did the sqlite-vec extension load" flag
-            // (`db.rs`'s `load_vec_extension`), not a per-project "were
-            // this project's embeddings actually built" flag — it will
-            // read `true` for most/every project's Db in a build where the
-            // extension links successfully, regardless of that project's
-            // own `semanticIndex` flag or embedding state. That's an
-            // existing characteristic of the signal both callers share,
-            // not something introduced here.
-            member_hits.push(MemberHits {
-                project_id,
-                member_name: info.name.clone(),
-                status: MemberStatus::IndexBuilding,
-                hits: Vec::new(),
-            });
-            continue;
-        }
-        let Some(db) = dbs.get(&project_id) else {
-            member_hits.push(MemberHits {
-                project_id,
-                member_name: info.name.clone(),
-                status: MemberStatus::Unavailable,
-                hits: Vec::new(),
-            });
-            continue;
-        };
-        match routing::search_member_of_with(db, &query, vector_for(db, &qv), fetch_for(audience.as_deref(), &types, limit), &types, Some(&shared_vocab)) {
-            Ok(mut hits) => member_hits.push(MemberHits {
-                hits: {
-                    hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
-                    hits.truncate(limit);
-                    hits
-                },
-                project_id,
-                member_name: info.name.clone(),
-                status: MemberStatus::Searched,
-            }),
-            Err(_) => member_hits.push(MemberHits {
-                project_id,
-                member_name: info.name.clone(),
-                status: MemberStatus::Unavailable,
-                hits: Vec::new(),
-            }),
-        }
+    let qv = if members.is_empty() { Err("nothing to search".to_string()) } else { query_vector(server, &query) };
+    let search = |ids: &[Uuid]| -> Vec<MemberHits> {
+        ids.iter()
+            .map(|id| {
+                let name = members.iter().find(|m| m.project_id == *id).map_or("", |m| m.name.as_str());
+                let db = dbs.get(id);
+                let fetch = fetch_for(audience.as_deref(), &types, limit);
+                let mut found =
+                    routing::search_target(*id, name, db, &query, db.and_then(|db| vector_for(db, &qv)), fetch, &types, Some(&shared_vocab));
+                found.hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
+                found.hits.truncate(limit);
+                found
+            })
+            .collect()
+    };
+    let mut member_hits = search(&plan.targets);
+    if routing::needs_reserve(&plan, &member_hits) {
+        member_hits.extend(search(&plan.reserve));
     }
 
     let mut report = routing::merge_routed(&plan, &member_hits, limit);
@@ -1880,10 +1674,10 @@ folder in the Ken app first."
         hit.snippet = snippet;
         hit.line = line;
     }
-    let mut out = format_execution_report(&report);
-    if !plan.targets.is_empty() {
+    let mut out = format_execution_report(&report, &members);
+    if !members.is_empty() {
         let note = keyword_only_note(&qv);
-        // After the Route and Members lines, which a reader looks for first.
+        // After the Route and Sources lines, which a reader looks for first.
         match out.match_indices('\n').nth(1) {
             Some((at, _)) => out.insert_str(at + 1, &note),
             None => out.push_str(&note),
@@ -1892,39 +1686,57 @@ folder in the Ken app first."
     Ok(out)
 }
 
-/// Renders a route_query [`routing::ExecutionReport`] as tool-call text
-/// (this server has no structured-content channel — every tool returns
-/// prose, matching the rest of this file's style).
-fn format_execution_report(report: &routing::ExecutionReport) -> String {
-    let reason = match &report.plan.reason {
-        RouteReason::Named => "named project match".to_string(),
-        RouteReason::KgEntities(ids) => format!(
-            "knowledge-graph match ({} entit{})",
-            ids.len(),
-            if ids.len() == 1 { "y" } else { "ies" }
-        ),
-        RouteReason::Broadcast => "broadcast — no name or knowledge-graph match".to_string(),
+/// `part` of `whole` as a whole percent, 0 for nothing.
+fn percent(part: i64, whole: i64) -> i64 {
+    if whole <= 0 {
+        0
+    } else {
+        (part * 100 / whole).clamp(0, 100)
+    }
+}
+
+/// Renders a route_query [`routing::ExecutionReport`] as tool-call text:
+/// the route, how each source's search went, the reference repos held back,
+/// then the hits.
+fn format_execution_report(report: &routing::ExecutionReport, members: &[MemberInfo]) -> String {
+    let name_of = |id: &Uuid| members.iter().find(|m| m.project_id == *id).map_or_else(|| id.to_string(), |m| m.name.clone());
+    let reason = match report.plan.reason {
+        RouteReason::Named => "named in the question",
+        RouteReason::Every => "every source",
     };
-    let mut out = format!(
-        "Route: {reason}, {} target project{}.\n",
-        report.plan.targets.len(),
-        if report.plan.targets.len() == 1 { "" } else { "s" }
-    );
-    out.push_str("Members: ");
-    let member_lines: Vec<String> = report
+    let searched = report.member_status.len();
+    let mut out = format!("Route: {reason} ({searched} searched).\n");
+    let sources: Vec<String> = report
         .member_status
         .iter()
         .map(|m| {
-            let status = match m.status {
-                MemberStatus::Searched => "searched",
-                MemberStatus::IndexBuilding => "index-building",
-                MemberStatus::Unavailable => "unavailable",
+            let mut status = match m.status {
+                MemberStatus::Searched => "searched".to_string(),
+                MemberStatus::Building { embedded, chunks } => {
+                    format!("keyword only, meaning search {}% built", percent(embedded, chunks))
+                }
+                MemberStatus::Unavailable => "unavailable, its index did not open".to_string(),
             };
+            if m.slow() {
+                status.push_str(&format!(", slow: {:.1} s", m.millis as f64 / 1000.0));
+            }
             format!("{} ({status})", m.member_name)
         })
         .collect();
-    out.push_str(&member_lines.join(", "));
-    out.push('\n');
+    out.push_str(&format!("Sources: {}\n", sources.join(", ")));
+    let held: Vec<String> = report
+        .plan
+        .reserve
+        .iter()
+        .filter(|id| !report.member_status.iter().any(|m| m.project_id == **id))
+        .map(name_of)
+        .collect();
+    if !held.is_empty() {
+        out.push_str(&format!(
+            "Held back: {} (a reference repo is searched for a question about the platform, when named, or when nothing else answers)\n",
+            held.join(", ")
+        ));
+    }
 
     if report.results.is_empty() {
         out.push_str(&format!("\nNo results. {LOOK_YOURSELF}"));
@@ -1943,9 +1755,6 @@ fn format_execution_report(report: &routing::ExecutionReport) -> String {
         ));
         if let Some(note) = hit.page.as_ref().and_then(page_note) {
             out.push_str(&format!(" ({note})"));
-        }
-        if !hit.kg_breadcrumbs.is_empty() {
-            out.push_str(&format!(" ({})", hit.kg_breadcrumbs.join(" ")));
         }
         out.push_str(&indented(&hit.snippet));
     }
@@ -2293,13 +2102,9 @@ fn ken_address(project_id: Uuid, rel_path: &str) -> String {
     format!("ken://{project_id}/{}", rel_path.replace('\\', "/"))
 }
 
-/// The workspace graph and routed search are how Ken works, not switches
+/// The workspace graph is how Ken works, not a switch
 /// (`features::BUILT_IN`), as in the app.
 fn federated_kg_enabled(_app_settings: &AppSettings) -> bool {
-    true
-}
-
-fn kg_routing_enabled(_app_settings: &AppSettings) -> bool {
     true
 }
 
@@ -2659,7 +2464,7 @@ mod tests {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
         );
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
@@ -2758,27 +2563,26 @@ mod tests {
     #[test]
     fn hits_are_tagged_by_kind_and_a_kind_filter_keeps_only_that() {
         let mut fx = fixture(true);
-        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing"}));
+        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("[meeting] notes/meeting.md"), "a meeting note tagged: {text}");
-        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "type": "code"}));
+        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "code"}));
         assert!(!text.contains("notes/meeting.md"), "code only: {text}");
-        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "type": "meeting,doc"}));
+        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "meeting,doc"}));
         assert!(text.contains("notes/meeting.md"), "{text}");
     }
 
     #[test]
     fn scoped_tools_work_and_ignore_project_arg() {
         let mut fx = fixture(true);
-        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing cutover"}));
+        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing cutover"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("notes/meeting.md"), "{text}");
-        assert!(text.contains("**billing**"), "{text}");
         assert!(!text.contains("<mark>"), "{text}");
 
         // A supplied project arg is ignored with a note.
         let (text, is_err) =
-            tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "project": "Other"}));
+            tool(&mut fx.server, "semantic_search", json!({"query": "billing", "project": "Other"}));
         assert!(!is_err);
         assert!(text.contains("locked to project \"Atlas\""), "{text}");
 
@@ -2826,19 +2630,19 @@ mod tests {
     fn unscoped_requires_and_matches_project() {
         let mut fx = fixture(false);
         // Missing project → helpful error naming projects.
-        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing"}));
+        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing"}));
         assert!(is_err);
         assert!(text.contains("Available projects: Atlas"), "{text}");
 
         // Unknown project → same courtesy.
         let (text, is_err) =
-            tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "project": "Zeus"}));
+            tool(&mut fx.server, "semantic_search", json!({"query": "billing", "project": "Zeus"}));
         assert!(is_err);
         assert!(text.contains("No Ken project matches"), "{text}");
 
         // Match by name (case-insensitive) and by path.
         let (text, is_err) =
-            tool(&mut fx.server, "search_knowledge", json!({"query": "billing", "project": "atlas"}));
+            tool(&mut fx.server, "semantic_search", json!({"query": "billing", "project": "atlas"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("notes/meeting.md"));
         let root = fx.root.to_string_lossy().to_string();
@@ -2856,7 +2660,7 @@ mod tests {
     #[test]
     fn missing_required_args_are_tool_errors() {
         let mut fx = fixture(true);
-        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({}));
+        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({}));
         assert!(is_err);
         assert!(text.contains("\"query\" argument is required"), "{text}");
         let (text, is_err) = tool(&mut fx.server, "read_document", json!({}));
@@ -2875,14 +2679,10 @@ mod tests {
 
     // --- kg-routing (task 3.5) ---
 
-    /// Builds a real (if tiny) semantic index with `FakeEmbedder` — the same
-    /// production `engine::rebuild_semantic_index` src-tauri's semantic-index
-    /// command uses, just with the deterministic no-model embedder tests get
-    /// everywhere else in ken-core. Needed because `routing::MemberInfo::
-    /// index_ready`/`execute_plan` gate *execution* on `db.vec_available()`
-    /// (mirrored by `route_query` below), so an FTS-only fixture Db would
-    /// make every route_query test see every member as `index-building` and
-    /// return zero hits — not what task 3.5 needs to test the happy path.
+    /// Builds a real (if tiny) semantic index with `FakeEmbedder`, the same
+    /// production `engine::rebuild_semantic_index` the app uses, with the
+    /// deterministic no-model embedder tests get everywhere else in ken-core,
+    /// so a search can use meaning and no source reads as still building.
     fn index_semantically(project: &Project, db: &mut Db) {
         let mut embedder = ken_core::embedder::FakeEmbedder::new();
         ken_core::engine::rebuild_semantic_index(
@@ -2896,8 +2696,8 @@ mod tests {
     }
 
     /// Two registered, indexed (FTS + fake-semantic) projects sharing one
-    /// base dir, unscoped, with `workspace`+`kgRouting` on — what the
-    /// flag-on tool-visibility and per-project-isolation tests below need.
+    /// base dir, unscoped: what the routing and per-project-isolation tests
+    /// below need.
     /// Tempdirs are returned so the caller keeps them alive for the test's
     /// duration (same idiom as `Fixture`'s `_base`/`_root` fields).
     fn two_project_fixture() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, Server) {
@@ -2933,7 +2733,7 @@ mod tests {
     }
 
     #[test]
-    fn kg_routing_tools_appear_and_route_query_returns_a_named_plan_when_flag_on() {
+    fn route_query_searches_only_the_source_the_question_names() {
         let (_base, _ra, _rb, mut server) = two_project_fixture();
         let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
@@ -2946,7 +2746,6 @@ mod tests {
                 "file_outline",
                 "related_files",
                 "history",
-                "search_knowledge",
                 "read_document",
                 "list_documents",
                 "list_projects",
@@ -2966,13 +2765,43 @@ mod tests {
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
         }
 
-        // "Atlas" names a member, so this is a Named-tier plan targeting
-        // only Atlas — no KG lookup, no broadcast.
+        // "Atlas" names a member, so only Atlas is searched.
         let (text, is_err) = tool(&mut server, "route_query", json!({"query": "Atlas launch schedule"}));
         assert!(!is_err, "{text}");
-        assert!(text.starts_with("Route: named project match"), "{text}");
+        assert!(text.starts_with("Route: named in the question (1 searched)."), "{text}");
         assert!(text.contains("a.md"), "{text}");
         assert!(!text.contains("b.md"), "{text}");
+
+        // Named by nothing: every source, merged once.
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        assert!(text.starts_with("Route: every source (2 searched)."), "{text}");
+        assert!(text.contains("Sources: Atlas (searched), Zeus (searched)") || text.contains("Sources: Zeus (searched), Atlas (searched)"), "{text}");
+        assert!(text.contains("a.md") && text.contains("b.md"), "{text}");
+    }
+
+    /// A reference repo is held back from a question about the team's own
+    /// work and said so; it joins when nothing else answers.
+    #[test]
+    fn route_query_holds_a_reference_repo_back_until_nothing_else_answers() {
+        let (_base, _ra, rb, mut server) = two_project_fixture();
+        let mut registry = Registry::load(&server.base_dir).unwrap();
+        let zeus = registry.projects.iter().find(|e| e.name == "Zeus").unwrap().id;
+        assert!(registry.set_kind(zeus, vec![registry::RepoKind::Reference], None));
+        registry.save(&server.base_dir).unwrap();
+        std::fs::write(rb.path().join("engine.md"), "The rendering pipeline draws every chunk.\n").unwrap();
+        let project = Project::open(rb.path()).unwrap();
+        let mut db = Db::open(&server.base_dir, project.config.id).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        index_semantically(&project, &mut db);
+        drop(db);
+
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        assert!(text.contains("Held back: Zeus"), "{text}");
+        assert!(text.contains("a.md") && !text.contains("b.md"), "{text}");
+
+        let (text, _) = tool(&mut server, "route_query", json!({"query": "rendering pipeline"}));
+        assert!(!text.contains("Held back"), "{text}");
+        assert!(text.contains("engine.md"), "nothing else answered: {text}");
     }
 
     #[test]
@@ -3136,27 +2965,6 @@ mod tests {
         assert!(text.contains("(decision D-007 · binding · 2026-10-07)"), "the entry's own id and date: {text}");
         let (text, _) = tool(&mut server, "semantic_search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
         assert!(text.contains("(ticket · superseded · 2026-07-21)") && text.contains("(decision D-007 · binding · 2026-10-07)"), "{text}");
-        let (text, _) = tool(&mut server, "search_knowledge", json!({"query": "companion pets", "project": "Atlas"}));
-        assert!(text.contains("(ticket · superseded · 2026-07-21) — "), "{text}");
-        assert!(text.contains("decisions/DECISIONS.md (ken://") && text.contains(") (decision · binding) — "), "the log as a whole: {text}");
-    }
-
-    #[test]
-    fn search_knowledge_falls_back_to_the_closest_passages_for_a_question() {
-        let mut fx = fixture(true);
-        // No file has "owns", "cutover" and "date" together.
-        let (text, is_err) = tool(&mut fx.server, "search_knowledge", json!({"query": "Who owns the cutover date?"}));
-        assert!(!is_err, "{text}");
-        assert!(text.contains("has every word"), "{text}");
-        assert!(text.contains("Keyword search only:"), "{text}");
-        assert!(text.contains(". [doc] People.md (ken://"), "same line shape: {text}");
-        assert!(text.contains("notes/meeting.md"), "{text}");
-        // All words in one file: the file-level answer, unchanged.
-        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "billing cutover"}));
-        assert!(!text.contains("has every word"), "{text}");
-        // Words in no file at all: still empty.
-        let (text, _) = tool(&mut fx.server, "search_knowledge", json!({"query": "zebra xylophone"}));
-        assert!(text.starts_with("No matches"), "{text}");
     }
 
     #[test]
@@ -3284,7 +3092,7 @@ mod tests {
 
     #[test]
     fn list_projects_says_which_projects_routed_search_can_use() {
-        // Routed search is built in: on whatever settings.json says.
+        // Routed search is built in, whatever settings.json says.
         let mut fx = fixture(true);
         let mut settings = AppSettings::default();
         settings.features.insert("kgRouting".into(), false.into());
@@ -3655,7 +3463,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "search_knowledge", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"],
         );
     }
 

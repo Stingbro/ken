@@ -235,9 +235,8 @@ mod tests {
     use std::fs;
 
     /// Runs `search_chunks_fts` + `semantic_search` + `search::merge_and_rerank`
-    /// for a query — the same building blocks task 2.2's `hybrid_search`
-    /// command is expected to compose, with results always reranked before
-    /// return (S7b Condition C).
+    /// for a query: the building blocks `routing::search_member` composes,
+    /// with results always reranked before return (S7b Condition C).
     fn hybrid_search(db: &Db, embedder: &mut FakeEmbedder, query: &str) -> Vec<search::HybridHit> {
         let fts_hits: Vec<FtsHit> = db.search_chunks_fts(query, 10).unwrap();
         let query_vec = embedder.embed(&[query.to_string()]).unwrap().remove(0);

@@ -362,9 +362,6 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     // team file, for every file: a team file's new override reaches them all.
     crate::authority::refresh(db, &project.root, None)?;
 
-    if let Some(result) = control_query(db)? {
-        db.set_index_control(&result)?;
-    }
     // The team's words for search, rebuilt when a page may have changed.
     if !stats.changed_paths.is_empty() || db.stored_vocabulary()?.is_none() {
         crate::vocab::Vocabulary::rebuild(db)?;
@@ -441,35 +438,6 @@ fn write_changes(project: &Project, db: &mut Db, indexed: &Indexed, on_disk: &On
         tick(db)?;
     }
     Ok(())
-}
-
-/// Pages tried, in order, as the known page a control query must rank first.
-const CONTROL_PAGES: &[&str] = &["START-HERE.md", "Current/Index.md", "README.md", "readme.md"];
-
-/// Search the first control page present by its title and check it comes
-/// back first (docs-system: "Every rebuild runs one control query that must
-/// rank one known page first"). None when the project has none of them.
-pub fn control_query(db: &Db) -> Result<Option<crate::db::ControlResult>> {
-    let Some(page) = CONTROL_PAGES
-        .iter()
-        .find(|p| matches!(db.get_file(p), Ok(Some(f)) if f.status == STATUS_INDEXED))
-    else {
-        return Ok(None);
-    };
-    let stem = page.rsplit('/').next().unwrap_or(page).trim_end_matches(".md");
-    let query = db
-        .page_meta(page)?
-        .and_then(|m| m.title)
-        .unwrap_or_else(|| stem.replace(['-', '_'], " "));
-    let top = db.search(&query, 5)?.into_iter().next().map(|h| h.rel_path);
-    let ok = top.as_deref() == Some(*page);
-    Ok(Some(crate::db::ControlResult {
-        page: page.to_string(),
-        query,
-        top: (!ok).then_some(top).flatten(),
-        ok,
-        at: std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
-    }))
 }
 
 /// Whether `text` is minified: a line over 2,000 characters with almost no
@@ -758,7 +726,7 @@ pub const SCOPED_MAX: usize = 2_000;
 
 /// Rescan only `rels`, the paths a watcher saw change, instead of the whole
 /// repo: what a full scan would do to those paths, and the same follow-ups
-/// (the control query, the vocabulary, the link report) when a page moved.
+/// (the vocabulary, the link report) when a page moved.
 /// `None` when a full scan is the right tool: too many paths, or a folder
 /// among them (a folder moved in brings files no event named).
 pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Option<ScanStats>> {
@@ -829,11 +797,6 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
     if !stats.changed_paths.is_empty() {
         crate::authority::refresh(db, &project.root, Some(&stats.changed_paths))?;
     }
-    if !stats.changed_paths.is_empty() {
-        if let Some(result) = control_query(db)? {
-            db.set_index_control(&result)?;
-        }
-    }
     if pages_moved || db.stored_vocabulary()?.is_none() {
         crate::vocab::Vocabulary::rebuild(db)?;
     }
@@ -867,12 +830,11 @@ pub fn reindex(project: &Project, db: &mut Db) -> Result<ScanStats> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(crate::Error::io(&cache, e)),
     }
-    scan(project, db)
-}
-
-/// Convenience wrapper mirroring the design's `ken_core::search`.
-pub fn search(db: &Db, query: &str, limit: usize) -> Result<Vec<crate::db::SearchHit>> {
-    db.search(query, limit)
+    let stats = scan(project, db)?;
+    // `clear` keeps the chunks, so the vectors of unchanged files survive a
+    // reindex; the chunks of files that are gone go now.
+    db.drop_orphan_chunks()?;
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -887,6 +849,11 @@ mod tests {
     }
 
     /// Copy the fixture project into a temp dir so tests can mutate it.
+    /// Whether a keyword search for `q` finds `path` in the chunk index.
+    fn finds(db: &Db, q: &str, path: &str) -> bool {
+        db.search_chunks_fts(q, 10).unwrap().iter().any(|h| h.path == path)
+    }
+
     fn temp_project() -> (tempfile::TempDir, Project) {
         let dir = tempfile::tempdir().unwrap();
         copy_dir(&fixture_root(), dir.path());
@@ -1058,16 +1025,16 @@ mod tests {
             ("LangdonSoft", "quotes.xlsx"),
             ("contract renewal terms", "contract.pdf"),
         ] {
-            let hits = db.search(q, 10).unwrap();
+            let hits = db.search_chunks_fts(q, 10).unwrap();
             assert!(
-                hits.iter().any(|h| h.rel_path.contains(path_frag)),
+                hits.iter().any(|h| h.path.contains(path_frag)),
                 "query {q:?} should hit {path_frag}: {hits:?}"
             );
         }
 
-        // Failed + binary files findable by name.
-        assert!(db.search("corrupt", 5).unwrap().iter().any(|h| h.status == "failed"));
-        assert!(!db.search("team photo", 5).unwrap().is_empty());
+        // Failed and binary files are listed, with no text to search.
+        assert_eq!(db.get_file("vendor/corrupt.pdf").unwrap().unwrap().status, STATUS_FAILED);
+        assert!(db.get_file("images/team-photo.png").unwrap().is_some());
     }
 
     /// A OneDrive/iCloud placeholder must never be read during indexing —
@@ -1084,14 +1051,9 @@ mod tests {
         let row = db.get_file("notes/meeting.md").unwrap().unwrap();
         assert_eq!(row.status, STATUS_CLOUD_ONLY);
         assert_eq!(row.error, None);
-        // Findable by name…
-        assert!(db
-            .search("meeting", 5)
-            .unwrap()
-            .iter()
-            .any(|h| h.rel_path == "notes/meeting.md"));
-        // …but its content was deliberately not extracted.
-        assert!(db.search("billing cutover", 5).unwrap().is_empty());
+        // Listed, but its content was deliberately not extracted.
+        assert_eq!(db.get_text("notes/meeting.md").unwrap().as_deref(), Some(""));
+        assert!(!finds(&db, "billing cutover", "notes/meeting.md"));
     }
 
     /// Once the bytes arrive (the user opened the file, or OneDrive synced it
@@ -1118,11 +1080,7 @@ mod tests {
         let after = db.get_file("notes/meeting.md").unwrap().unwrap();
         assert_eq!(after.status, STATUS_INDEXED);
         assert_eq!(after.error, None);
-        assert!(db
-            .search("billing cutover", 5)
-            .unwrap()
-            .iter()
-            .any(|h| h.rel_path.contains("meeting.md")));
+        assert!(finds(&db, "billing cutover", "notes/meeting.md"));
     }
 
     /// The retry rule has to converge: re-index exactly the rows whose content
@@ -1179,9 +1137,9 @@ mod tests {
         assert_eq!(stats.updated, 1, "{stats:?}");
         assert_eq!(stats.removed, 1, "{stats:?}");
 
-        assert!(!db.search("entirely new fact", 5).unwrap().is_empty());
-        assert!(!db.search("fresh doc", 5).unwrap().is_empty());
-        assert!(db.search("vendor pricing", 5).unwrap().is_empty());
+        assert!(finds(&db, "entirely new fact", "notes/plain.txt"));
+        assert!(finds(&db, "fresh doc", "notes/new.md"));
+        assert!(!finds(&db, "vendor pricing", "src/example.rs"));
     }
 
     #[test]
@@ -1189,17 +1147,17 @@ mod tests {
         let (_dir, mut project) = temp_project();
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
-        assert!(!db.search("obsolete cutover plan", 5).unwrap().is_empty());
+        assert!(finds(&db, "obsolete cutover plan", "archive/old-notes.md"));
 
         project.set_excluded(vec!["archive".into()]).unwrap();
         let stats = scan(&project, &mut db).unwrap();
         assert_eq!(stats.removed, 1, "{stats:?}");
-        assert!(db.search("obsolete cutover plan", 5).unwrap().is_empty());
+        assert!(!finds(&db, "obsolete cutover plan", "archive/old-notes.md"));
 
         project.set_excluded(vec![]).unwrap();
         let stats = scan(&project, &mut db).unwrap();
         assert_eq!(stats.added, 1, "{stats:?}");
-        assert!(!db.search("obsolete cutover plan", 5).unwrap().is_empty());
+        assert!(finds(&db, "obsolete cutover plan", "archive/old-notes.md"));
     }
 
     #[test]
@@ -1569,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn each_scan_runs_the_control_query_and_health_counts_the_queue() {
+    fn index_health_counts_the_queue() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("START-HERE.md"), "---\ntitle: Start here\n---\n# Start here\nRead this first.\n").unwrap();
         fs::write(dir.path().join("notes.md"), "Notes that mention start once.\n").unwrap();
@@ -1581,19 +1539,9 @@ mod tests {
         scan(&project, &mut db).unwrap();
 
         let h = db.index_health().unwrap();
-        let control = h.control.clone().unwrap();
-        assert!(control.ok, "{control:?}");
-        assert_eq!((control.page.as_str(), control.query.as_str()), ("START-HERE.md", "Start here"));
         assert_eq!(h.pending, 2, "both pages queued");
         assert_eq!(h.skipped, 1, "src/ is searchable only");
         assert_eq!((h.failed, h.retrying), (0, 0));
-
-        let empty = tempfile::tempdir().unwrap();
-        fs::write(empty.path().join("a.md"), "x\n").unwrap();
-        let p2 = Project::create(empty.path(), "None").unwrap();
-        let mut db2 = Db::open_in_memory().unwrap();
-        scan(&p2, &mut db2).unwrap();
-        assert_eq!(db2.index_health().unwrap().control, None, "no control page, no control");
     }
 
     #[test]
@@ -1648,11 +1596,11 @@ mod tests {
 
         fs::write(dir.path().join("notes/hot.md"), "hot new note\n").unwrap();
         assert!(refresh_path(&project, &mut db, "notes/hot.md").unwrap());
-        assert!(!db.search("hot new note", 5).unwrap().is_empty());
+        assert!(finds(&db, "hot new note", "notes/hot.md"));
 
         fs::remove_file(dir.path().join("notes/hot.md")).unwrap();
         assert!(refresh_path(&project, &mut db, "notes/hot.md").unwrap());
-        assert!(db.search("hot new note", 5).unwrap().is_empty());
+        assert!(!finds(&db, "hot new note", "notes/hot.md"));
     }
 
     #[test]
@@ -1669,7 +1617,7 @@ mod tests {
         fs::create_dir_all(&memory_dir).unwrap();
         fs::write(memory_dir.join("ways-of-working.md"), "prefers small diffs\n").unwrap();
         assert!(refresh_path(&project, &mut db, ".ken/memory/ways-of-working.md").unwrap());
-        assert!(!db.search("prefers small diffs", 5).unwrap().is_empty());
+        assert!(finds(&db, "prefers small diffs", ".ken/memory/ways-of-working.md"));
 
         // Ken's own metadata stays out, exactly as before.
         fs::write(dir.path().join(".ken/index-profile.json"), "{\"kind\":\"code\"}\n").unwrap();
@@ -1681,7 +1629,7 @@ mod tests {
         fs::create_dir_all(&git_dir).unwrap();
         fs::write(git_dir.join("COMMIT_EDITMSG"), "unique gitmessage token\n").unwrap();
         assert!(!refresh_path(&project, &mut db, ".git/COMMIT_EDITMSG").unwrap());
-        assert!(db.search("unique gitmessage token", 5).unwrap().is_empty());
+        assert!(!finds(&db, "unique gitmessage token", ".git/COMMIT_EDITMSG"));
         drop(dir);
     }
 
@@ -1705,11 +1653,7 @@ mod tests {
         let stats = scan(&project, &mut db).unwrap();
 
         // The transcript text is searchable and attributed to the video.
-        let hits = db.search("migration kickoff agenda", 5).unwrap();
-        assert!(
-            hits.iter().any(|h| h.rel_path == "clips/kickoff.mp4"),
-            "video searchable by transcript: {hits:?}"
-        );
+        assert!(finds(&db, "migration kickoff agenda", "clips/kickoff.mp4"), "video searchable by transcript");
         // The transcribed video is indexed; the bare one is metadata-only.
         assert_eq!(db.get_file("clips/kickoff.mp4").unwrap().unwrap().status, STATUS_INDEXED);
         assert_eq!(
@@ -1735,6 +1679,8 @@ mod tests {
         // Poison the index, then reindex.
         db.upsert_file("ghost.md", "md", 1, 1, "indexed", None, "ghost content")
             .unwrap();
+        let chunks = crate::chunker::chunk_file("ghost.md", "ghost content", &crate::chunker::IndexProfile::default_for("ghost.md"));
+        db.upsert_chunks("ghost.md", &chunks, crate::kenignore::Tier::Full).unwrap();
         // Seed a stale generated-transcript cache; reindex must purge it so
         // regenerated transcripts never reuse it.
         let cache = crate::transcript::cache_dir(&project.root);
@@ -1744,7 +1690,9 @@ mod tests {
 
         let stats = reindex(&project, &mut db).unwrap();
         assert_eq!(stats.added, 11);
-        assert!(db.search("ghost content", 5).unwrap().is_empty());
+        assert!(db.get_file("ghost.md").unwrap().is_none());
+        assert!(!finds(&db, "ghost content", "ghost.md"), "its chunks went too");
+        assert!(finds(&db, "billing cutover", "notes/meeting.md"), "the rest are searchable again");
         // From scratch: the on-disk transcript cache is gone.
         assert!(!cache.exists(), "transcript cache dir should be removed");
     }
@@ -1769,15 +1717,8 @@ mod tests {
         assert!(db.get_file("notes/plain.txt").unwrap().is_none());
         assert!(db.get_file("src/plain.txt").unwrap().is_some());
 
-        let hits = db.search("rollback rehearsal", 5).unwrap();
-        assert!(
-            hits.iter().any(|h| h.rel_path == "src/plain.txt"),
-            "moved file searchable at new path: {hits:?}",
-        );
-        assert!(
-            !hits.iter().any(|h| h.rel_path == "notes/plain.txt"),
-            "old path gone from index: {hits:?}",
-        );
+        assert!(finds(&db, "rollback rehearsal", "src/plain.txt"), "moved file searchable at new path");
+        assert!(!finds(&db, "rollback rehearsal", "notes/plain.txt"), "old path gone from index");
     }
     fn indexed(db: &Db) -> Vec<(String, i64)> {
         let mut v: Vec<(String, i64)> = db.list_files().unwrap().into_iter().map(|f| (f.rel_path, f.size)).collect();
@@ -1818,7 +1759,7 @@ mod tests {
         scan(&project, &mut full).unwrap();
         assert_eq!(scoped, indexed(&full), "the same index as a full scan");
         assert!(!scoped.iter().any(|(p, _)| p.starts_with("build/")), "gitignored, as the walk leaves it");
-        assert!(db.search("More about", 5).unwrap().iter().any(|h| h.rel_path == "a.md"));
+        assert!(finds(&db, "More about", "a.md"));
 
         // A folder among the paths: a full scan's job.
         fs::create_dir_all(root.join("moved-in")).unwrap();

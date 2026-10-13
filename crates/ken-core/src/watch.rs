@@ -220,14 +220,15 @@ mod tests {
 
         fs::write(dir.path().join("notes/fresh.md"), "brand new insight\n").unwrap();
         let db = Db::open_at(&db_path).unwrap();
+        let found = |db: &Db| db.search_chunks_fts("brand new insight", 5).unwrap().iter().any(|h| h.path == "notes/fresh.md");
         assert!(
-            wait_until(|| !db.search("brand new insight", 5).unwrap().is_empty(), 15),
+            wait_until(|| found(&db), 15),
             "new file should become searchable"
         );
 
         fs::remove_file(dir.path().join("notes/fresh.md")).unwrap();
         assert!(
-            wait_until(|| db.search("brand new insight", 5).unwrap().is_empty(), 15),
+            wait_until(|| !found(&db), 15),
             "deleted file should leave the index"
         );
         assert!(updates.load(Ordering::SeqCst) >= 2);

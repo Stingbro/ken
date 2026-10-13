@@ -1,329 +1,126 @@
-//! Workspace search routing (`openspec/changes/kg-routing`).
+//! Search across a workspace's sources (knowledge-core decision 20).
 //!
-//! Given a query, decide which member projects' semantic indexes to search
-//! — directly when a member is named, via the workspace KG when it isn't,
-//! broadcasting when neither applies — then fan out the existing per-member
-//! hybrid search (`crate::search`) and merge the member result lists into
-//! one cited list. This module is composition and policy only: no new
-//! storage, no new retrieval algorithm (proposal.md, design.md "Goals /
-//! Non-Goals").
+//! Every question searches every source, and the hits are merged once, by
+//! relevance. A source named in the question narrows the search to it, as
+//! does a repo or group the person chose. A reference repo joins only for a
+//! question about the platform, when it is named, or when nothing else
+//! answers. A source still building its meaning index, or slow to answer, is
+//! searched and reported, never dropped.
 //!
-//! ## Scope of this session (ken-core layer, tasks 1.1-1.4)
-//!
-//! `plan_route` (task 1.1) is the three-tier decision (design D1: "a pure
-//! function with the KG as optional input" — pure in the sense that its
-//! only I/O is through the caller-injected `&WorkspaceKgDb` read handle,
-//! which is exactly what makes it table-testable with an in-memory
-//! fixture). `search_member`/`execute_plan`/`merge_routed` (task 1.3) are
-//! the fan-out + cross-member RRF merge. `WorkspaceKgDb::rank_projects_for_entities`
-//! (task 1.2) lives in `workspace_kg_db.rs`, additive next to the existing
-//! `entity_links`/`doc_pointers` CRUD.
-//!
-//! ## Deviations from the design doc (recorded per this session's brief:
-//! "deferral over invention; record conflicts")
-//!
-//! * **No `KgHandle` type.** `design.md`/`tasks.md` write `kg: Option<&KgHandle>`
-//!   but no such type exists anywhere in the codebase. `workspace_kg_db.rs`
-//!   already documents that the design's `workspace.rs` member-enumeration
-//!   layer doesn't exist yet either. The concrete, already-real type that
-//!   fits the slot is `&WorkspaceKgDb` itself (it has an `open_in_memory`
-//!   test constructor, which is exactly what makes the KG a "soft
-//!   dependency" fixture-testable per D1) — used directly rather than
-//!   inventing a wrapper trait with a single implementor.
-//! * **No `ProjectId` newtype.** Every existing member-identifying type in
-//!   this crate (`federation::MemberSnapshot::project_id`,
-//!   `federation::Member::project_id`, `entity_links.project_id`) uses a
-//!   plain `Uuid` (a member's `ProjectConfig.id`). `RoutePlan::targets` does
-//!   the same rather than introducing a newtype nothing else in the crate
-//!   uses.
-//! * **No alias field.** `proposal.md`'s Named tier says "name/alias
-//!   containment", but `project::ProjectConfig` has only `name` — there is
-//!   no aliases list anywhere in the codebase to read. Named-tier matching
-//!   therefore matches `MemberInfo::name` only, normalized (so casing,
-//!   punctuation, and whitespace variants of the same name still match —
-//!   the closest available approximation of "alias-tolerant"). If a real
-//!   alias list lands later, `MemberInfo` can grow a field without changing
-//!   `plan_route`'s signature.
-//! * **No production single-DB `hybrid_search` exists in ken-core to call.**
-//!   Grepping for it turns up only a private test helper in `engine.rs`
-//!   (`fn hybrid_search`, `#[cfg(test)]`) with a doc comment saying the real
-//!   thing is "task 2.2's `hybrid_search` command" — which lives in
-//!   `src-tauri/src/lib.rs`, composing `Db::search_chunks_fts` +
-//!   `Db::semantic_search` + `search::merge_and_rerank` itself. `search_member`
-//!   below is that same composition, generalized to one member so this
-//!   layer (and `ken-mcp`, later) can reuse it instead of re-deriving it a
-//!   third time.
-//! * **Concurrency is the caller's, not this module's.** `Db` wraps a plain
-//!   `rusqlite::Connection`, which is `Send` but not `Sync` — there is no
-//!   way to fan a read out across threads over a shared `&Db` the way
-//!   `std::thread::scope` needs. ken-core's own precedent
-//!   (`std::thread::spawn` in `engine.rs`/`chat.rs`/`watch.rs`/etc.) always
-//!   pairs with an owned handle or channel, never a borrowed `!Sync` value
-//!   shared across threads; src-tauri's actual multi-project concurrency
-//!   wraps each project's `Db` in its own `Arc<Mutex<Db>>` and fans out via
-//!   `spawn_blocking`/tokio tasks (see `hybrid_search` in
-//!   `src-tauri/src/lib.rs`). Reproducing that here would mean either
-//!   requiring every caller to pass `Arc<Mutex<Db>>` (a shape ken-core's
-//!   `Db` API doesn't otherwise use) or spawning raw OS threads per search
-//!   inside a "pure" module. Instead: `search_member` is the single-member,
-//!   synchronous primitive; `execute_plan` composes it in a plain sequential
-//!   loop over `plan.targets` (still "embed once, reuse the vector across
-//!   members" — the loop just isn't parallel). A caller that wants real
-//!   concurrency (src-tauri task 2.1, ken-mcp) calls `search_member` itself
-//!   per target under its own thread/task pool and feeds the resulting
-//!   [`MemberHits`] to [`merge_routed`], which is pure and has no opinion on
-//!   how its inputs were produced. This is the "honest adaptation" the task
-//!   brief allowed for.
-//! * **KG breadcrumbs are plan-level, not per-hit.** `design.md` D3 shows
-//!   `kg://<entity-id> → project` as an illustration of what a breadcrumb
-//!   *explains*, not a literal stored string — precise per-hit entity
-//!   attribution would need joining each hit's path back through
-//!   `doc_pointers` by `(project_id, rel_path)`, which isn't available at
-//!   this layer (a hit's path comes from the member's own `chunks` table,
-//!   not from `doc_pointers`). `merge_routed` instead attaches every
-//!   `RouteReason::KgEntities` id as a `kg://<id>` breadcrumb to every hit
-//!   from that plan — correct ("these are the entities that caused this
-//!   search to happen") even if not maximally precise ("this exact hit is
-//!   about that exact entity"). The UI already owns final breadcrumb
-//!   rendering (D3: "the UI resolves ... to open the source"), so it can
-//!   compose `member name + these ids` however it likes.
+//! [`plan_route`] decides which sources to search, [`search_target`]
+//! searches one and says how it went, and [`merge_routed`] merges every
+//! source's hits into one cited list. [`execute_plan`] runs the three in
+//! order over plain `Db` handles. The app and the MCP server open the
+//! databases their own way and fan the searches out themselves, then call the
+//! same three, so every surface ranks through one pipeline (decision 15).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use uuid::Uuid;
 
+use crate::contenttype::ContentType;
 use crate::db::Db;
 use crate::embedder::Embedder;
 use crate::federation::normalize_name;
+use crate::registry::RepoKind;
 use crate::search::{self, HybridHit, Source};
-use crate::workspace_kg_db::WorkspaceKgDb;
+use crate::vocab::Vocabulary;
 use crate::Result;
 
-/// KG-guided tier cap (design/spec: "ranked ... cap 3").
-pub const KG_TARGET_CAP: usize = 3;
-/// Broadcast tier cap (design/spec: "capped at 5 by recent-activity order").
-pub const BROADCAST_CAP: usize = 5;
-/// Cross-member RRF constant — "same constant as `semantic-index`" (D2).
-const RRF_K: f64 = 60.0;
+/// A source whose search takes at least this long is reported as slow. Its
+/// hits are still merged: a slow source is waited for, not dropped.
+pub const SLOW_MILLIS: u64 = 2_000;
 
-/// Why [`plan_route`] chose the targets it did.
-#[derive(Debug, Clone, PartialEq)]
+/// Why [`plan_route`] chose the sources it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteReason {
-    /// A member's name matched the query (normalized containment).
+    /// The question named these sources, or the caller chose them.
     Named,
-    /// No member was named; these global entity ids (from the workspace KG)
-    /// matched the query and were mapped through `entity_links` to member
-    /// targets.
-    KgEntities(Vec<i64>),
-    /// Neither of the above (no KG, or no KG match): every ready member,
-    /// capped and ordered by recent activity.
-    Broadcast,
+    /// Every source, less the reference repos held back.
+    Every,
 }
 
-/// The outcome of [`plan_route`]: which member projects to search, and why.
+/// Which sources a search reads, and why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutePlan {
-    /// Member project ids to search, in priority order (used by
-    /// [`merge_routed`] as a tie-break — earlier here wins a scoring tie).
+    /// The sources to search. A tie between two hits goes to the one whose
+    /// source comes first here.
     pub targets: Vec<Uuid>,
     pub reason: RouteReason,
-    /// The question asks about the platform the team builds on
-    /// ([`asks_about_platform`]): a reference repo's assets then rank as
-    /// equals of the team's own files.
-    pub platform: bool,
-    /// The targets that are the team's knowledge base
-    /// ([`MemberInfo::knowledge_base`]): they keep a share of the merged
-    /// results ([`KB_LEAD`]). A member the registry calls a team or wiki
-    /// repo counts too, so a plan made by hand needs not list it.
-    pub knowledge: Vec<Uuid>,
+    /// Reference repos held back: searched only when no target answers
+    /// ([`needs_reserve`]).
+    pub reserve: Vec<Uuid>,
 }
 
-/// Per-member outcome of an actual search attempt (design D5: "not-ready
-/// members are skipped and reported", never block).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemberStatus {
-    /// The member was searched and its hits (if any) were merged in.
-    Searched,
-    /// The member's semantic index isn't ready yet; it was skipped.
-    IndexBuilding,
-    /// The member couldn't be searched for any other reason (DB error, or —
-    /// Broadcast tier's D5 latency budget — a search that blew the
-    /// ~150-200ms per-DB budget). Skipped, not blocking.
-    Unavailable,
+impl RoutePlan {
+    /// A search of exactly these sources, as the caller chose them (a pinned
+    /// repo, a group). Nothing is held back.
+    pub fn chosen(targets: Vec<Uuid>) -> RoutePlan {
+        RoutePlan { targets, reason: RouteReason::Named, reserve: Vec::new() }
+    }
 }
 
-/// Plan-time metadata for one workspace member. `index_ready` and
-/// `last_activity` are the caller's read of that member's actual state
-/// (semantic index built, most recent ingest-completion timestamp per
-/// `features/multi-project/README.md`'s "recent activity" contract) — this
-/// module does no I/O to discover them itself, keeping `plan_route`
-/// fixture-testable.
+/// What [`plan_route`] needs to know about one source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberInfo {
     pub project_id: Uuid,
     pub name: String,
-    /// Whether this member's semantic index is built and searchable. Only
-    /// the Broadcast tier's candidate set is filtered on this at plan time
-    /// (spec: "ready semantic indexes"); a KG-guided target can be
-    /// not-ready — `execute_plan` reports it `IndexBuilding` rather than
-    /// `plan_route` silently excluding a KG-selected member.
-    pub index_ready: bool,
-    /// Most recent ingest-completion timestamp (epoch millis or seconds —
-    /// whatever unit the caller is consistent with; this module only ever
-    /// compares it to other members' values).
-    pub last_activity: i64,
-    /// A team or wiki repo: the team's knowledge base. Searched on every
-    /// unnamed query, beside the capped members. Measured 2026-10-07: with
-    /// six members the cap of five dropped the team's wiki, and 0 of 31
-    /// questions answered by it reached `route_query`'s results.
-    pub knowledge_base: bool,
+    /// A reference repo ([`is_reference`]): the platform the team builds on,
+    /// not the team's own work.
+    pub reference: bool,
 }
 
-/// Whether a member of these kinds is the team's knowledge base
-/// ([`MemberInfo::knowledge_base`]).
-pub fn is_knowledge_base(kind: &[crate::registry::RepoKind]) -> bool {
-    kind.iter().any(|k| k.reads_entities())
+/// Whether a repo of these kinds is a reference repo: one that is only
+/// reference. A repo that is also the team's code or wiki is searched like
+/// any other.
+pub fn is_reference(kind: &[RepoKind]) -> bool {
+    !kind.is_empty() && kind.iter().all(|k| *k == RepoKind::Reference)
 }
 
-/// Three-tier route planning (spec: "Three-tier route planning"). No I/O of
-/// its own beyond reads through the caller-supplied `kg` handle — see the
-/// module doc's "Deviations" for why `kg: Option<&WorkspaceKgDb>` rather
-/// than a `KgHandle` abstraction.
+/// Plan a search for `query` over `members`.
 ///
-/// 1. **Named**: any member whose normalized name is contained in the
-///    normalized query. Short-circuits — if this tier finds anything, the
-///    KG is never consulted (task 1.4 "named beats KG").
-/// 2. **KG-guided**: only reached if `kg.is_some()` and no member was named.
-///    Global entities whose normalized name is contained in the normalized
-///    query are looked up via `WorkspaceKgDb::rank_projects_for_entities`,
-///    ranked by link count then pointer density, then the projects of the
-///    entities Claude's map or the judge related to them (never
-///    co-occurrence), mapped back to current members, capped at
-///    [`KG_TARGET_CAP`].
-/// 3. **Broadcast**: reached when neither tier above produced a target
-///    (`kg` is `None`, the KG read failed, no entity matched, or matched
-///    entities' projects aren't current members). Every `index_ready`
-///    member, most-recent-activity first, capped at [`BROADCAST_CAP`].
-pub fn plan_route(query: &str, members: &[MemberInfo], kg: Option<&WorkspaceKgDb>) -> RoutePlan {
-    let normalized_query = normalize_name(query);
-    let platform = asks_about_platform(query);
-
+/// When the question names sources (a member's name, matched whole words and
+/// case-insensitively), only those are searched, reference repos included.
+/// Otherwise every source is searched, except that a reference repo is held
+/// back in [`RoutePlan::reserve`] unless the question is about the platform
+/// ([`asks_about_platform`]).
+pub fn plan_route(query: &str, members: &[MemberInfo]) -> RoutePlan {
+    let normalized = normalize_name(query);
     let named: Vec<Uuid> = members
         .iter()
-        .filter(|m| contains_normalized(&normalized_query, &normalize_name(&m.name)))
+        .filter(|m| contains_normalized(&normalized, &normalize_name(&m.name)))
         .map(|m| m.project_id)
         .collect();
     if !named.is_empty() {
-        let knowledge = members.iter().filter(|m| m.knowledge_base && named.contains(&m.project_id)).map(|m| m.project_id).collect();
-        return RoutePlan {
-            targets: named,
-            reason: RouteReason::Named,
-            platform,
-            knowledge,
-        };
+        return RoutePlan::chosen(named);
     }
-
-    let mut ready: Vec<&MemberInfo> = members.iter().filter(|m| m.index_ready).collect();
-    ready.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-    // The knowledge base is always searched, outside the cap.
-    let knowledge: Vec<Uuid> = ready.iter().filter(|m| m.knowledge_base).map(|m| m.project_id).collect();
-
-    if let Some(kg) = kg {
-        if let Some((mut targets, matched_ids)) = kg_guided_targets(&normalized_query, members, kg) {
-            if !targets.is_empty() {
-                // The graph says where to look first, not where not to look:
-                // it holds no code repo at all (their files are never mined
-                // for entities) and misses what extraction missed. The other
-                // ready members follow, up to the broadcast cap, so "how is
-                // the Entra ID token validated" still reaches the code.
-                for m in &ready {
-                    if targets.len() >= BROADCAST_CAP.max(KG_TARGET_CAP) {
-                        break;
-                    }
-                    if !targets.contains(&m.project_id) {
-                        targets.push(m.project_id);
-                    }
-                }
-                for id in &knowledge {
-                    if !targets.contains(id) {
-                        targets.push(*id);
-                    }
-                }
-                return RoutePlan {
-                    targets,
-                    reason: RouteReason::KgEntities(matched_ids),
-                    platform,
-                    knowledge,
-                };
-            }
-        }
-    }
-
-    let mut targets = knowledge.clone();
-    targets.extend(ready.into_iter().filter(|m| !m.knowledge_base).take(BROADCAST_CAP).map(|m| m.project_id));
+    let platform = asks_about_platform(query);
+    let (targets, reserve): (Vec<&MemberInfo>, Vec<&MemberInfo>) = members.iter().partition(|m| platform || !m.reference);
     RoutePlan {
-        targets,
-        reason: RouteReason::Broadcast,
-        platform,
-        knowledge,
+        targets: targets.iter().map(|m| m.project_id).collect(),
+        reason: RouteReason::Every,
+        reserve: reserve.iter().map(|m| m.project_id).collect(),
     }
 }
 
-/// KG-guided tier body, split out of [`plan_route`] for readability. Returns
-/// `None` when no global entity matched the query at all (so the caller
-/// falls straight through to Broadcast without treating "matched entities
-/// but none map to a current member" any differently from "no match" — both
-/// end up at Broadcast, just via different `Some((vec![], _))` /`None` paths
-/// that `plan_route` treats identically via `!targets.is_empty()`). A read
-/// error against `kg` (corrupt DB, etc.) is treated the same as "no KG" —
-/// routing must never fail outright over a KG read (design: "KG a soft
-/// dependency").
-fn kg_guided_targets(
-    normalized_query: &str,
-    members: &[MemberInfo],
-    kg: &WorkspaceKgDb,
-) -> Option<(Vec<Uuid>, Vec<i64>)> {
-    let entities = kg.list_global_entities().ok()?;
-    let matched_ids: Vec<i64> = entities
-        .iter()
-        .filter(|e| contains_normalized(normalized_query, &normalize_name(&e.name)))
-        .map(|e| e.id)
-        .collect();
-    if matched_ids.is_empty() {
-        return None;
-    }
-
-    // The named entities' projects first, then the projects of what Claude's
-    // map or the judge related to them; a co-occurrence edge only says two
-    // names share files, so it never steers a route.
-    let mut ranked = kg.rank_projects_for_entities(&matched_ids).ok()?;
-    let related = kg.strongly_related(&matched_ids).unwrap_or_default();
-    ranked.extend(kg.rank_projects_for_entities(&related).unwrap_or_default());
-    let member_ids: HashSet<Uuid> = members.iter().map(|m| m.project_id).collect();
-    let mut targets: Vec<Uuid> = Vec::new();
-    for pid in ranked.into_iter().filter_map(|r| Uuid::parse_str(&r.project_id).ok()) {
-        if targets.len() < KG_TARGET_CAP && member_ids.contains(&pid) && !targets.contains(&pid) {
-            targets.push(pid);
-        }
-    }
-    Some((targets, matched_ids))
+/// Whether the reference repos the plan held back are searched too: it held
+/// some back and no source searched so far answered.
+pub fn needs_reserve(plan: &RoutePlan, searched: &[MemberHits]) -> bool {
+    !plan.reserve.is_empty() && searched.iter().all(|m| m.hits.is_empty())
 }
 
-/// Word-boundary-aware "does `haystack` contain `needle`" over
-/// already-`normalize_name`-normalized (lowercased, single-spaced) text.
-/// Padding both sides with a space before `contains` stops a short needle
-/// from matching inside a longer token (`"art"` must not match inside
-/// `"cart"`) while still letting a multi-word needle (`"shattered realms"`)
-/// match as a contiguous run anywhere in the haystack. An empty needle never
-/// matches (an unnamed member/entity must not swallow every query).
+/// Word-boundary-aware "does `haystack` contain `needle`" over text already
+/// normalized by `normalize_name` (lowercased, single-spaced). Padding both
+/// with a space stops a short needle matching inside a longer word (`art` in
+/// `cart`) while a name of several words still matches as a run. An empty
+/// needle never matches.
 fn contains_normalized(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let padded_haystack = format!(" {haystack} ");
-    let padded_needle = format!(" {needle} ");
-    padded_haystack.contains(&padded_needle)
+    format!(" {haystack} ").contains(&format!(" {needle} "))
 }
 
 /// How a hit is cited so a reader can go straight to it: `repo:path:line`,
@@ -375,23 +172,18 @@ pub fn head_sha(root: &Path) -> Option<String> {
     (full.len() >= 7 && full.chars().all(|c| c.is_ascii_hexdigit())).then(|| full[..7].to_string())
 }
 
-/// `ken://<project-id>/<rel-path>` (fixed scheme, `features/multi-project/
-/// README.md` "Cross-feature contracts": "Rel-paths are always forward-slash
-/// normalized, on Windows too").
+/// `ken://<project-id>/<rel-path>`, the path forward-slashed on every
+/// platform.
 fn ken_address(project_id: Uuid, rel_path: &str) -> String {
     format!("ken://{project_id}/{}", rel_path.replace('\\', "/"))
 }
 
-/// Run hybrid search for exactly one target member — the same
-/// `search_chunks_fts` + `semantic_search` + `search::merge_and_rerank`
-/// composition the src-tauri `hybrid_search` command (semantic-index task
-/// 2.2) and the `engine.rs` test helper both already use, generalized so
-/// this module (and later `ken-mcp`) can call one shared function instead
-/// of a third copy. `query_vec` is the query embedded once by the caller
-/// (design: "the query is embedded once and reused across all member KNN
-/// searches") — pass `None` when semantic search isn't available for this
-/// call (no embedder, or `db.vec_available()` is false); the FTS-only path
-/// degrades exactly like the Tauri command's.
+/// Search one source's chunk index: keyword search (with the vocabulary's
+/// other words for the query) and, when `query_vec` is given and the
+/// source's meaning index is built, meaning search, merged and reranked by
+/// [`search::merge_and_rerank_with`]. Each hit carries its line, its page
+/// facts and its label. `query_vec` is the question embedded once by the
+/// caller; None searches by keyword only.
 pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usize) -> Result<Vec<HybridHit>> {
     search_member_with(db, query, query_vec, limit, None)
 }
@@ -405,15 +197,15 @@ pub fn search_member_with(
     query: &str,
     query_vec: Option<&[f32]>,
     limit: usize,
-    shared: Option<&crate::vocab::Vocabulary>,
+    shared: Option<&Vocabulary>,
 ) -> Result<Vec<HybridHit>> {
     let mut fts_hits = db.search_chunks_fts(query, limit)?;
     // The team's other words for what was asked (Vocabulary page, decisions
     // aliases, page aliases): each alternative phrasing runs as its own
     // keyword search, its new chunks after the original's.
-    let own = crate::vocab::Vocabulary::cached(db)?;
+    let own = Vocabulary::cached(db)?;
     let vocab = match shared {
-        Some(s) => crate::vocab::Vocabulary::merged([&own, s]),
+        Some(s) => Vocabulary::merged([&own, s]),
         None => own,
     };
     for alt in vocab.alternatives(query) {
@@ -507,7 +299,7 @@ pub fn search_member_of(
     query: &str,
     query_vec: Option<&[f32]>,
     limit: usize,
-    types: &[crate::contenttype::ContentType],
+    types: &[ContentType],
 ) -> Result<Vec<HybridHit>> {
     search_member_of_with(db, query, query_vec, limit, types, None)
 }
@@ -519,8 +311,8 @@ pub fn search_member_of_with(
     query: &str,
     query_vec: Option<&[f32]>,
     limit: usize,
-    types: &[crate::contenttype::ContentType],
-    shared: Option<&crate::vocab::Vocabulary>,
+    types: &[ContentType],
+    shared: Option<&Vocabulary>,
 ) -> Result<Vec<HybridHit>> {
     if types.is_empty() {
         return search_member_with(db, query, query_vec, limit, shared);
@@ -534,10 +326,9 @@ pub fn search_member_of_with(
 /// One vocabulary for a routed search: every member's stored vocabulary
 /// together, so the team wiki's Vocabulary page and decisions aliases widen
 /// the search in the code repos too. Members are read once per search.
-pub fn workspace_vocabulary<'a>(dbs: impl IntoIterator<Item = &'a Db>) -> crate::vocab::Vocabulary {
-    let vocabs: Vec<crate::vocab::Vocabulary> =
-        dbs.into_iter().filter_map(|db| crate::vocab::Vocabulary::cached(db).ok()).collect();
-    crate::vocab::Vocabulary::merged(vocabs.iter())
+pub fn workspace_vocabulary<'a>(dbs: impl IntoIterator<Item = &'a Db>) -> Vocabulary {
+    let vocabs: Vec<Vocabulary> = dbs.into_iter().filter_map(|db| Vocabulary::cached(db).ok()).collect();
+    Vocabulary::merged(vocabs.iter())
 }
 
 /// Words that put a question on the platform rather than on the team's own
@@ -546,44 +337,85 @@ const PLATFORM_WORDS: &[&str] =
     &["engine", "platform", "built-in", "builtin", "vanilla", "base game", "out of the box", "upstream", "sdk", "framework"];
 
 /// Whether `query` asks about the platform the team builds on ("does the
-/// engine have a boss health bar", "the game's built-in minimap").
+/// engine have a boss health bar", "the game's built-in minimap"). Such a
+/// question searches the reference repos too.
 pub fn asks_about_platform(query: &str) -> bool {
     let words: String = query.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { ' ' }).collect();
     let words = format!(" {} ", words.split_whitespace().collect::<Vec<_>>().join(" "));
     PLATFORM_WORDS.iter().any(|w| words.contains(&format!(" {w} ")))
 }
 
-/// A handle `execute_plan` needs to search one planned target: identity plus
-/// enough to decide whether to search it at all. Distinct from
-/// [`MemberInfo`] (plan-time-only metadata, no `Db`) because this one
-/// borrows a live database connection.
-pub struct MemberDbHandle<'a> {
-    pub project_id: Uuid,
-    pub name: &'a str,
-    pub db: &'a Db,
-    /// Mirrors [`MemberInfo::index_ready`] at execution time — a target can
-    /// still be not-ready here even though it was a valid KG-guided pick at
-    /// plan time (see `plan_route`'s doc comment).
-    pub index_ready: bool,
+/// How one source's search went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberStatus {
+    /// Searched by keyword and, where it has a meaning index, by meaning.
+    Searched,
+    /// Searched by keyword only while its meaning index is built: `embedded`
+    /// of its `chunks` passages have a meaning vector so far.
+    Building { embedded: i64, chunks: i64 },
+    /// Not searched: its index would not open, or the search failed.
+    Unavailable,
 }
 
-/// One member's contribution to a routed search: either its ranked hits
-/// (`status == Searched`) or an explanation of why it has none. This is
-/// [`merge_routed`]'s actual input shape — a concurrent caller builds these
-/// itself (one per target, via [`search_member`] fanned out however it
-/// likes) instead of going through [`execute_plan`]'s sequential loop.
+/// How far a source's meaning index has got: `Building` until it is built,
+/// `Searched` once it is, or where this build has no vector search at all.
+pub fn meaning_status(db: &Db) -> MemberStatus {
+    if !db.vec_available() || db.semantic_built_at().ok().flatten().is_some() {
+        return MemberStatus::Searched;
+    }
+    MemberStatus::Building {
+        embedded: db.vector_count().unwrap_or(0),
+        chunks: db.chunk_count().unwrap_or(0),
+    }
+}
+
+/// One source's part in a routed search: its ranked hits (best first, as
+/// [`search_member`] returns them), how its search went, and how long it
+/// took. [`merge_routed`] takes a list of these, however they were made.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberHits {
     pub project_id: Uuid,
     pub member_name: String,
     pub status: MemberStatus,
-    /// Best-first, exactly as returned by [`search_member`]. Empty unless
-    /// `status == Searched`.
     pub hits: Vec<HybridHit>,
+    /// How long the search took, in milliseconds.
+    pub millis: u64,
 }
 
-/// One merged, cited search result (spec: "Every result is a cited
-/// address").
+/// Search one source for a routed search and say how it went. `db` None
+/// (its index would not open) or a failed search is `Unavailable`; a source
+/// whose meaning index is not built yet is searched by keyword and reported
+/// `Building` ([`meaning_status`]). The caller filters the hits further if
+/// it needs to, before [`needs_reserve`] and [`merge_routed`] read them.
+#[allow(clippy::too_many_arguments)]
+pub fn search_target(
+    project_id: Uuid,
+    name: &str,
+    db: Option<&Db>,
+    query: &str,
+    query_vec: Option<&[f32]>,
+    limit: usize,
+    types: &[ContentType],
+    shared: Option<&Vocabulary>,
+) -> MemberHits {
+    let started = Instant::now();
+    let (status, hits) = match db {
+        None => (MemberStatus::Unavailable, Vec::new()),
+        Some(db) => match search_member_of_with(db, query, query_vec, limit, types, shared) {
+            Ok(hits) => (meaning_status(db), hits),
+            Err(_) => (MemberStatus::Unavailable, Vec::new()),
+        },
+    };
+    MemberHits {
+        project_id,
+        member_name: name.to_string(),
+        status,
+        hits,
+        millis: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// One merged, cited search result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutedHit {
     pub path: String,
@@ -601,25 +433,27 @@ pub struct RoutedHit {
     /// For a Markdown page: section, verified or evidence date, and whether
     /// it is retired or generated.
     pub page: Option<crate::pagemeta::HitPage>,
-    /// `kg://<entity-id>` per entity that selected this hit's plan (empty
-    /// unless the plan's reason was `KgEntities` — see the module doc's
-    /// "KG breadcrumbs are plan-level, not per-hit").
-    pub kg_breadcrumbs: Vec<String>,
 }
 
-/// Per-member status entry in an [`ExecutionReport`] (spec: "per-member
-/// status list").
+/// How one source's search went, as reported beside the results.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberStatusEntry {
     pub project_id: Uuid,
     pub member_name: String,
     pub status: MemberStatus,
+    /// How long its search took, in milliseconds.
+    pub millis: u64,
 }
 
-/// Full result of routing + searching: the plan that produced it, the
-/// merged cited hits, and what happened per member. Mirrors the
-/// `{ plan, results, member_status }` shape `src-tauri`'s `route_search`
-/// command (task 2.1) is expected to return.
+impl MemberStatusEntry {
+    /// Whether its search took [`SLOW_MILLIS`] or longer.
+    pub fn slow(&self) -> bool {
+        self.millis >= SLOW_MILLIS
+    }
+}
+
+/// A routed search's outcome: the plan, the merged cited hits, and how each
+/// source searched went.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReport {
     pub plan: RoutePlan,
@@ -627,18 +461,19 @@ pub struct ExecutionReport {
     pub member_status: Vec<MemberStatusEntry>,
 }
 
-/// Sequential convenience composition of [`search_member`] over every
-/// `plan.targets` member found in `targets`, followed by [`merge_routed`].
-/// Embeds the query once (`embedder.embed_query`) and reuses the vector for
-/// every member, per design. See the module doc's "Concurrency is the
-/// caller's, not this module's" for why this loop is sequential rather than
-/// fanned out across threads, and how a caller that wants real concurrency
-/// should instead call [`search_member`] itself per target and pass the
-/// results straight to [`merge_routed`].
-///
-/// A planned target missing from `targets` (the caller didn't supply a
-/// handle for it) is reported `Unavailable` rather than silently dropped —
-/// D5's "skipped and reported, never blocking" applies to this gap too.
+/// A source [`execute_plan`] can search: its id, its name and its index.
+pub struct MemberDbHandle<'a> {
+    pub project_id: Uuid,
+    pub name: &'a str,
+    pub db: &'a Db,
+}
+
+/// Run a plan over plain `Db` handles, one source after another: embed the
+/// question once, search every target ([`search_target`]), then the held-back
+/// reference repos if nothing answered ([`needs_reserve`]), and merge
+/// ([`merge_routed`]). A planned source missing from `targets` is reported
+/// `Unavailable`. A caller that wants the searches to run at once calls the
+/// same three itself, as the app does.
 pub fn execute_plan(
     plan: &RoutePlan,
     targets: &[MemberDbHandle<'_>],
@@ -648,92 +483,61 @@ pub fn execute_plan(
 ) -> ExecutionReport {
     let query_vec = embedder.embed_query(query).ok();
     let vocab = workspace_vocabulary(targets.iter().map(|t| t.db));
-
-    let mut member_hits: Vec<MemberHits> = Vec::with_capacity(plan.targets.len());
-    for project_id in &plan.targets {
-        let Some(target) = targets.iter().find(|t| t.project_id == *project_id) else {
-            member_hits.push(MemberHits {
-                project_id: *project_id,
-                member_name: String::new(),
-                status: MemberStatus::Unavailable,
-                hits: Vec::new(),
-            });
-            continue;
-        };
-        if !target.index_ready {
-            member_hits.push(MemberHits {
-                project_id: *project_id,
-                member_name: target.name.to_string(),
-                status: MemberStatus::IndexBuilding,
-                hits: Vec::new(),
-            });
-            continue;
-        }
-        match search_member_with(target.db, query, query_vec.as_deref(), limit, Some(&vocab)) {
-            Ok(hits) => member_hits.push(MemberHits {
-                project_id: *project_id,
-                member_name: target.name.to_string(),
-                status: MemberStatus::Searched,
-                hits,
-            }),
-            Err(_) => member_hits.push(MemberHits {
-                project_id: *project_id,
-                member_name: target.name.to_string(),
-                status: MemberStatus::Unavailable,
-                hits: Vec::new(),
-            }),
-        }
+    let search = |ids: &[Uuid]| -> Vec<MemberHits> {
+        ids.iter()
+            .map(|id| {
+                let target = targets.iter().find(|t| t.project_id == *id);
+                search_target(
+                    *id,
+                    target.map_or("", |t| t.name),
+                    target.map(|t| t.db),
+                    query,
+                    query_vec.as_deref(),
+                    limit,
+                    &[],
+                    Some(&vocab),
+                )
+            })
+            .collect()
+    };
+    let mut member_hits = search(&plan.targets);
+    if needs_reserve(plan, &member_hits) {
+        member_hits.extend(search(&plan.reserve));
     }
-
     merge_routed(plan, &member_hits, limit)
 }
 
-/// Cross-member RRF merge (design D2, spec "Fan-out hybrid search with
-/// rank-only merge"): every `Searched` member's hit list is already ranked
-/// best-first; each hit's cross-member score is `1 / (k + rank)` (`k` =
-/// [`RRF_K`], `rank` 1-based within its own member's list) — raw scores
-/// never enter this computation at all, because [`HybridHit`] doesn't carry
-/// one. Ties (identical score — only possible across different members,
-/// since ranks strictly decrease within one member's list) are broken by
-/// the member's position in `plan.targets` (design: "tie-break by KG-target
-/// rank when routed, member recent-activity otherwise" — both are exactly
-/// what determined `plan.targets`' order in [`plan_route`], so reusing that
-/// order here needs no extra parameter), then by within-member rank.
+/// Merge every source's hits into one list, once, by relevance. Every source
+/// scores on the same scale (each file's tier already in its score), so the
+/// best answer leads whichever repo holds it. A tie goes to the hit ranked
+/// higher in its own source, then to the source the plan lists first. The
+/// same file kept in two repos counts once, at its best place. Every source
+/// searched is in `member_status`, whatever its status.
 ///
-/// Pure: no I/O, no `Db`, no embedder — safe to call directly with fixture
-/// [`MemberHits`] in tests.
+/// Pure: no database or model, so tests can feed it [`MemberHits`] directly.
 pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) -> ExecutionReport {
-    let target_order: HashMap<Uuid, usize> = plan.targets.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-    let breadcrumbs: Vec<String> = match &plan.reason {
-        RouteReason::KgEntities(ids) => ids.iter().map(|id| format!("kg://{id}")).collect(),
-        RouteReason::Named | RouteReason::Broadcast => Vec::new(),
-    };
+    let plan_order: HashMap<Uuid, usize> =
+        plan.targets.iter().chain(&plan.reserve).enumerate().map(|(i, id)| (*id, i)).collect();
 
-    // (score, target_order, within-member rank, hit) — sorted score DESC,
-    // then the two tie-breaks ASC.
-    let mut candidates: Vec<(f64, usize, usize, RoutedHit, f64, bool)> = Vec::new();
+    // (score, rank in its own source, the source's place in the plan, hit).
+    let mut candidates: Vec<(f64, usize, usize, RoutedHit)> = Vec::new();
     for mh in member_hits {
-        if mh.status != MemberStatus::Searched {
+        if mh.hits.is_empty() {
             continue;
         }
-        // Once per member: its commit, its kinds, and whether its pages are
-        // notes. A member missing from the registry is cited as plain
-        // repo:path:line.
+        // Once per source: its commit, and whether its pages are notes. A
+        // source missing from the registry is cited as plain repo:path:line.
         let (sha, kinds) = match crate::registry::entry_of(mh.project_id) {
             Some((root, kind)) => (head_sha(&root), kind),
             None => (None, Vec::new()),
         };
-        let wiki = kinds.iter().any(|k| matches!(k, crate::registry::RepoKind::Team | crate::registry::RepoKind::Wiki));
-        let knowledge = plan.knowledge.contains(&mh.project_id) || is_knowledge_base(&kinds);
-        let order = target_order.get(&mh.project_id).copied().unwrap_or(usize::MAX);
-        for (i, hit) in mh.hits.iter().enumerate() {
-            let rank = i + 1;
-            let score = 1.0 / (RRF_K + rank as f64);
-            let address = ken_address(mh.project_id, &hit.path);
+        let wiki = kinds.iter().any(|k| matches!(k, RepoKind::Team | RepoKind::Wiki));
+        let order = plan_order.get(&mh.project_id).copied().unwrap_or(usize::MAX);
+        for (rank, hit) in mh.hits.iter().enumerate() {
             candidates.push((
-                score,
-                order,
+                hit.score,
                 rank,
+                order,
                 RoutedHit {
                     path: hit.path.clone(),
                     chunk_id: hit.chunk_id,
@@ -741,38 +545,24 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     source: hit.source,
                     project_id: mh.project_id,
                     member_name: mh.member_name.clone(),
-                    address,
+                    address: ken_address(mh.project_id, &hit.path),
                     line: hit.line,
                     locator: locator(&mh.member_name, &hit.path, hit.line, sha.as_deref(), wiki),
                     page: hit.page.clone(),
-                    kg_breadcrumbs: breadcrumbs.clone(),
                 },
-                hit.score,
-                knowledge,
             ));
         }
     }
-    // Relevance leads across members: every member scores on the same scale
-    // (each file's tier already folded in), so the best answer wins whichever
-    // repo holds it. Rank-only fusion gave each repo's first hit the same
-    // weight: a code repo's best guess at a contract question tied the
-    // contract. Ties fall to RRF, the plan's order and the member's own rank.
-    candidates.sort_by(|a, b| {
-        b.4.total_cmp(&a.4)
-            .then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-    });
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     // One copy of a file kept in several repos (a vendored PDF, a design
     // asset): the same name and the same text is one answer, at its best rank.
     // A longer passage is the same answer wherever it sits (a copied doc, a
     // second checkout); a short one only when the file name matches too.
     let mut seen: std::collections::HashSet<(String, String)> = Default::default();
-    let ranked: Vec<Ranked> = candidates
+    let results = candidates
         .into_iter()
-        .map(|c| Ranked { rank: c.2, hit: c.3, score: c.4, knowledge: c.5 })
-        .filter(|r| {
-            let h = &r.hit;
+        .map(|c| c.3)
+        .filter(|h| {
             let name = if h.snippet.trim().len() > 80 {
                 String::new()
             } else {
@@ -780,8 +570,8 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
             };
             seen.insert((name, h.snippet.trim().to_string()))
         })
+        .take(limit)
         .collect();
-    let results = keep_knowledge_share(ranked).into_iter().take(limit).collect();
 
     let member_status = member_hits
         .iter()
@@ -789,92 +579,11 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
             project_id: mh.project_id,
             member_name: mh.member_name.clone(),
             status: mh.status,
+            millis: mh.millis,
         })
         .collect();
 
-    ExecutionReport {
-        plan: plan.clone(),
-        results,
-        member_status,
-    }
-}
-
-/// How far the knowledge base's hits can fall behind another member's: its
-/// `k`-th best hit ranks ahead of every other member's `k + KB_LEAD`-th, so
-/// the wiki's best answer is never pushed out by each code repo's first few
-/// guesses. Measured 2026-10-07 on 31 questions the team's wiki answers:
-/// searched alone the wiki ranked the right page 1 to 10, but merged by
-/// relevance with five code repos its fifth hit lost to every repo's first,
-/// and route_query's top five held the page for 10 of the 31. Reserved
-/// places (two of the first five, four of the first ten) were tried too and
-/// cost the 45 code questions a top-five answer at every setting that
-/// helped the wiki; holding the wiki's rank against each repo's rank did not
-/// (see `KB_SHARE_FLOOR`).
-pub const KB_LEAD: usize = 3;
-/// A knowledge-base hit is held up only if it scores at least this share of
-/// the list's best hit: a wiki page that barely matches a question about
-/// code does not push the code down.
-pub const KB_SHARE_FLOOR: f64 = 0.6;
-
-/// One merged hit with what [`keep_knowledge_share`] needs: its rank in its
-/// own member's list, its merge score, and whether it is from the
-/// knowledge base.
-struct Ranked {
-    rank: usize,
-    hit: RoutedHit,
-    score: f64,
-    knowledge: bool,
-}
-
-/// Reorder a merged list, best first, so the knowledge base keeps its share
-/// ([`KB_LEAD`]): before another member's hit of rank `r`, each
-/// knowledge-base member's next hit of rank `r - KB_LEAD` or better is
-/// placed, if it scores at least [`KB_SHARE_FLOOR`] of the best. Every hit
-/// keeps its order within its own member, and a hit that ranks higher on
-/// relevance is never moved down by more than the hits placed ahead of it.
-fn keep_knowledge_share(ranked: Vec<Ranked>) -> Vec<RoutedHit> {
-    let best = ranked.first().map_or(0.0, |r| r.score);
-    let held_up = |r: &Ranked| r.knowledge && (best <= 0.0 || r.score >= KB_SHARE_FLOOR * best);
-    if !ranked.iter().any(|r| !r.knowledge) || !ranked.iter().any(held_up) {
-        return ranked.into_iter().map(|r| r.hit).collect();
-    }
-    // Each knowledge-base member's hits that may be held up, by own rank.
-    let mut queues: Vec<(Uuid, std::collections::VecDeque<usize>)> = Vec::new();
-    for (i, r) in ranked.iter().enumerate().filter(|(_, r)| held_up(r)) {
-        match queues.iter_mut().find(|(id, _)| *id == r.hit.project_id) {
-            Some((_, q)) => q.push_back(i),
-            None => queues.push((r.hit.project_id, std::collections::VecDeque::from([i]))),
-        }
-    }
-    for (_, q) in &mut queues {
-        q.make_contiguous().sort_by_key(|&i| ranked[i].rank);
-    }
-    let mut placed = vec![false; ranked.len()];
-    let mut order: Vec<usize> = Vec::with_capacity(ranked.len());
-    for i in 0..ranked.len() {
-        if placed[i] {
-            continue;
-        }
-        if !ranked[i].knowledge {
-            for (_, q) in &mut queues {
-                while let Some(&k) = q.front() {
-                    if placed[k] {
-                        q.pop_front();
-                    } else if ranked[i].rank >= ranked[k].rank + KB_LEAD {
-                        q.pop_front();
-                        placed[k] = true;
-                        order.push(k);
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        placed[i] = true;
-        order.push(i);
-    }
-    let mut hits: Vec<Option<RoutedHit>> = ranked.into_iter().map(|r| Some(r.hit)).collect();
-    order.into_iter().filter_map(|i| hits[i].take()).collect()
+    ExecutionReport { plan: plan.clone(), results, member_status }
 }
 
 #[cfg(test)]
@@ -882,14 +591,12 @@ mod tests {
     use super::*;
     use crate::embedder::FakeEmbedder;
 
-    fn member(project_id: Uuid, name: &str, index_ready: bool, last_activity: i64) -> MemberInfo {
-        MemberInfo {
-            project_id,
-            name: name.to_string(),
-            index_ready,
-            last_activity,
-            knowledge_base: false,
-        }
+    fn member(project_id: Uuid, name: &str) -> MemberInfo {
+        MemberInfo { project_id, name: name.to_string(), reference: false }
+    }
+
+    fn reference(project_id: Uuid, name: &str) -> MemberInfo {
+        MemberInfo { reference: true, ..member(project_id, name) }
     }
 
     fn hit(path: &str, chunk_id: i64) -> HybridHit {
@@ -904,221 +611,174 @@ mod tests {
         }
     }
 
-    // --- plan_route table tests (task 1.4) ---
+    fn searched(project_id: Uuid, name: &str, hits: Vec<HybridHit>) -> MemberHits {
+        MemberHits { project_id, member_name: name.to_string(), status: MemberStatus::Searched, hits, millis: 0 }
+    }
 
+    fn every(targets: Vec<Uuid>) -> RoutePlan {
+        RoutePlan { targets, reason: RouteReason::Every, reserve: Vec::new() }
+    }
+
+    // --- plan_route ---
+
+    /// A question that names a source searches it alone.
     #[test]
-    fn named_tier_routes_directly_with_no_kg_lookup() {
-        let shattered = Uuid::new_v4();
-        let other = Uuid::new_v4();
-        let members = vec![
-            member(shattered, "Shattered Realms", true, 100),
-            member(other, "Other Project", true, 200),
-        ];
-        // No `kg` handle at all: if Named didn't short-circuit before ever
-        // touching `kg`, this would panic/error rather than route — passing
-        // `None` here is itself part of the assertion that Named never
-        // needs it.
-        let plan = plan_route("what's new in Shattered Realms lately?", &members, None);
-        assert_eq!(plan.targets, vec![shattered]);
+    fn a_named_source_narrows_the_search() {
+        let (shattered, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let members = vec![member(shattered, "Shattered Realms"), member(other, "Other Project")];
+        let plan = plan_route("what's new in Shattered Realms lately?", &members);
+        assert_eq!(plan, RoutePlan::chosen(vec![shattered]));
         assert_eq!(plan.reason, RouteReason::Named);
     }
 
+    /// With no source named, every source is searched: no cap, no order by
+    /// activity, the knowledge base no different from the rest.
     #[test]
-    fn kg_guided_tier_ranks_and_caps_at_three() {
-        let kg = WorkspaceKgDb::open_in_memory().unwrap();
-        let entity = kg
-            .insert_global_entity("topic", "Zylographs", "a shared concept", 1)
-            .unwrap();
+    fn every_source_is_searched_when_none_is_named() {
+        let members: Vec<MemberInfo> = (0..7).map(|i| member(Uuid::new_v4(), &format!("Project {i}"))).collect();
+        let plan = plan_route("can I merge my own pull request", &members);
+        assert_eq!(plan.reason, RouteReason::Every);
+        assert_eq!(plan.targets, members.iter().map(|m| m.project_id).collect::<Vec<_>>());
+        assert!(plan.reserve.is_empty());
+    }
 
-        let p1 = Uuid::new_v4();
-        let p2 = Uuid::new_v4();
-        let p3 = Uuid::new_v4();
-        let p4 = Uuid::new_v4();
-        // p1: 1 link, 2 pointers (density leader among 1-link projects).
-        kg.insert_entity_link(entity, p1, 1, "Zylographs").unwrap();
-        kg.insert_doc_pointer(entity, p1, "a.md", "").unwrap();
-        kg.insert_doc_pointer(entity, p1, "b.md", "").unwrap();
-        // p2, p3, p4: 1 link, 0 pointers each — four candidates total, cap
-        // must trim to 3.
-        kg.insert_entity_link(entity, p2, 2, "Zylographs").unwrap();
-        kg.insert_entity_link(entity, p3, 3, "Zylographs").unwrap();
-        kg.insert_entity_link(entity, p4, 4, "Zylographs").unwrap();
+    /// A reference repo is held back from a question about the team's own
+    /// work, joins a question about the platform, and joins when named.
+    #[test]
+    fn a_reference_repo_joins_for_the_platform_or_when_named() {
+        let (code, engine) = (Uuid::new_v4(), Uuid::new_v4());
+        let members = vec![member(code, "game"), reference(engine, "hytale-server")];
 
-        let members = vec![
-            member(p1, "Alpha", true, 400),
-            member(p2, "Bravo", true, 300),
-            member(p3, "Charlie", true, 200),
-            member(p4, "Delta", true, 100),
+        let own = plan_route("how much stamina does a block cost", &members);
+        assert_eq!((own.targets.clone(), own.reserve.clone()), (vec![code], vec![engine]));
+
+        let platform = plan_route("does the engine have a boss health bar", &members);
+        assert_eq!((platform.targets.clone(), platform.reserve.clone()), (vec![code, engine], vec![]));
+
+        let named = plan_route("where does hytale-server load worlds", &members);
+        assert_eq!(named, RoutePlan::chosen(vec![engine]));
+    }
+
+    #[test]
+    fn only_a_repo_that_is_only_reference_is_held_back() {
+        assert!(is_reference(&[RepoKind::Reference]));
+        assert!(!is_reference(&[RepoKind::Reference, RepoKind::Code]));
+        assert!(!is_reference(&[RepoKind::Wiki]));
+        assert!(!is_reference(&[]), "a repo whose kind is not said yet is searched");
+    }
+
+    #[test]
+    fn a_question_about_the_platform_is_spotted() {
+        assert!(asks_about_platform("Does the engine have a boss health bar?"));
+        assert!(asks_about_platform("How do we add our own pins to the game's built-in minimap?"));
+        assert!(asks_about_platform("Which shapes does it support out of the box?"));
+        assert!(!asks_about_platform("How much stamina does it cost to take a hit while holding up a weapon or shield?"));
+        assert!(!asks_about_platform("Who leads engineering?"), "whole words only");
+    }
+
+    /// The held-back reference repos are searched only when nothing else
+    /// answered.
+    #[test]
+    fn the_reserve_is_searched_only_when_nothing_answers() {
+        let (code, engine) = (Uuid::new_v4(), Uuid::new_v4());
+        let plan = RoutePlan { targets: vec![code], reason: RouteReason::Every, reserve: vec![engine] };
+        assert!(needs_reserve(&plan, &[searched(code, "game", vec![])]));
+        assert!(!needs_reserve(&plan, &[searched(code, "game", vec![hit("src/a.rs", 1)])]));
+        assert!(!needs_reserve(&every(vec![code]), &[searched(code, "game", vec![])]), "nothing held back");
+
+        let game = fixture_db_with_chunk("src/notes.md", "the quokka naps");
+        let server = fixture_db_with_chunk("world/Loader.md", "worlds load from region files");
+        let targets = vec![
+            MemberDbHandle { project_id: code, name: "game", db: &game },
+            MemberDbHandle { project_id: engine, name: "hytale-server", db: &server },
         ];
-        let plan = plan_route("tell me about the zylographs", &members, Some(&kg));
-        assert_eq!(plan.targets[0], p1, "highest pointer density must lead");
-        assert_eq!(plan.targets[..3].len(), 3, "the graph ranks at most 3");
-        assert_eq!(plan.targets.len(), 4, "then the other ready members, up to the broadcast cap");
-        assert_eq!(plan.reason, RouteReason::KgEntities(vec![entity]));
+        let mut embedder = FakeEmbedder::new();
+        let answered = execute_plan(&plan, &targets, &mut embedder, "quokka", 10);
+        assert!(answered.member_status.iter().all(|s| s.project_id == code), "the reserve stays out");
+        let fell_back = execute_plan(&plan, &targets, &mut embedder, "region files", 10);
+        assert_eq!(fell_back.member_status.len(), 2);
+        assert!(fell_back.results.iter().any(|r| r.project_id == engine && r.path == "world/Loader.md"));
     }
 
-    /// The graph steers by what Claude or the judge related to a named
-    /// entity; a co-occurrence edge (two names in the same files) does not.
-    #[test]
-    fn a_route_follows_claudes_and_judged_edges_not_cooccurrence() {
-        let kg = WorkspaceKgDb::open_in_memory().unwrap();
-        let named = kg.insert_global_entity("topic", "Balance Studio", "a tools app", 1).unwrap();
-        let by_claude = kg.insert_global_entity("repo", "Tools", "the authoring suite", 1).unwrap();
-        let by_files = kg.insert_global_entity("topic", "Patchlines", "update channels", 1).unwrap();
-        let (p1, p2, p3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        kg.insert_entity_link(named, p1, 1, "Balance Studio").unwrap();
-        kg.insert_entity_link(by_claude, p2, 2, "Tools").unwrap();
-        kg.insert_entity_link(by_files, p3, 3, "Patchlines").unwrap();
-        kg.insert_global_edge(named, by_claude, "app in", 1.0, "imported").unwrap();
-        kg.insert_global_edge(named, by_files, "related", 2.0, "cooccur").unwrap();
-        // p2 is the least active member, so only Claude's edge puts it ahead
-        // of p4; p3 is still indexing, so the broadcast fill cannot add it
-        // either: only the graph could, and its co-occurrence edge must not.
-        let p4 = Uuid::new_v4();
-        let members = vec![
-            member(p1, "Wiki", true, 10),
-            member(p2, "Docs", true, 5),
-            member(p3, "Ref", false, 900),
-            member(p4, "Site", true, 300),
-        ];
-        let plan = plan_route("what changed in balance studio?", &members, Some(&kg));
-        assert_eq!(plan.targets, vec![p1, p2, p4]);
-        assert_eq!(plan.reason, RouteReason::KgEntities(vec![named]));
-    }
-
-    /// A code repo is never in the graph: a question about an entity the
-    /// graph knows still reaches it.
-    #[test]
-    fn a_graph_route_still_reaches_members_the_graph_does_not_hold() {
-        let kg = WorkspaceKgDb::open_in_memory().unwrap();
-        let entity = kg.insert_global_entity("topic", "Entra ID", "the identity provider", 1).unwrap();
-        let (docs, code) = (Uuid::new_v4(), Uuid::new_v4());
-        kg.insert_entity_link(entity, docs, 1, "Entra ID").unwrap();
-        let members = vec![member(docs, "Project Documents", true, 100), member(code, "app", true, 50)];
-        let plan = plan_route("How are Entra ID tokens validated?", &members, Some(&kg));
-        assert_eq!(plan.targets, vec![docs, code], "the graph's member first, the code after");
-    }
-
-    #[test]
-    fn broadcast_tier_caps_at_five_by_recent_activity() {
-        let members: Vec<MemberInfo> = (0..7)
-            .map(|i| member(Uuid::new_v4(), &format!("Project {i}"), true, i))
-            .collect();
-        let plan = plan_route("nothing named or known here", &members, None);
-        assert_eq!(plan.targets.len(), 5, "Broadcast tier must cap at 5");
-        assert_eq!(plan.reason, RouteReason::Broadcast);
-        // Most-recent-activity first: activity == index, so 6,5,4,3,2.
-        let expected: Vec<Uuid> = members.iter().rev().take(5).map(|m| m.project_id).collect();
-        assert_eq!(plan.targets, expected);
-    }
-
-    #[test]
-    fn the_knowledge_base_is_searched_outside_the_cap() {
-        let mut members: Vec<MemberInfo> = (0..6)
-            .map(|i| member(Uuid::new_v4(), &format!("Repo {i}"), true, 10 + i))
-            .collect();
-        let mut wiki = member(Uuid::new_v4(), "Team-Docs", true, 0);
-        wiki.knowledge_base = true;
-        members.push(wiki.clone());
-        let plan = plan_route("can I merge my own pull request", &members, None);
-        assert_eq!(plan.targets.len(), 6, "five capped members plus the knowledge base");
-        assert_eq!(plan.targets[0], wiki.project_id, "the knowledge base first, though the least active");
-        // A member named in the query still narrows the search to it alone.
-        let named = plan_route("what does Repo 3 build", &members, None);
-        assert_eq!(named.targets, vec![members[3].project_id]);
-    }
-
-    #[test]
-    fn broadcast_tier_excludes_not_ready_members() {
-        let ready = Uuid::new_v4();
-        let building = Uuid::new_v4();
-        let members = vec![member(ready, "Ready", true, 1), member(building, "Building", false, 2)];
-        let plan = plan_route("unmatched query", &members, None);
-        assert_eq!(plan.targets, vec![ready]);
-    }
-
-    #[test]
-    fn kg_unavailable_degrades_to_broadcast() {
-        let members = vec![member(Uuid::new_v4(), "Alpha", true, 1)];
-        // `kg: None` — flag off / KG not built. Must not error, must not
-        // hang: falls straight to Broadcast.
-        let plan = plan_route("some query that matches nothing named", &members, None);
-        assert_eq!(plan.reason, RouteReason::Broadcast);
-    }
-
-    #[test]
-    fn kg_match_with_no_current_member_falls_back_to_broadcast() {
-        let kg = WorkspaceKgDb::open_in_memory().unwrap();
-        let entity = kg.insert_global_entity("topic", "Ghost Project", "s", 1).unwrap();
-        // Linked only to a project that is NOT in the current members list
-        // (e.g. removed from the workspace since the KG was last built).
-        kg.insert_entity_link(entity, Uuid::new_v4(), 1, "Ghost Project").unwrap();
-
-        let broadcastable = Uuid::new_v4();
-        let members = vec![member(broadcastable, "Alpha", true, 1)];
-        let plan = plan_route("what about the ghost project?", &members, Some(&kg));
-        assert_eq!(plan.reason, RouteReason::Broadcast);
-        assert_eq!(plan.targets, vec![broadcastable]);
-    }
-
-    #[test]
-    fn named_beats_kg_even_when_both_would_match() {
-        let kg = WorkspaceKgDb::open_in_memory().unwrap();
-        let named_project = Uuid::new_v4();
-        let kg_project = Uuid::new_v4();
-        // A KG entity that would route to `kg_project` if reached.
-        let entity = kg.insert_global_entity("topic", "Widgets", "s", 1).unwrap();
-        kg.insert_entity_link(entity, kg_project, 1, "Widgets").unwrap();
-
-        let members = vec![
-            member(named_project, "Widgets Factory", true, 1),
-            member(kg_project, "Somewhere Else", true, 2),
-        ];
-        // Query names a member directly AND matches the KG entity "Widgets".
-        let plan = plan_route("status update from Widgets Factory", &members, Some(&kg));
-        assert_eq!(plan.targets, vec![named_project]);
-        assert_eq!(plan.reason, RouteReason::Named);
-    }
-
-    // --- merge_routed: cross-member RRF ordering (task 1.4) ---
+    // --- merge_routed ---
 
     #[test]
     fn unscored_hits_merge_by_rank() {
         // Hits with no relevance score to compare (all 0.0) fall back to
-        // each hit's position in its own member's list.
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let plan = RoutePlan {
-            targets: vec![a, b],
-            reason: RouteReason::Broadcast,
-            platform: false,
-            knowledge: vec![],
-        };
+        // each hit's position in its own source's list, then the plan's order.
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let member_hits = vec![
-            MemberHits {
-                project_id: a,
-                member_name: "A".to_string(),
-                status: MemberStatus::Searched,
-                hits: vec![hit("a/one.md", 1), hit("a/two.md", 2)],
-            },
-            MemberHits {
-                project_id: b,
-                member_name: "B".to_string(),
-                status: MemberStatus::Searched,
-                hits: vec![hit("b/one.md", 10), hit("b/two.md", 11), hit("b/three.md", 12)],
-            },
+            searched(a, "A", vec![hit("a/one.md", 1), hit("a/two.md", 2)]),
+            searched(b, "B", vec![hit("b/one.md", 10), hit("b/two.md", 11), hit("b/three.md", 12)]),
         ];
-        let report = merge_routed(&plan, &member_hits, 10);
-        // Rank-1 hits from both members tie in score; A leads on
-        // target_order (A is plan.targets[0]).
-        assert_eq!(report.results[0].path, "a/one.md");
-        assert_eq!(report.results[1].path, "b/one.md");
-        // Rank-2 hits come next, same tie-break.
-        assert_eq!(report.results[2].path, "a/two.md");
-        assert_eq!(report.results[3].path, "b/two.md");
-        // B's rank-3 hit (no A counterpart) is last.
-        assert_eq!(report.results[4].path, "b/three.md");
+        let paths: Vec<String> = merge_routed(&every(vec![a, b]), &member_hits, 10).results.into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["a/one.md", "b/one.md", "a/two.md", "b/two.md", "b/three.md"]);
     }
+
+    /// Relevance decides across sources: a strong hit in the second repo
+    /// beats a weak first hit in the first, whatever the plan's order, and a
+    /// knowledge base gets no share held for it.
+    #[test]
+    fn scored_hits_merge_by_relevance_across_members() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
+        let member_hits = vec![
+            searched(a, "code", vec![scored("design.md", 1, 0.6), scored("spec.md", 2, 0.4)]),
+            searched(b, "notes", vec![scored("SOW.md", 10, 4.2), scored("log.md", 11, 0.5)]),
+        ];
+        let paths: Vec<String> = merge_routed(&every(vec![a, b]), &member_hits, 10).results.into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, vec!["SOW.md", "design.md", "log.md", "spec.md"]);
+    }
+
+    #[test]
+    fn limit_truncates_merged_results() {
+        let a = Uuid::new_v4();
+        let member_hits = vec![searched(a, "A", vec![hit("one.md", 1), hit("two.md", 2), hit("three.md", 3)])];
+        let report = merge_routed(&every(vec![a]), &member_hits, 2);
+        assert_eq!(report.results.len(), 2);
+    }
+
+    /// Every source searched is reported, slow or not, with or without hits.
+    #[test]
+    fn every_source_is_reported_and_a_slow_one_says_so() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let member_hits = vec![
+            MemberHits { millis: SLOW_MILLIS + 300, ..searched(a, "big", vec![hit("x.md", 1)]) },
+            MemberHits { status: MemberStatus::Unavailable, ..searched(b, "gone", vec![]) },
+            MemberHits { status: MemberStatus::Building { embedded: 40, chunks: 100 }, ..searched(c, "new", vec![hit("y.md", 2)]) },
+        ];
+        let report = merge_routed(&every(vec![a, b, c]), &member_hits, 10);
+        assert_eq!(report.member_status.len(), 3);
+        assert!(report.member_status[0].slow());
+        assert!(!report.member_status[1].slow());
+        assert_eq!(report.results.len(), 2, "the slow and the building source's hits both count");
+    }
+
+    /// A source still building its meaning index is searched by keyword and
+    /// reported with how far it has got; a source whose index would not open
+    /// is reported unavailable.
+    #[test]
+    fn a_building_source_is_searched_and_a_missing_one_reported() {
+        let (built, building, missing) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let built_db = fixture_db_with_chunk("notes/found.md", "the quokka naps");
+        let building_db = scanned_db("notes/also.md", "another quokka sleeps");
+        let targets = vec![
+            MemberDbHandle { project_id: built, name: "Built", db: &built_db },
+            MemberDbHandle { project_id: building, name: "Building", db: &building_db },
+        ];
+        let mut embedder = FakeEmbedder::new();
+        let report = execute_plan(&every(vec![built, building, missing]), &targets, &mut embedder, "quokka", 10);
+        let status = |id: Uuid| report.member_status.iter().find(|s| s.project_id == id).unwrap().status;
+        assert_eq!(status(built), MemberStatus::Searched);
+        if building_db.vec_available() {
+            assert!(matches!(status(building), MemberStatus::Building { embedded: 0, chunks } if chunks > 0), "{:?}", status(building));
+        }
+        assert_eq!(status(missing), MemberStatus::Unavailable);
+        assert!(report.results.iter().any(|r| r.project_id == built));
+        assert!(report.results.iter().any(|r| r.project_id == building), "keyword hits while meaning builds");
+    }
+
+    // --- one source's search ---
 
     /// A ruling outranks the closed ticket that says the same, a team file
     /// can turn that around, and code keeps the score it had.
@@ -1156,84 +816,6 @@ mod tests {
         assert!(!machine_written(&"A person wrote this line.\n".repeat(80)));
     }
 
-    #[test]
-    fn a_question_about_the_platform_is_spotted() {
-        assert!(asks_about_platform("Does the engine have a boss health bar?"));
-        assert!(asks_about_platform("How do we add our own pins to the game's built-in minimap?"));
-        assert!(asks_about_platform("Which shapes does it support out of the box?"));
-        assert!(!asks_about_platform("How much stamina does it cost to take a hit while holding up a weapon or shield?"));
-        assert!(!asks_about_platform("Who leads engineering?"), "whole words only");
-        assert!(plan_route("does the engine have flags", &[], None).platform);
-    }
-
-    /// Relevance decides across members: a strong hit in the second repo
-    /// beats a weak first hit in the first, whatever the plan's order.
-    #[test]
-    fn scored_hits_merge_by_relevance_across_members() {
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![a, b], reason: RouteReason::Broadcast, platform: false, knowledge: vec![] };
-        let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
-        let member_hits = vec![
-            MemberHits {
-                project_id: a,
-                member_name: "code".into(),
-                status: MemberStatus::Searched,
-                hits: vec![scored("design.md", 1, 0.6), scored("spec.md", 2, 0.4)],
-            },
-            MemberHits {
-                project_id: b,
-                member_name: "notes".into(),
-                status: MemberStatus::Searched,
-                hits: vec![scored("SOW.md", 10, 4.2), scored("log.md", 11, 0.5)],
-            },
-        ];
-        let paths: Vec<String> = merge_routed(&plan, &member_hits, 10).results.into_iter().map(|r| r.path).collect();
-        assert_eq!(paths, vec!["SOW.md", "design.md", "log.md", "spec.md"]);
-    }
-
-    /// The knowledge base's k-th hit ranks ahead of the code repo's
-    /// (k + 3)-th, its hits in their own order and the code's in theirs; a
-    /// wiki hit far weaker than the best is not held up.
-    #[test]
-    fn the_knowledge_base_keeps_its_share_of_the_merged_list() {
-        let (code, wiki) = (Uuid::new_v4(), Uuid::new_v4());
-        let plan = RoutePlan { targets: vec![wiki, code], reason: RouteReason::Broadcast, platform: false, knowledge: vec![wiki] };
-        let scored = |path: &str, id: i64, score: f64| HybridHit { score, ..hit(path, id) };
-        let merged = |wiki_scores: &[f64]| -> Vec<String> {
-            let member_hits = vec![
-                MemberHits {
-                    project_id: code,
-                    member_name: "code".into(),
-                    status: MemberStatus::Searched,
-                    hits: (0..10).map(|i| scored(&format!("src/f{i}.rs"), i, 9.0 - i as f64 * 0.1)).collect(),
-                },
-                MemberHits {
-                    project_id: wiki,
-                    member_name: "wiki".into(),
-                    status: MemberStatus::Searched,
-                    hits: wiki_scores.iter().enumerate().map(|(i, s)| scored(&format!("w{i}.md"), 100 + i as i64, *s)).collect(),
-                },
-            ];
-            merge_routed(&plan, &member_hits, 10).results.into_iter().map(|r| r.path).collect()
-        };
-        let paths = merged(&[6.0, 5.8, 5.6, 5.5, 5.0]);
-        assert_eq!(
-            paths,
-            vec!["src/f0.rs", "src/f1.rs", "src/f2.rs", "w0.md", "src/f3.rs", "w1.md", "src/f4.rs", "w2.md", "src/f5.rs", "w3.md"]
-        );
-        // Under half the best score: no reserved place, merged by relevance.
-        let paths = merged(&[4.0, 3.0]);
-        assert!(paths.iter().all(|p| p.starts_with("src/")), "{paths:?}");
-        // A wiki hit that wins on relevance is not held back.
-        let paths = merged(&[9.5, 1.0]);
-        assert_eq!(paths[0], "w0.md");
-        // The plan marks the knowledge base.
-        let mut members = vec![member(code, "app", true, 5), member(wiki, "Team-Docs", true, 1)];
-        members[1].knowledge_base = true;
-        assert_eq!(plan_route("who merges pull requests", &members, None).knowledge, vec![wiki]);
-        assert_eq!(plan_route("what does app build", &members, None).knowledge, Vec::<Uuid>::new(), "a named repo alone");
-    }
-
     /// A question in its own words still finds the chunk that says it
     /// differently: all-words finds nothing, any-word does.
     #[test]
@@ -1251,106 +833,7 @@ mod tests {
         assert!(hits.iter().all(|h| h.path != "other.py"), "a chunk with none of the words is not a hit");
     }
 
-    #[test]
-    fn limit_truncates_merged_results() {
-        let a = Uuid::new_v4();
-        let plan = RoutePlan {
-            targets: vec![a],
-            reason: RouteReason::Broadcast,
-            platform: false,
-            knowledge: vec![],
-        };
-        let member_hits = vec![MemberHits {
-            project_id: a,
-            member_name: "A".to_string(),
-            status: MemberStatus::Searched,
-            hits: vec![hit("one.md", 1), hit("two.md", 2), hit("three.md", 3)],
-        }];
-        let report = merge_routed(&plan, &member_hits, 2);
-        assert_eq!(report.results.len(), 2);
-    }
-
-    // --- execute_plan: not-ready member skipped + reported (task 1.4) ---
-
-    #[test]
-    fn not_ready_member_is_skipped_and_reported() {
-        let ready_id = Uuid::new_v4();
-        let building_id = Uuid::new_v4();
-        let plan = RoutePlan {
-            targets: vec![ready_id, building_id],
-            reason: RouteReason::Broadcast,
-            platform: false,
-            knowledge: vec![],
-        };
-
-        let ready_db = fixture_db_with_chunk("notes/found.md", "the quokka naps");
-        // Empty DB is fine — `index_ready: false` means it's never touched.
-        let building_db = Db::open_in_memory().unwrap();
-
-        let targets = vec![
-            MemberDbHandle {
-                project_id: ready_id,
-                name: "Ready",
-                db: &ready_db,
-                index_ready: true,
-            },
-            MemberDbHandle {
-                project_id: building_id,
-                name: "Building",
-                db: &building_db,
-                index_ready: false,
-            },
-        ];
-        let mut embedder = FakeEmbedder::new();
-        let report = execute_plan(&plan, &targets, &mut embedder, "quokka", 10);
-
-        assert_eq!(report.member_status.len(), 2);
-        let ready_status = report
-            .member_status
-            .iter()
-            .find(|s| s.project_id == ready_id)
-            .unwrap();
-        assert_eq!(ready_status.status, MemberStatus::Searched);
-        let building_status = report
-            .member_status
-            .iter()
-            .find(|s| s.project_id == building_id)
-            .unwrap();
-        assert_eq!(building_status.status, MemberStatus::IndexBuilding);
-
-        // Only the ready member's hit made it into the merged results.
-        assert!(report.results.iter().all(|r| r.project_id == ready_id));
-        assert!(report.results.iter().any(|r| r.path == "notes/found.md"));
-    }
-
-    #[test]
-    fn missing_target_handle_is_reported_unavailable() {
-        let a = Uuid::new_v4();
-        let missing = Uuid::new_v4();
-        let plan = RoutePlan {
-            targets: vec![a, missing],
-            reason: RouteReason::Broadcast,
-            platform: false,
-            knowledge: vec![],
-        };
-        let db = fixture_db_with_chunk("x.md", "hello world");
-        let targets = vec![MemberDbHandle {
-            project_id: a,
-            name: "A",
-            db: &db,
-            index_ready: true,
-        }];
-        let mut embedder = FakeEmbedder::new();
-        let report = execute_plan(&plan, &targets, &mut embedder, "hello", 10);
-        let missing_status = report
-            .member_status
-            .iter()
-            .find(|s| s.project_id == missing)
-            .unwrap();
-        assert_eq!(missing_status.status, MemberStatus::Unavailable);
-    }
-
-    // --- citation address integrity (task 1.4) ---
+    // --- citations ---
 
     #[test]
     fn a_hit_is_cited_by_repo_path_line_and_by_note_name_in_a_wiki() {
@@ -1389,57 +872,18 @@ mod tests {
     #[test]
     fn every_hit_carries_a_resolvable_ken_address() {
         let a = Uuid::new_v4();
-        let plan = RoutePlan {
-            targets: vec![a],
-            reason: RouteReason::KgEntities(vec![42]),
-            platform: false,
-            knowledge: vec![],
-        };
-        let member_hits = vec![MemberHits {
-            project_id: a,
-            member_name: "A".to_string(),
-            status: MemberStatus::Searched,
-            hits: vec![hit("notes\\windows-style.md", 1)],
-        }];
-        let report = merge_routed(&plan, &member_hits, 10);
+        let member_hits = vec![searched(a, "A", vec![hit("notes\\windows-style.md", 1)])];
+        let report = merge_routed(&every(vec![a]), &member_hits, 10);
         let result = &report.results[0];
-        let expected = format!("ken://{a}/notes/windows-style.md");
-        assert_eq!(result.address, expected, "backslashes must normalize to forward slashes");
+        assert_eq!(result.address, format!("ken://{a}/notes/windows-style.md"), "backslashes must normalize to forward slashes");
 
         // Round-trip: strip the scheme, split project id from rel path.
         let rest = result.address.strip_prefix("ken://").unwrap();
         let (project_part, path_part) = rest.split_once('/').unwrap();
         assert_eq!(Uuid::parse_str(project_part).unwrap(), a);
         assert_eq!(path_part, "notes/windows-style.md");
-
-        // KG-routed plan: breadcrumb present and well-formed.
-        assert_eq!(result.kg_breadcrumbs, vec!["kg://42".to_string()]);
     }
 
-    #[test]
-    fn named_and_broadcast_plans_carry_no_breadcrumbs() {
-        let a = Uuid::new_v4();
-        let plan = RoutePlan {
-            targets: vec![a],
-            reason: RouteReason::Named,
-            platform: false,
-            knowledge: vec![],
-        };
-        let member_hits = vec![MemberHits {
-            project_id: a,
-            member_name: "A".to_string(),
-            status: MemberStatus::Searched,
-            hits: vec![hit("x.md", 1)],
-        }];
-        let report = merge_routed(&plan, &member_hits, 10);
-        assert!(report.results[0].kg_breadcrumbs.is_empty());
-    }
-
-    /// A real (tempdir-backed, in-memory-DB) member fixture with one
-    /// FTS+KNN-indexed file at `rel_path`, for tests that need
-    /// `search_member`/`execute_plan` to do an actual search rather than
-    /// working from fixture `HybridHit`s directly (`merge_routed`'s tests
-    /// don't need this — it's pure).
     /// A search in the team's word finds a page written in the platform's
     /// word, through the Vocabulary page; the hit carries its line and page.
     #[test]
@@ -1502,6 +946,22 @@ mod tests {
         assert!(search_member(&db, "region", None, 10).unwrap().is_empty());
     }
 
+    /// A member with one file at `rel_path`, scanned but with no meaning
+    /// index built.
+    fn scanned_db(rel_path: &str, text: &str) -> Db {
+        use crate::project::Project;
+        let project_dir = tempfile::tempdir().unwrap();
+        let file_path = project_dir.path().join(rel_path);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, format!("# note\n{text}\n")).unwrap();
+        let project = Project::create(project_dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        db
+    }
+
+    /// A member with one file at `rel_path`, scanned and its meaning index
+    /// built, for tests that need a real search rather than fixture hits.
     fn fixture_db_with_chunk(rel_path: &str, text: &str) -> Db {
         use crate::project::Project;
         use crate::runner::CancelToken;
