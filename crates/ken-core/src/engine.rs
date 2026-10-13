@@ -90,11 +90,10 @@ pub fn rebuild_semantic_index_with_profile(
     mut on_progress: impl FnMut(usize, usize),
     profile: Option<&crate::profiler::ProjectProfile>,
 ) -> Result<bool> {
-    let files: Vec<_> = db
-        .list_files()?
-        .into_iter()
-        .filter(|f| f.status == "indexed")
-        .collect();
+    // Every file: an indexed one is chunked again from its text; one with no
+    // readable text keeps the chunks the scan gave it (its path, or its OCR
+    // text) and only has them embedded.
+    let files: Vec<_> = db.list_files()?;
     let total = files.len();
 
     // A different embedding model (or width) cannot share the index with the
@@ -134,25 +133,31 @@ pub fn rebuild_semantic_index_with_profile(
             continue;
         }
 
-        let text = match db.get_text(&file.rel_path)? {
-            Some(t) => t,
-            None => {
-                on_progress(done + 1, total);
-                continue;
-            }
-        };
+        if file.status == "indexed" {
+            let text = match db.get_text(&file.rel_path)? {
+                Some(t) => t,
+                None => {
+                    on_progress(done + 1, total);
+                    continue;
+                }
+            };
 
-        // project-profiler D3: stored-profile-else-default. `profile` is
-        // only `Some` when the caller resolved the `profiler` flag on and
-        // loaded a profile (see this function's doc comment) — `None`
-        // (the `rebuild_semantic_index` wrapper's default) always falls
-        // through to the plain extension default, unchanged from before
-        // this hook existed.
-        let idx_profile = profile
-            .and_then(|p| p.chunking_for(&file.rel_path))
-            .unwrap_or_else(|| IndexProfile::default_for(&file.rel_path));
-        let chunks = chunker::chunk_file(&file.rel_path, &text, &idx_profile);
-        db.upsert_chunks(&file.rel_path, &chunks, tier)?;
+            // project-profiler D3: stored-profile-else-default. `profile` is
+            // only `Some` when the caller resolved the `profiler` flag on and
+            // loaded a profile (see this function's doc comment) — `None`
+            // (the `rebuild_semantic_index` wrapper's default) always falls
+            // through to the plain extension default, unchanged from before
+            // this hook existed. An empty file keeps its name chunk.
+            let idx_profile = profile
+                .and_then(|p| p.chunking_for(&file.rel_path))
+                .unwrap_or_else(|| IndexProfile::default_for(&file.rel_path));
+            let chunks = if text.trim().is_empty() {
+                vec![chunker::name_chunk(&file.rel_path)]
+            } else {
+                chunker::chunk_file(&file.rel_path, &text, &idx_profile)
+            };
+            db.upsert_chunks(&file.rel_path, &chunks, tier)?;
+        }
 
         // Embed every chunk with no vector yet, not only the ones this call
         // changed: the scan writes chunks (for keyword search) before any

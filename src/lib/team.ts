@@ -9,7 +9,7 @@ export function findingLabel(kind: string): string {
     case "mismatch":
       return "drift";
     case "aged":
-      return "unverified";
+      return "unchecked";
     case "links":
     case "link":
       return "links";
@@ -21,10 +21,10 @@ export function findingLabel(kind: string): string {
   }
 }
 
-/** Findings in the order Team lists them: drift first, then unverified
+/** Findings in the order Team lists them: drift first, then unchecked
  *  pages, links, the first draft and anything else. Stable within a kind. */
 export function orderFindings(findings: readonly TeamFinding[]): TeamFinding[] {
-  const rank = (k: string) => ["drift", "unverified", "links", "first draft"].indexOf(findingLabel(k));
+  const rank = (k: string) => ["drift", "unchecked", "links", "first draft"].indexOf(findingLabel(k));
   return findings
     .map((f, i) => ({ f, i, r: rank(f.kind) }))
     .sort((a, b) => (a.r === -1 ? 9 : a.r) - (b.r === -1 ? 9 : b.r) || a.i - b.i)

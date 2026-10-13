@@ -468,6 +468,7 @@ fn index_one(
     // and leave the content to `cloud::hydrate` when the user opens it.
     if dataless {
         db.upsert_file(rel, kind.as_str(), size, mtime, STATUS_CLOUD_ONLY, None, "")?;
+        db.upsert_chunks(rel, &[crate::chunker::name_chunk(rel)], tier)?;
         return Ok(STATUS_CLOUD_ONLY);
     }
     let (status, error, text) = match extract::extract(&abs) {
@@ -497,15 +498,15 @@ fn index_one(
     // Chunks, for keyword search over sections and `repo:path:line`
     // citations. They need no model, so every indexed file has them; the
     // semantic rebuild only adds vectors. A file with no readable text has
-    // none.
-    if status == STATUS_INDEXED {
-        let chunks = crate::chunker::chunk_file(rel, &text, &crate::chunker::IndexProfile::default_for(rel));
-        db.upsert_chunks(rel, &chunks, tier)?;
+    // one chunk holding its path, so it is still found by name.
+    let chunks = if status == STATUS_INDEXED && !text.trim().is_empty() {
+        crate::chunker::chunk_file(rel, &text, &crate::chunker::IndexProfile::default_for(rel))
     } else {
-        db.delete_chunks(rel)?;
-    }
-    // What a page says about itself (title, aliases, verified, retired,
-    // generated), read from its frontmatter for search to rank and show.
+        vec![crate::chunker::name_chunk(rel)]
+    };
+    db.upsert_chunks(rel, &chunks, tier)?;
+    // What a page says about itself (title, aliases, status, checked),
+    // read from its frontmatter for search to rank and show.
     if kind == FileKind::Md {
         let meta = (status == STATUS_INDEXED).then(|| crate::pagemeta::parse(&text)).flatten();
         db.set_page_meta(rel, meta.as_ref())?;
@@ -1508,13 +1509,14 @@ mod tests {
     fn a_pages_frontmatter_is_stored_at_index_time_and_backfilled_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let page = dir.path().join("Rules.md");
-        fs::write(&page, "---\ntitle: Rules\naliases: [\"binding rules\"]\nverified: 2026-09-20\n---\n# Rules\n").unwrap();
+        fs::write(&page, "---\ntitle: Rules\naliases: [\"binding rules\"]\nchecked: 2026-09-20 f00218c\nreviewed_by: Chris\n---\n# Rules\n").unwrap();
         let project = Project::create(dir.path(), "Meta").unwrap();
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
         let meta = db.page_meta("Rules.md").unwrap().unwrap();
         assert_eq!(meta.aliases, vec!["binding rules"]);
-        assert_eq!(meta.verified.as_deref(), Some("2026-09-20"));
+        assert_eq!(meta.checked.as_ref().map(|c| c.to_string()).as_deref(), Some("2026-09-20 f00218c"));
+        assert_eq!(meta.reviewed_by.as_deref(), Some("Chris"));
 
         // A page indexed before frontmatter was read gets it on open.
         db.set_page_meta("Rules.md", None).unwrap();
@@ -1524,6 +1526,34 @@ mod tests {
         fs::write(&page, "# Rules, no frontmatter now, and longer\n").unwrap();
         scan(&project, &mut db).unwrap();
         assert_eq!(db.page_meta("Rules.md").unwrap(), None);
+    }
+
+    /// A file with no readable text (here minified, then empty) is found by
+    /// its name through one chunk holding its path; the chunk goes when the
+    /// file gains text, and with the file.
+    #[test]
+    fn a_file_with_no_text_is_found_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = format!("var a=1;{}\n", "x=y+1;".repeat(600));
+        fs::write(dir.path().join("bundle.js"), &bundle).unwrap();
+        fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let project = Project::create(dir.path(), "Names").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        let texts = |db: &Db, p: &str| db.chunks_of(p).unwrap().into_iter().map(|(_, _, t)| t).collect::<Vec<_>>();
+        assert_eq!(texts(&db, "bundle.js"), vec!["bundle.js"]);
+        assert_eq!(texts(&db, "empty.txt"), vec!["empty.txt"]);
+        let hits = crate::routing::search_member(&db, "bundle", None, 10).unwrap();
+        assert!(hits.iter().any(|h| h.path == "bundle.js"), "found by name: {hits:?}");
+
+        fs::write(dir.path().join("empty.txt"), "Now it says something about regions.\n").unwrap();
+        scan(&project, &mut db).unwrap();
+        let now = texts(&db, "empty.txt");
+        assert!(!now.is_empty() && now.iter().all(|t| t != "empty.txt"), "{now:?}");
+
+        fs::remove_file(dir.path().join("bundle.js")).unwrap();
+        scan(&project, &mut db).unwrap();
+        assert!(texts(&db, "bundle.js").is_empty());
     }
 
     #[test]

@@ -378,7 +378,6 @@ search uses Ken's installed embedding model; without it the answer says it was k
                 "properties": {
                     "query": { "type": "string", "description": "A question or search terms." },
                     "limit": { "type": "integer", "description": "Maximum hits to return (default 10)." },
-                    "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                     "project": project_arg
                 },
@@ -402,7 +401,6 @@ Ken's installed embedding model; without it the answer says it was keyword only.
                 "properties": {
                     "query": { "type": "string", "description": "A question or search terms. A project's name in it narrows the search to that project." },
                     "limit": { "type": "integer", "description": "Maximum merged hits to return (default 10)." },
-                    "audience": { "type": "string", "enum": ["any", "business", "dev"], "description": "Who the results are for: business (pages for readers who never see code: Current, Design, Work, or audience: business), dev (everything else but the method pages, code included), or any (default)." },
                     "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket (or any, the default). Every hit is tagged with its kind either way." },
                 },
                 "required": ["query"]
@@ -998,12 +996,10 @@ fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
         .unwrap_or(ROUTE_LIMIT);
     let (project, note) = resolve_project(server, args)?;
     let db = open_index(server, &project)?;
-    let audience = audience_arg(args);
     let types = types_arg(args);
     let qv = query_vector(server, &query);
-    let mut hits = routing::search_member_of(&db, &query, vector_for(&db, &qv), fetch_for(audience.as_deref(), &types, limit), &types)
+    let mut hits = routing::search_member_of(&db, &query, vector_for(&db, &qv), fetch_for(&types, limit), &types)
         .map_err(|e| format!("search failed: {e}"))?;
-    hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
     hits.truncate(limit);
     let mut out = note.unwrap_or_default();
     out.push_str(&keyword_only_note(&qv));
@@ -1324,25 +1320,17 @@ fn related_files(server: &Server, args: &Value) -> Result<String, String> {
 const LOOK_YOURSELF: &str = "Ken's index can miss things (a file not indexed yet, a recent change, other wording), so this \
 does not mean it isn't there: look directly with Grep, Glob and Read before saying so, and say where you looked.";
 
-/// The reader a search is for (item 2b): `business`, `dev`, or none for any.
-fn audience_arg(args: &Value) -> Option<String> {
-    args.get("audience").and_then(|a| a.as_str()).map(str::to_string).filter(|a| !a.is_empty() && a != "any")
-}
-
 /// The kinds of file a search keeps (`type`: "code", "spec,doc"); empty keeps all.
 fn types_arg(args: &Value) -> Vec<ken_core::contenttype::ContentType> {
     ken_core::contenttype::parse_filter(args.get("type").and_then(|t| t.as_str()))
 }
 
-/// Hits to read before filtering by audience or kind, so a filter still
-/// fills the page.
-fn fetch_for(audience: Option<&str>, types: &[ken_core::contenttype::ContentType], limit: usize) -> usize {
-    if !types.is_empty() {
-        limit * 5
-    } else if audience.is_some() {
-        limit * 3
-    } else {
+/// Hits to read before filtering by kind, so a filter still fills the page.
+fn fetch_for(types: &[ken_core::contenttype::ContentType], limit: usize) -> usize {
+    if types.is_empty() {
         limit
+    } else {
+        limit * 5
     }
 }
 
@@ -1636,7 +1624,6 @@ folder in the Ken app first."
     }
 
     let plan = routing::plan_route(&query, &members);
-    let audience = audience_arg(args);
     let types = types_arg(args);
     // One vocabulary for the whole search (the team wiki's widens every repo).
     let shared_vocab = routing::workspace_vocabulary(dbs.values());
@@ -1646,10 +1633,9 @@ folder in the Ken app first."
             .map(|id| {
                 let name = members.iter().find(|m| m.project_id == *id).map_or("", |m| m.name.as_str());
                 let db = dbs.get(id);
-                let fetch = fetch_for(audience.as_deref(), &types, limit);
+                let fetch = fetch_for(&types, limit);
                 let mut found =
                     routing::search_target(*id, name, db, &query, db.and_then(|db| vector_for(db, &qv)), fetch, &types, Some(&shared_vocab));
-                found.hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
                 found.hits.truncate(limit);
                 found
             })
@@ -2061,8 +2047,8 @@ you. Pass assignee \"all\" to list every ticket."
 
 /// What an agent must know before it trusts a page hit: its label (`decision
 /// D-410 · binding · 2026-10-06`, `ticket · superseded · 2026-07-21`), or for a hit
-/// without one, that it is retired (and what replaces it), generated, dated
-/// evidence, or when a person last verified it.
+/// without one, that it is superseded (and what replaces it, when an older
+/// page says), generated, dated evidence, or when the check last re-read it.
 fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
     if let Some(label) = &p.label {
         return Some(match p.generated {
@@ -2072,8 +2058,8 @@ fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
     }
     if p.retired {
         return Some(match p.replaced_by.is_empty() {
-            true => "retired".to_string(),
-            false => format!("retired, see {}", p.replaced_by.join(", ")),
+            true => "superseded".to_string(),
+            false => format!("superseded, see {}", p.replaced_by.join(", ")),
         });
     }
     if p.generated {
@@ -2082,7 +2068,7 @@ fn page_note(p: &ken_core::pagemeta::HitPage) -> Option<String> {
     if let Some(d) = &p.dated {
         return Some(format!("evidence from {d}, not current state"));
     }
-    p.verified.as_ref().map(|v| format!("verified {v}"))
+    p.checked.as_ref().map(|c| format!("checked {c}"))
 }
 
 fn source_label(source: Source) -> &'static str {

@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -583,10 +583,8 @@ impl Db {
             if !has_line {
                 self.conn.execute_batch("ALTER TABLE chunks ADD COLUMN line INTEGER;")?;
             }
-            // And what each Markdown page says about itself in its
-            // frontmatter (`pagemeta`), read at index time, so a hit can carry
-            // its verified date and rank by whether it is binding, evidence,
-            // retired or generated. The lists are JSON arrays.
+            // What each Markdown page says about itself (`page_meta`) is
+            // made by v22, in the shape of knowledge-core decision 5.
             self.conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS drift_runs (
@@ -602,29 +600,8 @@ impl Db {
                     target    TEXT NOT NULL,
                     PRIMARY KEY (from_path, kind, target)
                 );
-                CREATE TABLE IF NOT EXISTS page_meta (
-                    rel_path    TEXT PRIMARY KEY,
-                    title       TEXT,
-                    aliases     TEXT NOT NULL DEFAULT '[]',
-                    status      TEXT,
-                    verified    TEXT,
-                    updated     TEXT,
-                    sources     TEXT NOT NULL DEFAULT '[]',
-                    replaced_by TEXT NOT NULL DEFAULT '[]',
-                    generated   INTEGER NOT NULL DEFAULT 0,
-                    audience    TEXT
-                );
                 "#,
             )?;
-            // `audience` (item 2b) came after the table did; a DB made by an
-            // earlier build of this branch gets it here.
-            let has_audience: bool = self
-                .conn
-                .prepare("SELECT 1 FROM pragma_table_info('page_meta') WHERE name = 'audience'")?
-                .exists([])?;
-            if !has_audience {
-                self.conn.execute_batch("ALTER TABLE page_meta ADD COLUMN audience TEXT;")?;
-            }
         }
         if version < 15 {
             // The code map (`codemap`): each code file's definitions and
@@ -695,9 +672,8 @@ impl Db {
         }
         if version < 19 {
             // kb-ranking (2026-10-07): each file's authority in search
-            // (`authority`), the tiers that are not neutral. Filled here with
-            // the default tiers from the stored frontmatter, no file read;
-            // the next scan applies the team file's overrides.
+            // (`authority`), the tiers that are not neutral. Filled by v22,
+            // once the frontmatter it reads is stored.
             self.conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS file_authority (
@@ -707,7 +683,6 @@ impl Db {
                 );
                 "#,
             )?;
-            crate::authority::refresh_with(self, &crate::authority::Roles::default(), None)?;
         }
         if version < 20 {
             // kb-trust (2026-10-07): which later entry of a decisions log
@@ -753,6 +728,35 @@ impl Db {
             if has_name {
                 self.conn.execute_batch("ALTER TABLE contents DROP COLUMN name;")?;
             }
+        }
+        if version < 22 {
+            // knowledge-core decision 5: a page's frontmatter is six keys,
+            // `title`, `aliases`, `status`, `updated`, `sources` and
+            // `checked` (a date and a commit, in its written form), plus an
+            // optional `reviewed_by`. `replaced_by` and `generated` are still
+            // read from older pages. `verified` and `audience` are gone.
+            // The table is made again and filled from the stored text, no
+            // file read, and each file's tier with it (the default tiers;
+            // the next scan applies the team file's overrides).
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS page_meta;
+                CREATE TABLE page_meta (
+                    rel_path    TEXT PRIMARY KEY,
+                    title       TEXT,
+                    aliases     TEXT NOT NULL DEFAULT '[]',
+                    status      TEXT,
+                    updated     TEXT,
+                    sources     TEXT NOT NULL DEFAULT '[]',
+                    checked     TEXT,
+                    reviewed_by TEXT,
+                    replaced_by TEXT NOT NULL DEFAULT '[]',
+                    generated   INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+            )?;
+            self.backfill_page_meta()?;
+            crate::authority::refresh_with(self, &crate::authority::Roles::default(), None)?;
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -1445,13 +1449,30 @@ impl Db {
         )?;
 
         // A chunk's keyword row holds its path's words (`fts_names`), so the
-        // moved chunks' rows are written again with the new path.
+        // moved chunks' rows are written again with the new path. The chunk
+        // of a file with no text holds its path (`chunker::name_chunk`), so
+        // it is written again whole.
         {
-            let mut moved = tx.prepare("SELECT id, path, text FROM chunks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+            let moved: Vec<(i64, String, String)> = {
+                let mut stmt = tx.prepare("SELECT id, path, text FROM chunks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+                let rows = stmt.query_map(params![to, to_like], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
             let mut write = tx.prepare("UPDATE chunks_fts SET names = ?2 WHERE rowid = ?1")?;
-            let mut rows = moved.query(params![to, to_like])?;
-            while let Some(row) = rows.next()? {
-                let (id, path, text): (i64, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
+            for (id, path, mut text) in moved {
+                let old = format!("{from}{}", &path[to.len()..]);
+                if text == old {
+                    let c = crate::chunker::name_chunk(&path);
+                    text = c.text.clone();
+                    tx.execute(
+                        "UPDATE chunks SET text = ?2, token_est = ?3, content_hash = ?4 WHERE id = ?1",
+                        params![id, c.text, c.token_est as i64, c.content_hash],
+                    )?;
+                    tx.execute("UPDATE chunks_fts SET text = ?2 WHERE rowid = ?1", params![id, c.text])?;
+                    if vec_exists {
+                        tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
+                    }
+                }
                 write.execute(params![id, fts_names(&path, &text)])?;
             }
         }
@@ -2409,29 +2430,29 @@ impl Db {
     }
 
     /// Store (or, with None, forget) what a page's frontmatter says.
-    pub fn set_page_meta(&mut self, rel_path: &str, meta: Option<&crate::pagemeta::PageMeta>) -> Result<()> {
+    pub fn set_page_meta(&self, rel_path: &str, meta: Option<&crate::pagemeta::PageMeta>) -> Result<()> {
         let Some(m) = meta else {
             self.conn.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
             return Ok(());
         };
         let json = |v: &Vec<String>| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
         self.conn.execute(
-            r#"INSERT INTO page_meta (rel_path, title, aliases, status, verified, updated, sources, replaced_by, generated, audience)
+            r#"INSERT INTO page_meta (rel_path, title, aliases, status, updated, sources, checked, reviewed_by, replaced_by, generated)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                ON CONFLICT(rel_path) DO UPDATE SET
-                 title = ?2, aliases = ?3, status = ?4, verified = ?5, updated = ?6,
-                 sources = ?7, replaced_by = ?8, generated = ?9, audience = ?10"#,
+                 title = ?2, aliases = ?3, status = ?4, updated = ?5, sources = ?6,
+                 checked = ?7, reviewed_by = ?8, replaced_by = ?9, generated = ?10"#,
             params![
                 rel_path,
                 m.title,
                 json(&m.aliases),
                 m.status,
-                m.verified,
                 m.updated,
                 json(&m.sources),
+                m.checked.as_ref().map(|c| c.to_string()),
+                m.reviewed_by,
                 json(&m.replaced_by),
-                m.generated as i64,
-                m.audience
+                m.generated as i64
             ],
         )?;
         Ok(())
@@ -2487,7 +2508,7 @@ impl Db {
     /// What each of `paths` adds to a hit's score for its authority; a path
     /// with none stored is neutral and absent. None for an index made before
     /// authority was stored (opened read-only, so not upgraded): search then
-    /// ranks by the page's band, as it did.
+    /// ranks every hit as neutral.
     pub fn authority_weights(&self, paths: &[String]) -> Result<Option<std::collections::HashMap<String, f64>>> {
         if !table_exists(&self.conn, "file_authority")? {
             return Ok(None);
@@ -2620,7 +2641,7 @@ impl Db {
     /// `page_meta` row, from its stored text (no file read). Pages indexed
     /// before frontmatter was read get theirs on the next open. Returns how
     /// many pages had frontmatter.
-    pub fn backfill_page_meta(&mut self) -> Result<usize> {
+    pub fn backfill_page_meta(&self) -> Result<usize> {
         let rows: Vec<(String, String)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT f.rel_path, c.text FROM files f JOIN contents c ON c.file_id = f.id
@@ -2919,7 +2940,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT title, aliases, status, verified, updated, sources, replaced_by, generated, audience
+                "SELECT title, aliases, status, updated, sources, checked, reviewed_by, replaced_by, generated
                    FROM page_meta WHERE rel_path = ?1",
                 params![rel_path],
                 |r| {
@@ -2927,12 +2948,12 @@ impl Db {
                         title: r.get(0)?,
                         aliases: list(r.get(1)?),
                         status: r.get(2)?,
-                        verified: r.get(3)?,
-                        updated: r.get(4)?,
-                        sources: list(r.get(5)?),
-                        replaced_by: list(r.get(6)?),
-                        generated: r.get::<_, i64>(7)? != 0,
-                        audience: r.get(8)?,
+                        updated: r.get(3)?,
+                        sources: list(r.get(4)?),
+                        checked: r.get::<_, Option<String>>(5)?.as_deref().and_then(crate::pagemeta::Checked::parse),
+                        reviewed_by: r.get(6)?,
+                        replaced_by: list(r.get(7)?),
+                        generated: r.get::<_, i64>(8)? != 0,
                     })
                 },
             )

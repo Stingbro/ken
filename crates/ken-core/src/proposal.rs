@@ -125,7 +125,8 @@ pub fn page_prompt(page: &str, purpose: &str, sources: &[Source], today: &str) -
 }
 
 /// The reply as a page: fences stripped, `status: draft` set, and any
-/// `verified:` line dropped.
+/// `checked:` or `reviewed_by:` line dropped (and the older `verified:`):
+/// a draft has been neither checked nor reviewed.
 pub fn finish(reply: &str) -> Result<String> {
     let t = strip_fences(reply);
     if !t.starts_with("---") {
@@ -148,7 +149,7 @@ pub fn finish(reply: &str) -> Result<String> {
             out.push_str("---\n");
             continue;
         }
-        if in_fm && trimmed.starts_with("verified:") {
+        if in_fm && ["checked:", "reviewed_by:", "verified:"].iter().any(|k| trimmed.starts_with(k)) {
             continue;
         }
         if in_fm && trimmed.starts_with("status:") {
@@ -195,10 +196,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finish_forces_draft_and_drops_verified() {
-        let page = finish("```md\n---\ntitle: X\nstatus: current\nverified: 2026-01-01\n---\n\nBody.\n```").unwrap();
+    fn finish_forces_draft_and_drops_checked() {
+        let page = finish("```md\n---\ntitle: X\nstatus: current\nchecked: 2026-01-01 f00218c\nreviewed_by: Chris\nverified: 2026-01-01\n---\n\nBody.\n```").unwrap();
         assert!(page.starts_with("---\ntitle: X\nstatus: draft\n---\n"), "{page}");
-        assert!(!page.contains("verified"));
+        assert!(!page.contains("checked") && !page.contains("reviewed_by") && !page.contains("verified"));
         assert!(finish("no frontmatter").is_err());
     }
 

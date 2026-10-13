@@ -103,7 +103,7 @@ export interface TeamPage {
 }
 
 /** Something the wiki's own checks found: a page drifted from its source
- *  or unverified for thirty days, the link report, the first draft. */
+ *  or not checked for thirty days, the link report, the first draft. */
 export interface TeamFinding {
   /** drift · aged · links · draft, as the backend names it. */
   kind: string;
@@ -285,9 +285,6 @@ export interface DriftRun {
   measured: number;
   reused: number;
 }
-
-/** Who a search is for (item 2b); null is any reader. */
-export type Audience = "business" | "dev" | null;
 
 /** What a file is for (`contenttype::of`); every search hit carries one. */
 export type ContentType = "code" | "test" | "spec" | "doc" | "config" | "data" | "design" | "meeting" | "ticket";
@@ -1106,15 +1103,16 @@ export interface RoutedHit {
 export interface HitPage {
   section: string | null;
   title: string | null;
-  /** When a person last read it against its sources, `YYYY-MM-DD`. */
-  verified: string | null;
+  /** When the check last re-read it against its sources, `YYYY-MM-DD`. */
+  checked: string | null;
   /** For Research: the date the evidence is from. */
   dated: string | null;
+  /** `status: superseded`, or an older page's `replaced_by`. */
   retired: boolean;
+  /** Legacy, read only: an older page's `generated` key. */
   generated: boolean;
+  /** Legacy, read only: what an older retired page names as its successor. */
   replacedBy: string[];
-  /** 0 binding, 1 the rest, 2 evidence or no longer current. */
-  band: number;
   /** What the hit is and how much it counts, one short line: its kind, tier
    *  and date (`decision D-410 · binding · 2026-10-06`,
    *  `ticket · superseded · 2026-07-21`, `doc · current · 2026-10-07`). */
@@ -1413,7 +1411,6 @@ export const api = {
     limit = 30,
     scope?: string | null,
     group?: string | null,
-    audience: Audience = null,
     types: KindFilter = null,
   ) =>
     invoke<RouteSearchResult>("route_search", {
@@ -1421,7 +1418,6 @@ export const api = {
       limit,
       scope: scope ?? null,
       group: group ?? null,
-      audience,
       types,
     }),
   /** Named groups of members, stored in the workspace manifest. */

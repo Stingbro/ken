@@ -3,15 +3,17 @@
 //! without a test failing; this compares what a page or a ruling declared
 //! with what is there now, and says which of three things each mismatch is.
 //!
-//! - **Docs check**: a page's `verified:` date pins a commit in each cited
-//!   repo; a source that moved between that pin and the default branch makes
-//!   the page suspect.
+//! - **Docs check**: a page's `checked:` stamp pins a commit in each cited
+//!   repo (its commit where that repo has it, else the last commit on its
+//!   date); a source that moved between that pin and the default branch
+//!   makes the page suspect. A page never checked is measured from the
+//!   commit each citation names (`repo@sha:path`), else its `updated` date.
 //! - **Decision check**: each decisions-log entry, measured from the date it
 //!   declares for itself, against the code it cites. Superseded entries are
 //!   skipped.
-//! - **Age rule**: a page with a `sources:` list not verified in thirty days
+//! - **Age rule**: a page with a `sources:` list not checked in thirty days
 //!   is raised even when nothing it cites moved. A page with no sources (an
-//!   index, START-HERE) carries no `verified:` and is never raised.
+//!   index, START-HERE) carries no `checked:` and is never raised.
 //!
 //! A sweep works from what changed: once per repo it asks git which files
 //! moved since the last sweep's commit, re-measures only the citations of
@@ -33,11 +35,11 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
-use crate::pagemeta::{audience_of, section_of, Audience, Section};
+use crate::pagemeta::{section_of, Section};
 use crate::project::Project;
 use crate::Result;
 
-/// A page unverified for longer than this is raised by the age rule.
+/// A page not checked for longer than this is raised by the age rule.
 pub const AGE_DAYS: i64 = 30;
 /// The sweep interval unless the project sets `drift.intervalDays`.
 pub const DEFAULT_INTERVAL_DAYS: i64 = 7;
@@ -113,12 +115,8 @@ pub struct DriftRun {
     /// Code citations measured, and cross-references counted apart.
     pub code_citations: usize,
     pub cross_references: usize,
-    /// Business pages (item 2b): checked by the age rule only, since code
-    /// churn under a page for readers who never see code is noise to them.
-    #[serde(default)]
-    pub business_pages: usize,
     pub mismatches: Vec<Mismatch>,
-    /// Pages raised by the age rule: (page, verified date or none).
+    /// Pages raised by the age rule: (page, checked date or none).
     pub aged: Vec<(String, Option<String>)>,
     /// Why the run is void, if it is: a wrong control, too few pages.
     pub void_reason: Option<String>,
@@ -159,12 +157,6 @@ impl DriftRun {
             "{} pages and {} rulings examined; {} code citations measured, {} cross-references counted apart.\n",
             self.pages_examined, self.rulings_examined, self.code_citations, self.cross_references
         ));
-        if self.business_pages > 0 {
-            s.push_str(&format!(
-                "{} business pages are checked by age only: their readers never see the code they cite.\n",
-                self.business_pages
-            ));
-        }
         if self.uncontrolled {
             s.push_str("No controls are declared (`drift.controlMoved` and `drift.controlClean` in project.json), so a clean result proves less.\n");
         }
@@ -185,9 +177,9 @@ impl DriftRun {
         section("Findings: a cited source is gone", Severity::Finding, false, &mut s);
         section("Is the page still true? A cited source changed", Severity::Judgment, false, &mut s);
         if !self.aged.is_empty() {
-            s.push_str(&format!("\n**Not verified in {AGE_DAYS} days**\n"));
+            s.push_str(&format!("\n**Not checked in {AGE_DAYS} days**\n"));
             for (page, v) in &self.aged {
-                s.push_str(&format!("- {page} — {}\n", v.as_deref().map_or("never verified".to_string(), |d| format!("verified {d}"))));
+                s.push_str(&format!("- {page} — {}\n", v.as_deref().map_or("never checked".to_string(), |d| format!("checked {d}"))));
             }
         }
         section("Research (evidence at the time, reported apart): source gone", Severity::Finding, true, &mut s);
@@ -449,7 +441,7 @@ struct PinCache {
     /// Repo folder → the branch head the results were measured at.
     heads: std::collections::HashMap<String, String>,
     /// Citation key → result. Keyed by repo, branch, pin, path and line, so a
-    /// page re-verified (a new pin) measures afresh.
+    /// page checked again (a new pin) measures afresh.
     results: std::collections::HashMap<String, Measured>,
 }
 
@@ -559,9 +551,10 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     let mut repos_in_git: std::collections::HashMap<PathBuf, bool> = Default::default();
     let mut tracked: std::collections::HashMap<(PathBuf, String), Vec<String>> = Default::default();
     // `exact`: a citation pinned to its commit (`repo@sha:path`) is measured
-    // from that commit. A draft pins what it read; once a person verifies the
-    // page, its verified date is the pin instead.
-    let mut measure_one = |subject: &str, raw: &str, since: &str, exact: bool, research: bool, run: &mut DriftRun| {
+    // from that commit. A draft pins what it read; once the check has re-read
+    // the page, its `checked` stamp is the pin instead: `checked_sha` where
+    // the cited repo has that commit, else the last commit on `since`.
+    let mut measure_one = |subject: &str, raw: &str, since: &str, exact: bool, checked_sha: Option<&str>, research: bool, run: &mut DriftRun| {
         let c = match classify(raw) {
             Citation::Code(c) => c,
             Citation::Cross => {
@@ -624,6 +617,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             .at
             .as_deref()
             .filter(|_| exact)
+            .or(checked_sha)
             .and_then(|sha| git(&repo_root, &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")]));
         let pin = match exact_pin {
             Some(sha) => Some(sha),
@@ -690,33 +684,25 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             continue;
         }
         run.pages_examined += 1;
-        let section = section_of(&page);
-        let research = section == Some(Section::Research);
-        let business = audience_of(section, Some(&meta)) == Some(Audience::Business);
-        if business {
-            run.business_pages += 1;
-        }
-        let date = meta.verified.clone().or_else(|| meta.updated.clone());
-        // Only a page with a `sources:` list carries `verified:` (Chris's
-        // ruling): it says something a person checks against its sources.
-        // A navigation page (an index, START-HERE) has none and never ages.
+        let research = section_of(&page) == Some(Section::Research);
+        let checked = meta.checked.as_ref().map(|c| c.date.clone());
+        let checked_sha = meta.checked.as_ref().and_then(|c| c.sha.clone());
+        let date = checked.clone().or_else(|| meta.updated.clone());
+        // Only a page with a `sources:` list is checked (Chris's ruling): it
+        // says something the check re-reads against its sources. A
+        // navigation page (an index, START-HERE) has none and never ages.
         if !research && !meta.sources.is_empty() {
-            // Never verified: aged once it has gone unverified for as long
+            // Never checked: aged once it has gone unchecked for as long
             // since it was written. A draft from today is waiting for its
             // first read, not stale; a new wiki is all such pages.
-            let old = meta
-                .verified
-                .as_deref()
-                .or(meta.updated.as_deref())
-                .and_then(|v| days_between(v, now))
-                .is_none_or(|d| d > AGE_DAYS);
+            let old = date.as_deref().and_then(|v| days_between(v, now)).is_none_or(|d| d > AGE_DAYS);
             if old {
-                run.aged.push((page.clone(), meta.verified.clone()));
+                run.aged.push((page.clone(), checked.clone()));
             }
         }
-        if let (Some(since), false) = (date, business) {
+        if let Some(since) = date {
             for src in &meta.sources {
-                measure_one(&page, src, &since, meta.verified.is_none(), research, &mut run);
+                measure_one(&page, src, &since, checked.is_none(), checked_sha.as_deref(), research, &mut run);
             }
         }
     }
@@ -729,7 +715,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             let Some(since) = r.date.clone() else { continue };
             let subject = format!("{log}#{}", r.id);
             for src in &r.sources {
-                measure_one(&subject, src, &since, true, false, &mut run);
+                measure_one(&subject, src, &since, true, None, false, &mut run);
             }
         }
     }
@@ -786,7 +772,7 @@ pub fn file_run(db: &mut Db, run: &DriftRun) -> Result<()> {
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     /// `void` · `gone` (a cited source is gone) · `changed` (to re-read) ·
-    /// `aged` (not verified in [`AGE_DAYS`] days).
+    /// `aged` (not checked in [`AGE_DAYS`] days).
     pub kind: String,
     pub title: String,
     pub detail: String,
@@ -813,13 +799,13 @@ pub fn findings(run: &DriftRun) -> Vec<Finding> {
         })
         .collect();
     out.sort_by_key(|f| f.kind != "gone");
-    for (page, verified) in &run.aged {
+    for (page, checked) in &run.aged {
         out.push(Finding {
             kind: "aged".into(),
             title: page.clone(),
-            detail: match verified {
-                Some(d) => format!("Last verified {d}, more than {AGE_DAYS} days ago."),
-                None => "Never verified.".into(),
+            detail: match checked {
+                Some(d) => format!("Last checked {d}, more than {AGE_DAYS} days ago."),
+                None => "Never checked.".into(),
             },
             path: page.clone(),
         });
@@ -884,7 +870,7 @@ mod tests {
     /// A wiki drafted today: nothing in it may read as drift. Derived facts
     /// are not files, its own pages are cross-references, a path in the
     /// wrong case is the file it means, a folder without git is unmeasured,
-    /// and an unverified draft is not aged.
+    /// and an unchecked draft is not aged.
     #[test]
     fn a_fresh_draft_is_clean() {
         let parent = tempfile::tempdir().unwrap();
@@ -935,18 +921,37 @@ updated: {{date}}
             format!("---\ntitle: Pinned\nupdated: 2026-09-24\nsources:\n  - app@{}:README.md\n---\n# P\n", &read_at[..12]),
         )
         .unwrap();
+        // A page the check re-read at that commit pins to it in the same
+        // way, through its `checked` stamp.
+        fs::write(
+            wiki.join("Repo-Map/checked.md"),
+            format!("---\ntitle: Checked\nupdated: 2026-09-20\nchecked: 2026-09-24 {}\nsources:\n  - app:README.md\n---\n# C\n", &read_at[..12]),
+        )
+        .unwrap();
         commit_at(&code, "README.md", "# App\nNow with two approvals.\n", "2026-09-24");
         crate::scan::scan(&project, &mut db).unwrap();
         let run = sweep(&project, &db, chrono_free_epoch("2026-09-24").unwrap()).unwrap();
-        let hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
-        assert_eq!(hits, vec![("Repo-Map/pinned.md", Severity::Judgment)], "only the pinned page: the dated one took today's commit in");
+        let mut hits: Vec<_> = run.mismatches.iter().map(|m| (m.subject.as_str(), m.severity)).collect();
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec![("Repo-Map/checked.md", Severity::Judgment), ("Repo-Map/pinned.md", Severity::Judgment)],
+            "only the pinned pages: the dated one took today's commit in"
+        );
 
-        // Thirty-odd days on, still unverified: now it is aged. A navigation
-        // page with no sources carries no `verified:` and never is.
+        // Thirty-odd days on, still unchecked: now it is aged. A navigation
+        // page with no sources carries no `checked:` and never is.
         fs::write(wiki.join("Repo-Map/Index.md"), "---\ntitle: Repo Map\nupdated: 2026-09-24\n---\n# Repo Map\n| [[app]] | the app |\n").unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
         let later = sweep(&project, &db, chrono_free_epoch("2026-10-30").unwrap()).unwrap();
-        assert_eq!(later.aged, vec![("Repo-Map/app.md".to_string(), None), ("Repo-Map/pinned.md".to_string(), None)]);
+        assert_eq!(
+            later.aged,
+            vec![
+                ("Repo-Map/app.md".to_string(), None),
+                ("Repo-Map/checked.md".to_string(), Some("2026-09-24".to_string())),
+                ("Repo-Map/pinned.md".to_string(), None),
+            ]
+        );
     }
 
     /// A code repo nobody fetches (Ken never syncs code): a change merged
@@ -1038,7 +1043,8 @@ updated: {{date}}
     /// A wiki beside a code repo: a page whose cited code changed is a
     /// Judgment, a comment-only change clears itself, a deleted file and a
     /// line past the end are Findings, an old page is aged, Research is
-    /// apart, and the controls decide whether the run is trusted.
+    /// apart, every page with sources is measured alike, and the controls
+    /// decide whether the run is trusted.
     #[test]
     fn a_sweep_sorts_what_moved_and_checks_its_controls() {
         let parent = tempfile::tempdir().unwrap();
@@ -1061,9 +1067,10 @@ updated: {{date}}
         let wiki = parent.path().join("wiki");
         fs::create_dir_all(wiki.join("Platform")).unwrap();
         fs::create_dir_all(wiki.join("Research")).unwrap();
-        let page = |sources: &str, verified: &str| format!("---\nverified: {verified}\nsources:\n{sources}---\n# P\n");
+        let page = |sources: &str, checked: &str| format!("---\nchecked: {checked}\nsources:\n{sources}---\n# P\n");
         fs::write(wiki.join("Platform/Save.md"), page("  - game:src/save.rs:2\n", "2026-09-05")).unwrap();
-        // A business page citing the same changed code: age rule only.
+        // A Current page citing the same changed code is measured like any
+        // other (decision 28 drops the audience split).
         fs::create_dir_all(wiki.join("Current")).unwrap();
         fs::write(wiki.join("Current/Project.md"), page("  - game:src/save.rs:2\n", "2026-09-05")).unwrap();
         fs::write(wiki.join("Platform/Combat.md"), page("  - game:src/combat.rs\n  - \"[[Save]]\"\n", "2026-09-05")).unwrap();
@@ -1090,25 +1097,24 @@ updated: {{date}}
         assert!(run.mismatches.iter().any(|m| m.subject == "Research/Spike.md" && m.research));
         assert_eq!(run.aged, vec![("Platform/Old.md".to_string(), Some("2026-08-01".to_string()))]);
         assert_eq!(run.cross_references, 1);
-        assert_eq!(sev("Current/Project.md"), Vec::<Severity>::new(), "a business page's code is not measured");
-        assert_eq!(run.business_pages, 1);
+        assert_eq!(sev("Current/Project.md"), vec![Severity::Judgment], "no page is spared its code");
         assert_eq!(run.void_reason, None, "controls held: {:?}", run.void_reason);
         assert!(!run.uncontrolled);
         assert_eq!(run.exit_code, 1, "a live Finding");
         assert!(run.branches.iter().any(|b| b.contains("measured against main")), "{:?}", run.branches);
-        assert_eq!((run.measured, run.reused), (5, 0), "the first sweep measures every code citation");
+        assert_eq!((run.measured, run.reused), (5, 1), "the first sweep measures every code citation, a repeated one once");
 
         // Nothing committed since: every result carries over, the same as a
         // full sweep, with one git call per repo to see nothing moved.
         let again = sweep(&project, &db, now).unwrap();
         assert_eq!(again.mismatches, run.mismatches);
         assert_eq!(again.unmeasured, run.unmeasured);
-        assert_eq!((again.measured, again.reused), (0, 5));
+        assert_eq!((again.measured, again.reused), (0, 6));
 
         // A commit touching one file re-measures only the citations of it.
         commit_at(&code, "src/combat.rs", "// hits\nfn hit() { crit(); }\n", "2026-09-20");
         let after = sweep(&project, &db, now).unwrap();
-        assert_eq!((after.measured, after.reused), (1, 4));
+        assert_eq!((after.measured, after.reused), (1, 5));
         assert!(after
             .mismatches
             .iter()

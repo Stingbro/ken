@@ -1,11 +1,10 @@
 ---
 title: "{{What It Was}} {{date}}"
 aliases: ["{{What It Was}} {{date}}"]
-status: evidence
-audience: business
+status: current
 updated: {{date}}
-source: Research/Ingestion/Ingested/{{date}}-{{name}}/{{source file}}
-present: [{{who was there}}]
+sources:
+  - "[[Research/Ingestion/Ingested/{{date}}-{{name}}/{{source file}}]]"
 ---
 
 # {{What It Was}} {{date}}
@@ -13,6 +12,8 @@ present: [{{who was there}}]
 The write-up of {{the source}}, as evidence at {{date}}: cite it, never read it as current rules. Not here: what is true now → [[Current]]; a ruling once its decider accepts it → the decisions log.
 
 Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends, if it ends early.}}
+
+Present: {{who was there, comma-separated}}
 
 Keep the sections this kind of source needs and drop the rest. A meeting or session needs most of them; a document needs Summary, Key Takeaways, What It Overturns, Contradictions and Escalations; a short note may need only Summary, Actions and Requests, and Next Steps. Keep each heading as written, because Ken reads rulings, actions, escalations and next steps back by their headings.
 

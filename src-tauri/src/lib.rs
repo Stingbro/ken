@@ -844,7 +844,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     }
 
     // Pages indexed before frontmatter was read get their title, aliases,
-    // verified date and retired/generated state from the stored text.
+    // status and checked stamp from the stored text.
     if let Err(e) = db.backfill_page_meta() {
         eprintln!("warning: page frontmatter backfill failed: {e}");
     }
@@ -8797,8 +8797,8 @@ struct RoutedHitDto {
     line: Option<i64>,
     /// `repo:path:line`, `repo@sha:…`, led by `[[Note]]` in a wiki repo.
     locator: String,
-    /// For a Markdown page: section, verified or evidence date, retired or
-    /// generated, and what replaces it.
+    /// For a Markdown page: section, checked or evidence date, and whether
+    /// it is superseded.
     page: Option<ken_core::pagemeta::HitPage>,
     /// What the file is for (`contenttype::of`).
     content_type: &'static str,
@@ -8922,11 +8922,9 @@ struct RouteFanOut {
     names: std::collections::HashMap<uuid::Uuid, String>,
     query: String,
     query_vec: Option<Vec<f32>>,
-    /// Hits read from each source before the reader filter, and kept after.
-    fetch: usize,
+    /// Hits kept from each source.
     limit: usize,
     wanted: Vec<ken_core::contenttype::ContentType>,
-    audience: Option<String>,
     vocab: Arc<ken_core::vocab::Vocabulary>,
     done: Arc<AtomicUsize>,
 }
@@ -8941,16 +8939,13 @@ impl RouteFanOut {
             let name = self.names.get(&id).cloned().unwrap_or_default();
             let db = self.dbs.get(&id).cloned();
             let (query, query_vec, wanted) = (self.query.clone(), self.query_vec.clone(), self.wanted.clone());
-            let (audience, vocab, done, app) = (self.audience.clone(), self.vocab.clone(), self.done.clone(), self.app.clone());
-            let (fetch, limit) = (self.fetch, self.limit);
+            let (vocab, done, app) = (self.vocab.clone(), self.done.clone(), self.app.clone());
+            let limit = self.limit;
             handles.push(tauri::async_runtime::spawn_blocking(move || {
                 let guard = db.as_ref().map(|db| db.lock().unwrap());
-                let mut found =
-                    routing::search_target(id, &name, guard.as_deref(), &query, query_vec.as_deref(), fetch, &wanted, Some(&vocab));
+                let found =
+                    routing::search_target(id, &name, guard.as_deref(), &query, query_vec.as_deref(), limit, &wanted, Some(&vocab));
                 drop(guard);
-                // Item 2b: keep what suits the reader chosen (business, dev, any).
-                found.hits.retain(|h| ken_core::pagemeta::suits(audience.as_deref(), h.page.as_ref().and_then(|p| p.audience)));
-                found.hits.truncate(limit);
                 let done = done.fetch_add(1, Ordering::SeqCst) + 1;
                 let _ = app.emit("routed-search-state", RoutedSearchStateEvent::Searching { done, total });
                 found
@@ -8996,15 +8991,10 @@ async fn route_search(
     limit: Option<usize>,
     scope: Option<uuid::Uuid>,
     group: Option<String>,
-    audience: Option<String>,
     types: Option<String>,
 ) -> CmdResult<RouteSearchDto> {
     let limit = limit.unwrap_or(30);
     let wanted = ken_core::contenttype::parse_filter(types.as_deref());
-    // Item 2b: a reader chosen (business, dev) reads further down each
-    // member's ranking so the filter still fills the page.
-    let filtered = audience.as_deref().is_some_and(|a| !a.is_empty() && a != "any");
-    let fetch = if filtered { limit * 3 } else { limit };
 
     let group_targets: Option<Vec<uuid::Uuid>>;
     let (base_dir, embedder_slot, snapshots) = {
@@ -9138,10 +9128,8 @@ async fn route_search(
         names,
         query,
         query_vec,
-        fetch,
         limit,
         wanted,
-        audience,
         vocab,
         done: Arc::new(AtomicUsize::new(0)),
     };

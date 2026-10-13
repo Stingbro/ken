@@ -1,13 +1,21 @@
 //! What a wiki page says about itself, read from its frontmatter, and which
-//! library section it sits in. Search uses both: binding and verified pages
-//! rank first, Research is dated evidence, and a retired or generated page
-//! is labelled and ranked last (Ways of Working, docs-system: "Binding and
-//! verified first", "Retired Pages", "Generated Pages").
+//! library section it sits in. Search uses both: binding knowledge ranks
+//! first, Research is dated evidence, and a superseded page is labelled and
+//! ranked last (knowledge-core decisions 5, 7 and 23).
+//!
+//! A page has six keys (decision 5): `title`, `aliases`, `status` (draft,
+//! current or superseded), `updated`, `sources` (each `repo@sha:path` or
+//! `[[Note]]`) and `checked` (the date and commit of the check that last
+//! re-read the page), plus an optional `reviewed_by`. Two older keys are
+//! still read, never written: `replaced_by` (or `superseded_by`) and
+//! `generated`, so pages written before keep their rank and label.
 //!
 //! The parser is deliberately small and tolerant, not YAML: pages copied
 //! from the templates carry `{{date}}` placeholders and trailing `#`
 //! comments, which a YAML parser rejects outright. It reads only the keys
-//! the method defines and ignores everything else.
+//! above and ignores everything else.
+
+use std::fmt;
 
 use serde::Serialize;
 
@@ -18,24 +26,64 @@ pub struct PageMeta {
     pub title: Option<String>,
     /// The questions people type; a name link also resolves by these.
     pub aliases: Vec<String>,
-    /// `current` | `evidence` | `superseded` | `retired` | `generated` | …
+    /// A page's `draft` | `current` | `superseded`, lowercased. The older
+    /// `retired` and `deprecated` read as superseded. A ticket keeps its own
+    /// statuses (`todo`, `done`, `cancelled`…), read the same way.
     pub status: Option<String>,
-    /// When a person last read the page against its sources (`YYYY-MM-DD`).
-    pub verified: Option<String>,
-    /// When it last changed, if it says (`updated`, or `date` on a note).
+    /// When it last changed (`updated`, or `date` on an older note).
     pub updated: Option<String>,
     pub sources: Vec<String>,
-    /// The pages that replace a retired one.
+    /// When the check last re-read the page against its sources, and at
+    /// which commit.
+    pub checked: Option<Checked>,
+    /// Who reviewed the page, when a person did.
+    pub reviewed_by: Option<String>,
+    /// Legacy, read only: the pages that replace a retired one
+    /// (`replaced_by` or `superseded_by`). Ken never writes it; a page is
+    /// retired with `status: superseded`.
     pub replaced_by: Vec<String>,
-    /// Built by a generator (a `generated` key, or `status: generated`).
+    /// Legacy, read only: built by a generator (a `generated` key, or
+    /// `status: generated`).
     pub generated: bool,
-    /// `audience: business` or `audience: dev`, when the page says; else
-    /// its section decides (see [`audience_of`]).
-    pub audience: Option<String>,
+}
+
+/// What the check that re-read a page stamps on it: `checked: 2026-10-13
+/// f00218c`, the date and then the commit it read at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Checked {
+    pub date: String,
+    pub sha: Option<String>,
+}
+
+impl Checked {
+    /// The written form: a `YYYY-MM-DD` date, then optionally the commit
+    /// (7 to 40 hex digits), set apart by a space, `@` or a comma. None
+    /// without a date.
+    pub fn parse(v: &str) -> Option<Checked> {
+        let v = v.trim();
+        let date = date(v)?;
+        let sha = v[10..]
+            .split(|c: char| c.is_whitespace() || c == '@' || c == ',')
+            .find(|w| !w.is_empty())
+            .filter(|w| (7..=40).contains(&w.len()) && w.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
+        Some(Checked { date, sha })
+    }
+}
+
+impl fmt::Display for Checked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.sha {
+            Some(sha) => write!(f, "{} {sha}", self.date),
+            None => f.write_str(&self.date),
+        }
+    }
 }
 
 impl PageMeta {
-    /// No longer true: kept as evidence, served under its replacement.
+    /// No longer true: `status: superseded` (or an older `retired` or
+    /// `deprecated`), or a legacy `replaced_by`. Kept as evidence and ranked
+    /// last.
     pub fn retired(&self) -> bool {
         matches!(self.status.as_deref(), Some("superseded" | "retired" | "deprecated"))
             || !self.replaced_by.is_empty()
@@ -98,7 +146,8 @@ pub fn parse(text: &str) -> Option<PageMeta> {
                 meta.generated |= v.eq_ignore_ascii_case("generated");
                 meta.status = Some(v.to_ascii_lowercase());
             }
-            "verified" => meta.verified = date(&v),
+            "checked" => meta.checked = Checked::parse(&v),
+            "reviewed_by" => push_list(&mut meta, &key, v),
             "updated" | "date" => {
                 if meta.updated.is_none() {
                     meta.updated = date(&v);
@@ -107,7 +156,6 @@ pub fn parse(text: &str) -> Option<PageMeta> {
             "generated" | "generated_by" | "generator" => {
                 meta.generated = !matches!(v.to_ascii_lowercase().as_str(), "false" | "no");
             }
-            "audience" => meta.audience = Some(v.to_ascii_lowercase()),
             "aliases" | "sources" | "replaced_by" | "superseded_by" => push_list(&mut meta, &key, v),
             _ => {}
         }
@@ -120,6 +168,13 @@ fn push_list(meta: &mut PageMeta, key: &str, v: String) {
         "aliases" => meta.aliases.push(v),
         "sources" => meta.sources.push(v),
         "replaced_by" | "superseded_by" => meta.replaced_by.push(v),
+        // A list of reviewers reads as one line.
+        "reviewed_by" => {
+            meta.reviewed_by = Some(match meta.reviewed_by.take() {
+                Some(r) => format!("{r}, {v}"),
+                None => v,
+            })
+        }
         _ => {}
     }
 }
@@ -240,82 +295,6 @@ pub fn section_of(rel_path: &str) -> Option<Section> {
     })
 }
 
-/// Who a page is written for (item 2b). Business pages are for people who
-/// never read code: what the product does, what was decided and why, what
-/// changed in each release. Dev pages are conventions, architecture,
-/// how-tos and code references. The method's own pages are neither.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Audience {
-    Business,
-    Dev,
-    Method,
-}
-
-impl Audience {
-    pub fn name(self) -> &'static str {
-        match self {
-            Audience::Business => "business",
-            Audience::Dev => "dev",
-            Audience::Method => "method",
-        }
-    }
-}
-
-/// Whether a search result suits the reader chosen: `business`, `dev`, or
-/// none/`any` for everything. Business readers get pages written for them;
-/// developers get everything else but the method's own pages, code and
-/// documents outside the sections included. `audience` is the hit's
-/// ([`HitPage::audience`], none for a file that is not a page).
-pub fn suits(want: Option<&str>, audience: Option<&str>) -> bool {
-    match want.map(str::trim).filter(|w| !w.is_empty() && *w != "any") {
-        Some("business") => audience == Some("business"),
-        Some("dev") => !matches!(audience, Some("business") | Some("method")),
-        _ => true,
-    }
-}
-
-/// The audience of the file at `path`, read from the index: a Markdown
-/// page's frontmatter and section, none for anything else.
-pub fn audience_at(db: &crate::db::Db, path: &str) -> Option<&'static str> {
-    if !path.ends_with(".md") {
-        return None;
-    }
-    let meta = db.page_meta(path).ok().flatten();
-    audience_of(section_of(path), meta.as_ref()).map(Audience::name)
-}
-
-/// A page's audience: its frontmatter `audience:` when it says, else its
-/// section. Current, Design and Decisions are business; Rules and Reference
-/// are dev. Research is evidence
-/// for everyone and has none, nor does a page outside the sections.
-pub fn audience_of(section: Option<Section>, meta: Option<&PageMeta>) -> Option<Audience> {
-    match meta.and_then(|m| m.audience.as_deref()) {
-        Some("business") => return Some(Audience::Business),
-        Some("dev") | Some("developer") | Some("code") => return Some(Audience::Dev),
-        Some("method") => return Some(Audience::Method),
-        _ => {}
-    }
-    match section? {
-        Section::Current | Section::Design | Section::Decisions => Some(Audience::Business),
-        Section::Rules | Section::Reference => Some(Audience::Dev),
-        Section::Research => None,
-    }
-}
-
-/// Search bands, best first: binding and verified, then the rest, then
-/// evidence and pages that are not current (Research, retired, generated).
-pub fn band(section: Option<Section>, meta: Option<&PageMeta>) -> u8 {
-    let retired_or_generated = meta.is_some_and(|m| m.retired() || m.generated);
-    if retired_or_generated || section == Some(Section::Research) {
-        2
-    } else if matches!(section, Some(Section::Rules | Section::Decisions)) {
-        0
-    } else {
-        1
-    }
-}
-
 /// What a search hit on a page carries: where it sits, how fresh it is, and
 /// whether it is still current.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -323,17 +302,17 @@ pub fn band(section: Option<Section>, meta: Option<&PageMeta>) -> u8 {
 pub struct HitPage {
     pub section: Option<&'static str>,
     pub title: Option<String>,
-    pub verified: Option<String>,
+    /// The date the check last re-read it against its sources.
+    pub checked: Option<String>,
     /// For Research: the date the evidence is from, so nothing reads a past
     /// session's conclusion as current state.
     pub dated: Option<String>,
+    /// Superseded ([`PageMeta::retired`]).
     pub retired: bool,
+    /// Legacy: built by a generator.
     pub generated: bool,
+    /// Legacy: what replaces a retired page, when it says.
     pub replaced_by: Vec<String>,
-    /// [`band`]: 0 binding, 1 the rest, 2 evidence or not current.
-    pub band: u8,
-    /// Who it is written for ([`audience_of`]).
-    pub audience: Option<&'static str>,
     /// How much the hit counts, in one short line (`authority::hit_label`):
     /// filled by the search that has the index, None until then.
     pub label: Option<String>,
@@ -347,22 +326,19 @@ pub fn hit_page(rel_path: &str, meta: Option<PageMeta>) -> Option<HitPage> {
         return None;
     }
     let section = section_of(rel_path);
-    let band = band(section, meta.as_ref());
-    let audience = audience_of(section, meta.as_ref()).map(Audience::name);
     let meta = meta.unwrap_or_default();
+    let checked = meta.checked.as_ref().map(|c| c.date.clone());
     let dated = (section == Some(Section::Research))
-        .then(|| meta.updated.clone().or_else(|| meta.verified.clone()).or_else(|| date_in_name(rel_path)))
+        .then(|| meta.updated.clone().or_else(|| checked.clone()).or_else(|| date_in_name(rel_path)))
         .flatten();
     Some(HitPage {
         section: section.map(Section::name),
         retired: meta.retired(),
         generated: meta.generated,
         title: meta.title,
-        verified: meta.verified,
+        checked,
         dated,
         replaced_by: meta.replaced_by,
-        band,
-        audience,
         label: None,
     })
 }
@@ -373,26 +349,49 @@ mod tests {
 
     #[test]
     fn reads_a_template_page_with_placeholders_and_comments() {
-        let text = "---\r\ntitle: \"Project\"\r\naliases: [\"project\", \"what are we building\", \"what is the next milestone\"]\r\nstatus: current\r\nupdated: {{date}}\r\nverified: 2026-09-20      # a person read this against its sources; never stamped in bulk\r\nchanged_by: \"[[Standup - 2026-09-19]]\"\r\nsources:\r\n  - \"[[Standup - 2026-09-19]]\"\r\n  - \"D-012\"\r\n---\r\n\r\n# Project\r\n";
+        let text = "---\r\ntitle: \"Project\"\r\naliases: [\"project\", \"what are we building\", \"what is the next milestone\"]\r\nstatus: current\r\nupdated: {{date}}\r\nchecked: 2026-09-20 f00218c      # written by the check that re-read it\r\nreviewed_by: Chris\r\nsources:\r\n  - \"[[Standup - 2026-09-19]]\"\r\n  - \"D-012\"\r\n---\r\n\r\n# Project\r\n";
         let m = parse(text).unwrap();
         assert_eq!(m.title.as_deref(), Some("Project"));
         assert_eq!(m.aliases, vec!["project", "what are we building", "what is the next milestone"]);
         assert_eq!(m.status.as_deref(), Some("current"));
-        assert_eq!(m.verified.as_deref(), Some("2026-09-20"));
+        assert_eq!(m.checked, Some(Checked { date: "2026-09-20".into(), sha: Some("f00218c".into()) }));
+        assert_eq!(m.reviewed_by.as_deref(), Some("Chris"));
         assert_eq!(m.updated, None, "a placeholder is not a date");
         assert_eq!(m.sources, vec!["[[Standup - 2026-09-19]]", "D-012"]);
         assert!(!m.retired() && !m.generated);
     }
 
     #[test]
-    fn retired_and_generated_pages_say_so() {
+    fn checked_is_a_date_then_a_commit() {
+        let c = |v: &str| Checked::parse(v);
+        assert_eq!(c("2026-10-13 f00218c").map(|c| c.to_string()).as_deref(), Some("2026-10-13 f00218c"));
+        assert_eq!(c("2026-10-13 @ F00218C").and_then(|c| c.sha).as_deref(), Some("f00218c"));
+        assert_eq!(c("2026-10-13, f00218cabc").and_then(|c| c.sha).as_deref(), Some("f00218cabc"));
+        assert_eq!(c("2026-10-13"), Some(Checked { date: "2026-10-13".into(), sha: None }));
+        assert_eq!(c("2026-10-13 by hand").and_then(|c| c.sha), None, "not a commit");
+        assert_eq!(c("f00218c"), None, "a commit alone is not a check");
+        assert_eq!(parse("---\nchecked: {{date}} {{sha}}\n---\n").unwrap().checked, None);
+    }
+
+    #[test]
+    fn the_dropped_keys_are_not_read() {
+        let m = parse("---\nverified: 2026-09-20\naudience: business\nlens: dev\nchanged_by: \"[[Standup]]\"\npin: abc1234\n---\n").unwrap();
+        assert_eq!(m, PageMeta::default());
+    }
+
+    #[test]
+    fn superseded_and_the_legacy_keys_say_so() {
+        assert!(parse("---\nstatus: superseded\n---\n").unwrap().retired());
+        assert!(parse("---\nstatus: retired\n---\n").unwrap().retired(), "an older value");
+        assert!(parse("---\nstatus: deprecated\n---\n").unwrap().retired(), "an older value");
+        assert!(!parse("---\nstatus: draft\n---\n").unwrap().retired());
         let retired = parse("---\nstatus: superseded\nreplaced_by: [\"[[Rules]]\"]\n---\n").unwrap();
-        assert!(retired.retired());
         assert_eq!(retired.replaced_by, vec!["[[Rules]]"]);
         assert!(parse("---\nsuperseded_by: \"[[New]]\"\n---\n").unwrap().retired());
         assert!(parse("---\ngenerated: tools/gen.py --all @ abc1234\n---\n").unwrap().generated);
         assert!(parse("---\nstatus: generated\n---\n").unwrap().generated);
         assert!(!parse("---\ngenerated: false\n---\n").unwrap().generated);
+        assert_eq!(parse("---\nreviewed_by: [Ana, Ben]\n---\n").unwrap().reviewed_by.as_deref(), Some("Ana, Ben"));
     }
 
     #[test]
@@ -421,53 +420,17 @@ mod tests {
     }
 
     #[test]
-    fn bands_put_binding_first_and_evidence_last() {
-        let current = PageMeta { status: Some("current".into()), ..Default::default() };
-        let retired = PageMeta { status: Some("retired".into()), ..Default::default() };
-        assert_eq!(band(Some(Section::Rules), Some(&current)), 0);
-        assert_eq!(band(Some(Section::Decisions), None), 0);
-        assert_eq!(band(Some(Section::Current), Some(&current)), 1);
-        assert_eq!(band(None, None), 1, "a code file is ranked on its merits");
-        assert_eq!(band(Some(Section::Research), None), 2);
-        assert_eq!(band(Some(Section::Rules), Some(&retired)), 2, "retired beats binding");
-    }
-
-    #[test]
     fn a_hit_page_dates_research_and_names_what_replaces_a_retired_page() {
         let research = hit_page("Research/Ingested/Standup - 2026-09-12.md", None).unwrap();
-        assert_eq!((research.section, research.dated.as_deref(), research.band), (Some("Research"), Some("2026-09-12"), 2));
+        assert_eq!((research.section, research.dated.as_deref()), (Some("Research"), Some("2026-09-12")));
         let meta = PageMeta { status: Some("superseded".into()), replaced_by: vec!["[[Rules]]".into()], ..Default::default() };
         let old = hit_page("Ways-of-Working/Old.md", Some(meta)).unwrap();
         assert!(old.retired);
         assert_eq!(old.replaced_by, vec!["[[Rules]]"]);
         assert_eq!(old.dated, None, "only Research is stamped");
+        let checked = PageMeta { checked: Checked::parse("2026-09-20 f00218c"), ..Default::default() };
+        assert_eq!(hit_page("Design/Why.md", Some(checked)).unwrap().checked.as_deref(), Some("2026-09-20"));
         assert_eq!(hit_page("src/main.rs", None), None);
-    }
-
-    #[test]
-    fn a_reader_gets_business_pages_or_everything_else_or_all() {
-        for any in [None, Some(""), Some("any")] {
-            assert!(suits(any, Some("business")) && suits(any, Some("method")) && suits(any, None));
-        }
-        assert!(suits(Some("business"), Some("business")));
-        assert!(!suits(Some("business"), Some("dev")) && !suits(Some("business"), None), "code is not for business readers");
-        assert!(suits(Some("dev"), Some("dev")) && suits(Some("dev"), None), "developers get pages and code");
-        assert!(!suits(Some("dev"), Some("business")) && !suits(Some("dev"), Some("method")));
-    }
-
-    #[test]
-    fn the_section_decides_the_audience_unless_the_page_says() {
-        assert_eq!(audience_of(section_of("Current/Project.md"), None), Some(Audience::Business));
-        assert_eq!(audience_of(section_of("Work/Releases.md"), None), Some(Audience::Business));
-        assert_eq!(audience_of(section_of("Conventions/Architecture.md"), None), Some(Audience::Dev));
-        assert_eq!(audience_of(section_of("Rules/Naming.md"), None), Some(Audience::Dev));
-        assert_eq!(audience_of(section_of("Research/spike.md"), None), None);
-        let says = parse("---
-audience: Business
----
-").unwrap();
-        assert_eq!(audience_of(section_of("Platform/Pricing.md"), Some(&says)), Some(Audience::Business));
-        assert_eq!(hit_page("Design/Why.md", None).unwrap().audience, Some("business"));
     }
 
     #[test]

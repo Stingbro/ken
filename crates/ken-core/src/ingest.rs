@@ -372,13 +372,31 @@ pub fn kind_of(note: &str, raw: &str) -> SourceKind {
     if matches!(ext.as_str(), "vtt" | "srt") {
         return SourceKind::Recording;
     }
-    let present = field("present:").unwrap_or_default();
-    let people = present.trim_matches(|c| c == '[' || c == ']').trim();
-    if !people.is_empty() && !people.contains("{{") {
+    if !present_of(note).is_empty() {
         SourceKind::Meeting
     } else {
         SourceKind::Document
     }
+}
+
+/// Who was there, from the note's `Present:` line under its title (or a
+/// `present:` key in an older note's frontmatter). Empty when it does not
+/// say, or still holds the template's placeholder.
+pub fn present_of(note: &str) -> Vec<String> {
+    note.lines()
+        .take_while(|l| !l.starts_with("## "))
+        .find_map(|l| {
+            let t = l.trim();
+            t.get(..8).filter(|k| k.eq_ignore_ascii_case("present:")).map(|_| t[8..].trim().trim_end_matches('.').to_string())
+        })
+        .map(|v| {
+            v.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty() && !s.contains("{{"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The prompt: the template, the source's text, and the rules the method
@@ -468,7 +486,8 @@ pub fn wiki_context(db: &Db, text: &str) -> String {
 }
 
 /// The model's reply as a note: fences stripped, and the frontmatter
-/// `source:` set to where the source is filed.
+/// `sources:` set to where the source is filed (a `[[link]]` to it; the
+/// older `source:` key is dropped).
 pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
     let t = strip_fences(reply);
     if !t.starts_with("---") {
@@ -477,25 +496,30 @@ pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
     let mut out = String::with_capacity(t.len() + 64);
     let mut in_fm = false;
     let mut fm_done = false;
-    let mut wrote_source = false;
+    // Inside a `sources:` block list the model wrote: its items are dropped.
+    let mut in_sources = false;
     for (i, line) in t.lines().enumerate() {
         if line.trim_end() == "---" {
             if i == 0 {
                 in_fm = true;
             } else if in_fm && !fm_done {
-                if !wrote_source {
-                    out.push_str(&format!("source: {}\n", placement.source));
-                }
+                out.push_str(&format!("sources:\n  - \"[[{}]]\"\n", placement.source));
                 in_fm = false;
                 fm_done = true;
             }
             out.push_str("---\n");
             continue;
         }
-        if in_fm && line.trim_start().starts_with("source:") {
-            out.push_str(&format!("source: {}\n", placement.source));
-            wrote_source = true;
-            continue;
+        if in_fm {
+            let trimmed = line.trim_start();
+            if in_sources && (trimmed.starts_with("- ") || trimmed == "-") {
+                continue;
+            }
+            in_sources = false;
+            if let Some(rest) = trimmed.strip_prefix("sources:").or_else(|| trimmed.strip_prefix("source:")) {
+                in_sources = rest.trim().is_empty();
+                continue;
+            }
         }
         out.push_str(line);
         out.push('\n');
@@ -1038,7 +1062,7 @@ pub fn edit_prompt(page: &str, change: &str, existing: &str, note_stem: &str, no
          - Change only what the note changes or adds to this page. Keep every other line exactly as it is, in the same order.\n\
          - Use only what the note says. Cite it as [[{note_stem}]] beside what you changed.\n\
          {current}\
-         - Set `updated: {today}` in the frontmatter if there is one; leave any `verified:` line as it is.\n\
+         - Set `updated: {today}` in the frontmatter if there is one; leave any `checked:` or `reviewed_by:` line as it is.\n\
          - If the note changes nothing on this page, reply exactly NO CHANGE.\n\
          - Otherwise reply with the whole page, starting with its `---` frontmatter if it has one. No preamble, no code fences.\n\n\
          THE PAGE NOW:\n{existing}\n\nTHE NOTE ([[{note_stem}]]):\n{note}\n"
@@ -1449,7 +1473,7 @@ pub fn takeaways(note: &str) -> Takeaways {
     Takeaways {
         title: note.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("").trim().to_string(),
         kind: front("kind"),
-        present: front("present").trim_matches(['[', ']']).split(',').map(str::trim).filter(|s| !s.is_empty() && !s.contains("{{")).map(str::to_string).collect(),
+        present: present_of(note),
         length,
         summary: section("## Summary"),
         key_takeaways: rows("## Key Takeaways"),
@@ -1987,7 +2011,7 @@ mod tests {
         d
     }
 
-    const REPLY: &str = "```markdown\n---\ntitle: \"Standup - 2026-09-24\"\nstatus: evidence\nkind: meeting\nsource: wrong/path.txt\npresent: [Ana, Ben]\n---\n\n# Standup - 2026-09-24\n\nSource: `Standup notes.txt` (12 min).\n\n## Summary\n\nThe team moved the ship date.\n\n## Key Takeaways\n\n- We ship on Friday.\n\n## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n- Ana: *\"we ship on Friday\"*\n\n## What Was Said\n\n- **Ship.** Ana: *\"we ship on Friday\"*.\n\n## Actions and Requests\n\n- Fix the save bug → Ben.\n\n## Next Steps\n\n- Ben will fix the save bug.\n```";
+    const REPLY: &str = "```markdown\n---\ntitle: \"Standup - 2026-09-24\"\nstatus: current\nkind: meeting\nsource: wrong/path.txt\npresent: [Ana, Ben]\n---\n\n# Standup - 2026-09-24\n\nSource: `Standup notes.txt` (12 min).\n\n## Summary\n\nThe team moved the ship date.\n\n## Key Takeaways\n\n- We ship on Friday.\n\n## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n- Ana: *\"we ship on Friday\"*\n\n## What Was Said\n\n- **Ship.** Ana: *\"we ship on Friday\"*.\n\n## Actions and Requests\n\n- Fix the save bug → Ben.\n\n## Next Steps\n\n- Ben will fix the save bug.\n```";
 
     fn me() -> crate::day::Me {
         crate::day::Me { name: Some("Chris Staud".into()), email: Some("chris.staud@example.com".into()) }
@@ -2079,7 +2103,7 @@ mod tests {
         assert!(seen_prompt.contains("we ship on Friday") && seen_prompt.contains("Set `kind:`"));
         assert!(root.join(&raw).exists(), "the source waits in Raw until it is seen");
         let note = fs::read_to_string(root.join(&p.note)).unwrap();
-        assert!(note.starts_with("---\n") && note.contains(&format!("source: {}", p.source)) && !note.contains("wrong/path"));
+        assert!(note.starts_with("---\n") && note.contains(&format!("sources:\n  - \"[[{}]]\"\n---", p.source)) && !note.contains("wrong/path"));
         assert_eq!(waiting(root), vec![raw.clone()]);
         assert!(waiting_new(root, &db).unwrap().is_empty(), "not read twice");
         assert_eq!(in_review(&db).unwrap(), vec![raw.clone()]);
@@ -2141,11 +2165,14 @@ mod tests {
     fn the_kind_comes_from_the_note_else_from_the_source() {
         assert_eq!(kind_of("---\nkind: recording\npresent: [Ana]\n---\n", "Raw/x.txt"), SourceKind::Recording);
         assert_eq!(kind_of("---\ntitle: x\n---\n", "Raw/call.vtt"), SourceKind::Recording);
-        assert_eq!(kind_of("---\npresent: [Ana, Ben]\n---\n", "Raw/x.txt"), SourceKind::Meeting);
+        assert_eq!(kind_of("---\npresent: [Ana, Ben]\n---\n", "Raw/x.txt"), SourceKind::Meeting, "an older note");
+        assert_eq!(kind_of("---\ntitle: x\n---\n\n# X\n\nPresent: Ana, Ben\n\n## Summary\n", "Raw/x.txt"), SourceKind::Meeting);
+        assert_eq!(present_of("---\ntitle: x\n---\n\n# X\n\nPresent: Ana, Ben.\n"), vec!["Ana", "Ben"]);
+        assert_eq!(kind_of("---\ntitle: x\n---\n\n# X\n\nPresent: {{who was there, comma-separated}}\n", "Raw/spec.pdf"), SourceKind::Document);
         assert_eq!(kind_of("---\npresent: [{{who was there}}]\n---\n", "Raw/spec.pdf"), SourceKind::Document);
     }
 
-    const NOTE: &str = "---\ntitle: \"Standup - 2026-09-24\"\nstatus: evidence\n---\n\n# Standup - 2026-09-24\n\n\
+    const NOTE: &str = "---\ntitle: \"Standup - 2026-09-24\"\nstatus: current\n---\n\n# Standup - 2026-09-24\n\n\
         ## Summary\n\nThe ship date moved.\n\n\
         ## What It Overturns\n\n**Ship date is Friday, not Monday.** Current/Project.md said Monday.\n\n\
         ## Rulings Said in the Room\n\n- We ship region saves before combat — Ana.\n- {{The ruling, in the decider's words}} — {{decider}}.\n\n\

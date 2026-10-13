@@ -7,7 +7,7 @@ const finding = (kind: string, title = kind): TeamFinding => ({ kind, title, det
 describe("findingLabel", () => {
   it("names each kind plainly", () => {
     expect(findingLabel("drift")).toBe("drift");
-    expect(findingLabel("aged")).toBe("unverified");
+    expect(findingLabel("aged")).toBe("unchecked");
     expect(findingLabel("links")).toBe("links");
     expect(findingLabel("wiki-draft")).toBe("first draft");
     expect(findingLabel("other")).toBe("other");

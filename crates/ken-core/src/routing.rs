@@ -430,8 +430,8 @@ pub struct RoutedHit {
     pub line: Option<i64>,
     /// The human citation, see [`locator`].
     pub locator: String,
-    /// For a Markdown page: section, verified or evidence date, and whether
-    /// it is retired or generated.
+    /// For a Markdown page: section, checked or evidence date, and whether
+    /// it is superseded.
     pub page: Option<crate::pagemeta::HitPage>,
 }
 
@@ -922,7 +922,7 @@ mod tests {
         use crate::{engine, scan};
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("Platform")).unwrap();
-        std::fs::write(dir.path().join("Platform/World.md"), "---\nverified: 2026-09-05\n---\n# World\n\nEach region loads from disk.\n").unwrap();
+        std::fs::write(dir.path().join("Platform/World.md"), "---\nchecked: 2026-09-05 f00218c\n---\n# World\n\nEach region loads from disk.\n").unwrap();
         let project = Project::create(dir.path(), "T").unwrap();
         let mut db = Db::open_in_memory().unwrap();
         scan::scan(&project, &mut db).unwrap();
@@ -930,7 +930,7 @@ mod tests {
         let hits = search_member(&db, "region", None, 10).unwrap();
         let world = hits.iter().find(|h| h.path == "Platform/World.md").expect("found without any model");
         assert!(world.line.is_some());
-        assert_eq!(world.page.as_ref().and_then(|p| p.verified.as_deref()), Some("2026-09-05"));
+        assert_eq!(world.page.as_ref().and_then(|p| p.checked.as_deref()), Some("2026-09-05"));
 
         let missing_before = db.chunks_missing_vectors("Platform/World.md").unwrap().len();
         assert!(missing_before > 0);

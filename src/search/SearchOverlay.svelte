@@ -3,7 +3,6 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import {
     api,
-    type Audience,
     type ContentType,
     type KindFilter,
     type QuickAnswer,
@@ -261,8 +260,8 @@
     const all = scope === "all" && !!app.workspace;
     routedProgress = null;
     const res = all
-      ? await api.routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, audience, kinds)
-      : await api.routeSearch(q, 30, app.focused, null, audience, kinds);
+      ? await api.routeSearch(q, 30, pinnedMember ?? sharedScope.projectId, sharedScope.groupName, kinds)
+      : await api.routeSearch(q, 30, app.focused, null, kinds);
     // A slower earlier request must not overwrite a newer query's results.
     if (q !== query.trim()) return;
     searchError = null;
@@ -281,11 +280,6 @@
     selected = 0;
   }
 
-  // Item 2b: who the results are for, in every scope. Business: pages for
-  // readers who never see code (Current, Design, Work, or a page that says
-  // `audience: business`). Developers: everything else but the method's
-  // own pages, code included. Any: everything.
-  let audience = $state<Audience>(null);
   // What kind of file to keep: all, or one kind. Every hit shows its kind.
   let kinds = $state<KindFilter>(null);
   const KINDS: { v: KindFilter; label: string }[] = [
@@ -300,12 +294,6 @@
     { v: "data", label: "Data" },
     { v: "design", label: "Design" },
   ];
-  const READERS: { v: Audience; label: string; title: string }[] = [
-    { v: null, label: "Any reader", title: "Everything" },
-    { v: "business", label: "Business readers", title: "Only pages written for people who never read code: Current, Design, Work" },
-    { v: "dev", label: "Developers", title: "Dev pages and code; not the business pages or the method" },
-  ];
-
   function setScope(next: Scope) {
     if (scope === next) return;
     // Writes through to the shared store, so Home reflects it too.
@@ -408,21 +396,7 @@
       {/if}
     </div>
   {/if}
-  <div class="scope-row" role="group" aria-label="Who the results are for">
-    {#each READERS as opt (opt.label)}
-      <button
-        class="scope-btn"
-        class:active={audience === opt.v}
-        aria-pressed={audience === opt.v}
-        title={opt.title}
-        onclick={() => {
-          audience = opt.v;
-          void run();
-        }}
-      >
-        {opt.label}
-      </button>
-    {/each}
+  <div class="scope-row" role="group" aria-label="What kind of file">
     <select
       class="kind-select"
       aria-label="What kind of file"

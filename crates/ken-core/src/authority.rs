@@ -305,7 +305,7 @@ pub fn label_of(rel_path: &str, meta: Option<&PageMeta>, stored: Option<(&str, f
     let date = meta
         .updated
         .clone()
-        .or_else(|| meta.verified.clone())
+        .or_else(|| meta.checked.as_ref().map(|c| c.date.clone()))
         .or_else(|| matches!(tier, Tier::Record | Tier::Superseded).then(|| crate::pagemeta::date_in_name(rel_path)).flatten());
     let mut parts = vec![kind.to_string(), tier.name().to_string()];
     parts.extend(date);
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(label_of("Current/Project.md", Some(&current), Some(("current", W_CURRENT)), None), "doc · current · 2026-10-07");
         assert_eq!(label_of("Rules/Lifecycle.md", None, binding, Some("Docs lanes push main.")), "doc · binding");
         assert_eq!(label_of("Research/Ingested/Standup - 2026-09-12.md", None, Some(("record", -W_RECORD)), None), "meeting · record · 2026-09-12");
-        let checked = PageMeta { verified: Some("2026-09-20".into()), ..Default::default() };
+        let checked = PageMeta { checked: crate::pagemeta::Checked::parse("2026-09-20 f00218c"), ..Default::default() };
         assert_eq!(label_of("Design/Why.md", Some(&checked), None, None), "doc · reference · 2026-09-20");
     }
 

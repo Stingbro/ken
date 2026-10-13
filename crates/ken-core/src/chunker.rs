@@ -170,6 +170,20 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
         .collect()
 }
 
+/// The one chunk of a file with no readable text (a cloud placeholder, a
+/// failed, binary or minified file, an empty one): its path, so the names
+/// column and the path rerank still find it by name. Replaced by the file's
+/// own chunks once it has text.
+pub fn name_chunk(rel_path: &str) -> Chunk {
+    Chunk {
+        seq: 0,
+        text: rel_path.to_string(),
+        token_est: (rel_path.len() / 4).max(1),
+        content_hash: hash_text(rel_path),
+        line: 1,
+    }
+}
+
 fn hash_text(text: &str) -> String {
     let h = twox_hash::XxHash64::oneshot(0, text.as_bytes());
     format!("{h:016x}")
@@ -919,6 +933,13 @@ mod tests {
     fn default_for_falls_back_to_prose_for_unknown_extension() {
         let p = IndexProfile::default_for("weird_file.xyz123");
         assert_eq!(p, IndexProfile::default());
+    }
+
+    #[test]
+    fn a_name_chunk_holds_the_path() {
+        let c = name_chunk("art/logo.png");
+        assert_eq!((c.seq, c.text.as_str(), c.line), (0, "art/logo.png", 1));
+        assert_eq!(c.content_hash, name_chunk("art/logo.png").content_hash);
     }
 
     #[test]

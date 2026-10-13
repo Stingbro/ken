@@ -1,7 +1,7 @@
 ---
 title: "{{Question Answered}} {{date}}"
 aliases: ["{{Question Answered}} {{date}}", "{{the question, as someone would ask it}}"]
-status: evidence
+status: current
 updated: {{date}}
 sources:
   - "{{repo@sha:path:line of each file the answer rests on}}"

@@ -10,4 +10,4 @@ At set-up Ken fills `{{team_name}}`, `{{wiki_repo}}`, `{{KEY}}`, the repo table 
 
 ## Frontmatter
 
-`title`, `aliases`, `status` (`draft` · `current` · `superseded`, or `evidence` for Research), `updated`, `sources` (each `repo@sha:path` or `[[Note Name]]`) and `checked` (when a page was last re-read against its sources, and at which commit, written by the check that read it).
+Six keys: `title`, `aliases`, `status` (`draft` · `current` · `superseded`), `updated`, `sources` (each `repo@sha:path` or `[[Note Name]]`) and `checked` (the date and commit the page was last re-read against its sources at, `checked: 2026-10-13 f00218c`, written by the check that read it), plus an optional `reviewed_by`. A Research page is `current` too: its section makes it a record. A retired page is `status: superseded` with a banner naming the page that replaces it. Tickets keep their own keys (`id`, `status`, `type`, `assignee`).
