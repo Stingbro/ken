@@ -42,22 +42,64 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
     - Minified code and data (a line over 2,000 characters with under 3% whitespace) are searchable by name only.
   - The compile check is clean apart from the known warnings.
   - `npm run check` was not run: the worktree had no `node_modules`, and the only frontend change is a doc comment.
+- **Slice 2b: routing, and one index** (`0a9d8d2`). Decisions 20, 15, and the title control of 19.
+  - `routing::plan_route` searches every source; a source named in the question, or a repo or group the person chose (`RoutePlan::chosen`), narrows it.
+    - A reference repo is one whose kinds are all Reference; a repo whose kind is not said yet is searched like any other.
+    - It is held back in `RoutePlan::reserve` unless the question is about the platform (`asks_about_platform`) or names it.
+    - "Nothing else answers" means every searched source came back empty after the filters; the reserve is then searched and merged too (`needs_reserve`).
+  - One merge (`merge_routed`): by score, ties to the hit's rank in its own source, then the plan's order (registry or manifest order).
+  - Removed: the graph planner (with `rank_projects_for_entities` and `strongly_related` in `workspace_kg_db.rs`), the 5-repo cap, ordering by recent activity, `KB_LEAD` and the knowledge-base share, the RRF tie-break and the `kg://` breadcrumbs.
+  - Reported, never dropped (`routing::search_target`, `MemberStatus`):
+    - Building: the vector extension is there but the meaning index is not built. The source is searched by keyword and reported with `embedded` of `chunks` passages.
+    - Unavailable: its index did not open.
+    - Slow: its search took 2 s or more (`SLOW_MILLIS`). There is no time budget; every source is waited for.
+    - The app's coverage notes, `route_query` and `list_projects` say so.
+  - One index (15):
+    - Schema v21 drops the `search` FTS table, its triggers and `contents.name`. `Db::search`, `SearchHit` and its ranker (file-name tiers, phrase bonus, recency blend) are gone.
+    - Commands removed: `search`, `hybrid_search`, `search_all_projects`. "This repo" in ⌘K is `route_search` pinned to the focused member, so the overlay's search-only badge went with `hybrid_search` (decision 34 makes indexing two-state).
+    - The quick answer searches through `routing::search_member`.
+    - MCP: `search_knowledge` is removed now rather than in slice 10; `semantic_search` and `route_query` stay until slice 10 makes them `search`. The chat guide and allowed list follow.
+    - `crates/ken-core/tests/qa_probe.rs`, a probe of the old index, is deleted (38).
+  - The title-query control is retired (19): `scan::control_query`, `ControlResult` and `IndexHealth.control` are gone. Slice 5 adds the new controls.
+  - What only the old index did, now done by the chunk index:
+    - OCR text is chunked when it lands (`mark_ocr_done`).
+    - A move (`rename_prefix`) moves the chunks, their keyword rows' path words, page facts, tiers, links and the code map.
+    - A reindex drops the chunks of files that are gone (`drop_orphan_chunks`), keeping the vectors of the rest.
+  - Lost: a file with no text (a cloud placeholder, a failed, binary or minified file) is no longer found by its name alone.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
+  - Not run: any test, and the app. The v21 migration rewrites `contents` once (`DROP COLUMN`) on first open, which may take a moment on a large index.
 
-## Next: slice 2b, routing (20)
+## Next: slice 3, frontmatter (5)
 
 Nothing has been edited yet.
 
-- [ ] Every question searches every source, merged once, and a named repo narrows it.
-- [ ] Reference repos join only for platform questions, when named, or when nothing else answers.
-- [ ] Drop the graph planner, the 5-repo cap and the library-share rule.
-- [ ] Report a slow or building repo instead of dropping it.
-- [ ] Retire the file-level `search` index and its ranker (15).
+- [ ] `pagemeta.rs` `PageMeta`: six keys, `title`, `aliases`, `status`, `updated`, `sources` and `checked`, plus an optional `reviewed_by`.
+  - `status` is draft | current | superseded. Older values still read: `retired` and `deprecated` as superseded.
+  - `checked` is a date and a sha, written by the check that re-read the page. Pick one written form (say `checked: 2026-10-13 f00218c`) and parse both parts.
+  - Decide what happens to the keys the six leave out but code reads today: `generated` (`HitPage.generated`, the Record tier in `authority.rs`), `replaced_by`/`superseded_by` (decision 7: a retired page names its successor), and `date` (read as `updated`). Simplest: keep reading them as legacy and stop writing them; note the choice.
+- [ ] Drop `audience` everywhere:
+  - `pagemeta.rs`: `PageMeta.audience`, `Audience`, `audience_of`, `audience_at`, `suits`, `HitPage.audience`.
+  - `src-tauri/src/lib.rs`: `route_search`'s `audience` argument, `RouteFanOut.audience` and the `fetch` widening.
+  - `crates/ken-mcp/src/main.rs`: `audience_arg`, the `audience` property on `semantic_search` and `route_query`, and `fetch_for`'s audience case.
+  - `src/lib/api.ts`: `Audience` and `routeSearch`'s `audience`; `src/search/SearchOverlay.svelte`: the READERS row.
+  - `drift.rs`: the business-page split (decision 28 drops the audience split); every page with sources is measured alike.
+  - `Templates/Ingested-note.md`: `audience: business`.
+- [ ] `verified` becomes `checked`:
+  - `HitPage.verified` (and `api.ts` `HitPage`), the label's date in `authority::hit_label`, the MCP `page_note` ("verified …").
+  - `drift.rs` takes a page's pin from `checked`'s sha, else its date as now. The rest of drift is slice 8.
+  - `proposal.rs` drops `checked:` from a proposed page, as it dropped `verified:`.
+  - The ingest edit prompt (`ingest.rs`, "leave any `verified:` line") names `checked:`.
+- [ ] Remove `HitPage.band` and `pagemeta::band`: nothing ranks by them since 2a (23). Also the `authority_weights` doc comment that mentions band, and `band` in `api.ts` `HitPage`.
+- [ ] `db.rs` `page_meta` table (schema v22): add `checked` and `reviewed_by`, drop `verified` and `audience` (and whatever the legacy choice above retires); `set_page_meta` and `page_meta` follow.
+- [ ] Templates (`crates/ken-core/templates/wiki/Templates/`): only the six keys, plus `reviewed_by` where it fits.
+  - `Finding.md` and `Ingested-note.md` say `status: evidence`, not one of the three. Use `current`: the Research section already makes them record.
+  - `Ingested-note.md` also has `source:` and `present:`: fold the first into `sources:`, and move who was there into the body.
+  - `Ticket.md` keeps its own frontmatter (id, status, type, assignee; decision 8).
+- [ ] `lens`, `changed_by` and `pin` are not read anywhere; only a test fixture (`pagemeta.rs`, the `changed_by:` page) names one. Drop them from fixtures.
+- [ ] Tests to update: `pagemeta.rs`, `scan.rs` (the `verified:` Rules page), `routing.rs` (`a_scan_alone_makes_chunks_searchable…` asserts `verified`), `authority.rs` (the `checked` label test), `proposal.rs`, `drift.rs`, and the MCP label tests.
 
 ## Later slices
 
-- [ ] **3, frontmatter (5):**
-  - Six keys: `title`, `aliases`, `status`, `updated`, `sources` and `checked`, plus an optional `reviewed_by`.
-  - Drop `audience` (and `Audience` in `pagemeta.rs`), `lens`, `changed_by`, `pin` and `verified`.
 - [ ] **4, chunking (16):**
   - Code chunks by definition from the code index parse.
   - A heading breadcrumb title field weighted about 2–3×.
