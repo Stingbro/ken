@@ -88,39 +88,54 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
   - Not run: any test, and the app. The v22 migration rebuilds `page_meta` and the tiers once on first open, from stored text.
 
+- **Slice 4: chunking** (`740940c`). Decision 16.
+  - Code by definition (`chunker::chunk_with`): a file with a grammar is cut at the definitions the code index parsed. The scan makes the map before it chunks and passes it in; the semantic rebuild reads the stored one (`code_symbols`).
+    - The lines above a definition (comments, attributes, imports) go with it. Small neighbours share a chunk up to the target size; a definition too long for one is cut at its members, else at its line ends, each part keeping the symbol.
+    - Line blocks only where there is no grammar or the parse found no definition. JSON keeps its key-outline headers.
+  - Each chunk carries `end_line`, a `title` and, for code, its `symbol`: `Store.open`, or `save, load` (up to five, then `…`) for packed top-level definitions. Path and symbol are in the names field (`fts_names`); a code chunk's title is its doc comment. Role is left to slice 5.
+  - Breadcrumbs: every prose chunk's title is page title (frontmatter `title`, else the first `# `) › the headings above it. A top heading that repeats the title is said once.
+  - Search: `chunks_fts` gains a `title` field, weighted 2.5 times the body (`W_TITLE`) in both the all-words and the any-word query.
+  - Embedding: what is embedded is `chunker::embed_text`: the breadcrumb, or path › symbol and the doc comment, then the summary, a blank line, the chunk. The snippet is the chunk alone. The content hash covers title and symbol (`chunk_hash`); a chunk with neither keeps its old hash and vector.
+  - The cap in index health: `Chunked::capped` → `files.chunk_capped` → `FileHealthCounts.capped` → the team index health, `api.ts` and the Your day line ("N files too long to index whole").
+  - One-line summaries (`summary.rs`), per the lead's ruling:
+    - Claude writes them, never the local model: batches of up to 40 passages (48 KB) per call through `assistant::oneshot_answer` (the same CLI path as the map, with no tools).
+    - Only Markdown pages of a knowledge-base repo (kind team or wiki): pages, notes, decisions, tickets. Not code, not `Inbox/` or `Ingestion/Raw/`.
+    - Cached by chunk content hash (`chunk_summaries`); only chunks with no cached summary are sent. A passage the reply skips is cached empty, so it is not asked again. Summaries of text no chunk holds are pruned.
+    - Retrieval only: in the `title` field at once, and in the embedded text the next time the chunk is embedded. Never shown.
+    - Run by `extraction_worker` (`summarize_by_claude`): one batch per turn while chunks wait, behind `wait_for_extraction_slot` / `EXTRACT_PACING`, off with `backgroundExtraction`, ten minutes' backoff after a failed call. Slice 11 folds it into the build queue.
+  - Schema v23: `chunks` gains `end_line`, `title`, `symbol`; `files` gains `chunk_capped`; `chunk_summaries` and an index on `chunks.content_hash` are made; `chunks_fts` is made again with `title` (the rebuild moved here from v16). Prose and code with a grammar are read again once by the next scan.
+  - Choices:
+    - Vectors are not dropped when a summary arrives later; the summary joins the embedding on the chunk's next embed.
+    - No bigger chunks for long code (prose has them): a code file past 200 chunks loses its end and is counted.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
+  - Not run: any test, and the app. The first scan after v23 re-reads every prose and code file, and the next semantic rebuild re-embeds their chunks. The first background turns after that send a knowledge base's pages to Claude in batches until every chunk has a summary.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
 
-## Next: slice 4, chunking (16)
+- **How fast summaries may spend Claude.** The first pass over a knowledge base sends every page chunk to Claude, 40 to a call, with only the 2 s background pace between calls (about 125 calls for 5,000 chunks, back to back). Choose: leave it to the pace and the `backgroundExtraction` switch, or add an hourly cap until slice 11's throttle (Gentle / Normal / Fast) exists.
+- **The title weight in plain-word questions.** The breadcrumb field counts 2.5 times the body in the any-word fallback too, where names were cut to a quarter because one common word in a name outranked the body. If a common heading word ("Overview", "Notes") starts winning plain questions, lower `W_TITLE` there; it needs a measurement first (decision 38 left measurement to be designed).
+
+## Next: slice 5, kinds and roles (17, 18, 19)
 
 Nothing has been edited yet.
 
-- [ ] Code chunks by definition (`chunker.rs` `chunk_code` is line blocks today):
-  - Cut a code file at the definitions the code index already parses (`codemap::map_file`, `code_symbols` with `line`, `end_line`, `docs`). The scan has the map before it chunks; pass it in rather than parsing twice.
-  - Each chunk carries its enclosing symbol and line range. Store the symbol on the chunk (a `symbol` column on `chunks`, or in the names field); `line` stays the start.
-  - Line blocks only where there is no grammar (`codemap::Lang::of` is None). JSON keeps its key-outline headers (`with_json_headers`).
-  - A definition longer than the chunk size is cut at line ends inside it, each part keeping the symbol.
-- [ ] Code chunk fields: path, symbol, doc comment and role. Path and symbol go in the names field (`db::fts_names` already takes path words and declared names); the doc comment goes in the title field below. Role is empty until slice 5 and must not block it.
-- [ ] Heading breadcrumb on every prose chunk (`chunk_prose`, `chunk_log`): page title (frontmatter `title`, else the first `# `) › the headings above the chunk.
-  - Embedded with the chunk: prepend the breadcrumb to the text that is embedded, not to the text shown as the snippet. Decide whether that means a separate embed-text or storing it in the new column and joining at embed time (`engine.rs`, `chunks_missing_vectors`).
-  - A new FTS5 column `title` on `chunks_fts`, weighted about 2–3× the body in `bm25(chunks_fts, …)` (`search_chunks_fts`, `W_NAMES_ANY`). Schema v23 remakes `chunks_fts` (`rebuild_chunks_fts`) and marks prose files for one re-read, as v16 and v17 did.
-- [ ] One-line summaries for wiki pages, notes, decisions and tickets only (not code), cached by chunk `content_hash`, used for retrieval only (in the title field or embed text, never shown as the snippet).
-  - They need a model. Decide the writer (the Claude CLI at write time, or the local model in the background throttle of decision 34) and keep it off by default until the throttle exists; the slice can land the table and the hook with no writer.
-- [ ] Report the per-file chunk cap in index health: count files cut at `CHUNK_CAP` (200) or `LOG_CHUNK_CAP`, and carry the count in `IndexHealth` / `file_health_counts` and the health line (`api.ts` follows).
-- [ ] Re-chunking keeps vectors where text is unchanged (`upsert_chunks` diffs by hash); the breadcrumb changes every prose chunk's embed text once, so the first rebuild after v23 re-embeds them. Say so in the migration comment.
-- [ ] Tests to update or add: `chunker.rs` (code by definition, breadcrumbs, the cap), `db.rs` (`fts_names`, the title column and its weight, the v23 migration), `engine.rs` (embed text), `routing.rs` (a breadcrumb or symbol hit ranks), `scan.rs` (the cap count).
-
+- [ ] The `decision` and `note` kinds (17): add `ContentType::Decision` and `ContentType::Note` (`contenttype.rs`). `Decisions/DECISIONS.md` (and any log `chunker::is_log` reads) is a decision; `Inbox/`, `Ingested/`, `notes/` and `Research/Ingestion/` are notes. `authority::label_of` then reads the kind from `contenttype::of` instead of its `decisions.md` special case. `api.ts` and the search filters follow.
+- [ ] Tests are not indexed by default (17): a built-in rule in `kenignore::built_in_rule_sets` for test paths (the `contenttype` test dirs and names: `tests/`, `__tests__/`, `*_test.go`, `*.test.ts`, `test_*.py`…). A `!` line in `.kenignore`, or an index rule in `.ken/knowledge.json`, brings them back. Mark test files for removal on first open (or let the next scan drop them), and say so in the migration or scan comment.
+- [ ] Code roles (17): a code file's kind is its role.
+  - A small built-in core (service, controller, repository, model, handler, component, util, config…) read from the path and file name, no model.
+  - Per-repo role rules (glob → role) in `.ken/knowledge.json`, read at index time beside the tier overrides (`authority::Roles`), editable.
+  - A repo analysis proposes rules when a code repo is added: one Claude call over the file tree, the person confirms (the setup flow's repo step; the full flow is slice 11).
+  - Store the role per file (a `file_roles` table or a column), put it in the chunk's embedded header (`chunker::embed_text` takes a role) and in the names field. Changing a role re-embeds that file's chunks.
+- [ ] One label per hit (17): `kind · tier or role · date`. A code hit gets `code · service · 2026-10-01` (date from git or mtime); pages keep `kind · tier · date`. `authority::hit_label` stops returning None for code; the chat guide, the MCP text and `api.ts` follow.
+- [ ] Vocabulary (18): query rewrites (`vocab::Vocabulary`) come from the Vocabulary page and the decisions log's aliases only. Page titles and aliases (`db.page_aliases`) leave the rewrites and go into the names field of the page's chunks instead (`fts_names`, from `page_meta`). Rename rows: ingest and drift add rows to the Vocabulary page; leave a function for slices 7 and 8 to call.
+- [ ] Controls (19): a few known questions per source, each with the file it must return near the top, in `.ken/knowledge.json` (`controls: [{ question, expect, source }]`). Run through `routing::search_member` after every rebuild; store pass/fail. Setup proposes them (one Claude call over the source's pages); a person edits them.
+- [ ] One health line (19): indexed, failed or skipped; meaning built (`vector_count` of `chunk_count`); controls passing; model missing; files cut at the chunk cap (slice 4). One struct in `db.rs` (fold `IndexHealth` and `FileHealthCounts`), one command, one line in Your day and in the MCP `list_projects`. Drop the extraction counts from it.
+- [ ] Tests to update or add: `contenttype.rs` (decision, note), `kenignore.rs` (tests excluded and brought back), `authority.rs` (the code label), `vocab.rs` (no page aliases), `db.rs` (aliases in names, the health struct), a controls test through `routing`.
 
 ## Later slices
 
-- [ ] **5, kinds and roles (17, 18, 19):**
-  - Add the `decision` and `note` kinds.
-  - Tests are not indexed by default.
-  - Code roles: a built-in core plus per-repo rules proposed by a repo analysis.
-  - Query rewrites from Vocabulary and the decisions-log aliases only.
-  - Controls in `.ken/knowledge.json`.
-  - One health line.
 - [ ] **6, code index (26, 27):**
   - Rename "code map" to "code index" (`codemap.rs` and the UI strings).
   - Each hit names its symbol and role and offers the next calls.
