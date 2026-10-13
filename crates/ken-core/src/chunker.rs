@@ -10,15 +10,25 @@
 //!   are packed up to `target_tokens`, with `overlap_pct` of the previous
 //!   chunk's tail carried into the next chunk so a search hit near a chunk
 //!   boundary still has surrounding context.
-//! * **Code** — line-based blocks of ~`target_tokens`, no overlap. Splitting
-//!   mid-statement is acceptable; the goal is bounded, roughly-uniform chunks
-//!   for embedding, not syntactic correctness.
+//! * **Code** — by definition (knowledge-core decision 16): a file is cut at
+//!   the definitions the code index parsed (`codemap::map_file`), small
+//!   neighbours packed together up to `target_tokens`, a definition too long
+//!   for one chunk cut at its members or else its line ends. Each chunk
+//!   carries its enclosing symbol, its line range and the definition's doc
+//!   comment. A language with no grammar (or a file the parse found no
+//!   definition in) is cut into line blocks of ~`target_tokens`, no overlap.
+//!
+//! Every prose chunk carries its heading breadcrumb (page title › the
+//! headings above it) in [`Chunk::title`]; a code chunk carries its doc
+//! comment there. The title is searched as a field of its own and joins the
+//! text that is embedded ([`embed_text`]), never the text shown.
 //!
 //! Token counts are estimated as `chars / 4` — cheap and stable. Exactness
 //! doesn't matter here, only consistency between index time and any future
-//! re-chunking. `content_hash` is an xxHash64 of the chunk text, used by
-//! `db::upsert_chunks` to diff against the previous chunk set so an unchanged
-//! file costs zero re-embeddings.
+//! re-chunking. `content_hash` is an xxHash64 of the chunk text (with its
+//! title and symbol, when it has them), used by `db::upsert_chunks` to diff
+//! against the previous chunk set so an unchanged file costs zero
+//! re-embeddings.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,8 +39,9 @@ pub enum ChunkMode {
     /// Heading/paragraph-aware splitting with overlap. Markdown, plain text,
     /// extracted PDF text.
     Prose,
-    /// Line-based fixed-size blocks, no overlap. Source code and other
-    /// structured/dense text.
+    /// By definition where the code index has a grammar, else line-based
+    /// fixed-size blocks, no overlap. Source code and other structured/dense
+    /// text.
     Code,
     /// Never chunked or embedded. The file still keyword-searches (that's
     /// driven by kenignore's tier, not this), but produces zero semantic
@@ -116,58 +127,136 @@ pub struct Chunk {
     pub text: String,
     /// Estimated token count (`text.len() / 4`, minimum 1).
     pub token_est: usize,
-    /// xxHash64 of `text`, hex-encoded. Used for incremental diffing.
+    /// xxHash64 of `text`, hex-encoded, with `title` and `symbol` when the
+    /// chunk has them (see [`chunk_hash`]). Used for incremental diffing, and
+    /// as the key of the chunk's one-line summary (`summary`).
     pub content_hash: String,
     /// 1-based line in the file where this chunk's own content starts (not
     /// the overlap carried from the chunk before), so a hit can be cited as
     /// `repo:path:line`.
     pub line: usize,
+    /// 1-based last line of the chunk's own content, inclusive.
+    pub end_line: usize,
+    /// A prose chunk's heading breadcrumb (`Retries › Policy › Backoff`); a
+    /// code chunk's doc comment. Empty when there is none. Searched as the
+    /// keyword index's `title` field and embedded with the text, never shown.
+    pub title: String,
+    /// A code chunk's enclosing symbol (`Store.open`), or the definitions it
+    /// packs at the top of a file (`save, load`). None for prose, and for
+    /// code with no grammar.
+    pub symbol: Option<String>,
 }
 
 /// Hard cap on chunks per file. Guards against pathological inputs
 /// (generated/minified files, huge data dumps) blowing up chunk count and,
-/// downstream, embedding cost.
-const CHUNK_CAP: usize = 200;
+/// downstream, embedding cost. A file cut at it is counted in index health
+/// ([`Chunked::capped`]).
+pub const CHUNK_CAP: usize = 200;
 
-/// Split `text` (the contents of `rel_path`) into chunks per `profile`.
-/// Pure and infallible: empty/whitespace-only text yields no chunks.
+/// A file's chunks, and whether the cap cut it short.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Chunked {
+    pub chunks: Vec<Chunk>,
+    /// The file had more chunks than [`CHUNK_CAP`] (or [`LOG_CHUNK_CAP`] for
+    /// a log), and its end is not indexed.
+    pub capped: bool,
+}
+
+/// One piece of a file before it becomes a [`Chunk`].
+#[derive(Debug, Clone, Default)]
+struct Piece {
+    line: usize,
+    /// Known for code; prose works it out from the next piece.
+    end: Option<usize>,
+    text: String,
+    symbol: Option<String>,
+    doc: Option<String>,
+}
+
+impl Piece {
+    fn plain((line, text): (usize, String)) -> Piece {
+        Piece { line, text, ..Piece::default() }
+    }
+}
+
+/// Split `text` (the contents of `rel_path`) into chunks per `profile`, code
+/// in line blocks. See [`chunk_with`].
 pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chunk> {
+    chunk_with(rel_path, text, profile, &[]).chunks
+}
+
+/// Split `text` (the contents of `rel_path`) into chunks per `profile`. Code
+/// is cut at `defs`, the file's symbols from the code index (only the
+/// definitions are read); with none, into line blocks. Pure and infallible:
+/// empty/whitespace-only text yields no chunks.
+pub fn chunk_with(rel_path: &str, text: &str, profile: &IndexProfile, defs: &[crate::codemap::Symbol]) -> Chunked {
     if text.trim().is_empty() {
-        return Vec::new();
+        return Chunked::default();
     }
 
     // A log (a decisions log, a run of rulings) is cut one entry per chunk
     // and is not held to the cap: every entry is its own answer.
     let log = (profile.mode == ChunkMode::Prose && is_markdown(rel_path)).then(|| chunk_log(text, profile)).flatten();
     let cap = if log.is_some() { LOG_CHUNK_CAP } else { CHUNK_CAP };
+    let plain = |pieces: Vec<(usize, String)>| pieces.into_iter().map(Piece::plain).collect::<Vec<_>>();
     let pieces = match (log, profile.mode) {
-        (Some(entries), _) => entries,
-        (None, ChunkMode::Prose) => chunk_prose(text, profile),
-        (None, ChunkMode::Code) => chunk_code(text, profile),
+        (Some(entries), _) => plain(entries),
+        (None, ChunkMode::Prose) => plain(chunk_prose(text, profile)),
+        (None, ChunkMode::Code) if defs.iter().any(|d| d.is_def) => chunk_code_by_definition(text, profile, defs),
+        (None, ChunkMode::Code) => plain(chunk_code(text, profile)),
         (None, ChunkMode::Skip) => Vec::new(),
     };
-    let mut pieces: Vec<(usize, String)> = pieces.into_iter().filter(|(_, p)| !p.trim().is_empty()).collect();
+    let mut pieces: Vec<Piece> = pieces.into_iter().filter(|p| !p.text.trim().is_empty()).collect();
+    // Where each piece ends, before the cap drops the pieces after it.
+    let last_line = text.lines().count().max(1);
+    let file_lines: Vec<&str> = text.lines().collect();
+    for i in 0..pieces.len() {
+        if pieces[i].end.is_none() {
+            let next = pieces.get(i + 1).map_or(last_line, |p| p.line.saturating_sub(1));
+            let mut end = next.max(pieces[i].line).min(last_line);
+            while end > pieces[i].line && file_lines.get(end - 1).is_some_and(|l| l.trim().is_empty()) {
+                end -= 1;
+            }
+            pieces[i].end = Some(end);
+        }
+    }
+    let capped = pieces.len() > cap;
     pieces.truncate(cap);
     if profile.mode == ChunkMode::Code && rel_path.to_ascii_lowercase().ends_with(".json") {
-        pieces = with_json_headers(rel_path, text, pieces);
+        let headed = with_json_headers(rel_path, text, pieces.iter().map(|p| (p.line, p.text.clone())).collect());
+        for (p, (_, t)) in pieces.iter_mut().zip(headed) {
+            p.text = t;
+        }
+    }
+    // Prose: each chunk's heading breadcrumb.
+    if profile.mode == ChunkMode::Prose {
+        let title = page_title(text);
+        let heads = headings(text);
+        for p in pieces.iter_mut() {
+            p.doc = Some(breadcrumb(title.as_deref(), &heads, p.line)).filter(|b| !b.is_empty());
+        }
     }
 
-    pieces
+    let chunks = pieces
         .into_iter()
-        .take(cap)
         .enumerate()
-        .map(|(seq, (line, text))| {
-            let token_est = (text.len() / 4).max(1);
-            let content_hash = hash_text(&text);
+        .map(|(seq, p)| {
+            let token_est = (p.text.len() / 4).max(1);
+            let title = p.doc.unwrap_or_default();
+            let content_hash = chunk_hash(&title, p.symbol.as_deref(), &p.text);
             Chunk {
                 seq,
-                text,
                 token_est,
                 content_hash,
-                line,
+                line: p.line,
+                end_line: p.end.unwrap_or(p.line).max(p.line),
+                text: p.text,
+                title,
+                symbol: p.symbol,
             }
         })
-        .collect()
+        .collect();
+    Chunked { chunks, capped }
 }
 
 /// The one chunk of a file with no readable text (a cloud placeholder, a
@@ -181,12 +270,120 @@ pub fn name_chunk(rel_path: &str) -> Chunk {
         token_est: (rel_path.len() / 4).max(1),
         content_hash: hash_text(rel_path),
         line: 1,
+        end_line: 1,
+        title: String::new(),
+        symbol: None,
     }
 }
 
 fn hash_text(text: &str) -> String {
     let h = twox_hash::XxHash64::oneshot(0, text.as_bytes());
     format!("{h:016x}")
+}
+
+/// A chunk's content hash: of its text alone when it has no title or
+/// symbol (so such a chunk keeps the hash, and the vector, it had before
+/// titles), else of all three, since all three are embedded.
+pub fn chunk_hash(title: &str, symbol: Option<&str>, text: &str) -> String {
+    if title.is_empty() && symbol.is_none() {
+        return hash_text(text);
+    }
+    hash_text(&format!("{title}\u{0}{}\u{0}{text}", symbol.unwrap_or("")))
+}
+
+/// The text embedded for a chunk: a header, then a blank line, then the
+/// chunk's own text. A code chunk's header is its path and symbol, then its
+/// doc comment (`title`); a prose chunk's is its breadcrumb (`title`). Its
+/// one-line summary (`summary`, retrieval only) follows when it has one. A
+/// chunk with none of these is embedded as its text alone. A code role
+/// joins the header once roles exist (slice 5).
+pub fn embed_text(path: &str, title: &str, symbol: Option<&str>, summary: Option<&str>, text: &str) -> String {
+    let mut head: Vec<String> = Vec::new();
+    if let Some(s) = symbol.filter(|s| !s.is_empty()) {
+        head.push(format!("{path} › {s}"));
+    }
+    if !title.trim().is_empty() {
+        head.push(title.trim().to_string());
+    }
+    if let Some(s) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        head.push(s.to_string());
+    }
+    if head.is_empty() {
+        return text.to_string();
+    }
+    format!("{}\n\n{text}", head.join("\n"))
+}
+
+/// The page title a breadcrumb starts with: frontmatter `title`, else the
+/// first `# ` heading.
+pub fn page_title(text: &str) -> Option<String> {
+    crate::pagemeta::parse(text)
+        .and_then(|m| m.title)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .or_else(|| headings(text).into_iter().find(|h| h.1 == 1).map(|h| h.2))
+}
+
+/// Longest heading a breadcrumb carries, in bytes.
+const CRUMB_MAX: usize = 120;
+
+/// A page's headings as (1-based line, level, text), outside the
+/// frontmatter and fenced blocks.
+fn headings(text: &str) -> Vec<(usize, usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let front_end = (lines.first().map(|l| l.trim_end()) == Some("---"))
+        .then(|| lines.iter().skip(1).position(|l| matches!(l.trim_end(), "---" | "...")).map(|p| p + 1))
+        .flatten();
+    let mut out = Vec::new();
+    let mut fence: Option<&str> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if front_end.is_some_and(|e| i <= e) {
+            continue;
+        }
+        let t = l.trim_start();
+        let mark = if t.starts_with("```") { Some("```") } else if t.starts_with("~~~") { Some("~~~") } else { None };
+        match (fence, mark) {
+            (Some(f), Some(m)) if f == m => fence = None,
+            (None, Some(m)) => fence = Some(m),
+            _ => {}
+        }
+        if fence.is_some() || mark.is_some() {
+            continue;
+        }
+        let hashes = t.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+            let h = t[hashes..].trim().trim_end_matches('#').trim().trim_matches('*').trim();
+            if !h.is_empty() {
+                let mut end = h.len().min(CRUMB_MAX);
+                while !h.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.push((i + 1, hashes, h[..end].to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The breadcrumb of a chunk starting on `line`: the page title, then the
+/// headings it sits under (a heading on `line` itself included), joined by
+/// ` › `. A top heading that repeats the title is said once.
+fn breadcrumb(title: Option<&str>, heads: &[(usize, usize, String)], line: usize) -> String {
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    for (_, level, h) in heads.iter().take_while(|h| h.0 <= line) {
+        while stack.last().is_some_and(|s| s.0 >= *level) {
+            stack.pop();
+        }
+        stack.push((*level, h));
+    }
+    let mut parts: Vec<&str> = title.into_iter().collect();
+    for (i, (_, h)) in stack.into_iter().enumerate() {
+        if i == 0 && title.is_some_and(|t| t.eq_ignore_ascii_case(h)) {
+            continue;
+        }
+        parts.push(h);
+    }
+    parts.join(" › ")
 }
 
 /// Whether `rel_path` is a Markdown page.
@@ -712,6 +909,177 @@ fn chunk_code(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
         chunks.push((start, current));
     }
     chunks
+}
+
+/// Most names a chunk of several top-level definitions lists as its symbol.
+const PACKED_NAMES_MAX: usize = 5;
+
+/// A definition and the definitions inside it.
+struct DefNode<'a> {
+    sym: &'a crate::codemap::Symbol,
+    children: Vec<DefNode<'a>>,
+}
+
+/// Definitions nested by their line ranges. `defs` are sorted by start line,
+/// the outer of two that start together first.
+fn nest<'a>(defs: &[&'a crate::codemap::Symbol]) -> Vec<DefNode<'a>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < defs.len() {
+        let d = defs[i];
+        let mut j = i + 1;
+        while j < defs.len() && defs[j].line <= d.end_line {
+            j += 1;
+        }
+        out.push(DefNode { sym: d, children: nest(&defs[i + 1..j]) });
+        i = j;
+    }
+    out
+}
+
+/// A symbol inside `enclosing`, as `Outer.inner`.
+fn qualify(enclosing: Option<&str>, name: &str) -> String {
+    match enclosing {
+        Some(e) if !e.is_empty() => format!("{e}.{name}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Code cut at its definitions (knowledge-core decision 16). The file's
+/// lines are split into one stretch per top-level definition, each running
+/// from the end of the one before (so the comments, attributes and imports
+/// above a definition go with it) to the definition's last line; what
+/// follows the last definition is a stretch of its own. Stretches are packed
+/// together while they fit in a chunk. One too long for a chunk is cut the
+/// same way at the definitions inside it, keeping its name as the enclosing
+/// symbol, or at its line ends when it has none.
+fn chunk_code_by_definition(text: &str, profile: &IndexProfile, defs: &[crate::codemap::Symbol]) -> Vec<Piece> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let n = lines.len();
+    let mut ds: Vec<&crate::codemap::Symbol> = defs
+        .iter()
+        .filter(|d| d.is_def && d.line >= 1 && d.end_line >= d.line && (d.line as usize) <= n)
+        .collect();
+    ds.sort_by_key(|d| (d.line, std::cmp::Reverse(d.end_line)));
+    // Two patterns can tag one definition (a Java constant is also a field).
+    ds.dedup_by_key(|d| (d.line, d.end_line));
+    let tree = nest(&ds);
+    let max = (profile.target_tokens * 4).max(1);
+    let mut out = Vec::new();
+    cut_at_definitions(&lines, 1, n, &tree, None, None, max, &mut out);
+    out
+}
+
+/// Pieces of lines `start..=end` (1-based), cut at `nodes`, the definitions
+/// directly inside them. `enclosing` is the definition the lines are inside
+/// (qualified name and doc comment), if any.
+#[allow(clippy::too_many_arguments)]
+fn cut_at_definitions(
+    lines: &[&str],
+    start: usize,
+    end: usize,
+    nodes: &[DefNode],
+    enclosing: Option<&str>,
+    enclosing_doc: Option<&str>,
+    max: usize,
+    out: &mut Vec<Piece>,
+) {
+    // (first line, last line, the definition the stretch holds)
+    let mut stretches: Vec<(usize, usize, Option<&DefNode>)> = Vec::new();
+    let mut cursor = start;
+    for node in nodes {
+        let (a, b) = (node.sym.line as usize, (node.sym.end_line as usize).min(end));
+        if a > end || b < cursor {
+            continue;
+        }
+        stretches.push((cursor, b, Some(node)));
+        cursor = b + 1;
+    }
+    if cursor <= end {
+        // A closing brace or blank lines after the last definition go with it.
+        let rest_has_words = lines[cursor - 1..end].iter().any(|l| l.chars().any(char::is_alphanumeric));
+        match stretches.last_mut() {
+            Some(last) if !rest_has_words => last.1 = end,
+            _ => stretches.push((cursor, end, None)),
+        }
+    }
+    let size = |a: usize, b: usize| lines[a - 1..b].iter().map(|l| l.len() + 1).sum::<usize>();
+    let mut i = 0;
+    while i < stretches.len() {
+        let (a, b, node) = stretches[i];
+        if size(a, b) > max {
+            match node {
+                Some(d) if !d.children.is_empty() => {
+                    let q = qualify(enclosing, &d.sym.name);
+                    cut_at_definitions(lines, a, b, &d.children, Some(&q), d.sym.docs.as_deref(), max, out);
+                }
+                Some(d) => push_line_pieces(lines, a, b, max, Some(qualify(enclosing, &d.sym.name)), d.sym.docs.clone(), out),
+                None => push_line_pieces(lines, a, b, max, enclosing.map(str::to_string), enclosing_doc.map(str::to_string), out),
+            }
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut total = size(a, b);
+        while j < stretches.len() {
+            let s = size(stretches[j].0, stretches[j].1);
+            if total + s > max {
+                break;
+            }
+            total += s;
+            j += 1;
+        }
+        let held: Vec<&DefNode> = stretches[i..j].iter().filter_map(|s| s.2).collect();
+        let (symbol, doc) = match (held.as_slice(), enclosing) {
+            ([one], _) => (Some(qualify(enclosing, &one.sym.name)), one.sym.docs.clone()),
+            (_, Some(e)) => (Some(e.to_string()), enclosing_doc.map(str::to_string)),
+            ([], None) => (None, None),
+            (many, None) => {
+                let mut names: Vec<&str> = many.iter().take(PACKED_NAMES_MAX).map(|d| d.sym.name.as_str()).collect();
+                if many.len() > PACKED_NAMES_MAX {
+                    names.push("…");
+                }
+                (Some(names.join(", ")), None)
+            }
+        };
+        push_piece(lines, a, stretches[j - 1].1, symbol, doc, out);
+        i = j;
+    }
+}
+
+/// Lines `a..=b` cut at their line ends into pieces of at most `max` bytes
+/// (one longer line stays whole), each with `symbol` and `doc`.
+fn push_line_pieces(lines: &[&str], a: usize, b: usize, max: usize, symbol: Option<String>, doc: Option<String>, out: &mut Vec<Piece>) {
+    let mut first = a;
+    let mut size = 0usize;
+    for n in a..=b {
+        let len = lines[n - 1].len() + 1;
+        if n > first && size + len > max {
+            push_piece(lines, first, n - 1, symbol.clone(), doc.clone(), out);
+            first = n;
+            size = 0;
+        }
+        size += len;
+    }
+    push_piece(lines, first, b, symbol, doc, out);
+}
+
+/// Lines `a..=b` as one piece, blank lines at either end left out.
+fn push_piece(lines: &[&str], mut a: usize, mut b: usize, symbol: Option<String>, doc: Option<String>, out: &mut Vec<Piece>) {
+    while a < b && lines[a - 1].trim().is_empty() {
+        a += 1;
+    }
+    while b > a && lines[b - 1].trim().is_empty() {
+        b -= 1;
+    }
+    let text = lines[a - 1..b].join("\n");
+    if text.trim().is_empty() {
+        return;
+    }
+    out.push(Piece { line: a, end: Some(b), text, symbol, doc: doc.filter(|d| !d.trim().is_empty()) });
 }
 
 /// Keys whose string values go in a JSON chunk's header: what its numbers
@@ -1315,5 +1683,98 @@ mod tests {
         assert_eq!(unbold_id("**D-410** · 2026-10-06 · anchors — **X.**"), "D-410 · 2026-10-06 · anchors — **X.**");
         assert_eq!(unbold_id("- **SR-12** · done"), "SR-12 · done");
         assert_eq!(unbold_id("**Note** a bold word"), "**Note** a bold word");
+    }
+
+    fn code_profile(target_tokens: usize) -> IndexProfile {
+        IndexProfile { mode: ChunkMode::Code, target_tokens, overlap_pct: 0.0 }
+    }
+
+    /// Code is cut at its definitions, each chunk naming its symbol and its
+    /// lines; small neighbours share a chunk, and a definition too long for
+    /// one is cut at its members, keeping the enclosing name.
+    #[test]
+    fn code_is_cut_by_definition() {
+        let mut src = String::from("use crate::db::Db;\n\n/// Saves the world.\npub fn save(db: &Db) {\n    write_all(db);\n}\n\n");
+        src.push_str("/// The store.\npub struct Store {\n    rows: Vec<u8>,\n}\n\nimpl Store {\n");
+        for i in 0..12 {
+            src.push_str(&format!("    /// Method {i}.\n    pub fn method_{i}(&self) -> usize {{\n"));
+            for k in 0..6 {
+                src.push_str(&format!("        let v{k} = self.rows.len() + {k} * {i}; // padding to make it long\n"));
+            }
+            src.push_str("        0\n    }\n\n");
+        }
+        src.push_str("}\n");
+        let map = crate::codemap::map_file("src/store.rs", &src).unwrap();
+        let profile = code_profile(150); // 600 bytes a chunk
+        let out = chunk_with("src/store.rs", &src, &profile, &map.symbols);
+        assert!(!out.capped);
+        let chunks = out.chunks;
+        assert!(chunks.len() > 4, "{chunks:#?}");
+        for c in &chunks {
+            let first = src.lines().nth(c.line - 1).unwrap();
+            let last = src.lines().nth(c.end_line - 1).unwrap();
+            assert_eq!(c.text.lines().next().unwrap(), first, "line is the first line: {c:?}");
+            assert_eq!(c.text.lines().last().unwrap(), last, "end_line is the last line: {c:?}");
+            assert!(c.text.len() <= 600 || c.text.lines().count() == 1, "{} bytes", c.text.len());
+        }
+        let method_7 = chunks.iter().find(|c| c.text.contains("fn method_7")).unwrap();
+        assert!(method_7.symbol.as_deref().is_some_and(|s| s.ends_with("method_7")), "{method_7:?}");
+        assert!(method_7.title.contains("Method 7."), "the doc comment is the title: {method_7:?}");
+        assert!(method_7.text.contains("/// Method 7."), "the comment above goes with it");
+        // Every line of the file is in exactly one chunk.
+        let covered: usize = chunks.iter().map(|c| c.text.lines().count()).sum();
+        assert!(covered <= src.lines().count());
+        assert!(chunks.windows(2).all(|w| w[0].end_line < w[1].line), "no overlap");
+        // The same file with no definitions is cut into line blocks.
+        let blocks = chunk_with("src/store.rs", &src, &profile, &[]);
+        assert!(blocks.chunks.iter().all(|c| c.symbol.is_none() && c.title.is_empty()));
+    }
+
+    #[test]
+    fn small_top_level_definitions_share_a_chunk_named_by_them() {
+        let src = "def a():\n    return 1\n\ndef b():\n    return 2\n";
+        let map = crate::codemap::map_file("m.py", src).unwrap();
+        let chunks = chunk_with("m.py", src, &code_profile(500), &map.symbols).chunks;
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert_eq!(chunks[0].symbol.as_deref(), Some("a, b"));
+        assert_eq!((chunks[0].line, chunks[0].end_line), (1, 5));
+    }
+
+    #[test]
+    fn prose_chunks_carry_their_heading_breadcrumb() {
+        let page = "---\ntitle: Payments\n---\n\n# Payments\n\nIntro.\n\n## Retries\n\nThree times.\n\n### Backoff\n\nDoubling.\n\n```md\n# not a heading\n```\n\n## Refunds\n\nWithin a week.\n";
+        let chunks = chunk_file("Design/Payments.md", page, &IndexProfile::default_for("x.md"));
+        let title_of = |needle: &str| chunks.iter().find(|c| c.text.contains(needle)).map(|c| c.title.clone()).unwrap();
+        assert_eq!(title_of("Three times"), "Payments › Retries");
+        assert_eq!(title_of("Doubling"), "Payments › Retries › Backoff");
+        assert_eq!(title_of("Within a week"), "Payments › Refunds", "a sibling pops the deeper heading");
+        assert_eq!(title_of("Intro."), "Payments", "the top heading repeating the title is said once");
+        // The breadcrumb is not in the text shown.
+        assert!(!chunks.iter().any(|c| c.text.contains("Payments › ")));
+        // No frontmatter title: the first `# ` heading.
+        assert_eq!(page_title("# Grades\n\nBody.\n").as_deref(), Some("Grades"));
+        assert_eq!(page_title("Body only.\n"), None);
+    }
+
+    #[test]
+    fn a_file_past_the_cap_is_reported_capped() {
+        let text: String = (0..500).map(|i| format!("line {i} of a very large generated file padding content\n")).collect();
+        let out = chunk_with("generated.rs", &text, &code_profile(5), &[]);
+        assert!(out.capped);
+        assert_eq!(out.chunks.len(), CHUNK_CAP);
+        assert!(!chunk_with("small.rs", "fn a() {}\n", &code_profile(500), &[]).capped);
+    }
+
+    #[test]
+    fn the_embedded_text_has_the_header_and_the_shown_text_does_not() {
+        assert_eq!(embed_text("a.md", "", None, None, "Body."), "Body.", "nothing to add");
+        assert_eq!(embed_text("a.md", "Payments › Retries", None, None, "Three times."), "Payments › Retries\n\nThree times.");
+        assert_eq!(
+            embed_text("src/store.rs", "Opens the store.", Some("Store.open"), Some("Opens a store from disk."), "fn open() {}"),
+            "src/store.rs › Store.open\nOpens the store.\nOpens a store from disk.\n\nfn open() {}"
+        );
+        // A chunk with no title or symbol keeps the hash it had before titles.
+        assert_eq!(chunk_hash("", None, "Body."), hash_text("Body."));
+        assert_ne!(chunk_hash("A › B", None, "Body."), chunk_hash("A › C", None, "Body."), "a new breadcrumb is a new embedding");
     }
 }

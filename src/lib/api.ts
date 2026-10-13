@@ -11,13 +11,15 @@ export interface ProjectInfo {
   ingestRunner?: "hidden-tui" | "headless";
 }
 
-/** The team's index as three figures: repos indexed of all, files queued,
- *  files failed. */
+/** The team's index in figures: repos indexed of all, files queued, files
+ *  failed, and files cut at the per-file chunk cap (their end is not
+ *  searchable). */
 export interface IndexHealth {
   indexed: number;
   total: number;
   queued: number;
   failed: number;
+  capped: number;
 }
 
 /** A repo's index state: not indexed, searchable only, read for entities. */

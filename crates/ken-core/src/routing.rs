@@ -946,6 +946,32 @@ mod tests {
         assert!(search_member(&db, "region", None, 10).unwrap().is_empty());
     }
 
+    /// A passage is found by the headings it sits under, and a code chunk by
+    /// the symbol it holds, ahead of a file that only mentions the words.
+    #[test]
+    fn a_breadcrumb_or_a_symbol_finds_its_chunk() {
+        use crate::project::Project;
+        use crate::scan;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Design")).unwrap();
+        std::fs::write(
+            dir.path().join("Design/Payments.md"),
+            "# Payments\n\nHow money moves.\n\n## Retry backoff\n\nEach wait doubles, to a minute at most.\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Design/Other.md"), "# Other\n\nA long note on queues and dashboards, with retry mentioned once and backoff once, among many other things.\n").unwrap();
+        std::fs::write(dir.path().join("books.py"), "def reconcile_ledger(month):\n    return month\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db).unwrap();
+
+        let hits = search_member(&db, "retry backoff", None, 10).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("Design/Payments.md"), "{hits:?}");
+        assert_eq!(hits[0].line, Some(5), "the section under the heading");
+        let hits = search_member(&db, "reconcile ledger", None, 10).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("books.py"), "{hits:?}");
+    }
+
     /// A member with one file at `rel_path`, scanned but with no meaning
     /// index built.
     fn scanned_db(rel_path: &str, text: &str) -> Db {

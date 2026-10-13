@@ -165,6 +165,7 @@
     if (!h) return "";
     const parts = [h.indexed >= h.total ? `All ${h.total} ${h.total === 1 ? "folder" : "folders"} indexed` : `${h.indexed} of ${h.total} folders indexed`];
     if (h.queued > 0) parts.push(`${h.queued} not in the map yet`);
+    if (h.capped > 0) parts.push(`${h.capped} ${h.capped === 1 ? "file" : "files"} too long to index whole`);
     return parts.join(" · ");
   });
 </script>

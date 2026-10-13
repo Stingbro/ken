@@ -450,6 +450,11 @@ pub fn minified(text: &str) -> bool {
     })
 }
 
+/// The chunks of a file with no readable text: one, holding its path.
+fn name_only(rel: &str) -> crate::chunker::Chunked {
+    crate::chunker::Chunked { chunks: vec![crate::chunker::name_chunk(rel)], capped: false }
+}
+
 /// Index a single file (already known to exist and be included). Returns the
 /// status stored.
 fn index_one(
@@ -468,7 +473,7 @@ fn index_one(
     // and leave the content to `cloud::hydrate` when the user opens it.
     if dataless {
         db.upsert_file(rel, kind.as_str(), size, mtime, STATUS_CLOUD_ONLY, None, "")?;
-        db.upsert_chunks(rel, &[crate::chunker::name_chunk(rel)], tier)?;
+        db.store_chunked(rel, &name_only(rel), tier)?;
         return Ok(STATUS_CLOUD_ONLY);
     }
     let (status, error, text) = match extract::extract(&abs) {
@@ -495,16 +500,24 @@ fn index_one(
             db.set_file_byte_hash(rel, &hash, mtime)?;
         }
     }
+    // The code map: definitions, references and imports, for "find usages"
+    // and "go to definition". Every tier: a code repo is search-only and
+    // this is exactly what it is searched for. Made before the chunks, which
+    // cut code at its definitions.
+    let map = crate::codemap::Lang::of(rel).map(|_| {
+        if status == STATUS_INDEXED { crate::codemap::map_file(rel, &text).unwrap_or_default() } else { Default::default() }
+    });
     // Chunks, for keyword search over sections and `repo:path:line`
     // citations. They need no model, so every indexed file has them; the
     // semantic rebuild only adds vectors. A file with no readable text has
     // one chunk holding its path, so it is still found by name.
-    let chunks = if status == STATUS_INDEXED && !text.trim().is_empty() {
-        crate::chunker::chunk_file(rel, &text, &crate::chunker::IndexProfile::default_for(rel))
+    let chunked = if status == STATUS_INDEXED && !text.trim().is_empty() {
+        let defs = map.as_ref().map_or(&[][..], |m| &m.symbols[..]);
+        crate::chunker::chunk_with(rel, &text, &crate::chunker::IndexProfile::default_for(rel), defs)
     } else {
-        vec![crate::chunker::name_chunk(rel)]
+        name_only(rel)
     };
-    db.upsert_chunks(rel, &chunks, tier)?;
+    db.store_chunked(rel, &chunked, tier)?;
     // What a page says about itself (title, aliases, status, checked),
     // read from its frontmatter for search to rank and show.
     if kind == FileKind::Md {
@@ -513,12 +526,8 @@ fn index_one(
         let links = if status == STATUS_INDEXED { crate::links::extract(rel, &text) } else { Vec::new() };
         db.set_page_links(rel, &links)?;
     }
-    // The code map: definitions, references and imports, for "find usages"
-    // and "go to definition". Every tier: a code repo is search-only and
-    // this is exactly what it is searched for.
-    if crate::codemap::Lang::of(rel).is_some() {
-        let map = if status == STATUS_INDEXED { crate::codemap::map_file(rel, &text).unwrap_or_default() } else { Default::default() };
-        db.set_code_map(rel, &map)?;
+    if let Some(map) = &map {
+        db.set_code_map(rel, map)?;
     }
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
@@ -1572,6 +1581,25 @@ mod tests {
         assert_eq!(h.pending, 2, "both pages queued");
         assert_eq!(h.skipped, 1, "src/ is searchable only");
         assert_eq!((h.failed, h.retrying), (0, 0));
+    }
+
+    /// A file cut at the per-file chunk cap is counted in index health, and
+    /// code with a grammar is chunked by definition as it is indexed.
+    #[test]
+    fn the_chunk_cap_is_counted_and_code_is_cut_by_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        // No grammar: line blocks of about 2,000 bytes, far past 200 of them.
+        let big: String = (0..9000).map(|i| format!("key_{i}: a value long enough to pad the line out to sixty\n")).collect();
+        fs::write(dir.path().join("big.yaml"), big).unwrap();
+        fs::write(dir.path().join("small.yaml"), "a: 1\n").unwrap();
+        fs::write(dir.path().join("store.py"), "def open_store():\n    return 1\n\n\nclass Ledger:\n    def reconcile(self):\n        return 2\n").unwrap();
+        let project = Project::create(dir.path(), "Cap").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan(&project, &mut db).unwrap();
+        assert_eq!(db.file_health_counts().unwrap().capped, 1);
+        // What is embedded starts with the path and the symbol.
+        let (_, embed) = db.chunks_missing_vectors("store.py").unwrap().remove(0);
+        assert!(embed.starts_with("store.py › open_store"), "the chunk names what it holds: {embed}");
     }
 
     #[test]

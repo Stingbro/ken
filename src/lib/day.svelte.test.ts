@@ -20,7 +20,7 @@ vi.mock("./api", () => ({
     dayState: vi.fn(async () => ({ tickets: [], tasks: [], me: { name: null, email: null }, hasTickets: false })),
     teamDigest: vi.fn(async () => null),
     teamDigestWriting: vi.fn(async () => false),
-    indexHealth: vi.fn(async () => ({ indexed: 0, total: 0, queued: 0, failed: 0 })),
+    indexHealth: vi.fn(async () => ({ indexed: 0, total: 0, queued: 0, failed: 0, capped: 0 })),
     dayTaskUpdate: vi.fn(),
     ticketTasks: vi.fn(async () => []),
   },

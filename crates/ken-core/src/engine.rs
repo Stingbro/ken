@@ -151,12 +151,19 @@ pub fn rebuild_semantic_index_with_profile(
             let idx_profile = profile
                 .and_then(|p| p.chunking_for(&file.rel_path))
                 .unwrap_or_else(|| IndexProfile::default_for(&file.rel_path));
-            let chunks = if text.trim().is_empty() {
-                vec![chunker::name_chunk(&file.rel_path)]
+            // Code is cut at its definitions, read from the code index the
+            // scan stored rather than parsed again.
+            let chunked = if text.trim().is_empty() {
+                chunker::Chunked { chunks: vec![chunker::name_chunk(&file.rel_path)], capped: false }
             } else {
-                chunker::chunk_file(&file.rel_path, &text, &idx_profile)
+                let defs = if crate::codemap::Lang::of(&file.rel_path).is_some() {
+                    db.code_symbols(None, Some(&file.rel_path), Some(true), 5000)?
+                } else {
+                    Vec::new()
+                };
+                chunker::chunk_with(&file.rel_path, &text, &idx_profile, &defs)
             };
-            db.upsert_chunks(&file.rel_path, &chunks, tier)?;
+            db.store_chunked(&file.rel_path, &chunked, tier)?;
         }
 
         // Embed every chunk with no vector yet, not only the ones this call
@@ -309,6 +316,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(db.chunk_count().unwrap(), 0, "the Skip-mode profile entry should suppress all chunks");
+    }
+
+    /// What the model reads is the chunk under its breadcrumb (prose) or its
+    /// path and symbol (code); what search shows is the chunk alone.
+    #[test]
+    fn the_embedded_text_carries_the_breadcrumb_and_the_symbol() {
+        struct Recording(FakeEmbedder, Vec<String>);
+        impl Embedder for Recording {
+            fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                self.1.extend(texts.iter().cloned());
+                self.0.embed(texts)
+            }
+            fn dim(&self) -> usize {
+                self.0.dim()
+            }
+            fn model_id(&self) -> String {
+                self.0.model_id()
+            }
+        }
+        let project_dir = tempfile::tempdir().unwrap();
+        fs::write(project_dir.path().join("pay.md"), "# Payments\n\nIntro.\n\n## Retries\n\nThree times.\n").unwrap();
+        fs::write(project_dir.path().join("pay.py"), "def settle():\n    \"\"\"Settles the month.\"\"\"\n    return 1\n").unwrap();
+        let project = Project::create(project_dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        let mut embedder = Recording(FakeEmbedder::new(), Vec::new());
+        rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap();
+        assert!(embedder.1.iter().any(|t| t == "Payments › Retries\n\n## Retries\n\nThree times."), "{:?}", embedder.1);
+        assert!(embedder.1.iter().any(|t| t.starts_with("pay.py › settle")), "{:?}", embedder.1);
+        let shown = db.search_chunks_fts("three times", 5).unwrap();
+        assert_eq!(shown[0].text, "## Retries\n\nThree times.");
     }
 
     #[test]

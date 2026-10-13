@@ -15,7 +15,7 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// Meta key: the code map was filled from stored text for this index.
 const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
@@ -117,6 +117,9 @@ pub struct FileHealthCounts {
     pub failed: i64,
     /// Waiting to be indexed.
     pub queued: i64,
+    /// Cut at the per-file chunk cap: their end is not searchable
+    /// (`chunker::CHUNK_CAP`, knowledge-core decision 16).
+    pub capped: i64,
 }
 
 /// Extraction health for one project (see [`Db::index_health`]).
@@ -632,13 +635,14 @@ impl Db {
         if version < 16 {
             // index-words (2026-10-06): the keyword index gains a `names`
             // column (`fts_names`), so it is made again and filled from the
-            // stored chunks here, with no file read. Files whose chunks or
+            // stored chunks, with no file read (now by v23). Files whose chunks or
             // code map changed with it are read again by the next scan, once:
             // JSON (each chunk now starts with its key outline) and the
             // languages whose code map gained kinds (Java enums, fields and
             // records; TypeScript enums and type aliases). Clearing the byte
             // hash makes the scan read them rather than see an unchanged file.
-            self.rebuild_chunks_fts()?;
+            // The keyword index itself is made again by v23, with today's
+            // columns, which every database from before v16 also passes.
             self.conn.execute(
                 r#"UPDATE files SET mtime = ?1, byte_hash = NULL
                    WHERE status = 'indexed'
@@ -758,6 +762,63 @@ impl Db {
             self.backfill_page_meta()?;
             crate::authority::refresh_with(self, &crate::authority::Roles::default(), None)?;
         }
+        if version < 23 {
+            // knowledge-core decision 16: chunking. A chunk carries its last
+            // line, a title (a prose chunk's heading breadcrumb, a code
+            // chunk's doc comment) and a code chunk's enclosing symbol; a
+            // file records whether the chunk cap cut it short, for index
+            // health; and a chunk of a knowledge-base page can have a
+            // one-line summary, cached by its content hash and used for
+            // retrieval only. Guarded ADD COLUMNs: a fresh database made
+            // `chunks` and `files` above, and tests rewind schema_version.
+            for (table, column, ty) in [
+                ("chunks", "end_line", "INTEGER"),
+                ("chunks", "title", "TEXT NOT NULL DEFAULT ''"),
+                ("chunks", "symbol", "TEXT"),
+                ("files", "chunk_capped", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                let has: bool = self
+                    .conn
+                    .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"))?
+                    .exists([])?;
+                if !has {
+                    self.conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty};"))?;
+                }
+            }
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS chunk_summaries (
+                    content_hash TEXT PRIMARY KEY,
+                    summary      TEXT NOT NULL,
+                    made_at      INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS chunks_hash ON chunks(content_hash);
+                "#,
+            )?;
+            // The keyword index gains its `title` field, weighted above the
+            // body (`W_TITLE`): made again and filled from the stored chunks.
+            self.rebuild_chunks_fts()?;
+            // Prose is read again by the next scan, once, for its
+            // breadcrumbs, and code with a grammar for its cut by
+            // definition. A chunk whose text, title and symbol are unchanged
+            // keeps its vector (`upsert_chunks` diffs by hash), but a
+            // breadcrumb is new on every prose chunk, so the first semantic
+            // rebuild after this re-embeds the prose and the code it re-cut.
+            self.conn.execute(
+                r#"UPDATE files SET mtime = ?1, byte_hash = NULL
+                   WHERE status = 'indexed'
+                     AND (lower(rel_path) LIKE '%.md' OR lower(rel_path) LIKE '%.mdx'
+                          OR lower(rel_path) LIKE '%.txt' OR lower(rel_path) LIKE '%.pdf'
+                          OR lower(rel_path) LIKE '%.rs' OR lower(rel_path) LIKE '%.py'
+                          OR lower(rel_path) LIKE '%.pyi' OR lower(rel_path) LIKE '%.js'
+                          OR lower(rel_path) LIKE '%.jsx' OR lower(rel_path) LIKE '%.mjs'
+                          OR lower(rel_path) LIKE '%.cjs' OR lower(rel_path) LIKE '%.ts'
+                          OR lower(rel_path) LIKE '%.mts' OR lower(rel_path) LIKE '%.cts'
+                          OR lower(rel_path) LIKE '%.tsx' OR lower(rel_path) LIKE '%.go'
+                          OR lower(rel_path) LIKE '%.java' OR lower(rel_path) LIKE '%.cs')"#,
+                params![Self::REINDEX_SENTINEL_MTIME],
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -799,16 +860,20 @@ impl Db {
         tx.execute_batch(
             r#"
             DROP TABLE IF EXISTS chunks_fts;
-            CREATE VIRTUAL TABLE chunks_fts USING fts5(text, names);
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(text, names, title);
             "#,
         )?;
         {
-            let mut read = tx.prepare("SELECT id, path, text FROM chunks")?;
-            let mut write = tx.prepare("INSERT INTO chunks_fts(rowid, text, names) VALUES (?1, ?2, ?3)")?;
+            let mut read = tx.prepare(
+                "SELECT c.id, c.path, c.text, c.title, c.symbol, s.summary
+                   FROM chunks c LEFT JOIN chunk_summaries s ON s.content_hash = c.content_hash",
+            )?;
+            let mut write = tx.prepare("INSERT INTO chunks_fts(rowid, text, names, title) VALUES (?1, ?2, ?3, ?4)")?;
             let mut rows = read.query([])?;
             while let Some(row) = rows.next()? {
                 let (id, path, text): (i64, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
-                write.execute(params![id, text, fts_names(&path, &text)])?;
+                let (title, symbol, summary): (String, Option<String>, Option<String>) = (row.get(3)?, row.get(4)?, row.get(5)?);
+                write.execute(params![id, text, fts_names(&path, symbol.as_deref(), &text), fts_title(&title, summary.as_deref())])?;
             }
         }
         tx.commit()?;
@@ -976,31 +1041,58 @@ impl Db {
             if unchanged {
                 // Same text, but lines added above it move where it starts.
                 tx.execute(
-                    "UPDATE chunks SET line = ?3 WHERE path = ?1 AND seq = ?2",
-                    params![path, seq, chunk.line as i64],
+                    "UPDATE chunks SET line = ?3, end_line = ?4 WHERE path = ?1 AND seq = ?2",
+                    params![path, seq, chunk.line as i64, chunk.end_line as i64],
                 )?;
             } else {
                 tx.execute(
-                    r#"INSERT INTO chunks (path, seq, text, token_est, content_hash, tier, line)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    r#"INSERT INTO chunks (path, seq, text, token_est, content_hash, tier, line, end_line, title, symbol)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                        ON CONFLICT(path, seq) DO UPDATE SET
-                         text = ?3, token_est = ?4, content_hash = ?5, tier = ?6, line = ?7"#,
-                    params![path, seq, chunk.text, chunk.token_est as i64, chunk.content_hash, tier, chunk.line as i64],
+                         text = ?3, token_est = ?4, content_hash = ?5, tier = ?6, line = ?7,
+                         end_line = ?8, title = ?9, symbol = ?10"#,
+                    params![
+                        path,
+                        seq,
+                        chunk.text,
+                        chunk.token_est as i64,
+                        chunk.content_hash,
+                        tier,
+                        chunk.line as i64,
+                        chunk.end_line as i64,
+                        chunk.title,
+                        chunk.symbol
+                    ],
                 )?;
                 let id: i64 = tx.query_row(
                     "SELECT id FROM chunks WHERE path = ?1 AND seq = ?2",
                     params![path, seq],
                     |r| r.get(0),
                 )?;
+                // A summary cached for this text already (the same passage
+                // elsewhere, or this one before an edit was undone).
+                let summary: Option<String> = tx
+                    .query_row(
+                        "SELECT summary FROM chunk_summaries WHERE content_hash = ?1",
+                        params![chunk.content_hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 // chunks_fts row: delete-then-reinsert rather than UPDATE since
                 // FTS5 doesn't support partial-column UPDATE semantics the way
                 // a normal table does. The `names` column holds the path,
                 // file name and symbol names and their parts (`fts_names`);
-                // `text` is the chunk's own text, as embedded.
+                // `title` the breadcrumb or doc comment and the summary
+                // (`fts_title`); `text` is the chunk's own text, as shown.
                 tx.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![id])?;
                 tx.execute(
-                    "INSERT INTO chunks_fts(rowid, text, names) VALUES (?1, ?2, ?3)",
-                    params![id, chunk.text, fts_names(path, &chunk.text)],
+                    "INSERT INTO chunks_fts(rowid, text, names, title) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        chunk.text,
+                        fts_names(path, chunk.symbol.as_deref(), &chunk.text),
+                        fts_title(&chunk.title, summary.as_deref())
+                    ],
                 )?;
                 if vec_exists {
                     tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
@@ -1021,6 +1113,22 @@ impl Db {
         }
 
         tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Write a file's chunks ([`Db::upsert_chunks`]) and whether the chunk
+    /// cap cut it short, for index health.
+    pub fn store_chunked(
+        &mut self,
+        path: &str,
+        chunked: &crate::chunker::Chunked,
+        tier: crate::kenignore::Tier,
+    ) -> Result<Vec<(i64, String)>> {
+        let changed = self.upsert_chunks(path, &chunked.chunks, tier)?;
+        self.conn.execute(
+            "UPDATE files SET chunk_capped = ?2 WHERE rel_path = ?1",
+            params![path, chunked.capped as i64],
+        )?;
         Ok(changed)
     }
 
@@ -1165,7 +1273,7 @@ impl Db {
         // the chunks kept.
         let mut ranked = self.conn.prepare(
             r#"SELECT c.id, c.path
-               FROM (SELECT rowid AS id, bm25(chunks_fts, 1.0, ?3) AS r
+               FROM (SELECT rowid AS id, bm25(chunks_fts, 1.0, ?3, ?4) AS r
                      FROM chunks_fts
                      WHERE chunks_fts MATCH ?1
                      ORDER BY r
@@ -1177,7 +1285,7 @@ impl Db {
         let depth = (k * CHUNKS_READ_PER_FILE) as i64;
         let mut add = |q: &str, hits: &mut Vec<FtsHit>, names: f64| -> Result<()> {
             let rows = ranked
-                .query_map(params![q, depth, names], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .query_map(params![q, depth, names, W_TITLE], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             for (chunk_id, path) in rows {
                 if hits.len() >= k {
@@ -1312,19 +1420,97 @@ impl Db {
     /// semantic rebuild still has to embed. Chunks are written by every scan
     /// (keyword search over chunks needs no model); vectors only by the
     /// rebuild. With no vector table, every chunk counts as missing.
+    ///
+    /// The text is what is embedded (`chunker::embed_text`): the chunk's own
+    /// text under its breadcrumb or its path, symbol and doc comment, and its
+    /// one-line summary when one is cached by then.
     pub fn chunks_missing_vectors(&self, path: &str) -> Result<Vec<(i64, String)>> {
-        let sql = if table_exists(&self.conn, "vec_chunks")? {
-            "SELECT c.id, c.text FROM chunks c WHERE c.path = ?1
-               AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)
-             ORDER BY c.seq"
+        let missing = if table_exists(&self.conn, "vec_chunks")? {
+            "AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)"
         } else {
-            "SELECT c.id, c.text FROM chunks c WHERE c.path = ?1 ORDER BY c.seq"
+            ""
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = format!(
+            "SELECT c.id, c.text, c.title, c.symbol, s.summary
+               FROM chunks c LEFT JOIN chunk_summaries s ON s.content_hash = c.content_hash
+              WHERE c.path = ?1 {missing}
+              ORDER BY c.seq"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![path], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![path], |r| {
+                let (id, text, title): (i64, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
+                let (symbol, summary): (Option<String>, Option<String>) = (r.get(3)?, r.get(4)?);
+                Ok((id, crate::chunker::embed_text(path, &title, symbol.as_deref(), summary.as_deref(), &text)))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Up to `limit` chunks of this index's pages that have no one-line
+    /// summary cached for their text yet, as (content hash, path, title,
+    /// text), one per distinct text, in path order. Pages are the Markdown
+    /// files that were read (pages, notes, decisions, tickets); a raw source
+    /// waiting in `Inbox/` or kept under `Ingestion/Raw/` is not one, and
+    /// code never is (`summary`, knowledge-core decision 16).
+    pub fn chunks_wanting_summaries(&self, limit: usize) -> Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.content_hash, c.path, c.title, c.text
+               FROM chunks c JOIN files f ON f.rel_path = c.path
+              WHERE f.status = 'indexed'
+                AND c.symbol IS NULL
+                AND c.text <> c.path
+                AND (lower(c.path) LIKE '%.md' OR lower(c.path) LIKE '%.mdx' OR lower(c.path) LIKE '%.markdown')
+                AND c.path NOT LIKE 'Inbox/%'
+                AND c.path NOT LIKE '%Ingestion/Raw/%'
+                AND NOT EXISTS (SELECT 1 FROM chunk_summaries s WHERE s.content_hash = c.content_hash)
+              GROUP BY c.content_hash
+              ORDER BY c.path, c.seq
+              LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Cache one-line summaries by chunk content hash, and put each in the
+    /// `title` field of the keyword rows of the chunks holding that text. An
+    /// empty summary marks a text Claude was asked about and gave none, so
+    /// it is not asked again; it adds nothing to search. Summaries of text
+    /// no chunk holds any more are forgotten. Vectors are left as they are:
+    /// a summary joins the embedded text the next time its chunk is embedded.
+    pub fn store_chunk_summaries(&mut self, summaries: &[(String, String)], at: i64) -> Result<()> {
+        let tx = self.conn.savepoint()?;
+        for (hash, summary) in summaries {
+            tx.execute(
+                "INSERT OR REPLACE INTO chunk_summaries(content_hash, summary, made_at) VALUES (?1, ?2, ?3)",
+                params![hash, summary, at],
+            )?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare("SELECT id, title FROM chunks WHERE content_hash = ?1")?;
+                let rows = stmt.query_map(params![hash], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for (id, title) in rows {
+                tx.execute(
+                    "UPDATE chunks_fts SET title = ?2 WHERE rowid = ?1",
+                    params![id, fts_title(&title, Some(summary.as_str()))],
+                )?;
+            }
+        }
+        tx.execute("DELETE FROM chunk_summaries WHERE content_hash NOT IN (SELECT content_hash FROM chunks)", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The one-line summary cached for a chunk's text, if any (empty when
+    /// Claude gave none).
+    pub fn chunk_summary(&self, content_hash: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT summary FROM chunk_summaries WHERE content_hash = ?1", params![content_hash], |r| r.get(0))
+            .optional()?)
     }
 
     /// Remove every indexed file under a folder (used when a folder is
@@ -1453,13 +1639,13 @@ impl Db {
         // of a file with no text holds its path (`chunker::name_chunk`), so
         // it is written again whole.
         {
-            let moved: Vec<(i64, String, String)> = {
-                let mut stmt = tx.prepare("SELECT id, path, text FROM chunks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
-                let rows = stmt.query_map(params![to, to_like], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let moved: Vec<(i64, String, String, Option<String>)> = {
+                let mut stmt = tx.prepare("SELECT id, path, text, symbol FROM chunks WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
+                let rows = stmt.query_map(params![to, to_like], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
                 rows.collect::<std::result::Result<_, _>>()?
             };
             let mut write = tx.prepare("UPDATE chunks_fts SET names = ?2 WHERE rowid = ?1")?;
-            for (id, path, mut text) in moved {
+            for (id, path, mut text, symbol) in moved {
                 let old = format!("{from}{}", &path[to.len()..]);
                 if text == old {
                     let c = crate::chunker::name_chunk(&path);
@@ -1473,7 +1659,7 @@ impl Db {
                         tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
                     }
                 }
-                write.execute(params![id, fts_names(&path, &text)])?;
+                write.execute(params![id, fts_names(&path, symbol.as_deref(), &text)])?;
             }
         }
 
@@ -1705,17 +1891,19 @@ impl Db {
 
     /// Index health in counts, for Your day: every file row, the failed
     /// ones, and the files still waiting to be indexed (a `pending` file
-    /// row, or a file whose OCR text is still queued). Counting queries
-    /// only, so it is cheap on a large index. Extraction backlog is a
+    /// row, or a file whose OCR text is still queued), and the files cut at
+    /// the per-file chunk cap. Counting queries only, so it is cheap on a
+    /// large index. Extraction backlog is a
     /// separate number ([`Db::index_health`]).
     pub fn file_health_counts(&self) -> Result<FileHealthCounts> {
-        let (total, failed, pending): (i64, i64, i64) = self.conn.query_row(
+        let (total, failed, pending, capped): (i64, i64, i64, i64) = self.conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(status = 'failed'), 0),
-                    COALESCE(SUM(status = 'pending'), 0)
+                    COALESCE(SUM(status = 'pending'), 0),
+                    COALESCE(SUM(chunk_capped <> 0), 0)
                FROM files",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         // Queued is what waits to be read for entities (the white box's 8c:
         // "files queued for entities"), the same pending + retrying count the
@@ -1729,7 +1917,7 @@ impl Db {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        Ok(FileHealthCounts { total, failed, queued: pending + extraction })
+        Ok(FileHealthCounts { total, failed, queued: pending + extraction, capped })
     }
 
     /// Count of files whose content is actually in the index (status
@@ -3306,8 +3494,8 @@ impl Db {
             } else {
                 crate::kenignore::Tier::Full
             };
-            let chunks = crate::chunker::chunk_file(rel_path, &text, &crate::chunker::IndexProfile::default_for(rel_path));
-            self.upsert_chunks(rel_path, &chunks, tier)?;
+            let chunked = crate::chunker::chunk_with(rel_path, &text, &crate::chunker::IndexProfile::default_for(rel_path), &[]);
+            self.store_chunked(rel_path, &chunked, tier)?;
         }
         Ok(())
     }
@@ -3978,6 +4166,23 @@ fn name_parts(word: &str) -> Vec<String> {
 /// left out). A quarter keeps a name in the score without letting it lead.
 const W_NAMES_ANY: f64 = 0.25;
 
+/// The `title` column's BM25 weight (the text's is 1): a prose chunk's
+/// heading breadcrumb, a code chunk's doc comment, and a page chunk's
+/// one-line summary (`fts_title`). Knowledge-core decision 16 weights it
+/// about two to three times the body: a passage under "Retries › Backoff"
+/// is about backoff even when its own sentences never say the word.
+const W_TITLE: f64 = 2.5;
+
+/// The `title` column of a chunk's keyword row: its title (breadcrumb or
+/// doc comment) and its one-line summary, when it has one.
+fn fts_title(title: &str, summary: Option<&str>) -> String {
+    match summary.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if title.is_empty() => s.to_string(),
+        Some(s) => format!("{title}\n{s}"),
+        None => title.to_string(),
+    }
+}
+
 /// How many chunks the keyword search reads for each file it returns. A
 /// file's best chunk stands for it. Read chunk by chunk, "do I keep the
 /// bolts I already loaded" (2026-10-06) filled a repo's eight places with
@@ -3999,7 +4204,10 @@ const NAME_WORD_MAX: usize = 64;
 /// text: BM25 normalises each column by its own length, so a name match in
 /// a long chunk of numbers is not diluted by the numbers, and a word repeated
 /// fifty times in the code still counts once here.
-fn fts_names(rel_path: &str, chunk_text: &str) -> String {
+///
+/// A code chunk's symbol (`Store.open`, or `save, load` for packed
+/// definitions) is named here too, each name and its parts.
+fn fts_names(rel_path: &str, symbol: Option<&str>, chunk_text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut add = |w: &str| {
@@ -4008,7 +4216,12 @@ fn fts_names(rel_path: &str, chunk_text: &str) -> String {
         }
     };
     let declared = extract_symbol_names(chunk_text);
-    let named = path_tokens(rel_path).split(' ').map(str::to_string).chain(declared).collect::<Vec<_>>();
+    let symbols = symbol
+        .into_iter()
+        .flat_map(|s| s.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-')))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string);
+    let named = path_tokens(rel_path).split(' ').map(str::to_string).chain(symbols).chain(declared).collect::<Vec<_>>();
     for word in &named {
         add(word);
         add(&crate::search::stem(&word.to_lowercase()));
@@ -4282,6 +4495,9 @@ mod tests {
             token_est: text.split_whitespace().count(),
             content_hash: hash.to_string(),
             line: seq * 10 + 1,
+            end_line: seq * 10 + 1,
+            title: String::new(),
+            symbol: None,
         }
     }
 
@@ -4360,7 +4576,7 @@ mod tests {
 
     #[test]
     fn fts_names_split_compound_names_and_keep_them_whole() {
-        let names = fts_names("data/equipment/WeaponBases.json", "{ \"CritMultiplier\": 1.5, \"MAX_ROWS\": 7, \"plain\": \"aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgZW5jb2RlZCBkYXRhIHRoYXQgaXMgbG9uZw\" }");
+        let names = fts_names("data/equipment/WeaponBases.json", None, "{ \"CritMultiplier\": 1.5, \"MAX_ROWS\": 7, \"plain\": \"aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgZW5jb2RlZCBkYXRhIHRoYXQgaXMgbG9uZw\" }");
         let words: Vec<&str> = names.split(' ').collect();
         for want in ["data", "equipment", "WeaponBases", "Weapon", "Bases", "bas", "json", "Crit", "Multiplier", "MAX", "ROWS", "row"] {
             assert!(words.contains(&want), "{want} in {names}");
@@ -4394,6 +4610,100 @@ mod tests {
         let t = |s: &[&str]| s.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         assert_eq!(build_chunk_query(&t(&["weapon", "bases"]), false), "\"weapon\" AND (\"bases\" * OR \"bas\")");
         assert_eq!(build_chunk_query(&t(&["Ranges", "x"]), true), "(\"Ranges\" OR \"rang\") OR \"x\"");
+    }
+
+    fn titled(seq: usize, title: &str, symbol: Option<&str>, text: &str) -> crate::chunker::Chunk {
+        let mut c = chunk(seq, text, "");
+        c.title = title.to_string();
+        c.symbol = symbol.map(str::to_string);
+        c.content_hash = crate::chunker::chunk_hash(title, symbol, text);
+        c
+    }
+
+    /// A breadcrumb is searched, weighted above the body: a passage under
+    /// "Retries › Backoff" answers "backoff" though its sentences never say
+    /// it, ahead of a page that says it once in passing.
+    #[test]
+    fn the_title_field_is_searched_and_weighted_above_the_body() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_chunks("Design/Payments.md", &[titled(0, "Payments › Retries › Backoff", None, "Each wait doubles, to a minute at most.")], crate::kenignore::Tier::Full)
+            .unwrap();
+        db.upsert_chunks(
+            "Research/Notes.md",
+            &[titled(0, "", None, "Notes from the call: queues, workers, dashboards, alerts, and a word on backoff among many other things discussed.")],
+            crate::kenignore::Tier::Full,
+        )
+        .unwrap();
+        let hits = db.search_chunks_fts("backoff", 5).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("Design/Payments.md"), "{hits:?}");
+        // The snippet is the chunk's own text, never the breadcrumb.
+        assert_eq!(hits[0].text, "Each wait doubles, to a minute at most.");
+    }
+
+    #[test]
+    fn a_code_chunks_symbol_is_in_its_names() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_chunks("src/books.rs", &[titled(0, "Settles the month.", Some("Ledger.reconcile"), "fn x() {}")], crate::kenignore::Tier::Full)
+            .unwrap();
+        assert_eq!(db.search_chunks_fts("reconcile ledger", 5).unwrap().len(), 1);
+        assert_eq!(db.search_chunks_fts("settles the month", 5).unwrap().len(), 1, "the doc comment is the title");
+        // What is embedded carries the path, the symbol and the doc comment.
+        let (_, embed) = db.chunks_missing_vectors("src/books.rs").unwrap().remove(0);
+        assert_eq!(embed, "src/books.rs › Ledger.reconcile\nSettles the month.\n\nfn x() {}");
+    }
+
+    #[test]
+    fn summaries_are_cached_by_hash_and_searched_but_not_shown() {
+        let mut db = Db::open_in_memory().unwrap();
+        for path in ["Design/Payments.md", "src/pay.rs", "Inbox/raw.md"] {
+            db.upsert_file(path, "md", 1, 1, "indexed", None, "x").unwrap();
+        }
+        let page = titled(0, "Payments › Retries", None, "Each wait doubles.");
+        db.upsert_chunks("Design/Payments.md", std::slice::from_ref(&page), crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("src/pay.rs", &[titled(0, "", Some("pay"), "fn pay() {}")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("Inbox/raw.md", &[titled(0, "Raw", None, "A transcript.")], crate::kenignore::Tier::Full).unwrap();
+        let wanted = db.chunks_wanting_summaries(10).unwrap();
+        assert_eq!(wanted.len(), 1, "pages only, not code or raw sources: {wanted:?}");
+        assert_eq!(wanted[0].0, page.content_hash);
+
+        db.store_chunk_summaries(&[(page.content_hash.clone(), "How payment retries back off exponentially.".into())], 7).unwrap();
+        assert!(db.chunks_wanting_summaries(10).unwrap().is_empty());
+        let hits = db.search_chunks_fts("exponentially", 5).unwrap();
+        assert_eq!(hits.first().map(|h| h.text.as_str()), Some("Each wait doubles."), "found by its summary, shown by its text");
+        let (_, embed) = db.chunks_missing_vectors("Design/Payments.md").unwrap().remove(0);
+        assert_eq!(embed, "Payments › Retries\nHow payment retries back off exponentially.\n\nEach wait doubles.");
+
+        // The same text written again finds its summary in the cache.
+        db.delete_chunks("Design/Payments.md").unwrap();
+        db.upsert_chunks("Design/Payments.md", &[page], crate::kenignore::Tier::Full).unwrap();
+        assert_eq!(db.search_chunks_fts("exponentially", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_23_adds_the_title_field_and_marks_prose_and_code_to_read_again() {
+        let mut db = Db::open_in_memory().unwrap();
+        for path in ["notes.md", "src/a.rs", "data.json", "src/b.lua"] {
+            db.upsert_file(path, "code", 1, 5, "indexed", None, "x").unwrap();
+            db.set_file_byte_hash(path, "abc", 5).unwrap();
+        }
+        db.upsert_chunks("notes.md", &[chunk(0, "plain words", "h0")], crate::kenignore::Tier::Full).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE chunks_fts; CREATE VIRTUAL TABLE chunks_fts USING fts5(text, names);
+                 INSERT INTO chunks_fts(rowid, text, names) SELECT id, text, '' FROM chunks;
+                 UPDATE meta SET value = '22' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        db.migrate().unwrap();
+        let title: String = db.conn.query_row("SELECT title FROM chunks_fts", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "");
+        assert_eq!(db.search_chunks_fts("plain words", 5).unwrap().len(), 1, "filled again from the stored chunks");
+        for (path, again) in [("notes.md", true), ("src/a.rs", true), ("data.json", false), ("src/b.lua", false)] {
+            assert_eq!(db.get_file(path).unwrap().unwrap().mtime == -1, again, "{path}");
+        }
+        let chunked = crate::chunker::Chunked { chunks: vec![chunk(0, "plain words", "h0")], capped: true };
+        db.store_chunked("notes.md", &chunked, crate::kenignore::Tier::Full).unwrap();
+        assert_eq!(db.file_health_counts().unwrap().capped, 1, "a file cut at the cap is counted");
     }
 
     #[test]
@@ -5384,7 +5694,7 @@ mod tests {
         // OCR backlog is not counted; the extraction backlog is.
         assert!(db.enqueue_ocr_if_changed("c.png", "h1").unwrap());
         assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
-        assert_eq!(db.file_health_counts().unwrap(), FileHealthCounts { total: 4, failed: 1, queued: 2 });
+        assert_eq!(db.file_health_counts().unwrap(), FileHealthCounts { total: 4, failed: 1, queued: 2, capped: 0 });
     }
 
     fn seeded() -> Db {

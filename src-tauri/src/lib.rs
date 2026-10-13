@@ -10305,9 +10305,10 @@ fn write_team_digest(
 // ---------- index health for a team ----------
 
 /// Index health for Your day: how many of the team's repos have an index
-/// with files in it, how many files wait to be indexed, and how many files
-/// failed to index (`Db::file_health_counts`: counting queries only). The
-/// extraction backlog is not part of it.
+/// with files in it, how many files wait to be indexed, how many files
+/// failed to index, and how many were cut at the per-file chunk cap
+/// (`Db::file_health_counts`: counting queries only). The extraction
+/// backlog is not part of it.
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct TeamIndexHealthDto {
@@ -10315,6 +10316,7 @@ struct TeamIndexHealthDto {
     total: usize,
     queued: i64,
     failed: usize,
+    capped: i64,
 }
 
 #[tauri::command(async)]
@@ -10344,6 +10346,7 @@ fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<Te
             }
             out.failed += c.failed.max(0) as usize;
             out.queued += c.queued;
+            out.capped += c.capped;
         }
     }
     Ok(out)
@@ -11150,6 +11153,80 @@ fn map_by_claude(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) -
     start_knowledge_build(app, job)
 }
 
+/// How often the extraction worker asks whether chunks wait for a summary.
+const SUMMARY_CHECK: Duration = Duration::from_secs(30);
+/// How long the worker leaves summaries alone after a Claude call failed.
+const SUMMARY_BACKOFF: Duration = Duration::from_secs(600);
+/// Longest one batch of summaries may take.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What one turn of [`summarize_by_claude`] did.
+enum SummaryTick {
+    /// Nothing to do, or not allowed to.
+    Idle,
+    /// A batch was summarized.
+    Ran,
+    /// The Claude call failed.
+    Failed,
+    /// The project closed or the worker was asked to stop.
+    Stopped,
+}
+
+/// Summarize one batch of this project's knowledge-base chunks with Claude
+/// (`summary`, knowledge-core decision 16). Only for a knowledge-base repo
+/// (kind team or wiki), only while background extraction is on, and only
+/// on the shared background pace (`EXTRACT_PACING`). Claude reads the
+/// prompt and answers, with no tools. The local model never writes them.
+fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
+    let (base, root, on) = {
+        let guard = lock_tolerant(state);
+        let Some(active) = guard.members.get(&project_id) else {
+            return SummaryTick::Stopped;
+        };
+        (
+            guard.base_dir.clone(),
+            active.project.root.clone(),
+            ken_core::features::effective_flag(&guard.app_settings, &active.project, "backgroundExtraction"),
+        )
+    };
+    if !on {
+        return SummaryTick::Idle;
+    }
+    let (kinds, _) = ken_core::registry::index_of(&root);
+    if !kinds.iter().any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki)) {
+        return SummaryTick::Idle;
+    }
+    let Ok(mut db) = Db::open(&base, project_id) else {
+        return SummaryTick::Idle;
+    };
+    // Nothing waiting: no Claude, and the pace is left for others.
+    if !ken_core::summary::next_batch(&db).is_ok_and(|b| !b.is_empty()) {
+        return SummaryTick::Idle;
+    }
+    let Some(binary) = ken_core::runner::discover_claude() else {
+        return SummaryTick::Idle;
+    };
+    if !wait_for_extraction_slot(stop) {
+        return SummaryTick::Stopped;
+    }
+    let mut generate = |prompt: &str| -> ken_core::Result<String> {
+        match ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, SUMMARY_TIMEOUT, &CancelToken::new())? {
+            ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+            other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
+        }
+    };
+    let result = ken_core::summary::summarize_next(&mut db, &mut generate, engine::now_epoch());
+    stamp_extraction_slot();
+    match result {
+        Ok(Some(_)) => SummaryTick::Ran,
+        Ok(None) => SummaryTick::Idle,
+        Err(e) => {
+            eprintln!("summaries: {e}");
+            SummaryTick::Failed
+        }
+    }
+}
+
 fn extraction_worker(
     app: AppHandle,
     state: SharedState,
@@ -11168,6 +11245,8 @@ fn extraction_worker(
     let mut was_ready = false;
     let mut requeue_on_next_open = false;
     let mut last_map_check = Instant::now() - MAP_CHECK;
+    let mut last_summary_check = Instant::now() - SUMMARY_CHECK;
+    let mut summaries_after = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         // The map comes from Claude: one read of the whole project for the
         // first map, and again once changes have settled (the automatic-build
@@ -11178,6 +11257,18 @@ fn extraction_worker(
             if map_by_claude(&app, &state, project_id) {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
+            }
+        }
+        // One-line summaries of the knowledge base's pages, for search
+        // (knowledge-core decision 16): one batch per turn, while any wait.
+        if last_summary_check.elapsed() >= SUMMARY_CHECK && Instant::now() >= summaries_after {
+            last_summary_check = Instant::now();
+            match summarize_by_claude(&state, project_id, &stop) {
+                // More may wait: look again on the next turn.
+                SummaryTick::Ran => last_summary_check = Instant::now() - SUMMARY_CHECK,
+                SummaryTick::Failed => summaries_after = Instant::now() + SUMMARY_BACKOFF,
+                SummaryTick::Idle => {}
+                SummaryTick::Stopped => return,
             }
         }
         // The local, per-file path: off by policy (LOCAL_GENERATION), kept
