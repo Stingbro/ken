@@ -790,16 +790,25 @@ fn chunk_log(text: &str, profile: &IndexProfile) -> Option<Vec<(usize, String)>>
 
 /// Split text into paragraph/heading blocks: blank lines separate
 /// paragraphs; any line starting with `#` (markdown ATX heading) is always
-/// its own block, regardless of surrounding blank lines. Each block carries
-/// the 1-based line it starts on.
+/// its own block, regardless of surrounding blank lines, unless it sits in a
+/// fenced block: a comment in a code sample, or the one entry format's
+/// example heading, is no heading. Each block carries the 1-based line it
+/// starts on.
 fn split_prose_blocks(text: &str) -> Vec<(usize, String)> {
     let mut blocks = Vec::new();
     let mut current = String::new();
     let mut start = 0usize;
+    let mut fence: Option<&str> = None;
 
     for (i, line) in text.lines().enumerate() {
         let n = i + 1;
         let trimmed = line.trim();
+        let mark = if trimmed.starts_with("```") { Some("```") } else if trimmed.starts_with("~~~") { Some("~~~") } else { None };
+        match (fence, mark) {
+            (Some(f), Some(m)) if f == m => fence = None,
+            (None, Some(m)) => fence = Some(m),
+            _ => {}
+        }
         if trimmed.is_empty() {
             if !current.trim().is_empty() {
                 blocks.push((start, current.trim().to_string()));
@@ -807,7 +816,7 @@ fn split_prose_blocks(text: &str) -> Vec<(usize, String)> {
             current.clear();
             continue;
         }
-        if trimmed.starts_with('#') {
+        if trimmed.starts_with('#') && fence.is_none() {
             if !current.trim().is_empty() {
                 blocks.push((start, current.trim().to_string()));
             }
