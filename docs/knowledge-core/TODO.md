@@ -347,14 +347,27 @@ Chris answered the open questions. Slice 15 builds the ones that change code; th
 
 ## Next: slice 14, verify
 
-No test has been run and the app has not been started on this branch; only compile checks. The test suite spawns shells and git, so each run needs Chris's go-ahead first (see "How to pick it up"). Cap cargo at 4 jobs and 4 test threads while Chris works, and never start `ken-app` without asking.
+The test suite has been run (2026-10-14) and passes; the app has not been started on this branch. The test suite spawns shells and git, so each run needs Chris's go-ahead first (see "How to pick it up"). Cap cargo at 4 jobs and 4 test threads while Chris works, and never start `ken-app` without asking.
 
-- [ ] **The full test suite** (Chris said go, 2026-10-14), from the checkout root, each into a log file:
-  - [ ] Rust, ken-core: `scripts\win-build.cmd cargo test --release -j 4 -p ken-core -- --test-threads=4`. Compare against a baseline from `ken-workspace-home` (60 failures there, all needing the `claude` CLI, git or fixtures); a failure not in the baseline is this branch's.
-  - [ ] Rust, ken-mcp: `scripts\win-build.cmd cargo test --release -j 4 -p ken-mcp -- --test-threads=4` (the twelve tools, the personal set, the instructions).
-  - [ ] Rust, the app: `scripts\win-build.cmd cargo test --release -j 4 -p ken-app -- --test-threads=4`, after `scripts\win-build.cmd sidecar` on a fresh checkout.
-  - [ ] Frontend: `npm test` (vitest) and `npm run check` (svelte-check: 0 errors, the 6 known warnings).
-  - [ ] Fix what fails, one commit per cause, and note each here.
+- [x] **The full test suite** (Chris said go, 2026-10-14), from the checkout root, each into a log file:
+  - [x] Rust, ken-core: `scripts\win-build.cmd cargo test --release -j 4 -p ken-core --no-fail-fast -- --test-threads=4`. 849 passed, 0 failed, 38 ignored (the lib); the llama.cpp smoke test is ignored; no doctests. Of the 60 baseline failures from `ken-workspace-home`, 29 are ignored on Windows (they run the bash fake CLI), 11 pass and 20 are not on this branch. The first run had 18 failures: 17 new, and `scan::tests::initial_scan_indexes_all_formats` from the baseline, which now failed for this branch's reason (the fixture's `vendor/` ignore, below).
+  - [x] Rust, ken-mcp: `scripts\win-build.cmd cargo test --release -j 4 -p ken-mcp -- --test-threads=4` (the twelve tools, the personal set, the instructions). 45 passed (42 unit, 3 stdio), none failed.
+  - [x] Rust, the app: `scripts\win-build.cmd cargo test --release -j 4 -p ken-app -- --test-threads=4`, after `scripts\win-build.cmd sidecar` on a fresh checkout. 15 passed, none failed.
+  - [x] Frontend: `npm test` (vitest) and `npm run check` (svelte-check: 0 errors, the 6 known warnings). Vitest: 793 passed in 65 files. svelte-check: 0 errors, the 6 known warnings.
+  - [x] Fix what fails, one commit per cause, and note each here. Three were the code's, ten the tests':
+    - Code, `74895b4`: prose chunking cut at a `#` line inside a fence, so the one entry format's fenced example became a ruling.
+    - Code, `96beca1`: `ingest::present_of` split the `Present:` placeholder at its own comma and counted half of it as a person.
+    - Code, `61df900`: `needs_reserve` waited for every source to come back empty, which meaning search never does; a source now answers only with a hit its words found (decision 20).
+    - Test, `a3be9da`: the link report and a page hit name the new sections for `Ways-of-Working/` (Rules) and `Platform/` (Reference).
+    - Test, `1f7f746`: the v17 and v18 migration tests allow for v23, which reads prose and code again after them.
+    - Test, `98051d4`: the health test fails a file three times before counting it failed (decision 34).
+    - Test, `0b635ce`: a page's title shows in its names by a word its path lacks; the names field says each word once.
+    - Test, `7ebb5ac`: the commit test reads a move with `--no-renames` and the porcelain status untrimmed.
+    - Test, `17dcf9c`: the scan fixture's `vendor/` folder is a built-in ignore since slice 11; it is `suppliers/`, and the rescan tests take the corrupt PDF to its last try first.
+    - Test, `449dc5a`: two small definitions share a chunk, named `open_store, Ledger` (slice 4).
+    - Test, `82a3673`: the minified bundle fixture had a space in every twelve characters.
+    - Test, `ef376f6`: set-up's evidence says "a decisions log", not the file name (slice 1a).
+    - Test, `abda68e`: a lowercase section folder (`design/`) is already its section, so the map tests move `designs/` instead.
 - [ ] **The end-to-end run** (manual, with Chris; it starts the app and makes Claude calls), on a throwaway workspace, never `hytale-shared-source`:
   - [ ] Set up: name a new workspace, save a new knowledge base, add one small code repo. Check the template lands (START-HERE, the brief, `Decisions/DECISIONS.md`, `tickets/`, `log.md`, `.ken/knowledge.json`), the first commit names its files, the code repo gets no commit, and search and the code index answer before anything is built.
   - [ ] Health: Settings › Workspace shows one health line per source; the repo analysis proposes roles and controls into `.ken/knowledge.json`; the controls run after the meaning index builds.
