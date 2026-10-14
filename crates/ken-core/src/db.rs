@@ -4883,7 +4883,11 @@ mod tests {
         assert_eq!(db.index_health().unwrap(), IndexHealth::default());
         db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
         db.upsert_chunks("a.md", &[chunk(0, "alpha", "h0"), chunk(1, "beta", "h1")]).unwrap();
-        db.upsert_file("b.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
+        // Failed after its third try; before it, a failed file is queued.
+        for _ in 0..MAX_READ_ATTEMPTS {
+            db.upsert_file("b.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
+        }
+        db.upsert_file("e.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
         db.upsert_file("c.png", "image", 1, 1, "metadata_only", None, "").unwrap();
         db.upsert_file("d.md", "md", 1, 1, "pending", None, "").unwrap();
         // The OCR backlog is not counted.
@@ -4894,11 +4898,11 @@ mod tests {
         assert_eq!(
             h,
             IndexHealth {
-                files: 4,
+                files: 5,
                 indexed: 1,
                 failed: 1,
                 skipped: 1,
-                queued: 1,
+                queued: 2,
                 capped: 0,
                 chunks: 2,
                 embedded: 0,
