@@ -1,16 +1,24 @@
-//! The Timeline as the project's raid log (knowledge-core decision 37): one
-//! chronological, timestamped list of what happened in the project, each
-//! entry linked to its source. Read from what is already there, no model:
+//! The Log: the project's RAID register (risks, actions, issues, decisions)
+//! and its milestones, not a feed of every update (knowledge-core decision
+//! 37, Chris 2026-10-14). Read from what is already there, no model:
 //!
-//! - **ingest, drift and lint** runs: the knowledge base's `log.md` lines
-//!   (`## [YYYY-MM-DD] kind | title`, decision 2);
-//! - **rulings**: the decisions log's dated entries;
-//! - **ticket changes**: each ticket's `updated` date and status;
-//! - **commits**: the knowledge base's git log, and the commits of the other
-//!   repos that cite a ticket or a ruling (the graph's `commit` edges);
-//! - **findings**: when each was filed, and when it was resolved;
-//! - **releases**: each repo's tags.
+//! - **Risks** and **Issues**: the RAID register, `Current/RAID.md`
+//!   ([`crate::raid`]);
+//! - **Actions**: the open tickets that have an assignee; a done or
+//!   cancelled ticket leaves the list;
+//! - **Decisions**: the decisions log's rulings, a superseded or refined one
+//!   marked so;
+//! - **Milestones**: tickets marked `type: milestone`, the rows of
+//!   `Current/Roadmap.md`'s Upcoming and Reached tables, and each repo's
+//!   tags as releases.
+//!
+//! Each item carries its status, owner and date, and where it comes from. A
+//! closed item (a closed risk or issue, a superseded or refined ruling, a
+//! dropped or cancelled milestone) is marked `closed` so the Log folds it
+//! away. Ingests, drift, lint, findings, page changes and commits are left
+//! out: they stay in the Inbox, Settings and `log.md`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -18,80 +26,76 @@ use serde::Serialize;
 use crate::db::Db;
 use crate::Result;
 
-/// Most commits read from the knowledge base's log.
-const KB_COMMITS: usize = 300;
 /// Most tags read from one repo.
 const TAGS: usize = 50;
-/// Most findings read, filed or resolved.
-const FINDINGS: usize = 2_000;
-/// Longest entry text, in characters.
-const TEXT_CHARS: usize = 240;
+/// Longest title, in characters.
+const TITLE_CHARS: usize = 240;
+/// Where the roadmap sits in a knowledge base.
+pub const ROADMAP_PAGE: &str = "Current/Roadmap.md";
+/// The ticket `type` that makes a ticket a milestone.
+pub const MILESTONE_TYPE: &str = "milestone";
 
-/// One entry of the raid log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// One item of the register.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Entry {
-    /// The day, `YYYY-MM-DD`.
+pub struct Item {
+    /// `R-001`, a ticket id, `D-012`, a tag; empty for a roadmap row.
+    pub id: String,
+    pub title: String,
+    /// `open`, `mitigated`, `in-progress`, `live`, `superseded by D-020`,
+    /// `reached`, `released`…; a status a person writes is lowercased.
+    pub status: String,
+    pub owner: Option<String>,
+    /// `YYYY-MM-DD`: raised, last updated, ruled, due or reached; empty when
+    /// the source gives none.
     pub date: String,
-    /// The moment in Unix seconds, when the source says it (a finding);
-    /// None when only the day is known.
-    pub at: Option<i64>,
-    /// `ingest`, `drift`, `lint` (or another kind a `log.md` line names),
-    /// `ruling`, `ticket`, `commit`, `finding` or `release`.
+    /// Folded away on the Log.
+    pub closed: bool,
+    /// What it is: `risk`, `issue`, `ticket`, `ruling`, `roadmap`, `release`.
     pub kind: String,
-    pub text: String,
-    /// The repo it is in, by name, for a commit or a release of another
-    /// repo; None for the knowledge base.
+    /// The repo it is in, by name, for another repo's release; None for the
+    /// knowledge base.
     pub repo: Option<String>,
     /// The file it comes from in the knowledge base, and the line.
     pub path: Option<String>,
     pub line: Option<i64>,
-    /// A commit's sha or a release's tag.
-    pub reference: Option<String>,
 }
 
-impl Entry {
-    fn new(date: &str, kind: &str, text: &str) -> Entry {
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let text: String = if text.chars().count() > TEXT_CHARS {
-            text.chars().take(TEXT_CHARS - 1).chain(std::iter::once('…')).collect()
+impl Item {
+    fn new(kind: &str, id: &str, title: &str, status: &str, date: &str) -> Item {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title: String = if title.chars().count() > TITLE_CHARS {
+            title.chars().take(TITLE_CHARS - 1).chain(std::iter::once('…')).collect()
         } else {
-            text
+            title
         };
-        Entry { date: date.to_string(), at: None, kind: kind.to_string(), text, repo: None, path: None, line: None, reference: None }
+        Item { kind: kind.into(), id: id.into(), title, status: status.into(), date: date.into(), ..Default::default() }
     }
 
-    fn at(mut self, path: &str, line: Option<i64>) -> Entry {
+    fn at(mut self, path: &str, line: Option<i64>) -> Item {
         self.path = Some(path.to_string());
         self.line = line;
         self
     }
 }
 
+/// The register, group by group, in the order the Log shows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Register {
+    pub risks: Vec<Item>,
+    pub actions: Vec<Item>,
+    pub issues: Vec<Item>,
+    pub decisions: Vec<Item>,
+    pub milestones: Vec<Item>,
+}
+
 fn is_date(s: &str) -> bool {
     s.len() == 10 && s.as_bytes().iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() })
 }
 
-/// The `log.md` lines: `## [YYYY-MM-DD] kind | title`, each with its line.
-pub fn log_lines(text: &str) -> Vec<Entry> {
-    let mut out = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        let Some(rest) = line.trim().strip_prefix("## [") else { continue };
-        let Some((date, rest)) = rest.split_once(']') else { continue };
-        if !is_date(date.trim()) {
-            continue;
-        }
-        let (kind, title) = rest.split_once('|').unwrap_or((rest, ""));
-        let kind = kind.trim().to_lowercase();
-        if kind.is_empty() {
-            continue;
-        }
-        out.push(Entry::new(date.trim(), &kind, title.trim()).at(crate::ingest::LOG_PAGE, Some(i as i64 + 1)));
-    }
-    out
-}
-
-/// A ruling entry's line: its id and its bold ruling, else its first line.
+/// A ruling entry's words: its bold ruling, else its first line, without
+/// its id.
 fn ruling_text(id: &str, text: &str) -> String {
     let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     let ruling = lines
@@ -101,123 +105,174 @@ fn ruling_text(id: &str, text: &str) -> String {
         .map(|l| l.trim_matches('*').trim().to_string())
         .unwrap_or_default();
     let ruling = ruling.trim_start_matches('#').trim();
-    if ruling.contains(id) {
-        ruling.to_string()
-    } else {
-        format!("{id}: {ruling}")
+    // An entry with no bold ruling keeps the rest of its first line.
+    match ruling.strip_prefix(id) {
+        Some(rest) => rest.trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '*' | ':' | '·' | '-' | '—')).to_string(),
+        None => ruling.to_string(),
     }
 }
 
-/// The raid log of the knowledge base `db` at `root`: everything above,
-/// newest first (a day's timed entries before its untimed ones), at most
-/// `limit`. `repos` are the workspace's other repos (name and checkout),
-/// for their releases; `offset_secs` is the local time's offset from UTC,
-/// so a finding falls on the person's own day.
-pub fn raid_log(db: &Db, root: &Path, repos: &[(String, PathBuf)], offset_secs: i64, limit: usize) -> Result<Vec<Entry>> {
-    let mut out: Vec<Entry> = Vec::new();
+/// Who made a ruling, from its quote line: `> "the words" (Ana)` or
+/// `> Made by Ana.`
+fn ruling_who(text: &str) -> Option<String> {
+    let quote = text.lines().map(str::trim).find(|l| l.starts_with('>'))?;
+    let q = quote.trim_start_matches('>').trim();
+    let who = match q.strip_prefix("Made by ") {
+        Some(w) => w.trim().trim_end_matches('.'),
+        None => q.strip_suffix(')').and_then(|r| r.rsplit_once('(')).map(|(_, w)| w.trim())?,
+    };
+    (!who.is_empty()).then(|| who.to_string())
+}
 
-    // Runs: ingest, drift, lint.
-    if let Ok(text) = std::fs::read_to_string(root.join(crate::ingest::LOG_PAGE)) {
-        out.extend(log_lines(&text));
-    }
+/// The cells of a Markdown table row, trimmed, or None for a line that is
+/// not one.
+fn cells(line: &str) -> Option<Vec<String>> {
+    let t = line.trim();
+    let inner = t.strip_prefix('|')?.strip_suffix('|')?;
+    Some(inner.split('|').map(|c| c.trim().to_string()).collect())
+}
 
-    // Rulings.
-    let roles = crate::authority::Roles::of_repo(root);
-    for log in crate::supersede::log_paths(db, &roles)? {
-        for e in crate::supersede::entries(db, &log)? {
-            if is_date(&e.date) {
-                out.push(Entry::new(&e.date, "ruling", &ruling_text(&e.id, &e.text)).at(&log, Some(e.line)));
+/// The roadmap's milestones: each row of its Upcoming table (milestone,
+/// delivers, target, state) and its Reached table (milestone, reached), as
+/// the template lays them out. A row still holding a placeholder is not one;
+/// a row that says "dropped" folds away.
+pub fn roadmap(text: &str) -> Vec<Item> {
+    let mut out = Vec::new();
+    let mut section = String::new();
+    let mut header = true;
+    for (i, line) in text.lines().enumerate() {
+        if let Some(h) = line.trim().strip_prefix("## ") {
+            section = h.trim().to_lowercase();
+            header = true;
+            continue;
+        }
+        let Some(row) = cells(line) else {
+            header = true;
+            continue;
+        };
+        // The first row of a table is its header, the second its rule.
+        if header || row.iter().all(|c| c.chars().all(|ch| matches!(ch, '-' | ':' | ' '))) {
+            header = false;
+            continue;
+        }
+        if row.iter().any(|c| c.contains("{{")) || row.first().is_none_or(|c| c.is_empty()) {
+            continue;
+        }
+        let first_date = |c: &str| c.get(..10).filter(|d| is_date(d)).unwrap_or("").to_string();
+        let item = match section.as_str() {
+            "upcoming" => {
+                let target = row.get(2).map(|c| first_date(c)).unwrap_or_default();
+                let state = row.get(3).filter(|s| !s.is_empty()).map_or("planned".to_string(), |s| s.to_lowercase());
+                let mut it = Item::new("roadmap", "", &row[0], &state, &target);
+                it.closed = state.contains("dropped");
+                it
             }
+            "reached" => {
+                let reached = row.get(1).cloned().unwrap_or_default();
+                let dropped = reached.to_lowercase().contains("dropped");
+                let mut it = Item::new("roadmap", "", &row[0], if dropped { "dropped" } else { "reached" }, &first_date(&reached));
+                it.closed = dropped;
+                it
+            }
+            _ => continue,
+        };
+        out.push(item.at(ROADMAP_PAGE, Some(i as i64 + 1)));
+    }
+    out
+}
+
+/// The register of the knowledge base `db` at `root`. `repos` are the
+/// workspace's other repos (name and checkout), for their releases;
+/// `offset_secs` is the local time's offset from UTC, so a ticket dated by
+/// its file falls on the person's own day. Each group is newest first.
+pub fn register(db: &Db, root: &Path, repos: &[(String, PathBuf)], offset_secs: i64) -> Result<Register> {
+    let mut reg = Register::default();
+
+    // Risks and issues, from the page on disk.
+    let raid = std::fs::read_to_string(root.join(crate::raid::RAID_PAGE)).unwrap_or_default();
+    for e in crate::raid::parse(&raid) {
+        let mut it = Item::new(e.kind.as_str(), &e.id, &e.title, &e.status, &e.date).at(crate::raid::RAID_PAGE, Some(e.line));
+        it.owner = e.owner.clone();
+        it.closed = e.closed();
+        match e.kind {
+            crate::raid::Kind::Risk => reg.risks.push(it),
+            crate::raid::Kind::Issue => reg.issues.push(it),
         }
     }
 
-    // Ticket changes: the day it was last updated, and where it stands.
+    // Actions, and the tickets that mark a milestone.
     for path in db.page_paths()?.into_iter().filter(|p| crate::day::is_ticket_path(p)) {
         let text = db.get_text(&path)?.unwrap_or_default();
         let t = crate::day::parse_ticket(&path, &text);
+        let milestone = t.kind.eq_ignore_ascii_case(MILESTONE_TYPE);
+        if !milestone && (!t.open || t.assignees.is_empty()) {
+            continue;
+        }
         let updated = db.page_meta(&path)?.and_then(|m| m.updated).map(|u| u.chars().take(10).collect::<String>());
         let date = match updated.filter(|d| is_date(d)) {
             Some(d) => d,
-            None => match db.get_file(&path)? {
-                Some(f) => crate::day::date_of_epoch(f.mtime + offset_secs),
-                None => continue,
-            },
+            None => db.get_file(&path)?.map(|f| crate::day::date_of_epoch(f.mtime + offset_secs)).unwrap_or_default(),
         };
-        let state = if t.state.is_empty() { String::new() } else { format!(" · {}", t.state) };
-        out.push(Entry::new(&date, "ticket", &format!("{}{state}: {}", t.id, t.title)).at(&path, None));
-    }
-
-    // Commits: the knowledge base's own, then the other repos' that cite a
-    // ticket or a ruling.
-    let mut own_shas: std::collections::HashSet<String> = Default::default();
-    for c in crate::git::log(root, KB_COMMITS, None, &[]).unwrap_or_default() {
-        let mut e = Entry::new(&c.date, "commit", &format!("{} ({})", c.subject, c.author));
-        own_shas.insert(c.sha.clone());
-        e.reference = Some(c.sha);
-        out.push(e);
-    }
-    // One entry a commit, however many ids it cites.
-    let mut cited: std::collections::BTreeMap<String, (String, String)> = Default::default();
-    for edge in db.graph_edges_of(crate::graph::ORIGIN_COMMITS)? {
-        let Some(node) = crate::graph::Node::parse(&edge.src) else { continue };
-        let (date, subject) = edge.detail.split_once(' ').unwrap_or((edge.detail.as_str(), ""));
-        cited.entry(node.id).or_insert_with(|| (date.to_string(), subject.to_string()));
-    }
-    for (key, (date, subject)) in cited {
-        let Some((repo, sha)) = key.rsplit_once('@') else { continue };
-        if !is_date(&date) || own_shas.contains(sha) {
-            continue;
-        }
-        let mut e = Entry::new(&date, "commit", &subject);
-        e.repo = Some(repo.to_string());
-        e.reference = Some(sha.to_string());
-        out.push(e);
-    }
-
-    // Findings: filed, and resolved.
-    for item in db.review_items_of_kind(crate::findings::KIND, FINDINGS)? {
-        let Some(f) = item.payload.as_deref().and_then(|p| serde_json::from_str::<crate::findings::Finding>(p).ok()) else {
-            continue;
-        };
-        let page = f.page();
-        let mut moments = vec![("filed", item.created_at)];
-        if let Some(at) = item.resolved_at {
-            moments.push(("resolved", at));
-        }
-        for (what, at) in moments {
-            let mut e = Entry::new(&crate::day::date_of_epoch(at + offset_secs), "finding", &format!("{} {what}: {}", f.kind, f.text));
-            e.at = Some(at);
-            if !page.is_empty() {
-                e.path = Some(page.clone());
-            }
-            out.push(e);
+        let status = if t.state.is_empty() { "todo".to_string() } else { t.state.to_lowercase() };
+        let mut it = Item::new("ticket", &t.id, &t.title, &status, &date).at(&path, None);
+        it.owner = (!t.assignees.is_empty()).then(|| t.assignees.join(", "));
+        if milestone {
+            // Done is reached and stays in view; cancelled is dropped.
+            it.closed = !t.open && !t.state.eq_ignore_ascii_case("done");
+            reg.milestones.push(it);
+        } else {
+            reg.actions.push(it);
         }
     }
 
-    // Releases: the knowledge base's tags and each repo's.
+    // Decisions: every dated ruling, one the log marks superseded or
+    // refined said so and folded.
+    let roles = crate::authority::Roles::of_repo(root);
+    for log in crate::supersede::log_paths(db, &roles)? {
+        let entries = crate::supersede::entries(db, &log)?;
+        let mut later: HashMap<String, (String, String)> = HashMap::new();
+        for s in crate::supersede::marked(&log, &entries) {
+            later.entry(s.earlier.clone()).or_insert((s.relation.clone(), s.later.clone()));
+        }
+        for e in entries.iter().filter(|e| is_date(&e.date)) {
+            let (status, closed) = match later.get(&e.id) {
+                Some((rel, by)) if rel == "refines" => (format!("refined by {by}"), true),
+                Some((_, by)) => (format!("superseded by {by}"), true),
+                None => ("live".to_string(), false),
+            };
+            let mut it = Item::new("ruling", &e.id, &ruling_text(&e.id, &e.text), &status, &e.date).at(&log, Some(e.line));
+            it.owner = ruling_who(&e.text);
+            it.closed = closed;
+            reg.decisions.push(it);
+        }
+    }
+
+    // Milestones: the roadmap's rows, then releases (the knowledge base's
+    // tags and each repo's).
+    if let Some(text) = db.get_text(ROADMAP_PAGE)? {
+        reg.milestones.extend(roadmap(&text));
+    }
     let own = (String::new(), root.to_path_buf());
     for (name, dir) in std::iter::once(&own).chain(repos.iter()) {
         for t in crate::git::tags(dir, TAGS).unwrap_or_default() {
-            if !is_date(&t.date) {
-                continue;
-            }
-            let text = if t.subject.is_empty() || t.subject == t.name { t.name.clone() } else { format!("{}: {}", t.name, t.subject) };
-            let mut e = Entry::new(&t.date, "release", &text);
-            e.repo = (!name.is_empty()).then(|| name.clone());
-            e.reference = Some(t.name);
-            out.push(e);
+            let title = if t.subject.is_empty() || t.subject == t.name { t.name.clone() } else { t.subject.clone() };
+            let mut it = Item::new("release", &t.name, &title, "released", if is_date(&t.date) { &t.date } else { "" });
+            it.repo = (!name.is_empty()).then(|| name.clone());
+            reg.milestones.push(it);
         }
     }
 
-    sort(&mut out);
-    out.truncate(limit);
-    Ok(out)
+    for group in [&mut reg.risks, &mut reg.actions, &mut reg.issues, &mut reg.decisions, &mut reg.milestones] {
+        sort(group);
+    }
+    Ok(reg)
 }
 
-/// Newest first: by day, then a timed entry by its moment before the day's
-/// untimed ones, then in the order they were read.
-pub fn sort(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.at.unwrap_or(i64::MIN).cmp(&a.at.unwrap_or(i64::MIN))));
+/// Newest first, by date (an undated item last), then by id's number,
+/// highest first, so the later of two entries on one day leads.
+pub fn sort(items: &mut [Item]) {
+    let number = |id: &str| id.rsplit('-').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+    items.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| number(&b.id).cmp(&number(&a.id))));
 }
 
 #[cfg(test)]
@@ -227,25 +282,60 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn log_lines_read_each_run_with_its_line() {
-        let text = "# Log\n\n## [2026-10-01] ingest | Standup\n\nnot a line\n## [2026-10-02] drift | 2 checked, 1 fixed\n## [someday] lint | x\n";
-        let got = log_lines(text);
-        assert_eq!(got.len(), 2);
-        assert_eq!((got[0].date.as_str(), got[0].kind.as_str(), got[0].text.as_str()), ("2026-10-01", "ingest", "Standup"));
-        assert_eq!((got[0].path.as_deref(), got[0].line), (Some("log.md"), Some(3)));
-        assert_eq!((got[1].kind.as_str(), got[1].text.as_str()), ("drift", "2 checked, 1 fixed"));
+    fn roadmap_rows_are_milestones_and_placeholders_are_not() {
+        let text = "# Roadmap\n\n## Upcoming\n\n| milestone | delivers | target | state |\n|---|---|---|---|\n\
+                    | Combat | fights | 2026-11-01 | at risk |\n| {{name}} | x | {{date}} | planned |\n| Trading | trade | soon | |\n\n\
+                    ## Reached\n\n| milestone | reached |\n|---|---|\n| Saves | 2026-09-30 |\n| Guilds | dropped, D-020 |\n";
+        let got = roadmap(text);
+        let rows: Vec<(&str, &str, &str, bool)> = got.iter().map(|i| (i.title.as_str(), i.status.as_str(), i.date.as_str(), i.closed)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Combat", "at risk", "2026-11-01", false),
+                ("Trading", "planned", "", false),
+                ("Saves", "reached", "2026-09-30", false),
+                ("Guilds", "dropped", "", true),
+            ]
+        );
+        assert_eq!((got[0].path.as_deref(), got[0].line), (Some(ROADMAP_PAGE), Some(7)));
+        assert!(roadmap(include_str!("../templates/wiki/Templates/Roadmap.md")).is_empty(), "the blank has no milestones");
     }
 
-    /// One list, newest first, each entry linked to its source: runs from
-    /// `log.md`, rulings, ticket changes, findings filed and resolved, and
-    /// the other repos' commits that cite a ticket or a ruling.
     #[test]
-    fn the_raid_log_is_one_list_newest_first_with_links() {
+    fn a_rulings_words_and_who_made_it_come_from_its_entry() {
+        let entry = "## D-012 · 2026-10-02 · saves\n\n**Regions save apart.**\n\n> \"apart\" (Ana)\n\nWhy: size.\n";
+        assert_eq!(ruling_text("D-012", entry), "Regions save apart.");
+        assert_eq!(ruling_who(entry).as_deref(), Some("Ana"));
+        assert_eq!(ruling_who("**x**\n\n> Made by Ben.\n").as_deref(), Some("Ben"));
+        assert_eq!(ruling_who("**x**\n\n> \"just words\"\n"), None);
+        assert_eq!(ruling_text("D-3", "**D-3** · 2026-01-01 · saves"), "2026-01-01 · saves");
+    }
+
+    /// The register, group by group: risks and issues from the RAID page,
+    /// actions from open assigned tickets, decisions with a superseded one
+    /// folded, milestones from a milestone ticket and the roadmap. What the
+    /// old feed showed (log.md runs, findings, commits) is not in it.
+    #[test]
+    fn the_register_groups_risks_actions_issues_decisions_and_milestones() {
         let dir = tempfile::tempdir().unwrap();
         for (path, text) in [
             ("log.md", "# Log\n\n## [2026-10-01] ingest | Standup\n"),
-            ("Decisions/DECISIONS.md", "# Decisions\n\n## D-012 · 2026-10-02 · saves\n\n**Regions save apart.**\n"),
-            ("tickets/SR-101.md", "---\nid: SR-101\nstatus: done\nupdated: 2026-10-04\n---\n# Fix saves\n"),
+            (
+                "Decisions/DECISIONS.md",
+                "# Decisions\n\n## D-001 · 2026-09-01 · saves\n\n**Worlds save whole.**\n\n\
+                 ## D-002 · 2026-10-02 · saves\n\n**Regions save apart.**\n\n> \"apart\" (Ana)\n\nsupersedes: D-001\n",
+            ),
+            (
+                "Current/RAID.md",
+                "# RAID\n\n## R-001 · 2026-10-01 · Friday may slip\n\nstatus: open\nowner: Ben\n\n\
+                 ## R-002 · 2026-10-03 · Saves may corrupt\n\nstatus: closed\n\n\
+                 ## I-001 · 2026-10-04 · The build is red\n\nstatus: resolved\nowner: Ana\n",
+            ),
+            ("Current/Roadmap.md", "# Roadmap\n\n## Reached\n\n| milestone | reached |\n|---|---|\n| Saves | 2026-09-30 |\n"),
+            ("tickets/SR-101.md", "---\nid: SR-101\nstatus: in-progress\nassignee: Ben\nupdated: 2026-10-04\n---\n# Fix saves\n"),
+            ("tickets/SR-102.md", "---\nid: SR-102\nstatus: todo\nupdated: 2026-10-05\n---\n# Nobody's yet\n"),
+            ("tickets/SR-103.md", "---\nid: SR-103\nstatus: done\nassignee: Ben\nupdated: 2026-10-06\n---\n# Done already\n"),
+            ("tickets/SR-104.md", "---\nid: SR-104\nstatus: done\ntype: milestone\nupdated: 2026-10-07\n---\n# Alpha ships\n"),
         ] {
             let p = dir.path().join(path);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -254,49 +344,24 @@ mod tests {
         let project = Project::create(dir.path(), "Lib").unwrap();
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
-        // A finding filed on 2026-10-05 (UTC noon) and resolved a day later.
-        let filed = 1_791_201_600;
-        let f = crate::findings::Finding {
-            kind: "orphan".into(),
-            source: "lint".into(),
-            subject: "Design/Lonely.md".into(),
-            text: "Nothing links to Design/Lonely.md.".into(),
-            ..Default::default()
-        };
-        let id = crate::findings::file(&mut db, &f, filed).unwrap();
-        db.resolve_review_item(id, filed + 86_400).unwrap();
-        // A commit in another repo citing the ticket.
-        db.add_graph_edges(crate::graph::ORIGIN_COMMITS, &[crate::graph::Edge {
-            src: "commit:game@1a2b3c4".into(),
-            dst: "ticket:tickets/SR-101.md".into(),
-            kind: "commit".into(),
-            detail: "2026-10-03 Fix SR-101".into(),
-        }])
-        .unwrap();
+        // A finding, which the register leaves out.
+        let f = crate::findings::Finding { kind: "orphan".into(), source: "lint".into(), text: "Nothing links here.".into(), ..Default::default() };
+        crate::findings::file(&mut db, &f, 1_791_201_600).unwrap();
 
-        let log = raid_log(&db, dir.path(), &[], 0, 100).unwrap();
-        let kinds: Vec<(&str, &str)> = log.iter().map(|e| (e.date.as_str(), e.kind.as_str())).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                ("2026-10-06", "finding"),
-                ("2026-10-05", "finding"),
-                ("2026-10-04", "ticket"),
-                ("2026-10-03", "commit"),
-                ("2026-10-02", "ruling"),
-                ("2026-10-01", "ingest"),
-            ],
-            "{log:#?}"
-        );
-        assert!(log[0].text.starts_with("orphan resolved") && log[1].text.starts_with("orphan filed"), "{log:#?}");
-        assert_eq!(log[0].path.as_deref(), Some("Design/Lonely.md"));
-        assert_eq!(log[0].at, Some(filed + 86_400));
-        assert_eq!((log[2].text.as_str(), log[2].path.as_deref()), ("SR-101 · done: Fix saves", Some("tickets/SR-101.md")));
-        assert_eq!((log[3].repo.as_deref(), log[3].reference.as_deref(), log[3].text.as_str()), (Some("game"), Some("1a2b3c4"), "Fix SR-101"));
-        assert_eq!(log[4].text, "D-012: Regions save apart.");
-        assert_eq!(log[4].path.as_deref(), Some("Decisions/DECISIONS.md"));
-        assert!(log[4].line.is_some_and(|l| l > 1));
-        assert_eq!((log[5].path.as_deref(), log[5].line), (Some("log.md"), Some(3)));
-        assert_eq!(raid_log(&db, dir.path(), &[], 0, 2).unwrap().len(), 2);
+        let reg = register(&db, dir.path(), &[], 0).unwrap();
+        let ids = |g: &[Item]| g.iter().map(|i| (i.id.clone(), i.status.clone(), i.closed)).collect::<Vec<_>>();
+        let row = |id: &str, status: &str, closed: bool| (id.to_string(), status.to_string(), closed);
+        assert_eq!(ids(&reg.risks), vec![row("R-002", "closed", true), row("R-001", "open", false)]);
+        assert_eq!(reg.risks[1].owner.as_deref(), Some("Ben"));
+        assert_eq!((reg.risks[1].path.as_deref(), reg.risks[1].line), (Some(crate::raid::RAID_PAGE), Some(3)));
+        assert_eq!(ids(&reg.issues), vec![row("I-001", "resolved", false)]);
+        assert_eq!(ids(&reg.actions), vec![row("SR-101", "in-progress", false)], "open and assigned only");
+        assert_eq!((reg.actions[0].owner.as_deref(), reg.actions[0].date.as_str()), (Some("Ben"), "2026-10-04"));
+        assert_eq!(ids(&reg.decisions), vec![row("D-002", "live", false), row("D-001", "superseded by D-002", true)]);
+        assert_eq!((reg.decisions[0].title.as_str(), reg.decisions[0].owner.as_deref()), ("Regions save apart.", Some("Ana")));
+        assert_eq!(reg.decisions[0].path.as_deref(), Some("Decisions/DECISIONS.md"));
+        let milestones: Vec<(&str, &str, &str)> = reg.milestones.iter().map(|i| (i.kind.as_str(), i.title.as_str(), i.status.as_str())).collect();
+        assert_eq!(milestones, vec![("ticket", "Alpha ships", "done"), ("roadmap", "Saves", "reached")]);
+        assert!(!reg.milestones[0].closed, "a reached milestone stays in view");
     }
 }

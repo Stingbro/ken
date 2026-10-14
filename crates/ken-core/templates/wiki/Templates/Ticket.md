@@ -2,7 +2,7 @@
 id: {{KEY}}-001
 title: "{{What needs doing}}"
 status: todo          # todo | in-progress | blocked | in-review | done | cancelled
-type: {{type}}        # bug | feature | design | spike | refactor | process
+type: {{type}}        # bug | feature | design | spike | refactor | process | milestone
 assignee: {{person}}  # or empty: unclaimed
 updated: {{date}}
 ---

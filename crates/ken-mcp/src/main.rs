@@ -228,7 +228,7 @@ The knowledge base is a library kept beside the code. The code is the truth for 
 library complements it and never copies it: it holds why things are built as they are, what was decided and \
 reversed, what came out of a meeting, and how the parts fit. Its sections: Rules/ (how the team works, binding), \
 Decisions/DECISIONS.md (every ruling, added and never edited), Design/, Current/ (the project, roadmap and feature \
-status, true now), Reference/ (vocabulary, how-tos, Platform/ for each dependency), Research/ (dated findings; \
+status, true now; RAID.md holds the risks and issues, R-nnn and I-nnn, each with an owner and a status), Reference/ (vocabulary, how-tos, Platform/ for each dependency), Research/ (dated findings; \
 Ingestion/Raw/ is the inbox, Ingestion/Ingested/ the notes), tickets/ (the work in flight and done) and log.md.
 
 How to answer:

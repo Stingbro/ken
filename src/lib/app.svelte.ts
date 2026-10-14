@@ -69,7 +69,7 @@ export type Screen =
   | "inbox"
   | "files"
   | "ingests"
-  | "timeline"
+  | "log"
   | "settings";
 
 /** Settings' sections (the Briefing design's sub-nav). Workspace holds the
@@ -819,9 +819,10 @@ class AppStore {
     this.openSettings("workspace");
   }
 
-  /** The project's raid log (knowledge-core decision 37). */
-  openTimeline() {
-    this.screen = "timeline";
+  /** The Log: the project's RAID register and milestones (knowledge-core
+   *  decision 37). */
+  openLog() {
+    this.screen = "log";
     this.searchOpen = false;
   }
 

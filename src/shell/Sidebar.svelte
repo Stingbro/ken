@@ -1,6 +1,6 @@
 <script lang="ts">
   // The sidebar (the Briefing design): the workspace at the top with how its sync
-  // stands, then Home, Inbox, Files, Ingest and Timeline, with Settings and
+  // stands, then Home, Inbox, Files, Ingest and Log, with Settings and
   // Collapse at the foot. Counts are amber only when they count things
   // waiting on you; a teal dot means something new with nothing to do.
   import type { Component } from "svelte";
@@ -16,7 +16,7 @@
   import Inbox from "@lucide/svelte/icons/inbox";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import FileInput from "@lucide/svelte/icons/file-input";
-  import History from "@lucide/svelte/icons/history";
+  import ClipboardList from "@lucide/svelte/icons/clipboard-list";
   import Settings from "@lucide/svelte/icons/settings";
   import PanelLeftClose from "@lucide/svelte/icons/panel-left-close";
   import PanelLeftOpen from "@lucide/svelte/icons/panel-left-open";
@@ -71,7 +71,7 @@
     { key: "inbox", icon: Inbox, label: "Inbox" },
     { key: "files", icon: FolderOpen, label: "Files" },
     { key: "ingests", icon: FileInput, label: "Ingest" },
-    { key: "timeline", icon: History, label: "Timeline" },
+    { key: "log", icon: ClipboardList, label: "Log" },
   ];
 </script>
 

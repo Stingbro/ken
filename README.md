@@ -5,7 +5,7 @@ Point Ken at your folder — notes, Word docs, spreadsheets, PDFs — and it
 indexes everything, watches for changes, and makes every fact findable:
 full-text search with AI quick answers, AI-maintained structured documents,
 Claude chats, a daily digest, deep web research, a project graph and a
-timeline, an MCP knowledge server for your agents, and Git/shared-drive sync with
+log (the project's risks, actions, issues, decisions and milestones), an MCP knowledge server for your agents, and Git/shared-drive sync with
 conflict review. Specs live in `docs/superpowers/specs/`, and the
 knowledge layer's plan of record in `docs/knowledge-core/DECISIONS.md`.
 

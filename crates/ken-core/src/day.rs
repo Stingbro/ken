@@ -764,6 +764,8 @@ pub struct Ticket {
     pub state: String,
     /// Open unless the status is `done` or `cancelled`.
     pub open: bool,
+    /// `type` as the file states it (bug, feature, milestone…; may be empty).
+    pub kind: String,
     pub assignees: Vec<String>,
     pub target: Option<String>,
     /// Inside its repo, with forward slashes.
@@ -794,6 +796,7 @@ pub fn parse_ticket(rel_path: &str, raw: &str) -> Ticket {
         title,
         open: !closed,
         state,
+        kind: get("type").trim().to_string(),
         // Only a YAML sequence is several assignees: `Staud, Chris` is one.
         assignees: tasks::map_values(&map, "assignee"),
         target: opt(get("target")).or_else(|| opt(get("due"))),

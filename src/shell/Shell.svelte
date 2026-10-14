@@ -9,7 +9,7 @@
   import FilesScreen from "../screens/FilesScreen.svelte";
   import IngestsScreen from "../screens/IngestsScreen.svelte";
   import InboxScreen from "../screens/InboxScreen.svelte";
-  import TimelineScreen from "../screens/TimelineScreen.svelte";
+  import LogScreen from "../screens/LogScreen.svelte";
   import SettingsScreen from "../screens/SettingsScreen.svelte";
   import { inbox } from "../lib/inbox.svelte";
   import WhatsNewDialog from "../whats-new/WhatsNewDialog.svelte";
@@ -88,8 +88,8 @@
       {#if visited.has("ingests")}
         <div class="pane" hidden={app.screen !== "ingests"}><IngestsScreen /></div>
       {/if}
-      {#if visited.has("timeline")}
-        <div class="pane" hidden={app.screen !== "timeline"}><TimelineScreen /></div>
+      {#if visited.has("log")}
+        <div class="pane" hidden={app.screen !== "log"}><LogScreen /></div>
       {/if}
       {#if visited.has("settings")}
         <div class="pane" hidden={app.screen !== "settings"}><SettingsScreen /></div>

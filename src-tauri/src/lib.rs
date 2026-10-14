@@ -8706,38 +8706,36 @@ fn graph_related(state: State<SharedState>, path: String, project_id: Option<Str
         .collect())
 }
 
-/// The Timeline: the project's raid log (knowledge-core decision 37), read
-/// from the workspace's knowledge base, else the focused repo.
+/// The Log: the project's RAID register and milestones (knowledge-core
+/// decision 37), read from the workspace's knowledge base, else the focused
+/// repo.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RaidLogDto {
-    /// The repo it was read from, so an entry's file opens there.
+struct RaidRegisterDto {
+    /// The repo it was read from, so an item's file opens there.
     project_id: Option<String>,
     name: Option<String>,
-    entries: Vec<ken_core::raidlog::Entry>,
+    register: ken_core::raidlog::Register,
 }
 
-/// Most entries the Timeline asks for by default.
-const RAID_LOG_LIMIT: usize = 1_000;
-
-/// The raid log (knowledge-core decision 37): every ingest, drift and lint
-/// run, ruling, ticket change, commit, finding and release, newest first,
-/// each linked to its source. Reads git, so it runs off the lock.
+/// The Log (knowledge-core decision 37): the risks, actions, issues and
+/// decisions, and the milestones, each with its status, owner, date and
+/// source. Reads git for releases, so it runs off the lock.
 #[tauri::command(async)]
-fn raid_log(state: State<SharedState>, limit: Option<usize>) -> CmdResult<RaidLogDto> {
+fn raid_register(state: State<SharedState>) -> CmdResult<RaidRegisterDto> {
     let (base, repos, focused) = {
         let guard = state.lock().unwrap();
         let focused = member(&guard, None).ok().map(|m| (m.project.config.name.clone(), m.project.config.id, m.project.root.clone()));
         (guard.base_dir.clone(), workspace_repos(&guard), focused)
     };
     let Some((name, id, root)) = knowledge_base_of(&repos, focused.as_ref().map(|f| f.1)).or(focused) else {
-        return Ok(RaidLogDto { project_id: None, name: None, entries: Vec::new() });
+        return Ok(RaidRegisterDto { project_id: None, name: None, register: Default::default() });
     };
     let db = Db::open_read_only(&base, id).map_err(err)?;
     let others: Vec<(String, PathBuf)> = repos.into_iter().filter(|r| r.1 != id).map(|(n, _, r)| (n, r)).collect();
     let offset = i64::from(chrono::Local::now().offset().local_minus_utc());
-    let entries = ken_core::raidlog::raid_log(&db, &root, &others, offset, limit.unwrap_or(RAID_LOG_LIMIT)).map_err(err)?;
-    Ok(RaidLogDto { project_id: Some(id.to_string()), name: Some(name), entries })
+    let register = ken_core::raidlog::register(&db, &root, &others, offset).map_err(err)?;
+    Ok(RaidRegisterDto { project_id: Some(id.to_string()), name: Some(name), register })
 }
 
 /// A code file's structure for the Files panel: its definitions in order
@@ -12583,7 +12581,7 @@ pub fn run() {
             index_health,
             page_links,
             graph_related,
-            raid_log,
+            raid_register,
             code_file,
             code_usages,
             run_drift_now,

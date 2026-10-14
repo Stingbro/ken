@@ -795,31 +795,44 @@ export interface RelatedNeighbour {
   path: string | null;
 }
 
-/** One entry of the project's raid log (knowledge-core decision 37). */
-export interface RaidEntry {
-  /** `YYYY-MM-DD`. */
+/** One item of the Log, the project's RAID register (knowledge-core
+ *  decision 37). Mirrors `raidlog::Item`. */
+export interface RaidItem {
+  /** `R-001`, a ticket id, `D-012`, a tag; empty for a roadmap row. */
+  id: string;
+  title: string;
+  /** Lowercase, as its source says it: `open`, `mitigated`,
+   *  `in-progress`, `live`, `superseded by D-020`, `reached`, `released`… */
+  status: string;
+  owner: string | null;
+  /** `YYYY-MM-DD`: raised, updated, ruled, due or reached; empty when none. */
   date: string;
-  /** Unix seconds, when the source says the time (a finding). */
-  at: number | null;
-  /** `ingest` | `drift` | `lint` | `ruling` | `ticket` | `commit` |
-   *  `finding` | `release` (or another kind a `log.md` line names). */
+  /** Folded away under its group. */
+  closed: boolean;
+  /** `risk` | `issue` | `ticket` | `ruling` | `roadmap` | `release`. */
   kind: string;
-  text: string;
-  /** Another repo's name, for its commit or release. */
+  /** Another repo's name, for its release. */
   repo: string | null;
-  /** The file it comes from, in the repo the log was read from. */
+  /** The file it comes from, in the repo the register was read from. */
   path: string | null;
   line: number | null;
-  /** A commit's sha or a release's tag. */
-  reference: string | null;
 }
 
-/** The Timeline: the raid log of the workspace's knowledge base, else the
+/** The register, group by group. */
+export interface RaidRegister {
+  risks: RaidItem[];
+  actions: RaidItem[];
+  issues: RaidItem[];
+  decisions: RaidItem[];
+  milestones: RaidItem[];
+}
+
+/** The Log: the RAID register of the workspace's knowledge base, else the
  *  focused repo. */
 export interface RaidLog {
   projectId: string | null;
   name: string | null;
-  entries: RaidEntry[];
+  register: RaidRegister;
 }
 
 /**
@@ -1685,9 +1698,9 @@ export const api = {
    *  21): `path` in the member `projectId` (default the focused one). */
   graphRelated: (path: string, projectId: string | null = null) =>
     invoke<RelatedNeighbour[]>("graph_related", { path, projectId }),
-  /** The Timeline, the project's raid log (knowledge-core decision 37),
-   *  newest first. */
-  raidLog: (limit: number | null = null) => invoke<RaidLog>("raid_log", { limit }),
+  /** The Log: the project's RAID register (risks, actions, issues,
+   *  decisions) and milestones (knowledge-core decision 37). */
+  raidRegister: () => invoke<RaidLog>("raid_register"),
 
   // ---- Memory (ken-memory task 4.1) ----
   /** Kick off a distillation pass over the current journal window. Returns
