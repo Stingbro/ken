@@ -942,6 +942,22 @@ pub fn raw_target(root: &Path, name: &str) -> Result<std::path::PathBuf> {
     Ok(target)
 }
 
+/// Most characters of a ruling or an action in an Inbox card's title.
+const CARD_TITLE_CHARS: usize = 90;
+
+/// A ruling or an action as an Inbox card's title: whole when it is short,
+/// else cut at the last word that fits, with an ellipsis, never mid-word
+/// ("…to write one file, by").
+pub fn card_title(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= CARD_TITLE_CHARS {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(CARD_TITLE_CHARS).collect();
+    let at_word = cut.rfind(char::is_whitespace).map_or(cut.as_str(), |i| &cut[..i]);
+    format!("{}…", at_word.trim_end_matches([',', ';', ':', ' ']))
+}
+
 /// A name made safe for a file: no path separators or characters Windows
 /// refuses, trimmed, at most 80 characters.
 pub fn file_safe(name: &str) -> String {
@@ -2283,7 +2299,7 @@ pub fn follow_ups(
             // Shown as the entry against the log now; added against the log
             // as it is then, so rulings from one note go in in any order.
             let proposed = decisions_entry(&text, &entry);
-            let title = format!("Ruling: {}", entry.ruling.chars().take(60).collect::<String>());
+            let title = format!("Ruling: {}", card_title(&entry.ruling));
             let who = entry.who.as_deref().map(|w| format!(", made by {w}")).unwrap_or_default();
             let body = format!(
                 "Said in {stem}{who}: \"{}\". Add it to the decisions log in one click; it takes the next number then. \
@@ -2305,7 +2321,7 @@ pub fn follow_ups(
             next += 1;
             let page = format!("tickets/{id}.md");
             let p = Proposal { from: from.clone(), ..Proposal::new(page.clone(), "", ticket_text(&id, action, who.as_deref(), &stem, date)) };
-            let title = format!("Ticket {id}: {}", action.chars().take(60).collect::<String>());
+            let title = format!("Ticket {id}: {}", card_title(action));
             let body = format!(
                 "An action from {stem}{}. Ken drafted {page} in the ticket format; accept it to write it, or discard it. \
                  Its type is for the team to set.",
@@ -2484,6 +2500,18 @@ pub fn card_of(payload: Option<&str>) -> Option<Card> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_card_title_is_whole_or_cut_at_a_word() {
+        let short = "Change `save_world` in `src/world.py` to write one file, by Friday";
+        assert_eq!(card_title(short), short, "a title that fits is whole");
+        let long = "Change `save_world` in `src/world.py` to write the whole world to one file, `saves/world.json`, by Friday next week";
+        let t = card_title(long);
+        assert!(t.ends_with('…') && t.chars().count() <= CARD_TITLE_CHARS + 1, "{t}");
+        assert!(long.starts_with(t.trim_end_matches('…')), "{t}");
+        let rest = &long[t.trim_end_matches('…').len()..];
+        assert!(rest.starts_with(' ') || rest.starts_with(", "), "cut at a word: {t}");
+    }
 
     #[test]
     fn a_long_source_is_cut_at_a_line_and_says_so() {
