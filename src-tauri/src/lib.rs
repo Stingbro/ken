@@ -6922,6 +6922,12 @@ type PassAt = (String, ken_core::ingest::PassPhase);
 static INGEST_READING: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, PassAt>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// The libraries whose ingest waits for its turn of the throttle now
+/// (paused, or the gap): the status panel lists the source as waiting, not
+/// running.
+static INGEST_WAITING: std::sync::LazyLock<Mutex<std::collections::HashSet<uuid::Uuid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// Why a library's last pass stopped before the end (Claude Code itself
 /// failed), until the next pass starts.
 static INGEST_STOPPED: std::sync::LazyLock<Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
@@ -7101,11 +7107,13 @@ fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::
                     // not count or hold (Chris, 2026-10-14).
                     let call = |prompt: &str| {
                         let reading = INGEST_READING.lock().unwrap().get(&id).map(|(raw, _)| raw.clone());
+                        INGEST_WAITING.lock().unwrap().insert(id);
                         let _turn = if reading.is_none_or(|raw| placed_by_build(&base, id, &raw)) {
                             ken_core::throttle::claude_turn(&|| false)
                         } else {
                             ken_core::throttle::own_turn(&|| false)
                         };
+                        INGEST_WAITING.lock().unwrap().remove(&id);
                         ken_core::ingest::call_result(ken_core::assistant::oneshot(
                             &binary,
                             &root,
@@ -11264,7 +11272,9 @@ fn background_status(state: State<SharedState>) -> CmdResult<BackgroundStatusDto
         let builds = semantic_builds().lock().unwrap_or_else(|p| p.into_inner());
         for (id, (done, total)) in builds.iter() {
             let name = members.iter().find(|m| m.0 == *id).map(|m| m.1.clone()).unwrap_or_default();
-            running.push(ken_core::throttle::Job { id: 0, kind: "meaning".into(), label: name, done: *done as u64, total: *total as u64 });
+            // Embedding waits while paused, between batches.
+            let waiting = snapshot.setting.paused;
+            running.push(ken_core::throttle::Job { id: 0, kind: "meaning".into(), label: name, done: *done as u64, total: *total as u64, waiting });
         }
     }
     // The source each inbox is reading now.
@@ -11276,7 +11286,8 @@ fn background_status(state: State<SharedState>) -> CmdResult<BackgroundStatusDto
             ken_core::ingest::PassPhase::Writing => "writing pages".into(),
         };
         let file = raw.rsplit('/').next().unwrap_or(raw);
-        running.push(ken_core::throttle::Job { id: 0, kind: "ingest".into(), label: format!("{name}: {file}, {what}"), done: 0, total: 0 });
+        let waiting = INGEST_WAITING.lock().unwrap().contains(id);
+        running.push(ken_core::throttle::Job { id: 0, kind: "ingest".into(), label: format!("{name}: {file}, {what}"), done: 0, total: 0, waiting });
     }
     let mut queued = Vec::new();
     for (id, name, root) in &members {

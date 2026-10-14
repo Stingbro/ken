@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildLine, jobLine, jobPct, kindLabel, PACES } from "./background";
+import { buildLine, jobLine, jobPct, kindLabel, PACES, waitLine } from "./background";
 
 describe("background status panel", () => {
   it("offers the three paces in order", () => {
@@ -12,6 +12,12 @@ describe("background status panel", () => {
     expect(jobPct({ kind: "meaning", label: "Game", done: 1, total: 4 })).toBe(25);
     expect(jobPct({ kind: "checks", label: "Wiki", done: 0, total: 0 })).toBeNull();
     expect(kindLabel("unknown")).toBe("unknown");
+  });
+
+  it("reads a job that waits for its turn as waiting", () => {
+    const job = { kind: "ingest", label: "Wiki: note.md, reading", done: 0, total: 0, waiting: true };
+    expect(waitLine(job, true)).toBe("Ingest · Wiki: note.md, reading · paused");
+    expect(waitLine(job, false)).toBe("Ingest · Wiki: note.md, reading · waiting for its turn");
   });
 
   it("sums up the build queue", () => {

@@ -210,6 +210,8 @@ export interface BackgroundJob {
   label: string;
   done: number;
   total: number;
+  /** Waiting for its turn (paused, the gap, another call), not working. */
+  waiting?: boolean;
 }
 
 export interface BackgroundFailure {

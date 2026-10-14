@@ -6,7 +6,7 @@
   // is started, stopped and widened here too.
   import { onMount } from "svelte";
   import { api, type BackgroundStatus, type Pace } from "../lib/api";
-  import { buildLine, jobLine, jobPct, kindLabel, PACES } from "../lib/background";
+  import { buildLine, jobLine, jobPct, kindLabel, PACES, waitLine } from "../lib/background";
   import { toast } from "../lib/toast.svelte";
   import ProgressBar from "../lib/ProgressBar.svelte";
 
@@ -40,6 +40,10 @@
   }
 
   const setting = $derived(status?.throttle.setting ?? { pace: "gentle" as Pace, paused: false });
+  // Work that waits for its turn (paused, the gap) is not running: it is
+  // listed with what waits.
+  const working = $derived((status?.running ?? []).filter((j) => !j.waiting));
+  const waitingJobs = $derived((status?.running ?? []).filter((j) => j.waiting));
 
   function setPace(pace: Pace) {
     void act("Could not set the pace", () => api.backgroundSet(pace, setting.paused));
@@ -83,7 +87,7 @@
   </p>
 
   <div class="section">Running</div>
-  {#each status?.running ?? [] as job, i (i)}
+  {#each working as job, i (i)}
     <div class="row">
       <span>{jobLine(job)}</span>
       {#if jobPct(job) !== null}<ProgressBar pct={jobPct(job)} />{/if}
@@ -93,10 +97,13 @@
   {/each}
 
   <div class="section">Queued</div>
+  {#each waitingJobs as job, i (i)}
+    <div class="row"><span>{waitLine(job, setting.paused)}</span></div>
+  {/each}
   {#each status?.queued ?? [] as q, i (i)}
     <div class="row"><span>{kindLabel(q.kind)} · {q.label} · {q.count}</span></div>
   {:else}
-    <p class="note">Nothing waits.</p>
+    {#if waitingJobs.length === 0}<p class="note">Nothing waits.</p>{/if}
   {/each}
 
   <div class="section">Building the library</div>

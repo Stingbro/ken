@@ -107,6 +107,10 @@ pub struct Job {
     /// How far, when it knows: `done` of `total`.
     pub done: u64,
     pub total: u64,
+    /// Whether it waits for its turn (paused, the gap, another call, the
+    /// hour) rather than working: the panel lists it as waiting, not
+    /// running.
+    pub waiting: bool,
 }
 
 /// Something that failed, and why, for the status panel.
@@ -193,6 +197,20 @@ impl State {
 
 static STATE: Mutex<State> = Mutex::new(State::new());
 
+thread_local! {
+    /// The job this thread shows as running ([`begin`]), so a wait on this
+    /// thread can show it as waiting.
+    static CURRENT_JOB: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Show this thread's job as waiting for its turn, or as working again.
+fn mark_waiting(on: bool) {
+    let Some(id) = CURRENT_JOB.with(|c| c.get()) else { return };
+    if let Some(j) = state().jobs.iter_mut().find(|j| j.id == id) {
+        j.waiting = on;
+    }
+}
+
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -254,16 +272,26 @@ fn sleep_unless(d: Duration, stop: &dyn Fn() -> bool) -> bool {
 }
 
 /// Wait while background work is paused. False when `stop` says to stop.
+/// This thread's job shows as waiting meanwhile.
 pub fn wait_unpaused(stop: &dyn Fn() -> bool) -> bool {
-    loop {
+    let mut waited = false;
+    let out = loop {
         if stop() {
-            return false;
+            break false;
         }
         if !paused() {
-            return true;
+            break true;
+        }
+        if !waited {
+            waited = true;
+            mark_waiting(true);
         }
         std::thread::sleep(POLL);
+    };
+    if waited {
+        mark_waiting(false);
     }
+    out
 }
 
 /// A background Claude call's turn, held until it is dropped. When it
@@ -297,15 +325,24 @@ pub fn own_turn(stop: &dyn Fn() -> bool) -> Option<Turn> {
 }
 
 fn wait_turn(stop: &dyn Fn() -> bool, counted: bool) -> Option<Turn> {
-    loop {
+    let mut waited = false;
+    let out = loop {
         if stop() {
-            return None;
+            break None;
         }
         if state().give_turn(Instant::now(), counted) {
-            return Some(Turn(()));
+            break Some(Turn(()));
+        }
+        if !waited {
+            waited = true;
+            mark_waiting(true);
         }
         std::thread::sleep(POLL);
+    };
+    if waited {
+        mark_waiting(false);
     }
+    out
 }
 
 /// Wait for a background step that is not a Claude call: while paused and
@@ -359,15 +396,22 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         state().jobs.retain(|j| j.id != self.0);
+        CURRENT_JOB.with(|c| {
+            if c.get() == Some(self.0) {
+                c.set(None);
+            }
+        });
     }
 }
 
-/// Show `label` as running work of `kind` until the guard drops.
+/// Show `label` as running work of `kind` until the guard drops. A wait for
+/// a turn on this thread meanwhile shows it as waiting.
 pub fn begin(kind: &str, label: &str) -> Running {
     let mut s = state();
     let id = s.next_id;
     s.next_id += 1;
-    s.jobs.push(Job { id, kind: kind.to_string(), label: label.to_string(), done: 0, total: 0 });
+    s.jobs.push(Job { id, kind: kind.to_string(), label: label.to_string(), done: 0, total: 0, waiting: false });
+    CURRENT_JOB.with(|c| c.set(Some(id)));
     Running(id)
 }
 
@@ -494,6 +538,21 @@ mod tests {
         assert!(!step_turn(&stop_soon), "paused: no step");
         asked.set(0);
         assert!(!wait_unpaused(&stop_soon));
+
+        // A job whose thread waits for its turn shows as waiting, and as
+        // working again once the wait is over.
+        let job = begin("ingest", "Wiki: note.md");
+        let seen = std::cell::Cell::new(false);
+        asked.set(0);
+        let watch = || {
+            seen.set(seen.get() || snapshot().running.iter().any(|j| j.label == "Wiki: note.md" && j.waiting));
+            asked.set(asked.get() + 1);
+            asked.get() > 3
+        };
+        assert!(claude_turn(&watch).is_none());
+        assert!(seen.get(), "listed as waiting while paused");
+        assert!(snapshot().running.iter().any(|j| j.label == "Wiki: note.md" && !j.waiting), "not waiting after");
+        drop(job);
 
         set(Setting { pace: Pace::Fast, paused: false });
         let never = || false;

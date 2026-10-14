@@ -36,6 +36,11 @@ export function jobLine(job: BackgroundJob): string {
   return job.total > 0 ? `${head} · ${job.done} of ${job.total}` : head;
 }
 
+/** A job that waits for its turn, as a line: `Ingest · Wiki · paused`. */
+export function waitLine(job: BackgroundJob, paused: boolean): string {
+  return `${jobLine(job)} · ${paused ? "paused" : "waiting for its turn"}`;
+}
+
 /** The build queue in one line: `12 of 60 read · 1 in the inbox · 2 failed`. */
 export function buildLine(b: BuildProgress): string {
   const parts = [`${b.done} of ${b.total} read`];
