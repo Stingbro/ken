@@ -357,15 +357,17 @@ mod tests {
     #[test]
     fn pages_are_placed_by_folder_then_name_then_reference() {
         let p = |rel: &str| place(rel).map(|m| (m.to, m.section));
-        assert_eq!(p("design/payments.md"), Some(("Design/payments.md".into(), "Design".into())));
+        assert_eq!(p("designs/payments.md"), Some(("Design/payments.md".into(), "Design".into())));
         assert_eq!(p("docs/architecture/save/format.md"), Some(("Design/save/format.md".into(), "Design".into())));
         assert_eq!(p("docs/adr-012-retries.md"), Some(("Decisions/docs/adr-012-retries.md".into(), "Decisions".into())));
         assert_eq!(p("meeting-notes/2026-10-01.md"), Some(("Research/2026-10-01.md".into(), "Research".into())));
         assert_eq!(p("Coding Standards.md"), Some(("Rules/Coding Standards.md".into(), "Rules".into())));
         assert_eq!(p("guides/setup.md"), Some(("Reference/guides/setup.md".into(), "Reference".into())));
         assert_eq!(p("Roadmap.md"), Some(("Current/Roadmap.md".into(), "Current".into())));
-        // Left where they are.
-        for stays in ["START-HERE.md", "README.md", "Design/x.md", "Rules/y.md", "Templates/Rule.md", "tickets/T-1.md", "logo.png"] {
+        // Left where they are. A section's folder in any case is that
+        // section already (`pagemeta::section_of`), and on a disk that
+        // ignores case `design/` and `Design/` are one folder.
+        for stays in ["START-HERE.md", "README.md", "Design/x.md", "design/x.md", "Rules/y.md", "Templates/Rule.md", "tickets/T-1.md", "logo.png"] {
             assert_eq!(place(stays), None, "{stays}");
         }
     }
@@ -398,20 +400,20 @@ mod tests {
         let root = d.path();
         crate::wikinew::create(&root.join("w"), "Realms", &[], "2026-10-13").unwrap();
         let root = root.join("w");
-        fs::create_dir_all(root.join("design")).unwrap();
-        fs::write(root.join("design/payments.md"), "# Payments\n\nSee [the guide](../guide.md).\n").unwrap();
-        fs::write(root.join("guide.md"), "# Guide\n\nRead [payments](design/payments.md).\n").unwrap();
+        fs::create_dir_all(root.join("designs")).unwrap();
+        fs::write(root.join("designs/payments.md"), "# Payments\n\nSee [the guide](../guide.md).\n").unwrap();
+        fs::write(root.join("guide.md"), "# Guide\n\nRead [payments](designs/payments.md).\n").unwrap();
         // A page already where the dry run would put the guide.
         fs::create_dir_all(root.join("Reference")).unwrap();
 
         let plan = plan(&root);
-        assert!(root.join("design/payments.md").is_file(), "the dry run moves nothing");
+        assert!(root.join("designs/payments.md").is_file(), "the dry run moves nothing");
         let tos: Vec<&str> = plan.moves.iter().map(|m| m.to.as_str()).collect();
         assert!(tos.contains(&"Design/payments.md") && tos.contains(&"Reference/guide.md"), "{tos:?}");
 
         let applied = apply(&root, &plan.moves, "2026-10-13").unwrap();
         assert_eq!(applied.moved.len(), 2);
-        assert!(!root.join("design/payments.md").exists() && root.join("Design/payments.md").is_file());
+        assert!(!root.join("designs/payments.md").exists() && root.join("Design/payments.md").is_file());
         assert_eq!(fs::read_to_string(root.join("Reference/guide.md")).unwrap(), "# Guide\n\nRead [payments](../Design/payments.md).\n");
         assert_eq!(fs::read_to_string(root.join("Design/payments.md")).unwrap(), "# Payments\n\nSee [the guide](../Reference/guide.md).\n");
         assert!(fs::read_to_string(root.join("Design/Index.md")).unwrap().contains("[[payments]]"));
