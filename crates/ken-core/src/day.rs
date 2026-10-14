@@ -1117,20 +1117,10 @@ impl Me {
     }
 }
 
-/// Read git's global identity. Missing git or unset keys read as `None`.
+/// Read git's global identity (`crate::git`). Missing git or unset keys
+/// read as `None`.
 pub fn git_me() -> Me {
-    let read = |key: &str| -> Option<String> {
-        let mut cmd = std::process::Command::new("git");
-        let out = crate::proc::quiet(&mut cmd)
-            .args(["config", "--global", "--get", key])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        opt(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
+    let read = |key: &str| crate::git::global_config(key).and_then(opt);
     Me { name: read("user.name"), email: read("user.email") }
 }
 

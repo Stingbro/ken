@@ -1,7 +1,10 @@
-//! The code map: where each symbol is defined, where it is used, what each
-//! file imports, and so who calls what and which files depend on which. The
-//! structure a person gets from "find usages" and "go to definition", for
-//! Claude and for search.
+//! The code index (knowledge-core decision 26, once called the code map):
+//! where each symbol is defined, where it is used, what each file imports,
+//! and so who calls what and which files depend on which. The structure a
+//! person gets from "find usages" and "go to definition", for Claude and for
+//! search: search finds a definition by plain words ("save world" is
+//! `saveWorld`, see [`joined_names`]), and each code hit names its symbol and
+//! the calls that go further ([`next_calls`]).
 //!
 //! Parsed locally with tree-sitter and each grammar's own tags query, the
 //! approach GitHub's code navigation takes: definitions and references by
@@ -130,7 +133,7 @@ thread_local! {
     static CONTEXT: RefCell<TagsContext> = RefCell::new(TagsContext::new());
 }
 
-/// The code map of one file, or None when its language is not mapped.
+/// The code index of one file, or None when its language is not mapped.
 pub fn map_file(path: &str, text: &str) -> Option<FileMap> {
     let lang = Lang::of(path)?;
     if text.len() > MAX_BYTES {
@@ -287,6 +290,83 @@ pub fn imports_of(lang: Lang, text: &str) -> Vec<String> {
 /// Where `name` is defined.
 pub fn definitions(db: &Db, name: &str) -> Result<Vec<Symbol>> {
     db.code_symbols(Some(name), None, Some(true), 200)
+}
+
+/// Most definitions one search joins by plain words ([`definitions_named`]).
+pub const NAMED_MAX: usize = 8;
+
+/// Most words of a question read for [`joined_names`].
+const NAMED_WORDS: usize = 12;
+
+/// The names a question's plain words may join into, each as a lookup key
+/// ([`joined_key`]): every run of two to four words in a row ("save world"
+/// is `saveworld`, which is `saveWorld`, `save_world` and `SaveWorld`), and
+/// a word that is itself a compound name (`saveWorld` as typed). Stopwords
+/// go first, so "where is get_current_user" joins `get current user`. One
+/// plain word alone is not looked up: as a symbol, "where", "set" and
+/// "user" each named dozens of unrelated definitions.
+pub fn joined_names(query: &str) -> Vec<String> {
+    let words: Vec<String> = crate::db::significant_tokens(query).into_iter().take(NAMED_WORDS).collect();
+    let mut keys: Vec<String> = Vec::new();
+    let mut add = |key: String| {
+        if key.chars().count() >= 4 && !keys.contains(&key) {
+            keys.push(key);
+        }
+    };
+    for (i, word) in words.iter().enumerate() {
+        if crate::search::camel_parts(word).len() > 1 {
+            add(joined_key(word));
+        }
+        for n in 2..=4 {
+            if let Some(run) = words.get(i..i + n) {
+                add(run.iter().map(|w| joined_key(w)).collect());
+            }
+        }
+    }
+    keys
+}
+
+/// A name as the plain-word lookup compares it: ASCII lowercase, with no
+/// underscores, so `saveWorld`, `save_world` and `SaveWorld` are one key.
+/// The index `code_symbols_joined` holds the same expression in SQL.
+pub fn joined_key(name: &str) -> String {
+    name.chars().filter(|c| *c != '_').map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// Definitions whose names the question's plain words join into
+/// ([`joined_names`]), at most `limit`: how a plain code question reaches
+/// the code index (knowledge-core decision 26). `routing::search_member`
+/// adds the chunks that hold them to its keyword hits.
+pub fn definitions_named(db: &Db, query: &str, limit: usize) -> Result<Vec<Symbol>> {
+    let keys = joined_names(query);
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    db.definitions_by_joined_name(&keys, limit)
+}
+
+/// The name a hit's symbol is looked up by: the first of packed definitions
+/// (`save, load, …` is `save`) and its last part (`Store.open` is `open`),
+/// as the code index stores names.
+pub fn lookup_name(symbol: &str) -> &str {
+    let first = symbol.split(", ").next().unwrap_or(symbol).trim();
+    first.rsplit('.').next().unwrap_or(first).trim()
+}
+
+/// The calls that go further from a code hit, by tool name (decision 26):
+/// where its symbol is used, the file's outline, what it imports and what
+/// imports it. None for a file the code index does not parse. Slice 10
+/// renames the tools (`code_usages`, `code_outline`, `code_imports`).
+pub fn next_calls(path: &str, symbol: Option<&str>) -> Option<String> {
+    Lang::of(path)?;
+    let path = path.replace('\\', "/");
+    let mut calls = Vec::new();
+    if let Some(name) = symbol.map(lookup_name).filter(|n| !n.is_empty() && *n != "…") {
+        calls.push(format!("find_usages {name}"));
+    }
+    calls.push(format!("file_outline {path}"));
+    calls.push(format!("related_files {path}"));
+    Some(calls.join(" · "))
 }
 
 /// One use of a symbol, with the definition it sits in (its caller).
@@ -608,6 +688,50 @@ mod tests {
         assert_eq!(r("app/core/x.py", ".auth").as_deref(), Some("app/core/auth.py"));
         assert_eq!(r("src/com/acme/Auth.java", "com.acme.Store").as_deref(), Some("src/com/acme/Store.java"));
         assert_eq!(r("src/lib/api.ts", "@tauri-apps/api/core"), None, "a library");
+    }
+
+    #[test]
+    fn plain_words_join_into_the_names_they_could_be() {
+        let keys = joined_names("how do we save the world");
+        assert!(keys.contains(&"saveworld".to_string()), "{keys:?}");
+        let keys = joined_names("where is get_current_user defined");
+        assert!(keys.contains(&"getcurrentuser".to_string()), "{keys:?}");
+        assert!(joined_names("saveWorld").contains(&"saveworld".to_string()), "a compound name as typed");
+        assert!(joined_names("config").is_empty(), "one plain word is not a name");
+        assert_eq!(joined_key("Save_World"), joined_key("saveWorld"));
+        assert_eq!(joined_key("SaveWorld"), "saveworld");
+    }
+
+    #[test]
+    fn plain_words_find_a_definition_in_any_casing() {
+        let mut db = Db::open_in_memory().unwrap();
+        for (path, src) in [
+            ("game/store.js", "function saveWorld(world) {\n  return world;\n}\n"),
+            ("py/store.py", "def save_world(w):\n    return w\n"),
+            ("cs/Store.cs", "class Store {\n  void SaveWorld() { }\n}\n"),
+            ("py/other.py", "def save(w):\n    return w\n"),
+        ] {
+            db.set_code_index(path, &map_file(path, src).unwrap()).unwrap();
+        }
+        let found = definitions_named(&db, "save world", NAMED_MAX).unwrap();
+        let names: Vec<(&str, &str)> = found.iter().map(|d| (d.path.as_str(), d.name.as_str())).collect();
+        for want in [("game/store.js", "saveWorld"), ("py/store.py", "save_world"), ("cs/Store.cs", "SaveWorld")] {
+            assert!(names.contains(&want), "{want:?} in {names:?}");
+        }
+        assert!(!names.iter().any(|(p, _)| *p == "py/other.py"), "`save` alone is not `save world`");
+        assert!(definitions_named(&db, "save", NAMED_MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_code_hit_offers_the_calls_that_go_further() {
+        assert_eq!(lookup_name("Store.open"), "open");
+        assert_eq!(lookup_name("save, load, …"), "save");
+        assert_eq!(
+            next_calls("app/store.py", Some("Store.save")).as_deref(),
+            Some("find_usages save · file_outline app/store.py · related_files app/store.py")
+        );
+        assert_eq!(next_calls("app\\store.py", None).as_deref(), Some("file_outline app/store.py · related_files app/store.py"));
+        assert_eq!(next_calls("README.md", Some("x")), None, "not code the index parses");
     }
 }
 

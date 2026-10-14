@@ -156,7 +156,7 @@ pub fn rebuild_semantic_index_with_profile(
             let chunked = if text.trim().is_empty() {
                 chunker::Chunked { chunks: vec![chunker::name_chunk(&file.rel_path)], capped: false }
             } else {
-                let defs = if crate::codemap::Lang::of(&file.rel_path).is_some() {
+                let defs = if crate::codeindex::Lang::of(&file.rel_path).is_some() {
                     db.code_symbols(None, Some(&file.rel_path), Some(true), 5000)?
                 } else {
                     Vec::new()

@@ -11,7 +11,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -105,12 +104,7 @@ fn one_line(s: &str) -> String {
 /// What git says about a repo: the branch it is on (None on no branch), its
 /// HEAD, its `origin` URL.
 fn repo_facts(dir: &Path) -> (Option<String>, Option<String>, Option<String>) {
-    let git = |args: &[&str]| {
-        let mut cmd = Command::new("git");
-        let out = crate::proc::quiet(&mut cmd).args(args).current_dir(dir).output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (out.status.success() && !s.is_empty()).then_some(s)
-    };
+    let git = |args: &[&str]| crate::git::output(dir, args).filter(|s| !s.is_empty());
     let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD");
     (branch, git(&["rev-parse", "HEAD"]), crate::setup::origin_url(dir))
 }
@@ -198,17 +192,7 @@ pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], t
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {
-    let mut cmd = Command::new("git");
-    let out = crate::proc::quiet(&mut cmd)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| Error::Other(format!("git could not run: {e}")))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Other(format!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())))
-    }
+    crate::git::run(dir, args).map_err(Error::Other)
 }
 
 /// Lay a new knowledge base down at `dir` (missing or empty) for `team`,

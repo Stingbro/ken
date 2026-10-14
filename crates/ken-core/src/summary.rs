@@ -177,7 +177,7 @@ mod tests {
         let chunks = crate::chunker::chunk_file("Design/Payments.md", text, &crate::chunker::IndexProfile::default_for("x.md"));
         db.upsert_chunks("Design/Payments.md", &chunks, crate::kenignore::Tier::Full).unwrap();
         db.upsert_file("src/pay.rs", "code", 1, 1, "indexed", None, "fn pay() {}").unwrap();
-        let code = crate::codemap::map_file("src/pay.rs", "fn pay() {}\n").unwrap();
+        let code = crate::codeindex::map_file("src/pay.rs", "fn pay() {}\n").unwrap();
         let chunked = crate::chunker::chunk_with("src/pay.rs", "fn pay() {}\n", &crate::chunker::IndexProfile::default_for("src/pay.rs"), &code.symbols);
         db.store_chunked("src/pay.rs", &chunked, crate::kenignore::Tier::Full).unwrap();
         db

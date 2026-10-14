@@ -238,8 +238,9 @@ one project."
         json!({
             "name": "find_definition",
             "description": "Where a symbol (function, method, class, struct, interface, module) is defined in the code, \
-from Ken's code map (tree-sitter, every indexed repo). Returns each definition's ken:// address with its line, its \
-kind and its doc comment. Use it like 'go to definition'; then read_document or Read the file at that line.",
+from Ken's code index (tree-sitter, every indexed repo). Returns each definition's ken:// address with its line, its \
+kind and its doc comment. Use it like 'go to definition', before Grep or Glob: one call instead of a search through \
+every file; then read_document or Read the file at that line.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -252,8 +253,8 @@ kind and its doc comment. Use it like 'go to definition'; then read_document or 
         json!({
             "name": "find_usages",
             "description": "Every place a symbol is used (called, referenced, instantiated), each with the function or \
-class it sits in, so its callers. Like 'find usages': who calls this, what breaks if it changes. Names only, no type \
-resolution: two different symbols with one name both show.",
+class it sits in, so its callers. Like 'find usages': who calls this, what breaks if it changes. Use it before Grep \
+for a symbol's uses. Names only, no type resolution: two different symbols with one name both show.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -266,8 +267,8 @@ resolution: two different symbols with one name both show.",
         }),
         json!({
             "name": "file_outline",
-            "description": "A code file's definitions in order, nested (classes and their methods), each with its line. \
-Drill into a file before reading all of it.",
+            "description": "A code file's definitions in order, nested (classes and their methods), each with its line, \
+from Ken's code index. Drill into a file with it before reading all of it or grepping it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -280,7 +281,8 @@ Drill into a file before reading all of it.",
         json!({
             "name": "related_files",
             "description": "A code file's neighbours: the files it imports, the files that import it, and the libraries \
-it uses. For how a module fits in and what depends on it.",
+it uses, from Ken's code index. For how a module fits in and what depends on it; use it before Grep or Glob for \
+imports.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -395,7 +397,9 @@ one merged ranked list, with any project still building its meaning index or slo
 answer said so. Each hit is short — repo:path:line \
 to cite, ken:// address, kind, and about 300 characters around the best-matching lines — so \
 ten hits cost about 6,000 characters. For more of a hit call read_document with its ken:// \
-address (the #L line included): the lines around it, one cheap call. Meaning search uses \
+address (the #L line included): the lines around it, one cheap call. A code hit names \
+the definition it holds (`saveWorld`; plain words like \"save world\" find it) and the calls \
+that go further (find_usages, file_outline, related_files). Meaning search uses \
 Ken's installed embedding model; without it the answer says it was keyword only.",
             "inputSchema": {
                 "type": "object",
@@ -1017,11 +1021,12 @@ fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
         for (i, hit) in hits.iter().enumerate() {
             let (snippet, line) = short_hit(&db, Some(&project.root), &query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, SNIPPET_CHARS);
             out.push_str(&format!(
-                "\n{}. {} {}{} ({}{}) [{}]",
+                "\n{}. {} {}{}{} ({}{}) [{}]",
                 i + 1,
                 hit_tag(&hit.path, hit.label.as_deref()),
                 hit.path,
                 line.map(|l| format!(":{l}")).unwrap_or_default(),
+                symbol_tag(hit.symbol.as_deref()),
                 ken_address(project.config.id, &hit.path),
                 line.map(|l| format!("#L{l}")).unwrap_or_default(),
                 source_label(hit.source),
@@ -1030,6 +1035,7 @@ fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
                 out.push_str(&format!(" ({note})"));
             }
             out.push_str(&indented(&snippet));
+            out.push_str(&next_line(&hit.path, hit.symbol.as_deref()));
         }
     }
     Ok(out)
@@ -1064,9 +1070,6 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
                 .collect()
         }
     };
-    let fmt = "--format=%x1e%h%x1f%ad%x1f%an%x1f%s";
-    let n = format!("-n{limit}");
-    let since = days.map(|d| format!("--since={d}.days.ago"));
     let mut out = String::new();
     let mut count = 0;
     let mut changed_files = 0;
@@ -1088,47 +1091,30 @@ fn history(server: &Server, args: &Value) -> Result<String, String> {
             changed_files += files.len();
             continue;
         }
-        let mut runs: Vec<Vec<String>> = Vec::new();
-        let base = |extra: &[&str]| -> Vec<String> {
-            let mut v: Vec<String> = vec!["log".into(), n.clone(), "--date=short".into(), fmt.into()];
-            v.extend(since.iter().cloned());
-            v.extend(extra.iter().map(|s| s.to_string()));
-            v
+        // Read through the git helper drift shares (`ken_core::git`,
+        // knowledge-core decision 27).
+        let runs: Vec<Vec<String>> = match (&path, &query) {
+            (Some(p), _) => vec![vec!["--follow".into(), "--".into(), p.clone()]],
+            (None, Some(q)) => vec![
+                vec!["--name-only".into(), "-i".into(), format!("--grep={q}")],
+                vec!["--name-only".into(), format!("-S{q}")],
+            ],
+            (None, None) => vec![vec!["--name-only".into()]],
         };
-        match (&path, &query) {
-            (Some(p), _) => runs.push(base(&["--follow", "--", p])),
-            (None, Some(q)) => {
-                runs.push(base(&["--name-only", "-i", &format!("--grep={q}")]));
-                runs.push(base(&["--name-only", &format!("-S{q}")]));
-            }
-            (None, None) => runs.push(base(&["--name-only"])),
-        }
         let mut seen: Vec<String> = Vec::new();
-        for run in runs {
-            let mut cmd = std::process::Command::new("git");
-            let got = ken_core::proc::quiet(&mut cmd)
-                .args(&run)
-                .current_dir(root)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output();
-            let Ok(got) = got else { continue };
-            if !got.status.success() {
-                continue;
-            }
-            for record in String::from_utf8_lossy(&got.stdout).split('\u{1e}').filter(|r| !r.trim().is_empty()) {
-                let mut lines = record.lines();
-                let head: Vec<&str> = lines.next().unwrap_or("").split('\u{1f}').collect();
-                let [sha, date, author, subject] = head[..] else { continue };
-                if seen.iter().any(|s| s == sha) || count >= limit {
+        for run in &runs {
+            let extra: Vec<&str> = run.iter().map(String::as_str).collect();
+            let Some(commits) = ken_core::git::log(root, limit, days, &extra) else { continue };
+            for c in commits {
+                if seen.contains(&c.sha) || count >= limit {
                     continue;
                 }
-                seen.push(sha.to_string());
+                seen.push(c.sha.clone());
                 count += 1;
-                out.push_str(&format!("\n{count}. {sha} {date} {author} — {subject} ({project})"));
-                let files: Vec<&str> = lines.map(str::trim).filter(|l| !l.is_empty()).take(6).collect();
+                out.push_str(&format!("\n{count}. {} {} {} — {} ({project})", c.sha, c.date, c.author, c.subject));
                 // A path from an older commit may have moved or gone since:
                 // an address only for what is there now.
-                for f in files {
+                for f in c.files.iter().take(6) {
                     if root.join(f).exists() {
                         out.push_str(&format!("\n     {}", ken_address(*id, f)));
                     } else {
@@ -1193,7 +1179,7 @@ fn find_definition(server: &Server, args: &Value) -> Result<String, String> {
     let mut out = String::new();
     let mut n = 0;
     for (id, project, db) in &indexes {
-        for d in ken_core::codemap::definitions(db, &name).map_err(|e| e.to_string())? {
+        for d in ken_core::codeindex::definitions(db, &name).map_err(|e| e.to_string())? {
             n += 1;
             let docs = d.docs.as_deref().map(|t| format!(" — {}", t.lines().next().unwrap_or("").trim())).unwrap_or_default();
             out.push_str(&format!(
@@ -1208,7 +1194,7 @@ fn find_definition(server: &Server, args: &Value) -> Result<String, String> {
         }
     }
     if n == 0 {
-        return Ok(format!("No definition of {name:?} in the code map of {} project(s). {LOOK_YOURSELF}", indexes.len()));
+        return Ok(format!("No definition of {name:?} in the code index of {} project(s). {LOOK_YOURSELF}", indexes.len()));
     }
     Ok(format!("{n} definition{} of {name:?}:{out}", if n == 1 { "" } else { "s" }))
 }
@@ -1222,7 +1208,7 @@ fn find_usages(server: &Server, args: &Value) -> Result<String, String> {
     let mut callers: Vec<String> = Vec::new();
     let mut files: std::collections::BTreeSet<String> = Default::default();
     for (id, project, db) in &indexes {
-        let calls = ken_core::codemap::usages(db, &name, limit).map_err(|e| e.to_string())?;
+        let calls = ken_core::codeindex::usages(db, &name, limit).map_err(|e| e.to_string())?;
         let known: Vec<(String, i64)> = calls.iter().map(|u| (u.path.clone(), u.line)).collect();
         for u in &calls {
             if lines.len() >= limit {
@@ -1239,7 +1225,7 @@ fn find_usages(server: &Server, args: &Value) -> Result<String, String> {
         }
         // Uses the grammar does not count as calls: passed as a value, named
         // in a type, a decorator, an export.
-        for m in ken_core::codemap::mentions(db, &name, &known, limit).map_err(|e| e.to_string())? {
+        for m in ken_core::codeindex::mentions(db, &name, &known, limit).map_err(|e| e.to_string())? {
             if mention_lines.len() >= limit {
                 break;
             }
@@ -1251,7 +1237,7 @@ fn find_usages(server: &Server, args: &Value) -> Result<String, String> {
     let calls_only = lines.len();
     lines.extend(mention_lines);
     if lines.is_empty() {
-        return Ok(format!("No uses of {name:?} in the code map of {} project(s). {LOOK_YOURSELF}", indexes.len()));
+        return Ok(format!("No uses of {name:?} in the code index of {} project(s). {LOOK_YOURSELF}", indexes.len()));
     }
     let mut out = format!(
         "{} use{} of {name:?} in {} file{} ({calls_only} call{}, {} other reference{})",
@@ -1279,14 +1265,14 @@ fn index_with_file(server: &Server, args: &Value, path: &str) -> Result<(Uuid, S
     let at = indexes
         .iter()
         .position(|(_, _, db)| db.code_symbols(None, Some(path), None, 1).is_ok_and(|s| !s.is_empty()))
-        .ok_or_else(|| format!("No code map for {path:?}: not an indexed code file in a mapped language (Rust, Python, JavaScript, TypeScript, Go, Java, C#). {LOOK_YOURSELF}"))?;
+        .ok_or_else(|| format!("{path:?} is not in the code index: not an indexed code file in a mapped language (Rust, Python, JavaScript, TypeScript, Go, Java, C#). {LOOK_YOURSELF}"))?;
     Ok(indexes.swap_remove(at))
 }
 
 fn file_outline(server: &Server, args: &Value) -> Result<String, String> {
     let path = require_str(args, "path")?.replace('\\', "/");
     let (id, project, db) = index_with_file(server, args, &path)?;
-    let outline = ken_core::codemap::outline(&db, &path).map_err(|e| e.to_string())?;
+    let outline = ken_core::codeindex::outline(&db, &path).map_err(|e| e.to_string())?;
     let mut out = format!("{} ({project}) — {} definitions:", ken_address(id, &path), outline.len());
     for (depth, d) in outline {
         out.push_str(&format!("\n{}{} {} — L{}-{}", "  ".repeat(depth), d.kind, d.name, d.line, d.end_line));
@@ -1297,7 +1283,7 @@ fn file_outline(server: &Server, args: &Value) -> Result<String, String> {
 fn related_files(server: &Server, args: &Value) -> Result<String, String> {
     let path = require_str(args, "path")?.replace('\\', "/");
     let (id, project, db) = index_with_file(server, args, &path)?;
-    let r = ken_core::codemap::related(&db, &path).map_err(|e| e.to_string())?;
+    let r = ken_core::codeindex::related(&db, &path).map_err(|e| e.to_string())?;
     let list = |files: &[String]| -> String {
         if files.is_empty() {
             " (none)".to_string()
@@ -1341,6 +1327,20 @@ fn hit_tag(path: &str, label: Option<&str>) -> String {
         Some(l) => format!("[{l}]"),
         None => format!("[{}]", ken_core::contenttype::of(path).as_str()),
     }
+}
+
+/// A code hit's symbol beside its path, in backticks (`` `saveWorld` ``):
+/// every code hit names what it holds (knowledge-core decision 26), and the
+/// chat card reads it from there. Empty for a hit with no symbol.
+fn symbol_tag(symbol: Option<&str>) -> String {
+    symbol.map(str::trim).filter(|s| !s.is_empty()).map(|s| format!(" `{s}`")).unwrap_or_default()
+}
+
+/// The calls that go further from a code hit, under its snippet
+/// (`codeindex::next_calls`): its symbol's usages, the file's outline and
+/// its imports. Empty for a file the code index does not parse.
+fn next_line(path: &str, symbol: Option<&str>) -> String {
+    ken_core::codeindex::next_calls(path, symbol).map(|c| format!("\n   next: {c}")).unwrap_or_default()
 }
 
 // --- short hits and meaning search ---
@@ -1735,10 +1735,11 @@ fn format_execution_report(report: &routing::ExecutionReport, members: &[MemberI
     for (i, hit) in report.results.iter().enumerate() {
         // The locator is what to cite; the ken:// address is what to open.
         out.push_str(&format!(
-            "\n{}. {} {} ({}{}) [{}]",
+            "\n{}. {} {}{} ({}{}) [{}]",
             i + 1,
             hit_tag(&hit.path, hit.label.as_deref()),
             hit.locator,
+            symbol_tag(hit.symbol.as_deref()),
             hit.address,
             hit.line.map(|l| format!("#L{l}")).unwrap_or_default(),
             source_label(hit.source),
@@ -1747,6 +1748,7 @@ fn format_execution_report(report: &routing::ExecutionReport, members: &[MemberI
             out.push_str(&format!(" ({note})"));
         }
         out.push_str(&indented(&hit.snippet));
+        out.push_str(&next_line(&hit.path, hit.symbol.as_deref()));
     }
     out
 }
@@ -2487,6 +2489,13 @@ mod tests {
 
         let (text, _) = tool(&mut fx.server, "find_definition", json!({"name": "nothing_like_it"}));
         assert!(text.contains("look directly"), "empty says to look: {text}");
+
+        // Plain words reach the definition; the hit names its symbol and
+        // offers the calls that go further (decision 26).
+        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "save world"}));
+        assert!(text.contains("app/store.py:2 `save_world`"), "{text}");
+        assert!(text.contains("next: find_usages save_world · file_outline app/store.py · related_files app/store.py"), "{text}");
+        assert!(!text.contains("next: file_outline notes/"), "pages offer no code calls: {text}");
     }
 
     #[test]

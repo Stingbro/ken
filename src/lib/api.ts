@@ -1124,6 +1124,9 @@ export interface RoutedHit {
    *  (`decision D-410 · binding · 2026-10-06`, `ticket · superseded · 2026-07-21`,
    *  `code · service · 2026-10-01`). */
   label: string | null;
+  /** For a code hit, the definition its chunk holds (`Store.open`, or
+   *  `save, load` when it packs several). */
+  symbol: string | null;
 }
 
 /** What a hit on a wiki page carries (mirrors `pagemeta::HitPage`). */
@@ -1363,7 +1366,7 @@ export const api = {
   pageLinks: (path: string) =>
     invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),
   /** A code file's outline (definitions, nested) and the files it imports
-   *  and is imported by, from Ken's code map. */
+   *  and is imported by, from Ken's code index. */
   codeFile: (path: string) => invoke<CodeFile>("code_file", { path }),
   /** Go to definition and find usages for a symbol, across the workspace. */
   codeUsages: (name: string) => invoke<CodeUsages>("code_usages", { name }),

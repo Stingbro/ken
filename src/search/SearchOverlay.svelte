@@ -67,6 +67,8 @@
     contentType: ContentType;
     /** One label per hit: `kind · tier or role · date`. */
     label: string | null;
+    /** For a code hit, the definition it holds. */
+    symbol: string | null;
   }
 
   let results = $state<DisplayHit[]>([]);
@@ -278,6 +280,7 @@
       memberName: all ? h.memberName : null,
       contentType: h.contentType,
       label: h.label,
+      symbol: h.symbol,
     }));
     searched = true;
     selected = 0;
@@ -485,6 +488,9 @@
             <span class="meta">
               <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
               <span class="path mono" title={hit.path}>{hit.path.split("/").pop() || hit.path}</span>
+              {#if hit.symbol}
+                <span class="symbol mono" title="The definition this passage holds">{hit.symbol}</span>
+              {/if}
               {#if hit.label || hit.contentType}
                 <span class="tag tag-kind" title="What this file is, how much it counts and when it last changed">{hit.label ?? hit.contentType}</span>
               {/if}
@@ -729,6 +735,13 @@
   .path {
     font-size: 11.5px;
     color: var(--ink-tertiary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .symbol {
+    font-size: 11.5px;
+    color: var(--ink-secondary, var(--ink));
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

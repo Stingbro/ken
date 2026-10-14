@@ -172,6 +172,20 @@ fn result_preview(content: Option<&Value>) -> String {
             .join("\n"),
         _ => String::new(),
     };
+    // A search's hits (`3. [code · service] repo:src/a.ts:12 `saveWorld`
+    // (ken://…)`): the card lists each hit's line without its snippet, so it
+    // shows what was found, and a code hit's symbol beside its path
+    // (knowledge-core decision 26).
+    let hits: Vec<&str> = text.lines().filter(|l| is_hit_line(l)).collect();
+    if hits.len() > 1 {
+        let mut out = hits.iter().take(HIT_LINES).copied().collect::<Vec<_>>().join("\n");
+        if out.chars().count() > 1200 {
+            out = out.chars().take(1200).collect::<String>() + "…";
+        } else if hits.len() > HIT_LINES {
+            out.push_str("\n…");
+        }
+        return out;
+    }
     let mut out: String = text.lines().take(8).collect::<Vec<_>>().join("\n");
     if out.chars().count() > 600 {
         out = out.chars().take(600).collect::<String>() + "…";
@@ -179,6 +193,16 @@ fn result_preview(content: Option<&Value>) -> String {
         out.push_str("\n…");
     }
     out
+}
+
+/// Most hit lines a search's card keeps.
+const HIT_LINES: usize = 10;
+
+/// Whether a line of a tool result is one of Ken's search hits: numbered,
+/// with a ken:// address in brackets (`2. [doc] repo:a.md:4 (ken://…)`).
+fn is_hit_line(line: &str) -> bool {
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && line[digits..].starts_with(". ") && line.contains(" (ken://")
 }
 
 /// "Read notes/meeting.md" — a human-readable one-liner for a tool_use block.
@@ -190,7 +214,8 @@ fn summarize_tool(block: &Value) -> String {
     };
     let input = block.get("input");
     let arg = input.and_then(|i| {
-        ["file_path", "path", "pattern", "command", "query", "url", "notebook_path", "description"]
+        // `name` is the symbol Ken's code tools look up: the card shows it.
+        ["file_path", "path", "pattern", "command", "query", "url", "notebook_path", "name", "description"]
             .iter()
             .find_map(|k| i.get(k).and_then(Value::as_str))
     });
@@ -225,10 +250,12 @@ Never open files or switch the person's screen yourself; a link \
 is how they go there.\n\
 3. Search with Ken first. Ken's tools (mcp__ken__route_query across the workspace, mcp__ken__semantic_search in one \
 project, mcp__ken__kg_search over the knowledge graph, mcp__ken__read_document) search \
-the team's wiki, docs and code with Ken's own ranking and return ken:// addresses to cite. For code, navigate like an \
-IDE: mcp__ken__find_definition to go to a symbol, mcp__ken__find_usages for every use and its callers, \
-mcp__ken__file_outline to drill into a file, mcp__ken__related_files for what it imports and what imports it; then \
-read the lines they point to. mcp__ken__history tells when and why something changed (a file's commits, commits \
+the team's wiki, docs and code with Ken's own ranking and return ken:// addresses to cite. For code, use Ken's code \
+index before Grep and Glob, and navigate like an IDE: mcp__ken__find_definition to go to a symbol, \
+mcp__ken__find_usages for every use and its callers, mcp__ken__file_outline to drill into a file, \
+mcp__ken__related_files for what it imports and what imports it; then read the lines they point to. A code hit from \
+search names the symbol it holds and the calls that go further, and plain words find a symbol (\"save world\" finds \
+saveWorld). mcp__ken__history tells when and why something changed (a file's commits, commits \
 about some words, or with neither, what changed in the last `days` across every repo, git or not). Ken's tools and \
 Grep, Glob and Read cover every question about the files; do not run shell commands to look at them. \
 mcp__ken__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or show \
@@ -1623,6 +1650,19 @@ line 2") && preview.ends_with("…"), "{preview}");
         assert!(!preview.contains("line 9"));
         let wide = serde_json::json!({ "name": "Grep", "input": { "pattern": "é".repeat(100) } });
         assert_eq!(summarize_tool(&wide).chars().count(), "Grep ".len() + 80);
+    }
+
+    /// A search's card lists its hits, each code hit with its symbol beside
+    /// its path, and a code tool's card names the symbol it looked up.
+    #[test]
+    fn a_search_card_lists_its_hits_and_their_symbols() {
+        let result = "Route: every source (1 searched).\nSources: game (searched)\n\n1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld` (ken://a/src/world.ts#L3) [keyword]\n   export function saveWorld(w: string) {\n   next: find_usages saveWorld · file_outline src/world.ts · related_files src/world.ts\n2. [doc · reference · 2026-09-01] game:README.md:1 (ken://a/README.md#L1) [keyword]\n   # Game";
+        let preview = result_preview(Some(&Value::String(result.into())));
+        assert_eq!(preview.lines().count(), 2, "{preview}");
+        assert!(preview.starts_with("1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld`"), "{preview}");
+        assert!(!preview.contains("export function"), "no snippets: {preview}");
+        let find = serde_json::json!({ "name": "mcp__ken__find_definition", "input": { "name": "save_world" } });
+        assert_eq!(summarize_tool(&find), "Ken find definition save_world");
     }
 
     fn control_responses(dir: &Path) -> Vec<Value> {

@@ -515,12 +515,12 @@ fn index_one(
             db.set_file_byte_hash(rel, &hash, mtime)?;
         }
     }
-    // The code map: definitions, references and imports, for "find usages"
+    // The code index: definitions, references and imports, for "find usages"
     // and "go to definition". Every tier: a code repo is search-only and
     // this is exactly what it is searched for. Made before the chunks, which
     // cut code at its definitions.
-    let map = crate::codemap::Lang::of(rel).map(|_| {
-        if status == STATUS_INDEXED { crate::codemap::map_file(rel, &text).unwrap_or_default() } else { Default::default() }
+    let map = crate::codeindex::Lang::of(rel).map(|_| {
+        if status == STATUS_INDEXED { crate::codeindex::map_file(rel, &text).unwrap_or_default() } else { Default::default() }
     });
     // Chunks, for keyword search over sections and `repo:path:line`
     // citations. They need no model, so every indexed file has them; the
@@ -542,7 +542,7 @@ fn index_one(
         db.set_page_links(rel, &links)?;
     }
     if let Some(map) = &map {
-        db.set_code_map(rel, map)?;
+        db.set_code_index(rel, map)?;
     }
     // Incremental Map: an indexed file whose content changed is queued for
     // local-LLM extraction. The hash is over the extracted text, so mtime/size
@@ -1447,10 +1447,10 @@ mod tests {
         assert_eq!(db.backfill_extractions().unwrap(), 2);
     }
 
-    /// A folder a `.kenignore` line drops leaves the code map with its files,
+    /// A folder a `.kenignore` line drops leaves the code index with its files,
     /// so find-usages never points into it; unignored, it is mapped again.
     #[test]
-    fn an_ignored_folder_leaves_the_code_map() {
+    fn an_ignored_folder_leaves_the_code_index() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("app")).unwrap();
         fs::create_dir_all(dir.path().join("web")).unwrap();

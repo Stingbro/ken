@@ -851,10 +851,10 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     if let Err(e) = db.backfill_page_links() {
         eprintln!("warning: page links backfill failed: {e}");
     }
-    // The code map for an index made before it: definitions, usages and
+    // The code index for an index made before it: definitions, usages and
     // imports parsed from the stored text, no rescan.
-    if let Err(e) = db.backfill_code_map() {
-        eprintln!("warning: code map backfill failed: {e}");
+    if let Err(e) = db.backfill_code_index() {
+        eprintln!("warning: code index backfill failed: {e}");
     }
 
     // One-time extraction backfill: a project indexed before the incremental
@@ -7999,7 +7999,7 @@ fn page_links(state: State<SharedState>, path: String) -> CmdResult<ken_core::li
 #[serde(rename_all = "camelCase")]
 struct CodeFileDto {
     outline: Vec<CodeOutlineItem>,
-    related: ken_core::codemap::Related,
+    related: ken_core::codeindex::Related,
 }
 
 #[derive(Serialize)]
@@ -8007,19 +8007,19 @@ struct CodeFileDto {
 struct CodeOutlineItem {
     depth: usize,
     #[serde(flatten)]
-    symbol: ken_core::codemap::Symbol,
+    symbol: ken_core::codeindex::Symbol,
 }
 
 #[tauri::command(async)]
 fn code_file(state: State<SharedState>, path: String) -> CmdResult<CodeFileDto> {
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
-    let outline = ken_core::codemap::outline(&active.db, &path)
+    let outline = ken_core::codeindex::outline(&active.db, &path)
         .map_err(err)?
         .into_iter()
         .map(|(depth, symbol)| CodeOutlineItem { depth, symbol })
         .collect();
-    let related = ken_core::codemap::related(&active.db, &path).map_err(err)?;
+    let related = ken_core::codeindex::related(&active.db, &path).map_err(err)?;
     Ok(CodeFileDto { outline, related })
 }
 
@@ -8079,15 +8079,15 @@ async fn code_usages(state: State<'_, SharedState>, name: String) -> CmdResult<C
                 kind,
                 within,
             };
-            for d in ken_core::codemap::definitions(&db, &name).map_err(err)? {
+            for d in ken_core::codeindex::definitions(&db, &name).map_err(err)? {
                 out.definitions.push(dto(d.path, d.line, d.kind, None));
             }
-            let calls = ken_core::codemap::usages(&db, &name, 200).map_err(err)?;
+            let calls = ken_core::codeindex::usages(&db, &name, 200).map_err(err)?;
             let known: Vec<(String, i64)> = calls.iter().map(|u| (u.path.clone(), u.line)).collect();
             for u in calls {
                 out.uses.push(dto(u.path, u.line, u.kind, u.within));
             }
-            for m in ken_core::codemap::mentions(&db, &name, &known, 200).map_err(err)? {
+            for m in ken_core::codeindex::mentions(&db, &name, &known, 200).map_err(err)? {
                 out.uses.push(dto(m.path, m.line, m.kind, m.within));
             }
         }
@@ -8866,6 +8866,8 @@ struct RoutedHitDto {
     /// One label per hit: `kind · tier or role · date`
     /// (`authority::hit_label`).
     label: Option<String>,
+    /// For a code hit, the definition it holds (`Store.open`).
+    symbol: Option<String>,
 }
 
 impl From<routing::RoutedHit> for RoutedHitDto {
@@ -8888,6 +8890,7 @@ impl From<routing::RoutedHit> for RoutedHitDto {
             locator: h.locator,
             page: h.page,
             label: h.label,
+            symbol: h.symbol,
         }
     }
 }

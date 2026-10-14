@@ -15,10 +15,12 @@ use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
-/// Meta key: the code map was filled from stored text for this index.
-const CODE_MAP_BACKFILLED: &str = "code_map_backfilled";
+/// Meta key: the code index was filled from stored text for this index. The
+/// stored key keeps its old name, so an index filled before the rename is not
+/// filled twice.
+const CODE_INDEX_BACKFILLED: &str = "code_map_backfilled";
 
 /// Install the statically-linked sqlite-vec (`vec0`) extension into SQLite's
 /// process-global auto-extension list exactly once. sqlite-vec is compiled into
@@ -658,10 +660,10 @@ impl Db {
             )?;
         }
         if version < 15 {
-            // The code map (`codemap`): each code file's definitions and
+            // The code index (`codeindex`): each code file's definitions and
             // references, from tree-sitter's tags queries, and what it
             // imports. Filled as files are indexed, and from stored text for
-            // an index made before (`backfill_code_map`).
+            // an index made before (`backfill_code_index`).
             self.conn.execute_batch(
                 r#"
                 CREATE TABLE IF NOT EXISTS code_symbols (
@@ -687,9 +689,9 @@ impl Db {
             // index-words (2026-10-06): the keyword index gains a `names`
             // column (`fts_names`), so it is made again and filled from the
             // stored chunks, with no file read (now by v23). Files whose chunks or
-            // code map changed with it are read again by the next scan, once:
+            // code index changed with it are read again by the next scan, once:
             // JSON (each chunk now starts with its key outline) and the
-            // languages whose code map gained kinds (Java enums, fields and
+            // languages whose code index gained kinds (Java enums, fields and
             // records; TypeScript enums and type aliases). Clearing the byte
             // hash makes the scan read them rather than see an unchanged file.
             // The keyword index itself is made again by v23, with today's
@@ -890,6 +892,16 @@ impl Db {
             }
             self.conn.execute_batch("DELETE FROM meta WHERE key = 'vocabulary';")?;
             self.rebuild_chunks_fts()?;
+        }
+        if version < 25 {
+            // knowledge-core decision 26: plain words find a definition by
+            // its name in any casing ("save world" is `saveWorld`,
+            // `save_world`, `SaveWorld`), through an index on the name as
+            // `codeindex::joined_key` writes it. Definitions only. Nothing is
+            // read again.
+            self.conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS code_symbols_joined ON code_symbols(lower(replace(name, '_', ''))) WHERE is_def = 1;",
+            )?;
         }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
@@ -1636,7 +1648,7 @@ impl Db {
     /// `events.source`, `entities.sources` (a JSON array), the file-valued
     /// `review_items.source_ref` kinds, and what search reads by path: the
     /// chunks (with the path words in their keyword row, `fts_names`), page
-    /// facts, tiers, page links and the code map. `contents` is keyed by
+    /// facts, tiers, page links and the code index. `contents` is keyed by
     /// `file_id`, not by path, so its rows need no move.
     pub fn rename_prefix(&mut self, from_rel: &str, to_rel: &str) -> Result<usize> {
         let from = from_rel.trim_matches('/').to_string();
@@ -3077,8 +3089,8 @@ impl Db {
     }
 
     /// Every stored link, as (linking page, link).
-    /// Replace one file's code map: its symbols and its imports.
-    pub fn set_code_map(&mut self, path: &str, map: &crate::codemap::FileMap) -> Result<()> {
+    /// Replace one file's code index: its symbols and its imports.
+    pub fn set_code_index(&mut self, path: &str, map: &crate::codeindex::FileMap) -> Result<()> {
         // A savepoint: the scan calls this inside its own transaction.
         let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM code_symbols WHERE path = ?1", params![path])?;
@@ -3099,9 +3111,9 @@ impl Db {
         Ok(())
     }
 
-    /// Code-map symbols matching a query: `name` exactly (case-insensitive),
+    /// Code-index symbols matching a query: `name` exactly (case-insensitive),
     /// definitions only or references only, in `path` when given.
-    pub fn code_symbols(&self, name: Option<&str>, path: Option<&str>, is_def: Option<bool>, limit: usize) -> Result<Vec<crate::codemap::Symbol>> {
+    pub fn code_symbols(&self, name: Option<&str>, path: Option<&str>, is_def: Option<bool>, limit: usize) -> Result<Vec<crate::codeindex::Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, name, kind, line, end_line, is_def, docs FROM code_symbols
              WHERE (?1 IS NULL OR name = ?1 COLLATE NOCASE)
@@ -3110,17 +3122,26 @@ impl Db {
              ORDER BY path, line
              LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![name, path, is_def.map(i64::from), limit as i64], |r| {
-            Ok(crate::codemap::Symbol {
-                path: r.get(0)?,
-                name: r.get(1)?,
-                kind: r.get(2)?,
-                line: r.get(3)?,
-                end_line: r.get(4)?,
-                is_def: r.get::<_, i64>(5)? != 0,
-                docs: r.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![name, path, is_def.map(i64::from), limit as i64], symbol_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Definitions whose name, ASCII lowercase and without underscores
+    /// (`codeindex::joined_key`), is one of `keys`, at most `limit`: the
+    /// plain-word lookup (`codeindex::definitions_named`), read through the
+    /// `code_symbols_joined` index.
+    pub fn definitions_by_joined_name(&self, keys: &[String], limit: usize) -> Result<Vec<crate::codeindex::Symbol>> {
+        if keys.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; keys.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT path, name, kind, line, end_line, is_def, docs FROM code_symbols
+             WHERE is_def = 1 AND lower(replace(name, '_', '')) IN ({marks})
+             ORDER BY path, line
+             LIMIT {limit}"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(keys.iter()), symbol_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -3131,8 +3152,8 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// How many files have a code map: none on an index made before it.
-    pub fn code_mapped_files(&self) -> Result<i64> {
+    /// How many files are in the code index: none on an index made before it.
+    pub fn code_indexed_files(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM (SELECT DISTINCT path FROM code_symbols UNION SELECT DISTINCT path FROM code_imports)",
             [],
@@ -3141,11 +3162,11 @@ impl Db {
     }
 
     /// Map every indexed code file from its stored text, for an index made
-    /// before the code map. Returns how many files were mapped.
-    pub fn backfill_code_map(&mut self) -> Result<usize> {
+    /// before the code index. Returns how many files were mapped.
+    pub fn backfill_code_index(&mut self) -> Result<usize> {
         // Once per index. Not "is anything mapped": a scan maps the files it
         // re-reads, so a few mapped files say nothing about the rest.
-        if self.meta_get(CODE_MAP_BACKFILLED)?.is_some() {
+        if self.meta_get(CODE_INDEX_BACKFILLED)?.is_some() {
             return Ok(0);
         }
         let files: Vec<(String, String)> = {
@@ -3160,7 +3181,7 @@ impl Db {
         let mut n = 0;
         let tx = self.conn.savepoint()?;
         for (path, text) in files {
-            if let Some(map) = crate::codemap::map_file(&path, &text) {
+            if let Some(map) = crate::codeindex::map_file(&path, &text) {
                 tx.execute("DELETE FROM code_symbols WHERE path = ?1", params![path])?;
                 tx.execute("DELETE FROM code_imports WHERE path = ?1", params![path])?;
                 for s in &map.symbols {
@@ -3177,7 +3198,7 @@ impl Db {
         }
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '1')",
-            params![CODE_MAP_BACKFILLED],
+            params![CODE_INDEX_BACKFILLED],
         )?;
         tx.commit()?;
         Ok(n)
@@ -3294,6 +3315,18 @@ impl Db {
                 },
             )
             .optional()?)
+    }
+
+    /// The line a chunk starts on and the symbol it holds (`Store.open`, or
+    /// `save, load` for packed definitions; None for prose and line blocks).
+    pub fn chunk_line_symbol(&self, chunk_id: i64) -> Result<(Option<i64>, Option<String>)> {
+        Ok(self
+            .conn
+            .query_row("SELECT line, symbol FROM chunks WHERE id = ?1", params![chunk_id], |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .optional()?
+            .unwrap_or((None, None)))
     }
 
     /// The line a chunk starts on, when it has been chunked since lines were
@@ -4435,6 +4468,19 @@ fn fts_names(rel_path: &str, symbol: Option<&str>, chunk_text: &str, extra: &[St
     out.join(" ")
 }
 
+/// One `code_symbols` row (path, name, kind, line, end_line, is_def, docs).
+fn symbol_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::codeindex::Symbol> {
+    Ok(crate::codeindex::Symbol {
+        path: r.get(0)?,
+        name: r.get(1)?,
+        kind: r.get(2)?,
+        line: r.get(3)?,
+        end_line: r.get(4)?,
+        is_def: r.get::<_, i64>(5)? != 0,
+        docs: r.get(6)?,
+    })
+}
+
 fn like_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
@@ -5319,19 +5365,19 @@ mod tests {
         assert!(db.list_events().unwrap().is_empty());
     }
 
-    /// An index made before the code map gets one from its stored text, even
+    /// An index made before the code index gets one from its stored text, even
     /// when a scan since has mapped a file or two, and only once.
     #[test]
-    fn the_code_map_backfills_every_unmapped_file_once() {
+    fn the_code_index_backfills_every_unmapped_file_once() {
         let mut db = Db::open_in_memory().unwrap();
         for (p, t) in [("a.py", "def alpha():\n    beta()\n"), ("b.py", "def beta():\n    pass\n"), ("c.md", "# not code")] {
             db.upsert_file(p, "code", 1, 1, "indexed", None, t).unwrap();
         }
-        let a = crate::codemap::map_file("a.py", "def alpha():\n    beta()\n").unwrap();
-        db.set_code_map("a.py", &a).unwrap(); // a scan re-read this one
-        assert_eq!(db.backfill_code_map().unwrap(), 1, "b.py, not the mapped one or the page");
+        let a = crate::codeindex::map_file("a.py", "def alpha():\n    beta()\n").unwrap();
+        db.set_code_index("a.py", &a).unwrap(); // a scan re-read this one
+        assert_eq!(db.backfill_code_index().unwrap(), 1, "b.py, not the mapped one or the page");
         assert_eq!(db.code_symbols(Some("beta"), None, Some(true), 5).unwrap().len(), 1);
-        assert_eq!(db.backfill_code_map().unwrap(), 0, "once");
+        assert_eq!(db.backfill_code_index().unwrap(), 0, "once");
     }
 
     /// A whole-project build settles the queue it read, but a file edited

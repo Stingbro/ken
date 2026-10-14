@@ -16,7 +16,7 @@
   import { delimiterForPath } from "../lib/csv";
   import MarkdownEditor from "./MarkdownEditor.svelte";
   import PageLinks from "./PageLinks.svelte";
-  import CodeMap from "./CodeMap.svelte";
+  import CodeIndex from "./CodeIndex.svelte";
   import PlainEditor from "./PlainEditor.svelte";
   import CsvEditor from "./CsvEditor.svelte";
   import PreviewPane from "./PreviewPane.svelte";
@@ -546,7 +546,7 @@
   {#if meta?.kind === "md"}
     <PageLinks {relPath} refresh={reloadKey + savedCount} />
   {:else if /\.(rs|py|pyi|jsx?|mjs|cjs|tsx?|mts|cts|go|java|cs)$/i.test(relPath)}
-    <CodeMap {relPath} refresh={reloadKey} />
+    <CodeIndex {relPath} refresh={reloadKey} />
   {/if}
 </div>
 

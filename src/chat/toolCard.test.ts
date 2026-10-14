@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseToolCard } from "./toolCard";
+import { cardHits, parseToolCard } from "./toolCard";
 
 describe("parseToolCard", () => {
   it("reads a card the engine stored", () => {
@@ -18,5 +18,23 @@ describe("parseToolCard", () => {
   it("is null for anything that isn't a card", () => {
     expect(parseToolCard("Read a.md")).toBeNull();
     expect(parseToolCard(JSON.stringify({ name: "Read" }))).toBeNull();
+  });
+});
+
+describe("cardHits", () => {
+  it("lists a search's hits with each code hit's symbol beside its path", () => {
+    const result = [
+      "1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld` (ken://a/src/world.ts#L3) [keyword]",
+      "2. [decision D-410 · binding · 2026-10-06] [[DECISIONS]] · wiki:Decisions/DECISIONS.md:9 (ken://b/Decisions/DECISIONS.md#L9) [both]",
+    ].join("\n");
+    expect(cardHits(result)).toEqual([
+      { place: "game:src/world.ts:3", symbol: "saveWorld" },
+      { place: "[[DECISIONS]] · wiki:Decisions/DECISIONS.md:9", symbol: null },
+    ]);
+  });
+
+  it("is empty for a result that lists no hits", () => {
+    expect(cardHits("Read 40 lines")).toEqual([]);
+    expect(cardHits(undefined)).toEqual([]);
   });
 });

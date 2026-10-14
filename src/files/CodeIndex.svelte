@@ -1,5 +1,5 @@
 <script lang="ts">
-  // A code file's structure under it (the code map): its outline, what it
+  // A code file's structure under it (the code index): its outline, what it
   // imports and what imports it, and for any definition, where it is used
   // across the workspace. "Go to definition" and "find usages" for people.
   import { api, type CodeFile, type CodeUsages, type CodeUse } from "../lib/api";
@@ -108,7 +108,7 @@
               {#if u.within}<span class="muted">in {u.within}</span>{/if}
             </button>
           {:else}
-            <div class="muted">No uses found in the code map.</div>
+            <div class="muted">No uses found in the code index.</div>
           {/each}
         {/if}
       </div>

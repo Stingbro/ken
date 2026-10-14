@@ -181,9 +181,12 @@ fn ken_address(project_id: Uuid, rel_path: &str) -> String {
 /// Search one source's chunk index: keyword search (with the vocabulary's
 /// other words for the query) and, when `query_vec` is given and the
 /// source's meaning index is built, meaning search, merged and reranked by
-/// [`search::merge_and_rerank_with`]. Each hit carries its line, its page
-/// facts and its label. `query_vec` is the question embedded once by the
-/// caller; None searches by keyword only.
+/// [`search::merge_hits`] and [`search::rerank_weighted`]. Each hit carries
+/// its line, its page facts, its label and, for code, its symbol.
+/// `query_vec` is the question embedded once by the caller; None searches by
+/// keyword only. A question whose plain words name a definition in the code
+/// index ("save world" for `saveWorld`) finds the chunk that holds it too,
+/// cited at its line ([`joined_definitions`]).
 pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usize) -> Result<Vec<HybridHit>> {
     search_member_with(db, query, query_vec, limit, None)
 }
@@ -214,6 +217,17 @@ pub fn search_member_with(
                 fts_hits.push(hit);
             }
         }
+    }
+    // The code index for plain words (decision 26): "save world" names
+    // `saveWorld`, `save_world` and `SaveWorld`. The chunk holding each
+    // definition the words join into is its file's keyword hit, cited at the
+    // definition's own line. It is scored like any other hit; its symbol's
+    // words count as name words in the rerank.
+    let named = joined_definitions(db, query)?;
+    if !named.is_empty() {
+        fts_hits.retain(|h| !named.iter().any(|n| n.hit.path == h.path));
+        let rest = std::mem::take(&mut fts_hits);
+        fts_hits = named.iter().map(|n| n.hit.clone()).chain(rest).collect();
     }
     // Meaning only from a finished meaning index: a half-built one holds
     // whatever was embedded first (asset JSON, in path order) and handed
@@ -259,9 +273,25 @@ pub fn search_member_with(
     // member's own ranking.
     let paths: Vec<String> = fts_hits.iter().map(|h| h.path.clone()).chain(vec_hits.iter().map(|h| h.path.clone())).collect();
     let authority = db.authority_weights(&paths)?.unwrap_or_default();
-    let mut hits = search::merge_and_rerank_with(&fts_hits, &vec_hits, query, &extra, &authority);
+    // Each hit's line and, for code, its symbol, before the rerank reads the
+    // symbol: a definition the words named is cited at its own line, under
+    // its own name when its chunk packs several.
+    let mut merged = search::merge_hits(&fts_hits, &vec_hits);
+    for hit in &mut merged {
+        let (line, symbol) = db.chunk_line_symbol(hit.chunk_id)?;
+        match named.iter().find(|n| n.hit.chunk_id == hit.chunk_id) {
+            Some(n) => {
+                hit.line = Some(n.line);
+                hit.symbol = Some(symbol.filter(|s| !s.contains(", ") && s.ends_with(n.name.as_str())).unwrap_or_else(|| n.name.clone()));
+            }
+            None => {
+                hit.line = line;
+                hit.symbol = symbol;
+            }
+        }
+    }
+    let mut hits = search::rerank_weighted(query, merged, &vec_hits, &extra, &authority);
     for hit in &mut hits {
-        hit.line = db.chunk_line(hit.chunk_id)?;
         hit.page = crate::pagemeta::hit_page(&hit.path, db.page_meta(&hit.path)?);
         if machine_written(&hit.snippet) {
             hit.score -= W_BLOB;
@@ -277,6 +307,33 @@ pub fn search_member_with(
         hit.label = crate::authority::hit_label(db, &hit.path, Some(&hit.snippet))?;
     }
     Ok(hits)
+}
+
+/// A definition the question's plain words named, as a keyword hit: the
+/// chunk that holds it, the definition's line and its name.
+struct NamedDefinition {
+    hit: search::FtsHit,
+    line: i64,
+    name: String,
+}
+
+/// The definitions a question's plain words join into
+/// (`codeindex::definitions_named`), one per file, each with the chunk that
+/// holds it. None for a file with no chunks (not indexed, or gone).
+fn joined_definitions(db: &Db, query: &str) -> Result<Vec<NamedDefinition>> {
+    let mut out: Vec<NamedDefinition> = Vec::new();
+    for def in crate::codeindex::definitions_named(db, query, crate::codeindex::NAMED_MAX)? {
+        if out.iter().any(|n| n.hit.path == def.path) {
+            continue;
+        }
+        let Some((chunk_id, text)) = db.chunk_at_line(&def.path, def.line)? else { continue };
+        out.push(NamedDefinition {
+            hit: search::FtsHit { chunk_id, path: def.path, text },
+            line: def.line,
+            name: def.name,
+        });
+    }
+    Ok(out)
 }
 
 /// Machine-written text (an inlined search index, a data dump in one line)
@@ -434,6 +491,9 @@ pub struct RoutedHit {
     pub page: Option<crate::pagemeta::HitPage>,
     /// `kind · tier or role · date` (`authority::hit_label`).
     pub label: Option<String>,
+    /// For a code hit, the definition its chunk holds
+    /// ([`search::HybridHit::symbol`]).
+    pub symbol: Option<String>,
 }
 
 /// How one source's search went, as reported beside the results.
@@ -551,6 +611,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
                     locator: locator(&mh.member_name, &hit.path, hit.line, sha.as_deref(), wiki),
                     page: hit.page.clone(),
                     label: hit.label.clone(),
+                    symbol: hit.symbol.clone(),
                 },
             ));
         }
@@ -610,6 +671,7 @@ mod tests {
             line: None,
             page: None,
             label: None,
+            symbol: None,
             score: 0.0,
         }
     }
@@ -973,6 +1035,49 @@ mod tests {
         assert_eq!(hits[0].line, Some(5), "the section under the heading");
         let hits = search_member(&db, "reconcile ledger", None, 10).unwrap();
         assert_eq!(hits.first().map(|h| h.path.as_str()), Some("books.py"), "{hits:?}");
+    }
+
+    /// A query naming a function leads with where it is defined, at its
+    /// line, and the hit names it: the jump slice 2a's nudges gave, back
+    /// through the code index's plain-word lookup.
+    #[test]
+    fn a_symbol_the_query_names_leads_with_its_definition() {
+        use crate::project::Project;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(dir.path().join("app/auth.py"), "import jwt\n\n\ndef get_current_user(token):\n    return jwt.decode(token)\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# Notes\n\nWe talked about get current user flows a lot, current user this, current user that.\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let hits = search_member(&db, "where is get_current_user defined", None, 8).unwrap();
+        assert_eq!(hits.first().map(|h| (h.path.as_str(), h.line)), Some(("app/auth.py", Some(4))), "{hits:?}");
+        assert_eq!(hits[0].symbol.as_deref(), Some("get_current_user"));
+    }
+
+    /// Plain words find a definition in any casing, and the routed hit
+    /// carries the symbol on.
+    #[test]
+    fn plain_words_reach_a_definition_and_the_routed_hit_names_it() {
+        use crate::project::Project;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/world.ts"), "export function loadWorld() {}\n\nexport function saveWorld(w: string) {\n  return w;\n}\n").unwrap();
+        std::fs::write(dir.path().join("store.py"), "def save_world(w):\n    return w\n").unwrap();
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let hits = search_member(&db, "how do we save world", None, 8).unwrap();
+        let ts = hits.iter().find(|h| h.path == "src/world.ts").expect("saveWorld");
+        assert_eq!(ts.line, Some(3), "{hits:?}");
+        assert_eq!(ts.symbol.as_deref(), Some("saveWorld"));
+        let py = hits.iter().find(|h| h.path == "store.py").expect("save_world");
+        assert_eq!(py.symbol.as_deref(), Some("save_world"));
+
+        let id = Uuid::new_v4();
+        let report = merge_routed(&every(vec![id]), &[searched(id, "T", hits)], 10);
+        let routed = report.results.iter().find(|r| r.path == "src/world.ts").unwrap();
+        assert_eq!(routed.symbol.as_deref(), Some("saveWorld"));
     }
 
     /// A member with one file at `rel_path`, scanned but with no meaning

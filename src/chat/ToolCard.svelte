@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ToolCard } from "../lib/api";
+  import { cardHits } from "./toolCard";
 
   let { card }: { card: ToolCard } = $props();
 
@@ -9,6 +10,9 @@
     if (card.status === "error") open = true;
   });
   const hasResult = $derived(!!card.result && card.result.trim().length > 0);
+  // A search's hits, listed while the result is folded: each place, and a
+  // code hit's symbol beside it.
+  const hits = $derived(cardHits(card.result));
 </script>
 
 <div class="card" class:error={card.status === "error"}>
@@ -28,6 +32,15 @@
   </button>
   {#if open && hasResult}
     <pre class="result mono">{card.result}</pre>
+  {:else if hits.length > 0}
+    <ul class="hits">
+      {#each hits as hit, i (i)}
+        <li class="mono">
+          <span class="place">{hit.place}</span>
+          {#if hit.symbol}<span class="symbol" title="The definition this hit holds">{hit.symbol}</span>{/if}
+        </li>
+      {/each}
+    </ul>
   {/if}
 </div>
 
@@ -112,6 +125,28 @@
     word-break: break-word;
     max-height: 180px;
     overflow: auto;
+  }
+  .hits {
+    margin: 0;
+    padding: 4px 10px 6px 32px;
+    list-style: none;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--ink-tertiary);
+  }
+  .hits li {
+    display: flex;
+    gap: 6px;
+    min-width: 0;
+  }
+  .place {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .symbol {
+    flex: none;
+    color: var(--ink-secondary, var(--ink));
   }
   @media (prefers-reduced-motion: reduce) {
     .spin {

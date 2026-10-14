@@ -11,7 +11,7 @@
 //!   chunk's tail carried into the next chunk so a search hit near a chunk
 //!   boundary still has surrounding context.
 //! * **Code** — by definition (knowledge-core decision 16): a file is cut at
-//!   the definitions the code index parsed (`codemap::map_file`), small
+//!   the definitions the code index parsed (`codeindex::map_file`), small
 //!   neighbours packed together up to `target_tokens`, a definition too long
 //!   for one chunk cut at its members or else its line ends. Each chunk
 //!   carries its enclosing symbol, its line range and the definition's doc
@@ -189,7 +189,7 @@ pub fn chunk_file(rel_path: &str, text: &str, profile: &IndexProfile) -> Vec<Chu
 /// is cut at `defs`, the file's symbols from the code index (only the
 /// definitions are read); with none, into line blocks. Pure and infallible:
 /// empty/whitespace-only text yields no chunks.
-pub fn chunk_with(rel_path: &str, text: &str, profile: &IndexProfile, defs: &[crate::codemap::Symbol]) -> Chunked {
+pub fn chunk_with(rel_path: &str, text: &str, profile: &IndexProfile, defs: &[crate::codeindex::Symbol]) -> Chunked {
     if text.trim().is_empty() {
         return Chunked::default();
     }
@@ -921,13 +921,13 @@ const PACKED_NAMES_MAX: usize = 5;
 
 /// A definition and the definitions inside it.
 struct DefNode<'a> {
-    sym: &'a crate::codemap::Symbol,
+    sym: &'a crate::codeindex::Symbol,
     children: Vec<DefNode<'a>>,
 }
 
 /// Definitions nested by their line ranges. `defs` are sorted by start line,
 /// the outer of two that start together first.
-fn nest<'a>(defs: &[&'a crate::codemap::Symbol]) -> Vec<DefNode<'a>> {
+fn nest<'a>(defs: &[&'a crate::codeindex::Symbol]) -> Vec<DefNode<'a>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < defs.len() {
@@ -958,13 +958,13 @@ fn qualify(enclosing: Option<&str>, name: &str) -> String {
 /// together while they fit in a chunk. One too long for a chunk is cut the
 /// same way at the definitions inside it, keeping its name as the enclosing
 /// symbol, or at its line ends when it has none.
-fn chunk_code_by_definition(text: &str, profile: &IndexProfile, defs: &[crate::codemap::Symbol]) -> Vec<Piece> {
+fn chunk_code_by_definition(text: &str, profile: &IndexProfile, defs: &[crate::codeindex::Symbol]) -> Vec<Piece> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return Vec::new();
     }
     let n = lines.len();
-    let mut ds: Vec<&crate::codemap::Symbol> = defs
+    let mut ds: Vec<&crate::codeindex::Symbol> = defs
         .iter()
         .filter(|d| d.is_def && d.line >= 1 && d.end_line >= d.line && (d.line as usize) <= n)
         .collect();
@@ -1709,7 +1709,7 @@ mod tests {
             src.push_str("        0\n    }\n\n");
         }
         src.push_str("}\n");
-        let map = crate::codemap::map_file("src/store.rs", &src).unwrap();
+        let map = crate::codeindex::map_file("src/store.rs", &src).unwrap();
         let profile = code_profile(150); // 600 bytes a chunk
         let out = chunk_with("src/store.rs", &src, &profile, &map.symbols);
         assert!(!out.capped);
@@ -1738,7 +1738,7 @@ mod tests {
     #[test]
     fn small_top_level_definitions_share_a_chunk_named_by_them() {
         let src = "def a():\n    return 1\n\ndef b():\n    return 2\n";
-        let map = crate::codemap::map_file("m.py", src).unwrap();
+        let map = crate::codeindex::map_file("m.py", src).unwrap();
         let chunks = chunk_with("m.py", src, &code_profile(500), &map.symbols).chunks;
         assert_eq!(chunks.len(), 1, "{chunks:?}");
         assert_eq!(chunks[0].symbol.as_deref(), Some("a, b"));

@@ -19,3 +19,24 @@ export function parseToolCard(content: string, chatWorking = true): ToolCard | n
     return null;
   }
 }
+
+/** One hit a search card lists: where it is and, for code, the symbol it
+ *  holds. */
+export interface CardHit {
+  place: string;
+  symbol: string | null;
+}
+
+/** The hits in a Ken search's result, from lines like
+ *  `1. [code · service · 2026-10-01] repo:src/a.ts:12 `saveWorld` (ken://…)`:
+ *  the place a person cites and, for a code hit, its symbol (knowledge-core
+ *  decision 26). Empty for any other result. */
+export function cardHits(result: string | undefined): CardHit[] {
+  if (!result) return [];
+  const out: CardHit[] = [];
+  for (const line of result.split(/\r?\n/)) {
+    const m = /^\d+\. (?:\[[^\]]*\] )?(.+?)(?: `([^`]+)`)? \(ken:\/\//.exec(line);
+    if (m) out.push({ place: m[1], symbol: m[2] ?? null });
+  }
+  return out;
+}

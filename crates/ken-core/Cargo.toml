@@ -63,7 +63,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "native-cer
 # declaration keywords (fn/struct/class/def/...), run once per chunk at
 # index time. Not on any hot per-keystroke path.
 regex = "1"
-# The code map (codemap.rs): definitions, references and imports, parsed with
+# The code index (codeindex.rs): definitions, references and imports, parsed with
 # tree-sitter and each grammar's own tags query, as GitHub's code navigation
 # does. Local, no model; each grammar builds its C parser through `cc`.
 tree-sitter = "0.27"

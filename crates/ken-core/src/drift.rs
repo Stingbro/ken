@@ -30,7 +30,6 @@
 //! they arrive with Wright, not here.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -264,15 +263,10 @@ pub fn resolve_repo(project_root: &Path, repo: &str) -> Option<PathBuf> {
     sibling.is_dir().then_some(sibling)
 }
 
+/// Git in `root`, through the one helper history shares (`crate::git`,
+/// decision 27): its trimmed answer, None when it fails.
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
-    let out = crate::proc::quiet(&mut cmd)
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    crate::git::output(root, args)
 }
 
 /// The branch to measure against: the remote's default, read from git, else
@@ -501,12 +495,8 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// local branches and the remote are untouched. Never prompts: a remote that
 /// needs a password a person has not stored fails, and is said so.
 fn fetch(root: &Path, remote: &str) -> std::result::Result<(), String> {
-    let mut cmd = Command::new("git");
-    crate::proc::quiet(&mut cmd)
-        .args(["fetch", "--quiet", "--no-tags", remote])
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
+    let mut cmd = crate::git::command(root);
+    cmd.args(["fetch", "--quiet", "--no-tags", remote])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -846,6 +836,8 @@ mod tests {
         assert_eq!(chrono_free_epoch("2026-09-24"), Some(1_790_208_000));
         assert_eq!(days_between("2026-08-24", 1_790_208_000), Some(31));
     }
+
+    use std::process::Command;
 
     fn git_ok(dir: &Path, args: &[&str]) {
         let out = Command::new("git").args(args).current_dir(dir).output().unwrap();

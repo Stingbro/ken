@@ -77,6 +77,12 @@ pub struct HybridHit {
     /// (`authority::hit_label`, knowledge-core decision 17): `kind · tier or
     /// role · date`. Filled with `line`; None before that.
     pub label: Option<String>,
+    /// For a code chunk, the definition it holds (`Store.open`, or `save,
+    /// load` for packed definitions; knowledge-core decision 26). Filled by
+    /// the caller with the database before the rerank, which counts its
+    /// words as name words, beside the path's: the symbol is in the chunk's
+    /// names field with the path.
+    pub symbol: Option<String>,
     /// How well it answers the query ([`rerank`]'s score, its file's tier
     /// included): the same scale in every member, so hits from
     /// different repos merge by relevance rather than by repo.
@@ -116,6 +122,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             line: None,
             page: None,
             label: None,
+            symbol: None,
             score: 0.0,
         });
     }
@@ -135,6 +142,7 @@ pub fn merge_hits(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<HybridHit> {
             line: None,
             page: None,
             label: None,
+            symbol: None,
             score: 0.0,
         });
     }
@@ -348,7 +356,10 @@ pub fn rerank_weighted(
         if q_tokens > 0 {
             let filename = hit.path.rsplit(['/', '\\']).next().unwrap_or(&hit.path);
             let filename_tokens: HashSet<String> = tokenize_lower(filename).into_iter().collect();
-            let path_tokens: HashSet<String> = tokenize_lower(&hit.path).into_iter().collect();
+            // A code chunk's symbol is named with its path (the names
+            // field holds both), so its words count as path words.
+            let path_tokens: HashSet<String> =
+                tokenize_lower(&hit.path).into_iter().chain(hit.symbol.as_deref().map(tokenize_lower).unwrap_or_default()).collect();
             let snippet_tokens: HashSet<String> =
                 tokenize_lower(&hit.snippet).into_iter().collect();
 
@@ -407,7 +418,7 @@ mod tests {
     /// with none (all code) keeps its score.
     #[test]
     fn authority_moves_a_hit_by_its_weight_and_leaves_the_rest() {
-        let hit = |path: &str| HybridHit { path: path.into(), chunk_id: 1, snippet: "who merges the pull request".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 };
+        let hit = |path: &str| HybridHit { path: path.into(), chunk_id: 1, snippet: "who merges the pull request".into(), source: Source::Keyword, line: None, page: None, label: None, symbol: None, score: 0.0 };
         let hits = vec![hit("tickets/SR-1.md"), hit("src/merge.rs"), hit("decisions/DECISIONS.md")];
         let plain = rerank_with("merge pull request", hits.clone(), &[], &HashMap::new());
         let weights: HashMap<String, f64> =
@@ -440,8 +451,8 @@ mod tests {
     #[test]
     fn a_question_word_meets_a_camel_case_file_name() {
         let hits = vec![
-            HybridHit { path: "docs/notes.md".into(), chunk_id: 1, snippet: "weapon notes".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
-            HybridHit { path: "data/WeaponBases.json".into(), chunk_id: 2, snippet: "{}".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
+            HybridHit { path: "docs/notes.md".into(), chunk_id: 1, snippet: "weapon notes".into(), source: Source::Keyword, line: None, page: None, label: None, symbol: None, score: 0.0 },
+            HybridHit { path: "data/WeaponBases.json".into(), chunk_id: 2, snippet: "{}".into(), source: Source::Keyword, line: None, page: None, label: None, symbol: None, score: 0.0 },
         ];
         let out = rerank("where are the weapon base stats", hits, &[]);
         assert_eq!(out[0].path, "data/WeaponBases.json");
@@ -450,8 +461,8 @@ mod tests {
     #[test]
     fn a_keyword_hit_outside_the_knn_list_still_gets_its_meaning_score() {
         let hits = vec![
-            HybridHit { path: "a.rs".into(), chunk_id: 1, snippet: "x".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
-            HybridHit { path: "b.rs".into(), chunk_id: 2, snippet: "x".into(), source: Source::Keyword, line: None, page: None, label: None, score: 0.0 },
+            HybridHit { path: "a.rs".into(), chunk_id: 1, snippet: "x".into(), source: Source::Keyword, line: None, page: None, label: None, symbol: None, score: 0.0 },
+            HybridHit { path: "b.rs".into(), chunk_id: 2, snippet: "x".into(), source: Source::Keyword, line: None, page: None, label: None, symbol: None, score: 0.0 },
         ];
         let extra: HashMap<String, f64> = [("b.rs".to_string(), 0.3)].into_iter().collect();
         let out = rerank_with("zzz", hits, &[], &extra);
@@ -586,8 +597,20 @@ mod tests {
             line: None,
             page: None,
             label: None,
+            symbol: None,
             score: 0.0,
         }
+    }
+
+    /// A code chunk's symbol counts as a name, beside its path: the chunk
+    /// that defines `get_current_user` outranks a note that only says the
+    /// words.
+    #[test]
+    fn a_chunks_symbol_counts_as_a_name() {
+        let def = HybridHit { symbol: Some("get_current_user".into()), ..hybrid("app/auth.py", 1, "def get_current_user(token):", Source::Keyword) };
+        let note = hybrid("notes.md", 2, "we talked about get current user flows", Source::Keyword);
+        let ranked = rerank("get current user", vec![note, def], &[]);
+        assert_eq!(ranked[0].path, "app/auth.py", "{ranked:?}");
     }
 
     #[test]
