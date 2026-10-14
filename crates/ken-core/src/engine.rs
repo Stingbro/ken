@@ -83,26 +83,7 @@ pub fn rebuild_semantic_index(
     db: &mut Db,
     embedder: &mut dyn Embedder,
     token: &CancelToken,
-    on_progress: impl FnMut(usize, usize),
-) -> Result<bool> {
-    rebuild_semantic_index_with_profile(project, db, embedder, token, on_progress, None)
-}
-
-/// Same as [`rebuild_semantic_index`], resolving each file's chunk profile
-/// as `stored_profile.chunking_for(rel_path)` else `IndexProfile::default_for`
-/// (design D3) when `profile` is `Some`. `profile` is normally
-/// `Some(&profiler::ProjectProfile::load(&project.root))` only when the
-/// `profiler` flag is on for this project — passing `None` (what
-/// [`rebuild_semantic_index`] always does) reproduces the plain
-/// extension-default chunking exactly, which is how flag-off/no-profile
-/// inertness holds here.
-pub fn rebuild_semantic_index_with_profile(
-    project: &Project,
-    db: &mut Db,
-    embedder: &mut dyn Embedder,
-    token: &CancelToken,
     mut on_progress: impl FnMut(usize, usize),
-    profile: Option<&crate::profiler::ProjectProfile>,
 ) -> Result<bool> {
     // Every file: an indexed one is chunked again from its text; one with no
     // readable text keeps the chunks the scan gave it (its path, or its OCR
@@ -156,15 +137,9 @@ pub fn rebuild_semantic_index_with_profile(
                 }
             };
 
-            // project-profiler D3: stored-profile-else-default. `profile` is
-            // only `Some` when the caller resolved the `profiler` flag on and
-            // loaded a profile (see this function's doc comment) — `None`
-            // (the `rebuild_semantic_index` wrapper's default) always falls
-            // through to the plain extension default, unchanged from before
-            // this hook existed. An empty file keeps its name chunk.
-            let idx_profile = profile
-                .and_then(|p| p.chunking_for(&file.rel_path))
-                .unwrap_or_else(|| IndexProfile::default_for(&file.rel_path));
+            // Chunked by its extension's profile. An empty file keeps its
+            // name chunk.
+            let idx_profile = IndexProfile::default_for(&file.rel_path);
             // Code is cut at its definitions, read from the code index the
             // scan stored rather than parsed again.
             let chunked = if text.trim().is_empty() {
@@ -431,58 +406,6 @@ Payments retry three times.").unwrap();
             })
             .collect();
         search::merge_and_rerank(&fts_hits, &vec_hits, query)
-    }
-
-    #[test]
-    fn rebuild_semantic_index_with_none_profile_matches_plain_wrapper() {
-        // project-profiler consumer-hook inertness (1.5/1.6): the plain
-        // `rebuild_semantic_index` is exactly `rebuild_semantic_index_with_profile`
-        // called with `None` — so a caller that never resolves a profile
-        // (flag off, or none exists) gets identical chunk output either way.
-        let project_dir = tempfile::tempdir().unwrap();
-        fs::write(project_dir.path().join("note.md"), "# Hi\nSome prose text here.\n").unwrap();
-        let project = Project::create(project_dir.path(), "T").unwrap();
-
-        let mut db_a = Db::open_in_memory().unwrap();
-        scan::scan(&project, &mut db_a).unwrap();
-        let mut embedder_a = FakeEmbedder::new();
-        rebuild_semantic_index(&project, &mut db_a, &mut embedder_a, &CancelToken::new(), |_, _| {}).unwrap();
-
-        let mut db_b = Db::open_in_memory().unwrap();
-        scan::scan(&project, &mut db_b).unwrap();
-        let mut embedder_b = FakeEmbedder::new();
-        rebuild_semantic_index_with_profile(
-            &project, &mut db_b, &mut embedder_b, &CancelToken::new(), |_, _| {}, None,
-        )
-        .unwrap();
-
-        assert_eq!(db_a.chunk_count().unwrap(), db_b.chunk_count().unwrap());
-        assert!(db_a.chunk_count().unwrap() > 0);
-    }
-
-    #[test]
-    fn rebuild_semantic_index_with_profile_uses_stored_chunking_over_default() {
-        // A stored profile mapping *.md to Skip mode must suppress chunks
-        // for markdown files even though the extension default is Prose.
-        let project_dir = tempfile::tempdir().unwrap();
-        fs::write(project_dir.path().join("note.md"), "# Hi\nSome prose text here.\n").unwrap();
-        let project = Project::create(project_dir.path(), "T").unwrap();
-        let mut db = Db::open_in_memory().unwrap();
-        scan::scan(&project, &mut db).unwrap();
-
-        let mut profile = crate::profiler::ProjectProfile::default();
-        profile.chunking.push(crate::profiler::PatternProfile {
-            pattern: "*.md".into(),
-            profile: IndexProfile { mode: chunker::ChunkMode::Skip, target_tokens: 1, overlap_pct: 0.0 },
-        });
-
-        let mut embedder = FakeEmbedder::new();
-        rebuild_semantic_index_with_profile(
-            &project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}, Some(&profile),
-        )
-        .unwrap();
-
-        assert_eq!(db.chunk_count().unwrap(), 0, "the Skip-mode profile entry should suppress all chunks");
     }
 
     /// What the model reads is the chunk under its breadcrumb (prose) or its

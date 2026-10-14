@@ -43,12 +43,6 @@ pub enum ChunkMode {
     /// fixed-size blocks, no overlap. Source code and other structured/dense
     /// text.
     Code,
-    /// Never chunked or embedded. The file still keyword-searches (that's
-    /// driven by kenignore's tier, not this), but produces zero semantic
-    /// chunks — used by project-profiler pattern entries (e.g. `*.log`) to
-    /// opt noisy/generated text out of embedding without excluding it
-    /// entirely.
-    Skip,
 }
 
 /// How a file should be split into chunks. Per-path selection lives in
@@ -78,8 +72,7 @@ impl Default for IndexProfile {
 
 /// Prose-ish extensions: markdown, plain text, extracted PDF text. Module
 /// level (not just local to `default_for`) so other modules can classify by
-/// the same taxonomy instead of duplicating it — project-profiler's doc-ratio
-/// scan and default chunking table reuse this exact list.
+/// the same taxonomy instead of duplicating it.
 pub const PROSE_EXTS: &[&str] = &["md", "mdx", "txt", "pdf"];
 /// Source-code and other structured/dense-text extensions. See [`PROSE_EXTS`].
 pub const CODE_EXTS: &[&str] = &[
@@ -204,7 +197,6 @@ pub fn chunk_with(rel_path: &str, text: &str, profile: &IndexProfile, defs: &[cr
         (None, ChunkMode::Prose) => plain(chunk_prose(text, profile)),
         (None, ChunkMode::Code) if defs.iter().any(|d| d.is_def) => chunk_code_by_definition(text, profile, defs),
         (None, ChunkMode::Code) => plain(chunk_code(text, profile)),
-        (None, ChunkMode::Skip) => Vec::new(),
     };
     let mut pieces: Vec<Piece> = pieces.into_iter().filter(|p| !p.text.trim().is_empty()).collect();
     // Where each piece ends, before the cap drops the pieces after it.
@@ -1346,12 +1338,6 @@ mod tests {
         assert_eq!(p.mode, ChunkMode::Code);
         assert_eq!(p.target_tokens, 500);
         assert_eq!(p.overlap_pct, 0.0);
-    }
-
-    #[test]
-    fn skip_mode_produces_no_chunks() {
-        let profile = IndexProfile { mode: ChunkMode::Skip, target_tokens: 350, overlap_pct: 0.0 };
-        assert!(chunk_file("noisy.log", "line one\nline two\nline three\n", &profile).is_empty());
     }
 
     #[test]

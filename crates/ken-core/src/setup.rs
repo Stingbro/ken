@@ -123,6 +123,24 @@ pub fn origin_url(repo: &Path) -> Option<String> {
     None
 }
 
+/// Manifest file names that mark a folder as code: set-up's kind detection
+/// reads them, and so does the workspace's candidate list. A `*.sln` and a
+/// `.git` folder are checked apart from these, by their callers.
+pub const REPO_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "Gemfile",
+    "requirements.txt",
+    "CMakeLists.txt",
+];
+
 fn exists_ci(dir: &Path, rel: &str) -> bool {
     dir.join(rel).exists()
         || fs::read_dir(dir).ok().is_some_and(|mut it| {
@@ -160,10 +178,10 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
         .filter(|f| dir.join(f).is_file())
         .take(1)
         .collect();
-    let mut code: Vec<String> = crate::profiler::REPO_MARKERS
+    let mut code: Vec<String> = REPO_MARKERS
         .iter()
         .copied()
-        .filter(|m| *m != ".git" && exists_ci(dir, m))
+        .filter(|m| exists_ci(dir, m))
         .map(str::to_string)
         .chain(
             fs::read_dir(dir)
@@ -255,7 +273,7 @@ fn nested_markers(dir: &Path, depth: usize) -> Vec<String> {
             for name in dirs {
                 let child = path.join(&name);
                 let child_rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-                for m in crate::profiler::REPO_MARKERS.iter().filter(|m| **m != ".git") {
+                for m in REPO_MARKERS {
                     if exists_ci(&child, m) && found.len() < 3 {
                         found.push(format!("{child_rel}/{m}"));
                     }

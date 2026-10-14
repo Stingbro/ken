@@ -7,10 +7,9 @@
 //!
 //! Deviation from `project.rs::Project::save` (which does a plain
 //! `fs::write`): `proposal.md`/`spec.md` both call out the workspace
-//! manifest as written *atomically*, so [`Workspace::save`] uses the
-//! temp-file + rename pattern `profiler::ProjectProfile::save` already
-//! established in this crate, rather than copying `Project::save`'s
-//! non-atomic write verbatim.
+//! manifest as written *atomically*, so [`Workspace::save`] writes a temp
+//! file and renames it over the manifest, rather than copying
+//! `Project::save`'s non-atomic write verbatim.
 //!
 //! `workspace.rs` only resolves members into `Project`s (via the same
 //! adopt-or-create discipline as `Project::create`) and reports per-member
@@ -594,15 +593,15 @@ pub struct Candidate {
     /// a full tree walk per candidate.
     pub file_count: usize,
     /// Repo marker file names found directly inside the folder (see
-    /// `crate::profiler::REPO_MARKERS`), plus `.git`/`*.sln` when present.
+    /// `crate::setup::REPO_MARKERS`), plus `.git`/`*.sln` when present.
     pub markers: Vec<String>,
 }
 
 /// List `parent`'s immediate subfolders as workspace-member candidates.
 /// Hidden folders (dot-prefixed — this also excludes `.ken-workspace`
 /// itself) and junk build dirs (`node_modules`, `target`, ... —
-/// `crate::scan::is_junk_dir_name`, the same table the ingest walk and the
-/// profiler use) are never candidates. One level deep only: neither this
+/// `crate::scan::is_junk_dir_name`, the same table the ingest walk uses)
+/// are never candidates. One level deep only: neither this
 /// listing nor a candidate's `file_count`/`markers` recurse into
 /// subfolders (D5).
 /// The workspace-root `.kenignore` — `<parent>/.kenignore`.
@@ -789,15 +788,14 @@ fn group_folder_children(
 
 /// One level deep into a single candidate: does it have `.ken/project.json`
 /// already, how many files sit directly in it, and which repo markers
-/// (`crate::profiler::REPO_MARKERS`, `.git`, `*.sln`) does it carry.
+/// (`crate::setup::REPO_MARKERS`, `.git`, `*.sln`) does it carry.
 fn scan_candidate(dir: &Path, name: &str) -> Result<Candidate> {
     let existing = project::existing_config(dir).is_some();
     let mut file_count = 0usize;
     let mut markers: Vec<String> = Vec::new();
 
     // `.git` is itself a hidden dir, so it's checked directly rather than
-    // encountered in the (non-hidden) listing below — same reasoning as
-    // `profiler::scan_stats`.
+    // encountered in the listing below, which skips folders.
     if dir.join(".git").is_dir() {
         markers.push(".git".to_string());
     }
@@ -812,7 +810,7 @@ fn scan_candidate(dir: &Path, name: &str) -> Result<Candidate> {
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if crate::profiler::REPO_MARKERS.contains(&fname) && !markers.iter().any(|m| m == fname) {
+        if crate::setup::REPO_MARKERS.contains(&fname) && !markers.iter().any(|m| m == fname) {
             markers.push(fname.to_string());
         } else if fname.to_ascii_lowercase().ends_with(".sln") && !markers.iter().any(|m| m == "*.sln") {
             markers.push("*.sln".to_string());

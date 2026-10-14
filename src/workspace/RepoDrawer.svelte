@@ -1,11 +1,11 @@
 <script lang="ts">
   // One repo's settings, opened from its row on the workspace settings
-  // screen: what it is for, reindex, its profile, the folders Ken watches,
+  // screen: what it is for, reindex, the folders Ken watches,
   // cloud files, video transcription and sync (the knowledge base only). The
   // repo is focused before this opens; every card acts on the focused repo.
   import { onMount, untrack } from "svelte";
-  import { app, forFocused } from "../lib/app.svelte";
-  import { api, memberLeaf, type FeatureInfo, type ProjectProfile, type SourceRow, type SyncStatus } from "../lib/api";
+  import { app } from "../lib/app.svelte";
+  import { api, memberLeaf, type SourceRow, type SyncStatus } from "../lib/api";
   import { toast } from "../lib/toast.svelte";
   import {
     buildFolderTree,
@@ -44,30 +44,14 @@
   let toggling = $state(false);
   let sync = $state<SyncStatus | null>(null);
   let syncingNow = $state(false);
-  let features = $state<FeatureInfo[]>([]);
-  let profileState = $state<"scanning" | "refining" | "ready" | "error" | null>(null);
-  let profileResult = $state<ProjectProfile | null>(null);
-  let profileError = $state<string | null>(null);
 
   const focusedHere = $derived(app.focused === repo.id);
-  const profilerOn = $derived(features.find((f) => f.name === "profiler")?.effective ?? false);
   const excludedSet = $derived(new Set(app.project?.excluded ?? []));
   const folderTree = $derived(buildFolderTree(app.folders));
   let expanded = $state<Set<string>>(new Set());
 
   onMount(() => {
     void api.syncStatus().then((s) => (sync = s)).catch(() => (sync = null));
-    void api.listFeatures(repo.id).then((f) => (features = f)).catch(() => (features = []));
-    let off: (() => void) | undefined;
-    void api
-      .onProfileState((ev) => {
-        if (!forFocused(ev.project_id)) return;
-        profileState = ev.state;
-        if (ev.state === "ready") profileResult = ev.profile;
-        if (ev.state === "error") profileError = ev.reason;
-      })
-      .then((fn) => (off = fn));
-    return () => off?.();
   });
 
   function onKey(e: KeyboardEvent) {
@@ -82,16 +66,6 @@
       toast.error("Could not reindex", e);
     } finally {
       busy = false;
-    }
-  }
-
-  async function analyze() {
-    profileError = null;
-    try {
-      await api.profileProject(repo.id);
-    } catch (e) {
-      profileState = "error";
-      profileError = String(e);
     }
   }
 
@@ -207,38 +181,6 @@
         <button class="btn btn-small btn-ghost" onclick={openInFiles}>Open in Files</button>
       </div>
     </div>
-
-    {#if profilerOn}
-      <div class="card">
-        <div class="card-title">Repo profile</div>
-        <p class="note">Ken reads the repo's shape (code or docs, languages, build output) to tune what it indexes.</p>
-        {#if profileState === "scanning" || profileState === "refining"}
-          <p class="note">{profileState === "refining" ? "Refining…" : "Scanning…"}</p>
-        {/if}
-        {#if profileResult}
-          <div class="row">
-            <span class="chip mono">{profileResult.kind}</span>
-            {#if profileResult.languages.length > 0}<span class="soft">{profileResult.languages.join(", ")}</span>{/if}
-          </div>
-          {#if profileResult.summary}<p class="note">{profileResult.summary}</p>{/if}
-          {#if profileResult.excludes.length > 0}
-            <p class="note">Left out: <span class="mono">{profileResult.excludes.join(" · ")}</span></p>
-          {/if}
-        {/if}
-        {#if profileState === "error" && profileError}
-          <p class="note warn">
-            {profileError.includes("hand-edited")
-              ? "Its .ken/index-profile.json was edited by hand, so Ken leaves it. Delete the file to let Ken write a new one."
-              : `Could not read the repo's shape: ${profileError}`}
-          </p>
-        {/if}
-        <div class="row">
-          <button class="btn btn-small" onclick={analyze} disabled={profileState === "scanning" || profileState === "refining"}>
-            {profileResult ? "Read it again" : "Read its shape"}
-          </button>
-        </div>
-      </div>
-    {/if}
 
     <div class="card">
       <div class="card-title">Watched folders</div>
@@ -469,13 +411,6 @@
     margin: 0;
     font-size: 12px;
     line-height: 1.55;
-    color: var(--ink-tertiary);
-  }
-  .note.warn {
-    color: var(--needs-input-text);
-  }
-  .soft {
-    font-size: 12px;
     color: var(--ink-tertiary);
   }
   .small {

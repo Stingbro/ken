@@ -41,7 +41,6 @@ pub mod model;
 pub mod ocr;
 pub mod pagemeta;
 pub mod proc;
-pub mod profiler;
 pub mod project;
 pub mod proposal;
 pub mod raid;

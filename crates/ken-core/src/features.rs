@@ -2,9 +2,12 @@
 //! single source of truth: command validation and UI rendering both derive
 //! from it, so an unknown flag is rejected in one place and no switch can be
 //! shown that does nothing. Only *implemented* flags are registered — product
-//! docs may list more, but each lands here in the change that ships it (e.g.
-//! `profiler`, registered by the project-profiler change's ken-core layer;
-//! its src-tauri/frontend wiring is a later phase of that same change).
+//! docs may list more, but each lands here in the change that ships it.
+//!
+//! `profiler` ("Repo profile") is gone (knowledge-core decisions 17, 19, 21
+//! and 34): the repo analysis and `.ken/knowledge.json` took its place. An
+//! old `profiler` value in `settings.json` or a repo's switches is not a
+//! registered flag, so nothing reads it and none is shown.
 
 use serde_json::Value;
 
@@ -47,16 +50,6 @@ pub const FLAGS: &[FlagDef] = &[
                       with a model that runs on this computer. It needs a \
                       search-by-meaning model from Settings › AI; \
                       until one is installed, search is by keyword.",
-    },
-    FlagDef {
-        name: "profiler",
-        label: "Repo profile",
-        applies: "this repo",
-        scope: FlagScope::Project,
-        default: false,
-        description: "Analyze each project's shape (deterministic scan, \
-                      optional local-LLM refinement) to tune semantic-index \
-                      chunking, exclusions, and knowledge extraction.",
     },
 ];
 
@@ -136,17 +129,16 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_semantic_index_and_profiler() {
-        assert_eq!(FLAGS.len(), 2);
+    fn registry_has_semantic_index_alone() {
+        assert_eq!(FLAGS.len(), 1);
         assert!(flag("semanticIndex").is_some());
         for name in BUILT_IN {
             assert!(flag(name).is_none(), "{name} is how Ken works, not a switch");
         }
         // Background work is paused and paced by the throttle, not a flag.
         assert!(flag("backgroundExtraction").is_none());
-        let profiler = flag("profiler").expect("profiler flag registered");
-        assert_eq!(profiler.scope, FlagScope::Project);
-        assert!(!profiler.default);
+        // The repo profile is gone; the repo analysis took its place.
+        assert!(flag("profiler").is_none());
         // The task board is how Ken works now (Your day), not a switch; the
         // families and their team bus are gone (decision 37).
         assert!(flag("kenTasks").is_none());

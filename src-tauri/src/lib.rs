@@ -75,11 +75,6 @@ struct MemberRuntime {
     /// True while a background reindex (clear + full rescan) is running, so a
     /// second `reindex` command can't stack another rebuild on top.
     reindex_running: Arc<AtomicBool>,
-    /// True while `profile_project` (project-profiler task 2.1) is scanning
-    /// or refining this project, so a second call can't stack another pass
-    /// on top. `profile_candidates` (task 2.2) has no equivalent guard: its
-    /// targets aren't open members and share no state to race on.
-    profiling_running: Arc<AtomicBool>,
     /// Stops the per-project background worker (one-line summaries and the
     /// knowledge checks) when this project closes.
     _background_worker: StopOnDrop,
@@ -637,22 +632,15 @@ fn maybe_warn_large_index(
 /// `activate()` on project open, the model-download-completion handler
 /// (all three pass `target: None` — the pre-workspace single-project
 /// semantics `member(&guard, None)` resolves, unchanged from before this
-/// parameter existed), and from `profile_project`/task 2.3's re-ingest
-/// trigger (which passes a real target id — profiling can run against any
-/// open member, not just the focused one).
-///
-/// project-profiler task 2.3: when the `profiler` flag is on for this
-/// project, the background rebuild loads `.ken/index-profile.json` and
-/// passes it to `rebuild_semantic_index_with_profile` so the profile's
-/// chunking actually takes effect; flag off (or no profile) passes `None`,
-/// which reproduces the old extension-only chunking exactly.
+/// parameter existed), and from `reapply_semantic_index_everywhere` (which
+/// passes each open member's id).
 fn apply_semantic_index_flag(
     app: &AppHandle,
     state: &SharedState,
     target: Option<uuid::Uuid>,
     enabled: bool,
 ) -> CmdResult<()> {
-    let (project, base, embedder_slot, cancel_slot, warned_large, app_settings) = {
+    let (project, base, embedder_slot, cancel_slot, warned_large) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, target)?;
         (
@@ -661,7 +649,6 @@ fn apply_semantic_index_flag(
             active.semantic_embedder.clone(),
             active.semantic_build_cancel.clone(),
             active.semantic_index_warned_large.clone(),
-            guard.app_settings.clone(),
         )
     };
 
@@ -677,7 +664,7 @@ fn apply_semantic_index_flag(
         return Ok(());
     }
 
-    start_semantic_build(app, project, base, embedder_slot, cancel_slot, warned_large, app_settings, MeaningBuild::Full);
+    start_semantic_build(app, project, base, embedder_slot, cancel_slot, warned_large, MeaningBuild::Full);
     Ok(())
 }
 
@@ -730,11 +717,10 @@ fn queue_meaning_catch_up(app: &AppHandle, project_id: uuid::Uuid) {
                         m.semantic_embedder.clone(),
                         m.semantic_build_cancel.clone(),
                         m.semantic_index_warned_large.clone(),
-                        guard.app_settings.clone(),
                     )
                 })
         };
-        let Some((project, base, embedder_slot, cancel_slot, warned_large, app_settings)) = snapshot else { return };
+        let Some((project, base, embedder_slot, cancel_slot, warned_large)) = snapshot else { return };
         {
             let builds = semantic_builds().lock().unwrap_or_else(|p| p.into_inner());
             if builds.contains_key(&project_id) {
@@ -742,7 +728,7 @@ fn queue_meaning_catch_up(app: &AppHandle, project_id: uuid::Uuid) {
                 return;
             }
         }
-        start_semantic_build(&app, project, base, embedder_slot, cancel_slot, warned_large, app_settings, MeaningBuild::CatchUp);
+        start_semantic_build(&app, project, base, embedder_slot, cancel_slot, warned_large, MeaningBuild::CatchUp);
     });
 }
 
@@ -757,7 +743,6 @@ fn start_semantic_build(
     embedder_slot: EmbedderSlot,
     cancel_slot: Arc<Mutex<Option<CancelToken>>>,
     warned_large: Arc<AtomicBool>,
-    app_settings: ken_core::settings::AppSettings,
     mode: MeaningBuild,
 ) {
     let project_id = project.config.id;
@@ -801,13 +786,6 @@ fn start_semantic_build(
         };
         let mut embedder = SlotEmbedder { slot: bg_embedder_slot, model_id, dim };
         let progress_app = bg_app.clone();
-        // project-profiler task 2.3: resolve the stored profile only when the
-        // `profiler` flag is on for this project — `None` otherwise, which
-        // makes `rebuild_semantic_index_with_profile` byte-identical to the
-        // old profile-less `rebuild_semantic_index` (ken-core task 1.5's
-        // flag-off inertness guarantee).
-        let profiler_enabled = ken_core::features::effective_flag(&app_settings, &project, "profiler");
-        let profile = profiler_enabled.then(|| ken_core::profiler::ProjectProfile::load(&project.root));
         let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let progress = |done, total| {
             emit_member(
@@ -823,14 +801,7 @@ fn start_semantic_build(
             }
         };
         let result = match mode {
-            MeaningBuild::Full => engine::rebuild_semantic_index_with_profile(
-                &project,
-                &mut db,
-                &mut embedder,
-                &token,
-                progress,
-                profile.as_ref(),
-            ),
+            MeaningBuild::Full => engine::rebuild_semantic_index(&project, &mut db, &mut embedder, &token, progress),
             MeaningBuild::CatchUp => engine::catch_up_semantic_index(&project, &mut db, &mut embedder, &token, progress),
         };
         // A build another one replaced leaves the mark to it; one turned off,
@@ -1265,7 +1236,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
         reindex_running: Arc::new(AtomicBool::new(false)),
-        profiling_running: Arc::new(AtomicBool::new(false)),
         _background_worker: StopOnDrop(stop.clone()),
         _ocr_worker: StopOnDrop(ocr_stop.clone()),
         _bg_hydrate: StopOnDrop(bg_stop.clone()),
@@ -1546,7 +1516,7 @@ const DISMISSED_MEMORY_PREFIX: &str = "distill-dismissed:";
 /// is actually resident in `AppState::members`; callers
 /// that need residency check `guard.members.contains_key(..)`/`.get(..)`
 /// themselves. Centralizes the `memory::workspace_pseudo_member_id` call so
-/// every exclusion site (search fan-out, profiler) derives
+/// every exclusion site (the search fan-out) derives
 /// the same id the same way.
 fn memory_pseudo_member_id(state: &AppState) -> Option<uuid::Uuid> {
     state
@@ -3494,310 +3464,6 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
 
     // Return immediately; the real stats arrive on the `index-updated` event.
     Ok(ScanStats::default())
-}
-
-// ===========================================================================
-// project-profiler: deterministic scan + optional local-LLM refinement of a
-// project's shape, written to `.ken/index-profile.json` (ken-core's
-// `profiler.rs`, task 1.x). This section is the src-tauri wiring (task 2.x):
-// the `profile_project` command for an open member, `profile_candidates` for
-// workspace-creation folders that aren't projects yet, and the shared
-// scan/refine/save pass both call into.
-// ===========================================================================
-
-/// Frontend-facing view of a `ken_core::profiler::ProjectProfile` (camelCase;
-/// `chunking` and `generated_hash` are internal wiring the settings/
-/// workspace-creation UI has no use for, so they're left off rather than
-/// exposed and ignored).
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProfileDto {
-    kind: ken_core::profiler::ProjectKind,
-    summary: String,
-    languages: Vec<String>,
-    excludes: Vec<String>,
-    focus_hints: Vec<String>,
-    hand_edited: bool,
-}
-
-impl ProfileDto {
-    fn of(profile: &ken_core::profiler::ProjectProfile) -> ProfileDto {
-        ProfileDto {
-            kind: profile.kind,
-            summary: profile.summary.clone(),
-            languages: profile.languages.clone(),
-            excludes: profile.excludes.clone(),
-            focus_hints: profile.focus_hints.clone(),
-            hand_edited: profile.is_hand_edited(),
-        }
-    }
-}
-
-/// Payload for the `profile-state` event (project-profiler task 2.1),
-/// mirroring `SemanticIndexStateEvent`'s state-tag shape:
-/// `{"state":"scanning"}`, `{"state":"refining"}`,
-/// `{"state":"ready","profile":{...}}`, `{"state":"error","reason":"..."}`.
-/// Delivered via `emit_member` (keyed by `project_id`) for `profile_project`,
-/// or a path-keyed envelope (see `CandidateProfileEnvelope`) for
-/// `profile_candidates` — the frontend tells the two sources apart by which
-/// key accompanies this same tag shape.
-#[derive(Clone, Serialize)]
-#[serde(tag = "state", rename_all = "camelCase")]
-enum ProfileStateEvent {
-    Scanning,
-    Refining,
-    Ready { profile: ProfileDto },
-    Error { reason: String },
-}
-
-/// `profile_candidates`' per-candidate envelope (task 2.2): candidate
-/// folders being profiled during workspace creation aren't open projects —
-/// no `Uuid`, no `MemberRuntime` — so events key off the candidate's
-/// absolute path instead of `emit_member`'s `project_id`. Same event name
-/// (`profile-state`) and same inner shape as the project-scoped version.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CandidateProfileEnvelope {
-    path: String,
-    #[serde(flatten)]
-    state: ProfileStateEvent,
-}
-
-/// Result of one `scan_and_profile` pass: the profile that ended up on disk,
-/// and whether it's worth kicking a re-ingest over (task 2.3).
-struct ProfileOutcome {
-    profile: ken_core::profiler::ProjectProfile,
-    /// `true` when `excludes` or `chunking` differ from what was on disk
-    /// before this pass. `summary`/`focus_hints`/`kind` changing alone
-    /// doesn't warrant a re-ingest — nothing chunking- or exclusion-relevant
-    /// changed.
-    changed: bool,
-}
-
-/// The deterministic-scan → optional-refinement → save pass shared by
-/// `profile_project` (one open member) and `profile_candidates` (workspace-
-/// creation folders, task 2.2) — both just run this on a background thread
-/// with a differently-scoped `emit` closure. Never called while holding the
-/// global `AppState` lock: `scan_stats` walks the filesystem and the
-/// refinement step may block on the local LLM, both of which would freeze
-/// every other open member's commands if run under the guard (lock-audit.md
-/// write template).
-///
-/// Hand-edit protection (design D2 / spec "hand-edited profile is
-/// preserved"): if the on-disk profile has diverged from the hash Ken
-/// stamped on its own last write, this refuses to overwrite it and emits
-/// `error` instead of silently clobbering the user's edits.
-/// `ProjectProfile::save`'s doc comment assigns the "get explicit user
-/// confirmation before calling save again" responsibility to "task 2.x/3.x"
-/// jointly; task 3.x (workspace-creation/settings UI, not built yet) is
-/// where an actual confirm-then-force flow belongs. Until it lands, refusing
-/// outright is the only safe behavior this command can offer on its own —
-/// deviation noted in tasks.md.
-///
-/// LLM refinement runs only when the local model is `Ready` right now
-/// (`local_llm::llm_status()`); the design's "skippable (setting)" toggle
-/// has no backing setting anywhere in this codebase yet, so model
-/// availability is the sole gate — noted as a deviation in tasks.md.
-/// Refinement failure (timeout, unparseable output — `generate_stream`
-/// returning `Err`) is not an error: the deterministic profile already
-/// saved above stands, matching the spec's "model failure falls back...
-/// reaches ready, not error".
-fn scan_and_profile(
-    root: &Path,
-    excluded: &[String],
-    emit: impl Fn(ProfileStateEvent),
-) -> Option<ProfileOutcome> {
-    emit(ProfileStateEvent::Scanning);
-
-    let stats = match ken_core::profiler::scan_stats(root, excluded) {
-        Ok(s) => s,
-        Err(e) => {
-            emit(ProfileStateEvent::Error { reason: e.to_string() });
-            return None;
-        }
-    };
-
-    let existing = ken_core::profiler::ProjectProfile::load(root);
-    if existing.is_hand_edited() {
-        emit(ProfileStateEvent::Error {
-            reason: "index-profile.json has been hand-edited — re-analyze needs an \
-                      explicit overwrite confirmation that the workspace-creation/ \
-                      settings UI doesn't build yet; delete .ken/index-profile.json \
-                      to force a fresh scan"
-                .into(),
-        });
-        return None;
-    }
-
-    let mut profile = ken_core::profiler::deterministic_profile(&stats);
-    if let Err(e) = profile.save(root) {
-        emit(ProfileStateEvent::Error { reason: e.to_string() });
-        return None;
-    }
-
-    if LOCAL_GENERATION && matches!(ken_core::local_llm::llm_status(), ken_core::local_llm::LlmStatus::Ready) {
-        emit(ProfileStateEvent::Refining);
-        let tree = ken_core::profiler::tree_sample(&stats);
-        let prompt = ken_core::profiler::compose_profile_prompt(&stats, &tree);
-        let mut sink = |_: &str| true;
-        if let Ok(text) = ken_core::local_llm::generate_stream(
-            &prompt,
-            ken_core::local_llm::Priority::Background,
-            &mut sink,
-        ) {
-            let refinement = ken_core::profiler::parse_profile_refinement(&text);
-            ken_core::profiler::apply_refinement(&mut profile, &refinement, root);
-            if let Err(e) = profile.save(root) {
-                // The deterministic profile already landed above — a failed
-                // refinement save degrades to "no refinement", not an error.
-                eprintln!("warning: profile refinement save failed: {e}");
-            }
-        }
-    }
-
-    let changed = existing.excludes != profile.excludes || existing.chunking != profile.chunking;
-    emit(ProfileStateEvent::Ready { profile: ProfileDto::of(&profile) });
-    Some(ProfileOutcome { profile, changed })
-}
-
-/// project-profiler task 2.3: after a profile save changes `excludes` or
-/// `chunking`, resume the semantic-index build with the fresh profile so
-/// the new chunking actually takes effect on the `chunks` table — reusing
-/// exactly the mechanism `set_project_feature("semanticIndex", true)`
-/// already drives (`apply_semantic_index_flag`), which as of this change
-/// resolves and passes the stored profile itself whenever the `profiler`
-/// flag is on (see that function's doc comment). A no-op when semantic
-/// indexing isn't already enabled for this project: there's nothing to
-/// rebuild, and calling `apply_semantic_index_flag(.., true)`
-/// unconditionally would incorrectly turn semantic indexing ON as a side
-/// effect of profiling — the two flags must stay independent.
-fn maybe_rebuild_semantic_index_for_profile(
-    app: &AppHandle,
-    state: &SharedState,
-    target: Option<uuid::Uuid>,
-) {
-    let enabled = {
-        let guard = state.lock().unwrap();
-        match member(&guard, target) {
-            Ok(active) => semantic_index_enabled(&guard.app_settings, &active.project),
-            Err(_) => false, // member closed mid-profile — nothing to rebuild
-        }
-    };
-    if enabled {
-        let _ = apply_semantic_index_flag(app, state, target, true);
-    }
-}
-
-/// Profile one open member: deterministic scan → save → optional
-/// Background-priority LLM refinement → re-save (task 2.1). Gated on the
-/// per-project `profiler` flag (spec: flag off touches nothing) — off
-/// returns `Err` immediately rather than silently scanning. Returns as soon
-/// as the background thread is spawned; progress reaches the frontend via
-/// `profile-state` events scoped to `project_id` (`emit_member`). See
-/// `scan_and_profile`'s doc comment for the hand-edit and refinement-gating
-/// deviations.
-#[tauri::command(async)]
-fn profile_project(
-    app: AppHandle,
-    state: State<SharedState>,
-    project_id: Option<String>,
-) -> CmdResult<()> {
-    let target: Option<uuid::Uuid> = project_id
-        .as_deref()
-        .map(|s| s.parse::<uuid::Uuid>())
-        .transpose()
-        .map_err(err)?;
-
-    let (root, excluded, resolved_id, running) = {
-        let guard = state.lock().unwrap();
-        let active = member(&guard, target)?;
-        // ken-memory task 2.1 (D3): the workspace pseudo-member is excluded
-        // from profiler candidates. It's unreachable from the frontend today
-        // (never listed in `workspace_overview`), but this is the actual
-        // enforcement point, not just an absence-from-the-UI accident.
-        if Some(active.project.config.id) == memory_pseudo_member_id(&guard) {
-            return Err("the workspace-memory member can't be profiled".into());
-        }
-        if !ken_core::features::effective_flag(&guard.app_settings, &active.project, "profiler") {
-            return Err("profiler flag is off for this project".into());
-        }
-        (
-            active.project.root.clone(),
-            active.project.excluded_folders(),
-            active.project.config.id,
-            active.profiling_running.clone(),
-        )
-    };
-
-    if running.swap(true, Ordering::SeqCst) {
-        return Err("this project is already being profiled".into());
-    }
-
-    let bg_app = app.clone();
-    let bg_state = state.inner().clone();
-    std::thread::spawn(move || {
-        let emit_app = bg_app.clone();
-        let outcome = scan_and_profile(&root, &excluded, |evt| {
-            emit_member(&emit_app, resolved_id, "profile-state", evt);
-        });
-        if outcome.is_some_and(|o| o.changed) {
-            maybe_rebuild_semantic_index_for_profile(&bg_app, &bg_state, Some(resolved_id));
-        }
-        running.store(false, Ordering::SeqCst);
-    });
-
-    Ok(())
-}
-
-/// Profile each selected workspace-creation candidate folder (task 2.2):
-/// deterministic scan + save first (design D5 — the UI can show a kind
-/// badge immediately), optional LLM refinement streamed in after,
-/// concurrency 2 (same idea as the ingest semaphore) via two worker threads
-/// sharing a path queue. Each candidate's `.ken/index-profile.json` is
-/// written directly to its own folder (adopt-if-exists, design D2), so the
-/// profile is already in place if/when the folder becomes a real project —
-/// `create_project`/`open_member` need no changes to pick it up. A failed
-/// candidate never blocks the others or the command's return (spec:
-/// "per-candidate profiling failure SHALL never block creation").
-///
-/// Deviation (tasks.md 2.2): the workspace-creation UX itself (candidate
-/// picker, "Skip analysis" control, confirm screen) doesn't exist yet —
-/// Phase 2 built only `open_member`/`close_member`. This command is the
-/// honestly-implementable slice: it profiles whatever paths a (future)
-/// picker UI passes it. Wiring an actual creation flow around it, including
-/// the skip control and kind-badge display, is frontend work deferred to
-/// task 3.x.
-///
-/// Not gated on the `profiler` flag the way `profile_project` is: none of
-/// these paths is a `Project` yet, so there's no per-project `features` map
-/// to read an override from. The (future) workspace-creation UI is expected
-/// to check the *global* `profiler` default (`list_features` with no
-/// `project_id`) before calling this at all.
-#[tauri::command(async)]
-fn profile_candidates(app: AppHandle, paths: Vec<String>) -> CmdResult<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let queue = Arc::new(Mutex::new(paths));
-    const CANDIDATE_CONCURRENCY: usize = 2;
-    for _ in 0..CANDIDATE_CONCURRENCY {
-        let queue = queue.clone();
-        let worker_app = app.clone();
-        std::thread::spawn(move || loop {
-            let path = { queue.lock().unwrap().pop() };
-            let Some(path) = path else { break };
-            let root = PathBuf::from(&path);
-            let emit_app = worker_app.clone();
-            let emit_path = path.clone();
-            let _ = scan_and_profile(&root, &[], |evt| {
-                let _ = emit_app.emit(
-                    "profile-state",
-                    CandidateProfileEnvelope { path: emit_path.clone(), state: evt },
-                );
-            });
-        });
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -12539,8 +12205,6 @@ pub fn run() {
             extracted_text,
             get_ocr_regions,
             reindex,
-            profile_project,
-            profile_candidates,
             move_file,
             delete_file,
             create_folder,

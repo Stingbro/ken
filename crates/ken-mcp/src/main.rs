@@ -30,7 +30,6 @@ use ken_core::day;
 use ken_core::db::Db;
 use ken_core::embedder::Embedder;
 use ken_core::memory;
-use ken_core::profiler::{self, ProjectProfile};
 use ken_core::project::Project;
 use ken_core::registry::{self, Registry};
 use ken_core::routing::{self, MemberHits, MemberInfo, MemberStatus, RouteReason};
@@ -501,8 +500,7 @@ workspace's repos (a ken:// address, or a path with `project`), or pasted `text`
             "name": "repos",
             "description": "The repos Ken searches in the open workspace: name, folder, whether the folder is there, \
 and which one is the knowledge base, each with its index health in one line (files indexed, failed or skipped; how \
-far its meaning search has got; its controls; whether the embedding model is missing) and, if it has one, its \
-one-line `.ken/index-profile.json` summary.",
+far its meaning search has got; its controls; whether the embedding model is missing).",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ];
@@ -1001,13 +999,6 @@ folder in the Ken app first."
                 Err(_) => "no index yet".to_string(),
             };
             out.push_str(&format!(" — {readiness}"));
-            if profiler::profile_path(&s.entry.path).is_file() {
-                let summary = ProjectProfile::load(&s.entry.path).summary;
-                let summary = summary.trim();
-                if !summary.is_empty() {
-                    out.push_str(&format!(" — \"{summary}\""));
-                }
-            }
         }
     }
     Ok(out)
