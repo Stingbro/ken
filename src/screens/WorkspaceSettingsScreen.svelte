@@ -4,7 +4,8 @@
   // branch, commit, how far behind its upstream, its health line), what the
   // knowledge base's `.ken/knowledge.json` holds and nothing else shows (the
   // index rules, the tiers, each source's roles, the controls with their last
-  // results), what a scan found and what a source lacks for its kind, the
+  // results), "Analyse again" for each source the repo analysis can propose
+  // for, what a scan found and what a source lacks for its kind, the
   // template files the knowledge base lacks, the pages outside its sections,
   // its drift runs and what its checks found, and its rules and templates.
   // Each row opens that repo's own settings in a drawer. Add a repo and Scan
@@ -28,6 +29,7 @@
   import { toast } from "../lib/toast.svelte";
   import { rail } from "../lib/rail.svelte";
   import {
+    analysisNote,
     controlLine,
     controlResult,
     editorLines,
@@ -62,6 +64,13 @@
   $effect(() => {
     void app.workspace?.id;
     void refresh();
+  });
+  // An analysis asked for again ends with a change to the Inbox, filed or
+  // not, so a busy row is read again then.
+  $effect(() => {
+    let off: (() => void) | undefined;
+    void api.onReviewChanged(() => void refresh()).then((fn) => (off = fn));
+    return () => off?.();
   });
 
   /** An action here: `what` names it in the notice when it fails. */
@@ -221,6 +230,13 @@
     });
   }
 
+  // "Analyse again" (Chris, 2026-10-14): the source's earlier no is
+  // forgotten and one background call is queued; its proposal arrives in
+  // the Inbox, replacing one still waiting.
+  function analyseAgain(r: SourceRow) {
+    void run(`analyse${r.id}`, `Could not analyse ${memberLeaf(r.name)} again`, () => api.analyzeSourceAgain(r.id));
+  }
+
   function runSweep() {
     const id = overview?.wiki?.id;
     if (!id) return;
@@ -289,6 +305,7 @@
   const driftCount = $derived(moved.length + rows.filter((r) => (r.behind ?? 0) > 0).length);
   const findings = $derived(orderFindings(overview?.findings ?? []));
   const kindless = $derived(kindlessRepos(rows));
+  const analysable = $derived(rows.filter((r) => r.canAnalyzeAgain));
   const controlsPassing = $derived((overview?.controls ?? []).filter((c) => c.passed).length);
 </script>
 
@@ -515,6 +532,23 @@
             <button class="btn btn-ghost" disabled={!overview.wiki} onclick={() => edit("controls", (overview?.controls ?? []).map(controlLine))}>Edit</button>
           </div>
         {/if}
+
+        <div class="divider">repo analysis · proposed in the Inbox · {analysable.length}</div>
+        {#each analysable as r (r.id)}
+          <div class="entry">
+            <span class="finding">
+              <span class="ftitle">{memberLeaf(r.name)}</span>
+              <span class="sub">{analysisNote(r, overview.controls, overview.wiki?.settingsName ?? null)}</span>
+            </span>
+            <span class="e-actions">
+              <button class="btn btn-ghost" disabled={r.analyzing || busy !== null} onclick={() => analyseAgain(r)}>
+                {r.analyzing ? "Analysing…" : "Analyse again"}
+              </button>
+            </span>
+          </div>
+        {:else}
+          <p class="note">No source to analyse: one needs its kind said and a knowledge base that lists it.</p>
+        {/each}
 
         {#if overview.wiki}
           <div class="divider">knowledge base files · against Ken's template · {overview.templateGaps.length}</div>

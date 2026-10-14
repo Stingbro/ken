@@ -2289,6 +2289,100 @@ fn analysis_proposals(state: State<SharedState>) -> CmdResult<Vec<AnalysisDto>> 
         .collect())
 }
 
+/// Sources whose analysis a person asked for again, while it is queued for
+/// the throttle's turn or running; Settings › Workspace shows them busy.
+static ANALYSING: std::sync::LazyLock<Mutex<std::collections::HashSet<uuid::Uuid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// A source's place in [`ANALYSING`], given up however its analysis ends.
+struct Analysing(uuid::Uuid);
+
+impl Drop for Analysing {
+    fn drop(&mut self) {
+        ANALYSING.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
+
+/// "Analyse again" in Settings › Workspace (Chris, 2026-10-14): the mark
+/// that keeps the source `project_id` from being analysed again is cleared
+/// now (`repo_analysis::forget`), and one Claude call is queued in the
+/// background, a turn of the one throttle counted against the hour like any
+/// analysis. Its proposal arrives as a new Inbox card in the knowledge
+/// base's index, replacing one still waiting for the source
+/// (`repo_analysis::analyze_again`); Accept and Dismiss are the usual ones.
+/// Refused for a code repo that keeps its own settings file, where Ken
+/// writes nothing (decision 36). Asking while it is queued or running does
+/// nothing more.
+#[tauri::command(async)]
+fn analyze_source_again(app: AppHandle, state: State<SharedState>, project_id: String) -> CmdResult<()> {
+    let id: uuid::Uuid = project_id.parse().map_err(err)?;
+    let (base, sources): (PathBuf, Vec<Project>) = {
+        let guard = lock_tolerant(&state);
+        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+        let sources = ws
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        (guard.base_dir.clone(), sources)
+    };
+    let project = sources.iter().find(|p| p.config.id == id).cloned().ok_or("that source is not in the workspace")?;
+    let name = project.config.name.clone();
+    let kinds = ken_core::registry::kind_of(&project.root);
+    if kinds.is_empty() {
+        return Err(format!("Nobody has said what {name} is: pick its kind first."));
+    }
+    let settings = ken_core::knowledge_settings::for_repo(&project.root).ok_or("no knowledge base lists this source")?;
+    if !ken_core::repo_analysis::writable(&settings) {
+        return Err(format!("{name} keeps its own settings file, and Ken writes nothing in a code repo."));
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let kb = sources.iter().find(|p| canon(&p.root) == canon(&settings.kb_root)).ok_or("its knowledge base is not open")?;
+    let kb_id = kb.config.id;
+    let binary = ken_core::runner::discover_claude().ok_or("Claude Code is not there to ask")?;
+    if !ANALYSING.lock().unwrap_or_else(|e| e.into_inner()).insert(id) {
+        return Ok(());
+    }
+    let place = Analysing(id);
+    let mut kb_db = Db::open(&base, kb_id).map_err(err)?;
+    ken_core::repo_analysis::forget(&mut kb_db, &settings.name).map_err(err)?;
+    std::thread::spawn(move || {
+        let _place = place;
+        let root = project.root.clone();
+        // Background work: a turn of the one throttle (decision 34).
+        let mut generate = |prompt: &str| -> ken_core::Result<String> {
+            let _turn = ken_core::throttle::claude_turn(&|| false);
+            let _running = ken_core::throttle::begin("analysis", &name);
+            match ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, ANALYSIS_TIMEOUT, &CancelToken::new())? {
+                ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+                other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
+            }
+        };
+        let filed = ken_core::repo_analysis::analyze_again(
+            &project.root,
+            Some(settings),
+            &kinds,
+            &mut kb_db,
+            &mut generate,
+            engine::now_epoch(),
+        );
+        match filed {
+            Ok(_) => ken_core::throttle::clear_failure("analysis", &name),
+            Err(e) => {
+                eprintln!("repo analysis of {name}, asked again: {e}");
+                ken_core::throttle::fail("analysis", &name, &e.to_string());
+            }
+        }
+        drop(_place);
+        let _ = app.emit("review-changed", ());
+    });
+    Ok(())
+}
+
 /// Say what a repo is for, in a person's words; the first-wiki draft reads it.
 #[tauri::command]
 fn set_project_description(state: State<SharedState>, id: String, description: String) -> CmdResult<Vec<RegistryEntryStatus>> {
@@ -7781,6 +7875,14 @@ struct SourceDto {
     settings_name: String,
     /// Its role rules (decision 17) as `pattern = role` lines.
     roles: Vec<String>,
+    /// Whether "Analyse again" is offered (Chris, 2026-10-14): its kind is
+    /// said, a knowledge base lists it, and its settings are not a code
+    /// repo's own file, where Ken writes nothing (decision 36).
+    can_analyze_again: bool,
+    /// Its analysis, asked for again, is queued or running.
+    analyzing: bool,
+    /// A repo analysis for it waits in the Inbox.
+    analysis_waiting: bool,
 }
 
 #[derive(Serialize)]
@@ -8011,9 +8113,11 @@ fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsD
         let (files, health, stored) =
             with_index(&dbs, &base_dir, p.config.id, |db| (db.file_count().unwrap_or(-1), db.index_health().ok(), ken_core::controls::stored(db)))
                 .unwrap_or((-1, None, Vec::new()));
-        let settings_name = ken_core::knowledge_settings::for_repo(&p.root)
-            .map(|s| s.name)
-            .unwrap_or_else(|| ken_core::knowledge_settings::repo_name(&p.root));
+        let settings = ken_core::knowledge_settings::for_repo(&p.root);
+        let settings_name =
+            settings.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| ken_core::knowledge_settings::repo_name(&p.root));
+        let can_analyze_again =
+            !kind.is_empty() && p.root.is_dir() && settings.as_ref().is_some_and(ken_core::repo_analysis::writable);
         results.push((settings_name.clone(), stored));
         repos.push(SourceDto {
             id: p.config.id.to_string(),
@@ -8036,6 +8140,9 @@ fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsD
             }),
             settings_name,
             roles: Vec::new(),
+            can_analyze_again,
+            analyzing: ANALYSING.lock().unwrap_or_else(|e| e.into_inner()).contains(&p.config.id),
+            analysis_waiting: false,
         });
     }
     let is_wiki = |r: &SourceDto| r.kind.contains(&ken_core::registry::RepoKind::Wiki);
@@ -8069,6 +8176,8 @@ fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsD
     let mut wiki = wiki_index.map(|i| repos.remove(i));
     let mut sweep = None;
     let mut findings = Vec::new();
+    // The sources a repo analysis waits for in the knowledge base's Inbox.
+    let mut waiting_analyses: Vec<String> = Vec::new();
     let (mut rules, mut templates) = (Vec::new(), Vec::new());
     let (mut ignores, mut weights, mut controls, mut template_gaps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     if let Some(w) = &wiki {
@@ -8078,6 +8187,7 @@ fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsD
                 let db = lock_tolerant(d);
                 sweep = db.last_drift_run().ok().flatten();
                 findings = kb_findings(&w.id, &db);
+                waiting_analyses = ken_core::repo_analysis::open(&db).map(|o| o.into_iter().map(|(_, p)| p.source).collect()).unwrap_or_default();
             }
         }
         // The older layout kept the rules in Ways-of-Working/Rules.
@@ -8094,6 +8204,7 @@ fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsD
     if let Some(root) = wiki.as_ref().map(|w| PathBuf::from(&w.path)) {
         for r in repos.iter_mut().chain(wiki.iter_mut()) {
             r.roles = ken_core::knowledge_settings::role_lines(&root, &r.settings_name);
+            r.analysis_waiting = waiting_analyses.iter().any(|s| s.eq_ignore_ascii_case(&r.settings_name));
         }
     }
     // The older workspace `.kenignore`, while a source still reads it: each
@@ -12218,6 +12329,7 @@ pub fn run() {
             accept_analysis,
             loose_proposals,
             analysis_proposals,
+            analyze_source_again,
             ignore_file,
             unignore_file,
             list_ignored,

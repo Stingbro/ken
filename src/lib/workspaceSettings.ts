@@ -1,7 +1,8 @@
 // The workspace settings screen, the pure part (knowledge-core decision 37):
 // how a finding of the knowledge base's checks is labelled, the sources no one
 // has said the kind of and the kinds set-up would give them, and how the
-// editors read and show the tiers, roles and controls of `.ken/knowledge.json`.
+// editors read and show the tiers, roles and controls of `.ken/knowledge.json`,
+// and what the repo analysis row says of a source.
 import type { ControlRow, Finding, RepoKind, SetupRepoRow, SourceRow } from "./api";
 
 /** The tag a finding row carries. */
@@ -111,4 +112,23 @@ export function controlResult(c: Pick<ControlRow, "ran" | "rank" | "passed">): s
   if (!c.ran) return "not run yet";
   if (c.passed && c.rank !== null) return `passes, at ${c.rank}`;
   return "fails: not in the top 5";
+}
+
+/** What the repo analysis row says of a source beside "Analyse again"
+ *  (Chris, 2026-10-14): queued or running, a proposal waiting in the Inbox,
+ *  or what `.ken/knowledge.json` holds for it already. A control with no
+ *  source is the knowledge base's own (`kbName`). */
+export function analysisNote(
+  r: Pick<SourceRow, "analyzing" | "analysisWaiting" | "roles" | "settingsName">,
+  controls: readonly Pick<ControlRow, "source">[],
+  kbName: string | null,
+): string {
+  if (r.analyzing) return "Queued or running: one Claude call from the background budget; its proposal arrives in the Inbox.";
+  if (r.analysisWaiting) return "A proposal waits in the Inbox. Analysing again replaces it.";
+  const name = r.settingsName.toLowerCase();
+  const hasControls = controls.some((c) => (c.source ?? kbName)?.toLowerCase() === name);
+  if (r.roles.length > 0 || hasControls) {
+    return "Its rules or controls are in .ken/knowledge.json. Accept adds only what it has none of yet: empty them here first to take fresh ones.";
+  }
+  return "Nothing for it waits in the Inbox or is in .ken/knowledge.json.";
 }

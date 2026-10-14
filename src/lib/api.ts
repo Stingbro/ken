@@ -105,6 +105,13 @@ export interface SourceRow {
   settingsName: string;
   /** Its role rules (decision 17), `pattern = role` lines. */
   roles: string[];
+  /** Whether "Analyse again" is offered: its kind is said, a knowledge base
+   *  lists it, and its settings are not a code repo's own file. */
+  canAnalyzeAgain: boolean;
+  /** Its analysis, asked for again, is queued or running. */
+  analyzing: boolean;
+  /** A repo analysis for it waits in the Inbox. */
+  analysisWaiting: boolean;
 }
 
 /** Something a source lacks for its kind, or the workspace lacks. */
@@ -1585,6 +1592,10 @@ export const api = {
    *  Dismiss is `resolveReviewItem`. */
   acceptAnalysis: (itemId: number, projectId: string | null = null) =>
     invoke<string | null>("accept_analysis", { itemId, projectId }),
+  /** "Analyse again": clears the source's "proposed before" mark and queues
+   *  one background Claude call; its proposal arrives as a new Inbox card,
+   *  replacing one still waiting for the source. */
+  analyzeSourceAgain: (projectId: string) => invoke<void>("analyze_source_again", { projectId }),
   /// Silence a file's issues for this user only (app-data, never synced).
   ignoreFile: (relPath: string) =>
     invoke<void>("ignore_file", { relPath }),

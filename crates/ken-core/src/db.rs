@@ -2253,6 +2253,12 @@ impl Db {
         Ok(())
     }
 
+    /// Remove a review item, open or resolved, as if it was never filed.
+    pub fn delete_review_item(&mut self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM review_items WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     fn map_review_item(r: &rusqlite::Row) -> rusqlite::Result<ReviewItemRow> {
         Ok(ReviewItemRow {
             id: r.get(0)?,

@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { controlLine, controlResult, editorLines, findingLabel, kindlessRepos, orderFindings, parseControls, proposedKinds } from "./workspaceSettings";
+import {
+  analysisNote,
+  controlLine,
+  controlResult,
+  editorLines,
+  findingLabel,
+  kindlessRepos,
+  orderFindings,
+  parseControls,
+  proposedKinds,
+} from "./workspaceSettings";
 import type { Finding, RepoKind } from "./api";
 
 const finding = (kind: string, title = kind): Finding => ({ kind, title, detail: "", path: null, projectId: null });
@@ -89,5 +99,21 @@ describe("controls", () => {
     expect(controlResult({ ran: false, rank: null, passed: false })).toBe("not run yet");
     expect(controlResult({ ran: true, rank: 2, passed: true })).toBe("passes, at 2");
     expect(controlResult({ ran: true, rank: null, passed: false })).toBe("fails: not in the top 5");
+  });
+});
+
+describe("analysisNote", () => {
+  const row = { analyzing: false, analysisWaiting: false, roles: [] as string[], settingsName: "Game" };
+  it("says busy first, then a waiting card", () => {
+    expect(analysisNote({ ...row, analyzing: true, analysisWaiting: true }, [], "Wiki")).toMatch(/^Queued or running/);
+    expect(analysisNote({ ...row, analysisWaiting: true }, [], "Wiki")).toMatch(/replaces it/);
+  });
+  it("says when the file holds its rules or controls already", () => {
+    expect(analysisNote(row, [], "Wiki")).toMatch(/^Nothing for it/);
+    expect(analysisNote({ ...row, roles: ["src/net/** = protocol"] }, [], "Wiki")).toMatch(/Accept adds only/);
+    expect(analysisNote(row, [{ source: "game" }], "Wiki")).toMatch(/Accept adds only/);
+    // A control with no source is the knowledge base's own.
+    expect(analysisNote(row, [{ source: null }], "Wiki")).toMatch(/^Nothing for it/);
+    expect(analysisNote({ ...row, settingsName: "Wiki" }, [{ source: null }], "Wiki")).toMatch(/Accept adds only/);
   });
 });

@@ -526,6 +526,8 @@ pub fn set_controls(kb_root: &Path, controls: &[Control]) -> Result<()> {
 }
 
 /// [`accept_proposals`]'s change to the settings, None when nothing changes.
+/// A source whose role rules a person emptied in Settings › Workspace has
+/// none, so a fresh analysis it accepts can fill them.
 pub fn with_proposals(settings: &Settings, roles: &[(String, String)], controls: &[Control]) -> Option<Value> {
     let mut value = settings.value.clone();
     let obj = value.as_object_mut()?;
@@ -535,7 +537,8 @@ pub fn with_proposals(settings: &Settings, roles: &[(String, String)], controls:
         if let Some(repos) = repos.as_object_mut() {
             let key = repos.keys().find(|k| k.eq_ignore_ascii_case(&settings.name)).cloned().unwrap_or_else(|| settings.name.clone());
             let entry = repos.entry(key).or_insert_with(|| Value::Object(Default::default()));
-            if let Some(entry) = entry.as_object_mut().filter(|e| !e.contains_key("roles")) {
+            let has_roles = |e: &serde_json::Map<String, Value>| e.get("roles").is_some_and(|r| r.as_object().is_none_or(|r| !r.is_empty()));
+            if let Some(entry) = entry.as_object_mut().filter(|e| !has_roles(e)) {
                 let rules: serde_json::Map<String, Value> = roles.iter().map(|(p, r)| (p.clone(), Value::String(r.clone()))).collect();
                 entry.insert("roles".into(), Value::Object(rules));
                 changed = true;

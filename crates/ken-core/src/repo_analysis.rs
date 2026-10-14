@@ -13,8 +13,11 @@
 //! never asked. When Claude is not there, or the call fails, nothing waits
 //! and the built-in core roles apply; the next time a source is added the
 //! analysis is tried again. A source whose analysis is in the file, or was
-//! proposed once (waiting, accepted or dismissed), is never analysed again,
-//! so a person's edits and a person's no both stay.
+//! proposed once (waiting, accepted or dismissed), is not analysed again by
+//! itself, so a person's edits and a person's no both stay. A person can ask
+//! for it in Settings › Workspace ("Analyse again", Chris, 2026-10-14):
+//! [`forget`] clears the mark and [`analyze_again`] files a fresh card, which
+//! replaces one still waiting for the source.
 
 use std::path::Path;
 
@@ -243,7 +246,15 @@ pub fn due(root: &Path) -> Option<Settings> {
 
 /// [`due`] with the settings already found.
 pub fn due_of(settings: Option<Settings>) -> Option<Settings> {
-    settings.filter(|s| !s.analyzed() && (!s.own || crate::registry::is_library(&s.kb_root)))
+    settings.filter(|s| !s.analyzed() && writable(s))
+}
+
+/// Whether what the analysis proposes for a source with these settings could
+/// ever be written: not when they are a code repo's own settings file, since
+/// Ken writes nothing in a code repo (decision 36). "Analyse again" is
+/// offered only where this holds.
+pub fn writable(settings: &Settings) -> bool {
+    !settings.own || crate::registry::is_library(&settings.kb_root)
 }
 
 /// The proposal a Review item holds, when it is an analysis.
@@ -260,6 +271,30 @@ pub fn proposed_before(db: &Db, name: &str) -> Result<bool> {
 /// The analyses waiting for a person, newest first.
 pub fn open(db: &Db) -> Result<Vec<(ReviewItemRow, Proposal)>> {
     Ok(db.list_open_review_items()?.into_iter().filter_map(|it| proposal_of(&it).map(|p| (it, p))).collect())
+}
+
+/// The ids of the analyses waiting for the source `name`.
+pub fn waiting_for(db: &Db, name: &str) -> Result<Vec<i64>> {
+    Ok(open(db)?.into_iter().filter(|(_, p)| p.source.eq_ignore_ascii_case(name)).map(|(it, _)| it.id).collect())
+}
+
+/// Clear the mark that keeps the source `name` from being analysed again,
+/// when a person asks for a fresh analysis (Chris, 2026-10-14): its cards
+/// that are done, accepted or dismissed, leave the knowledge base's index
+/// `db`. A card still waiting stays until the fresh one replaces it
+/// ([`analyze_again`]). Returns how many went.
+pub fn forget(db: &mut Db, name: &str) -> Result<usize> {
+    let done: Vec<i64> = db
+        .review_items_of_kind(KIND, 500)?
+        .iter()
+        .filter(|it| it.status != "open")
+        .filter(|it| proposal_of(it).is_some_and(|p| p.source.eq_ignore_ascii_case(name)))
+        .map(|it| it.id)
+        .collect();
+    for id in &done {
+        db.delete_review_item(*id)?;
+    }
+    Ok(done.len())
 }
 
 /// The card's text: each rule and each control, one a line.
@@ -323,6 +358,34 @@ pub fn analyze_and_propose(
     }
     let analysis = analyze(root, &settings.name, kinds, generate)?;
     file(kb_db, &settings, &analysis, now)
+}
+
+/// Analyse the source at `root` again because a person asked ("Analyse
+/// again" in Settings › Workspace, Chris, 2026-10-14): one call whatever the
+/// file or the index already holds for it, its proposal filed as a new card
+/// ([`file`]) that replaces a card still waiting for the same source. Accept
+/// is the usual one, writing only what the file has none of for the source
+/// yet. Nothing is asked for settings that cannot be written ([`writable`]).
+/// Returns the new card's id; None when it proposed nothing, and a waiting
+/// card then stays.
+pub fn analyze_again(
+    root: &Path,
+    settings: Option<Settings>,
+    kinds: &[RepoKind],
+    kb_db: &mut Db,
+    generate: &mut dyn FnMut(&str) -> Result<String>,
+    now: i64,
+) -> Result<Option<i64>> {
+    let Some(settings) = settings.filter(writable) else { return Ok(None) };
+    let waiting = waiting_for(kb_db, &settings.name)?;
+    let analysis = analyze(root, &settings.name, kinds, generate)?;
+    let id = file(kb_db, &settings, &analysis, now)?;
+    if id.is_some() {
+        for old in waiting {
+            kb_db.delete_review_item(old)?;
+        }
+    }
+    Ok(id)
 }
 
 /// Accept the analysis waiting as item `id` in the knowledge base at
@@ -455,5 +518,84 @@ mod tests {
         assert_eq!(analyze_and_propose(&tools, tools_settings(), &[RepoKind::Code], &mut db, &mut never, 6).unwrap(), None);
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert!(v["repos"]["Tools"].get("roles").is_none(), "a dismissed proposal is never written");
+    }
+
+    /// "Analyse again" (Chris, 2026-10-14): a person clears a dismissed
+    /// source's mark and asks once; the fresh card replaces one still
+    /// waiting, and a code repo's own settings file is never asked about.
+    #[test]
+    fn a_person_can_ask_for_the_analysis_again() {
+        let d = tempfile::tempdir().unwrap();
+        let (wiki, game) = (d.path().join("Wiki"), d.path().join("Game"));
+        std::fs::create_dir_all(wiki.join(crate::ingest::RAW)).unwrap();
+        std::fs::write(wiki.join(crate::ingest::RAW).join(".keep"), "").unwrap();
+        std::fs::create_dir_all(wiki.join(".ken")).unwrap();
+        let file_path = wiki.join(crate::wikinew::KNOWLEDGE_FILE);
+        std::fs::write(&file_path, "{ \"repos\": { \"Game\": { \"kind\": \"code\" } } }\n").unwrap();
+        git(&wiki, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git(&wiki, &["config", k, v]);
+        }
+        git(&wiki, &["add", "-A"]);
+        git(&wiki, &["commit", "-q", "-m", "start"]);
+        std::fs::create_dir_all(game.join("src/net")).unwrap();
+        std::fs::write(game.join("src/net/Packet.java"), "class Packet {}").unwrap();
+        std::fs::write(game.join("src/Main.java"), "class Main {}").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        let settings = || crate::knowledge_settings::among(&game, "Game", &[wiki.clone()]);
+        let reply = |role: &str| format!(r#"{{"roles": {{"src/net/**": "{role}"}}, "controls": [{{"question": "where do packets start", "expect": "src/net/Packet.java"}}]}}"#);
+        let asked = std::cell::Cell::new(0);
+        let mut claude = |_: &str| -> Result<String> {
+            asked.set(asked.get() + 1);
+            Ok(reply("protocol"))
+        };
+
+        // Dismissed once: the source is not asked about by itself again.
+        let first = analyze_and_propose(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 1).unwrap().expect("a card");
+        db.resolve_review_item(first, 2).unwrap();
+        assert_eq!(analyze_and_propose(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 3).unwrap(), None);
+        assert_eq!(asked.get(), 1);
+
+        // The person asks: the mark is cleared, and one call files a card.
+        assert_eq!(forget(&mut db, "game").unwrap(), 1, "the dismissed card goes, matched ignoring case");
+        assert!(!proposed_before(&db, "Game").unwrap());
+        assert!(db.get_review_item(first).unwrap().is_none());
+        let second = analyze_again(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 4).unwrap().expect("a fresh card");
+        assert_eq!(asked.get(), 2, "one call");
+        assert_eq!(waiting_for(&db, "Game").unwrap(), vec![second]);
+
+        // Asked again while that card waits: the new card replaces it.
+        let mut claude = |_: &str| -> Result<String> { Ok(reply("network")) };
+        let third = analyze_again(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 5).unwrap().expect("a fresh card");
+        assert_eq!(waiting_for(&db, "Game").unwrap(), vec![third], "the waiting card is replaced");
+        assert!(db.get_review_item(second).unwrap().is_none());
+        assert_eq!(forget(&mut db, "Game").unwrap(), 0, "a waiting card is not the mark");
+
+        // A fresh analysis that proposes nothing leaves the waiting card.
+        let mut empty = |_: &str| -> Result<String> { Ok(r#"{"roles": {}, "controls": []}"#.into()) };
+        assert_eq!(analyze_again(&game, settings(), &[RepoKind::Code], &mut db, &mut empty, 6).unwrap(), None);
+        assert_eq!(waiting_for(&db, "Game").unwrap(), vec![third]);
+
+        // Accepted, then the person empties the roles and asks again: the
+        // usual Accept fills them, and leaves the controls already there.
+        accept(&wiki, &mut db, third, 7).unwrap();
+        crate::knowledge_settings::set_role_lines(&wiki, "Game", &[]).unwrap();
+        let mut claude = |_: &str| -> Result<String> { Ok(reply("wire")) };
+        let fourth = analyze_again(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 8).unwrap().expect("asked whatever the file holds");
+        let (_, accepted) = accept(&wiki, &mut db, fourth, 9).unwrap();
+        assert!(accepted.written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&file_path).unwrap()).unwrap();
+        assert_eq!(v["repos"]["Game"]["roles"]["src/net/**"], "wire");
+        assert_eq!(v["controls"].as_array().map(Vec::len), Some(1), "the controls in the file stay as they were");
+
+        // A code repo that keeps its own settings file: nothing is asked.
+        let own = d.path().join("Own");
+        std::fs::create_dir_all(own.join(".ken")).unwrap();
+        std::fs::write(own.join(crate::wikinew::KNOWLEDGE_FILE), "{}\n").unwrap();
+        let own_settings = Settings { kb_root: own.clone(), name: "Own".into(), own: true, value: serde_json::json!({}) };
+        assert!(!writable(&own_settings));
+        let mut never = |_: &str| -> Result<String> { panic!("Ken writes nothing in a code repo") };
+        assert_eq!(analyze_again(&own, Some(own_settings), &[RepoKind::Code], &mut db, &mut never, 10).unwrap(), None);
     }
 }
