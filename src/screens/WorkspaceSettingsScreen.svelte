@@ -671,7 +671,7 @@
         {/each}
         {#if overview.wiki}
           <div class="add-rule">
-            <input bind:value={newRule} placeholder="Add a rule, as a sentence" onkeydown={(e) => e.key === "Enter" && addRule()} />
+            <input class="input" bind:value={newRule} placeholder="Add a rule, as a sentence" onkeydown={(e) => e.key === "Enter" && addRule()} />
             <button class="btn btn-ghost" disabled={!newRule.trim() || busy !== null} onclick={addRule}>Add</button>
           </div>
         {/if}
