@@ -1789,7 +1789,9 @@ mod tests {
 
     #[test]
     fn minified_code_is_found_and_prose_is_not() {
-        let bundle = format!("!function(){{{}}}();", "var a=1;b=2;".repeat(400));
+        // A minifier drops even the space after `var` (`var a=1;` is one
+        // whitespace in eight, over the 3%).
+        let bundle = format!("!function(){{{}}}();", "a=1;b=2;".repeat(400));
         assert!(minified(&bundle));
         assert!(minified(&format!("[{}]", "{\"id\":1,\"name\":\"x\"},".repeat(200))));
         assert!(!minified("fn save() {\n    write();\n}\n"));
