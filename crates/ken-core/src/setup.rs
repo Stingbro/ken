@@ -746,7 +746,7 @@ mod tests {
         let docs = row("Realms-Docs");
         assert_eq!(docs.kind, vec![RepoKind::Wiki]);
         assert!(docs.include);
-        assert!(docs.evidence.iter().any(|e| e.contains("DECISIONS")), "{:?}", docs.evidence);
+        assert!(docs.evidence.iter().any(|e| e.contains("a decisions log")), "{:?}", docs.evidence);
 
         let game = row("Realms-Game");
         assert_eq!(game.kind, vec![RepoKind::Code]);
