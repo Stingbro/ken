@@ -8168,13 +8168,15 @@ fn git_line(root: &std::path::Path, args: &[&str]) -> Option<String> {
 }
 
 /// A wiki page's title: its frontmatter `title`, else its first heading,
-/// else its file name.
+/// else its file name. A title or heading that is still a placeholder (a
+/// blank in `Templates/`, `# {{Title}}`) is not one, so a blank shows by its
+/// file name.
 fn page_title(root: &std::path::Path, rel: &str) -> String {
     let text = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
     text.lines()
         .find_map(|l| l.trim_start().strip_prefix("title:").map(|t| t.trim().trim_matches('"').to_string()))
-        .filter(|t| !t.contains("{{"))
-        .or_else(|| text.lines().find_map(|l| l.strip_prefix("# ").map(|t| t.trim().to_string())))
+        .filter(|t| !t.contains("{{") && !t.is_empty())
+        .or_else(|| text.lines().find_map(|l| l.strip_prefix("# ").map(|t| t.trim().to_string())).filter(|t| !t.contains("{{") && !t.is_empty()))
         .unwrap_or_else(|| rel.rsplit('/').next().unwrap_or(rel).trim_end_matches(".md").to_string())
 }
 
@@ -12674,6 +12676,30 @@ mod tests {
         assert!(p.contains("who owns billing?"));
         assert!(p.contains("Wiki:People.md: Priya owns billing"));
         assert!(p.contains("<|im_start|>assistant"));
+    }
+
+    /// A blank in Templates/ shows by its file name, not its placeholder
+    /// title (end-to-end finding 7); a page keeps its own title.
+    #[test]
+    fn a_blank_shows_by_its_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Templates")).unwrap();
+        std::fs::write(dir.path().join("Templates/Design-Note.md"), "---
+title: \"{{Design Question}}\"
+---
+
+# {{Design Question}}
+").unwrap();
+        std::fs::write(dir.path().join("Templates/Rule.md"), "# {{The rule}}
+").unwrap();
+        std::fs::write(dir.path().join("Saving.md"), "---
+title: \"How worlds save\"
+---
+# Saving
+").unwrap();
+        assert_eq!(page_title(dir.path(), "Templates/Design-Note.md"), "Design-Note");
+        assert_eq!(page_title(dir.path(), "Templates/Rule.md"), "Rule");
+        assert_eq!(page_title(dir.path(), "Saving.md"), "How worlds save");
     }
 
     /// A quick answer is told each hit's label and that a binding ruling
