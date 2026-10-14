@@ -4931,7 +4931,9 @@ mod tests {
         let meta = crate::pagemeta::PageMeta { title: Some("World regions".into()), aliases: vec!["shard layout".into()], ..Default::default() };
         db.set_page_meta("Reference/Regions.md", Some(&meta)).unwrap();
         let names = db.chunk_names("Reference/Regions.md").unwrap().join(" ");
-        assert!(names.contains("shard") && names.contains("layout") && names.contains("regions"), "{names}");
+        // A word the path already gave ("Regions") is not said twice, so the
+        // title shows by its other word.
+        assert!(names.contains("shard") && names.contains("layout") && names.contains("World"), "{names}");
         assert_eq!(db.search_chunks_fts("shard layout", 5).unwrap().len(), 1, "an alias finds its page through the names field");
 
         db.upsert_file("src/Pay.java", "code", 1, 1, "indexed", None, "class Pay {}").unwrap();
