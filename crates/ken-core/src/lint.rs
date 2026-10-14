@@ -372,16 +372,61 @@ pub fn weekly_next(db: &Db, root: &Path, now: i64) -> Result<Option<Pending>> {
         return Ok(None);
     }
     let left = if n < pages.len() { format!(" ({} more were left out for length)", pages.len() - n) } else { String::new() };
+    let others = other_files(db, root, &pages)?;
     let prompt = format!(
         "These are the binding and current pages of a team's knowledge base: its rules, and what it says is true now{left}. \
          {CONTRADICTION_RULES}\n\n\
          Also name up to five pages the knowledge base lacks: a subject these pages keep relying on that no page here \
-         covers. Not a page that would only be nice to have.\n\n\
+         covers. Not a page that would only be nice to have, and never one of the files the knowledge base already \
+         holds, listed after the pages.\n\n\
          Answer with JSON only: {{\"contradictions\": [{CONTRADICTION_SHAPE}], \"missing\": [{{\"name\": \"<the page's \
          title>\", \"why\": \"<which pages need it and for what, one sentence>\"}}]}}\n\
-         Answer with empty lists when there is nothing.\n\nPages:\n{text}"
+         Answer with empty lists when there is nothing.\n\nPages:\n{text}\n\
+         The knowledge base also holds these files, not quoted here (the decisions log, the blanks in Templates/, \
+         notes, tickets and the other pages):\n{others}"
     );
     Ok(Some(Pending { pages, prompt }))
+}
+
+/// Most files the weekly lint lists as already held.
+const OTHER_FILES: usize = 300;
+
+/// The knowledge base's other Markdown files, one path a line, for the
+/// weekly lint to know what is there: the index's pages not in `quoted`,
+/// and the blanks in `Templates/`, which the index leaves out.
+fn other_files(db: &Db, root: &Path, quoted: &[String]) -> Result<String> {
+    let mut files: Vec<String> = db
+        .page_paths()?
+        .into_iter()
+        .filter(|p| crate::chunker::is_markdown(p) && !quoted.contains(p))
+        .collect();
+    for entry in std::fs::read_dir(root.join("Templates")).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".md") {
+            files.push(format!("Templates/{name}"));
+        }
+    }
+    files.sort();
+    files.dedup();
+    let more = files.len().saturating_sub(OTHER_FILES);
+    let mut out: String = files.iter().take(OTHER_FILES).map(|f| format!("- {f}\n")).collect();
+    if more > 0 {
+        out.push_str(&format!("- and {more} more\n"));
+    }
+    Ok(out)
+}
+
+/// Whether a suggested page is one the knowledge base has: a path it names
+/// (`Decisions log (Decisions/DECISIONS.md)`) is a file there, or its name
+/// reaches a page by file name or alias.
+fn already_there(root: &Path, resolver: &crate::links::Resolver, name: &str) -> bool {
+    let named_path = name
+        .split(|c: char| c.is_whitespace() || "()[]`,;\"'".contains(c))
+        .map(|t| t.trim_end_matches(['.', ':']))
+        .filter(|t| t.contains('/') || t.ends_with(".md"))
+        .any(|t| !t.starts_with('/') && !t.contains("..") && root.join(t).is_file());
+    let link = crate::links::Link { kind: crate::links::LinkKind::Name, target: name.trim().to_string() };
+    named_path || !resolver.resolve(&link).is_empty()
 }
 
 /// File what the weekly lint found in the knowledge base at `root`, with its
@@ -389,10 +434,13 @@ pub fn weekly_next(db: &Db, root: &Path, now: i64) -> Result<Option<Pending>> {
 /// many findings were new.
 pub fn weekly_done(db: &mut Db, root: &Path, reply: &str, now: i64, today: &str) -> Result<usize> {
     let mut found = contradictions(&list_in(reply, "contradictions"));
+    let resolver = crate::links::Resolver::from_db(db)?;
     for item in list_in(reply, "missing").iter().take(5) {
         let s = |k: &str| item.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
         let name = s("name");
-        if name.is_empty() {
+        // A page the knowledge base has is not missing, whatever the reply
+        // says: the template's blanks and the decisions log are not quoted.
+        if name.is_empty() || already_there(root, &resolver, &name) {
             continue;
         }
         let why = s("why");
@@ -593,6 +641,41 @@ mod tests {
         assert_eq!(queued(&db).unwrap(), vec!["Design/Refunds.md".to_string()], "queued since: still waits");
     }
 
+    /// A fresh install files nothing: the template's placeholders are not
+    /// links, its blanks are not missing pages, and a note's `sources:` link
+    /// to the source moved beside it (a full path, with `.md`) reaches it.
+    #[test]
+    fn a_fresh_template_and_one_ingested_note_file_no_findings() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("Test-Wiki");
+        crate::wikinew::create(&root, "Test", &[], "2026-10-14").unwrap();
+        let src = "Research/Ingestion/Ingested/Meetings/2026-10/2026-10-14-sync/sync.md";
+        let note = "Research/Ingestion/Ingested/Meetings/2026-10/2026-10-14-sync.md";
+        fs::create_dir_all(root.join(src).parent().unwrap()).unwrap();
+        fs::write(root.join(src), "# Sync\n\nWe met about saving.\n").unwrap();
+        fs::write(
+            root.join(note),
+            format!("---\ntitle: \"Sync 2026-10-14\"\nstatus: current\nsources:\n  - \"[[{src}]]\"\n---\n\n# Sync 2026-10-14\n\nWhat was said: worlds save to one file.\n"),
+        )
+        .unwrap();
+        let project = Project::create(&root, "Test-Wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let found = scan_findings(&db).unwrap();
+        assert!(found.is_empty(), "{found:#?}");
+
+        // The weekly pass never files a page the knowledge base has: a blank
+        // in Templates/ or the decisions log, which it is not shown.
+        let reply = r#"{"contradictions": [], "missing": [
+            {"name": "Design Note template (Templates/Design-Note.md)", "why": "Design/Index.md says notes are written from it."},
+            {"name": "Decisions log (Decisions/DECISIONS.md)", "why": "Pages cite rulings by D-nnn."},
+            {"name": "Vocabulary", "why": "Words differ."}
+        ]}"#;
+        assert_eq!(weekly_done(&mut db, &root, reply, 1, "2026-10-14").unwrap(), 0);
+        assert!(crate::findings::open(&db).unwrap().is_empty());
+    }
+
     #[test]
     fn the_weekly_lint_reads_binding_and_current_pages_and_files_suggestions() {
         let (dir, _p, mut db) = library(&[
@@ -603,7 +686,8 @@ mod tests {
         assert!(weekly_due(&db, 100).unwrap());
         let pending = weekly_next(&db, dir.path(), 100).unwrap().expect("two pages to compare");
         assert!(pending.prompt.contains("--- Rules/Reviews.md") && pending.prompt.contains("--- Current/Project.md"));
-        assert!(!pending.prompt.contains("Glossary"), "reference pages wait for their own checks");
+        assert!(!pending.prompt.contains("--- Reference/Glossary.md"), "reference pages wait for their own checks");
+        assert!(pending.prompt.contains("- Reference/Glossary.md"), "but are named, so they are never suggested");
         let reply = r#"{"contradictions": [{"page": "Current/Project.md", "against": "Rules/Reviews.md", "text": "One approval against two"}],
                         "missing": [{"name": "Release process", "why": "Reviews and Project both rely on it."}]}"#;
         assert_eq!(weekly_done(&mut db, dir.path(), reply, 100, "2026-10-14").unwrap(), 2);

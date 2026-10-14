@@ -91,9 +91,42 @@ pub fn strip_code(text: &str) -> String {
     out
 }
 
-/// The links on the page at `from` (its repo-relative path), code stripped.
+/// Template placeholders blanked out: everything from `{{` to its `}}`,
+/// and a link written as `[[<a page>]]`. A placeholder is prose waiting to
+/// be filled in, so a link inside one (`{{[[the page that holds it]]}}`)
+/// names no page. Line breaks are kept.
+pub fn strip_placeholders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                out.extend(after[..end].chars().filter(|c| *c == '\n'));
+                rest = &after[end + 2..];
+            }
+            None => {
+                rest = after;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a page is one of the knowledge base's blanks in `Templates/`:
+/// its links are placeholders until a page is made from it.
+pub fn is_template(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("templates/") || lower.contains("/templates/")
+}
+
+/// The links on the page at `from` (its repo-relative path), code and
+/// template placeholders stripped.
 pub fn extract(from: &str, text: &str) -> Vec<Link> {
-    let body = strip_code(text);
+    let body = strip_placeholders(&strip_code(text));
     let mut out: Vec<Link> = Vec::new();
     let mut push = |l: Link| {
         if !out.contains(&l) {
@@ -107,8 +140,10 @@ pub fn extract(from: &str, text: &str) -> Vec<Link> {
         let Some(end) = after.find("]]") else { break };
         let inner = &after[..end];
         let name = inner.split(['|', '#']).next().unwrap_or("").trim();
-        // A template placeholder (`[[{{ingested note}}]]`) is not a link.
-        if !name.is_empty() && !name.contains('\n') && !name.contains("{{") {
+        // A template placeholder (`[[{{ingested note}}]]`, `[[<a page>]]`)
+        // is not a link.
+        let placeholder = name.contains("{{") || (name.starts_with('<') && name.ends_with('>'));
+        if !name.is_empty() && !name.contains('\n') && !placeholder {
             push(Link { kind: LinkKind::Name, target: name.to_string() });
         }
         rest = &after[end + 2..];
@@ -161,6 +196,10 @@ pub struct Resolver {
     /// Other files by full file name (`world.png`), for `![[world.png]]`
     /// embeds; never reported as duplicates (every folder has a README).
     by_file: HashMap<String, Vec<String>>,
+    /// Every file by its whole path, lowercased, a page's without `.md`:
+    /// a name link may give the path (`[[Research/…/source.md]]`), as a
+    /// note's `sources:` does for the source moved beside it.
+    by_path: HashMap<String, String>,
     paths: std::collections::HashSet<String>,
 }
 
@@ -178,7 +217,12 @@ impl Resolver {
     pub fn new(pages: &[String], aliases: &[(String, Vec<String>)]) -> Resolver {
         let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
         let mut by_file: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_path: HashMap<String, String> = HashMap::new();
         for p in pages {
+            by_path.insert(p.to_lowercase(), p.clone());
+            if let Some(no_md) = p.to_lowercase().strip_suffix(".md") {
+                by_path.insert(no_md.to_string(), p.clone());
+            }
             if is_page(p) {
                 by_name.entry(stem(p)).or_default().push(p.clone());
             } else {
@@ -195,7 +239,7 @@ impl Resolver {
                 }
             }
         }
-        Resolver { by_name, by_file, paths: pages.iter().cloned().collect() }
+        Resolver { by_name, by_file, by_path, paths: pages.iter().cloned().collect() }
     }
 
     /// The pages a link reaches: zero (missing or broken), one, or more
@@ -203,8 +247,13 @@ impl Resolver {
     pub fn resolve(&self, link: &Link) -> Vec<String> {
         match link.kind {
             LinkKind::Name => {
-                let key = link.target.trim().to_lowercase();
+                let key = link.target.trim().trim_start_matches("./").to_lowercase();
                 let key = key.strip_suffix(".md").unwrap_or(&key);
+                if key.contains('/') {
+                    if let Some(p) = self.by_path.get(key) {
+                        return vec![p.clone()];
+                    }
+                }
                 self.by_name
                     .get(key)
                     .or_else(|| self.by_file.get(key))
@@ -291,6 +340,10 @@ pub fn report(db: &Db) -> Result<LinkReport> {
     // Index.md) only matter when a link names it.
     let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (from, link) in db.all_page_links()? {
+        // A blank in Templates/ links to placeholders, never to pages.
+        if is_template(&from) {
+            continue;
+        }
         match link.kind {
             LinkKind::Name => {
                 r.name_links += 1;
@@ -349,6 +402,19 @@ pub fn page_links(db: &Db, path: &str) -> Result<PageLinks> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_inside_a_placeholder_is_none_and_a_name_link_may_give_a_path() {
+        let text = "| {{the trap}} | {{[[the page that holds it]]}} |\nSee [[<a page>]] and [[Research/Notes/2026-10-14-sync/sync.md]].\n";
+        let links = extract("START-HERE.md", text);
+        assert_eq!(links, vec![Link { kind: LinkKind::Name, target: "Research/Notes/2026-10-14-sync/sync.md".into() }]);
+        let pages = vec!["Research/Notes/2026-10-14-sync/sync.md".to_string(), "Design/Saving.md".to_string()];
+        let r = Resolver::new(&pages, &[]);
+        assert_eq!(r.resolve(&links[0]), vec![pages[0].clone()]);
+        let no_md = Link { kind: LinkKind::Name, target: "design/saving".into() };
+        assert_eq!(r.resolve(&no_md), vec![pages[1].clone()], "a path, without .md and in any case");
+        assert!(is_template("Templates/Rule.md") && !is_template("Design/Templates.md"));
+    }
 
     #[test]
     fn extracts_name_and_path_links_and_ignores_code_and_urls() {
