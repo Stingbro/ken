@@ -18,6 +18,11 @@
 //! Claude is asked by the app, in the background, each call a turn of the
 //! one background throttle (`throttle::claude_turn`); this module only says
 //! what to ask and files what comes back.
+//!
+//! Each pass that filed or resolved a finding writes one `log.md` line,
+//! `## [date] lint | scan: 2 filed, 1 resolved`, committed like the other
+//! runs' lines (decision 2, [`log_pass`]); a pass that changed nothing
+//! writes nothing.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -128,11 +133,55 @@ pub fn scan_findings(db: &Db) -> Result<Vec<Finding>> {
     Ok(out)
 }
 
-/// The lint on every scan: files what [`scan_findings`] finds and resolves
-/// what it no longer finds. Returns (filed, resolved).
-pub fn on_scan(db: &mut Db, now: i64) -> Result<(usize, usize)> {
+/// The lint on every scan of the knowledge base at `root`: files what
+/// [`scan_findings`] finds and resolves what it no longer finds, with its
+/// `log.md` line ([`log_pass`]) when it did either. Returns (filed,
+/// resolved).
+pub fn on_scan(db: &mut Db, root: &Path, now: i64, today: &str) -> Result<(usize, usize)> {
     let found = scan_findings(db)?;
-    crate::findings::sync(db, &SCAN_KINDS, &found, now)
+    let (filed, resolved) = crate::findings::sync(db, &SCAN_KINDS, &found, now)?;
+    log_pass(root, today, "scan", filed, resolved)?;
+    Ok((filed, resolved))
+}
+
+/// One lint pass's line in `log.md` (decision 2), `## [today] lint | pass:
+/// N filed, N resolved`, and one commit of the log through
+/// [`crate::git::commit_paths`], as ingest and drift commit theirs (never
+/// pushed). The log is written but left out of the commit when it holds a
+/// person's uncommitted work. A pass that filed and resolved nothing writes
+/// nothing. Returns the commit, when one was made.
+pub fn log_pass(root: &Path, today: &str, pass: &str, filed: usize, resolved: usize) -> Result<Option<String>> {
+    if filed == 0 && resolved == 0 {
+        return Ok(None);
+    }
+    let mut said = Vec::new();
+    if filed > 0 {
+        said.push(format!("{filed} filed"));
+    }
+    if resolved > 0 {
+        said.push(format!("{resolved} resolved"));
+    }
+    let title = format!("{pass}: {}", said.join(", "));
+    let dirty = crate::git::uncommitted(root).iter().any(|p| p == crate::ingest::LOG_PAGE);
+    let log = crate::ingest::append_log(root, today, "lint", &title)?;
+    if dirty {
+        return Ok(None);
+    }
+    let message = format!("lint: the {pass} pass of {today}\n\n{}.\n", title.split_once(": ").map_or(title.as_str(), |(_, t)| t));
+    Ok(crate::git::commit_paths(root, &[log], &message).unwrap_or_else(|e| {
+        eprintln!("lint: could not commit {}: {e}", crate::ingest::LOG_PAGE);
+        None
+    }))
+}
+
+/// File `found`, each unless an open finding is the same one; returns how
+/// many were new.
+fn file_new(db: &mut Db, found: &[Finding], now: i64) -> Result<usize> {
+    let before = crate::findings::open(db)?.len();
+    for f in found {
+        crate::findings::file(db, f, now)?;
+    }
+    Ok(crate::findings::open(db)?.len().saturating_sub(before))
 }
 
 fn read_list(db: &Db, name: &str) -> Result<Vec<String>> {
@@ -274,16 +323,17 @@ fn list_in(reply: &str, key: &str) -> Vec<Value> {
     }
 }
 
-/// File what the comparison after an edit found, and take its pages off the
-/// queue (pages queued since stay). Returns how many findings it filed.
-pub fn after_edit_done(db: &mut Db, pending: &Pending, reply: &str, now: i64) -> Result<usize> {
+/// File what the comparison after an edit found in the knowledge base at
+/// `root`, with its `log.md` line when it filed something new, and take its
+/// pages off the queue (pages queued since stay). Returns how many findings
+/// were new.
+pub fn after_edit_done(db: &mut Db, root: &Path, pending: &Pending, reply: &str, now: i64, today: &str) -> Result<usize> {
     let found = contradictions(&list_in(reply, "contradictions"));
-    for f in &found {
-        crate::findings::file(db, f, now)?;
-    }
+    let filed = file_new(db, &found, now)?;
     let rest: Vec<String> = queued(db)?.into_iter().filter(|p| !pending.pages.contains(p)).collect();
     store_list(db, QUEUE, &rest)?;
-    Ok(found.len())
+    log_pass(root, today, "after an edit", filed, 0)?;
+    Ok(filed)
 }
 
 /// When the weekly lint last ran, if it has.
@@ -334,9 +384,10 @@ pub fn weekly_next(db: &Db, root: &Path, now: i64) -> Result<Option<Pending>> {
     Ok(Some(Pending { pages, prompt }))
 }
 
-/// File what the weekly lint found and mark it done. Returns how many
-/// findings it filed.
-pub fn weekly_done(db: &mut Db, reply: &str, now: i64) -> Result<usize> {
+/// File what the weekly lint found in the knowledge base at `root`, with its
+/// `log.md` line when it filed something new, and mark it done. Returns how
+/// many findings were new.
+pub fn weekly_done(db: &mut Db, root: &Path, reply: &str, now: i64, today: &str) -> Result<usize> {
     let mut found = contradictions(&list_in(reply, "contradictions"));
     for item in list_in(reply, "missing").iter().take(5) {
         let s = |k: &str| item.get(k).and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
@@ -353,11 +404,10 @@ pub fn weekly_done(db: &mut Db, reply: &str, now: i64) -> Result<usize> {
             ..Default::default()
         });
     }
-    for f in &found {
-        crate::findings::file(db, f, now)?;
-    }
+    let filed = file_new(db, &found, now)?;
     db.store_check_state(WEEKLY_AT, &now.to_string())?;
-    Ok(found.len())
+    log_pass(root, today, "weekly", filed, 0)?;
+    Ok(filed)
 }
 
 /// Whether a code line has a comment before byte `at`: `//`, `#`, `/*`,
@@ -499,18 +549,24 @@ mod tests {
             ("Design/Payments.md", "# Payments\n"),
             ("Design/Lonely.md", "# Lonely\n"),
         ]);
-        on_scan(&mut db, 1).unwrap();
+        assert_eq!(on_scan(&mut db, dir.path(), 1, "2026-10-14").unwrap(), (3, 0));
         let open = crate::findings::open(&db).unwrap();
         let kinds: BTreeSet<(String, String)> = open.iter().map(|(_, f)| (f.kind.clone(), f.subject.clone())).collect();
         assert!(kinds.contains(&("missing-page".into(), "Ghost".into())), "{kinds:?}");
         assert!(kinds.contains(&("broken-link".into(), "START-HERE.md".into())), "{kinds:?}");
         assert!(kinds.contains(&("orphan".into(), "Design/Lonely.md".into())), "{kinds:?}");
-        assert_eq!(on_scan(&mut db, 2).unwrap(), (0, 0), "found again: nothing new, nothing resolved");
+        assert_eq!(on_scan(&mut db, dir.path(), 2, "2026-10-14").unwrap(), (0, 0), "found again: nothing new, nothing resolved");
 
         fs::write(dir.path().join("START-HERE.md"), "# Start\nSee [[Payments]] and [[Lonely]].\n").unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
-        on_scan(&mut db, 3).unwrap();
+        on_scan(&mut db, dir.path(), 3, "2026-10-15").unwrap();
         assert!(crate::findings::open(&db).unwrap().is_empty(), "every one fixed, every one resolved");
+
+        // One log line a pass that filed or resolved something; none for the
+        // pass that changed nothing.
+        let log = fs::read_to_string(dir.path().join("log.md")).unwrap();
+        let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("## [")).collect();
+        assert_eq!(lines, vec!["## [2026-10-14] lint | scan: 3 filed", "## [2026-10-15] lint | scan: 3 resolved"]);
     }
 
     #[test]
@@ -527,7 +583,10 @@ mod tests {
         assert!(pending.prompt.contains("--- Design/Payments.md") && pending.prompt.contains("--- Design/Refunds.md"), "{}", pending.prompt);
         queue_after_edit(&db, &["Design/Refunds.md".to_string()]).unwrap();
         let reply = r#"[{"page": "Design/Payments.md", "against": "Design/Refunds.md", "text": "A week against a day", "quote": "Refunds take a week."}]"#;
-        assert_eq!(after_edit_done(&mut db, &pending, reply, 5).unwrap(), 1);
+        assert_eq!(after_edit_done(&mut db, dir.path(), &pending, reply, 5, "2026-10-14").unwrap(), 1);
+        assert!(fs::read_to_string(dir.path().join("log.md")).unwrap().contains("## [2026-10-14] lint | after an edit: 1 filed"));
+        assert_eq!(after_edit_done(&mut db, dir.path(), &pending, reply, 6, "2026-10-14").unwrap(), 0, "the same again: nothing new");
+        assert_eq!(fs::read_to_string(dir.path().join("log.md")).unwrap().matches("lint |").count(), 1, "and no line");
         let open = crate::findings::open(&db).unwrap();
         assert_eq!(open[0].1.kind, "contradiction");
         assert_eq!((open[0].1.subject.as_str(), open[0].1.against.as_str()), ("Design/Payments.md", "Design/Refunds.md"));
@@ -547,11 +606,44 @@ mod tests {
         assert!(!pending.prompt.contains("Glossary"), "reference pages wait for their own checks");
         let reply = r#"{"contradictions": [{"page": "Current/Project.md", "against": "Rules/Reviews.md", "text": "One approval against two"}],
                         "missing": [{"name": "Release process", "why": "Reviews and Project both rely on it."}]}"#;
-        assert_eq!(weekly_done(&mut db, reply, 100).unwrap(), 2);
+        assert_eq!(weekly_done(&mut db, dir.path(), reply, 100, "2026-10-14").unwrap(), 2);
+        assert!(fs::read_to_string(dir.path().join("log.md")).unwrap().contains("## [2026-10-14] lint | weekly: 2 filed"));
         let kinds: Vec<String> = crate::findings::open(&db).unwrap().into_iter().map(|(_, f)| f.kind).collect();
         assert!(kinds.contains(&"suggested-page".to_string()) && kinds.contains(&"contradiction".to_string()), "{kinds:?}");
         assert!(!weekly_due(&db, 100 + WEEK - 1).unwrap());
         assert!(weekly_due(&db, 100 + WEEK).unwrap());
+    }
+
+    /// A lint pass's line is committed like ingest's and drift's: only the
+    /// log, and not when a person has work in it.
+    #[test]
+    fn a_lint_line_is_committed_with_the_log_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(root).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git(&["config", k, v]);
+        }
+        fs::write(root.join("log.md"), "# Log\n").unwrap();
+        fs::write(root.join("Other.md"), "# Other\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "start"]);
+        fs::write(root.join("Other.md"), "# Other, a person's edit\n").unwrap();
+
+        assert_eq!(log_pass(root, "2026-10-14", "scan", 0, 0).unwrap(), None, "nothing done, nothing written");
+        assert!(log_pass(root, "2026-10-14", "scan", 2, 1).unwrap().is_some(), "a commit");
+        let shown = git(&["show", "--name-only", "--format=%s", "HEAD"]);
+        assert!(shown.starts_with("lint: the scan pass of 2026-10-14") && shown.contains("log.md") && !shown.contains("Other.md"), "{shown}");
+        assert!(fs::read_to_string(root.join("log.md")).unwrap().ends_with("## [2026-10-14] lint | scan: 2 filed, 1 resolved\n"));
+
+        fs::write(root.join("log.md"), "# Log\n\nA person's note.\n").unwrap();
+        assert_eq!(log_pass(root, "2026-10-15", "weekly", 1, 0).unwrap(), None, "the person's work stays theirs to commit");
+        assert!(fs::read_to_string(root.join("log.md")).unwrap().contains("## [2026-10-15] lint | weekly: 1 filed"));
     }
 
     #[test]

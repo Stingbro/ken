@@ -385,12 +385,16 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
 /// What every scan ends with: the supersessions the decisions log marks
 /// itself, stored for search (knowledge-core decision 25), and in a
 /// knowledge base the lint that needs no model (decision 29), its findings
-/// filed and the fixed ones resolved, and the project graph's edges that
+/// filed and the fixed ones resolved with a `log.md` line when it did
+/// either (decision 2), and the project graph's edges that
 /// the knowledge base's own index holds (decision 21).
 fn after_scan(project: &Project, db: &mut Db) -> Result<()> {
     crate::supersede::store_marked(db, &crate::authority::Roles::of_repo(&project.root))?;
     if crate::registry::is_library(&project.root) {
-        if let Err(e) = crate::lint::on_scan(db, crate::engine::now_epoch()) {
+        // The lint's `log.md` line carries the UTC date: a scan has no local
+        // clock to read (the app's runs pass their local date).
+        let now = crate::engine::now_epoch();
+        if let Err(e) = crate::lint::on_scan(db, &project.root, now, &crate::day::date_of_epoch(now)) {
             eprintln!("lint: {e}");
         }
         if let Err(e) = crate::graph::on_scan(db, &project.root) {

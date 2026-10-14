@@ -6496,11 +6496,11 @@ fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<Atom
         }
     };
     if let Ok(Some(p)) = ken_core::lint::after_edit_next(&db, root) {
-        return done(claude(&p.prompt).and_then(|reply| ken_core::lint::after_edit_done(&mut db, &p, &reply, now)));
+        return done(claude(&p.prompt).and_then(|reply| ken_core::lint::after_edit_done(&mut db, root, &p, &reply, now, &local_date_today())));
     }
     if ken_core::lint::weekly_due(&db, now).unwrap_or(false) {
         if let Ok(Some(p)) = ken_core::lint::weekly_next(&db, root, now) {
-            return done(claude(&p.prompt).and_then(|reply| ken_core::lint::weekly_done(&mut db, &reply, now)));
+            return done(claude(&p.prompt).and_then(|reply| ken_core::lint::weekly_done(&mut db, root, &reply, now, &local_date_today())));
         }
     }
     let roles = ken_core::authority::Roles::of_repo(root);
