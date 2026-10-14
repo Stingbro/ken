@@ -27,7 +27,7 @@ A library Claude keeps for the project, beside the code. **The code is the truth
 - **The code wins on what was built.** A page, ticket or plan says what was intended; when it disagrees with the code, say so and cite both.
 - **An empty search proves nothing.** Check `Reference/Vocabulary.md` for the other word, then read the repos directly before saying something is not there, and say where you looked.
 - **A Research page or an ingested note is evidence from its date.** Cite it with its date.
-- **File a good answer back** as a page when it will be asked again.
+- **File a good answer back** as a source when it will be asked again (`add_source`); ingest makes the pages.
 
 ## Ingesting
 

@@ -311,8 +311,8 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
     - The first WoW commit also carries the template removals and the `team/` → `wright/` rename (they were staged with it); the second carries the template edits.
   - Gaps found between the code and the decisions:
     - **Lint writes no `log.md` line.** Decision 2 says one line per lint pass; only ingest, drift (when it wrote) and the wiki map call `ingest::append_log`. The raid log reads lint runs from `log.md`, so it never shows one.
-    - **The template's decisions log** (`templates/wiki/Decisions/DECISIONS.md`) shows `supersedes:` only, not `refines:` and `[REFINED BY …]`, which Ken writes.
-    - **The template's brief** still says "file a good answer back as a page"; the guide offers `add_source`, and ingest writes the page. Same end, different words.
+    - **The template's decisions log** showed `supersedes:` only: fixed after the slice, it now shows `refines:` and `[REFINED BY D-nnn]` too.
+    - **The template's brief** said "file a good answer back as a page": fixed after the slice, it now says as a source through `add_source`, and ingest makes the pages.
     - **Sync pushes the knowledge base** (already open), where decision 12 says Ken never pushes; the page says never.
     - **The templates link** points at the `knowledge-core` branch; repoint it when the branch merges.
   - Checked: tag balance on every changed page, every relative link and anchor they hold (and every link into the five changed Knowledge pages from elsewhere in `docs/` and `design/`), and both JSON templates parse. Not done: a cold read against `research/PAGE-COLD-READ-RUBRIC.md`, and the artifacts were not republished.
