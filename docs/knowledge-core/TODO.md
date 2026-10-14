@@ -229,6 +229,28 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 6 warnings (the two the old Timeline screen had are gone with it).
   - Not run: any test, and the app. The v26 migration drops the old model's tables on first open. The first scan of a knowledge base makes its edges; the first checks turn reads up to 500 commits per repo (one `git log` each), and the topic queue starts with the next ingest or drift fix.
 
+- **Slice 10: MCP tools** (`4fa5318`). Decision 22, with the server instructions of decision 1.
+  - The knowledge server (`ken-mcp`, the default) lists exactly decision 22's twelve, in its order (`knowledge_tools`):
+    - `search` replaces `route_query` and `semantic_search`: one tool on `routing`, every repo merged once. `project` (names, ids or folders, comma-separated; a registered repo outside the workspace too) narrows it through `RoutePlan::chosen`, and the route line says "the project asked for". A server locked with `--project` still searches every repo, its own included. Hits keep the label, locator, symbol and `next:` line.
+    - `read` replaces `read_document`; given a folder (`.` for the whole repo) it lists the indexed files, so `list_documents` folds in (`list_folder`). `split_address` reads a ken:// address for `read` and `add_source`.
+    - `related` is `related_files`. `code_definition`, `code_usages`, `code_outline` are the old three; `code_imports` is new: imports, importers and libraries from `codeindex::related`. `codeindex::next_calls` says `code_usages <symbol> · code_outline <path> · code_imports <path>`.
+    - `history` stays. `tickets` replaces `ticket_list`, read only, over the workspace's repos from the registry (no workspace needed).
+    - `propose_decision` (decision 13): `ruling` and `why` required; `topic`, `quote`, `who`, `aliases`, `supersedes`, `source` (a note's name, written as its `sources:` line). It is filed in the knowledge base's Inbox as ingest files one (`proposal::file_page_proposal`, `append` set, `from: chat`, `proposal::FROM_CHAT`), opening the knowledge base's index read-write for that one row and only if the app made it. The log is never written; Apply adds it with the next number and `ingest::accepted` commits "decisions: add the ruling proposed in chat". `decisions_entry` writes no `sources:` line, and a Why of "proposed in a chat with Ken", for a ruling from no note.
+    - `add_source`: a file of a registered repo (a ken:// address or a path with `project`; refused outside a repo, for a folder, and for a file already in Raw) is copied, or a pasted `text` (at most `MAX_SOURCE_CHARS`) is written as a note (`ingest::note_source`), into the knowledge base's `Research/Ingestion/Raw/` under a free name. `raw_target` moved from the app into `ingest` for both. Nothing is ingested inline; the app's Raw watcher or the next pass reads it.
+    - `repos` replaces `list_projects`: the one health line, and the knowledge base marked `(knowledge base)`.
+    - The knowledge base is the open workspace's first repo with an inbox, else the first `registry::is_library` (`knowledge_base`).
+  - Server `instructions` (decision 1): where the open workspace's knowledge base is (name, folder, ken:// root, or that there is none yet), then `BRIEF`: the sections, "the code is the truth, the library complements it", the code index before Grep and Glob, the label and how to weigh the tiers, a ruling is settled, the code wins on what was built, an empty search proves nothing, Research is evidence at its date, cite ken:// addresses, and that rulings and sources wait for a person.
+  - The personal set (lead's ruling): `ken-mcp --personal`, server name `ken-personal`, lists `task_list`, `task_create`, `task_update`, `memory_write`, `journal_append`, and `open_in_ken` when the app's listener is in its environment, with a short `instructions` of its own. Neither set answers the other's tools (-32602). Only Ken's own chat registers it: `chat_mcp_config` (src-tauri) writes both servers into the chat's `--mcp-config`, the listener's URL and token only on the personal set. Claude Code's registration (`mcp_info`'s command, JSON and instruction text) is the knowledge server only.
+  - Callers: `KEN_GUIDE` keeps the app's rules only (edits as diffs, clickable citations, search with Ken and look yourself before saying "not there", the knowledge base changes through a person, tasks and memory, opening a file); the label, tier weighing, "code wins" and "a ruling is settled" moved to the instructions. `KEN_MCP_ALLOWED` is the twelve, `KEN_PERSONAL_ALLOWED` the personal six, `KEN_SERVER` and `PERSONAL_SERVER` their server names; `ken_mcp_tool` reads both prefixes, the chat's permission handler allows both sets, and `assistant::chat_args` allows both (not `open_in_ken`). The tool card's comments and tests, `api.ts`, the README and code comments say the new names.
+  - Choices:
+    - `tickets` lists every assignee by default (it is knowledge now, decision 8), with `assignee: me` for the person's; the count of the person's linked tasks is gone from it (tasks are the personal set's).
+    - `add_source` takes files of registered repos only, not any path on disk: a source is read by Claude and lands in a repo the team shares. A file elsewhere goes in through the Ingest screen.
+    - `propose_decision` requires `why` (decision 13 says Ken fills it properly).
+    - A ruling or source filed from outside the app shows in the Inbox at its next refresh; nothing signals the open app.
+    - The sidecar was not re-staged: `scripts\win-build.cmd dev` and `build` stage it first, and the check passed against the staged one.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 6 warnings (the known ones).
+  - Not run: any test, and the app. Nothing migrates. A Claude Code session registered with the old tool names keeps its registration (`ken`, `--project <root>`) and sees the new tools at its next start.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
@@ -258,37 +280,37 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 
 - **The `entities` index state.** With the local reader gone, "read in full" (`entities`) indexes exactly like `search`; set-up and the Team screen still offer both. Slice 11 makes indexing two-state (decision 34); until then the choice does nothing.
 
-- **Where the memory and task tools go (slice 10).** Decision 22 takes them off the knowledge server, and decision 37 keeps Your day, tasks and memory. The plan below serves them as a second tool set from the same binary that only Ken's own chat registers. Choose: that, or leave them app-only (no MCP tools) so outside Claude sessions never see them.
+- **The chat guide leans on the server's instructions.** Decision 1 leaves the chat guide only the app's rules, so how to weigh a hit's label, "a ruling is settled" and "the code wins" now reach Ken's chat through the knowledge server's `instructions`, which Claude Code adds to the system prompt. The chat's answers were measured with those rules in the guide. Choose: keep it, or repeat the three in the guide until a measurement (decision 38) shows the instructions carry them.
 
-## Next: slice 10, MCP tools (22, with 1)
+- **Signalling the app when an MCP tool files something.** A ruling `propose_decision` files, or a source `add_source` puts in Raw, reaches the open app at its next refresh (the Raw watcher starts an ingest for a source; nothing tells the Inbox about a ruling). Choose: keep, or have ken-mcp tell the app over its listener when one is running.
+
+## Next: slice 11, setup and building (32–34)
 
 Nothing has been edited yet.
 
-- [ ] The knowledge server's tools are the twelve of decision 22, renamed and merged in `crates/ken-mcp/src/main.rs` (definitions, dispatch, the `tools_list` tests there and in `tests/stdio.rs`):
-  - `search` replaces `route_query` and `semantic_search`: one tool on `routing`, every source merged once, `project` narrowing it, `type` filtering, the label and `next:` line on each hit.
-  - `read` replaces `read_document`, and lists a folder when given one (`list_documents` folds in).
-  - `related` is `related_files` (slice 9's graph), same arguments.
-  - `code_definition`, `code_usages`, `code_outline` are `find_definition`, `find_usages`, `file_outline`; `code_imports` is new: a code file's imports, importers and libraries (`codeindex::related`, what `related_files` said before slice 9).
-  - `history` stays.
-  - `tickets` replaces `ticket_list` (read only).
-  - `propose_decision` is new: a ruling from chat as a ready entry in the Inbox (decision 13, `ingest::RulingEntry` and `decisions_entry`), never written to the log directly.
-  - `add_source` is new: a file or a pasted text put in the knowledge base's `Research/Ingestion/Raw/` for the next ingest pass, never ingested inline.
-  - `repos` replaces `list_projects`, with the one health line.
-- [ ] Server `instructions` from the brief (decision 1): the short form of the wiki `CLAUDE.md` in the `initialize` result: where the knowledge base is, the sections and tiers, "the code is the truth, the library complements it", use the code index before Grep, cite ken:// addresses.
-- [ ] Memory, task and family tools leave the knowledge server: `memory_write`, `journal_append`, `task_create`, `task_update`, `task_list` (and `open_in_ken`, which only Ken's chat can use) move to a second tool set Ken's own chat registers (say `ken-mcp --personal`), so Your day, tasks and memory keep working in chat (decision 37).
-- [ ] Callers follow the names: the chat guide and `KEN_MCP_ALLOWED` (`chat.rs`), `codeindex::next_calls` (`code_usages <symbol> · code_outline <path> · code_imports <path>`), the chat card's tool summaries (`summarize_tool`, `toolCard.ts`), the MCP set-up text in `src-tauri` (`mcp_info`), and the tool descriptions saying to use the code index before Grep.
-- [ ] Tests to update or add: the tool list, each renamed tool's reply, `search` over two projects and one, `read` of a folder, `code_imports`, `propose_decision` filing a ready entry, `add_source` landing in Raw, the `instructions` text, and the personal tool set.
+- [ ] The three-step setup (32), in `src/onboarding/SetupFlow.svelte`, `setupFlow.ts` and `setup.rs`:
+  - 1, the workspace name; 2, where the knowledge base is saved: a new repo (`setup::create_wiki`, `wikinew::create`) or an existing wiki to overlay; 3, the sources: repos and folders (`propose`, `propose_repos`), each with its kind. The row's team and index state go (35, 34); connectors are left for later (DECISIONS "Still open").
+  - Confirm lays down the knowledge base's structure (the template, decision 4) and scans every source, so search and the code index work from day one.
+  - Running setup again on a knowledge base reports missing or out-of-date template files as a diff and never overwrites (4); `rescan` keeps reporting what moved.
+- [ ] The Files tab splits into Wiki and Sources (32): `FilesScreen.svelte` and `FileTree.svelte` show the knowledge base under Wiki and the other repos under Sources.
+- [ ] The build queue (33), a new module in ken-core:
+  - A queue of the workspace's sources, the heavy hitters first (a simple order to start, by indexed size, since the exact order is still open), kept in the knowledge base's index (`Db::check_state` or a table).
+  - Two passes, both through ordinary ingest one source at a time: a high-level pass per source (one note from its README, layout and code index outline, written into Raw like any source), then file by file from broad to fine.
+  - Throttled by the one throttle below and shown in the status panel; "a few at once once trusted" is a setting, default one.
+  - Answers worth keeping are filed back as pages: a chat answer offered as a source (`add_source`'s path) or as a page proposal; pick one and say so.
+- [ ] Map an existing wiki after a dry run (33): each page placed in a section (Rules, Decisions, Design, Current, Reference, Research), shown as a list of moves first; applied on Confirm with links rewritten where certain and the rest reported (7), a `log.md` line and one commit (36). Nothing is deleted.
+- [ ] Index rules in one place (34):
+  - Two states: a path is indexed or it isn't. `kenignore::Tier::SearchOnly` and the `~` syntax go; `registry::IndexState` {Off, Search, Entities} becomes indexed or not, which settles the `entities` item above.
+  - The rules live in `.ken/knowledge.json` (per repo under `repos`, read through `knowledge_settings`) plus the fixed built-ins: VCS, dependencies, build output, secrets, tests (`kenignore::TEST_PATTERNS`), minified and generated files, binaries. `project.json`'s `excluded`, the repo `.kenignore` and the workspace `.kenignore` are read once into it (or kept read-only as legacy; say which), and the Team screen's ignore list follows.
+  - A file is read again when its content hash changes; one that fails three times is counted as failed (check the scan's failure handling against this).
+- [ ] One throttle and one status panel (34):
+  - Gentle / Normal / Fast and Pause, one app setting over all background work: the summaries and checks (`EXTRACT_PACING`, `summary::MAX_CALLS_PER_HOUR`, `CHECKS_EVERY` in `background_worker`), the build queue, ingest passes, the semantic rebuild. It replaces the `backgroundExtraction` flag, and slice 4's summary cap.
+  - One status panel: what is running, what is queued, progress, and what failed with its reason.
+- [ ] Not carried over: `wikidraft.rs`, `wikiverify.rs`, `checkout.rs` (none is on this branch; keep it so).
+- [ ] Tests to update or add: setup's three steps and the re-run diff, the Files split, the queue's order and two passes, the wiki mapping's dry run and apply, the two index states and the rules from `.ken/knowledge.json`, the throttle levels and Pause.
 
 ## Later slices
 
-- [ ] **11, setup and building (32–34):**
-  - The three-step setup.
-  - The Files tab splits into Wiki and Sources.
-  - The build queue with two passes.
-  - Map an existing wiki after a dry run.
-  - Index rules in one place; the `entities` index state goes (see Open for Chris).
-  - One throttle and one status panel.
-  - Don't carry over `wikidraft.rs`, `wikiverify.rs` or `checkout.rs`.
 - [ ] **12, Wright leftovers (35–38):**
   - Remove escalations, families and the team bus, OpenSpec, the people, owner and roster code (`people.rs`), and the evals and `KEN_EVAL_*` hooks.
   - The Team screen becomes workspace settings.
