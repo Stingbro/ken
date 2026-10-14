@@ -92,6 +92,21 @@ impl Settings {
             .collect()
     }
 
+    /// Whether this source's older ignore files (its `.kenignore`, its lines
+    /// of the workspace's `.kenignore`, `project.json`'s `excluded`) have
+    /// moved into this file ([`move_legacy_ignores`]): its entry says
+    /// `ignoreMoved`. From then on they are not read.
+    pub fn ignores_moved(&self) -> bool {
+        self.repo_entry().and_then(|e| e.get(IGNORE_MOVED)).and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    /// The folders this source's entry leaves out by name, `/archive` lines,
+    /// as the repo drawer's folder list shows and edits them.
+    pub fn excluded_folders(&self) -> Vec<String> {
+        let lines = self.repo_entry().and_then(|e| e.get("ignore")).and_then(Value::as_array).cloned().unwrap_or_default();
+        lines.iter().filter_map(Value::as_str).filter_map(folder_of).collect()
+    }
+
     /// Whether the repo analysis has been saved for this source: its entry
     /// has `roles`, or a control names it.
     pub fn analyzed(&self) -> bool {
@@ -212,6 +227,136 @@ pub fn base(kb_root: &Path, repo: &str) -> Option<String> {
     let repos = value.get("repos")?.as_object()?;
     let entry = repos.iter().find(|(k, _)| k.eq_ignore_ascii_case(repo)).map(|(_, v)| v)?;
     entry.get("base")?.as_str().map(str::trim).filter(|b| !b.is_empty()).map(str::to_string)
+}
+
+/// The key a source's `repos` entry carries once its older ignore files have
+/// moved into the file.
+pub const IGNORE_MOVED: &str = "ignoreMoved";
+
+/// A folder an ignore line leaves out by name (`/archive`, `/docs/old/`),
+/// without its slashes; None for a pattern, a `!` line or anything else.
+fn folder_of(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix('/')?;
+    let folder = rest.trim_matches('/');
+    (!folder.is_empty() && !folder.contains(['*', '?', '[', '\\'])).then(|| folder.to_string())
+}
+
+/// The source's entry in `repos`, made when the file does not list it: the
+/// one named `name` (ignoring case), else `folder`.
+fn entry_mut<'a>(value: &'a mut Value, name: &str, folder: &str) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let repos = value.as_object_mut()?.entry("repos").or_insert_with(|| Value::Object(Default::default()));
+    let repos = repos.as_object_mut()?;
+    let key = repos
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(name))
+        .or_else(|| repos.keys().find(|k| k.eq_ignore_ascii_case(folder)))
+        .cloned()
+        .unwrap_or_else(|| name.to_string());
+    repos.entry(key).or_insert_with(|| Value::Object(Default::default())).as_object_mut()
+}
+
+/// What moved for one source: the lines, where they came from, and the
+/// commit that holds them (None when the knowledge base is not a git repo,
+/// or its settings file held a person's uncommitted work).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub lines: Vec<String>,
+    pub from: Vec<String>,
+    pub commit: Option<String>,
+}
+
+/// Move the older ignore rules of the source at `project` into the
+/// knowledge base's `.ken/knowledge.json`, once (Chris, 2026-10-14; decision
+/// 34): the lines of its workspace's `.kenignore` that reach inside it, its
+/// own `.kenignore`, and `project.json`'s `excluded` folders (as `/folder`
+/// lines, last, so nothing in the older files brings them back), put before
+/// the lines its `repos` entry already holds, which still win. The entry is
+/// marked [`IGNORE_MOVED`], and from then on the older files are not read;
+/// they are never changed or deleted. One commit in the knowledge base
+/// names the file. Nothing happens when the source has no settings file to
+/// move into, when that file is a code repo's own (Ken writes nothing in a
+/// code repo, decision 36), when it has moved already, or when the older
+/// files hold no lines. Returns what moved.
+pub fn move_legacy_ignores(project: &crate::project::Project) -> Result<Option<Moved>> {
+    move_legacy_ignores_into(project, for_repo(&project.root))
+}
+
+/// [`move_legacy_ignores`] with the settings already found.
+pub fn move_legacy_ignores_into(project: &crate::project::Project, settings: Option<Settings>) -> Result<Option<Moved>> {
+    let Some(settings) = settings else { return Ok(None) };
+    if settings.ignores_moved() || (settings.own && !crate::registry::is_library(&settings.kb_root)) {
+        return Ok(None);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut from: Vec<String> = Vec::new();
+    for (source, found) in project.legacy_ignore_lines() {
+        let found: Vec<String> = found.into_iter().filter(|l| !lines.contains(l)).collect();
+        if !found.is_empty() {
+            from.push(source);
+            lines.extend(found);
+        }
+    }
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let mut value = editable(&settings.kb_root)?;
+    let entry = entry_mut(&mut value, &settings.name, &folder_name(&project.root))
+        .ok_or_else(|| Error::Other(format!("the {} entry is not an object", settings.name)))?;
+    let held: Vec<Value> = entry.get("ignore").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut all: Vec<Value> = lines.iter().filter(|l| !held.iter().any(|h| h.as_str() == Some(l.as_str()))).map(|l| Value::String(l.clone())).collect();
+    all.extend(held);
+    entry.insert("ignore".into(), Value::Array(all));
+    entry.insert(IGNORE_MOVED.into(), Value::Bool(true));
+    let dirty = crate::git::uncommitted(&settings.kb_root).iter().any(|p| p == KNOWLEDGE_FILE);
+    write(&settings.kb_root, &value)?;
+    let commit = if dirty {
+        None
+    } else {
+        let message = format!(
+            "ignore: move {}'s older ignore rules into {KNOWLEDGE_FILE}\n\nFrom: {}.\nThose files are no longer read; they were \
+             left as they are.\n\nLines:\n{}\n",
+            settings.name,
+            from.join(", "),
+            lines.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")
+        );
+        crate::git::commit_paths(&settings.kb_root, &[KNOWLEDGE_FILE.to_string()], &message).unwrap_or_else(|e| {
+            eprintln!("ignore: could not commit {KNOWLEDGE_FILE}: {e}");
+            None
+        })
+    };
+    Ok(Some(Moved { lines, from, commit }))
+}
+
+/// Write the folders the source at `root` leaves out (the repo drawer's
+/// list) as `/folder` lines of its entry in `.ken/knowledge.json`, when its
+/// older ignore files have moved there: its other lines are kept, after the
+/// folders. Returns false, writing nothing, when they have not moved (the
+/// list is still `project.json`'s `excluded` then).
+pub fn set_excluded_folders(root: &Path, folders: &[String]) -> Result<bool> {
+    set_excluded_folders_in(for_repo(root), root, folders)
+}
+
+/// [`set_excluded_folders`] with the settings already found.
+pub fn set_excluded_folders_in(settings: Option<Settings>, root: &Path, folders: &[String]) -> Result<bool> {
+    let Some(settings) = settings.filter(Settings::ignores_moved) else { return Ok(false) };
+    let mut value = editable(&settings.kb_root)?;
+    let entry = entry_mut(&mut value, &settings.name, &folder_name(root))
+        .ok_or_else(|| Error::Other(format!("the {} entry is not an object", settings.name)))?;
+    let others: Vec<Value> = entry
+        .get("ignore")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter(|l| l.as_str().is_none_or(|l| folder_of(l).is_none())).cloned().collect())
+        .unwrap_or_default();
+    let mut lines: Vec<Value> = folders
+        .iter()
+        .map(|f| f.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|f| !f.is_empty())
+        .map(|f| Value::String(format!("/{f}")))
+        .collect();
+    lines.extend(others);
+    entry.insert("ignore".into(), Value::Array(lines));
+    write(&settings.kb_root, &value)?;
+    Ok(true)
 }
 
 /// Write the knowledge base's top-level `ignore` lines, blank lines dropped,
@@ -484,5 +629,98 @@ mod tests {
         assert!(again.analyzed());
         let other = vec![("x/**".to_string(), "y".to_string())];
         assert!(with_proposals(&again, &other, &controls).is_none(), "a person's rules and controls stay");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git(dir, &["config", k, v]);
+        }
+    }
+
+    /// The older ignore files move into `.ken/knowledge.json` once (Chris,
+    /// 2026-10-14): one commit in the knowledge base naming the file, the
+    /// older files left as they were, nothing committed in the code repo,
+    /// and the older files not read after.
+    #[test]
+    fn the_older_ignore_files_move_in_once() {
+        use crate::kenignore::{classify, Tier};
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path();
+        std::fs::create_dir_all(ws.join(crate::workspace::CONFIG_DIR)).unwrap();
+        std::fs::write(ws.join(".kenignore"), "# the workspace\nGame/assets/raw/\n*.log\nOther/x/\nGame-worktrees/\n").unwrap();
+        let (wiki, game) = (ws.join("Wiki"), ws.join("Game"));
+
+        // The knowledge base: a git repo with an inbox and the settings file,
+        // whose entry for the code repo already holds a person's line.
+        repo(&wiki);
+        std::fs::create_dir_all(wiki.join(crate::ingest::RAW)).unwrap();
+        std::fs::write(wiki.join(crate::ingest::RAW).join(".keep"), "").unwrap();
+        kb(&wiki, r#"{ "repos": { "Game": { "kind": "code", "ignore": ["!assets/raw/keep.png"] } } }"#);
+        git(&wiki, &["add", "-A"]);
+        git(&wiki, &["commit", "-q", "-m", "start"]);
+
+        // The code repo: its own `.kenignore` (with a malformed line), and an
+        // `excluded` folder in its `project.json`.
+        repo(&game);
+        std::fs::write(game.join(".kenignore"), "build-cache/\n~docs/\n!\n").unwrap();
+        git(&game, &["add", "-A"]);
+        git(&game, &["commit", "-q", "-m", "start"]);
+        let mut project = crate::project::Project::create(&game, "Game").unwrap();
+        project.set_excluded(vec!["archive/".into()]).unwrap();
+        let settings = || among(&game, "Game", &[wiki.clone()]);
+        let rules = project.index_rules_with(settings().as_ref());
+        assert_eq!(classify("build-cache/x.bin", false, &[&rules]), Tier::Ignored, "read until it moves");
+
+        let moved = move_legacy_ignores_into(&project, settings()).unwrap().expect("moved");
+        assert_eq!(moved.lines, vec!["/assets/raw/", "*.log", "build-cache/", "~docs/", "/archive"]);
+        assert_eq!(moved.from, vec!["the workspace's .kenignore", "Game/.kenignore", "Game's project.json excluded"]);
+        assert!(moved.commit.is_some());
+        let v = read(&wiki).unwrap();
+        assert_eq!(
+            v["repos"]["Game"]["ignore"],
+            serde_json::json!(["/assets/raw/", "*.log", "build-cache/", "~docs/", "/archive", "!assets/raw/keep.png"]),
+            "before the person's own line, which still wins"
+        );
+        assert_eq!(v["repos"]["Game"][IGNORE_MOVED], true);
+
+        // One commit in the knowledge base, naming the file; none in the code repo.
+        let shown = git(&wiki, &["show", "--name-only", "--format=%s", "HEAD"]);
+        assert!(shown.starts_with("ignore: move Game's older ignore rules into .ken/knowledge.json"), "{shown}");
+        assert!(shown.lines().any(|l| l == KNOWLEDGE_FILE), "{shown}");
+        assert_eq!(git(&game, &["rev-list", "--count", "HEAD"]).trim(), "1");
+        assert_eq!(git(&game, &["status", "--porcelain", "--", ".kenignore"]), "", "the code repo's file is as it was");
+
+        // The older files are left as they were.
+        assert_eq!(std::fs::read_to_string(game.join(".kenignore")).unwrap(), "build-cache/\n~docs/\n!\n");
+        assert!(std::fs::read_to_string(ws.join(".kenignore")).unwrap().contains("Game/assets/raw/"));
+        assert_eq!(crate::project::Project::open(&game).unwrap().config.excluded, vec!["archive/"]);
+
+        // Once: a second sight moves nothing and commits nothing.
+        assert_eq!(move_legacy_ignores_into(&project, settings()).unwrap(), None);
+        assert_eq!(git(&wiki, &["rev-list", "--count", "HEAD"]).trim(), "2");
+
+        // Not read after: a line taken out of the settings is gone, though
+        // the older file still holds it.
+        let mut v = read(&wiki).unwrap();
+        v["repos"]["Game"]["ignore"] = serde_json::json!(["/assets/raw/", "*.log", "~docs/", "/archive", "!assets/raw/keep.png"]);
+        write(&wiki, &v).unwrap();
+        let rules = project.index_rules_with(settings().as_ref());
+        assert_eq!(classify("build-cache/x.bin", false, &[&rules]), Tier::Indexed);
+        assert_eq!(classify("archive/old.md", false, &[&rules]), Tier::Ignored, "the moved folder");
+        assert_eq!(classify("assets/raw/keep.png", false, &[&rules]), Tier::Indexed, "the person's line still wins");
+
+        // The repo drawer's folders are the settings' folder lines now.
+        assert_eq!(settings().unwrap().excluded_folders(), vec!["assets/raw", "archive"]);
+        assert!(set_excluded_folders_in(settings(), &game, &["old/".into(), "docs\\drafts".into()]).unwrap());
+        assert_eq!(read(&wiki).unwrap()["repos"]["Game"]["ignore"], serde_json::json!(["/old", "/docs/drafts", "*.log", "~docs/", "!assets/raw/keep.png"]));
+        assert!(!set_excluded_folders_in(among(&game, "Other", &[]), &game, &[]).unwrap(), "nothing moved: project.json keeps them");
     }
 }

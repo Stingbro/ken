@@ -242,12 +242,19 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         return Ok(stats);
     }
 
+    // On first sight, the older ignore files move into the knowledge base's
+    // `.ken/knowledge.json` (one commit there) and are not read after.
+    if let Err(e) = crate::knowledge_settings::move_legacy_ignores(project) {
+        eprintln!("ignore: could not move the older ignore rules of {}: {e}", project.root.display());
+    }
+
     // The index rules (knowledge-core decision 34), loaded once per scan:
     // the fixed built-ins, the repo switched off, the older `.kenignore`
-    // files, then `.ken/knowledge.json`. The built-ins leave tests out
-    // (decision 17), so a file indexed before and ignored now is removed
-    // below like any other.
+    // files until they move, then `.ken/knowledge.json`. The built-ins leave
+    // tests out (decision 17), so a file indexed before and ignored now is
+    // removed below like any other.
     let rules = project.index_rules();
+    let excluded = project.legacy_excluded();
 
     // What's on disk (rel_path -> size, mtime, cloud placeholder?)
     let mut on_disk: HashMap<String, (i64, i64, bool)> = HashMap::new();
@@ -314,7 +321,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
             continue;
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if project.is_excluded(&rel_str) {
+        if crate::project::in_folders(&excluded, &rel_str) {
             continue;
         }
         // A path that is not indexed never produces a row, exactly like
@@ -592,7 +599,7 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
         return Ok(false);
     }
     let abs = project.root.join(rel);
-    let excluded = project.is_excluded(rel)
+    let excluded = crate::project::in_folders(&project.legacy_excluded(), rel)
         || is_hidden_rel(rel)
         || rel.rsplit('/').next().is_some_and(|n| is_office_lock_name(n) || is_backup_name(n))
         || inside_linked_checkout(&project.root, rel);
@@ -700,10 +707,11 @@ fn refresh_one(
     db: &mut Db,
     rel: &str,
     rules: &[crate::kenignore::Rule],
+    legacy_excluded: &[String],
     git: &mut GitIgnores,
 ) -> Result<Refreshed> {
     let abs = project.root.join(rel);
-    let excluded = project.is_excluded(rel)
+    let excluded = crate::project::in_folders(legacy_excluded, rel)
         || is_hidden_rel(rel)
         || rel.rsplit('/').next().is_some_and(|n| is_office_lock_name(n) || is_backup_name(n))
         || inside_linked_checkout(&project.root, rel)
@@ -759,6 +767,7 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
         return Ok(None);
     }
     let rules = project.index_rules();
+    let legacy_excluded = project.legacy_excluded();
     let mut git = GitIgnores::of(project);
     let mut stats = ScanStats::default();
 
@@ -773,7 +782,7 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
                 gone_folders.push(rel);
                 continue;
             }
-            match refresh_one(project, db, rel, &rules, &mut git)? {
+            match refresh_one(project, db, rel, &rules, &legacy_excluded, &mut git)? {
                 Refreshed::Unchanged => stats.unchanged += 1,
                 Refreshed::Removed => {
                     stats.removed += 1;

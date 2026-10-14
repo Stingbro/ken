@@ -328,7 +328,7 @@ impl ProjectInfo {
             id: project.config.id.to_string(),
             name: project.config.name.clone(),
             root: project.root.to_string_lossy().into_owned(),
-            excluded: project.config.excluded.clone(),
+            excluded: project.excluded_folders(),
             ingest_runner: project
                 .config
                 .extra
@@ -379,8 +379,10 @@ struct FileRowDto {
 }
 
 impl FileRowDto {
-    fn new(row: FileRow, project: &Project) -> FileRowDto {
-        let excluded = project.is_excluded(&row.rel_path);
+    /// `excluded`: the source's excluded folders (`Project::excluded_folders`),
+    /// read once by the caller.
+    fn new(row: FileRow, excluded: &[String]) -> FileRowDto {
+        let excluded = ken_core::project::in_folders(excluded, &row.rel_path);
         let background_eligible =
             ken_core::bg_hydrate::wants_background_index(&row, excluded);
         FileRowDto { row, background_eligible }
@@ -2432,7 +2434,11 @@ fn set_folder_selection(
 ) -> CmdResult<ProjectInfo> {
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
-    active.project.set_excluded(excluded).map_err(err)?;
+    // Once the older ignore files have moved into `.ken/knowledge.json`, the
+    // folders are lines there; until then, `project.json`'s `excluded`.
+    if !ken_core::knowledge_settings::set_excluded_folders(&active.project.root, &excluded).map_err(err)? {
+        active.project.set_excluded(excluded).map_err(err)?;
+    }
     let stats = scan::scan(&active.project, &mut active.db).map_err(err)?;
     let info = ProjectInfo::of(&active.project);
     let project_id = active.project.config.id;
@@ -2454,6 +2460,7 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
         (active.project.clone(), active.search_db.clone())
     };
     let files = lock_tolerant(&search_db).list_files().map_err(err)?;
+    let excluded = project.excluded_folders();
 
     // Folders straight from disk so excluded/empty ones still show.
     let mut folders = Vec::new();
@@ -2472,7 +2479,7 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
             if let Ok(rel) = entry.path().strip_prefix(&project.root) {
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 folders.push(FolderInfo {
-                    excluded: project.is_excluded(&rel),
+                    excluded: ken_core::project::in_folders(&excluded, &rel),
                     rel_path: rel,
                 });
             }
@@ -2481,7 +2488,7 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
     folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     let files = files
         .into_iter()
-        .map(|row| FileRowDto::new(row, &project))
+        .map(|row| FileRowDto::new(row, &excluded))
         .collect();
     Ok(TreeData { files, folders })
 }
@@ -2528,6 +2535,7 @@ fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
     let mut folders: Vec<FolderInfo> = Vec::new();
 
     for (folder_name, project, live) in members {
+        let excluded = project.excluded_folders();
         // Each member is a folder in the merged tree — and a nested member
         // ("SR/ShatteredRealms") needs its group folder ("SR") emitted
         // too, or the tree has a node whose parent doesn't exist. Emitted
@@ -2553,7 +2561,7 @@ fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
         };
         for mut row in rows {
             row.rel_path = format!("{folder_name}/{}", row.rel_path);
-            files.push(FileRowDto::new(row, &project));
+            files.push(FileRowDto::new(row, &excluded));
         }
 
         // Folders from disk, same as `get_tree`, so an excluded or empty
@@ -2573,7 +2581,7 @@ fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
                 if let Ok(rel) = entry.path().strip_prefix(&project.root) {
                     let rel = rel.to_string_lossy().replace('\\', "/");
                     folders.push(FolderInfo {
-                        excluded: project.is_excluded(&rel),
+                        excluded: ken_core::project::in_folders(&excluded, &rel),
                         rel_path: format!("{folder_name}/{rel}"),
                     });
                 }
@@ -3113,7 +3121,7 @@ fn file_meta(state: State<SharedState>, rel_path: String) -> CmdResult<Option<Fi
             r.kind = ken_core::extract::FileKind::from_path(&abs).as_str().to_string();
         }
     }
-    Ok(row.map(|r| FileRowDto::new(r, &active.project)))
+    Ok(row.map(|r| FileRowDto::new(r, &active.project.excluded_folders())))
 }
 
 #[tauri::command(async)]
@@ -3444,7 +3452,7 @@ fn profile_project(
         }
         (
             active.project.root.clone(),
-            active.project.config.excluded.clone(),
+            active.project.excluded_folders(),
             active.project.config.id,
             active.profiling_running.clone(),
         )
@@ -7608,7 +7616,8 @@ struct WorkspaceSettingsDto {
     /// The index rules every source reads, from the knowledge base's
     /// `.ken/knowledge.json` (knowledge-core decision 34).
     ignores: Vec<String>,
-    /// The older workspace `.kenignore` lines, still read, never written.
+    /// The older workspace `.kenignore` lines, while a source still reads
+    /// them (until they move into `.ken/knowledge.json`); never written.
     legacy_ignores: Vec<String>,
     /// The tier overrides (`search.weights`, decision 23) as
     /// `pattern = tier` lines.
@@ -7872,7 +7881,15 @@ fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsD
             r.roles = ken_core::knowledge_settings::role_lines(&root, &r.settings_name);
         }
     }
+    // The older workspace `.kenignore`, while a source still reads it: each
+    // source's lines move into `.ken/knowledge.json` at its first scan.
+    let still_read = repos
+        .iter()
+        .chain(wiki.iter())
+        .any(|r| !ken_core::knowledge_settings::for_repo(std::path::Path::new(&r.path)).is_some_and(|s| s.ignores_moved()));
     let legacy_ignores = std::fs::read_to_string(ws.root.join(".kenignore"))
+        .ok()
+        .filter(|_| still_read)
         .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty() && !l.starts_with('#')).collect())
         .unwrap_or_default();
     let workspace = ws.config.name.clone();
@@ -11700,6 +11717,7 @@ fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> 
     let guard = state.lock().unwrap();
     let active = member(&guard, None)?;
     let mut options = vec!["research".to_string()];
+    let excluded = active.project.excluded_folders();
     if let Ok(entries) = std::fs::read_dir(&active.project.root) {
         let mut dirs: Vec<String> = entries
             .flatten()
@@ -11709,7 +11727,7 @@ fn research_output_options(state: State<SharedState>) -> CmdResult<Vec<String>> 
                 !name.starts_with('.')
                     && !ken_core::scan::is_junk_dir_name(name)
                     && name != "research"
-                    && !active.project.is_excluded(name)
+                    && !ken_core::project::in_folders(&excluded, name)
             })
             .collect();
         dirs.sort();

@@ -231,7 +231,8 @@ export interface WorkspaceSettings {
   gaps: SettingsGap[];
   /** The index rules in the knowledge base's `.ken/knowledge.json`. */
   ignores: string[];
-  /** Older workspace `.kenignore` lines, still read, never written. */
+  /** Older workspace `.kenignore` lines, while a source still reads them
+   *  (until they move into `.ken/knowledge.json`); never written. */
   legacyIgnores: string[];
   /** The tier overrides (`search.weights`), `pattern = tier` lines. */
   weights: string[];

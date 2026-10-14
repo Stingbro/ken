@@ -73,13 +73,14 @@ pub fn wants_background_index(row: &FileRow, excluded: bool) -> bool {
 }
 
 /// The project's cloud-only documents worth pulling down now, as rel paths.
-/// Filters on `project.is_excluded` here (not only in the scanner) because the
+/// Filters on the excluded folders here (not only in the scanner) because the
 /// worker reads the index directly, where a just-excluded folder's rows can
 /// still be present until the next rescan removes them.
 pub fn pending_documents(files: &[FileRow], project: &Project) -> Vec<String> {
+    let excluded = project.excluded_folders();
     files
         .iter()
-        .filter(|f| wants_background_index(f, project.is_excluded(&f.rel_path)))
+        .filter(|f| wants_background_index(f, crate::project::in_folders(&excluded, &f.rel_path)))
         .map(|f| f.rel_path.clone())
         .collect()
 }

@@ -121,6 +121,15 @@ fn write_config(path: &Path, config: &ProjectConfig) -> Result<()> {
     fs::write(path, json + "\n").map_err(|e| Error::io(path, e))
 }
 
+/// Whether a project-relative path is one of `folders` or inside one.
+pub fn in_folders(folders: &[String], rel_path: &str) -> bool {
+    let rel = rel_path.trim_start_matches('/');
+    folders.iter().any(|ex| {
+        let ex = ex.trim_matches('/');
+        !ex.is_empty() && (rel == ex || rel.starts_with(&format!("{ex}/")))
+    })
+}
+
 impl Project {
     /// Create a new project in an existing folder. If the folder already has
     /// a `.ken/project.json` (e.g. cloned from a teammate), it is adopted
@@ -206,28 +215,98 @@ impl Project {
         write_config(&config_path(&self.root), &self.config)
     }
 
-    /// Is a project-relative path inside an excluded folder?
+    /// Is a project-relative path inside a folder of `project.json`'s
+    /// `excluded`?
     pub fn is_excluded(&self, rel_path: &str) -> bool {
-        let rel = rel_path.trim_start_matches('/');
-        self.config.excluded.iter().any(|ex| {
-            let ex = ex.trim_matches('/');
-            !ex.is_empty() && (rel == ex || rel.starts_with(&format!("{ex}/")))
-        })
+        in_folders(&self.config.excluded, rel_path)
+    }
+
+    /// Whether this source's older ignore files have moved into the
+    /// knowledge base's `.ken/knowledge.json`
+    /// (`knowledge_settings::move_legacy_ignores`): from then on its
+    /// `.kenignore` files and `project.json`'s `excluded` are not read.
+    pub fn ignores_moved(&self) -> bool {
+        crate::knowledge_settings::for_repo(&self.root).is_some_and(|s| s.ignores_moved())
+    }
+
+    /// The folders a scan still leaves out by `project.json`'s `excluded`:
+    /// none once they have moved into `.ken/knowledge.json`, where they are
+    /// index rules like any other.
+    pub fn legacy_excluded(&self) -> Vec<String> {
+        if self.ignores_moved() { Vec::new() } else { self.config.excluded.clone() }
+    }
+
+    /// The folders the person left out of this source, as the repo drawer
+    /// shows them: the `/folder` lines of its entry in `.ken/knowledge.json`
+    /// once its older ignore files have moved there, else `project.json`'s
+    /// `excluded`.
+    pub fn excluded_folders(&self) -> Vec<String> {
+        match crate::knowledge_settings::for_repo(&self.root).filter(|s| s.ignores_moved()) {
+            Some(s) => s.excluded_folders(),
+            None => self.config.excluded.clone(),
+        }
     }
 
     /// Every index rule this source reads, in the order `kenignore::classify`
     /// folds them (knowledge-core decision 34): the fixed built-ins, the repo
-    /// switched off as a whole, the older `.kenignore` files (read only, as
-    /// legacy: Ken writes none now), then the rules in the knowledge base's
-    /// `.ken/knowledge.json`, the one place a person writes them, which win.
+    /// switched off as a whole, the older `.kenignore` files until they have
+    /// moved into `.ken/knowledge.json` (read only: Ken writes none now),
+    /// then the rules in the knowledge base's `.ken/knowledge.json`, the one
+    /// place a person writes them, which win.
     pub fn index_rules(&self) -> Vec<crate::kenignore::Rule> {
+        self.index_rules_with(crate::knowledge_settings::for_repo(&self.root).as_ref())
+    }
+
+    /// [`Project::index_rules`] with the settings already found.
+    pub fn index_rules_with(&self, settings: Option<&crate::knowledge_settings::Settings>) -> Vec<crate::kenignore::Rule> {
         let mut rules = crate::kenignore::built_in_rule_sets();
         rules.extend(crate::kenignore::repo_rules_for(&self.root));
-        rules.extend(self.kenignore_rules());
-        if let Some(settings) = crate::knowledge_settings::for_repo(&self.root) {
+        if !settings.is_some_and(|s| s.ignores_moved()) {
+            rules.extend(self.kenignore_rules());
+        }
+        if let Some(settings) = settings {
             rules.extend(crate::kenignore::parse_lines(&settings.index_rules()));
         }
         rules
+    }
+
+    /// The lines of this source's older ignore files, each with where it came
+    /// from, in the order they were read: its lines of the workspace's
+    /// `.kenignore`, its own `.kenignore`, then `project.json`'s `excluded`
+    /// as `/folder` lines (checked before every rule, so they come last
+    /// here). Comments, blank and malformed lines are left out. What
+    /// `knowledge_settings::move_legacy_ignores` moves.
+    pub fn legacy_ignore_lines(&self) -> Vec<(String, Vec<String>)> {
+        let rule_lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(str::trim_end)
+                .filter(|l| !crate::kenignore::parse(l).is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut out = Vec::new();
+        if let Some((ws, member)) = self.workspace_of() {
+            if let Ok(text) = fs::read_to_string(ws.join(".kenignore")) {
+                out.push(("the workspace's .kenignore".to_string(), rule_lines(&crate::kenignore::lines_for_member(&text, &member))));
+            }
+        }
+        if let Ok(text) = fs::read_to_string(self.root.join(".kenignore")) {
+            out.push((format!("{name}/.kenignore"), rule_lines(&text)));
+        }
+        let excluded: Vec<String> =
+            self.config.excluded.iter().map(|e| e.trim().trim_matches('/')).filter(|e| !e.is_empty()).map(|e| format!("/{e}")).collect();
+        out.push((format!("{name}'s project.json excluded"), excluded));
+        out
+    }
+
+    /// The workspace folder this project sits in (the one holding
+    /// `.ken-workspace/`, up to three levels up), and the project's folder
+    /// relative to it.
+    fn workspace_of(&self) -> Option<(PathBuf, String)> {
+        let ws = self.root.ancestors().skip(1).take(3).find(|a| a.join(crate::workspace::CONFIG_DIR).is_dir())?;
+        let member = self.root.strip_prefix(ws).ok()?.to_string_lossy().replace('\\', "/");
+        Some((ws.to_path_buf(), member))
     }
 
     /// The older `.kenignore` rules, read as legacy: this project's own file
@@ -246,12 +325,8 @@ impl Project {
     }
 
     fn workspace_kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
-        let Some(ws) = self.root.ancestors().skip(1).take(3).find(|a| a.join(crate::workspace::CONFIG_DIR).is_dir()) else {
-            return Vec::new();
-        };
+        let Some((ws, member)) = self.workspace_of() else { return Vec::new() };
         let Ok(text) = fs::read_to_string(ws.join(".kenignore")) else { return Vec::new() };
-        let Ok(member) = self.root.strip_prefix(ws) else { return Vec::new() };
-        let member = member.to_string_lossy().replace('\\', "/");
         crate::kenignore::parse(&crate::kenignore::lines_for_member(&text, &member))
     }
 
