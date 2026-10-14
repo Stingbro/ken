@@ -84,6 +84,7 @@ const FINDING_KINDS: Record<string, string> = {
   contradiction: "Contradiction",
   question: "Open question",
   drift: "Out of date",
+  aged: "Not checked",
 };
 
 export function findingItem(f: Finding, i: number): InboxItem {

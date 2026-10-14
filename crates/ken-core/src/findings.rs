@@ -2,7 +2,8 @@
 //! what a check found that a person should look at, kept as Review items of
 //! kind [`KIND`] in the knowledge base's index. Ingest files each
 //! contradiction a source shows and each question it leaves open; drift
-//! files a ruling whose code changed and a source that is gone; lint files
+//! files a ruling whose code changed, a source that is gone and a page past
+//! the age rule; lint files
 //! broken links, missing pages, ambiguous names, orphans, contradictions
 //! between pages and code that cites a ruling the log lacks; the
 //! supersession pass files each pair it finds. A finding changes nothing by
@@ -30,7 +31,8 @@ pub const KIND: &str = "finding";
 pub struct Finding {
     /// `contradiction` | `question` (ingest, and lint after an edit or
     /// weekly) · `drift` (a ruling whose code changed, a cited source that is
-    /// gone, a void run) · `broken-link` | `missing-page` | `ambiguous-name` |
+    /// gone, a void run) · `aged` (a page not checked in 30 days) ·
+    /// `broken-link` | `missing-page` | `ambiguous-name` |
     /// `orphan` (lint on every scan) · `suggested-page` (the weekly lint) ·
     /// `unknown-ruling` (code cites an id the log does not have) ·
     /// `supersession`

@@ -7,6 +7,7 @@ const finding = (kind: string, title = kind): Finding => ({ kind, title, detail:
 describe("findingLabel", () => {
   it("names each kind plainly", () => {
     expect(findingLabel("drift")).toBe("drift");
+    expect(findingLabel("aged")).toBe("not checked");
     expect(findingLabel("orphan")).toBe("links");
     expect(findingLabel("broken-link")).toBe("links");
     expect(findingLabel("unknown-ruling")).toBe("ruling");
@@ -25,8 +26,9 @@ describe("orderFindings", () => {
       finding("question", "q"),
       finding("contradiction", "c2"),
       finding("supersession", "s"),
+      finding("aged", "a"),
     ];
-    expect(orderFindings(list).map((f) => f.title)).toEqual(["d", "s", "c1", "c2", "o", "q"]);
+    expect(orderFindings(list).map((f) => f.title)).toEqual(["d", "a", "s", "c1", "c2", "o", "q"]);
   });
 });
 

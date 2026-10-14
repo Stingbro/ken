@@ -9,6 +9,8 @@ export function findingLabel(kind: string): string {
   switch (kind) {
     case "drift":
       return "drift";
+    case "aged":
+      return "not checked";
     case "supersession":
       return "supersession";
     case "unknown-ruling":
@@ -27,11 +29,11 @@ export function findingLabel(kind: string): string {
   }
 }
 
-/** Findings in the order the settings screen lists them: drift first, then superseded
- *  rulings, contradictions, rulings cited in code, links, pages to write and
- *  anything else. Stable within a kind. */
+/** Findings in the order the settings screen lists them: drift first, then pages
+ *  not checked in a month, superseded rulings, contradictions, rulings cited in
+ *  code, links, pages to write and anything else. Stable within a kind. */
 export function orderFindings(findings: readonly Finding[]): Finding[] {
-  const order = ["drift", "supersession", "contradiction", "ruling", "links", "page to write"];
+  const order = ["drift", "not checked", "supersession", "contradiction", "ruling", "links", "page to write"];
   const rank = (k: string) => order.indexOf(findingLabel(k));
   return findings
     .map((f, i) => ({ f, i, r: rank(f.kind) }))

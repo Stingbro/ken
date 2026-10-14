@@ -13,8 +13,9 @@
 //!   declares for itself, against the code it cites. Superseded entries are
 //!   skipped.
 //! - **Age rule**: a page with a `sources:` list not checked in thirty days
-//!   is raised even when nothing it cites moved. A page with no sources (an
-//!   index, START-HERE) carries no `checked:` and is never raised.
+//!   is filed as an `aged` finding even when nothing it cites moved, for a
+//!   person to read; Claude is not asked. A page with no sources (an index,
+//!   START-HERE) carries no `checked:` and is never raised.
 //!
 //! A sweep works from what changed: once per repo it asks git which files
 //! moved since the last sweep's commit, re-measures only the citations of
@@ -35,10 +36,11 @@
 //!
 //! **What a run does** ([`act`]): a page whose sources changed only in
 //! whitespace or comments has its `checked:` stamp advanced, silently. A
-//! page with a real change, or past the age rule, is re-read by Claude (the
-//! caller's `reread`, never the local model) against the diff or the code as
-//! it is, and either stamped or fixed one section at a time through the
-//! ingest edit rules: held for a person when ingest would hold it. A cited
+//! page whose cited code really changed since its `checked:` is re-read by
+//! Claude (the caller's `reread`, never the local model) against the diff,
+//! and either stamped or fixed one section at a time through the ingest
+//! edit rules: held for a person when ingest would hold it. A page past the
+//! age rule is a finding, filed once for each `checked:` date. A cited
 //! file that was renamed is followed and the citation rewritten when git
 //! names one new path. A ruling whose cited code changed is never edited: it
 //! becomes a finding, as does a source that is gone. Each run that writes is
@@ -58,6 +60,8 @@ use crate::Result;
 
 /// A page not checked for longer than this is raised by the age rule.
 pub const AGE_DAYS: i64 = 30;
+/// The kind of the age rule's finding.
+pub const AGED: &str = "aged";
 /// A run happens at least this often, for the age rule: pages whose
 /// sources never move are still read again.
 pub const AGE_RUN_DAYS: i64 = 7;
@@ -912,46 +916,28 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// What changed under one page's citations: the diff of each changed file
-/// from its pin, or for a page past the age rule the cited files as they
-/// are now.
-fn evidence(project_root: &Path, sources: &[String], changed: &[&Mismatch]) -> String {
+/// from its pin.
+fn evidence(project_root: &Path, changed: &[&Mismatch]) -> String {
     let mut out = String::new();
-    let add = |head: String, body: String, out: &mut String| {
-        if out.len() < QUOTES_CHARS && !body.trim().is_empty() {
-            out.push_str(&format!("\n--- {head}\n{}\n", clip(&body, QUOTE_CHARS)));
+    for m in changed {
+        let Citation::Code(c) = classify(&m.citation) else { continue };
+        let (Some(repo), Some(pin), Some(branch)) = (resolve_repo(project_root, &c.repo), m.pin.as_deref(), m.branch.as_deref()) else {
+            continue;
+        };
+        let diff = git(&repo, &["diff", "-U3", pin, branch, "--", &c.path]).unwrap_or_default();
+        if out.len() < QUOTES_CHARS && !diff.trim().is_empty() {
+            out.push_str(&format!("\n--- {} (git diff {} {branch})\n{}\n", m.citation, &pin[..pin.len().min(7)], clip(&diff, QUOTE_CHARS)));
         }
-    };
-    if !changed.is_empty() {
-        for m in changed {
-            let Citation::Code(c) = classify(&m.citation) else { continue };
-            let (Some(repo), Some(pin), Some(branch)) = (resolve_repo(project_root, &c.repo), m.pin.as_deref(), m.branch.as_deref()) else {
-                continue;
-            };
-            let diff = git(&repo, &["diff", "-U3", pin, branch, "--", &c.path]).unwrap_or_default();
-            add(format!("{} (git diff {} {branch})", m.citation, &pin[..pin.len().min(7)]), diff, &mut out);
-        }
-        return out;
-    }
-    for raw in sources {
-        let Citation::Code(c) = classify(raw) else { continue };
-        let Some(repo) = resolve_repo(project_root, &c.repo) else { continue };
-        let (branch, _) = default_branch(&repo);
-        let text = git(&repo, &["show", &format!("{branch}:{}", c.path)]).unwrap_or_default();
-        add(format!("{raw} (as it is on {branch})"), text, &mut out);
     }
     out
 }
 
 /// The re-read of one page (decision 28): the page and what changed under
 /// it; Claude answers CHECKED, or the one section to put in its place.
-pub fn reread_prompt(page: &str, text: &str, evidence: &str, aged: bool) -> String {
-    let why = if aged {
-        format!("It has not been checked in {AGE_DAYS} days; the code it cites is below as it is now")
-    } else {
-        "Code it cites has changed; the changes are below".to_string()
-    };
+pub fn reread_prompt(page: &str, text: &str, evidence: &str) -> String {
     format!(
-        "You are checking one page of a team's knowledge base, `{page}`, against the code it cites. {why}.\n\n\
+        "You are checking one page of a team's knowledge base, `{page}`, against the code it cites. Code it cites has \
+         changed; the changes are below.\n\n\
          Rules:\n\
          - If everything the page says still holds, reply exactly CHECKED.\n\
          - If part of it no longer holds, reply with the one section that holds it, corrected: its heading line, then \
@@ -976,11 +962,13 @@ pub fn reread_prompt(page: &str, text: &str, evidence: &str, aged: bool) -> Stri
 ///   otherwise becomes a finding.
 /// - A page whose sources changed only in whitespace or comments has its
 ///   `checked:` stamp advanced.
-/// - A page with a real change, or past the age rule, is re-read with
+/// - A page whose cited code really changed since its pin is re-read with
 ///   `reread`: CHECKED (or no change) stamps it; a section replaces its
 ///   section through the ingest rules (`ingest::hold`), written or held for
 ///   a person as a page proposal. Without `reread`, or when a call fails,
 ///   the page waits for a later run.
+/// - A page past the age rule whose code did not move is an `aged` finding
+///   ([`file_aged`]); it is not re-read.
 ///
 /// A page holding a person's uncommitted work is left alone this run. What
 /// was written is one commit (`git::commit_paths`, never pushed) with one
@@ -1022,10 +1010,12 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             None => by_page.entry(m.subject.clone()).or_default().push(m.clone()),
         }
     }
-    let aged: std::collections::HashSet<String> = run.aged.iter().map(|(p, _)| p.clone()).collect();
-    let mut pages: Vec<String> = by_page.keys().cloned().chain(aged.iter().cloned()).collect();
-    pages.sort();
-    pages.dedup();
+    // The age rule files a finding (Chris, 2026-10-14): a page whose code
+    // really moved is re-read below instead.
+    let reread_due = |page: &str| by_page.get(page).is_some_and(|ms| ms.iter().any(|m| m.severity == Severity::Judgment));
+    let aged: Vec<(String, Option<String>)> = run.aged.iter().filter(|(p, _)| !reread_due(p)).cloned().collect();
+    run.findings += file_aged(db, &aged, now)?;
+    let pages: Vec<String> = by_page.keys().cloned().collect();
 
     for page in pages {
         if dirty.contains(&page) {
@@ -1063,10 +1053,9 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
         }
 
         let changed: Vec<&Mismatch> = found.iter().filter(|m| m.severity == Severity::Judgment).collect();
-        let is_aged = aged.contains(&page);
         let sources = db.page_meta(&page)?.map(|m| m.sources).unwrap_or_default();
         let sha = head_for(root, &sources);
-        if changed.is_empty() && !is_aged {
+        if changed.is_empty() {
             // Whitespace or comments only: the stamp advances, silently.
             if found.iter().any(|m| m.severity == Severity::AutoRecleared) {
                 write_page(root, &page, &stamp_checked(&text, today, sha.as_deref()))?;
@@ -1076,8 +1065,8 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             continue;
         }
 
-        // A real change, or the age rule: Claude re-reads the page, unless
-        // an edit a run held for it still waits for a person.
+        // A real change: Claude re-reads the page, unless an edit a run held
+        // for it still waits for a person.
         if held_open(db, &page)? {
             continue;
         }
@@ -1085,7 +1074,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             run.waiting.push(page.clone());
             continue;
         };
-        let prompt = reread_prompt(&page, &text, &evidence(root, &sources, &changed), changed.is_empty());
+        let prompt = reread_prompt(&page, &text, &evidence(root, &changed));
         let section = match call(&prompt) {
             Ok(reply) if reply.trim().trim_end_matches('.').eq_ignore_ascii_case("CHECKED") => None,
             Ok(reply) => match crate::ingest::finish_section(&reply) {
@@ -1180,6 +1169,39 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
         crate::graph::queue_topics(db, &run.fixed)?;
     }
     Ok(())
+}
+
+/// The age rule's finding for one page: when it was last checked, or that it
+/// never was. The text holds the date, so a page checked again and aged
+/// again is a new finding.
+fn aged_finding(page: &str, checked: Option<&str>) -> crate::findings::Finding {
+    let when = checked.map_or("has never been checked".to_string(), |d| format!("was last checked on {d}"));
+    let text = format!(
+        "{page} {when}, more than {AGE_DAYS} days ago, and nothing it cites has moved since. Read it against its \
+         sources and stamp `checked:`, or retire it."
+    );
+    crate::findings::Finding { kind: AGED.into(), source: SOURCE.into(), subject: page.into(), text, ..Default::default() }
+}
+
+/// File the age rule's findings for `aged` (page, checked date): each page
+/// once for each `checked:` date, open or done, so a weekly run never files
+/// it again; an open one whose page is no longer aged (checked since,
+/// re-read, retired or gone) is resolved. Returns how many were filed.
+fn file_aged(db: &mut Db, aged: &[(String, Option<String>)], now: i64) -> Result<usize> {
+    let found: Vec<crate::findings::Finding> = aged.iter().map(|(p, c)| aged_finding(p, c.as_deref())).collect();
+    let keys: std::collections::HashSet<_> = found.iter().map(crate::findings::Finding::key).collect();
+    for (it, f) in crate::findings::open(db)? {
+        if f.kind == AGED && !keys.contains(&f.key()) {
+            db.resolve_review_item(it.id, now)?;
+        }
+    }
+    let filed_before: std::collections::HashSet<_> = crate::findings::ever(db, AGED)?.iter().map(crate::findings::Finding::key).collect();
+    let mut filed = 0;
+    for f in found.iter().filter(|f| !filed_before.contains(&f.key())) {
+        crate::findings::file(db, f, now)?;
+        filed += 1;
+    }
+    Ok(filed)
 }
 
 /// Whether an edit a drift run held for `page` still waits for a person:
@@ -1691,6 +1713,66 @@ updated: {{date}}
         assert!(r.commit.is_none(), "nothing written, nothing committed");
         assert!(!due(&db, later + 60).unwrap(), "waits for the hour");
         assert!(due(&db, later + RETRY_SECS).unwrap());
+    }
+
+    /// The age rule files a finding, never a re-read (Chris, 2026-10-14):
+    /// once for each `checked:` date, not again when a person marked it done,
+    /// and resolved once the page is checked again.
+    #[test]
+    fn an_aged_page_is_a_finding_filed_once() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("game");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&code, &["config", k, v]);
+        }
+        commit_at(&code, "src/save.rs", "fn save() {}\n", "2026-07-01");
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Platform")).unwrap();
+        let page = |checked: &str| format!("---\ntitle: Save\nchecked: {checked}\nsources:\n  - game:src/save.rs\n---\n# Save\n\nOne file.\n");
+        fs::write(wiki.join("Platform/Save.md"), page("2026-08-01")).unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        settings(&wiki, serde_json::json!({ "fetch": false }));
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let mut asked = 0;
+        let mut reread = |_: &str| -> Result<String> {
+            asked += 1;
+            Ok("CHECKED".into())
+        };
+        let now = chrono_free_epoch("2026-09-24").unwrap();
+        let r = run(&project, &mut db, now, "2026-09-24", Some(&mut reread as &mut Reread<'_>)).unwrap();
+        assert_eq!(r.aged.len(), 1);
+        assert_eq!(r.findings, 1);
+        assert!(r.stamped.is_empty() && r.commit.is_none(), "nothing written: {r:?}");
+        let aged = |db: &Db| crate::findings::open(db).unwrap().into_iter().filter(|(_, f)| f.kind == AGED).collect::<Vec<_>>();
+        let open = aged(&db);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].1.subject, "Platform/Save.md");
+        assert!(open[0].1.text.contains("last checked on 2026-08-01"), "{}", open[0].1.text);
+
+        // A week on: not filed again; marked done, still not filed again.
+        let week = now + 7 * 86_400;
+        assert_eq!(run(&project, &mut db, week, "2026-10-01", Some(&mut reread as &mut Reread<'_>)).unwrap().findings, 0);
+        db.resolve_review_item(open[0].0.id, week).unwrap();
+        assert_eq!(run(&project, &mut db, week + 7 * 86_400, "2026-10-08", Some(&mut reread as &mut Reread<'_>)).unwrap().findings, 0);
+        assert!(aged(&db).is_empty());
+
+        // Checked again by a person and aged again: a new finding, and the
+        // check itself resolves it.
+        // Each rewrite changes the size too: a scan reads again what moved
+        // in size or time, and these land within one second.
+        fs::write(wiki.join("Platform/Save.md"), page("2026-09-01").replace("One file.", "One file, read.")).unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let later = chrono_free_epoch("2026-10-10").unwrap();
+        assert_eq!(run(&project, &mut db, later, "2026-10-10", Some(&mut reread as &mut Reread<'_>)).unwrap().findings, 1);
+        fs::write(wiki.join("Platform/Save.md"), page("2026-10-09").replace("One file.", "One file, read again.")).unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        run(&project, &mut db, later + 60, "2026-10-10", Some(&mut reread as &mut Reread<'_>)).unwrap();
+        assert!(aged(&db).is_empty(), "checked since: resolved");
+        assert_eq!(asked, 0, "the age rule never calls Claude");
     }
 
     #[test]
