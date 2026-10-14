@@ -677,6 +677,89 @@ fn apply_semantic_index_flag(
         return Ok(());
     }
 
+    start_semantic_build(app, project, base, embedder_slot, cancel_slot, warned_large, app_settings, MeaningBuild::Full);
+    Ok(())
+}
+
+/// What a meaning build does: a full rebuild chunks every file again, a
+/// catch-up embeds only what a scan left without a vector and runs the
+/// controls (`engine::catch_up_semantic_index`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeaningBuild {
+    Full,
+    CatchUp,
+}
+
+/// Repos whose meaning index should catch up once the build running for them
+/// ends: a change that lands mid-build is not lost, and changes in a burst
+/// cost one more build, not one each. Locked only under `semantic_builds`.
+fn meaning_wanted() -> &'static Mutex<std::collections::HashSet<uuid::Uuid>> {
+    static WANTED: std::sync::OnceLock<Mutex<std::collections::HashSet<uuid::Uuid>>> = std::sync::OnceLock::new();
+    WANTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Tell the UI a repo's index changed, and have its meaning index catch up.
+/// Every path that writes to a repo's index (a scan, the watcher, a file
+/// refreshed after a write) ends here, so a changed chunk always gets its
+/// vector and the controls run again (knowledge-core decision 19).
+fn emit_index_updated(app: &AppHandle, project_id: uuid::Uuid, stats: ScanStats) {
+    emit_member(app, project_id, "index-updated", stats);
+    queue_meaning_catch_up(app, project_id);
+}
+
+/// Queue a catch-up of a repo's meaning index, when the repo has search by
+/// meaning on: at once when no build runs for it, else once the running one
+/// ends. Its own thread, so a caller holding the state lock is never held
+/// up by it. The embedding goes through the throttle's local-work gate: it
+/// waits while paused and rests by the pace (`engine::embed_pending`).
+fn queue_meaning_catch_up(app: &AppHandle, project_id: uuid::Uuid) {
+    use tauri::Manager as _;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let state: SharedState = app.state::<SharedState>().inner().clone();
+        let snapshot = {
+            let guard = lock_tolerant(&state);
+            guard
+                .members
+                .get(&project_id)
+                .filter(|m| semantic_index_enabled(&guard.app_settings, &m.project))
+                .map(|m| {
+                    (
+                        m.project.clone(),
+                        guard.base_dir.clone(),
+                        m.semantic_embedder.clone(),
+                        m.semantic_build_cancel.clone(),
+                        m.semantic_index_warned_large.clone(),
+                        guard.app_settings.clone(),
+                    )
+                })
+        };
+        let Some((project, base, embedder_slot, cancel_slot, warned_large, app_settings)) = snapshot else { return };
+        {
+            let builds = semantic_builds().lock().unwrap_or_else(|p| p.into_inner());
+            if builds.contains_key(&project_id) {
+                meaning_wanted().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id);
+                return;
+            }
+        }
+        start_semantic_build(&app, project, base, embedder_slot, cancel_slot, warned_large, app_settings, MeaningBuild::CatchUp);
+    });
+}
+
+/// Start a meaning build for one repo on its own thread, replacing one
+/// running for it. Shared by the flag (`apply_semantic_index_flag`, a full
+/// rebuild) and the catch-up after a change.
+#[allow(clippy::too_many_arguments)]
+fn start_semantic_build(
+    app: &AppHandle,
+    project: Project,
+    base: PathBuf,
+    embedder_slot: EmbedderSlot,
+    cancel_slot: Arc<Mutex<Option<CancelToken>>>,
+    warned_large: Arc<AtomicBool>,
+    app_settings: ken_core::settings::AppSettings,
+    mode: MeaningBuild,
+) {
     let project_id = project.config.id;
 
     let Some((model_id, dim)) = ensure_shared_embedder() else {
@@ -688,20 +771,25 @@ fn apply_semantic_index_flag(
                 reason: "No search-by-meaning model is installed. Download one in Settings › AI.".into(),
             },
         );
-        return Ok(());
+        return;
     };
 
     let token = CancelToken::new();
     if let Some(old) = cancel_slot.lock().unwrap().replace(token.clone()) {
         old.cancel();
     }
+    // Marked running before the thread starts, so a change that lands now
+    // waits for this build rather than starting another.
+    semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id, (0, 0));
 
     let bg_app = app.clone();
     let bg_embedder_slot = embedder_slot.clone();
+    let bg_cancel_slot = cancel_slot.clone();
     std::thread::spawn(move || {
         let mut db = match Db::open(&base, project.config.id) {
             Ok(db) => db,
             Err(e) => {
+                semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).remove(&project_id);
                 emit_member(
                     &bg_app,
                     project_id,
@@ -713,7 +801,6 @@ fn apply_semantic_index_flag(
         };
         let mut embedder = SlotEmbedder { slot: bg_embedder_slot, model_id, dim };
         let progress_app = bg_app.clone();
-        semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id, (0, 0));
         // project-profiler task 2.3: resolve the stored profile only when the
         // `profiler` flag is on for this project — `None` otherwise, which
         // makes `rebuild_semantic_index_with_profile` byte-identical to the
@@ -722,27 +809,46 @@ fn apply_semantic_index_flag(
         let profiler_enabled = ken_core::features::effective_flag(&app_settings, &project, "profiler");
         let profile = profiler_enabled.then(|| ken_core::profiler::ProjectProfile::load(&project.root));
         let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let result = engine::rebuild_semantic_index_with_profile(
-            &project,
-            &mut db,
-            &mut embedder,
-            &token,
-            |done, total| {
-                emit_member(
-                    &progress_app,
-                    project_id,
-                    "semantic-index-state",
-                    SemanticIndexStateEvent::Building { done, total },
-                );
-                semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id, (done, total));
-                if done == total || last_emit.elapsed() >= std::time::Duration::from_millis(500) {
-                    last_emit = std::time::Instant::now();
-                    emit_semantic_progress(&progress_app);
-                }
-            },
-            profile.as_ref(),
-        );
-        semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).remove(&project_id);
+        let progress = |done, total| {
+            emit_member(
+                &progress_app,
+                project_id,
+                "semantic-index-state",
+                SemanticIndexStateEvent::Building { done, total },
+            );
+            semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).insert(project_id, (done, total));
+            if done == total || last_emit.elapsed() >= std::time::Duration::from_millis(500) {
+                last_emit = std::time::Instant::now();
+                emit_semantic_progress(&progress_app);
+            }
+        };
+        let result = match mode {
+            MeaningBuild::Full => engine::rebuild_semantic_index_with_profile(
+                &project,
+                &mut db,
+                &mut embedder,
+                &token,
+                progress,
+                profile.as_ref(),
+            ),
+            MeaningBuild::CatchUp => engine::catch_up_semantic_index(&project, &mut db, &mut embedder, &token, progress),
+        };
+        // A build another one replaced leaves the mark to it; one turned off,
+        // or one that ran to its end, takes it down, and a change that landed
+        // while it ran starts the catch-up now.
+        let again = {
+            let mut builds = semantic_builds().lock().unwrap_or_else(|p| p.into_inner());
+            let replaced = token.is_cancelled() && bg_cancel_slot.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+            if replaced {
+                false
+            } else {
+                builds.remove(&project_id);
+                meaning_wanted().lock().unwrap_or_else(|p| p.into_inner()).remove(&project_id) && !token.is_cancelled()
+            }
+        };
+        if again {
+            queue_meaning_catch_up(&bg_app, project_id);
+        }
         emit_semantic_progress(&bg_app);
         match result {
             Ok(true) => {
@@ -763,8 +869,6 @@ fn apply_semantic_index_flag(
             }
         }
     });
-
-    Ok(())
 }
 
 /// Activate a project: register it, open its DB, start the watcher, and
@@ -1078,7 +1182,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                 watch_sync.changed(stats.changed_paths.clone());
             }
             enqueue_transcriptions(&emit_app, &watch_state, project_id, &stats.videos_needing_transcript);
-            emit_member(&emit_app, project_id, "index-updated", stats.clone());
+            emit_index_updated(&emit_app, project_id, stats.clone());
         },
     )
     .map_err(err)?;
@@ -1137,7 +1241,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
 
                 if let Ok(mut db) = Db::open_at(&db_path) {
                     if let Ok(stats) = scan::scan(&poll_project, &mut db) {
-                        emit_member(&emit_app, project_id, "index-updated", stats);
+                        emit_index_updated(&emit_app, project_id, stats);
                     }
                 }
             }
@@ -1225,7 +1329,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                         scan_sync.changed(stats.changed_paths.clone());
                     }
                     enqueue_transcriptions(&scan_app, &scan_state, project_id, &stats.videos_needing_transcript);
-                    emit_member(&scan_app, project_id, "index-updated", stats);
+                    emit_index_updated(&scan_app, project_id, stats);
                     // The library inbox: anything waiting in Raw/. Drift and
                     // the lint run in the background worker (`knowledge_checks`).
                     start_ingest_pass(&scan_project, &base, code_sources_of(&scan_state, &scan_project.root), false);
@@ -1381,15 +1485,7 @@ fn background_hydrate_worker(
                         // the footer's cloud_only count drops.
                         let paths = vec![rel.clone()];
                         sync.changed(paths.clone());
-                        emit_member(
-                            &app,
-                            project_id,
-                            "index-updated",
-                            ScanStats {
-                                changed_paths: paths,
-                                ..Default::default()
-                            },
-                        );
+                        emit_index_updated(&app, project_id, ScanStats { changed_paths: paths, ..Default::default() });
                     }
                 }
                 // Provider offline, or the file is still downloading past the
@@ -2487,7 +2583,7 @@ fn rescan_member(app: &AppHandle, base: &Path, project: &Project) {
     std::thread::spawn(move || {
         if let Ok(mut db) = Db::open(&base, project.config.id) {
             if let Ok(stats) = scan::scan(&project, &mut db) {
-                emit_member(&app, project.config.id, "index-updated", stats);
+                emit_index_updated(&app, project.config.id, stats);
             }
         }
     });
@@ -2628,7 +2724,7 @@ fn set_folder_selection(
     let videos = stats.videos_needing_transcript.clone();
     drop(guard);
     enqueue_transcriptions(&app, state.inner(), project_id, &videos);
-    emit_member(&app, project_id, "index-updated", stats);
+    emit_index_updated(&app, project_id, stats);
     Ok(info)
 }
 
@@ -3129,15 +3225,7 @@ async fn hydrate_file(
     if changed {
         let paths = vec![rel_path.clone()];
         sync.changed(paths.clone());
-        emit_member(
-            &app,
-            project_id,
-            "index-updated",
-            ScanStats {
-                changed_paths: paths,
-                ..Default::default()
-            },
-        );
+        emit_index_updated(&app, project_id, ScanStats { changed_paths: paths, ..Default::default() });
     }
     Ok(())
 }
@@ -3390,7 +3478,7 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
                             project_id,
                             &stats.videos_needing_transcript,
                         );
-                        emit_member(&bg_app, project_id, "index-updated", stats);
+                        emit_index_updated(&bg_app, project_id, stats);
                     }
                     Err(e) => {
                         let _ = bg_app.emit("scan-error", e.to_string());
@@ -4431,7 +4519,7 @@ fn finish_recording(app: &AppHandle, state: &SharedState, base: &Path, storage: 
         }
         (guard.base_dir.clone(), code_sources(&guard, &project.root))
     };
-    emit_member(app, take.project_id, "index-updated", ScanStats::default());
+    emit_index_updated(app, take.project_id, ScanStats::default());
     start_ingest_pass(&project, &base_dir, others, true);
     let _ = app.emit("record-saved", RecordSaved { rel_path: md_rel, project_id: Some(take.project_id.to_string()) });
     Ok(())
@@ -4553,7 +4641,7 @@ fn move_file(
         drop(guard);
         // Nothing was re-read, so there are no fresh stats and no new
         // transcription work — just tell the UI the index moved.
-        emit_member(&app, project_id, "index-updated", ScanStats::default());
+        emit_index_updated(&app, project_id, ScanStats::default());
     } else {
         scan::refresh_path(&active.project, &mut active.db, &from_rel).map_err(err)?;
         scan::refresh_path(&active.project, &mut active.db, &to_rel).map_err(err)?;
@@ -4652,7 +4740,7 @@ async fn delete_file(
     deindex_removed(&active.project, &mut active.db, &rel_path, is_dir).map_err(err)?;
     let project_id = active.project.config.id;
     drop(guard);
-    emit_member(&app, project_id, "index-updated", ScanStats::default());
+    emit_index_updated(&app, project_id, ScanStats::default());
     Ok(())
 }
 
@@ -4926,12 +5014,7 @@ fn import_commit(
     if changed {
         let paths = vec![final_rel.clone()];
         sync.wrote(paths.clone());
-        emit_member(
-            &app,
-            project.config.id,
-            "index-updated",
-            ScanStats { changed_paths: paths, ..Default::default() },
-        );
+        emit_index_updated(&app, project.config.id, ScanStats { changed_paths: paths, ..Default::default() });
     }
     Ok(final_rel)
 }
@@ -5369,7 +5452,7 @@ fn spawn_transcription(app: &AppHandle, job: TranscriptionJob) {
                         let _ = scan::refresh_path(&project, &mut db, &job.rel_path);
                     }
                 }
-                emit_member(&app, job.project_id, "index-updated", ScanStats::default());
+                emit_index_updated(&app, job.project_id, ScanStats::default());
             }
             Err(e) => {
                 job.jobs.lock().unwrap().attempted.insert(job.rel_path.clone());
@@ -8312,12 +8395,17 @@ fn workspace_save_roles(app: AppHandle, state: State<SharedState>, project_id: S
     Ok(())
 }
 
-/// Write the knowledge base's controls (decision 19). They run at each
-/// source's next rebuild or scan, as they always do; nothing runs now.
+/// Write the knowledge base's controls (decision 19). Each open source's
+/// meaning index catches up, which runs its controls again; a source with no
+/// meaning index runs them at its next scan.
 #[tauri::command(async)]
-fn workspace_save_controls(state: State<SharedState>, controls: Vec<ken_core::controls::Control>) -> CmdResult<()> {
-    let (kb, _, _) = kb_and_open(&state)?;
-    ken_core::knowledge_settings::set_controls(&kb.2, &controls).map_err(err)
+fn workspace_save_controls(app: AppHandle, state: State<SharedState>, controls: Vec<ken_core::controls::Control>) -> CmdResult<()> {
+    let (kb, _, open) = kb_and_open(&state)?;
+    ken_core::knowledge_settings::set_controls(&kb.2, &controls).map_err(err)?;
+    for p in &open {
+        queue_meaning_catch_up(&app, p.config.id);
+    }
+    Ok(())
 }
 
 /// Lay down the template files the knowledge base lacks that a person
@@ -11230,7 +11318,7 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
             // Queue empty: flush a trailing throttled emit, self-heal errored
             // rows that still have retries, then idle.
             if pending_emit {
-                emit_member(&app, project_id, "index-updated", ScanStats::default());
+                emit_index_updated(&app, project_id, ScanStats::default());
                 last_emit = Instant::now();
                 pending_emit = false;
             }
@@ -11287,7 +11375,7 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
                 if db.mark_ocr_done(&rel, &hash, &rows).is_ok() {
                     pending_emit = true;
                     if last_emit.elapsed() >= Duration::from_millis(750) {
-                        emit_member(&app, project_id, "index-updated", ScanStats::default());
+                        emit_index_updated(&app, project_id, ScanStats::default());
                         last_emit = Instant::now();
                         pending_emit = false;
                     }
@@ -11630,7 +11718,7 @@ fn answer_edit_proposal(
         let _ = app.emit("chat-updated", row);
     }
     if let Some(rel) = proposal.rel_path {
-        emit_member(&app, project_id, "index-updated", ScanStats { changed_paths: vec![rel], ..Default::default() });
+        emit_index_updated(&app, project_id, ScanStats { changed_paths: vec![rel], ..Default::default() });
     }
     Ok(())
 }

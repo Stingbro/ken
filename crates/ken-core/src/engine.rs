@@ -125,6 +125,9 @@ pub fn rebuild_semantic_index_with_profile(
     // Chunks still to embed, gathered across files.
     let mut pending_ids: Vec<i64> = Vec::new();
     let mut pending_texts: Vec<String> = Vec::new();
+    // Whether anything was chunked again, dropped or embedded: what makes
+    // the controls due again.
+    let mut changed = false;
 
     for (done, file) in files.into_iter().enumerate() {
         if token.is_cancelled() {
@@ -136,6 +139,9 @@ pub fn rebuild_semantic_index_with_profile(
             // `files`, but if one slips through (e.g. a `.kenignore` edit
             // landed after the last scan), don't chunk/embed it, and drop any
             // stale chunks left from before it became Ignore.
+            if db.has_chunks(&file.rel_path)? {
+                changed = true;
+            }
             db.delete_chunks(&file.rel_path)?;
             on_progress(done + 1, total);
             continue;
@@ -171,7 +177,9 @@ pub fn rebuild_semantic_index_with_profile(
                 };
                 chunker::chunk_with(&file.rel_path, &text, &idx_profile, &defs)
             };
-            db.store_chunked(&file.rel_path, &chunked)?;
+            if !db.store_chunked(&file.rel_path, &chunked)?.is_empty() {
+                changed = true;
+            }
         }
 
         // Embed every chunk with no vector yet, not only the ones this call
@@ -180,6 +188,7 @@ pub fn rebuild_semantic_index_with_profile(
         // `upsert_chunks` drops the vector of a chunk whose text changed, so
         // those are missing too.
         for (id, text) in db.chunks_missing_vectors(&file.rel_path)? {
+            changed = true;
             pending_ids.push(id);
             pending_texts.push(text);
             if pending_ids.len() >= EMBED_BATCH {
@@ -194,14 +203,84 @@ pub fn rebuild_semantic_index_with_profile(
     db.set_embed_model(&embedder.model_id())?;
     db.set_embed_dim(embedder.dim())?;
     db.set_semantic_built_at(now_epoch())?;
-    // The controls, through the real pipeline with meaning, after every
-    // rebuild (knowledge-core decision 19). A failure is reported, never a
-    // failed rebuild.
+    run_controls(project, db, embedder, changed);
+    Ok(true)
+}
+
+/// Bring the meaning index up to date after a scan changed some chunks, or a
+/// person accepted new controls: embed every chunk that has no vector yet,
+/// then run the controls. Unlike [`rebuild_semantic_index`] it chunks
+/// nothing again, since the scan already wrote the chunks; it reads only
+/// what is missing, so it is cheap to ask for after every change.
+///
+/// It is only asked for when the files or the controls changed, so the
+/// controls always run, even when nothing needed embedding (knowledge-core
+/// decision 19). It waits while background work is paused before it starts,
+/// and its embedding obeys the throttle like the rebuild's.
+///
+/// A source with no meaning index yet, or one built with another model,
+/// gets the full rebuild instead. Returns `Ok(false)` when cancelled.
+pub fn catch_up_semantic_index(
+    project: &Project,
+    db: &mut Db,
+    embedder: &mut dyn Embedder,
+    token: &CancelToken,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<bool> {
+    if db.semantic_built_at()?.is_none()
+        || needs_reembed(db.embed_model()?.as_deref(), db.embed_dim()?, db.vector_count()?, &embedder.model_id(), embedder.dim())
+    {
+        return rebuild_semantic_index(project, db, embedder, token, on_progress);
+    }
+    if !crate::throttle::wait_unpaused(&|| token.is_cancelled()) {
+        return Ok(false);
+    }
+    db.ensure_vec_chunks(embedder.dim())?;
+
+    let paths = db.paths_missing_vectors()?;
+    let total = paths.len();
+    let mut pending_ids: Vec<i64> = Vec::new();
+    let mut pending_texts: Vec<String> = Vec::new();
+    for (done, path) in paths.iter().enumerate() {
+        if token.is_cancelled() {
+            return Ok(false);
+        }
+        for (id, text) in db.chunks_missing_vectors(path)? {
+            pending_ids.push(id);
+            pending_texts.push(text);
+            if pending_ids.len() >= EMBED_BATCH {
+                embed_pending(db, embedder, &mut pending_ids, &mut pending_texts, token)?;
+            }
+        }
+        on_progress(done + 1, total);
+    }
+    embed_pending(db, embedder, &mut pending_ids, &mut pending_texts, token)?;
+    if token.is_cancelled() {
+        return Ok(false);
+    }
+    on_progress(total, total);
+    db.set_semantic_built_at(now_epoch())?;
+    run_controls(project, db, embedder, true);
+    Ok(true)
+}
+
+/// The controls, through the real pipeline with meaning (knowledge-core
+/// decision 19): when the index changed, when the controls are not the ones
+/// last run, or when none ran yet. A failure is reported, never a failed
+/// build.
+fn run_controls(project: &Project, db: &Db, embedder: &mut dyn Embedder, changed: bool) {
     let controls = crate::controls::for_source(&project.root);
+    let due = changed
+        || match db.control_results() {
+            Ok(Some(_)) => !crate::controls::same_set(&crate::controls::stored(db), &controls),
+            _ => true,
+        };
+    if !due {
+        return;
+    }
     if let Err(e) = crate::controls::run_and_store(db, &controls, &mut |q| embedder.embed_query(q).ok()) {
         eprintln!("controls: {e}");
     }
-    Ok(true)
 }
 
 /// Whether the stored vectors came from a different model than `model_id`
@@ -256,6 +335,79 @@ mod tests {
             assert_eq!(db.vector_count().unwrap(), before, "every chunk read again");
         }
     }
+    fn set_controls(root: &std::path::Path, controls: &str) {
+        fs::create_dir_all(root.join(".ken")).unwrap();
+        fs::write(root.join(".ken/knowledge.json"), format!(r#"{{"controls": {controls}}}"#)).unwrap();
+    }
+
+    /// After a scan changed a file, or a person accepted controls, the
+    /// catch-up embeds what has no vector and runs the controls, even when
+    /// nothing needed embedding (knowledge-core decision 19).
+    #[test]
+    fn a_catch_up_embeds_what_a_scan_changed_and_runs_the_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# Retry
+
+Payments retry three times.").unwrap();
+        set_controls(dir.path(), "[]");
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_at(&app_dir.path().join("t.db")).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        let mut embedder = FakeEmbedder::new();
+        assert!(rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap());
+        assert!(crate::controls::stored(&db).is_empty());
+
+        // Accepted: the controls changed, nothing needs embedding.
+        set_controls(dir.path(), r#"[{"question": "how often do payments retry", "expect": "a.md"}]"#);
+        assert!(db.paths_missing_vectors().unwrap().is_empty() || !db.vec_available());
+        assert!(catch_up_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap());
+        let results = crate::controls::stored(&db);
+        assert_eq!(results.len(), 1, "the accepted control ran");
+        assert!(results[0].passed, "{results:?}");
+
+        // A file changed: the scan writes its chunks, the catch-up embeds them.
+        fs::write(dir.path().join("b.md"), "# Saving
+
+Worlds save every five minutes.").unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        if db.vec_available() {
+            assert_eq!(db.paths_missing_vectors().unwrap(), vec!["b.md".to_string()]);
+        }
+        assert!(catch_up_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap());
+        if db.vec_available() {
+            assert!(db.paths_missing_vectors().unwrap().is_empty(), "every changed chunk has its vector");
+        }
+    }
+
+    /// A rebuild that changed nothing, with the controls last run, leaves
+    /// their results alone; new controls make them due again.
+    #[test]
+    fn a_rebuild_runs_the_controls_only_when_something_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# Retry
+
+Payments retry three times.").unwrap();
+        set_controls(dir.path(), r#"[{"question": "how often do payments retry", "expect": "a.md"}]"#);
+        let project = Project::create(dir.path(), "T").unwrap();
+        let mut db = Db::open_at(&app_dir.path().join("t.db")).unwrap();
+        scan::scan(&project, &mut db).unwrap();
+        let mut embedder = FakeEmbedder::new();
+        rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap();
+        assert!(crate::controls::stored(&db)[0].passed);
+
+        // A marker run of the same controls: a rebuild with nothing to do keeps it.
+        let marker = r#"[{"question":"how often do payments retry","expect":"a.md","rank":4,"passed":true}]"#;
+        db.store_control_results(marker).unwrap();
+        rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap();
+        assert_eq!(crate::controls::stored(&db)[0].rank, Some(4), "nothing changed, nothing ran");
+
+        set_controls(dir.path(), r#"[{"question": "payments retry", "expect": "a.md"}]"#);
+        rebuild_semantic_index(&project, &mut db, &mut embedder, &CancelToken::new(), |_, _| {}).unwrap();
+        assert_eq!(crate::controls::stored(&db)[0].question, "payments retry", "new controls ran");
+    }
+
     use crate::scan;
     use crate::search::{self, FtsHit, VecHit};
     use crate::Error;

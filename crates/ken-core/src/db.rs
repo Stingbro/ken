@@ -1584,6 +1584,27 @@ impl Db {
         self.delete_chunks(rel_path)
     }
 
+    /// Whether `path` has any chunk in the index.
+    pub fn has_chunks(&self, path: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM chunks WHERE path = ?1)", params![path], |r| r.get(0))?)
+    }
+
+    /// The paths with at least one chunk that has no vector yet, in path
+    /// order: what a catch-up after a scan has to embed. With no vector
+    /// table, every path with a chunk.
+    pub fn paths_missing_vectors(&self) -> Result<Vec<String>> {
+        let sql = if table_exists(&self.conn, "vec_chunks")? {
+            "SELECT DISTINCT c.path FROM chunks c
+              WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)
+              ORDER BY c.path"
+        } else {
+            "SELECT DISTINCT path FROM chunks ORDER BY path"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     /// The chunks of `path` that have no vector yet, as (id, text): what a
     /// semantic rebuild still has to embed. Chunks are written by every scan
     /// (keyword search over chunks needs no model); vectors only by the

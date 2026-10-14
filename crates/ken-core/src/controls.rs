@@ -11,10 +11,12 @@
 //! person edits them there. The last run's results are stored in the
 //! source's index, for the health line.
 //!
-//! When they run: at the end of every semantic rebuild, with the question
-//! embedded as a search would embed it; and at the end of a scan while the
-//! source has no meaning index, by keyword alone, which is then how it is
-//! searched.
+//! When they run: at the end of a semantic rebuild that changed something,
+//! and of every catch-up after a scan or an accepted proposal (a change is
+//! what asks for one), with the question embedded as a search would embed
+//! it; and at the end of a scan while the source has no meaning index, by
+//! keyword alone, which is then how it is searched. Controls that are not
+//! the ones last run are always due.
 
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +82,14 @@ pub fn run_and_store(db: &Db, controls: &[Control], embed: &mut dyn FnMut(&str) 
     let json = serde_json::to_string(&results).map_err(|e| crate::Error::Other(e.to_string()))?;
     db.store_control_results(&json)?;
     Ok(results)
+}
+
+/// Whether `results` are a run of exactly `controls`: the same questions
+/// and files, in order. When they are not, the controls changed since the
+/// last run and are due again.
+pub fn same_set(results: &[ControlResult], controls: &[Control]) -> bool {
+    results.len() == controls.len()
+        && results.iter().zip(controls).all(|(r, c)| r.question == c.question && r.expect == c.expect)
 }
 
 /// The results the last run stored, empty when none ran yet.

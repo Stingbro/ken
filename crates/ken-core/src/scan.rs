@@ -377,11 +377,17 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
 
     // The controls, by keyword, while this source has no meaning index:
     // that is how it is searched until one is built, and the rebuild runs
-    // them with meaning after (decision 19).
-    if db.semantic_built_at()?.is_none() && (!stats.changed_paths.is_empty() || db.control_results()?.is_none()) {
+    // them with meaning after (decision 19). They run again when the files
+    // or the controls changed, or none ran yet.
+    if db.semantic_built_at()?.is_none() {
         let controls = crate::controls::for_source(&project.root);
-        if let Err(e) = crate::controls::run_and_store(db, &controls, &mut |_| None) {
-            eprintln!("controls: {e}");
+        let due = !stats.changed_paths.is_empty()
+            || db.control_results()?.is_none()
+            || !crate::controls::same_set(&crate::controls::stored(db), &controls);
+        if due {
+            if let Err(e) = crate::controls::run_and_store(db, &controls, &mut |_| None) {
+                eprintln!("controls: {e}");
+            }
         }
     }
 
