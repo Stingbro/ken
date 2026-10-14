@@ -173,6 +173,40 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
   - Not run: any test, and the app. Nothing migrates: older cards still read (their undo records are ignored), and a source an older card holds in Raw waits for Seen.
 
+- **Slice 8: drift, lint and supersession** (`c1a652d`). Decisions 25, 28, 29, 30, with 36 (Ken's commits).
+  - When drift runs (28): `drift::due` is true when a cited repo's branch head is not the one the last run measured (`branch_moved`, from the run's `PinCache`), a week after the last run (`AGE_RUN_DAYS`, the age rule's turn for pages whose sources do not move), or an hour after a run that left pages waiting for a re-read (`RETRY_SECS`). Gone: `DriftConfig.interval_days`, `DEFAULT_INTERVAL_DAYS` and the interval check. The app's background worker looks every five minutes (`knowledge_checks`, `CHECKS_EVERY`); the open scan no longer sweeps. Run drift now (Team screen) forces a run.
+  - What a run does (28), `drift::act` after the sweep (`drift::run` does both and records the run):
+    - Whitespace or comments only: the page's `checked:` advances silently (`stamp_checked`: today and the head of the page's first cited repo, 12 hex digits).
+    - A real change, or a page past the age rule: Claude re-reads it (`reread_prompt`: the page, then the diff of each changed citation from its pin, or the cited files as they are now) and answers CHECKED or one section. A section goes through the ingest rules (`replace_section`, `stamp_updated`, `ingest::hold`, the size rule measured without Ken's stamps); a held fix is a page proposal from `drift` (`HELD_FROM`), and the page is not read again while it waits (`held_open`). No Claude, the switch off or the hourly cap reached: the page waits (`DriftRun.waiting`).
+    - A renamed file: followed when git names one new path between the pin and the branch (`renamed_to`); the citation is rewritten and, when the file's name changed, a Vocabulary rename row added.
+    - A ruling whose cited code changed or is gone: a `drift` finding against the ruling; a ruling is never edited. A cited source that is gone and not followed: a `drift` finding against the page. A void run: one finding, nothing stamped or fixed; the next run that holds resolves it.
+    - A page with a person's uncommitted work is left for a later run.
+  - One commit and a `log.md` line per run that writes (28, 36): `ingest::append_log(root, today, "drift", "N checked, N fixed, N held, N renames followed")` and `git::commit_paths` with the pages stamped, fixed or followed and the Vocabulary page (`drift::commit_message`). `DriftRun` records `stamped`, `fixed`, `held`, `renamed`, `findings`, `waiting`, `commit` and `commit_error`; `Mismatch` keeps its `pin` and `branch`. Applying a held drift edit is its own commit (`ingest::accepted`, "drift: apply the held edit to …").
+  - One config (28): `DriftConfig::for_repo` reads `drift` in the knowledge base's `.ken/knowledge.json` (`controlMoved`, `controlClean`, `minPages`, `fetch`) through `knowledge_settings`; `DriftConfig::of` (project.json) is gone and an old `intervalDays` is ignored. Nothing else reads a drift config. The template's `knowledge.json` has `drift: {}` and a note.
+  - Lint (29), new module `lint`:
+    - On every scan of a knowledge base (`scan::after_scan`, also after a watcher scan that touched a page): broken links, missing pages (opening the first page that asks), ambiguous names and orphans (`lint::orphans`: a page nothing links to, not an index, START-HERE, `log.md`, the brief, the decisions log, a note, a ticket or a template). Filed and resolved by `findings::sync`, at most 50 a kind (`MAX_PER_KIND`).
+    - After an edit: an ingest (`finish_ingest`) and a drift run queue the pages they wrote (`queue_after_edit`); one Claude call compares them with their link neighbours, 12 pages at most (`after_edit_next`, `after_edit_done`); each contradiction is a `contradiction` finding from `lint`.
+    - Weekly (`weekly_due`, `weekly_next`, `weekly_done`): the binding and current pages, the decisions log left out, read together for contradictions and up to five `suggested-page` findings.
+    - Removed: `links::findings` and `links::Finding`.
+  - Rulings cited in code (30): `lint::unknown_rulings` reads the code files of the workspace's other repos (read-only indexes, `Db::code_texts_containing`) for comments citing an id in the log's own shape (its ids' prefixes, `git::cited_ids` per line, `code_citations`), and files the ones the log lacks as `unknown-ruling` findings (synced, so a fixed one resolves). Run after each drift run. The graph edges wait for slice 9. The generated Cited-in-Code page: confirmed nothing on the branch writes it; its name is gone from the chunker and db test fixtures (a comment keeps the measurement history).
+  - One findings list (29): `Finding` gains `subject` (the page, missing name, later ruling or code line) and `relation`; repeats fold by kind, page and target (`Finding::key`, `findings::file`); `findings::sync` for checks that own their kinds; `findings::ever`; `Finding::page` is the page to open. `team_findings` reads stored findings only (no sweep, no link report); `drift::findings` and `drift::Finding` are gone. The Inbox (`FINDING_KINDS`) and Team screen (`findingLabel`, `orderFindings`) name the new kinds; the dead draft and proposal kinds are gone from both.
+  - Supersession wired in (25):
+    - Markers on every scan (`supersede::store_marked`, every repo): the pairs each decisions log marks itself are stored, replacing the log's last ones, so search labels them outside any harness and a marker taken out leaves search too.
+    - The Claude pass on new entries only (`next_cluster`, `judged`): a cluster is asked about only when it holds an entry the pass has not read (kept in `Db::check_state("supersede_seen")`); one call per worker turn.
+    - Each pair is a `supersession` finding (later id as subject, earlier as target, the evidence quoted), not stored as a supersession; a pair the log marks, or one filed before, is not filed again.
+    - Confirm (Inbox, `confirm_finding`, `supersede::confirm`, `mark_in_log`) writes `supersedes:` (or `refines:`) on the later entry and `[SUPERSEDED BY D-nnn]` (or `[REFINED BY …]`) on the earlier, in every log form (plain and bold one-line entries, and `## D-nnn · date · topic`), as one commit of the log. Dismiss marks it done.
+    - Removed: `supersede::run`, `Report` and `Judge`.
+  - Every background Claude call (re-reads, both lints, the pass) goes through the CLI with no tools (`background_claude`), never the local model, behind `wait_for_extraction_slot` / `EXTRACT_PACING`, the hourly cap `summary::take_call` (now shared by every background call, 20 an hour) and `backgroundExtraction`. A refused or failed call backs the checks off ten minutes (`CHECKS_BACKOFF`).
+  - `Db::check_state` / `store_check_state` keep the checks' state in `meta` (`check:` keys). No schema change.
+  - Choices:
+    - A run writes its `log.md` line and commit only when it wrote a page; a run that changed nothing (or only filed findings) leaves no line (see Open for Chris).
+    - Ken does not fetch a code repo only to look for a move: it sees a move when the branch moves locally (a person's pull, any fetch), and every run fetches first, so the weekly run catches up.
+    - A page past the age rule is re-read by Claude like a real change, against the cited files as they are.
+    - The first time the pass sees a log, every entry is new to it, so the whole log is clustered once (at the shared hourly cap).
+    - `checked`'s commit is the head of the page's first cited repo (slice 3's one sha per page).
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
+  - Not run: any test, and the app. Nothing migrates. The first scan of a knowledge base after this files the scan lint's findings and stores its markers; the worker's first turn makes a drift run when one is due (a cited branch moved since the last sweep, or a week since it) and starts the supersession pass over the whole decisions log, one cluster per turn.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
@@ -186,33 +220,38 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 
 - **Mark as seen.** With the source claimed as its note is written, Seen only closes the card. Choose: keep it, or close a card by itself once nothing waits from it.
 
-## Next: slice 8, drift, lint and supersession (25, 28–30)
+- **A log line for a drift run that changed nothing.** Decision 2 says one `log.md` line per drift run; a run now writes its line (and commit) only when it stamped, fixed or followed a page, so a retry that changes nothing leaves no trace. Choose: keep that, or a line for every run (a commit each time too).
+
+- **Re-reading pages past the age rule.** A page not checked in 30 days is re-read by Claude like a real change, one call each, sharing the 20-an-hour cap with summaries. A knowledge base with hundreds of old pages takes days to catch up the first week. Choose: keep it, or file aged pages as findings and re-read only pages whose code moved.
+
+- **The supersession pass's first read.** The first time the pass sees a decisions log, every entry counts as new, so the whole log is clustered and asked about once (at the shared cap). Choose: keep it, or mark the existing entries read at first sight and judge only entries added from then on.
+
+- **Fetching code repos.** Ken sees a branch move when it moves locally (a person's pull, any fetch); every drift run fetches first, so at worst the weekly run catches up. Choose: keep it, or fetch each cited repo on a timer (say hourly) so an upstream merge starts a run within the hour.
+
+- **The `base` a repo entry names.** `.ken/knowledge.json` says `base` is the branch drift measures against, but drift measures against the remote's default branch (or the checkout's upstream, said so), as before. Choose: read `base` when set, or drop it from the template.
+
+## Next: slice 9, project graph and Timeline (21, 37)
 
 Nothing has been edited yet.
 
-- [ ] Drift on a default-branch move (28): for each source repo, keep the default branch's head the last run measured (`drift::default_branch`, after `fetch`). When Ken sees it move (a scan, a fetch), sweep that commit range only; `PinCache` already re-measures only the files a range touched. Replace the weekly schedule (`drift::due`, `DriftConfig.interval_days`, `DEFAULT_INTERVAL_DAYS`, the interval in `run_drift_if_due`) with the move, plus a weekly age rule (`AGE_DAYS`) for pages whose sources do not move.
-- [ ] What a run does with each page (28):
-  - Whitespace or comments only (`Severity::AutoRecleared`): the page's `checked:` advances silently (`pagemeta::Checked`, `checked: date sha`).
-  - A real change (`Judgment`): Claude, through the CLI and never the local model, re-reads the section citing the source against the diff, and either stamps `checked` or fixes it through the ingest edit rules (`ingest::edit_prompt`, `replace_section`, `stamp_updated`, `hold`; held edits as `page-proposal` items).
-  - A rename: followed (`moved`), the citation rewritten when certain, and a `vocab::add_rename` row when a name changed.
-  - A ruling whose cited code changed is never edited: it becomes a finding against the ruling. So does a source that is gone (`Severity::Finding`).
-- [ ] One commit and a `log.md` line per run (28, 36): `ingest::append_log(root, date, "drift", …)` and `git::commit_paths` with only the pages the run stamped or fixed; pages with a person's uncommitted work held (`git::uncommitted`).
-- [ ] One config (28): the drift settings move from `project.json` (`"drift"`, `DriftConfig::of`) into `.ken/knowledge.json` (`knowledge_settings`). Keep the optional controls (`control_moved`, `control_clean`, `min_pages`) and `fetch`; drop `interval_days`. Slice 3 removed the audience split; check nothing else reads a second config.
-- [ ] Lint on every scan (29): `links::report` finds broken links, missing pages and ambiguous names; add orphans (a page nothing links to, other than an index, START-HERE, `log.md`, a note or a ticket). File each as a finding (`findings::file`), one open finding per page and kind, resolved when the scan no longer finds it, in place of computing them in `team_findings`.
-- [ ] Lint after each edit (29): when an ingest or a drift run writes pages, one Claude call compares the touched pages and their link neighbours (`links::page_links`) for contradictions; each is a `contradiction` finding.
-- [ ] Weekly lint (29): binding and current pages (`authority::Tier::Binding`, `Tier::Current`) read for contradictions, plus missing-page suggestions, as findings.
-- [ ] One findings list (29): drift's mismatches (`drift::findings`), lint and ingest all through `findings`; `team_findings` reads stored findings only; the Inbox's `findingItem` kinds follow. Fold repeated findings (same kind, page and target) into one.
-- [ ] Supersession wired in (25): the markers (`supersede::marked` over `supersede::entries`) are read on every scan and stored (`Db::replace_supersessions`), so search labels them outside the eval harness. The Claude pass (`supersede::run` with a judge through `assistant::oneshot_answer`) runs on new log entries only, behind `EXTRACT_PACING` and `backgroundExtraction`. Each pair it finds is a finding; when a person confirms, Ken writes `supersedes:` on the later entry and `[SUPERSEDED BY D-nnn]` on the earlier, as one commit.
-- [ ] Rulings cited in code (30): a code comment citing a ruling id the log does not have is a finding (the `PREFIX-number` shape of `git::cited_ids`, kept to the log's prefix). The graph edges wait for slice 9. The generated Cited-in-Code page: nothing on this branch writes `decisions/Cited-in-Code.md` any more; only chunker and db tests name it as a fixture. Confirm and say so.
-- [ ] Tests to update or add: a run on a moved branch only, the silent stamp, a fixed section and a held one, a ruling becoming a finding, the run's commit on a temp repo, the config in `.ken/knowledge.json`, orphans, findings folded and resolved, markers read on a scan, and the pass on new entries only.
+- [ ] One graph per knowledge base, from exact sources only (21). Nodes: pages, decisions-log entries, tickets, notes, repos, code files and symbols, topics. Edges, each with its kind:
+  - page links (`page_links`, resolved by `links::Resolver`);
+  - `sources:` citations (`page_meta.sources`, `drift::classify`: a code file, a `[[Note]]`, a `D-nnn`);
+  - note → page changed (an ingest card's `pages`, and the `Changed from [[note]]` lines it writes);
+  - supersedes (`supersessions`, the markers stored on every scan since slice 8);
+  - imports and usages (`codeindex::related`, the code index's usages);
+  - code comments citing a ruling (`lint::code_citations`, kept as edges for the ids the log has);
+  - commits citing tickets or rulings (`git::commits_citing`, kept to ids the knowledge base has as a ticket or a log entry, so `UTF-8` drops out).
+  Built from the index on a scan, no model. Where it lives (the knowledge base's index or a new table set) is the slice's first choice.
+- [ ] Topic tags at write time only (21): ingest's plan and page prompts, and drift's re-read, ask Claude for a few topics for what they write; stored beside the graph, not in frontmatter (decision 5 has six keys). No other topic extraction.
+- [ ] Remove what decision 21 drops: the background local-model extraction (the `extractions` queue, `knowledge_model::process_next_pending_for`, the local path of `extraction_worker`, `LOCAL_GENERATION`'s per-file use), the Claude map build (`map_by_claude`, `start_knowledge_build`, `refresh_knowledge_model`, `AutoBuildTracker`), the federation (`federation.rs`, `workspace_kg_db.rs`, the `workspace_kg_*` commands, `federated_kg_enabled`), and person-centred entities (`entities`, `entity_edges`, `events` read models), with their tests, `api.ts` wrappers and stores (`knowledge.svelte.ts`). Keep the worker's summaries and checks turns.
+- [ ] Expose it as `related` (21): `graph::related(node)` returns neighbours by edge kind, nearest first. An app command for the chat card and Files; the MCP `related_files` answers from it (slice 10 renames the tools); `kg_search` goes with the entity model.
+- [ ] Remove the Map and Explore (37): `MapScreen.svelte`, `ExploreScreen.svelte`, `EntityWikiPanel.svelte`, their Shell entries and routes, `knowledge_model` and its DTO.
+- [ ] The Timeline becomes the raid log (37): one chronological, timestamped list of every ingest (`log.md` lines), ruling (decisions-log entries), ticket change (ticket `updated` and status), commit (the knowledge base's git log), finding (filed and resolved) and release (tags), each linked to its source. `TimelineScreen.svelte` reads it in place of the `events` model.
+- [ ] Tests to update or add: each edge kind from a small knowledge base and code repo, commit edges kept to known ids, `related` ordering, topic tags stored from a write, the raid log's order and links, and nothing left reading the removed tables.
 
 ## Later slices
 
-- [ ] **9, project graph and Timeline (21, 37):**
-  - Graph edges from exact sources only, plus topic tags at write time.
-  - Expose it as `related`.
-  - Remove the Map and Explore.
-  - The Timeline becomes the raid log.
 - [ ] **10, MCP tools (22):**
   - The tools: `search`, `read`, `related`, `code_definition`, `code_usages`, `code_outline`, `code_imports`, `history`, `tickets`, `propose_decision`, `add_source`, `repos`.
   - Server `instructions` from the brief (1).
