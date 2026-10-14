@@ -2264,9 +2264,9 @@ fn page_note(p: &ken_core::pagemeta::HitPage, labelled: bool) -> Option<String> 
         return p.generated.then(|| "generated: fix the generator, not the page".to_string());
     }
     if p.retired {
-        return Some(match p.replaced_by.is_empty() {
+        return Some(match p.superseded_by.is_empty() {
             true => "superseded".to_string(),
-            false => format!("superseded, see {}", p.replaced_by.join(", ")),
+            false => format!("superseded, see {}", p.superseded_by.join(", ")),
         });
     }
     if p.generated {

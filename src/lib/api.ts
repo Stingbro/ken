@@ -1121,12 +1121,12 @@ export interface HitPage {
   checked: string | null;
   /** For Research: the date the evidence is from. */
   dated: string | null;
-  /** `status: superseded`, or an older page's `replaced_by`. */
+  /** `status: superseded`, or a page that names its successor. */
   retired: boolean;
   /** Legacy, read only: an older page's `generated` key. */
   generated: boolean;
-  /** Legacy, read only: what an older retired page names as its successor. */
-  replacedBy: string[];
+  /** What a retired page names as its successor: `superseded_by`, or an older page's `replaced_by`. */
+  supersededBy: string[];
 }
 
 /** `building`: searched by keyword while its meaning index is built.

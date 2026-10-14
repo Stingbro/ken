@@ -302,7 +302,7 @@ pub fn place(root: &Path, raw: &str, date: &str, kind: SourceKind) -> Placement 
 
 /// The kind a note's folder says (`…/Ingested/Meetings/2026-09/…` is a
 /// meeting): how a written note's kind is read, so the note carries no
-/// `kind:` key of its own (decision 5's six keys).
+/// `kind:` key of its own (decision 5's keys).
 pub fn kind_at(note_path: &str) -> Option<SourceKind> {
     let rest = note_path.strip_prefix(INGESTED)?.strip_prefix('/')?;
     let folder = rest.split('/').next()?;
@@ -1073,14 +1073,26 @@ fn page_list(db: &Db) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// The plan: which pages the note changes, which new pages it calls for, its
-/// rulings written up for the decisions log, and the renames it tells of.
+/// The plan: which pages the note changes, which new pages it calls for,
+/// which pages it retires, its rulings written up for the decisions log, and
+/// the renames it tells of.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Plan {
     pub update: Vec<PageChange>,
     pub create: Vec<NewPage>,
+    pub retire: Vec<Retire>,
     pub rulings: Vec<RulingDraft>,
     pub renames: Vec<Rename>,
+}
+
+/// A page the note makes untrue as a whole, and the page that replaces it
+/// (decision 7), a path or a `[[link]]`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct Retire {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub by: String,
 }
 
 /// A name the note says changed, for the Vocabulary page's Renames table
@@ -1162,6 +1174,8 @@ struct RawPlan {
     #[serde(default)]
     create: Vec<NewPage>,
     #[serde(default)]
+    retire: Vec<Retire>,
+    #[serde(default)]
     rulings: Vec<RulingDraft>,
     #[serde(default)]
     renames: Vec<Rename>,
@@ -1179,6 +1193,8 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str) -> Str
            What is now true about the project changes its page in Current.\n\
          - create: new pages it calls for, a topic nothing covers yet, in the section it belongs to (Current, Design, \
            Reference, Reference/Platform, Rules).\n\
+         - retire: existing pages the note makes untrue as a whole, each with the page that replaces it in `by` (a \
+           page from the list or one you create). A page that is partly wrong is an update; most notes retire none.\n\
          - rulings: each ruling under the note's Rulings, written up for the decisions log: the ruling in one sentence, \
            a topic of two or three words, why it was made in one line (from the note), the words it was made in, who \
            made it when the note says, a few aliases (other words anyone might search for it by), and the ids of the \
@@ -1186,7 +1202,7 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str) -> Str
          - renames: each thing the note says now goes by another name, old and new, for the Vocabulary page.\n\n\
          At most 10 updates and 10 new pages. Reply with JSON only: {\"update\": [{\"path\": \"path\", \"change\": \
          \"what changes, in one line\", \"against\": \"\"}, …], \"create\": [{\"path\": \"Section/Name.md\", \"purpose\": \
-         \"what the page is for\"}, …], \"rulings\": [{\"ruling\": \"…\", \"topic\": \"…\", \"why\": \"…\", \"quote\": \"…\", \
+         \"what the page is for\"}, …], \"retire\": [{\"path\": \"path\", \"by\": \"path\"}, …], \"rulings\": [{\"ruling\": \"…\", \"topic\": \"…\", \"why\": \"…\", \"quote\": \"…\", \
          \"who\": \"…\", \"aliases\": [\"…\"], \"supersedes\": [\"D-nnn\"]}, …], \"renames\": [{\"old\": \"…\", \"new\": \"…\"}, …]}.\n\n\
          PAGES IN THE KNOWLEDGE BASE:\n",
     );
@@ -1225,11 +1241,20 @@ pub fn read_plan(reply: &str, pages: &[(String, String)], root: &Path) -> Plan {
     create.retain(|n| may_propose(&n.path) && !root.join(&n.path).exists());
     create.dedup_by(|a, b| a.path == b.path);
     create.truncate(MAX_NEW);
+    let mut retire: Vec<Retire> = Vec::new();
+    for r in raw.retire {
+        let known = pages.iter().any(|(q, _)| *q == r.path);
+        let by = r.by.trim().to_string();
+        if known && !by.is_empty() && by != r.path && !retire.iter().any(|x| x.path == r.path) {
+            retire.push(Retire { by, ..r });
+        }
+    }
+    retire.truncate(MAX_UPDATES);
     let rulings = raw.rulings.into_iter().filter(|r| !r.ruling.trim().is_empty()).collect();
     let mut renames = raw.renames;
     renames.retain(|r| !r.old.trim().is_empty() && !r.new.trim().is_empty());
     renames.truncate(MAX_NEW);
-    Plan { update, create, rulings, renames }
+    Plan { update, create, retire, rulings, renames }
 }
 
 /// The prompt for one page edit from a note: the section that holds the
@@ -1821,8 +1846,9 @@ pub fn page_prompt(page: &str, purpose: &str, note_stem: &str, note: &str, blank
 }
 
 /// The reply as a new page: fences stripped, `status: draft` set, and any
-/// `checked:` or `reviewed_by:` line dropped (and the older `verified:`):
-/// a draft has been neither checked nor reviewed.
+/// `checked:`, `reviewed_by:` or `superseded_by:` line dropped (and the
+/// older `verified:` and `replaced_by:`): a draft has been neither checked
+/// nor reviewed, and nothing replaces it yet.
 pub fn finish_page(reply: &str) -> Result<String> {
     let t = strip_fences(reply);
     if !t.starts_with("---") {
@@ -1845,7 +1871,7 @@ pub fn finish_page(reply: &str) -> Result<String> {
             out.push_str("---\n");
             continue;
         }
-        if in_fm && ["checked:", "reviewed_by:", "verified:"].iter().any(|k| trimmed.starts_with(k)) {
+        if in_fm && ["checked:", "reviewed_by:", "verified:", "superseded_by:", "replaced_by:"].iter().any(|k| trimmed.starts_with(k)) {
             continue;
         }
         if in_fm && trimmed.starts_with("status:") {
@@ -2146,6 +2172,42 @@ pub fn follow_ups(
                 let body = format!("Held from {stem}: {}. Read the page and apply it, or discard it.", why.reason());
                 file_page_proposal(db, &p, &format!("Held: {} from {stem}", new.path), &body, now)?;
                 out.held.push(new.path.clone());
+            }
+        }
+    }
+
+    // A retired page keeps its text and names its successor (decision 7):
+    // `status: superseded` and `superseded_by:`, written at once unless it is
+    // a Rules page or holds a person's work. A page this run already edited,
+    // or a successor path that is not there, is left as it is.
+    for r in &plan.retire {
+        let page = &r.path;
+        let successor = crate::pagemeta::successor_name(&r.by);
+        let linked = r.by.starts_with("[[");
+        if out.pages.iter().any(|p| &p.path == page) || out.held.contains(page) || (!linked && !root.join(&successor).is_file()) {
+            continue;
+        }
+        let Ok(base) = fs::read_to_string(root.join(page)) else { continue };
+        let proposed = stamp_updated(&crate::pagemeta::retire(&base, &r.by), date);
+        let label = format!("retired, superseded by {successor}");
+        let held = if is_method_page(page) {
+            Some(Held::Rules)
+        } else if out.dirty.contains(page) {
+            Some(Held::Uncommitted)
+        } else {
+            None
+        };
+        match held {
+            None => {
+                write_file(&root.join(page), &proposed)?;
+                out.pages.push(PageWritten { path: page.clone(), label, new: false });
+                out.touched.push(page.clone());
+            }
+            Some(why) => {
+                let p = Proposal { from: from.clone(), ..Proposal::new(page.clone(), base, proposed) };
+                let body = format!("Held from {stem}: {}. It retires the page, {label}. Apply it, or discard it.", why.reason());
+                file_page_proposal(db, &p, &format!("Held: retire {page} from {stem}"), &body, now)?;
+                out.held.push(page.clone());
             }
         }
     }
@@ -2660,6 +2722,13 @@ mod tests {
         );
         assert_eq!(plan.rulings.len(), 1);
         assert_eq!(plan.rulings[0].aliases, vec!["region save", "world file"], "a list written as one string");
+        let retire = "{\"retire\": [{\"path\": \"Design/Card.md\", \"by\": \" Design/New.md \"}, {\"path\": \"Design/Card.md\", \"by\": \"x.md\"}, \
+                      {\"path\": \"Nope/Missing.md\", \"by\": \"Design/New.md\"}, {\"path\": \"Current/Project.md\", \"by\": \"\"}]}";
+        assert_eq!(
+            read_plan(retire, &pages, d.path()).retire,
+            vec![Retire { path: "Design/Card.md".into(), by: "Design/New.md".into() }],
+            "a real page, once, with a successor"
+        );
         assert_eq!(read_plan("no json here", &pages, d.path()), Plan::default());
         let many: Vec<String> = (0..14).map(|i| format!("{{\"path\": \"Design/P{i}.md\"}}")).collect();
         assert_eq!(read_plan(&format!("{{\"create\": [{}]}}", many.join(",")), &pages, d.path()).create.len(), MAX_NEW);
@@ -2910,6 +2979,27 @@ mod tests {
         ] {
             assert!(msg.contains(part), "{part}: {msg}");
         }
+    }
+
+    #[test]
+    fn a_retired_page_names_its_successor() {
+        let mut r = run();
+        let plan = "{\"retire\": [{\"path\": \"Design/Card.md\", \"by\": \"Design/Save.md\"}, {\"path\": \"Rules/Sizes.md\", \"by\": \"[[Save]]\"}, \
+                    {\"path\": \"Current/Project.md\", \"by\": \"Design/Gone.md\"}]}";
+        let model = |p: &str| -> Result<String> { Ok(if p.contains("PAGES IN THE KNOWLEDGE BASE") { plan.to_string() } else { "NO CHANGE".into() }) };
+        let done = follow_ups(&r.root, &mut r.db, &r.placement, NOTE, "", "2026-09-24", 9, model).unwrap();
+
+        // Written at once, its text kept.
+        let card = fs::read_to_string(r.root.join("Design/Card.md")).unwrap();
+        assert_eq!(card, "---\ntitle: Card\nstatus: superseded\nsuperseded_by: Design/Save.md\nupdated: 2026-09-24\n---\nThe card shows a name.\n");
+        assert_eq!(done.pages, vec![PageWritten { path: "Design/Card.md".into(), label: "retired, superseded by Design/Save.md".into(), new: false }]);
+        assert!(done.touched.contains(&"Design/Card.md".to_string()));
+
+        // A Rules page is held; a successor that is not there retires nothing.
+        assert_eq!(done.held, vec!["Rules/Sizes.md"]);
+        let held = waiting_from(&r).into_iter().find(|p| p.page == "Rules/Sizes.md").unwrap();
+        assert!(held.proposed.contains("status: superseded\nsuperseded_by: \"[[Save]]\"\n"), "{}", held.proposed);
+        assert_eq!(fs::read_to_string(r.root.join("Current/Project.md")).unwrap(), PROJECT);
     }
 
     #[test]

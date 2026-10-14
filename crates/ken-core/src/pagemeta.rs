@@ -3,12 +3,14 @@
 //! first, Research is dated evidence, and a superseded page is labelled and
 //! ranked last (knowledge-core decisions 5, 7 and 23).
 //!
-//! A page has six keys (decision 5): `title`, `aliases`, `status` (draft,
-//! current or superseded), `updated`, `sources` (each `repo@sha:path` or
-//! `[[Note]]`) and `checked` (the date and commit of the check that last
-//! re-read the page), plus an optional `reviewed_by`. Two older keys are
-//! still read, never written: `replaced_by` (or `superseded_by`) and
-//! `generated`, so pages written before keep their rank and label.
+//! A page has seven keys (decisions 5 and 7): `title`, `aliases`, `status`
+//! (draft, current or superseded), `updated`, `sources` (each
+//! `repo@sha:path` or `[[Note]]`), `checked` (the date and commit of the
+//! check that last re-read the page) and, on a retired page,
+//! `superseded_by` (the page that replaces it), plus an optional
+//! `reviewed_by`. Two older keys are still read, never written:
+//! `replaced_by`, read as `superseded_by`, and `generated`, so pages written
+//! before keep their rank and label.
 //!
 //! The parser is deliberately small and tolerant, not YAML: pages copied
 //! from the templates carry `{{date}}` placeholders and trailing `#`
@@ -38,10 +40,10 @@ pub struct PageMeta {
     pub checked: Option<Checked>,
     /// Who reviewed the page, when a person did.
     pub reviewed_by: Option<String>,
-    /// Legacy, read only: the pages that replace a retired one
-    /// (`replaced_by` or `superseded_by`). Ken never writes it; a page is
-    /// retired with `status: superseded`.
-    pub replaced_by: Vec<String>,
+    /// The pages that replace a retired one, each a path or a `[[link]]`:
+    /// `superseded_by`, or an older page's `replaced_by`. Written beside
+    /// `status: superseded` when a page is retired ([`retire`]).
+    pub superseded_by: Vec<String>,
     /// Legacy, read only: built by a generator (a `generated` key, or
     /// `status: generated`).
     pub generated: bool,
@@ -82,12 +84,61 @@ impl fmt::Display for Checked {
 
 impl PageMeta {
     /// No longer true: `status: superseded` (or an older `retired` or
-    /// `deprecated`), or a legacy `replaced_by`. Kept as evidence and ranked
-    /// last.
+    /// `deprecated`), or a page that names its successor. Kept as evidence
+    /// and ranked last.
     pub fn retired(&self) -> bool {
         matches!(self.status.as_deref(), Some("superseded" | "retired" | "deprecated"))
-            || !self.replaced_by.is_empty()
+            || !self.superseded_by.is_empty()
     }
+}
+
+/// A successor as a hit's label names it: `[[Design/New|the new design]]`
+/// is `Design/New`; a path stays as written.
+pub fn successor_name(s: &str) -> String {
+    let s = s.trim();
+    let inner = s.strip_prefix("[[").and_then(|t| t.strip_suffix("]]")).unwrap_or(s);
+    inner.split('|').next().unwrap_or(inner).trim().to_string()
+}
+
+/// `text` retired in favour of `successor` (a path or a `[[link]]`):
+/// `status: superseded` and `superseded_by:` set in its frontmatter, the
+/// lines they replace (an older `replaced_by` too) dropped. A page with no
+/// frontmatter gets one. The page's line endings are kept.
+pub fn retire(text: &str, successor: &str) -> String {
+    let crlf = text.contains("\r\n");
+    let successor = successor.trim();
+    let written = if successor.starts_with("[[") { format!("\"{successor}\"") } else { successor.to_string() };
+    let body = text.replace("\r\n", "\n");
+    let lines: Vec<&str> = body.lines().collect();
+    let close = (lines.first().map(|l| l.trim_end()) == Some("---"))
+        .then(|| lines.iter().skip(1).position(|l| l.trim_end() == "---").map(|p| p + 1))
+        .flatten();
+    let stamp = ["status: superseded".to_string(), format!("superseded_by: {written}")];
+    let mut out: Vec<String> = vec!["---".into()];
+    match close {
+        Some(close) => {
+            // A key's block list goes with it.
+            let mut dropping = false;
+            for l in &lines[1..close] {
+                if !l.starts_with([' ', '\t', '-']) {
+                    let key = l.split_once(':').map(|(k, _)| k.trim().to_ascii_lowercase());
+                    dropping = matches!(key.as_deref(), Some("status" | "superseded_by" | "replaced_by"));
+                }
+                if !dropping {
+                    out.push(l.to_string());
+                }
+            }
+            out.extend(stamp);
+            out.extend(lines[close..].iter().map(|l| l.to_string()));
+        }
+        None => {
+            out.extend(stamp);
+            out.push("---".into());
+            out.extend(lines.iter().map(|l| l.to_string()));
+        }
+    }
+    let text = out.join("\n") + "\n";
+    if crlf { text.replace('\n', "\r\n") } else { text }
 }
 
 /// Read the frontmatter at the top of `text`, if it has any. Accepts LF and
@@ -156,7 +207,7 @@ pub fn parse(text: &str) -> Option<PageMeta> {
             "generated" | "generated_by" | "generator" => {
                 meta.generated = !matches!(v.to_ascii_lowercase().as_str(), "false" | "no");
             }
-            "aliases" | "sources" | "replaced_by" | "superseded_by" => push_list(&mut meta, &key, v),
+            "aliases" | "sources" | "superseded_by" | "replaced_by" => push_list(&mut meta, &key, v),
             _ => {}
         }
     }
@@ -167,7 +218,7 @@ fn push_list(meta: &mut PageMeta, key: &str, v: String) {
     match key {
         "aliases" => meta.aliases.push(v),
         "sources" => meta.sources.push(v),
-        "replaced_by" | "superseded_by" => meta.replaced_by.push(v),
+        "superseded_by" | "replaced_by" => meta.superseded_by.push(v),
         // A list of reviewers reads as one line.
         "reviewed_by" => {
             meta.reviewed_by = Some(match meta.reviewed_by.take() {
@@ -311,8 +362,8 @@ pub struct HitPage {
     pub retired: bool,
     /// Legacy: built by a generator.
     pub generated: bool,
-    /// Legacy: what replaces a retired page, when it says.
-    pub replaced_by: Vec<String>,
+    /// What replaces a retired page, when it says (`superseded_by`).
+    pub superseded_by: Vec<String>,
 }
 
 /// The page facts for a hit on `rel_path`, or None when it is not a
@@ -335,7 +386,7 @@ pub fn hit_page(rel_path: &str, meta: Option<PageMeta>) -> Option<HitPage> {
         title: meta.title,
         checked,
         dated,
-        replaced_by: meta.replaced_by,
+        superseded_by: meta.superseded_by,
     })
 }
 
@@ -382,12 +433,29 @@ mod tests {
         assert!(parse("---\nstatus: deprecated\n---\n").unwrap().retired(), "an older value");
         assert!(!parse("---\nstatus: draft\n---\n").unwrap().retired());
         let retired = parse("---\nstatus: superseded\nreplaced_by: [\"[[Rules]]\"]\n---\n").unwrap();
-        assert_eq!(retired.replaced_by, vec!["[[Rules]]"]);
+        assert_eq!(retired.superseded_by, vec!["[[Rules]]"], "the older key reads as superseded_by");
+        let named = parse("---\nstatus: superseded\nsuperseded_by: Design/New.md\n---\n").unwrap();
+        assert_eq!(named.superseded_by, vec!["Design/New.md"]);
         assert!(parse("---\nsuperseded_by: \"[[New]]\"\n---\n").unwrap().retired());
         assert!(parse("---\ngenerated: tools/gen.py --all @ abc1234\n---\n").unwrap().generated);
         assert!(parse("---\nstatus: generated\n---\n").unwrap().generated);
         assert!(!parse("---\ngenerated: false\n---\n").unwrap().generated);
         assert_eq!(parse("---\nreviewed_by: [Ana, Ben]\n---\n").unwrap().reviewed_by.as_deref(), Some("Ana, Ben"));
+    }
+
+    #[test]
+    fn retiring_a_page_names_its_successor() {
+        let page = "---\ntitle: Old design\nstatus: current\nreplaced_by:\n  - \"[[Older]]\"\nupdated: 2026-07-21\n---\n\n# Old design\n";
+        let out = retire(page, "Design/New.md");
+        assert_eq!(out, "---\ntitle: Old design\nupdated: 2026-07-21\nstatus: superseded\nsuperseded_by: Design/New.md\n---\n\n# Old design\n");
+        let m = parse(&out).unwrap();
+        assert!(m.retired());
+        assert_eq!(m.superseded_by, vec!["Design/New.md"]);
+        let linked = retire("# Bare\r\n", "[[New]]");
+        assert_eq!(linked, "---\r\nstatus: superseded\r\nsuperseded_by: \"[[New]]\"\r\n---\r\n# Bare\r\n");
+        assert_eq!(parse(&linked).unwrap().superseded_by, vec!["[[New]]"]);
+        assert_eq!(successor_name("[[Design/New|the new one]]"), "Design/New");
+        assert_eq!(successor_name("Design/new.md"), "Design/new.md");
     }
 
     #[test]
@@ -419,10 +487,10 @@ mod tests {
     fn a_hit_page_dates_research_and_names_what_replaces_a_retired_page() {
         let research = hit_page("Research/Ingested/Standup - 2026-09-12.md", None).unwrap();
         assert_eq!((research.section, research.dated.as_deref()), (Some("Research"), Some("2026-09-12")));
-        let meta = PageMeta { status: Some("superseded".into()), replaced_by: vec!["[[Rules]]".into()], ..Default::default() };
+        let meta = PageMeta { status: Some("superseded".into()), superseded_by: vec!["[[Rules]]".into()], ..Default::default() };
         let old = hit_page("Ways-of-Working/Old.md", Some(meta)).unwrap();
         assert!(old.retired);
-        assert_eq!(old.replaced_by, vec!["[[Rules]]"]);
+        assert_eq!(old.superseded_by, vec!["[[Rules]]"]);
         assert_eq!(old.dated, None, "only Research is stamped");
         let checked = PageMeta { checked: Checked::parse("2026-09-20 f00218c"), ..Default::default() };
         assert_eq!(hit_page("Design/Why.md", Some(checked)).unwrap().checked.as_deref(), Some("2026-09-20"));

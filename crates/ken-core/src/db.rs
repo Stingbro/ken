@@ -2527,6 +2527,8 @@ impl Db {
         Ok(())
     }
 
+    /// The page's successor (`superseded_by`) is kept in the `replaced_by`
+    /// column, the name v22 gave it, so no index is made again for it.
     fn write_page_meta(&self, rel_path: &str, meta: Option<&crate::pagemeta::PageMeta>) -> Result<()> {
         let Some(m) = meta else {
             self.conn.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
@@ -2548,7 +2550,7 @@ impl Db {
                 json(&m.sources),
                 m.checked.as_ref().map(|c| c.to_string()),
                 m.reviewed_by,
-                json(&m.replaced_by),
+                json(&m.superseded_by),
                 m.generated as i64
             ],
         )?;
@@ -3197,7 +3199,7 @@ impl Db {
                         sources: list(r.get(4)?),
                         checked: r.get::<_, Option<String>>(5)?.as_deref().and_then(crate::pagemeta::Checked::parse),
                         reviewed_by: r.get(6)?,
-                        replaced_by: list(r.get(7)?),
+                        superseded_by: list(r.get(7)?),
                         generated: r.get::<_, i64>(8)? != 0,
                     })
                 },

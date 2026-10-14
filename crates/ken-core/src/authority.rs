@@ -314,6 +314,11 @@ pub fn label_of(rel_path: &str, meta: Option<&PageMeta>, stored: Option<(&str, f
         .or_else(|| matches!(tier, Tier::Record | Tier::Superseded).then(|| crate::pagemeta::date_in_name(rel_path)).flatten());
     let mut parts = vec![kind.to_string(), tier.name().to_string()];
     parts.extend(date);
+    // A retired page names its successor (decision 7).
+    if !meta.superseded_by.is_empty() {
+        let names: Vec<String> = meta.superseded_by.iter().map(|s| crate::pagemeta::successor_name(s)).collect();
+        parts.push(format!("superseded by {}", names.join(", ")));
+    }
     parts.join(" · ")
 }
 
@@ -451,6 +456,11 @@ mod tests {
         assert_eq!(label_of("log/RULINGS.md", None, Some(("rule", W_BINDING)), Some(entry)), "decision D-410 · binding · 2026-10-06", "a log by its entries, the older tier name");
         let cancelled = page(Some("cancelled"), Some("2026-07-21"));
         assert_eq!(label_of("tickets/SR-121.md", Some(&cancelled), Some(("superseded", -W_SUPERSEDED)), None), "ticket · superseded · 2026-07-21");
+        let superseded = Some(("superseded", -W_SUPERSEDED));
+        let retired = PageMeta { superseded_by: vec!["Design/new.md".into()], ..page(Some("superseded"), Some("2026-07-21")) };
+        assert_eq!(label_of("Design/old.md", Some(&retired), superseded, None), "doc · superseded · 2026-07-21 · superseded by Design/new.md");
+        let older = crate::pagemeta::parse("---\nstatus: superseded\nreplaced_by: \"[[Design/new]]\"\nupdated: 2026-07-21\n---\n").unwrap();
+        assert_eq!(label_of("Design/old.md", Some(&older), superseded, None), "doc · superseded · 2026-07-21 · superseded by Design/new", "the older key");
         let current = page(Some("current"), Some("2026-10-07"));
         assert_eq!(label_of("Current/Project.md", Some(&current), Some(("current", W_CURRENT)), None), "doc · current · 2026-10-07");
         assert_eq!(label_of("Rules/Lifecycle.md", None, binding, Some("Docs lanes push main.")), "doc · binding");

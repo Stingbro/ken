@@ -36,7 +36,7 @@ A source dropped in `Research/Ingestion/Raw/` becomes a dated note in `Ingested/
 ## Keeping It True
 
 - A page lists what its claims rest on under `sources:`, each with the commit it was read at.
-- A page that is no longer true is retired, not deleted: `status: superseded` and a banner naming the page that replaces it. Move anything true that exists nowhere else first.
+- A page that is no longer true is retired, not deleted: `status: superseded` and `superseded_by:` naming the page that replaces it (a path or a `[[link]]`). Move anything true that exists nowhere else first.
 - A move rewrites the links to the page in the same change.
 - A quoted number carries the date it was measured.
 - {{a trap that costs time on this team, and the page that holds it}}
