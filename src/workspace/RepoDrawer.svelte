@@ -335,33 +335,38 @@
             Ken fetches others' changes when you come back to it, and commits and pushes only what it wrote here
             soon after. When two people change one file, the banner at the top of Files opens both versions.
           </p>
-          {#if sync.others.length > 0}
-            <div class="row">
-              <span class="small">
-                {sync.others.length === 1 ? "1 file" : `${sync.others.length} files`} changed outside Ken. Sync leaves
-                them to you.
-              </span>
-              {#if !showingOthers}
-                <button class="btn btn-small push" onclick={() => (showingOthers = true)}>Commit my other changes…</button>
-              {/if}
-            </div>
-            {#if showingOthers}
-              <ul class="others mono small">
-                {#each sync.others as path (path)}
-                  <li>{path}</li>
-                {/each}
-              </ul>
-              <div class="row">
-                <span class="note">One commit of exactly these files, its message naming each. Sync then pushes it.</span>
-                <button class="btn btn-small" onclick={() => (showingOthers = false)} disabled={committingOthers}>Cancel</button>
-                <button class="btn btn-small btn-primary" onclick={() => void commitOthers()} disabled={committingOthers}>
-                  {committingOthers ? "Committing…" : `Commit ${sync.others.length === 1 ? "this file" : `these ${sync.others.length}`}`}
-                </button>
-              </div>
-            {/if}
-          {/if}
         {:else}
           <p class="note">No remote, so Ken keeps everything on this computer.</p>
+        {/if}
+        <!-- Offered with or without a remote (finding 17): a knowledge base
+             kept on this computer has a person's own changes too. The list
+             is empty in a code or reference repo, where Ken never commits. -->
+        {#if sync.others.length > 0}
+          <div class="row">
+            <span class="small">
+              {sync.others.length === 1 ? "1 file" : `${sync.others.length} files`} changed outside Ken. Ken leaves
+              them to you.
+            </span>
+            {#if !showingOthers}
+              <button class="btn btn-small push" onclick={() => (showingOthers = true)}>Commit my other changes…</button>
+            {/if}
+          </div>
+          {#if showingOthers}
+            <ul class="others mono small">
+              {#each sync.others as path (path)}
+                <li>{path}</li>
+              {/each}
+            </ul>
+            <div class="row">
+              <span class="note">
+                One commit of exactly these files, its message naming each.{sync.remote ? " Sync then pushes it." : ""}
+              </span>
+              <button class="btn btn-small" onclick={() => (showingOthers = false)} disabled={committingOthers}>Cancel</button>
+              <button class="btn btn-small btn-primary" onclick={() => void commitOthers()} disabled={committingOthers}>
+                {committingOthers ? "Committing…" : `Commit ${sync.others.length === 1 ? "this file" : `these ${sync.others.length}`}`}
+              </button>
+            </div>
+          {/if}
         {/if}
       {:else}
         <div class="row"><span class="chip mono">shared drive</span></div>

@@ -6027,8 +6027,9 @@ fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
 /// "Commit my other changes" (Chris, 2026-10-14): commit exactly the files
 /// a person was shown as changed outside Ken in the knowledge base
 /// (`sync::commit_others`), with a message naming each, then sync so the
-/// commit is pushed with the rest. Refused in a code or reference repo
-/// (decision 36). Returns the commit, when one was made.
+/// commit is pushed with the rest. Offered with or without a remote; with
+/// none, the commit stays on this computer. Refused in a code or reference
+/// repo (decision 36). Returns the commit, when one was made.
 #[tauri::command(async)]
 fn sync_commit_others(state: State<SharedState>, paths: Vec<String>) -> CmdResult<Option<String>> {
     let root = {
