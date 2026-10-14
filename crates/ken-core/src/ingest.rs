@@ -335,6 +335,8 @@ pub fn present_of(note: &str) -> Vec<String> {
             let t = l.trim();
             t.get(..8).filter(|k| k.eq_ignore_ascii_case("present:")).map(|_| t[8..].trim().trim_end_matches('.').to_string())
         })
+        // The placeholder is read whole: it holds a comma of its own.
+        .filter(|v| !v.contains("{{"))
         .map(|v| {
             v.trim_matches(|c| c == '[' || c == ']')
                 .split(',')
