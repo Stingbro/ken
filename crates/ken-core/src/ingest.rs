@@ -2430,6 +2430,42 @@ pub fn accepted(root: &Path, p: &crate::proposal::Proposal) -> std::result::Resu
     crate::git::commit_paths(root, &paths, &message)
 }
 
+/// The note a waiting item came from: a held edit's, ruling's or ticket's
+/// `from`, or the `source` of a finding an ingest filed (a contradiction or
+/// an open question). None for anything else.
+pub fn note_of(it: &crate::db::ReviewItemRow) -> Option<String> {
+    let payload = it.payload.as_deref()?;
+    let note = if it.kind == crate::proposal::PROPOSAL_KIND {
+        serde_json::from_str::<crate::proposal::Proposal>(payload).ok()?.from?
+    } else if it.kind == crate::findings::KIND {
+        serde_json::from_str::<crate::findings::Finding>(payload).ok()?.source
+    } else {
+        return None;
+    };
+    crate::chunker::is_markdown(&note).then_some(note)
+}
+
+/// Close the ingest card of `note` once nothing waits from it (Chris,
+/// 2026-10-14): every held edit, ruling and ticket from the note applied or
+/// discarded, and every finding it filed resolved or dismissed. Called after
+/// a person settles one of them; Seen stays as the manual close. A source an
+/// older card still holds in Raw moves beside its note first, as Seen does.
+/// Returns the card's id when it closed.
+pub fn close_if_settled(root: &Path, db: &mut Db, note: &str, now: i64) -> Result<Option<i64>> {
+    let open = db.list_open_review_items()?;
+    if open.iter().any(|it| note_of(it).as_deref() == Some(note)) {
+        return Ok(None);
+    }
+    let Some(item) = open.iter().find(|it| it.kind == REVIEW_KIND && it.source_ref == note) else { return Ok(None) };
+    if let Some(card) = card_of(item.payload.as_deref()) {
+        if root.join(&card.placement.raw).is_file() {
+            claim(root, &card.placement)?;
+        }
+    }
+    db.resolve_review_item(item.id, now)?;
+    Ok(Some(item.id))
+}
+
 /// Change the card of the ingest whose note is `note`, and store it.
 fn record(db: &mut Db, note: &str, change: impl FnOnce(&mut Card)) -> Result<()> {
     let Some(item) = db.review_items_of_kind(REVIEW_KIND, 500)?.into_iter().find(|it| it.source_ref == note) else { return Ok(()) };
@@ -2615,6 +2651,44 @@ mod tests {
         db.insert_review_item(REVIEW_KIND, "Ingested", "", "n.md", Some(&serde_json::to_string(&card).unwrap()), 1).unwrap();
         assert_eq!(in_review(d.path(), &db).unwrap(), vec![raw]);
         assert!(waiting_new(d.path(), &db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_card_closes_by_itself_once_nothing_waits_from_it() {
+        let d = library();
+        let root = d.path();
+        let mut db = Db::open_in_memory().unwrap();
+        let note = format!("{INGESTED}/Meetings/2026-10/2026-10-14-standup.md");
+        let card = Card {
+            placement: Placement { raw: format!("{RAW}/gone.txt"), note: note.clone(), source: "s".into() },
+            pages: Vec::new(),
+            commit: None,
+            commit_error: None,
+        };
+        let card_id = db.insert_review_item(REVIEW_KIND, "Ingested", "", &note, Some(&serde_json::to_string(&card).unwrap()), 1).unwrap();
+        let held = crate::proposal::Proposal { from: Some(note.clone()), ..crate::proposal::Proposal::new("Design/Card.md", "a", "b") };
+        crate::proposal::file_page_proposal(&mut db, &held, "Held", "", 1).unwrap();
+        let other = crate::proposal::Proposal { from: Some("Research/other.md".into()), ..crate::proposal::Proposal::new("Design/Save.md", "a", "b") };
+        crate::proposal::file_page_proposal(&mut db, &other, "Held", "", 1).unwrap();
+        let question = crate::findings::Finding { kind: "question".into(), source: note.clone(), text: "Who tells the players?".into(), ..Default::default() };
+        let finding_id = crate::findings::file(&mut db, &question, 1).unwrap();
+
+        let open = db.list_open_review_items().unwrap();
+        let held_item = open.iter().find(|it| it.source_ref == "Design/Card.md").unwrap();
+        assert_eq!(note_of(held_item).as_deref(), Some(note.as_str()));
+        assert_eq!(note_of(open.iter().find(|it| it.id == finding_id).unwrap()).as_deref(), Some(note.as_str()));
+        assert_eq!(note_of(open.iter().find(|it| it.id == card_id).unwrap()), None, "the card itself waits from nothing");
+
+        db.resolve_review_item(held_item.id, 2).unwrap();
+        assert_eq!(close_if_settled(root, &mut db, &note, 2).unwrap(), None, "its question is still open");
+        db.resolve_review_item(finding_id, 3).unwrap();
+        assert_eq!(close_if_settled(root, &mut db, &note, 3).unwrap(), Some(card_id), "nothing waits from it now");
+        assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none());
+        assert!(
+            db.list_open_review_items().unwrap().iter().any(|it| it.source_ref == "Design/Save.md"),
+            "another note's held edit still waits"
+        );
+        assert_eq!(close_if_settled(root, &mut db, &note, 4).unwrap(), None, "closed once");
     }
 
     #[test]

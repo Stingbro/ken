@@ -5514,10 +5514,22 @@ fn resolve_review_item(state: State<SharedState>, id: i64, project_id: Option<St
     let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, pid)?;
-    active
-        .db
-        .resolve_review_item(id, engine::now_epoch())
-        .map_err(err)
+    settle_review_item(&active.project.root, &mut active.db, id)
+}
+
+/// Mark a stored item done (a discarded proposal, a finding marked done or
+/// dismissed, an applied proposal), then close the ingest card it came from
+/// when nothing else waits from that note (`ingest::close_if_settled`).
+fn settle_review_item(root: &Path, db: &mut Db, id: i64) -> CmdResult<()> {
+    let note = db.list_open_review_items().map_err(err)?.iter().find(|it| it.id == id).and_then(ken_core::ingest::note_of);
+    let now = engine::now_epoch();
+    db.resolve_review_item(id, now).map_err(err)?;
+    if let Some(note) = note {
+        if let Err(e) = ken_core::ingest::close_if_settled(root, db, &note, now) {
+            eprintln!("warning: could not close the card of {note}: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// Confirm a supersession finding (knowledge-core decision 25): Ken writes
@@ -5535,7 +5547,7 @@ fn confirm_finding(state: State<SharedState>, id: i64, project_id: Option<String
         .find(|(it, _)| it.id == id)
         .ok_or("no open finding with that id")?;
     let commit = ken_core::supersede::confirm(&active.project.root, &finding)?;
-    active.db.resolve_review_item(item.id, engine::now_epoch()).map_err(err)?;
+    settle_review_item(&active.project.root, &mut active.db, item.id)?;
     Ok(commit)
 }
 
@@ -6885,7 +6897,7 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
     if let Err(e) = ken_core::ingest::accepted(&active.project.root, &proposal) {
         eprintln!("warning: could not commit {}: {e}", proposal.page);
     }
-    active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
+    settle_review_item(&active.project.root, &mut active.db, item_id)?;
     Ok(proposal.page)
 }
 
