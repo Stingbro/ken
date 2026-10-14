@@ -372,17 +372,15 @@ fn secrets_row() -> IgnoreRow {
     }
 }
 
-/// A repo Ken leaves untouched: code or reference, and not also team or
-/// wiki. It gains no file from Ken; its project config lives in app data.
-pub fn leaves_untouched(kind: &[RepoKind]) -> bool {
-    !kind.is_empty() && kind.iter().all(|k| matches!(k, RepoKind::Code | RepoKind::Reference))
-}
-
-/// Give each untouched repo among `rows` its project in app data before the
+/// Give each repo among `rows` its project config in app data before the
 /// workspace adopts it, so opening the workspace finds that one instead of
-/// writing `.ken/project.json` into the repo.
-fn place_untouched(rows: &[&RepoRow], folder: impl Fn(&RepoRow) -> Option<PathBuf>) -> Result<()> {
-    for r in rows.iter().filter(|r| leaves_untouched(&r.kind)) {
+/// writing `.ken/project.json` into the repo. The config is this machine's
+/// (the repo's index id, its feature switches), so no repo carries it: a
+/// code repo gains no file from Ken, and the knowledge base holds only what
+/// its team shares (`.ken/knowledge.json`). A repo that already has its own
+/// `.ken/project.json` keeps it.
+fn place_configs(rows: &[&RepoRow], folder: impl Fn(&RepoRow) -> Option<PathBuf>) -> Result<()> {
+    for r in rows {
         if let Some(dir) = folder(r) {
             crate::project::Project::create_outside(&dir, workspace::member_leaf(&r.member))?;
         }
@@ -397,7 +395,7 @@ fn place_untouched(rows: &[&RepoRow], folder: impl Fn(&RepoRow) -> Option<PathBu
 pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores: &[IgnoreRow], today: &str) -> Result<Workspace> {
     let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include).collect();
     let members: Vec<String> = chosen.iter().map(|r| r.member.clone()).collect();
-    place_untouched(&chosen, |r| Some(parent.join(&r.member)))?;
+    place_configs(&chosen, |r| Some(parent.join(&r.member)))?;
 
     // Ignore lines first, so the workspace opens with them in force.
     let fresh: Vec<&IgnoreRow> = {
@@ -628,7 +626,7 @@ pub fn confirm_repos(base: &Path, root: &Path, name: &str, rows: &[RepoRow]) -> 
     let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include && r.path.is_some()).collect();
     let members: Vec<(String, PathBuf)> =
         chosen.iter().filter_map(|r| r.path.clone().map(|p| (r.member.clone(), p))).collect();
-    place_untouched(&chosen, |r| r.path.clone())?;
+    place_configs(&chosen, |r| r.path.clone())?;
     let ws = Workspace::create_at(root, name, &members)?;
     register(base, &ws, &chosen)?;
     Workspace::open(root)
@@ -835,12 +833,14 @@ mod tests {
         let ws = confirm_repos(base.path(), &root, "Code", &rows).unwrap();
         assert!(root.join(".ken-workspace/workspace.json").exists());
         assert!(!p.join(".ken-workspace").exists() && !p.join(".kenignore").exists(), "nothing in a parent");
-        // A code repo gains no file from Ken; the wiki keeps its own config.
+        // No repo gains a project config from Ken: a code repo gets no
+        // .ken/, and the docs repo no .ken/project.json.
         assert_eq!(row("Realms-Game").kind, vec![RepoKind::Code]);
         assert!(!p.join("Realms-Game/.ken").exists(), "a code repo gets no .ken/");
         let game = crate::project::Project::open(&p.join("Realms-Game")).unwrap();
         assert!(game.is_outside());
-        assert!(p.join("Realms-Docs/.ken/project.json").exists());
+        assert!(!p.join("Realms-Docs/.ken/project.json").exists());
+        assert!(crate::project::Project::open(&p.join("Realms-Docs")).unwrap().is_outside());
         let canon = |x: std::path::PathBuf| plain_canonical(&x);
         assert!(!canon(p.to_path_buf()).to_string_lossy().starts_with(r"\\?\"), "no verbatim prefix");
         assert_eq!(ws.member_root("Personal"), canon(elsewhere.path().join("Personal")));
