@@ -105,9 +105,12 @@ pub fn plan_route(query: &str, members: &[MemberInfo]) -> RoutePlan {
 }
 
 /// Whether the reference repos the plan held back are searched too: it held
-/// some back and no source searched so far answered.
+/// some back and no source searched so far answered. A source answers when
+/// the question's words found something there. Meaning search always
+/// returns its nearest passages, however far, so a source with a meaning
+/// index would never come back empty and the reserve would never be asked.
 pub fn needs_reserve(plan: &RoutePlan, searched: &[MemberHits]) -> bool {
-    !plan.reserve.is_empty() && searched.iter().all(|m| m.hits.is_empty())
+    !plan.reserve.is_empty() && searched.iter().all(|m| m.hits.iter().all(|h| h.source == Source::Semantic))
 }
 
 /// A name as a question would say it, for matching one against the other:
@@ -778,6 +781,8 @@ mod tests {
         let plan = RoutePlan { targets: vec![code], reason: RouteReason::Every, reserve: vec![engine] };
         assert!(needs_reserve(&plan, &[searched(code, "game", vec![])]));
         assert!(!needs_reserve(&plan, &[searched(code, "game", vec![hit("src/a.rs", 1)])]));
+        let near = HybridHit { source: Source::Semantic, ..hit("src/a.rs", 1) };
+        assert!(needs_reserve(&plan, &[searched(code, "game", vec![near])]), "only the nearest meaning is no answer");
         assert!(!needs_reserve(&every(vec![code]), &[searched(code, "game", vec![])]), "nothing held back");
 
         let game = fixture_db_with_chunk("src/notes.md", "the quokka naps");
