@@ -266,7 +266,7 @@
             <span><input type="checkbox" bind:checked={row.include} aria-label="Index {row.member}" /></span>
             <span class="repo">
               <span class="mono">{row.member}</span>
-              <span class="evidence mono" title={row.path ?? ""}>{row.path}</span>
+              <span class="evidence mono path" title={row.path ?? ""}>{row.path}</span>
               {#if row.evidence.length > 0}<span class="evidence">{row.evidence.join(" · ")}</span>{/if}
               <textarea
                 class="textarea description"
@@ -410,16 +410,22 @@
   .move {
     overflow-wrap: anywhere;
   }
+  /* The table fits its card and scrolls down only (finding 10). The set-up
+     panel is 460px wide at any window size; the old column minimums alone
+     came to more than that, so a long path pushed it sideways. The source
+     and kind columns now shrink to the card, a path wraps anywhere, and the
+     kind chips wrap onto a second line. */
   .table {
     display: flex;
     flex-direction: column;
-    overflow: auto;
+    overflow-x: hidden;
+    overflow-y: auto;
     max-height: 46vh;
     font-size: 12.5px;
   }
   .tr {
     display: grid;
-    grid-template-columns: 56px minmax(220px, 2.4fr) minmax(170px, 1.2fr) 28px;
+    grid-template-columns: 44px minmax(0, 1.8fr) minmax(88px, 1fr) 24px;
     gap: 8px;
     align-items: start;
     padding: 8px 12px;
@@ -465,10 +471,17 @@
     font-size: 11.5px;
     color: var(--ink-3);
   }
+  /* A path has few break points, so it may break between any two letters;
+     the full path is also its tooltip. */
+  .path {
+    overflow-wrap: anywhere;
+    word-break: break-all;
+  }
   .kinds {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
+    min-width: 0;
   }
   /* The app's chip, as a toggle: on is the selection, in the accent. */
   .kinds .chip {
