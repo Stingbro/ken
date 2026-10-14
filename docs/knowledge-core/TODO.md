@@ -13,7 +13,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - `hooks.rs`: an unreachable pattern.
   - `ocr`: an unused attribute.
   - `src-tauri/src/lib.rs`: an unused `profile` field.
-  - `svelte-check`: 6 warnings (since slice 9; the old Timeline screen's two unused-style warnings went with it).
+  - `svelte-check`: 6 warnings (since slice 9; the old Timeline screen's two unused-style warnings went with it). One is the unused `h2` style, in `WorkspaceSettingsScreen.svelte` since slice 12.
 - **A fresh checkout:** run `scripts\win-build.cmd sidecar` once before the Rust check, or the app's build script stops on the missing `ken-mcp` binary.
 - **Tests:** don't run test binaries or anything that spawns shells without asking first. Endpoint security on the dev machine flags it.
 
@@ -273,12 +273,33 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 6 warnings (the known ones).
   - Not run: any test, and the app. The v27 migration adds a column once on first open. The next full scan tries each failed file again (up to its third try). Nothing builds until a person starts it.
 
+- **Slice 12: Wright leftovers** (`d36c1fd`). Decisions 35 to 38, with 36's commit rule and the lead's throttle carry-over.
+  - Escalations go (14, 37): `day.rs`'s `Escalation`, `ESCALATIONS_DIR`, `parse_escalation`, `escalation_reply`, `scan_escalations` and `Me::addressed`; Your day's `DayEscalationDto`, `escalations` and `my_escalations`, the `escalation_reply` command and the watcher's `escalations/` folder; `api.ts`'s `DayEscalation` and `escalationReply`, `day.ts`'s `escalationDetail`, and the Inbox's People group, escalation kind, reply box and icon. An older note's `## Escalations` heading still reads as its open questions (ingest, unchanged).
+  - People, owners and the roster go (35): `people.rs` (no caller was left), the dead `setup::remote_owner`, and `RulingEntry.decider`, now `who` (free text, decision 13; the older key still reads).
+  - No team (35): the registry has no `team` and no team kind. `RepoKind` is Wiki, Code, Reference; an older `team` reads as the wiki, said once (`Registry::load`); `set_kind` and `infer_library` take no team. A workspace has one knowledge base, so `team` leaves every command (`ingest_*`, `record_start`, `files_banner`, `set_project_kind`, `day_state`, `index_health`, the digest), the `x-team` header, `AppState.last_team`, `scope.team`, `selectTeam` and `teamProjectIds` (now `workspaceProjectIds`). The title bar's team switcher is `WorkspaceSwitcher` (this workspace, the others, open another). Groups stay a way to sort repos. `team_wiki` is `knowledge_base_id`; `inbox_project` takes the workspace's repo with the inbox, a wiki first. The digest is the workspace's (`day_digest`, `refresh_day_digest`, `day_digest_writing`, `day-digest-*` events, `digest::compose_workspace_digest_prompt`); its file is `team-digests/<workspace>/_all.json`, as before, and the schedule keeps one last attempt. The template's `knowledge.json` says `workspace`, not `team`, and the knowledge base's kind is `wiki`; `{{team_name}}` is `{{workspace_name}}`. Set-up's `detect` reads the settings file as the knowledge base.
+  - The Team screen is workspace settings (37): `WorkspaceSettingsScreen.svelte` under Settings › Workspace (`workspace_settings`, `SourceDto`, `WorkspaceSettingsDto`). Each source with kind, indexed or off, branch, commit, drift and its one health line (`IndexHealth::line`); the index rules; editors for the tiers (`search.weights` as `pattern = tier` lines, `workspace_save_weights`, the knowledge base scanned again), each code or reference source's roles (`pattern = role`, `workspace_save_roles`, that source scanned again) and the controls (`question | file | source`, `workspace_save_controls`) with each one's last result (`control_rows`: the source the control names, else the knowledge base); then the template gaps, the layout dry run, drift, findings, rules and templates as before. `knowledge_settings` gains `parse_pair`, `weight_lines` and `set_weight_lines` (a tier name or a number; one bad line refuses the save), `role_lines` and `set_role_lines`, `all_controls` and `set_controls`. The Inbox and the sidebar's count read `knowledge_findings` rather than the whole screen. `team.ts` is `workspaceSettings.ts` (`editorLines`, `parseControls`, `controlLine`, `controlResult`); `src/team/` is `src/workspace/`. The repo drawer's Sync card says a code or reference repo never syncs.
+  - Ken's commits (36): sync runs only for the knowledge base (a wiki, or the repo holding the inbox), on unless a person switches it off; a code or reference repo never syncs, whatever its `sync` block says (`sync_auto`). A cycle commits only the paths Ken wrote there (`SyncEngine::wrote`: a save in the app, a new, moved or deleted file, an import, a resolved conflict, a ticket's status) through `git::commit_paths` (`sync::commit_own`), never `git add -A`, then pulls and pushes as before. A new knowledge base's first commit adds the template files by name (`wikinew::git_commit_new`, globally ignored ones left out).
+  - Memory stays personal and local (37): `.ken/memory/` joins `.git/info/exclude`, and sync never commits memory, staging, transcripts or `.ken-workspace/` (`sync::personal`). Your day, tasks and memory are otherwise unchanged.
+  - OpenSpec (37): the comments citing `openspec/changes/...` are gone (`memory.rs`, `search.rs`, `workspace.rs`, `src-tauri/src/lib.rs`). `contenttype` still reads a source's own `openspec/` specs.
+  - Families and the team bus (37): nothing was left; `features.rs`'s test still checks `kenFamilies` is not a flag.
+  - Evaluation (38): no `eval_run`, probe, bench or `KEN_EVAL_*` hook is left. `local_llm_integration.rs` is the llama.cpp smoke test, not an eval.
+  - Carry-over: the throttle's default pace is Gentle (`throttle::Pace`'s default and the state it starts in), so a fresh install makes at most 20 background Claude calls an hour, as before slice 11; the panel says Gentle is the default. Normal and Fast stay in Settings.
+  - Tests: Your day without escalations (tickets from every repo, no `escalations` key), the registry without a team (an older `team` kind reads as the wiki), sync never in a code repo and committing only Ken's paths and never memory, the settings editors (Rust and TypeScript), controls with their last result, the digest schedule (an older per-team one reads as never tried), `who` read from `decider`, the template's `workspace` key, the throttle default.
+  - Choices:
+    - Ken's own changes are the writes made through Ken; an edit made outside Ken in the knowledge base is the person's to commit.
+    - Sync still pushes the knowledge base, as the way people share it (see Open for Chris).
+    - Saving controls does not run them; each source runs them at its next rebuild or scan.
+    - The tiers and roles editors are text lines, like the index rules.
+    - The digest keeps its `team-digests` folder, so a workspace's earlier digest is still found.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 6 warnings (the known ones; the unused `h2` style moved with the Team screen into `WorkspaceSettingsScreen.svelte`). The sidecar was re-staged.
+  - Not run: any test, and the app. Nothing migrates: an older registry's team kind reads as the wiki and its team name is dropped at its next save; per-team digest files are no longer read; the next sync cycle in a code repo does nothing.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
 
 - **The title weight in plain-word questions.** The breadcrumb field counts 2.5 times the body in the any-word fallback too, where names were cut to a quarter because one common word in a name outranked the body. If a common heading word ("Overview", "Notes") starts winning plain questions, lower `W_TITLE` there; it needs a measurement first (decision 38 left measurement to be designed).
-- **Confirming what the repo analysis proposes.** Role rules and controls are written into `.ken/knowledge.json` as soon as Claude proposes them, applied on the next scan, and a person edits them there (the settings screen is slice 12). Choose: keep that, or hold them as a proposal card in the Inbox until a person accepts them.
+- **Confirming what the repo analysis proposes.** Role rules and controls are written into `.ken/knowledge.json` as soon as Claude proposes them and applied on the next scan; since slice 12 Settings › Workspace shows and edits them. Choose: keep that, or hold them as a proposal card in the Inbox until a person accepts them.
 
 - **How much a symbol counts in the rerank.** Slice 6 counts a code chunk's symbol words like path words (1.0 each, beside 0.5 for the text and 3.0 for the file name), which brings a named definition above a note that only says the words. If definitions still lose to pages that merely mention them, they could count like the file name instead; that wants the measurement decision 38 left open.
 
@@ -300,7 +321,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 
 - **Commits that cite something made later.** A commit is read once, and linked only to tickets and rulings the knowledge base has then; a ticket filed after the commit that names it is not linked. Choose: keep, or re-read a repo's history when a ticket or ruling is added.
 
-- **The throttle's numbers.** Gentle, Normal and Fast are 20, 60 and 240 background Claude calls an hour (Normal was 20 for summaries and checks alone), 10, 2 and 0 seconds between calls, and local work a quarter, a half and all of the time. Ingest counts against the hour too, so a dropped source can wait behind summaries in a busy hour. Choose: keep, or other numbers, or leave a person's own ingest out of the hourly budget.
+- **The throttle's numbers.** Gentle (the default since slice 12, so a fresh install makes at most 20 background Claude calls an hour), Normal and Fast are 20, 60 and 240 calls an hour, 10, 2 and 0 seconds between calls, and local work a quarter, a half and all of the time. Ingest counts against the hour too, so a dropped source can wait behind summaries in a busy hour. Choose: keep, or leave a person's own ingest out of the hourly budget.
 
 - **Starting the build.** The build queue starts when a person presses Build the library; set-up does not start it. Choose: keep, or start it at Gentle when set-up confirms.
 
@@ -308,25 +329,36 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 
 - **The older ignore files.** A repo's `.kenignore`, the workspace's `.kenignore` and `project.json`'s `excluded` are still read, never written; the rules a person writes now go in `.ken/knowledge.json`. Choose: keep reading them, or move their lines into `.ken/knowledge.json` once (a commit in the knowledge base) and stop reading them.
 
+- **Sync pushes the knowledge base.** Decision 12 says Ken never pushes an ingest's commit, and decision 36 limits Ken's commits to the knowledge base; the sync engine still pulls and pushes the knowledge base (on unless switched off), which is how people share it, so an ingest's commit reaches the remote at the next cycle. Choose: keep, or pull only and leave pushing to a person.
+
+- **What counts as Ken's own change.** Sync commits what was written through Ken (saves, new, moved and deleted files, imports, resolved conflicts, a ticket's status). An edit made in another editor stays uncommitted, and a pull can then stop on it (said as a sync problem). Choose: keep, or offer a "commit my other changes" action that names each file.
+
 - **Signalling the app when an MCP tool files something.** A ruling `propose_decision` files, or a source `add_source` puts in Raw, reaches the open app at its next refresh (the Raw watcher starts an ingest for a source; nothing tells the Inbox about a ruling). Choose: keep, or have ken-mcp tell the app over its listener when one is running.
 
-## Next: slice 12, Wright leftovers (35–38)
+## Next: slice 13, the method pages in WoW
 
-Nothing has been edited yet.
+The pages on Ways of Working's `docs/knowledge-core` branch (`ae76475`) against DECISIONS.md and the code as it stands after slice 12. Nothing has been edited yet.
 
-- [ ] Escalations go (14, 37): `day.rs`'s `Escalation`, `ESCALATIONS_DIR`, `parse_escalation` and the repo walk; Your day's `DayEscalationDto` and `escalations` field in `src-tauri/src/lib.rs`; their `api.ts` types, `day.ts`, `day.svelte.ts` and `day.test.ts`; the Inbox's escalation kind (`InboxScreen.svelte`, `InboxKindIcon.svelte`, `inbox.svelte.ts`); the mentions left in `drift.rs`, `ingest.rs` and the Team screen.
-- [ ] People, owners and the roster go (35): `people.rs` (no caller is left; check `lint.rs`, `links.rs`, `extract.rs`, `setup.rs`, `memory.svelte.ts`, `kenAddress.ts` for the words only). The registry's `team` field and `set_kind(.., team)`, `infer_library(.., team)`, and the `team` argument of `team_overview`, `team_wiki`, `ingest_overview` and friends: a workspace has one knowledge base, so `team` becomes the workspace (groups stay a way to sort repos, not a team).
-- [ ] The Team screen becomes workspace settings (37): `TeamScreen.svelte` renamed (and its Settings section), with sources (kind, indexed or off, branch, drift), the index rules, and editors for what `.ken/knowledge.json` holds and nothing shows yet: tiers (`search.weights`), roles per repo, controls (with their last results) and the one health line per source (`index_health`). The confirm-the-proposals question in Open for Chris is settled here or left open.
-- [ ] Ken's commits (36): `sync.rs` still runs `git add -A`, commits and pushes in repos whose kind syncs (team and wiki; off by default otherwise, line ~100). Make it never commit in a code repo and never `git add -A`; the knowledge base's commits stay Ken's own changes (`git::commit_paths`).
-- [ ] OpenSpec (37): no `openspec/` folder is on the branch; drop the doc comments that cite `openspec/changes/...` (`workspace.rs`, `src-tauri/src/lib.rs`). `contenttype`'s `openspec` spec folder stays: it classifies a source's own specs.
-- [ ] Families and the team bus (37): confirm nothing is left beyond `features.rs`'s test that `kenFamilies` is not a flag.
-- [ ] Evaluation (38): confirm no `eval_run`, probe, bench or `KEN_EVAL_*` hook is left (none found in `crates`, `src-tauri`, `src`, `scripts`); `crates/ken-core/tests/local_llm_integration.rs` is the only integration test, check it is not an eval.
-- [ ] Keep Your day, tasks and memory (37); memory stays personal and local, never pushed (check `sync.rs` does not reach the workspace memory folder).
-- [ ] Tests to update or add: Your day without escalations, the registry without a team, the workspace settings screen's helpers, sync never committing in a code repo.
+- [ ] Knowledge (`docs/manual/docs-system.html`):
+  - Building a Library: an existing wiki's pages are "given frontmatter" when mapped; `wikimap` moves them, rewrites path links and adds them to their indexes, but writes no frontmatter. Drop the words, or make it a Ken task. Say building starts when a person asks (Build the library), not at set-up.
+  - Finding Things: "A good answer is filed back as a page" should say it is filed back as a source and ingest writes the page (decision 33, slice 11).
+  - Ingest: the held edits also include a page someone changed while it was read (decision 11); the code also holds a page with a person's uncommitted work.
+  - The timeline: findings of every kind, filed and resolved, not only drift findings; commits are the knowledge base's own and the other repos' that cite a ticket or ruling (decision 37, slice 9).
+  - Add Ken's commit rule (36): only in the knowledge base, only its own changes, never `git add -A`, never in a code repo; and that memory stays personal and local (37).
+  - Frontmatter: "superseded, with the page that replaces it" holds only while the banner rule stands (Open for Chris, how a retired page names its successor).
+- [ ] Drift (`docs/manual/drift.html`):
+  - The Checks: the Answer row reads "the escalations in a ticket's thread"; escalations are cut (14, 37). The Scope and Answer checks stay with Wright (31): move them to Build, or mark them Wright's.
+  - Triggers: the ticket-close trigger and G8 are Wright's; drop them or point at Build.
+  - "Each run writes one line to log.md": Ken writes the line only when a run changed a page (Open for Chris, a log line for a run that changed nothing).
+  - What Happens to a Change: Ken classes whitespace and comments as cosmetic, not import order.
+  - Pinned copies, the backfill that sorts pages into provable, stale and undated, and the instrument's exit code have no counterpart in Ken on this branch: keep them as method for Wright, or drop them.
+  - Movement: Ken measures against the remote's default branch; `.ken/knowledge.json`'s `base` is not read (Open for Chris).
+- [ ] Decisions (`docs/manual/decisions.html`): the entry format matches `ingest::decisions_entry`. Add `refines:` and `[REFINED BY …]`, which Ken writes when a person confirms a narrowing. "Who said it" is already free text, with no decider (35).
+- [ ] Pages off the branch that still describe the cut team layer: `workspace.html` (three repos and a roster, `escalations/`, `ideas/`), `index.html` ("Three repos, one roster"), `tickets.html` (a ticket "in the team repo"). Decisions 8 and 35 put the tickets in the one knowledge base and cut the roster. `personal-layer.html` and `agents.html` describe the team bus and escalations as Wright's; leave them unless Chris wants them cut from WoW too.
+- [ ] Commit on `docs/knowledge-core` in WoW and push; note the WoW commit here.
 
 ## Later slices
 
-- [ ] **13, the method pages in WoW:** finish the remaining pages on `docs/knowledge-core` in the WoW repo.
 - [ ] **14, verify:**
   - The full test suite (ask first, see above).
   - An end-to-end run: set up a new knowledge base, ingest a source, search, drift on a commit.
