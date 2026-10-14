@@ -317,56 +317,39 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
     - **The templates link** points at the `knowledge-core` branch; repoint it when the branch merges.
   - Checked: tag balance on every changed page, every relative link and anchor they hold (and every link into the five changed Knowledge pages from elsewhere in `docs/` and `design/`), and both JSON templates parse. Not done: a cold read against `research/PAGE-COLD-READ-RUBRIC.md`, and the artifacts were not republished.
 
-## Open for Chris
+## Decided by Chris, 2026-10-14
 
-- **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
+Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
 
-- **The title weight in plain-word questions.** The breadcrumb field counts 2.5 times the body in the any-word fallback too, where names were cut to a quarter because one common word in a name outranked the body. If a common heading word ("Overview", "Notes") starts winning plain questions, lower `W_TITLE` there; it needs a measurement first (decision 38 left measurement to be designed).
-- **Confirming what the repo analysis proposes.** Role rules and controls are written into `.ken/knowledge.json` as soon as Claude proposes them and applied on the next scan; since slice 12 Settings › Workspace shows and edits them. Choose: keep that, or hold them as a proposal card in the Inbox until a person accepts them.
-
-- **How much a symbol counts in the rerank.** Slice 6 counts a code chunk's symbol words like path words (1.0 each, beside 0.5 for the text and 3.0 for the file name), which brings a named definition above a note that only says the words. If definitions still lose to pages that merely mention them, they could count like the file name instead; that wants the measurement decision 38 left open.
-
-- **Commits for what is applied later.** A held edit, a ruling or a ticket applied after the ingest is its own commit. Choose: keep one commit per click, or gather them into one commit per card when it is marked seen.
-
-- **Mark as seen.** With the source claimed as its note is written, Seen only closes the card. Choose: keep it, or close a card by itself once nothing waits from it.
-
-- **A log line for a drift run that changed nothing.** Decision 2 says one `log.md` line per drift run; a run now writes its line (and commit) only when it stamped, fixed or followed a page, so a retry that changes nothing leaves no trace. Choose: keep that, or a line for every run (a commit each time too).
-
-- **Re-reading pages past the age rule.** A page not checked in 30 days is re-read by Claude like a real change, one call each, sharing the 20-an-hour cap with summaries. A knowledge base with hundreds of old pages takes days to catch up the first week. Choose: keep it, or file aged pages as findings and re-read only pages whose code moved.
-
-- **The supersession pass's first read.** The first time the pass sees a decisions log, every entry counts as new, so the whole log is clustered and asked about once (at the shared cap). Choose: keep it, or mark the existing entries read at first sight and judge only entries added from then on.
-
-- **Fetching code repos.** Ken sees a branch move when it moves locally (a person's pull, any fetch); every drift run fetches first, so at worst the weekly run catches up. Choose: keep it, or fetch each cited repo on a timer (say hourly) so an upstream merge starts a run within the hour.
-
-- **The `base` a repo entry names.** `.ken/knowledge.json` says `base` is the branch drift measures against, but drift measures against the remote's default branch (or the checkout's upstream, said so), as before. Choose: read `base` when set, or drop it from the template.
-
-- **Topic tags: a call of their own.** Tags are asked for in a separate background call after an ingest or drift writes (up to 12 pages a call, sharing the 20-an-hour cap). Choose: keep, or ask for them inside the ingest plan and the drift re-read so they cost no extra call.
-
-- **Commits that cite something made later.** A commit is read once, and linked only to tickets and rulings the knowledge base has then; a ticket filed after the commit that names it is not linked. Choose: keep, or re-read a repo's history when a ticket or ruling is added.
-
-- **The throttle's numbers.** Gentle (the default since slice 12, so a fresh install makes at most 20 background Claude calls an hour), Normal and Fast are 20, 60 and 240 calls an hour, 10, 2 and 0 seconds between calls, and local work a quarter, a half and all of the time. Ingest counts against the hour too, so a dropped source can wait behind summaries in a busy hour. Choose: keep, or leave a person's own ingest out of the hourly budget.
-
-- **Starting the build.** The build queue starts when a person presses Build the library; set-up does not start it. Choose: keep, or start it at Gentle when set-up confirms.
-
-- **How much of a source pass two reads.** At most 50 files a source, broadest first. Choose: keep, a larger cap, or every prose page plus the code files the code index ranks highest.
-
-- **The older ignore files.** A repo's `.kenignore`, the workspace's `.kenignore` and `project.json`'s `excluded` are still read, never written; the rules a person writes now go in `.ken/knowledge.json`. Choose: keep reading them, or move their lines into `.ken/knowledge.json` once (a commit in the knowledge base) and stop reading them.
-
-- **Sync pushes the knowledge base.** Decision 12 says Ken never pushes an ingest's commit, and decision 36 limits Ken's commits to the knowledge base; the sync engine still pulls and pushes the knowledge base (on unless switched off), which is how people share it, so an ingest's commit reaches the remote at the next cycle. Choose: keep, or pull only and leave pushing to a person.
-
-- **What counts as Ken's own change.** Sync commits what was written through Ken (saves, new, moved and deleted files, imports, resolved conflicts, a ticket's status). An edit made in another editor stays uncommitted, and a pull can then stop on it (said as a sync problem). Choose: keep, or offer a "commit my other changes" action that names each file.
-
-- **Signalling the app when an MCP tool files something.** A ruling `propose_decision` files, or a source `add_source` puts in Raw, reaches the open app at its next refresh (the Raw watcher starts an ingest for a source; nothing tells the Inbox about a ruling). Choose: keep, or have ken-mcp tell the app over its listener when one is running.
-
-- **Lint and `log.md`.** Decision 2 wants a line per lint pass; lint writes none, so the Timeline shows no lint runs. Choose: a line per scan-lint, after-edit and weekly pass that filed or resolved something, or drop lint from decision 2.
-
-- **Wright's pages in WoW.** `docs/wright/*`, the Wright white box, the deck, `personal-layer.html`, `agents.html`, `PROPOSAL.md` and `presets.json` still describe the team repo, the roster in `people/`, owners and deciders, `.wright/team.json` with the team kind, three index states and the standing sweep, and `pin:`/`verified:` (some as dated rulings). The templates now say Wright's files lay down into the knowledge base and `team.json` holds only Wright's own settings. Choose: bring the Wright pages in line in a later WoW slice, or cut Wright's team layer from WoW too.
+- **Kept as built:**
+  - Sync keeps pulling and pushing the knowledge base; it is how people share it. Decision 12 now reads "Ken never pushes outside sync".
+  - The supersession pass judges the whole log the first time it sees it.
+  - One commit per click for what is applied after an ingest.
+  - A drift run logs (and commits) only when it changed a page.
+  - No fetch timer: drift catches up on a pull or at the weekly run.
+  - A commit is read once; a ticket or ruling filed later does not reach back.
+  - The build queue starts only when a person presses Build the library.
+  - Pass two reads at most 50 files a source.
+  - The title weight (2.5) and the symbol weight (1.0) stay until decision 38's measurement exists.
+- **To build (slice 15):**
+  - A seventh key, `superseded_by`, names a retired page's successor; Ken writes it and search shows it.
+  - The repo analysis's role rules and controls wait as an Inbox proposal card and apply only once a person accepts.
+  - Pages past the 30-day age rule are filed as findings; Claude re-reads only pages whose cited code moved.
+  - A person's own ingest is outside the hourly budget; background work keeps it.
+  - An Inbox card closes by itself once nothing waits from it.
+  - Lint writes a `log.md` line for each pass that filed or resolved something.
+  - Drift reads `base` from `.ken/knowledge.json` when it is set.
+  - Topic tags come back inside the ingest plan and the drift re-read; the separate tags call goes.
+  - The older ignore files move into `.ken/knowledge.json` once (a commit in the knowledge base) and are no longer read.
+  - Sync offers "commit my other changes", naming each file first.
+  - ken-mcp tells a running app when `propose_decision` or `add_source` files something.
+- **Ways-of-Working:** Wright's pages are brought in line with the new templates in a later WoW slice; Wright keeps its pages.
 
 ## Next: slice 14, verify
 
 No test has been run and the app has not been started on this branch; only compile checks. The test suite spawns shells and git, so each run needs Chris's go-ahead first (see "How to pick it up"). Cap cargo at 4 jobs and 4 test threads while Chris works, and never start `ken-app` without asking.
 
-- [ ] **The full test suite** (ask first), from the checkout root, each into a log file:
+- [ ] **The full test suite** (Chris said go, 2026-10-14), from the checkout root, each into a log file:
   - [ ] Rust, ken-core: `scripts\win-build.cmd cargo test --release -j 4 -p ken-core -- --test-threads=4`. Compare against a baseline from `ken-workspace-home` (60 failures there, all needing the `claude` CLI, git or fixtures); a failure not in the baseline is this branch's.
   - [ ] Rust, ken-mcp: `scripts\win-build.cmd cargo test --release -j 4 -p ken-mcp -- --test-threads=4` (the twelve tools, the personal set, the instructions).
   - [ ] Rust, the app: `scripts\win-build.cmd cargo test --release -j 4 -p ken-app -- --test-threads=4`, after `scripts\win-build.cmd sidecar` on a fresh checkout.
@@ -380,3 +363,20 @@ No test has been run and the app has not been started on this branch; only compi
   - [ ] Drift: commit a real change under a page's `sources:` in the code repo, then a comment-only change. Check the first is re-read and stamped or fixed (`checked:` with the new commit), the second advances `checked:` silently, a ruling citing the changed code becomes a finding and is not edited, one commit and one `log.md` line, and nothing written in the code repo.
   - [ ] Throttle: Pause stops every background call; Gentle holds to 20 an hour; the status panel lists running, queued and failed work.
   - [ ] Note what was run, what held and what did not here, then ask Chris before merging anything.
+
+## Next: slice 15, Chris's answers
+
+One lane at a time, a compile check, a commit and a push each, as before; the tests touched are re-run at the end.
+
+- [ ] `superseded_by`: the seventh key (decisions 5, 7), written when a page is retired, shown on the hit's label; `replaced_by` still read on older pages.
+- [ ] Repo analysis proposals: an Inbox card holds the proposed role rules and controls; Accept writes them to `.ken/knowledge.json` (one commit), Dismiss drops them.
+- [ ] Age rule: aged pages become findings; only pages whose `sources:` moved are re-read.
+- [ ] Throttle: a person's own ingest skips the hourly budget (still paced between calls).
+- [ ] Inbox: a card closes by itself once nothing waits from it.
+- [ ] Lint: a `log.md` line per pass that filed or resolved something (decision 2).
+- [ ] Drift: `base` read when set, the remote default otherwise.
+- [ ] Topic tags inside the ingest plan and the drift re-read; the tags call removed.
+- [ ] Old ignore files: moved into `.ken/knowledge.json` once, then no longer read.
+- [ ] Sync: "commit my other changes", listing each file before it commits.
+- [ ] ken-mcp signals a running app after `propose_decision` and `add_source`.
+- [ ] Re-run the tests the slice touched; update DECISIONS.md where an answer changes a decision's wording (2, 5, 7, 12).
