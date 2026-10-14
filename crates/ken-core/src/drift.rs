@@ -6,8 +6,9 @@
 //!
 //! - **Docs check**: a page's `checked:` stamp pins a commit in each cited
 //!   repo (its commit where that repo has it, else the last commit on its
-//!   date); a source that moved between that pin and the default branch
-//!   makes the page suspect. A page never checked is measured from the
+//!   date); a source that moved between that pin and the branch measured
+//!   against (the repo's `base` in `.ken/knowledge.json`, else its remote's
+//!   default, [`branch_for`]) makes the page suspect. A page never checked is measured from the
 //!   commit each citation names (`repo@sha:path`), else its `updated` date.
 //! - **Decision check**: each decisions-log entry, measured from the date it
 //!   declares for itself, against the code it cites. Superseded entries are
@@ -342,6 +343,30 @@ pub fn default_branch(root: &Path) -> (String, Option<String>) {
     (branch, Some(note))
 }
 
+/// The branch to measure `repo_root` against: the `base` its entry sets in
+/// the knowledge base's `.ken/knowledge.json` (`repos.<repo>.base`, the
+/// repo by the name a citation gives it, else its folder's name), as the
+/// remote has it (`origin/<base>`) where it was fetched, else the local
+/// branch. Without a `base`, or one git does not know (said so), the
+/// remote's default branch or the upstream ([`default_branch`]).
+pub fn branch_for(kb_root: &Path, repo: &str, repo_root: &Path) -> (String, Option<String>) {
+    let folder = repo_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(base) = crate::knowledge_settings::base(kb_root, repo).or_else(|| crate::knowledge_settings::base(kb_root, &folder)) else {
+        return default_branch(repo_root);
+    };
+    let known = |r: &str| git(repo_root, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_some();
+    let remote = format!("origin/{base}");
+    if !base.starts_with("origin/") && known(&remote) {
+        return (remote, None);
+    }
+    if known(&base) {
+        return (base, None);
+    }
+    let (branch, _) = default_branch(repo_root);
+    let note = format!("its base {base} was not found; measured against {branch}");
+    (branch, Some(note))
+}
+
 /// The last commit on `branch` at or before the end of `date` (`YYYY-MM-DD`).
 fn pin_at(root: &Path, branch: &str, date: &str) -> Option<String> {
     let before = format!("--before={date}T23:59:59");
@@ -488,6 +513,10 @@ struct PinCache {
     version: u32,
     /// Repo folder → the branch head the results were measured at.
     heads: std::collections::HashMap<String, String>,
+    /// Repo folder → the branch measured against, so a later look for a
+    /// move reads the same branch (a repo's `base`, else its default).
+    #[serde(default)]
+    branches: std::collections::HashMap<String, String>,
     /// Citation key → result. Keyed by repo, branch, pin, path and line, so a
     /// page checked again (a new pin) measures afresh.
     results: std::collections::HashMap<String, Measured>,
@@ -634,7 +663,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             }
             return;
         }
-        let (branch, note) = branches.entry(repo_root.clone()).or_insert_with(|| default_branch(&repo_root)).clone();
+        let (branch, note) = branches.entry(repo_root.clone()).or_insert_with(|| branch_for(&project.root, &c.repo, &repo_root)).clone();
         if let Some(n) = note {
             let n = format!("{}: {n}", c.repo);
             if !run.branches.contains(&n) {
@@ -656,6 +685,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             }
             let head = git(&repo_root, &["rev-parse", &branch]);
             cache.advance(&repo_root, head.as_deref());
+            cache.branches.insert(repo_root.display().to_string(), branch.clone());
         }
         let exact_pin = c
             .at
@@ -816,7 +846,7 @@ pub fn branch_moved(db: &Db) -> bool {
     let cache = PinCache::load(db);
     cache.heads.iter().any(|(repo, head)| {
         let root = Path::new(repo);
-        let (branch, _) = default_branch(root);
+        let branch = cache.branches.get(repo).cloned().unwrap_or_else(|| default_branch(root).0);
         git(root, &["rev-parse", &branch]).is_some_and(|now| &now != head)
     })
 }
@@ -878,7 +908,7 @@ fn head_for(project_root: &Path, sources: &[String]) -> Option<String> {
     sources.iter().find_map(|raw| {
         let Citation::Code(c) = classify(raw) else { return None };
         let repo = resolve_repo(project_root, &c.repo)?;
-        let (branch, _) = default_branch(&repo);
+        let (branch, _) = branch_for(project_root, &c.repo, &repo);
         git(&repo, &["rev-parse", "--short=12", &branch]).filter(|s| !s.is_empty())
     })
 }
@@ -1713,6 +1743,50 @@ updated: {{date}}
         assert!(r.commit.is_none(), "nothing written, nothing committed");
         assert!(!due(&db, later + 60).unwrap(), "waits for the hour");
         assert!(due(&db, later + RETRY_SECS).unwrap());
+    }
+
+    /// A repo's `base` in `.ken/knowledge.json` is the branch drift measures
+    /// against; without one, the default (here the checked-out branch).
+    #[test]
+    fn drift_measures_against_the_base_when_set() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("game");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&code, &["config", k, v]);
+        }
+        commit_at(&code, "src/save.rs", "fn save() {\n    write();\n}\n", "2026-09-01");
+        git_ok(&code, &["branch", "stable"]);
+        commit_at(&code, "src/save.rs", "fn save() {\n    write_all();\n}\n", "2026-09-10");
+
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Platform")).unwrap();
+        fs::write(wiki.join("Platform/Save.md"), "---\ntitle: Save\nchecked: 2026-09-05\nsources:\n  - game:src/save.rs\n---\n# Save\n").unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        let knowledge = |repos: serde_json::Value| {
+            fs::create_dir_all(wiki.join(".ken")).unwrap();
+            let all = serde_json::json!({ "repos": repos, "drift": { "fetch": false } });
+            fs::write(wiki.join(crate::wikinew::KNOWLEDGE_FILE), all.to_string()).unwrap();
+        };
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let now = chrono_free_epoch("2026-09-24").unwrap();
+
+        knowledge(serde_json::json!({ "Game": { "kind": "code", "base": "stable" } }));
+        assert_eq!(branch_for(&wiki, "game", &code), ("stable".to_string(), None));
+        let run = sweep(&project, &db, now).unwrap();
+        assert!(run.mismatches.is_empty(), "stable has not moved: {:?}", run.mismatches);
+
+        knowledge(serde_json::json!({ "Game": { "kind": "code" } }));
+        assert_eq!(branch_for(&wiki, "game", &code).0, "main", "no base: the default");
+        let run = sweep(&project, &db, now).unwrap();
+        assert_eq!(run.mismatches.iter().map(|m| m.severity).collect::<Vec<_>>(), vec![Severity::Judgment]);
+
+        knowledge(serde_json::json!({ "Game": { "kind": "code", "base": "nowhere" } }));
+        let (branch, note) = branch_for(&wiki, "game", &code);
+        assert_eq!(branch, "main");
+        assert!(note.is_some_and(|n| n.contains("base nowhere was not found")));
     }
 
     /// The age rule files a finding, never a re-read (Chris, 2026-10-14):

@@ -204,6 +204,16 @@ pub fn ignore_lines(kb_root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The branch drift measures `repo` against: `repos.<repo>.base` in the
+/// knowledge base's file, the name matched ignoring case. None when the
+/// entry or its `base` is missing or blank.
+pub fn base(kb_root: &Path, repo: &str) -> Option<String> {
+    let value = read(kb_root)?;
+    let repos = value.get("repos")?.as_object()?;
+    let entry = repos.iter().find(|(k, _)| k.eq_ignore_ascii_case(repo)).map(|(_, v)| v)?;
+    entry.get("base")?.as_str().map(str::trim).filter(|b| !b.is_empty()).map(str::to_string)
+}
+
 /// Write the knowledge base's top-level `ignore` lines, blank lines dropped,
 /// keeping every other key as it was. The file must exist: a knowledge base
 /// has one from its template.
@@ -443,6 +453,8 @@ mod tests {
         set_role_lines(&wiki, "game", &["src/net/** = Protocol".into()]).unwrap();
         assert_eq!(role_lines(&wiki, "Game"), vec!["src/net/** = protocol"]);
         assert_eq!(read(&wiki).unwrap()["repos"]["Game"]["base"], "main", "the entry keeps its other keys");
+        assert_eq!(base(&wiki, "game").as_deref(), Some("main"));
+        assert_eq!(base(&wiki, "Tools"), None, "no entry, no base");
         set_role_lines(&wiki, "Tools", &["cli/** = command".into()]).unwrap();
         assert_eq!(role_lines(&wiki, "Tools"), vec!["cli/** = command"], "an entry is made for a source the file lacks");
         assert!(set_role_lines(&wiki, "Game", &["just words".into()]).is_err());
