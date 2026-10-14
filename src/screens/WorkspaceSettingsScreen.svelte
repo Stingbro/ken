@@ -698,6 +698,7 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+    container-type: inline-size;
   }
   .head {
     display: flex;
@@ -730,6 +731,14 @@
     display: grid;
     grid-template-columns: minmax(0, 1.7fr) minmax(280px, 1fr);
     gap: 24px;
+  }
+  /* The sources table cannot shrink below its columns: where the screen is
+     too narrow for it beside the drift and findings column, that column goes
+     below it instead of over it. */
+  @container (max-width: 1100px) {
+    .cols {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
   .left,
   .right {
