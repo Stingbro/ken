@@ -963,8 +963,11 @@ fn evidence(project_root: &Path, changed: &[&Mismatch]) -> String {
 }
 
 /// The re-read of one page (decision 28): the page and what changed under
-/// it; Claude answers CHECKED, or the one section to put in its place.
-pub fn reread_prompt(page: &str, text: &str, evidence: &str) -> String {
+/// it; Claude answers CHECKED, or the one section to put in its place, then
+/// the page's topic tags on a last line of JSON (decision 21), offered the
+/// topics in use.
+pub fn reread_prompt(page: &str, text: &str, evidence: &str, topics_in_use: &[String]) -> String {
+    let topics = crate::graph::topics_ask(topics_in_use);
     format!(
         "You are checking one page of a team's knowledge base, `{page}`, against the code it cites. Code it cites has \
          changed; the changes are below.\n\n\
@@ -975,9 +978,25 @@ pub fn reread_prompt(page: &str, text: &str, evidence: &str) -> String {
            every other line of the section exactly as it is. The section you send replaces that section of the page.\n\
          - Use only the page and the code below; do not use any tools.\n\
          - Leave the frontmatter alone; Ken stamps it.\n\
+         - Then, on a last line of its own, the page's topics as JSON, {{\"topics\": [\"…\"]}}: {topics}.\n\
          - No preamble, no code fences.\n\n\
          THE PAGE NOW:\n{text}\n\nTHE CODE:\n{evidence}\n"
     )
+}
+
+/// A re-read's reply split into its answer and the topics its last line
+/// gives (`{"topics": […]}`); no topics when that line is missing.
+pub fn split_topics(reply: &str) -> (String, Vec<String>) {
+    let t = reply.trim_end();
+    let (head, last) = t.rsplit_once('\n').unwrap_or(("", t));
+    let last = last.trim();
+    if !last.starts_with('{') {
+        return (t.to_string(), Vec::new());
+    }
+    match crate::local_llm::parse_json_lenient(last) {
+        Ok(v) if v.get("topics").is_some() => (head.trim_end().to_string(), crate::graph::topic_list(v.get("topics"))),
+        _ => (t.to_string(), Vec::new()),
+    }
 }
 
 /// Act on what a sweep found (decision 28), in the knowledge base at
@@ -1046,6 +1065,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
     let aged: Vec<(String, Option<String>)> = run.aged.iter().filter(|(p, _)| !reread_due(p)).cloned().collect();
     run.findings += file_aged(db, &aged, now)?;
     let pages: Vec<String> = by_page.keys().cloned().collect();
+    let in_use = crate::graph::topics_in_use(db, 80)?;
 
     for page in pages {
         if dirty.contains(&page) {
@@ -1104,8 +1124,15 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             run.waiting.push(page.clone());
             continue;
         };
-        let prompt = reread_prompt(&page, &text, &evidence(root, &changed));
-        let section = match call(&prompt) {
+        let prompt = reread_prompt(&page, &text, &evidence(root, &changed), &in_use);
+        let (reply, topics) = match call(&prompt) {
+            Ok(reply) => {
+                let (answer, topics) = split_topics(&reply);
+                (Ok(answer), topics)
+            }
+            Err(e) => (Err(e), Vec::new()),
+        };
+        let section = match reply {
             Ok(reply) if reply.trim().trim_end_matches('.').eq_ignore_ascii_case("CHECKED") => None,
             Ok(reply) => match crate::ingest::finish_section(&reply) {
                 Ok(s) => s,
@@ -1124,6 +1151,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             write_page(root, &page, &stamped)?;
             push_once(&mut touched, &page);
             run.stamped.push(page.clone());
+            crate::graph::tag_written(db, &page, &topics)?;
             continue;
         };
         let proposed = stamp_checked(
@@ -1135,6 +1163,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             write_page(root, &page, &stamped)?;
             push_once(&mut touched, &page);
             run.stamped.push(page.clone());
+            crate::graph::tag_written(db, &page, &topics)?;
             continue;
         }
         // The stamps are Ken's own: the size rule measures the section alone.
@@ -1150,6 +1179,8 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
                 write_page(root, &page, &proposed)?;
                 push_once(&mut touched, &page);
                 run.fixed.push(page.clone());
+                // Its topic tags come with the re-read that wrote it.
+                crate::graph::tag_written(db, &page, &topics)?;
             }
             Some(why) => {
                 // Held against the page as it is now: the same section, put
@@ -1196,7 +1227,6 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             Err(e) => run.commit_error = Some(e),
         }
         crate::lint::queue_after_edit(db, &run.fixed)?;
-        crate::graph::queue_topics(db, &run.fixed)?;
     }
     Ok(())
 }
@@ -1689,9 +1719,10 @@ updated: {{date}}
             asked.push(p.lines().next().unwrap_or("").to_string());
             Ok(if p.contains("`Platform/Save.md`") {
                 assert!(p.contains("write_all"), "the diff is in the prompt");
-                "## Saving\n\nSaves call write_all().\n".into()
+                assert!(p.contains("{\"topics\": [\"…\"]}") && p.contains("(none yet)"), "the topics are asked for: {p}");
+                "## Saving\n\nSaves call write_all().\n{\"topics\": [\"Saves\", \"disk\"]}\n".into()
             } else if p.contains("`Rules/Strict.md`") {
-                "## Saving\n\nRules are strict.\n".into()
+                "## Saving\n\nRules are strict.\n{\"topics\": [\"rules\"]}".into()
             } else {
                 "CHECKED".into()
             })
@@ -1708,6 +1739,9 @@ updated: {{date}}
         let read = |p: &str| fs::read_to_string(wiki.join(p)).unwrap();
         assert!(read("Platform/Save.md").contains("Saves call write_all()") && read("Platform/Save.md").contains("checked: 2026-09-24 "));
         assert!(read("Platform/Save.md").contains("## More\n\nOne."), "only the one section changed");
+        assert!(!read("Platform/Save.md").contains("topics"), "the topics line is not part of the section");
+        assert_eq!(crate::graph::topics_of(&db, "Platform/Save.md").unwrap(), vec!["disk", "saves"], "tagged by the re-read that wrote it");
+        assert!(crate::graph::topics_of(&db, "Rules/Strict.md").unwrap().is_empty(), "a held fix wrote nothing");
         assert!(read("Platform/Combat.md").contains("checked: 2026-09-24 ") && read("Platform/Combat.md").contains("Hits land."));
         assert!(read("Platform/Moved.md").contains("game:src/new_name.rs"), "the citation follows the rename");
         assert!(read("Reference/Vocabulary.md").contains("old_name") && read("Reference/Vocabulary.md").contains("new_name"));
@@ -1847,6 +1881,14 @@ updated: {{date}}
         run(&project, &mut db, later + 60, "2026-10-10", Some(&mut reread as &mut Reread<'_>)).unwrap();
         assert!(aged(&db).is_empty(), "checked since: resolved");
         assert_eq!(asked, 0, "the age rule never calls Claude");
+    }
+
+    #[test]
+    fn a_reread_reply_ends_with_its_topics() {
+        assert_eq!(split_topics("CHECKED\n{\"topics\": [\"Saves\", \"saves\"]}\n"), ("CHECKED".to_string(), vec!["saves".to_string()]));
+        assert_eq!(split_topics("## A\n\nText.\n\n{\"topics\": []}"), ("## A\n\nText.".to_string(), Vec::new()));
+        assert_eq!(split_topics("CHECKED"), ("CHECKED".to_string(), Vec::new()), "no topics line");
+        assert_eq!(split_topics("## A\n\n{ not json"), ("## A\n\n{ not json".to_string(), Vec::new()));
     }
 
     #[test]

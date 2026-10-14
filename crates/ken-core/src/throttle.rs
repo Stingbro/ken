@@ -2,8 +2,8 @@
 //!
 //! A person picks a pace, Gentle, Normal or Fast, or pauses: one app setting
 //! over everything Ken does on its own. Every background Claude call (the
-//! one-line summaries, drift's re-reads, the lint, topic tags, the
-//! supersession pass, ingest and the build queue) takes a turn here
+//! one-line summaries, drift's re-reads, the lint, the supersession pass,
+//! ingest and the build queue) takes a turn here
 //! ([`claude_turn`]): it waits while paused, waits out the pace's gap since
 //! the last call ended, and takes one of the hour's calls. One call runs at
 //! a time across the app, however many repos are open. Local work on the

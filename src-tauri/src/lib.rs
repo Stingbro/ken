@@ -6445,8 +6445,9 @@ const CHECKS_BACKOFF: Duration = Duration::from_secs(600);
 /// 28 to 30), for a knowledge base only: a drift run when one is due
 /// ([`run_drift`]), the graph's commit edges from each repo whose branch
 /// moved, then at most one background Claude call, the first of what
-/// waits: the lint after an edit, the topic tags of pages just written, the
-/// weekly lint, the supersession pass over new decisions-log entries. The
+/// waits: the lint after an edit, the weekly lint, the supersession pass
+/// over new decisions-log entries. Topic tags need no call of their own:
+/// the ingest plan and the drift re-read give them (decision 21). The
 /// lint that needs no model, the supersession markers and the graph's own
 /// edges are made with every scan (`scan::after_scan`).
 fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
@@ -6496,9 +6497,6 @@ fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<Atom
     };
     if let Ok(Some(p)) = ken_core::lint::after_edit_next(&db, root) {
         return done(claude(&p.prompt).and_then(|reply| ken_core::lint::after_edit_done(&mut db, &p, &reply, now)));
-    }
-    if let Ok(Some(call)) = ken_core::graph::topics_next(&db, root) {
-        return done(claude(&call.prompt).and_then(|reply| ken_core::graph::topics_done(&mut db, &call, &reply)));
     }
     if ken_core::lint::weekly_due(&db, now).unwrap_or(false) {
         if let Ok(Some(p)) = ken_core::lint::weekly_next(&db, root, now) {

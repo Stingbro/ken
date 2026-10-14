@@ -21,9 +21,10 @@
 //!     ([`read_commits`]);
 //!   - `imports` and `uses`: read live from each repo's code index when
 //!     [`related`] is asked, never copied here;
-//!   - `topic`: a page is about a topic, tagged by Claude when Ken writes
-//!     the page ([`queue_topics`], [`topics_next`], [`topics_done`]). There
-//!     is no other topic extraction, and no model reads anything else.
+//!   - `topic`: a page is about a topic, tagged by Claude in the same call
+//!     that writes the page: the ingest plan and the drift re-read ask for
+//!     its topics ([`topics_ask`], [`tag_written`]). There is no other
+//!     topic extraction, and no model reads anything else.
 //! - **Exposed as `related`** ([`related`]): a node's neighbours by edge kind,
 //!   nearest first.
 //!
@@ -63,12 +64,6 @@ pub const MAX_TOPICS: usize = 5;
 pub const FIRST_COMMITS: usize = 500;
 /// Most commits read from one repo at a time after that.
 pub const MORE_COMMITS: usize = 2_000;
-/// Most pages one tagging call reads.
-const TOPIC_PAGES: usize = 12;
-/// Longest stretch of one page a tagging call quotes, in characters.
-const TOPIC_PAGE_CHARS: usize = 4_000;
-/// The pages waiting for their topic tags (`Db::check_state`).
-const TOPIC_QUEUE: &str = "graph_topic_queue";
 
 /// One node of the graph.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -376,39 +371,9 @@ pub fn read_commits(db: &mut Db, root: &Path, repos: &[(String, PathBuf)]) -> Re
 // Topic tags, at write time only
 // ---------------------------------------------------------------------
 
-fn read_list(db: &Db, name: &str) -> Result<Vec<String>> {
-    Ok(db.check_state(name)?.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
-}
-
-fn store_list(db: &Db, name: &str, list: &[String]) -> Result<()> {
-    db.store_check_state(name, &serde_json::to_string(list).unwrap_or_else(|_| "[]".into()))
-}
-
-/// Queue pages an ingest or a drift run just wrote for their topic tags
-/// (decision 21: Claude tags at write time only). Only Markdown pages that
-/// are not an index or the log; each once.
-pub fn queue_topics(db: &Db, pages: &[String]) -> Result<()> {
-    let mut queue = read_list(db, TOPIC_QUEUE)?;
-    let before = queue.len();
-    for p in pages.iter().filter(|p| may_be_tagged(p)) {
-        if !queue.contains(p) {
-            queue.push(p.clone());
-        }
-    }
-    if queue.len() != before {
-        store_list(db, TOPIC_QUEUE, &queue)?;
-    }
-    Ok(())
-}
-
-/// The pages waiting for their topic tags.
-pub fn topics_queued(db: &Db) -> Result<Vec<String>> {
-    read_list(db, TOPIC_QUEUE)
-}
-
 /// A page worth tagging: Markdown, not an index, the log, the brief or a
 /// template.
-fn may_be_tagged(path: &str) -> bool {
+pub fn may_be_tagged(path: &str) -> bool {
     if !crate::chunker::is_markdown(path) {
         return false;
     }
@@ -417,13 +382,6 @@ fn may_be_tagged(path: &str) -> bool {
     !["index.md", "log.md", "start-here.md", "claude.md", "agents.md"].contains(&name)
         && !lower.starts_with("templates/")
         && !lower.starts_with(".ken/")
-}
-
-/// One tagging call to make: the pages it is about and its prompt.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TopicCall {
-    pub pages: Vec<String>,
-    pub prompt: String,
 }
 
 /// The topics in use, most used first, at most `n`.
@@ -439,47 +397,25 @@ pub fn topics_in_use(db: &Db, n: usize) -> Result<Vec<String>> {
     Ok(out.into_iter().take(n).map(|(t, _)| t).collect())
 }
 
-/// The next tagging call: up to a dozen queued pages that are still there,
-/// quoted, with the topics already in use so pages about one thing share a
-/// tag. None when nothing waits; queued pages that are gone leave the queue.
-pub fn topics_next(db: &Db, root: &Path) -> Result<Option<TopicCall>> {
-    let queue = topics_queued(db)?;
-    if queue.is_empty() {
-        return Ok(None);
-    }
-    let (here, gone): (Vec<String>, Vec<String>) = queue.into_iter().partition(|p| root.join(p).is_file());
-    if !gone.is_empty() {
-        store_list(db, TOPIC_QUEUE, &here)?;
-    }
-    let pages: Vec<String> = here.into_iter().take(TOPIC_PAGES).collect();
-    if pages.is_empty() {
-        return Ok(None);
-    }
-    let mut quoted = String::new();
-    for p in &pages {
-        let Ok(text) = std::fs::read_to_string(root.join(p)) else { continue };
-        let cut: String = text.chars().take(TOPIC_PAGE_CHARS).collect();
-        let more = if cut.len() < text.len() { "\n[…]" } else { "" };
-        quoted.push_str(&format!("\n--- {p}\n{cut}{more}\n"));
-    }
-    let in_use = topics_in_use(db, 80)?;
+/// What the prompt that writes a page (the ingest plan, the drift re-read)
+/// asks about its topics: short lowercase names of what it is about, the
+/// topics already in use offered first so pages about one thing share a tag.
+pub fn topics_ask(in_use: &[String]) -> String {
     let in_use = if in_use.is_empty() { "(none yet)".to_string() } else { in_use.join(", ") };
-    let prompt = format!(
-        "These pages of a team's knowledge base were just written. Tag each with 1 to {MAX_TOPICS} topics: short \
-         lowercase names (one to three words) of the features, systems or areas of work the page is about, so pages \
-         about the same thing share a tag. Use a topic already in use when one fits: {in_use}. Do not tag a page with \
-         a person, a date or a word like \"notes\". Use only the pages below; do not use any tools.\n\n\
-         Answer with JSON only: [{{\"page\": \"<path>\", \"topics\": [\"<topic>\"]}}]\n\nPages:\n{quoted}"
-    );
-    Ok(Some(TopicCall { pages, prompt }))
+    format!(
+        "1 to {MAX_TOPICS} topics: short lowercase names (one to three words) of the features, systems or areas of work \
+         it is about, so pages about the same thing share a tag. Use a topic already in use when one fits: {in_use}. \
+         Never a person, a date or a word like \"notes\""
+    )
 }
 
-/// The topics a reply gives each page: (path, topics), only for pages the
-/// call asked about, each topic once and at most [`MAX_TOPICS`].
-pub fn parse_topics(reply: &str, asked: &[String]) -> Vec<(String, Vec<String>)> {
-    let items = match crate::local_llm::parse_json_lenient(reply) {
-        Ok(Value::Array(a)) => a,
-        Ok(Value::Object(o)) => o.get("pages").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+/// The topics a JSON list gives each page, `[{"page": …, "topics": […]}]`
+/// (or that list under `pages`): (path, topics), only for pages in `asked`,
+/// each page once, each topic once and at most [`MAX_TOPICS`].
+pub fn topics_from(items: &Value, asked: &[String]) -> Vec<(String, Vec<String>)> {
+    let items = match items {
+        Value::Array(a) => a.clone(),
+        Value::Object(o) => o.get("pages").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
         _ => Vec::new(),
     };
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
@@ -488,16 +424,32 @@ pub fn parse_topics(reply: &str, asked: &[String]) -> Vec<(String, Vec<String>)>
         if !asked.contains(&page) || out.iter().any(|(p, _)| *p == page) {
             continue;
         }
-        let mut topics: Vec<String> = Vec::new();
-        for t in item.get("topics").and_then(Value::as_array).into_iter().flatten() {
-            let t = topic_name(t.as_str().unwrap_or(""));
-            if !t.is_empty() && !topics.contains(&t) && topics.len() < MAX_TOPICS {
-                topics.push(t);
-            }
-        }
-        out.push((page, topics));
+        out.push((page, topic_list(item.get("topics"))));
     }
     out
+}
+
+/// A list of topics as stored: each named once, at most [`MAX_TOPICS`].
+pub fn topic_list(v: Option<&Value>) -> Vec<String> {
+    let mut topics: Vec<String> = Vec::new();
+    for t in v.and_then(Value::as_array).into_iter().flatten() {
+        let t = topic_name(t.as_str().unwrap_or(""));
+        if !t.is_empty() && !topics.contains(&t) && topics.len() < MAX_TOPICS {
+            topics.push(t);
+        }
+    }
+    topics
+}
+
+/// A page's topic tags from the write that made it: replaced, unless the
+/// page is not one worth tagging or no topics came back (it keeps the ones
+/// it had).
+pub fn tag_written(db: &Db, page: &str, topics: &[String]) -> Result<bool> {
+    if !may_be_tagged(page) || topics.is_empty() {
+        return Ok(false);
+    }
+    set_topics(db, page, topics)?;
+    Ok(true)
 }
 
 /// A page's topic tags, replacing the ones it had.
@@ -524,19 +476,6 @@ pub fn topics_of(db: &Db, page: &str) -> Result<Vec<String>> {
         .collect();
     out.sort();
     Ok(out)
-}
-
-/// Store what a tagging call answered and take its pages off the queue
-/// (pages queued since stay). A page the reply skipped keeps the tags it
-/// had. Returns how many pages were tagged.
-pub fn topics_done(db: &mut Db, call: &TopicCall, reply: &str) -> Result<usize> {
-    let tagged = parse_topics(reply, &call.pages);
-    for (page, topics) in &tagged {
-        set_topics(db, page, topics)?;
-    }
-    let rest: Vec<String> = topics_queued(db)?.into_iter().filter(|p| !call.pages.contains(p)).collect();
-    store_list(db, TOPIC_QUEUE, &rest)?;
-    Ok(tagged.len())
 }
 
 // ---------------------------------------------------------------------
@@ -809,24 +748,30 @@ mod tests {
         assert_eq!(edges[0].detail, "2026-10-07 Fix SR-101 per D-013, UTF-8 safe, see SR-999");
     }
 
-    /// Topic tags come from a write: the pages it wrote are queued, one call
-    /// tags them, and the reply is stored beside the graph (never in
-    /// frontmatter). Pages the call did not ask about are ignored.
+    /// Topic tags come from the write that made a page: the reply's list is
+    /// stored beside the graph (never in frontmatter). Pages the write did
+    /// not make, and pages not worth tagging, are ignored.
     #[test]
     fn topic_tags_are_stored_from_a_write() {
         let (dir, mut db) = saves_library();
-        queue_topics(&db, &["Design/Saves.md".into(), "log.md".into(), "src/x.rs".into()]).unwrap();
-        assert_eq!(topics_queued(&db).unwrap(), vec!["Design/Saves.md".to_string()], "only pages worth tagging");
-        let call = topics_next(&db, dir.path()).unwrap().expect("a call");
-        assert_eq!(call.pages, vec!["Design/Saves.md".to_string()]);
-        assert!(call.prompt.contains("--- Design/Saves.md") && call.prompt.contains("(none yet)"), "{}", call.prompt);
-        let reply = r#"[{"page": "Design/Saves.md", "topics": ["Saves", "regions", "saves", "a", "b", "c", "d"]},
-                        {"page": "Other.md", "topics": ["nope"]}]"#;
-        assert_eq!(topics_done(&mut db, &call, reply).unwrap(), 1);
+        assert!(topics_ask(&[]).contains("(none yet)"));
+        let reply: Value = serde_json::from_str(
+            r#"[{"page": "Design/Saves.md", "topics": ["Saves", "regions", "saves", "a", "b", "c", "d"]},
+                {"page": "Other.md", "topics": ["nope"]}, {"page": "log.md", "topics": ["log"]}]"#,
+        )
+        .unwrap();
+        let asked = vec!["Design/Saves.md".to_string(), "log.md".to_string()];
+        let tagged = topics_from(&reply, &asked);
+        assert_eq!(tagged.len(), 2, "only the pages asked about");
+        for (page, topics) in &tagged {
+            tag_written(&db, page, topics).unwrap();
+        }
         assert_eq!(topics_of(&db, "Design/Saves.md").unwrap(), vec!["a", "b", "c", "regions", "saves"]);
-        assert!(topics_queued(&db).unwrap().is_empty());
-        assert!(topics_next(&db, dir.path()).unwrap().is_none());
+        assert!(topics_of(&db, "log.md").unwrap().is_empty(), "the log is not tagged");
+        assert!(!tag_written(&db, "Design/Saves.md", &[]).unwrap(), "no topics back: the page keeps its tags");
+        assert_eq!(topics_of(&db, "Design/Saves.md").unwrap().len(), 5);
         assert_eq!(topics_in_use(&db, 10).unwrap().len(), 5);
+        assert!(topics_ask(&topics_in_use(&db, 10).unwrap()).contains("a, b, c, regions, saves"));
         // The file itself is untouched.
         assert!(!fs::read_to_string(dir.path().join("Design/Saves.md")).unwrap().contains("regions"));
         // A scan keeps them; a page that is gone loses them.

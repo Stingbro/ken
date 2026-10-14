@@ -1074,8 +1074,9 @@ fn page_list(db: &Db) -> Result<Vec<(String, String)>> {
 }
 
 /// The plan: which pages the note changes, which new pages it calls for,
-/// which pages it retires, its rulings written up for the decisions log, and
-/// the renames it tells of.
+/// which pages it retires, its rulings written up for the decisions log, the
+/// renames it tells of, and the topics of the note and each page it names
+/// (decision 21: tagged at write time, in the same call).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Plan {
     pub update: Vec<PageChange>,
@@ -1083,7 +1084,12 @@ pub struct Plan {
     pub retire: Vec<Retire>,
     pub rulings: Vec<RulingDraft>,
     pub renames: Vec<Rename>,
+    /// (page, topics); the note itself is [`NOTE_TOPICS`].
+    pub topics: Vec<(String, Vec<String>)>,
 }
+
+/// What the plan calls the note when it gives the note's topics.
+pub const NOTE_TOPICS: &str = "note";
 
 /// A page the note makes untrue as a whole, and the page that replaces it
 /// (decision 7), a path or a `[[link]]`.
@@ -1179,11 +1185,14 @@ struct RawPlan {
     rulings: Vec<RulingDraft>,
     #[serde(default)]
     renames: Vec<Rename>,
+    #[serde(default)]
+    topics: serde_json::Value,
 }
 
-/// The plan step: the note, the knowledge base's pages, and what the
-/// knowledge base and the code say on the source's subject (`context`).
-pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str) -> String {
+/// The plan step: the note, the knowledge base's pages, what the knowledge
+/// base and the code say on the source's subject (`context`), and the topics
+/// already in use for its tags.
+pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str, topics_in_use: &[String]) -> String {
     let mut s = String::from(
         "A note was just ingested into a team's knowledge base. Plan what follows from it. Only what the note itself \
          supports; most notes change a few pages, many change none.\n\n\
@@ -1199,11 +1208,18 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str) -> Str
            a topic of two or three words, why it was made in one line (from the note), the words it was made in, who \
            made it when the note says, a few aliases (other words anyone might search for it by), and the ids of the \
            rulings it replaces, from the passages below.\n\
-         - renames: each thing the note says now goes by another name, old and new, for the Vocabulary page.\n\n\
+         - renames: each thing the note says now goes by another name, old and new, for the Vocabulary page.\n\
+         - topics: for the note (page \"note\") and each page you update, create or retire, ",
+    );
+    s.push_str(&crate::graph::topics_ask(topics_in_use));
+    s.push_str(
+        ".\n\n\
          At most 10 updates and 10 new pages. Reply with JSON only: {\"update\": [{\"path\": \"path\", \"change\": \
          \"what changes, in one line\", \"against\": \"\"}, …], \"create\": [{\"path\": \"Section/Name.md\", \"purpose\": \
-         \"what the page is for\"}, …], \"retire\": [{\"path\": \"path\", \"by\": \"path\"}, …], \"rulings\": [{\"ruling\": \"…\", \"topic\": \"…\", \"why\": \"…\", \"quote\": \"…\", \
-         \"who\": \"…\", \"aliases\": [\"…\"], \"supersedes\": [\"D-nnn\"]}, …], \"renames\": [{\"old\": \"…\", \"new\": \"…\"}, …]}.\n\n\
+         \"what the page is for\"}, …], \"retire\": [{\"path\": \"path\", \"by\": \"path\"}, …], \"rulings\": \
+         [{\"ruling\": \"…\", \"topic\": \"…\", \"why\": \"…\", \"quote\": \"…\", \"who\": \"…\", \"aliases\": [\"…\"], \
+         \"supersedes\": [\"D-nnn\"]}, …], \"renames\": [{\"old\": \"…\", \"new\": \"…\"}, …], \"topics\": [{\"page\": \
+         \"note\", \"topics\": [\"…\"]}, {\"page\": \"path\", \"topics\": [\"…\"]}, …]}.\n\n\
          PAGES IN THE KNOWLEDGE BASE:\n",
     );
     for (p, t) in pages {
@@ -1254,7 +1270,13 @@ pub fn read_plan(reply: &str, pages: &[(String, String)], root: &Path) -> Plan {
     let mut renames = raw.renames;
     renames.retain(|r| !r.old.trim().is_empty() && !r.new.trim().is_empty());
     renames.truncate(MAX_NEW);
-    Plan { update, create, retire, rulings, renames }
+    let named: Vec<String> = std::iter::once(NOTE_TOPICS.to_string())
+        .chain(update.iter().map(|u| u.path.clone()))
+        .chain(create.iter().map(|n| n.path.clone()))
+        .chain(retire.iter().map(|r| r.path.clone()))
+        .collect();
+    let topics = crate::graph::topics_from(&raw.topics, &named);
+    Plan { update, create, retire, rulings, renames, topics }
 }
 
 /// The prompt for one page edit from a note: the section that holds the
@@ -2102,7 +2124,8 @@ pub fn follow_ups(
     // A person's work not yet committed, before Ken writes anything.
     out.dirty = crate::git::uncommitted(root);
     let pages = page_list(db)?;
-    let plan = generate(&plan_prompt(&pages, note, context)).map(|r| read_plan(&r, &pages, root)).unwrap_or_default();
+    let in_use = crate::graph::topics_in_use(db, 80)?;
+    let plan = generate(&plan_prompt(&pages, note, context, &in_use)).map(|r| read_plan(&r, &pages, root)).unwrap_or_default();
 
     // Each change is one section of its page, written at once or held.
     for change in &plan.update {
@@ -2209,6 +2232,15 @@ pub fn follow_ups(
                 file_page_proposal(db, &p, &format!("Held: retire {page} from {stem}"), &body, now)?;
                 out.held.push(page.clone());
             }
+        }
+    }
+
+    // The topics the plan gave the note and the pages written (decision 21);
+    // a held page is tagged by nothing until a person applies it.
+    for (page, topics) in &plan.topics {
+        let page = if page == NOTE_TOPICS { &placement.note } else { page };
+        if *page == placement.note || out.pages.iter().any(|p| &p.path == page) {
+            crate::graph::tag_written(db, page, topics)?;
         }
     }
 
@@ -2358,10 +2390,9 @@ pub fn finish_ingest(root: &Path, db: &mut Db, placement: &Placement, note: &str
     };
     // The pages written wait for the lint after an edit (decision 29): one
     // Claude call compares them with their neighbours, in the background.
-    // They wait for their topic tags too (decision 21), the note with them.
+    // Their topic tags came with the plan.
     let written: Vec<String> = f.pages.iter().map(|p| p.path.clone()).collect();
     crate::lint::queue_after_edit(db, &written)?;
-    crate::graph::queue_topics(db, &[written.as_slice(), std::slice::from_ref(&placement.note)].concat())?;
     record(db, &placement.note, |card| {
         card.pages = f.pages.clone();
         card.commit = commit;
@@ -2729,6 +2760,13 @@ mod tests {
             vec![Retire { path: "Design/Card.md".into(), by: "Design/New.md".into() }],
             "a real page, once, with a successor"
         );
+        let tagged = "{\"update\": [\"Current/Project.md\"], \"topics\": [{\"page\": \"note\", \"topics\": [\"Ship dates\"]}, \
+                      {\"page\": \"Current/Project.md\", \"topics\": \"ship dates\"}, {\"page\": \"Design/Card.md\", \"topics\": [\"cards\"]}]}";
+        assert_eq!(
+            read_plan(tagged, &pages, d.path()).topics,
+            vec![(NOTE_TOPICS.to_string(), vec!["ship dates".to_string()]), ("Current/Project.md".to_string(), Vec::new())],
+            "the note and the pages the plan names; topics that are not a list give none"
+        );
         assert_eq!(read_plan("no json here", &pages, d.path()), Plan::default());
         let many: Vec<String> = (0..14).map(|i| format!("{{\"path\": \"Design/P{i}.md\"}}")).collect();
         assert_eq!(read_plan(&format!("{{\"create\": [{}]}}", many.join(",")), &pages, d.path()).create.len(), MAX_NEW);
@@ -2850,7 +2888,9 @@ mod tests {
          {\"path\": \"Rules/Sizes.md\", \"change\": \"a preset is effort\"}, {\"path\": \"Design/Save.md\", \"change\": \"one file\", \"against\": \"D-001\"}], \
          \"create\": [{\"path\": \"Reference/Platform/Release-dates.md\", \"purpose\": \"when we ship\"}, {\"path\": \"Rules/Ship-on-Fridays.md\", \"purpose\": \"the rule\"}], \
          \"rulings\": [{\"ruling\": \"We ship region saves before combat\", \"topic\": \"region saves\", \"why\": \"combat needs them\", \"quote\": \"regions first\", \"who\": \"Ana\", \"aliases\": [\"save regions\"]}], \
-         \"renames\": [{\"old\": \"Guild\", \"new\": \"Clan\"}, {\"old\": \"\", \"new\": \"x\"}]}"
+         \"renames\": [{\"old\": \"Guild\", \"new\": \"Clan\"}, {\"old\": \"\", \"new\": \"x\"}], \
+         \"topics\": [{\"page\": \"note\", \"topics\": [\"Ship dates\", \"standups\"]}, {\"page\": \"Current/Project.md\", \"topics\": [\"ship dates\"]}, \
+         {\"page\": \"Design/Card.md\", \"topics\": [\"cards\"]}]}"
             .into()
     }
 
@@ -2915,6 +2955,11 @@ mod tests {
         );
         assert_eq!(done.touched, vec!["Current/Project.md", "Reference/Platform/Release-dates.md", "Reference/Index.md", "Reference/Vocabulary.md"]);
         assert_eq!(done.renames, vec!["Guild → Clan"]);
+        // Topic tags came with the plan: the note's and the written page's,
+        // none for a held one.
+        assert_eq!(crate::graph::topics_of(&r.db, &r.placement.note).unwrap(), vec!["ship dates", "standups"]);
+        assert_eq!(crate::graph::topics_of(&r.db, "Current/Project.md").unwrap(), vec!["ship dates"]);
+        assert!(crate::graph::topics_of(&r.db, "Design/Card.md").unwrap().is_empty(), "held, not tagged");
         let vocabulary = fs::read_to_string(r.root.join("Reference/Vocabulary.md")).unwrap();
         assert!(vocabulary.contains("| Guild | Clan | 2026-09-24 | |"), "{vocabulary}");
 
