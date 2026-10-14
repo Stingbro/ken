@@ -220,6 +220,14 @@ pub fn next(queue: &Queue) -> Option<usize> {
     queue.items.iter().position(|i| i.state == ItemState::Queued)
 }
 
+/// Whether the source at `raw` (`Research/Ingestion/Raw/…`) is one the
+/// queue placed. Its ingest is background work, held to the throttle's hour;
+/// any other source in Raw is a person's own, which is not
+/// (`throttle::own_turn`).
+pub fn placed(queue: &Queue, raw: &str) -> bool {
+    queue.items.iter().any(|i| i.raw.as_deref() == Some(raw))
+}
+
 /// The file name a second-pass item takes in Raw: the source and the path,
 /// made safe, its extension kept, so ingest reads it as what it is.
 pub fn raw_name(source: &str, path: &str) -> String {
@@ -385,6 +393,8 @@ mod tests {
         q.items[first].state = ItemState::InRaw;
         q.items[first].raw = Some(raw.clone());
         assert_eq!(next(&q), None, "one waits in Raw");
+        assert!(placed(&q, &raw), "the queue's source is background work");
+        assert!(!placed(&q, &format!("{}/dropped.md", crate::ingest::RAW)), "a source a person dropped is their own");
 
         assert!(!refresh(&mut q, kb, &[]), "still waiting");
         assert!(refresh(&mut q, kb, &[(raw.clone(), "The CLI timed out.".into())]));

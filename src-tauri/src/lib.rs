@@ -6680,11 +6680,19 @@ fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::
                     let on_phase: Arc<dyn Fn(&str, ken_core::ingest::PassPhase) + Send + Sync> = Arc::new(move |raw, phase| {
                         INGEST_READING.lock().unwrap().insert(id, (raw.to_string(), phase));
                     });
-                    // Each ingest call is a turn of the one background throttle
-                    // (knowledge-core decision 34): paused with everything else,
-                    // paced, and counted against the hour's calls.
+                    // Each ingest call is a turn of the one throttle
+                    // (knowledge-core decision 34): paused with everything else
+                    // and paced. A source the build queue placed is background
+                    // work, counted against the hour's calls; a source a person
+                    // dropped or added is their own ingest, which the hour does
+                    // not count or hold (Chris, 2026-10-14).
                     let call = |prompt: &str| {
-                        let _turn = ken_core::throttle::claude_turn(&|| false);
+                        let reading = INGEST_READING.lock().unwrap().get(&id).map(|(raw, _)| raw.clone());
+                        let _turn = if reading.is_none_or(|raw| placed_by_build(&base, id, &raw)) {
+                            ken_core::throttle::claude_turn(&|| false)
+                        } else {
+                            ken_core::throttle::own_turn(&|| false)
+                        };
                         ken_core::ingest::call_result(ken_core::assistant::oneshot(
                             &binary,
                             &root,
@@ -6716,6 +6724,18 @@ fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::
         }
     });
     true
+}
+
+/// Whether the source at `raw` in the knowledge base `id`'s Raw was placed
+/// there by its build queue (`buildqueue::placed`), so its ingest is
+/// background work. When the queue cannot be read, it is counted as
+/// background work too.
+fn placed_by_build(base: &Path, id: uuid::Uuid, raw: &str) -> bool {
+    match Db::open_read_only(base, id).and_then(|db| ken_core::buildqueue::load(&db)) {
+        Ok(Some(queue)) => ken_core::buildqueue::placed(&queue, raw),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 /// A pass over every open library, as after a transcription model is

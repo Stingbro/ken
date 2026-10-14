@@ -77,7 +77,8 @@
       {PACES.find((p) => p.value === setting.pace)?.note}.
     {/if}
     {#if status}
-      {status.throttle.callsLastHour} of {status.throttle.callsPerHour} Claude calls used this hour.
+      {status.throttle.callsLastHour} of {status.throttle.callsPerHour} Claude calls used this hour. A source you add yourself
+      is read at the pace but not counted.
     {/if}
   </p>
 

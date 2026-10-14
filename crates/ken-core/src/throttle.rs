@@ -13,6 +13,12 @@
 //! the inbox, a cloud file brought down) take a [`step_turn`]: the pause and
 //! the gap, no call counted.
 //!
+//! A person's own ingest (a source they dropped into Raw, added in the app
+//! or through the MCP `add_source`) is not background work: its calls take
+//! an [`own_turn`], which waits while paused, while another call runs and
+//! for the gap, but is neither counted against the hour nor held by it.
+//! The build queue's sources are background work and keep the budget.
+//!
 //! It replaces the shared two-second pace, the summaries' hourly cap and
 //! the `backgroundExtraction` switch, which Pause now is.
 //!
@@ -152,15 +158,40 @@ struct State {
     next_id: u64,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    setting: Setting { pace: Pace::Gentle, paused: false },
-    next: None,
-    held_until: None,
-    calls: VecDeque::new(),
-    jobs: Vec::new(),
-    failed: VecDeque::new(),
-    next_id: 1,
-});
+impl State {
+    const fn new() -> State {
+        State {
+            setting: Setting { pace: Pace::Gentle, paused: false },
+            next: None,
+            held_until: None,
+            calls: VecDeque::new(),
+            jobs: Vec::new(),
+            failed: VecDeque::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Give a Claude call the turn at `now` when it may go: not paused, no
+    /// other call holding the turn, the gap since the last one waited out,
+    /// and, for background work (`counted`), a call left in the hour, which
+    /// it then takes. A person's own ingest is not counted and not held by
+    /// a full hour. Whether the turn was given.
+    fn give_turn(&mut self, now: Instant, counted: bool) -> bool {
+        let free = !self.setting.paused
+            && self.held_until.is_none_or(|t| now >= t)
+            && self.next.is_none_or(|t| now >= t);
+        if !free {
+            return false;
+        }
+        if counted && !take_call_at(&mut self.calls, now, self.setting.pace.limits().calls_per_hour) {
+            return false;
+        }
+        self.held_until = Some(now + TURN_HOLD);
+        true
+    }
+}
+
+static STATE: Mutex<State> = Mutex::new(State::new());
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -253,23 +284,25 @@ impl Drop for Turn {
 /// the hour has a call left. The call is counted when the turn is given.
 /// None when `stop` said to stop while waiting.
 pub fn claude_turn(stop: &dyn Fn() -> bool) -> Option<Turn> {
+    wait_turn(stop, true)
+}
+
+/// Wait for the turn of a Claude call a person asked for: their own ingest
+/// of a source they dropped or added. It waits while paused, while another
+/// call holds the turn and for the gap since the last one ended, like any
+/// call, but it is not counted against the hour and a full hour does not
+/// hold it. None when `stop` said to stop while waiting.
+pub fn own_turn(stop: &dyn Fn() -> bool) -> Option<Turn> {
+    wait_turn(stop, false)
+}
+
+fn wait_turn(stop: &dyn Fn() -> bool, counted: bool) -> Option<Turn> {
     loop {
         if stop() {
             return None;
         }
-        {
-            let mut s = state();
-            let now = Instant::now();
-            let free = !s.setting.paused
-                && s.held_until.is_none_or(|t| now >= t)
-                && s.next.is_none_or(|t| now >= t);
-            if free {
-                let cap = s.setting.pace.limits().calls_per_hour;
-                if take_call_at(&mut s.calls, now, cap) {
-                    s.held_until = Some(now + TURN_HOLD);
-                    return Some(Turn(()));
-                }
-            }
+        if state().give_turn(Instant::now(), counted) {
+            return Some(Turn(()));
         }
         std::thread::sleep(POLL);
     }
@@ -408,6 +441,35 @@ mod tests {
         }
         assert!(!take_call_at(&mut calls, start + Duration::from_secs(1800), 3), "the hour is full");
         assert!(take_call_at(&mut calls, start + Duration::from_secs(3600), 3), "an hour on, the first calls have left the window");
+    }
+
+    #[test]
+    fn a_persons_own_ingest_skips_the_hour_but_not_the_pace_or_the_pause() {
+        let mut s = State::new();
+        let start = Instant::now();
+        let cap = Pace::Gentle.limits().calls_per_hour;
+        // Background work fills the hour.
+        for i in 0..cap {
+            let at = start + Duration::from_secs(i as u64 * 60);
+            s.next = None;
+            assert!(s.give_turn(at, true), "call {i} of the hour");
+            s.held_until = None;
+        }
+        let later = start + Duration::from_secs(cap as u64 * 60);
+        assert!(!s.give_turn(later, true), "the hour is full for background work");
+        assert!(s.give_turn(later, false), "a person's own ingest still goes");
+        assert_eq!(s.calls.len(), cap, "and is not counted against the hour");
+
+        // It still waits for a call that holds the turn, for the gap and for a pause.
+        assert!(!s.give_turn(later, false), "one call at a time");
+        s.held_until = None;
+        s.next = Some(later + Duration::from_secs(10));
+        assert!(!s.give_turn(later, false), "paced between calls");
+        assert!(s.give_turn(later + Duration::from_secs(10), false));
+        s.held_until = None;
+        s.next = None;
+        s.setting.paused = true;
+        assert!(!s.give_turn(later, false), "paused with everything else");
     }
 
     #[test]
