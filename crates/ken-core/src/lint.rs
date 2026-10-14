@@ -361,11 +361,12 @@ pub fn weekly_due(db: &Db, now: i64) -> Result<bool> {
 }
 
 /// The binding and current pages (decision 23's top two tiers), the
-/// decisions log left out: its rulings are the supersession pass's.
+/// decisions log left out (its rulings are the supersession pass's), and the
+/// RAID register: a risk says what might happen, never what is true.
 pub fn binding_and_current(db: &Db, root: &Path) -> Result<Vec<String>> {
     let roles = crate::authority::Roles::of_repo(root);
     let mut out = Vec::new();
-    for p in db.page_paths()?.into_iter().filter(|p| crate::chunker::is_markdown(p) && !roles.is_decisions_log(p)) {
+    for p in db.page_paths()?.into_iter().filter(|p| crate::chunker::is_markdown(p) && !roles.is_decisions_log(p) && p != crate::raid::RAID_PAGE) {
         let tier = db.authority_of(&p)?.and_then(|(t, _)| crate::authority::Tier::parse(&t));
         if matches!(tier, Some(crate::authority::Tier::Binding | crate::authority::Tier::Current)) {
             out.push(p);

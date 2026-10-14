@@ -32,7 +32,7 @@ Each repo sits beside this one under one folder. Name a sibling by its repo name
 | [[Rules]] | how we work and the conventions we hold ourselves to · binding |
 | `Decisions/DECISIONS.md` | every ruling · binding until superseded |
 | [[Design]] | what we chose to build, and why not the alternative |
-| [[Current]] | what is true now about the project |
+| [[Current]] | what is true now about the project · [[RAID]] holds its risks and issues |
 | [[Reference]] | the vocabulary, how-tos, where things live, the platform we build on |
 | [[Research]] | dated findings and the ingest inbox · evidence at its date |
 | `tickets/` | the work in flight and the work done |
@@ -43,4 +43,5 @@ Each repo sits beside this one under one folder. Name a sibling by its repo name
 2. [[Project]] · what we are building.
 3. [[Vocabulary]] · the words where a search misses.
 4. `Decisions/DECISIONS.md` · what has been decided.
-5. [[Rules]] · how we work.
+5. [[RAID]] · what might go wrong, and what is wrong now.
+6. [[Rules]] · how we work.

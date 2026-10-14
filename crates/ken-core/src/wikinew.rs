@@ -30,6 +30,7 @@ pub const TEMPLATE: &[(&str, &str)] = template![
     "log.md",
     "Current/Index.md",
     "Current/Project.md",
+    "Current/RAID.md",
     "Decisions/DECISIONS.md",
     "Design/Index.md",
     "Reference/Index.md",

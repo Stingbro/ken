@@ -14,6 +14,7 @@ A library Claude keeps for the project, beside the code. **The code is the truth
 | `Decisions/DECISIONS.md` | every ruling, added and never edited · binding until superseded |
 | `Design/` | what we chose to build, and why not the alternative |
 | `Current/` | what is true now: the project, the roadmap, feature status · rewritten in place, never appended to |
+| `Current/RAID.md` | the risks and issues, `## R-001 · date · title` then `status:`, `owner:`, `sources:` · an entry is added with the next number, then its status changes in place |
 | `Reference/` | the vocabulary, how-tos, where things live · `Platform/`, one page per dependency we build on |
 | `Research/` | dated findings · `Ingestion/Raw/` is the inbox, `Ingestion/Ingested/` the notes · evidence at its date, never current state |
 | `tickets/` | the work in flight and the work done |
@@ -31,7 +32,7 @@ A library Claude keeps for the project, beside the code. **The code is the truth
 
 ## Ingesting
 
-A source dropped in `Research/Ingestion/Raw/` becomes a dated note in `Ingested/`, and the source moves beside it. The pages it changes are updated one section at a time, citing the note, and a new page joins its section's index. What it contradicts, in a page, a ruling, a ticket or the code, is named and becomes a finding, as does each question it leaves open. A ruling waits for one click into the decisions log; an action becomes a drafted ticket. An edit that rewrites more than a fifth of a page, lands on a `Rules/` page, or contradicts a ruling or the code waits for a person. Each ingest is one commit in this repo with one line in `log.md`, so git takes it back.
+A source dropped in `Research/Ingestion/Raw/` becomes a dated note in `Ingested/`, and the source moves beside it. The pages it changes are updated one section at a time, citing the note, and a new page joins its section's index. What it contradicts, in a page, a ruling, a ticket or the code, is named and becomes a finding, as does each question it leaves open. A ruling waits for one click into the decisions log, and a risk or issue for one click into `Current/RAID.md`; an action becomes a drafted ticket. An edit that rewrites more than a fifth of a page, lands on a `Rules/` page, or contradicts a ruling or the code waits for a person. Each ingest is one commit in this repo with one line in `log.md`, so git takes it back.
 
 ## Keeping It True
 

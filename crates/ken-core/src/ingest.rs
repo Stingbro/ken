@@ -1040,7 +1040,9 @@ fn yaml_str(s: &str) -> String {
 
 /// Sections an ingest never edits: evidence stays evidence, the blanks and
 /// the wiki's own meta pages have their own ways in, the decisions log takes
-/// rulings only as ready entries, and tickets come only as drafts.
+/// rulings only as ready entries, and tickets come only as drafts. The RAID
+/// register ([`crate::raid::RAID_PAGE`]) takes risks and issues only as
+/// entries a person adds.
 const OFF_LIMITS: [&str; 6] = ["Research/", "Templates/", "_meta/", "Decisions/", "tickets/", ".ken/"];
 
 /// Rules pages: binding, so an edit to one is held for a person. `Rules/`
@@ -1065,7 +1067,7 @@ fn may_propose(page: &str) -> bool {
         && !page.contains('\\')
         && !page.starts_with('/')
         && !OFF_LIMITS.iter().any(|p| page.starts_with(p))
-        && !matches!(page, "START-HERE.md" | "CLAUDE.md" | "README.md" | LOG_PAGE)
+        && !matches!(page, "START-HERE.md" | "CLAUDE.md" | "README.md" | LOG_PAGE | crate::raid::RAID_PAGE)
         && !page.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case("index.md"))
 }
 

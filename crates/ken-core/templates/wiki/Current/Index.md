@@ -16,3 +16,4 @@ What is true now about the project, rewritten in place when it changes and never
 | page | holds |
 |---|---|
 | [[Project]] | the product · who it is for · the goal · what is out of scope |
+| [[RAID]] | the risks and issues, each with an owner and a status · an entry is added, then its status changes in place |

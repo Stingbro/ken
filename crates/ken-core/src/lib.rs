@@ -44,6 +44,7 @@ pub mod proc;
 pub mod profiler;
 pub mod project;
 pub mod proposal;
+pub mod raid;
 pub mod raidlog;
 pub mod record;
 pub mod pty_registry;
