@@ -182,6 +182,12 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
     if code.is_empty() && dir.join(".git").exists() {
         code = nested_markers(dir, 2);
     }
+    // A repo of source files with no manifest (a few Python scripts, say)
+    // is code too, when most of what git tracks is source. Not a knowledge
+    // base, which says what it is.
+    if code.is_empty() && settings.is_empty() && library.is_empty() && dir.join(".git").exists() {
+        code.extend(mostly_source(dir));
+    }
     if !settings.is_empty() || !library.is_empty() {
         kind.push(RepoKind::Wiki);
         ev.extend(settings.iter().map(|s| s.to_string()));
@@ -194,6 +200,38 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
         ev.push(code.join(", "));
     }
     (kind, ev)
+}
+
+/// Extensions that are data or configuration, not source, among
+/// `chunker::CODE_EXTS`: a repo of them alone is not code.
+const NOT_SOURCE: [&str; 6] = ["json", "yaml", "yml", "toml", "properties", "lang"];
+
+/// The evidence that the git repo at `dir` is code by what it tracks, when
+/// more than half its tracked files are source by extension
+/// (`chunker::CODE_EXTS`, less data and configuration): `"mostly source:
+/// 2 of 3 tracked files (.py)"`. None when it is not, or git cannot say.
+fn mostly_source(dir: &Path) -> Option<String> {
+    let listed = crate::git::output_raw(dir, &["ls-files", "-z"])?;
+    let files: Vec<&str> = listed.split('\0').filter(|f| !f.is_empty()).collect();
+    let mut exts: Vec<String> = Vec::new();
+    let mut source = 0;
+    for f in &files {
+        let name = f.rsplit('/').next().unwrap_or(f);
+        let Some((_, ext)) = name.rsplit_once('.') else { continue };
+        let ext = ext.to_ascii_lowercase();
+        if crate::chunker::CODE_EXTS.contains(&ext.as_str()) && !NOT_SOURCE.contains(&ext.as_str()) {
+            source += 1;
+            if !exts.contains(&ext) {
+                exts.push(ext);
+            }
+        }
+    }
+    if source == 0 || source * 2 <= files.len() {
+        return None;
+    }
+    exts.truncate(3);
+    let shown: Vec<String> = exts.iter().map(|e| format!(".{e}")).collect();
+    Some(format!("mostly source: {source} of {} tracked files ({})", files.len(), shown.join(", ")))
 }
 
 /// Code markers in the folders below `dir`, at most `depth` levels down, as
@@ -875,6 +913,35 @@ mod tests {
         fs::create_dir_all(docs.path().join("notes/node_modules/y")).unwrap();
         fs::write(docs.path().join("notes/node_modules/y/package.json"), "{}").unwrap();
         assert!(detect(docs.path()).0.is_empty(), "only a dependency folder has a marker");
+    }
+
+    /// A git repo of source files with no manifest is code, by what it
+    /// tracks; one of mostly prose, or of untracked scripts, is not.
+    #[test]
+    fn a_repo_of_source_files_with_no_manifest_is_code() {
+        let git = |dir: &Path, args: &[&str]| crate::git::run(dir, args).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let game = d.path().join("tiny-game");
+        fs::create_dir_all(game.join("src")).unwrap();
+        fs::write(game.join("README.md"), "# Tiny game\n").unwrap();
+        fs::write(game.join("src/world.py"), "def save_world():\n    pass\n").unwrap();
+        fs::write(game.join("src/combat.py"), "def hit():\n    return 1\n").unwrap();
+        git(&game, &["init", "-q"]);
+        assert!(detect(&game).0.is_empty(), "nothing tracked yet");
+        git(&game, &["add", "-A"]);
+        let (kind, ev) = detect(&game);
+        assert_eq!(kind, vec![RepoKind::Code]);
+        assert_eq!(ev, vec!["mostly source: 2 of 3 tracked files (.py)".to_string()]);
+
+        let notes = d.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        for n in ["a.md", "b.md", "c.md"] {
+            fs::write(notes.join(n), "# Note\n").unwrap();
+        }
+        fs::write(notes.join("tool.py"), "print(1)\n").unwrap();
+        git(&notes, &["init", "-q"]);
+        git(&notes, &["add", "-A"]);
+        assert!(detect(&notes).0.is_empty(), "mostly prose is not code");
     }
 
     #[test]
