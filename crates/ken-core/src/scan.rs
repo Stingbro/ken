@@ -382,9 +382,22 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         }
     }
 
-    // The link report is read live, on the Team screen (`links::findings`).
-
+    after_scan(project, db)?;
     Ok(stats)
+}
+
+/// What every scan ends with: the supersessions the decisions log marks
+/// itself, stored for search (knowledge-core decision 25), and in a
+/// knowledge base the lint that needs no model (decision 29), its findings
+/// filed and the fixed ones resolved.
+fn after_scan(project: &Project, db: &mut Db) -> Result<()> {
+    crate::supersede::store_marked(db, &crate::authority::Roles::of_repo(&project.root))?;
+    if crate::registry::is_library(&project.root) {
+        if let Err(e) = crate::lint::on_scan(db, crate::engine::now_epoch()) {
+            eprintln!("lint: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// Files written per transaction during a scan.
@@ -829,6 +842,9 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
     }
     if pages_moved || db.stored_vocabulary()?.is_none() {
         crate::vocab::Vocabulary::rebuild(db)?;
+    }
+    if pages_moved {
+        after_scan(project, db)?;
     }
     Ok(Some(stats))
 }

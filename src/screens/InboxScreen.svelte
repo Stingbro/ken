@@ -71,15 +71,16 @@
       case "finding": {
         const f = s.finding;
         const out: { label: string; run: () => void; primary?: boolean }[] = [];
-        // A proposed page change applies, or is discarded; any other finding
-        // is marked done once seen to.
-        if (f.kind === "proposal" && f.itemId && f.projectId) {
-          out.push({ label: "Apply", primary: true, run: () => void act(item, () => api.applyPageProposal(f.itemId as number, f.projectId), "Applied.") });
+        // A supersession is confirmed (Ken writes it into the log) or
+        // dismissed; any other finding is marked done once seen to.
+        const confirms = f.kind === "supersession";
+        if (confirms && f.itemId && f.projectId) {
+          out.push({ label: "Confirm", primary: true, run: () => void act(item, () => api.confirmFinding(f.itemId as number, f.projectId), "Confirmed. The decisions log says so now.") });
         }
         if (f.path && f.projectId) out.push({ label: "Open the page", primary: out.length === 0, run: () => void openInRepo(f.projectId as string, f.path as string) });
         if (f.itemId && f.projectId) {
-          const label = f.kind === "proposal" ? "Discard" : "Mark as done";
-          out.push({ label, run: () => void act(item, () => api.resolveReviewItem(f.itemId as number, f.projectId), f.kind === "proposal" ? "Discarded." : "Marked as done.") });
+          const label = confirms ? "Dismiss" : "Mark as done";
+          out.push({ label, run: () => void act(item, () => api.resolveReviewItem(f.itemId as number, f.projectId), confirms ? "Dismissed." : "Marked as done.") });
         }
         return out;
       }

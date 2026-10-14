@@ -11,5 +11,7 @@
   "search": {
     "weights": {}
   },
-  "_search_note": "search.weights: a path pattern to a tier (binding, current, reference, record, superseded) or a number added to a hit's score; the longest pattern wins."
+  "_search_note": "search.weights: a path pattern to a tier (binding, current, reference, record, superseded) or a number added to a hit's score; the longest pattern wins.",
+  "drift": {},
+  "_drift_note": "Drift runs when a cited repo's branch moves, and at least weekly for pages whose sources do not move. All optional: controlMoved (a page known to have moved since its check) and controlClean (a page known to be clean) void a run that reads them wrong; minPages voids a run that examines fewer pages; fetch: false measures against the remote branches as last fetched."
 }

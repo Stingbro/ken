@@ -28,7 +28,7 @@ export type InboxTone = "attn" | "danger" | "accent" | "ink";
 
 export type InboxSource =
   | { type: "proposal"; proposal: IngestProposal; cardId: number; note: string; projectId: string }
-  | { type: "finding"; finding: TeamFinding & { itemId?: number | null } }
+  | { type: "finding"; finding: TeamFinding }
   | { type: "conflict"; conflict: ConflictItem }
   | { type: "failed"; relPath: string; error: string | null }
   | { type: "escalation"; escalation: DayEscalation }
@@ -99,35 +99,28 @@ export function proposalItem(p: IngestProposal, cardId: number, note: string, pr
   };
 }
 
-export function findingItem(f: TeamFinding & { itemId?: number | null }, i: number): InboxItem {
+/** What each kind of finding is called in the Inbox. */
+const FINDING_KINDS: Record<string, string> = {
+  "broken-link": "Broken link",
+  "missing-page": "Missing page",
+  "ambiguous-name": "Unclear link",
+  orphan: "Orphan page",
+  "suggested-page": "Page to write",
+  "unknown-ruling": "Unknown ruling",
+  supersession: "Superseded ruling",
+  contradiction: "Contradiction",
+  question: "Open question",
+  drift: "Out of date",
+};
+
+export function findingItem(f: TeamFinding, i: number): InboxItem {
   const k = f.kind;
-  const kind =
-    k === "broken-link" || k === "links"
-      ? "Broken link"
-      : k === "missing-page"
-        ? "Missing page"
-        : k === "ambiguous-name"
-          ? "Unclear link"
-          : k === "aged"
-            ? "Not checked lately"
-            : k === "draft" || k === "wiki-draft"
-              ? "First draft"
-              : k === "proposal"
-                ? "Proposal"
-                : k === "draft-failed"
-                  ? "Couldn't draft"
-                  : k === "repo-removed"
-                    ? "Repo left the team"
-                    : k === "contradiction"
-                      ? "Contradiction"
-                      : k === "question"
-                        ? "Open question"
-                        : "Out of date";
+  const kind = FINDING_KINDS[k] ?? "Out of date";
   return {
     id: `finding:${f.itemId ?? `${k}:${f.projectId ?? ""}:${f.path ?? i}:${f.title}`}`,
     group: "ken",
     kind,
-    tone: k === "draft" ? "accent" : "attn",
+    tone: "attn",
     from: "Ken",
     title: f.title,
     short: f.detail,

@@ -4,6 +4,7 @@
 //! resolves by path. The two are counted apart, code is stripped first, and
 //! the report is a writing queue: broken path links by section, missing
 //! names by how many pages ask for them, and every name two pages claim.
+//! The lint files what it finds as findings, on every scan (`lint`).
 //!
 //! Links are extracted per page at index time and stored raw; resolution
 //! runs when asked, against the pages and aliases the index holds then, so
@@ -345,59 +346,6 @@ pub fn page_links(db: &Db, path: &str) -> Result<PageLinks> {
     Ok(out)
 }
 
-/// One entry of the link report for the Team screen: a page to write, a
-/// broken link, or a name two pages claim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Finding {
-    /// `missing-page` · `broken-link` · `ambiguous-name`
-    pub kind: String,
-    pub title: String,
-    pub detail: String,
-    /// The page to open: the first one asking, the linking page, or the
-    /// first claimant.
-    pub path: String,
-}
-
-/// The report as findings, the most asked-for missing page first, at most
-/// `limit` of each kind.
-pub fn findings(report: &LinkReport, limit: usize) -> Vec<Finding> {
-    let mut out = Vec::new();
-    for (name, askers) in report.missing_names.iter().take(limit) {
-        out.push(Finding {
-            kind: "missing-page".into(),
-            title: format!("[[{name}]] has no page"),
-            detail: format!(
-                "Asked for by {} page{}: {}.",
-                askers.len(),
-                if askers.len() == 1 { "" } else { "s" },
-                askers.join(", ")
-            ),
-            path: askers.first().cloned().unwrap_or_default(),
-        });
-    }
-    for (section, links) in &report.broken_paths {
-        for (from, to) in links.iter().take(limit) {
-            out.push(Finding {
-                kind: "broken-link".into(),
-                title: format!("{from} links to {to}, which is not there"),
-                detail: format!("In {section}."),
-                path: from.clone(),
-            });
-        }
-    }
-    for (name, owners) in report.duplicate_names.iter().take(limit) {
-        out.push(Finding {
-            kind: "ambiguous-name".into(),
-            title: format!("Two pages claim the name {name}"),
-            detail: format!("A link to [[{name}]] is ambiguous: {}.", owners.join(", ")),
-            path: owners.first().cloned().unwrap_or_default(),
-        });
-    }
-    out
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,9 +394,10 @@ mod tests {
 
     /// End to end over a scanned library: the report counts both kinds,
     /// ranks the missing name asked for most, groups the broken path by
-    /// section, gives page neighbours both ways, and reads as findings.
+    /// section, and gives page neighbours both ways. The lint files it as
+    /// findings (`lint::scan_findings`).
     #[test]
-    fn a_scanned_library_reports_its_links_as_findings() {
+    fn a_scanned_library_reports_its_links() {
         use crate::project::Project;
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
@@ -478,12 +427,7 @@ mod tests {
         let n = page_links(&db, "Current/Team.md").unwrap();
         assert_eq!(n.outgoing, vec!["Ways-of-Working/Rules.md"], "reached through an alias");
         assert_eq!(n.incoming, vec!["Ways-of-Working/Rules.md"]);
-
-        let found = findings(&r, 20);
-        assert_eq!(found[0].kind, "missing-page");
-        assert!(found[0].title.contains("[[Ghost]]") && found[0].path == "Current/Team.md", "{found:?}");
-        assert!(found.iter().any(|f| f.kind == "broken-link" && f.path == "Ways-of-Working/Rules.md"));
-        assert!(findings(&LinkReport::default(), 20).is_empty(), "clean: nothing found");
+        assert!(LinkReport::default().is_clean());
     }
 
     #[test]

@@ -149,7 +149,7 @@
   function runSweep() {
     const id = overview?.wiki?.id;
     if (!id) return;
-    void run("sweep", "Could not run the sweep", () => api.runDriftNow(id));
+    void run("sweep", "Could not run drift", () => api.runDriftNow(id));
   }
 
   function addRule() {
@@ -393,9 +393,9 @@
           <p class="note">Nothing drifted and nothing missing{scanned ? "" : " (Scan again checks for new folders)"}.</p>
         {/if}
 
-        <div class="divider">standing sweep · the wiki's drift check</div>
+        <div class="divider">drift · runs when the code moves, and weekly</div>
         {#if !overview.wiki}
-          <p class="note">No wiki, so nothing to sweep.</p>
+          <p class="note">No wiki, so nothing to check.</p>
         {:else if overview.sweep}
           <div class="entry">
             <span>
@@ -403,16 +403,24 @@
               {overview.sweep.voidReason ? `void: ${overview.sweep.voidReason}` : overview.sweep.uncontrolled ? "no controls set" : "both controls held"}
             </span>
           </div>
+          {#if !overview.sweep.voidReason}
+            <div class="entry">
+              <span>
+                {overview.sweep.stamped?.length ?? 0} checked · {overview.sweep.fixed?.length ?? 0} fixed ·
+                {overview.sweep.held?.length ?? 0} held for you{overview.sweep.waiting?.length ? ` · ${overview.sweep.waiting.length} waiting to be read` : ""}{overview.sweep.commit ? ` · commit ${overview.sweep.commit}` : ""}
+              </span>
+            </div>
+          {/if}
         {:else}
-          <p class="note">The sweep has not run yet.</p>
+          <p class="note">Drift has not run yet.</p>
         {/if}
         {#if overview.wiki}
           <div class="actions">
-            <button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Sweeping…" : "Run the sweep now"}</button>
+            <button class="btn btn-ghost" disabled={busy !== null} onclick={runSweep}>{busy === "sweep" ? "Checking…" : "Run drift now"}</button>
           </div>
         {/if}
 
-        <div class="divider">findings · drift, links · {findings.length}</div>
+        <div class="divider">findings · drift, lint, ingest · {findings.length}</div>
         {#each findings as f, i (i)}
           <div class="entry">
             <span class="tag">{findingLabel(f.kind)}</span>

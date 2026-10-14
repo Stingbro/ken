@@ -5,24 +5,29 @@
 //! never overwrites" anchors) because nothing said that D-410, a day later,
 //! had ruled anchors are written only by the tools and the fix is not built.
 //!
-//! The pass reads a decisions log's entries from the index (one chunk per
-//! entry), finds entries that may cover the same subject — the topics in each
-//! entry's head, the named things they share (`/commands`, files,
-//! identifiers), one citing the other, and how close their meaning is — puts
-//! them in small clusters, and asks Claude once per cluster which later entry
-//! supersedes or refines which earlier one, and on what point. Those pairs,
-//! and the ones the log marks itself (`[SUPERSEDED BY D-302]`, `[REFINES]
-//! D-425`), are stored in Ken's index, never in the log: search labels a
-//! superseded entry's hit and ranks it under its successor, and read_document
-//! says so beside the entry.
+//! Wired in (knowledge-core decision 25):
+//!
+//! - **Markers on every scan** ([`store_marked`]): the pairs the log marks
+//!   itself (`[SUPERSEDED BY D-302]`, `[REFINES] D-425`, `supersedes: D-114`)
+//!   are stored in Ken's index, so search labels a superseded entry's hit
+//!   and ranks it under its successor, and read_document says so beside it.
+//! - **The Claude pass on new entries only** ([`next_cluster`], [`judged`]):
+//!   the log's entries are read from the index (one chunk per entry), put in
+//!   small clusters of entries that may cover the same subject (the topics
+//!   in each entry's head, the named things they share, one citing the
+//!   other, how close their meaning is), and Claude is asked about a cluster
+//!   only when it holds an entry the pass has not read. The app asks in the
+//!   background, behind the shared pace and the hourly cap.
+//! - **Each pair it finds is a finding**, never written by itself. When a
+//!   person confirms one ([`confirm`]), Ken writes `supersedes:` on the later
+//!   entry and `[SUPERSEDED BY D-nnn]` on the earlier ([`mark_in_log`]) as
+//!   one commit; the next scan stores it as a marker.
 //!
 //! Generic: any log whose entries carry an id and a date (`**D-410** ·
 //! 2026-10-06 · topics — **TITLE**`), named by the team file (`decisions`) or
 //! called `DECISIONS.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -400,97 +405,239 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-/// The pass over one log: its entries, its clusters, the calls made and the
-/// pairs found.
-#[derive(Debug, Clone, Default)]
-pub struct Report {
-    pub log: String,
-    pub entries: usize,
-    /// Entries with a meaning vector (the rest cluster by words alone).
-    pub vectors: usize,
-    pub clusters: Vec<Vec<String>>,
-    pub calls: usize,
-    pub failed: usize,
-    pub prompt_chars: usize,
-    pub marked: usize,
-    pub pairs: Vec<Supersession>,
+/// Store the pairs every decisions log marks itself ([`marked`]), on every
+/// scan (decision 25): search labels a superseded entry and leads with its
+/// successor from these. They replace what was stored for each log, so a
+/// marker taken out of the log is gone from search too. Returns how many
+/// pairs were stored.
+pub fn store_marked(db: &Db, roles: &Roles) -> Result<usize> {
+    let mut n = 0;
+    for log in log_paths(db, roles)? {
+        let pairs = marked(&log, &entries(db, &log)?);
+        n += pairs.len();
+        db.replace_supersessions(&log, &pairs)?;
+    }
+    Ok(n)
 }
 
-/// One Claude call: a prompt in, its answer's text out.
-pub type Judge<'a> = dyn Fn(&str) -> Result<String> + Sync + 'a;
+/// The check state that remembers which entries the Claude pass has read.
+const SEEN: &str = "supersede_seen";
 
-/// Run the pass over every decisions log in the repo the index `db` is of
-/// (`roles` from its team file): cluster each log's entries and, with a
-/// `judge`, ask it once per cluster, `workers` calls at a time; then store
-/// the judged and marked pairs in the index, replacing the log's last ones.
-/// Without a judge it only reports the clusters and stores nothing.
-pub fn run(db: &Db, roles: &Roles, tuning: &Tuning, judge: Option<&Judge<'_>>, workers: usize) -> Result<Vec<Report>> {
-    let mut reports = Vec::new();
+fn seen(db: &Db) -> Result<HashMap<String, HashSet<String>>> {
+    Ok(db.check_state(SEEN)?.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+}
+
+fn store_seen(db: &Db, seen: &HashMap<String, HashSet<String>>) -> Result<()> {
+    db.store_check_state(SEEN, &serde_json::to_string(seen).unwrap_or_else(|_| "{}".into()))
+}
+
+/// One Claude call the pass wants: a cluster of one log's entries with at
+/// least one the pass has not read yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub log: String,
+    /// The cluster's entries, oldest first.
+    pub ids: Vec<String>,
+    /// Those the pass had not read.
+    pub new: Vec<String>,
+    pub prompt: String,
+}
+
+/// The next cluster to ask Claude about (decision 25): the pass runs on new
+/// entries only, so a cluster is asked about only when it holds an entry the
+/// pass has not read; a new entry is clustered with the whole log, so it
+/// meets the older rulings it may change. The first time the pass sees a
+/// log, every entry is new to it. New entries no cluster takes in are marked
+/// read at once. None when nothing waits; no call is needed then.
+pub fn next_cluster(db: &Db, roles: &Roles, tuning: &Tuning) -> Result<Option<Pending>> {
+    let mut seen_all = seen(db)?;
+    let mut changed = false;
+    let mut out = None;
     for log in log_paths(db, roles)? {
         let entries = entries(db, &log)?;
-        if entries.len() < 2 {
+        let seen = seen_all.entry(log.clone()).or_default();
+        let new: HashSet<&str> = entries.iter().map(|e| e.id.as_str()).filter(|id| !seen.contains(*id)).collect();
+        if new.is_empty() {
             continue;
         }
         let vectors = db.chunk_vectors(&entries.iter().map(|e| e.chunk_id).collect::<Vec<_>>())?;
         let groups = clusters(&entries, &vectors, tuning);
-        let prompts: Vec<(Vec<&Entry>, String)> = groups
-            .iter()
-            .map(|g| {
-                let members: Vec<&Entry> = g.iter().map(|&i| &entries[i]).collect();
-                let p = prompt(&log, &members);
-                (members, p)
-            })
-            .collect();
-        let marked = marked(&log, &entries);
-        let mut report = Report {
-            log: log.clone(),
-            entries: entries.len(),
-            vectors: vectors.len(),
-            clusters: groups.iter().map(|g| g.iter().map(|&i| entries[i].id.clone()).collect()).collect(),
-            prompt_chars: prompts.iter().map(|(_, p)| p.len()).sum(),
-            marked: marked.len(),
-            ..Default::default()
-        };
-        let Some(judge) = judge else {
-            report.pairs = marked;
-            reports.push(report);
-            continue;
-        };
-        let next = AtomicUsize::new(0);
-        let found: Mutex<Vec<Supersession>> = Mutex::new(Vec::new());
-        let failed = AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..workers.max(1) {
-                s.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::SeqCst);
-                    let Some((members, p)) = prompts.get(i) else { break };
-                    match judge(p) {
-                        Ok(answer) => found.lock().unwrap().extend(parse_judgement(&answer, &log, members)),
-                        Err(_) => {
-                            failed.fetch_add(1, Ordering::SeqCst);
-                        }
-                    }
-                });
-            }
-        });
-        report.calls = prompts.len();
-        report.failed = failed.into_inner();
-        let mut pairs = found.into_inner().unwrap_or_default();
-        for m in marked {
-            match pairs.iter_mut().find(|p| p.earlier == m.earlier && p.later == m.later) {
-                Some(p) => {
-                    p.source = "marked+judged".into();
-                    p.relation = m.relation;
-                }
-                None => pairs.push(m),
-            }
+        if let Some(g) = groups.iter().find(|g| g.iter().any(|&i| new.contains(entries[i].id.as_str()))) {
+            let members: Vec<&Entry> = g.iter().map(|&i| &entries[i]).collect();
+            out = Some(Pending {
+                log: log.clone(),
+                ids: members.iter().map(|e| e.id.clone()).collect(),
+                new: members.iter().map(|e| e.id.clone()).filter(|id| new.contains(id.as_str())).collect(),
+                prompt: prompt(&log, &members),
+            });
+            break;
         }
-        pairs.sort_by(|a, b| (id_number(&a.later), id_number(&a.earlier)).cmp(&(id_number(&b.later), id_number(&b.earlier))));
-        db.replace_supersessions(&log, &pairs)?;
-        report.pairs = pairs;
-        reports.push(report);
+        // No cluster holds a new entry: nothing near it to supersede.
+        seen.extend(new.iter().map(|s| s.to_string()));
+        changed = true;
     }
-    Ok(reports)
+    if changed {
+        store_seen(db, &seen_all)?;
+    }
+    Ok(out)
+}
+
+/// What the supersession findings name as their source kind.
+pub const FINDING_KIND: &str = "supersession";
+
+/// File what Claude found in `pending`'s cluster: each pair is a finding
+/// (decision 25), unless the log already marks it or a finding for it was
+/// filed before (open, confirmed or dismissed). The cluster's new entries
+/// are then read. Returns how many findings were filed.
+pub fn judged(db: &mut Db, pending: &Pending, reply: &str, now: i64) -> Result<usize> {
+    let entries = entries(db, &pending.log)?;
+    let members: Vec<&Entry> = entries.iter().filter(|e| pending.ids.contains(&e.id)).collect();
+    let marked = marked(&pending.log, &entries);
+    let filed_before = crate::findings::ever(db, FINDING_KIND)?;
+    let mut n = 0;
+    for s in parse_judgement(reply, &pending.log, &members) {
+        let known = marked.iter().any(|m| m.earlier == s.earlier && m.later == s.later)
+            || filed_before.iter().any(|f| f.source == pending.log && f.subject == s.later && f.against == s.earlier);
+        if known {
+            continue;
+        }
+        let verb = if s.relation == "refines" { "refines" } else { "supersedes" };
+        let on = if s.point.is_empty() { String::new() } else { format!(" on {}", s.point) };
+        let f = crate::findings::Finding {
+            kind: FINDING_KIND.into(),
+            source: pending.log.clone(),
+            subject: s.later.clone(),
+            against: s.earlier.clone(),
+            against_kind: "ruling".into(),
+            text: format!("{} {verb} {}{on}. Confirm it and Ken writes it into the log.", s.later, s.earlier),
+            quote: s.evidence.clone(),
+            relation: s.relation.clone(),
+        };
+        crate::findings::file(db, &f, now)?;
+        n += 1;
+    }
+    let mut seen_all = seen(db)?;
+    seen_all.entry(pending.log.clone()).or_default().extend(pending.new.iter().cloned());
+    store_seen(db, &seen_all)?;
+    Ok(n)
+}
+
+/// The lines `id`'s entry spans in a log's lines: from its first line to
+/// the next entry or heading. Fenced examples are not entries.
+fn entry_span(lines: &[String], id: &str) -> Option<(usize, usize)> {
+    let mut fence = false;
+    let mut start: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("```") {
+            fence = !fence;
+            if start.is_some() {
+                return start.map(|s| (s, i));
+            }
+            continue;
+        }
+        if fence {
+            continue;
+        }
+        let begins = crate::chunker::entry_start(l).map(|(e, _)| e);
+        match (start, begins) {
+            (None, Some(e)) if e == id => start = Some(i),
+            (Some(s), Some(_)) => return Some((s, i)),
+            (Some(s), None) if l.trim_start().starts_with('#') => return Some((s, i)),
+            _ => {}
+        }
+    }
+    start.map(|s| (s, lines.len()))
+}
+
+/// A decisions log with a confirmed pair written into it (decision 25): the
+/// later entry says `supersedes: D-earlier` (or `refines:`), and the earlier
+/// one carries `[SUPERSEDED BY D-later]` (or `[REFINED BY …]`). Every entry
+/// form reads: the plain and bold one-line forms take the marker at the end
+/// of their line and the field on an indented line under it; the one entry
+/// format (`## D-nnn · date · topic`) takes the marker on the line after its
+/// bold ruling and the field among its own fields. None when an entry is
+/// not in the log, or both are already written.
+pub fn mark_in_log(text: &str, earlier: &str, later: &str, relation: &str) -> Option<String> {
+    let crlf = text.contains("\r\n");
+    let t = text.replace("\r\n", "\n");
+    let mut lines: Vec<String> = t.lines().map(str::to_string).collect();
+    let refines = relation == "refines";
+    let marker = format!("[{} BY {later}]", if refines { "REFINED" } else { "SUPERSEDED" });
+    let field = if refines { "refines" } else { "supersedes" };
+    let (es, ee) = entry_span(&lines, earlier)?;
+    let (ls, le) = entry_span(&lines, later)?;
+    let has_marker = lines[es..ee].iter().any(|l| l.contains(&marker));
+    let field_at = (ls..le).find(|&i| lines[i].trim_start().to_ascii_lowercase().starts_with(&format!("{field}:")));
+    let has_field = field_at.is_some_and(|i| regex::Regex::new(&format!(r"\b{}\b", regex::escape(earlier))).is_ok_and(|r| r.is_match(&lines[i])));
+    if has_marker && has_field {
+        return None;
+    }
+    let heading = |i: usize, lines: &[String]| lines[i].trim_start().starts_with('#');
+    let mark_earlier = |lines: &mut Vec<String>| {
+        if has_marker {
+            return;
+        }
+        if heading(es, lines) {
+            let after = (es + 1..ee).find(|&i| lines[i].trim_start().starts_with("**")).unwrap_or(es);
+            lines.insert(after + 1, marker.clone());
+        } else {
+            let line = lines[es].trim_end().to_string();
+            lines[es] = format!("{line} {marker}");
+        }
+    };
+    let mark_later = |lines: &mut Vec<String>| {
+        if has_field {
+            return;
+        }
+        if let Some(i) = field_at {
+            let line = lines[i].trim_end().to_string();
+            lines[i] = format!("{line}, {earlier}");
+            return;
+        }
+        let last = (ls..le).rev().find(|&i| !lines[i].trim().is_empty()).unwrap_or(ls);
+        // The one entry format keeps its fields flush; a one-line entry's
+        // fields sit indented under it.
+        let indent: String = if heading(ls, lines) {
+            String::new()
+        } else {
+            let own: String = lines[last].chars().take_while(|c| c.is_whitespace()).collect();
+            if last > ls && !own.is_empty() { own } else { "  ".to_string() }
+        };
+        lines.insert(last + 1, format!("{indent}{field}: {earlier}"));
+    };
+    // The entry further down first, so the other's lines stay where they are.
+    if es > ls {
+        mark_earlier(&mut lines);
+        mark_later(&mut lines);
+    } else {
+        mark_later(&mut lines);
+        mark_earlier(&mut lines);
+    }
+    let out = lines.join("\n") + "\n";
+    Some(if crlf { out.replace('\n', "\r\n") } else { out })
+}
+
+/// A person confirmed a supersession finding: Ken writes the pair into its
+/// log ([`mark_in_log`]) and commits that one file in the knowledge base at
+/// `root` (`git::commit_paths`, never pushed). Returns the commit, None
+/// when the log already said so or the knowledge base is not a git repo.
+pub fn confirm(root: &std::path::Path, f: &crate::findings::Finding) -> std::result::Result<Option<String>, String> {
+    if f.kind != FINDING_KIND {
+        return Err("only a supersession is confirmed".into());
+    }
+    let path = root.join(&f.source);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("could not read {}: {e}", f.source))?;
+    let Some(marked) = mark_in_log(&text, &f.against, &f.subject, &f.relation) else {
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        if let Some(gone) = [&f.against, &f.subject].into_iter().find(|id| entry_span(&lines, id).is_none()) {
+            return Err(format!("{gone} is not in {} any more", f.source));
+        }
+        return Ok(None);
+    };
+    std::fs::write(&path, marked).map_err(|e| format!("could not write {}: {e}", f.source))?;
+    let verb = if f.relation == "refines" { "refines" } else { "supersedes" };
+    let message = format!("decisions: {} {verb} {}\n\n{}", f.subject, f.against, f.text);
+    crate::git::commit_paths(root, std::slice::from_ref(&f.source), &message)
 }
 
 /// What a hit on entry `id` of `log` adds to its label for the pairs:
@@ -700,53 +847,157 @@ mod tests {
             text.push_str("\n\n");
         }
         let log = "decisions/DECISIONS.md".to_string();
-        db.upsert_file(&log, "md", 1, 1, "indexed", None, &text).unwrap();
-        let chunks = crate::chunker::chunk_file(&log, &text, &crate::chunker::IndexProfile::default_for(&log));
-        db.upsert_chunks(&log, &chunks, crate::kenignore::Tier::Full).unwrap();
+        index(&mut db, &log, &text);
         (db, log)
     }
 
+    fn index(db: &mut Db, log: &str, text: &str) {
+        db.upsert_file(log, "md", 1, 1, "indexed", None, text).unwrap();
+        let chunks = crate::chunker::chunk_file(log, text, &crate::chunker::IndexProfile::default_for(log));
+        db.upsert_chunks(log, &chunks, crate::kenignore::Tier::Full).unwrap();
+    }
+
     #[test]
-    fn a_pass_reads_the_log_from_the_index_and_stores_the_pairs() {
-        let (db, log) = indexed_log();
+    fn markers_are_stored_and_the_pass_reads_new_entries_only() {
+        let (mut db, log) = indexed_log();
+        let roles = Roles::default();
         let entries = entries(&db, &log).unwrap();
         assert_eq!(entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["D-302", "D-379", "D-380", "D-381", "D-410", "D-411"]);
         let d410 = entries.iter().find(|e| e.id == "D-410").unwrap();
         assert!(d410.text.starts_with("**D-410** · 2026-10-06") && d410.line > 0, "{d410:?}");
 
-        let tuning = Tuning { min_score: 0.6, neighbours: 2, max_cluster: 4 };
-        // A dry run reports and stores nothing.
-        let dry = run(&db, &Roles::default(), &tuning, None, 1).unwrap();
-        assert_eq!((dry.len(), dry[0].calls, dry[0].marked), (1, 0, 2));
-        assert!(!dry[0].clusters.is_empty());
-        assert!(!db.has_supersessions().unwrap());
-
-        let asked = AtomicUsize::new(0);
-        let judge = |p: &str| -> Result<String> {
-            asked.fetch_add(1, Ordering::SeqCst);
-            Ok(if p.contains("--- D-410") && p.contains("--- D-379") {
-                r#"[{"earlier":"D-379","later":"D-410","relation":"supersedes","point":"who writes anchors","evidence":"only through the tools"}]"#.into()
-            } else {
-                "[]".into()
-            })
-        };
-        let reports = run(&db, &Roles::default(), &tuning, Some(&judge), 2).unwrap();
-        assert_eq!(reports[0].calls, asked.load(Ordering::SeqCst));
-        let pairs: Vec<(String, String, String)> = db.supersessions(None).unwrap().into_iter().map(|s| (s.earlier, s.later, s.source)).collect();
-        assert!(pairs.contains(&("D-379".into(), "D-410".into(), "judged".into())), "{pairs:?}");
-        assert!(pairs.contains(&("D-302".into(), "D-381".into(), "marked".into())), "{pairs:?}");
-
-        assert_eq!(note(&db, &log, "D-379").unwrap().as_deref(), Some("superseded by D-410 on who writes anchors"));
-        assert_eq!(note(&db, &log, "D-410").unwrap().as_deref(), Some("supersedes D-379"));
-        assert_eq!(note(&db, &log, "D-411").unwrap().as_deref(), Some("refines D-380"));
+        // Markers, on every scan: what the log says itself, and nothing else.
+        assert_eq!(store_marked(&db, &roles).unwrap(), 2);
+        assert_eq!(note(&db, &log, "D-302").unwrap().as_deref(), Some("superseded by D-381 on rolls per chest"));
         assert_eq!(note(&db, &log, "D-381").unwrap().as_deref(), Some("supersedes D-302"));
+        assert_eq!(note(&db, &log, "D-411").unwrap().as_deref(), Some("refines D-380"));
+        assert_eq!(note(&db, &log, "D-001").unwrap(), None);
         let chunk = entry_chunk(&db, &log, "D-410", 0).unwrap().unwrap();
         assert!(chunk.1.contains("**D-410**"));
 
-        assert_eq!(note(&db, &log, "D-001").unwrap(), None);
+        // The pass: every entry is new the first time, and each cluster is
+        // asked about once.
+        let tuning = Tuning { min_score: 0.6, neighbours: 2, max_cluster: 4 };
+        let mut calls = 0;
+        while let Some(p) = next_cluster(&db, &roles, &tuning).unwrap() {
+            calls += 1;
+            assert!(calls < 10, "a cluster asked about twice: {p:?}");
+            assert!(!p.new.is_empty() && p.prompt.contains(&format!("--- {}", p.ids[0])));
+            let anchors = p.ids.contains(&"D-379".to_string()) && p.ids.contains(&"D-410".to_string());
+            let reply = if anchors {
+                r#"[{"earlier":"D-379","later":"D-410","relation":"supersedes","point":"who writes anchors","evidence":"only through the tools"},
+                    {"earlier":"D-302","later":"D-381","relation":"supersedes","point":"rolls","evidence":""}]"#
+            } else {
+                "[]"
+            };
+            judged(&mut db, &p, reply, 5).unwrap();
+        }
+        assert!(calls >= 1);
+        let found: Vec<crate::findings::Finding> = crate::findings::open(&db).unwrap().into_iter().map(|(_, f)| f).collect();
+        assert_eq!(found.len(), 1, "a pair the log marks itself is no finding: {found:?}");
+        let f = &found[0];
+        assert_eq!((f.kind.as_str(), f.subject.as_str(), f.against.as_str(), f.relation.as_str()), ("supersession", "D-410", "D-379", "supersedes"));
+        assert_eq!(f.page(), log, "it opens the log");
+        assert_eq!(note(&db, &log, "D-379").unwrap(), None, "a judged pair is not in search until a person confirms it");
+        assert!(next_cluster(&db, &roles, &tuning).unwrap().is_none(), "nothing new: no call");
 
-        // Run again: the log's pairs are replaced, not added to.
-        run(&db, &Roles::default(), &tuning, Some(&judge), 1).unwrap();
-        assert_eq!(db.supersessions(Some(&log)).unwrap().len(), pairs.len());
+        // A new entry: only a cluster holding it is asked about.
+        let mut text = db.get_text(&log).unwrap().unwrap();
+        text.push_str("**D-412** · 2026-10-07 · anchors, tools — **ANCHORS MOVE ONLY IN THE TOOLS, NEVER `/sr_anchor` MOVE.**\n");
+        index(&mut db, &log, &text);
+        let p = next_cluster(&db, &roles, &tuning).unwrap().expect("the new entry is read");
+        assert_eq!(p.new, vec!["D-412".to_string()]);
+        let again = r#"[{"earlier":"D-379","later":"D-410","relation":"supersedes","point":"who writes anchors","evidence":""}]"#;
+        judged(&mut db, &p, again, 6).unwrap();
+        assert_eq!(crate::findings::open(&db).unwrap().len(), 1, "a pair already filed is not filed again");
+        assert!(next_cluster(&db, &roles, &tuning).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_confirmed_pair_is_written_into_every_entry_form() {
+        // The one entry format: the marker under the bold ruling, the field
+        // among the entry's own.
+        let log = "# Decisions\n\n## D-001 · 2026-10-01 · saves\n\n**Saves are global.**\n\nWhy: simple.\nsources: [[n]]\n\n\
+                   ## D-002 · 2026-10-02 · saves\n\n**Saves are per region.**\n\nWhy: size.\nsources: [[m]]\n";
+        let out = mark_in_log(log, "D-001", "D-002", "supersedes").unwrap();
+        assert!(out.contains("**Saves are global.**\n[SUPERSEDED BY D-002]\n"), "{out}");
+        assert!(out.ends_with("sources: [[m]]\nsupersedes: D-001\n"), "{out}");
+        assert!(mark_in_log(&out, "D-001", "D-002", "supersedes").is_none(), "already written");
+        let rulings = crate::drift::parse_rulings(&out);
+        assert!(rulings.iter().find(|r| r.id == "D-001").is_some_and(|r| r.superseded), "{rulings:?}");
+
+        // The bold one-line form: the marker on its line, the field under it.
+        let bold = "**D-379** · 2026-10-05 · anchors — **THE SERVER NEVER OVERWRITES.**\n  sources: game:a.rs\n\n\
+                    **D-410** · 2026-10-06 · anchors — **ONLY THE TOOLS.**\n";
+        let out = mark_in_log(bold, "D-379", "D-410", "supersedes").unwrap();
+        assert!(out.starts_with("**D-379** · 2026-10-05 · anchors — **THE SERVER NEVER OVERWRITES.** [SUPERSEDED BY D-410]\n  sources: game:a.rs\n"), "{out}");
+        assert!(out.contains("**ONLY THE TOOLS.**\n  supersedes: D-379\n"), "{out}");
+
+        // The plain form, refining, with the field already there.
+        let plain = "D-001 - 2026-01-01 - topic - THE RULING.\nD-002 - 2026-01-02 - topic - NARROWER.\n  refines: D-000\n";
+        let out = mark_in_log(plain, "D-001", "D-002", "refines").unwrap();
+        assert!(out.starts_with("D-001 - 2026-01-01 - topic - THE RULING. [REFINED BY D-002]\n"), "{out}");
+        assert!(out.contains("  refines: D-000, D-001\n"), "{out}");
+        assert!(mark_in_log(plain, "D-001", "D-999", "supersedes").is_none(), "an entry the log lacks");
+    }
+
+    #[test]
+    fn confirming_writes_the_log_and_commits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(["-c", "user.name=T", "-c", "user.email=t@t"]).args(args).current_dir(root).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("Decisions")).unwrap();
+        let log = "Decisions/DECISIONS.md";
+        std::fs::write(root.join(log), "# Decisions\n\n**D-379** · 2026-10-05 · anchors — **NEVER.**\n\n**D-410** · 2026-10-06 · anchors — **TOOLS.**\n").unwrap();
+        std::fs::write(root.join("notes.md"), "a person's own work\n").unwrap();
+        git(&["add", "--", log]);
+        git(&["commit", "-q", "-m", "log"]);
+        let f = crate::findings::Finding {
+            kind: FINDING_KIND.into(),
+            source: log.into(),
+            subject: "D-410".into(),
+            against: "D-379".into(),
+            against_kind: "ruling".into(),
+            text: "D-410 supersedes D-379 on who writes anchors.".into(),
+            relation: "supersedes".into(),
+            ..Default::default()
+        };
+        assert!(confirm(root, &f).unwrap().is_some());
+        let text = std::fs::read_to_string(root.join(log)).unwrap();
+        assert!(text.contains("**NEVER.** [SUPERSEDED BY D-410]") && text.contains("**TOOLS.**\n  supersedes: D-379"), "{text}");
+        let shown = git(&["show", "--name-only", "--format=%s", "HEAD"]);
+        assert!(shown.starts_with("decisions: D-410 supersedes D-379") && !shown.contains("notes.md"), "{shown}");
+        assert_eq!(confirm(root, &f).unwrap(), None, "said once");
+        let gone = crate::findings::Finding { against: "D-001".into(), ..f.clone() };
+        assert!(confirm(root, &gone).is_err());
+    }
+
+    #[test]
+    fn a_scan_reads_the_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Decisions")).unwrap();
+        let mut log = "# Decisions\n\n## D-001 · 2026-10-01 · saves\n\n**Saves are global.**\n[SUPERSEDED BY D-002]\n\n\
+                       ## D-002 · 2026-10-02 · saves\n\n**Saves are per region.**\n\nsupersedes: D-001\n"
+            .to_string();
+        for n in 3..=6 {
+            log.push_str(&format!("\n## D-00{n} · 2026-10-0{n} · topic {n}\n\n**Ruling {n}.**\n"));
+        }
+        let log = log.as_str();
+        std::fs::write(dir.path().join("Decisions/DECISIONS.md"), log).unwrap();
+        let project = crate::project::Project::create(dir.path(), "kb").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        assert_eq!(note(&db, "Decisions/DECISIONS.md", "D-001").unwrap().as_deref(), Some("superseded by D-002"));
+
+        // The marker taken out of the log: gone from search on the next scan.
+        let bare = log.replace("[SUPERSEDED BY D-002]\n", "").replace("supersedes: D-001\n", "");
+        std::fs::write(dir.path().join("Decisions/DECISIONS.md"), bare).unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        assert_eq!(note(&db, "Decisions/DECISIONS.md", "D-001").unwrap(), None);
     }
 }

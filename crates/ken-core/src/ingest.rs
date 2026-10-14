@@ -2190,6 +2190,7 @@ pub fn follow_ups(
             against: c.against.clone(),
             text: c.text.clone(),
             quote: c.quote.clone(),
+            ..Default::default()
         };
         crate::findings::file(db, &f, now)?;
         out.contradictions.push(c.line());
@@ -2252,6 +2253,10 @@ pub fn finish_ingest(root: &Path, db: &mut Db, placement: &Placement, note: &str
         Ok(c) => (c, None),
         Err(e) => (None, Some(e)),
     };
+    // The pages written wait for the lint after an edit (decision 29): one
+    // Claude call compares them with their neighbours, in the background.
+    let written: Vec<String> = f.pages.iter().map(|p| p.path.clone()).collect();
+    crate::lint::queue_after_edit(db, &written)?;
     record(db, &placement.note, |card| {
         card.pages = f.pages.clone();
         card.commit = commit;
@@ -2262,9 +2267,9 @@ pub fn finish_ingest(root: &Path, db: &mut Db, placement: &Placement, note: &str
 /// After a person applies what waited in the knowledge base (a ready ruling,
 /// a drafted ticket, a held edit): a held new page joins its section index,
 /// and the change is its own commit. Returns the commit; None when the
-/// proposal did not come from an ingest (Ken commits only in the knowledge
-/// base, decision 36), is in another repo, or the knowledge base is not a
-/// git repo.
+/// proposal did not come from an ingest or a drift run (Ken commits only in
+/// the knowledge base, decision 36), is in another repo, or the knowledge
+/// base is not a git repo.
 pub fn accepted(root: &Path, p: &crate::proposal::Proposal) -> std::result::Result<Option<String>, String> {
     let (Some(from), None) = (p.from.as_deref(), p.root.as_ref()) else { return Ok(None) };
     let from = note_stem(from);
@@ -2277,6 +2282,8 @@ pub fn accepted(root: &Path, p: &crate::proposal::Proposal) -> std::result::Resu
         }
     }
     let message = match (kind, &p.append) {
+        // An edit a drift run held (decision 28).
+        _ if from == crate::drift::HELD_FROM => format!("drift: apply the held edit to {}", p.page),
         ("ruling", Some(r)) => format!("decisions: add the ruling from {from}\n\n{}", r.ruling),
         ("ticket", _) => format!("tickets: {} from {from}", note_stem(&p.page)),
         ("new page", _) => format!("ingest: add {} from {from}", p.page),

@@ -34,6 +34,7 @@ pub mod kenignore;
 pub mod knowledge_model;
 pub mod knowledge_settings;
 pub mod links;
+pub mod lint;
 pub mod local_llm;
 pub mod memory;
 pub mod model;

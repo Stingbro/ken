@@ -858,10 +858,10 @@ fn chunk_prose(text: &str, profile: &IndexProfile) -> Vec<(usize, String)> {
 
     for (block_line, block) in blocks {
         // One paragraph or table longer than a chunk is cut at its line ends
-        // into chunks of its own. Kept whole, the 2,300-row table of
-        // decisions/Cited-in-Code.md was one 445 KB chunk on 2026-10-06: it
-        // held every word of nearly every question, so it matched them all
-        // and answered none.
+        // into chunks of its own. Kept whole, a generated 2,300-row table
+        // (the Cited-in-Code page, since removed) was one 445 KB chunk on
+        // 2026-10-06: it held every word of nearly every question, so it
+        // matched them all and answered none.
         if block.len() > target_chars {
             if !current.trim().is_empty() {
                 chunks.push((line.unwrap_or(block_line), std::mem::take(&mut current)));
@@ -1494,12 +1494,12 @@ mod tests {
     #[test]
     fn a_table_longer_than_a_chunk_is_cut_at_its_rows_and_keeps_its_header() {
         let header = "| id | cited at | the comment |\n|---|---|---|\n";
-        let mut text = format!("# Decisions Cited in Code\n\n{header}");
+        let mut text = format!("# Error Codes\n\n{header}");
         for i in 0..200 {
             text.push_str(&format!("| D-{i:03} | `game:src/save{i}.rs:{i}` | // D-{i:03}: worlds save as region files |\n"));
         }
-        let chunks = chunk_file("decisions/Cited-in-Code.md", &text, &IndexProfile::default_for("x.md"));
-        assert_eq!(chunks[0].text, "# Decisions Cited in Code", "the heading before it stays its own chunk");
+        let chunks = chunk_file("Reference/Error-Codes.md", &text, &IndexProfile::default_for("x.md"));
+        assert_eq!(chunks[0].text, "# Error Codes", "the heading before it stays its own chunk");
         assert!(chunks.len() > 10, "{} chunks", chunks.len());
         for c in &chunks[1..] {
             assert!(c.text.len() <= 350 * 4, "{} bytes", c.text.len());

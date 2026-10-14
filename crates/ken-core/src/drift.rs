@@ -1,7 +1,8 @@
-//! Drift at Level 2: the checks that read pages and the decisions log, run
-//! as a standing sweep (Ways of Working, drift). A declaration goes stale
-//! without a test failing; this compares what a page or a ruling declared
-//! with what is there now, and says which of three things each mismatch is.
+//! Drift (knowledge-core decision 28): the checks that read pages and the
+//! decisions log against the code they cite (Ways of Working, drift). A
+//! declaration goes stale without a test failing; this compares what a page
+//! or a ruling declared with what is there now, says which of three things
+//! each mismatch is, and acts on it.
 //!
 //! - **Docs check**: a page's `checked:` stamp pins a commit in each cited
 //!   repo (its commit where that repo has it, else the last commit on its
@@ -21,10 +22,27 @@
 //!
 //! Only code citations (`repo:path[:line]`) are measured; a `[[Note]]` or a
 //! `D-nnn` is a cross-reference, counted apart. Research pages report in
-//! their own bucket. Every run can carry two controls (a page known to have
-//! moved, one known clean) and a minimum page count; a wrong control or too
-//! few pages voids the run, and a run with no controls says so. Nothing is
-//! edited: each run is recorded, and the Team screen lists what it found.
+//! their own bucket and are never acted on. Every run can carry two controls
+//! (a page known to have moved, one known clean) and a minimum page count; a
+//! wrong control or too few pages voids the run, and a run with no controls
+//! says so. The settings live in the knowledge base's `.ken/knowledge.json`
+//! under `drift` ([`DriftConfig::for_repo`]).
+//!
+//! **When a run happens** ([`due`]): when a cited repo's branch has moved
+//! since the last run, a week after the last run (the age rule's turn, for
+//! pages whose sources do not move), and an hour after a run that left pages
+//! waiting for a re-read.
+//!
+//! **What a run does** ([`act`]): a page whose sources changed only in
+//! whitespace or comments has its `checked:` stamp advanced, silently. A
+//! page with a real change, or past the age rule, is re-read by Claude (the
+//! caller's `reread`, never the local model) against the diff or the code as
+//! it is, and either stamped or fixed one section at a time through the
+//! ingest edit rules: held for a person when ingest would hold it. A cited
+//! file that was renamed is followed and the citation rewritten when git
+//! names one new path. A ruling whose cited code changed is never edited: it
+//! becomes a finding, as does a source that is gone. Each run that writes is
+//! one commit in the knowledge base and one `log.md` line.
 //!
 //! The Scope and Answer checks read a ticket's diff and its escalations, so
 //! they arrive with Wright, not here.
@@ -40,8 +58,15 @@ use crate::Result;
 
 /// A page not checked for longer than this is raised by the age rule.
 pub const AGE_DAYS: i64 = 30;
-/// The sweep interval unless the project sets `drift.intervalDays`.
-pub const DEFAULT_INTERVAL_DAYS: i64 = 7;
+/// A run happens at least this often, for the age rule: pages whose
+/// sources never move are still read again.
+pub const AGE_RUN_DAYS: i64 = 7;
+/// How long pages left waiting for a re-read (Claude not there, the hourly
+/// cap reached) wait before a run tries them again, in seconds.
+pub const RETRY_SECS: i64 = 3_600;
+/// What a held edit from a drift run names as where it came from
+/// (`Proposal::from`), so applying it is a commit of its own.
+pub const HELD_FROM: &str = "drift";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,14 +90,20 @@ pub struct Mismatch {
     pub detail: String,
     /// Research: evidence, reported apart from live pages.
     pub research: bool,
+    /// The commit it was measured from, and the branch it was measured
+    /// against, when known: what a rename is looked for between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
-/// The project's drift settings (`project.json` → `"drift"`).
+/// The knowledge base's drift settings: `drift` in its `.ken/knowledge.json`
+/// (one config, decision 28). All optional. An older `intervalDays` is
+/// ignored: a run follows the code now, not a schedule.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriftConfig {
-    #[serde(default)]
-    pub interval_days: Option<i64>,
     /// A page whose sources are known to have moved since its pin.
     #[serde(default)]
     pub control_moved: Option<String>,
@@ -89,16 +120,15 @@ pub struct DriftConfig {
 }
 
 impl DriftConfig {
-    pub fn of(project: &Project) -> DriftConfig {
-        project
-            .config
-            .extra
-            .get("drift")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default()
+    /// The settings the repo at `root` reads (`knowledge_settings`), the
+    /// defaults when it has none.
+    pub fn for_repo(root: &Path) -> DriftConfig {
+        crate::knowledge_settings::for_repo(root).map(|s| DriftConfig::from_settings(&s.value)).unwrap_or_default()
     }
-    pub fn interval_days(&self) -> i64 {
-        self.interval_days.filter(|d| *d > 0).unwrap_or(DEFAULT_INTERVAL_DAYS)
+
+    /// `drift` in a settings file's JSON.
+    pub fn from_settings(value: &serde_json::Value) -> DriftConfig {
+        value.get("drift").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
     }
 }
 
@@ -131,6 +161,26 @@ pub struct DriftRun {
     pub measured: usize,
     #[serde(default)]
     pub reused: usize,
+    /// What the run did ([`act`]): pages whose `checked` stamp advanced,
+    /// pages fixed, edits held for a person, citations rewritten after a
+    /// rename, findings filed, pages left waiting for a re-read, and the
+    /// run's commit (or why there is none).
+    #[serde(default)]
+    pub stamped: Vec<String>,
+    #[serde(default)]
+    pub fixed: Vec<String>,
+    #[serde(default)]
+    pub held: Vec<String>,
+    #[serde(default)]
+    pub renamed: Vec<String>,
+    #[serde(default)]
+    pub findings: usize,
+    #[serde(default)]
+    pub waiting: Vec<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub commit_error: Option<String>,
 }
 
 impl DriftRun {
@@ -157,7 +207,7 @@ impl DriftRun {
             self.pages_examined, self.rulings_examined, self.code_citations, self.cross_references
         ));
         if self.uncontrolled {
-            s.push_str("No controls are declared (`drift.controlMoved` and `drift.controlClean` in project.json), so a clean result proves less.\n");
+            s.push_str("No controls are declared (`drift.controlMoved` and `drift.controlClean` in .ken/knowledge.json), so a clean result proves less.\n");
         }
         let auto = self.mismatches.iter().filter(|m| m.severity == Severity::AutoRecleared).count();
         if auto > 0 {
@@ -531,7 +581,7 @@ fn is_template(text: &str) -> bool {
 
 /// Run the sweep over one wiki or team repo.
 pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
-    let cfg = DriftConfig::of(project);
+    let cfg = DriftConfig::for_repo(&project.root);
     let mut run = DriftRun { at: now, ..Default::default() };
     let mut branches: std::collections::HashMap<PathBuf, (String, Option<String>)> = Default::default();
     let mut cache = PinCache::load(db);
@@ -655,6 +705,8 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
                 severity,
                 detail,
                 research,
+                pin: pin.clone(),
+                branch: Some(branch.clone()),
             }),
             Measured::Clean => {}
             Measured::Unmeasured(why) => run.unmeasured.push(format!("{subject} — {}: {why} ({since})", raw.trim())),
@@ -737,17 +789,39 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     Ok(run)
 }
 
-/// Whether a sweep is due: none recorded, or the last older than the interval.
-pub fn due(db: &Db, project: &Project, now: i64) -> Result<bool> {
-    let interval = DriftConfig::of(project).interval_days() * 86_400;
-    Ok(db.last_drift_run_at()?.is_none_or(|at| now - at >= interval))
+/// Whether a run is due ([`AGE_RUN_DAYS`], [`RETRY_SECS`]): none recorded
+/// yet; a week since the last, for the age rule; an hour since a run that
+/// left pages waiting for a re-read; or a repo the last run measured has a
+/// new head on its branch ([`branch_moved`]).
+pub fn due(db: &Db, now: i64) -> Result<bool> {
+    let Some(last) = db.last_drift_run()? else { return Ok(true) };
+    if now - last.at >= AGE_RUN_DAYS * 86_400 {
+        return Ok(true);
+    }
+    if !last.waiting.is_empty() && now - last.at >= RETRY_SECS {
+        return Ok(true);
+    }
+    Ok(branch_moved(db))
+}
+
+/// Whether a repo the last run measured has moved on: its branch's head,
+/// as git has it here, is not the one the run measured at. Ken sees a move
+/// when that branch moves locally (a pull, or any fetch; each run fetches
+/// first); it does not fetch only to look.
+pub fn branch_moved(db: &Db) -> bool {
+    let cache = PinCache::load(db);
+    cache.heads.iter().any(|(repo, head)| {
+        let root = Path::new(repo);
+        let (branch, _) = default_branch(root);
+        git(root, &["rev-parse", &branch]).is_some_and(|now| &now != head)
+    })
 }
 
 /// The kind of the Review items earlier versions filed for a run.
 pub const REVIEW_KIND: &str = "drift";
 
-/// Record the run. What it found is read from the record (the Team screen's
-/// findings); an item an earlier version filed for a run is resolved.
+/// Record the run; an item an earlier version filed for a run is resolved.
+/// What the run found is in the findings list ([`act`]).
 pub fn file_run(db: &mut Db, run: &DriftRun) -> Result<()> {
     db.insert_drift_run(run)?;
     while let Some((id, _)) = db.open_review_item_of_kind(REVIEW_KIND)? {
@@ -756,51 +830,403 @@ pub fn file_run(db: &mut Db, run: &DriftRun) -> Result<()> {
     Ok(())
 }
 
-/// One thing a run found, for the Team screen: what it is about, what is
-/// wrong, and the page to open (empty when it is about the run itself).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Finding {
-    /// `void` · `gone` (a cited source is gone) · `changed` (to re-read) ·
-    /// `aged` (not checked in [`AGE_DAYS`] days).
-    pub kind: String,
-    pub title: String,
-    pub detail: String,
-    pub path: String,
+/// One Claude call for a re-read: a prompt in, the answer's text out. An
+/// error (no Claude, the switch off, the hourly cap reached) leaves the page
+/// waiting for a later run.
+pub type Reread<'a> = dyn FnMut(&str) -> Result<String> + 'a;
+
+/// One drift run: the sweep, what it found acted on ([`act`]), the run
+/// recorded. `today` is the local date the stamps and the log line carry.
+pub fn run(project: &Project, db: &mut Db, now: i64, today: &str, reread: Option<&mut Reread<'_>>) -> Result<DriftRun> {
+    let mut run = sweep(project, db, now)?;
+    act(project, db, &mut run, today, reread)?;
+    file_run(db, &run)?;
+    Ok(run)
 }
 
-/// What a run found, live pages first: a void run is one finding; else each
-/// mismatch on a live page and each page past the age rule. Research is
-/// evidence and left out.
-pub fn findings(run: &DriftRun) -> Vec<Finding> {
-    if let Some(why) = &run.void_reason {
-        return vec![Finding { kind: "void".into(), title: "The last sweep is void".into(), detail: why.clone(), path: String::new() }];
+/// What a finding from a run says it came from.
+const SOURCE: &str = "drift";
+/// What a void run's finding points at, so the next run that holds resolves it.
+const THE_RUN: &str = "the run";
+
+fn finding(subject: &str, against: &str, against_kind: &str, text: String) -> crate::findings::Finding {
+    crate::findings::Finding {
+        kind: "drift".into(),
+        source: SOURCE.into(),
+        subject: subject.into(),
+        against: against.into(),
+        against_kind: against_kind.into(),
+        text,
+        ..Default::default()
     }
-    let page_of = |subject: &str| subject.split('#').next().unwrap_or(subject).to_string();
-    let mut out: Vec<Finding> = run
-        .mismatches
-        .iter()
-        .filter(|m| !m.research)
-        .map(|m| Finding {
-            kind: if m.severity == Severity::Finding { "gone" } else { "changed" }.into(),
-            title: format!("{} cites {}", m.subject, m.citation),
-            detail: m.detail.clone(),
-            path: page_of(&m.subject),
+}
+
+/// `text` with its frontmatter's `checked:` set to `today` and `sha`.
+pub fn stamp_checked(text: &str, today: &str, sha: Option<&str>) -> String {
+    let checked = crate::pagemeta::Checked { date: today.to_string(), sha: sha.map(str::to_string) };
+    crate::day::set_frontmatter(text, "checked", &checked.to_string())
+}
+
+/// The commit a page's check is stamped with: the head of the branch its
+/// first code citation's repo is measured against (one sha per page, as
+/// slice 3 chose).
+fn head_for(project_root: &Path, sources: &[String]) -> Option<String> {
+    sources.iter().find_map(|raw| {
+        let Citation::Code(c) = classify(raw) else { return None };
+        let repo = resolve_repo(project_root, &c.repo)?;
+        let (branch, _) = default_branch(&repo);
+        git(&repo, &["rev-parse", "--short=12", &branch]).filter(|s| !s.is_empty())
+    })
+}
+
+/// The one new path git names for `path` renamed between `pin` and
+/// `branch`; None when it was not renamed, or git names more than one.
+fn renamed_to(repo_root: &Path, pin: &str, branch: &str, path: &str) -> Option<String> {
+    let out = git(repo_root, &["diff", "-M", "--name-status", "--diff-filter=R", pin, branch])?;
+    let found: Vec<String> = out
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let (status, from, to) = (f.next()?, f.next()?, f.next()?);
+            (status.starts_with('R') && from.eq_ignore_ascii_case(path)).then(|| to.to_string())
         })
         .collect();
-    out.sort_by_key(|f| f.kind != "gone");
-    for (page, checked) in &run.aged {
-        out.push(Finding {
-            kind: "aged".into(),
-            title: page.clone(),
-            detail: match checked {
-                Some(d) => format!("Last checked {d}, more than {AGE_DAYS} days ago."),
-                None => "Never checked.".into(),
-            },
-            path: page.clone(),
-        });
+    (found.len() == 1).then(|| found[0].clone())
+}
+
+/// A file name without its folder and extension: the name a rename row
+/// records when it changed (`SaveSystem` → `WorldSaver`).
+fn stem(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit_once('.').map_or(name, |(s, _)| s)
+}
+
+/// Longest diff or file a re-read quotes, in characters, and the most of
+/// them in one prompt.
+const QUOTE_CHARS: usize = 8_000;
+const QUOTES_CHARS: usize = 24_000;
+
+fn clip(s: &str, max: usize) -> String {
+    let cut: String = s.chars().take(max).collect();
+    if cut.len() < s.len() { format!("{cut}\n[…]") } else { cut }
+}
+
+/// What changed under one page's citations: the diff of each changed file
+/// from its pin, or for a page past the age rule the cited files as they
+/// are now.
+fn evidence(project_root: &Path, sources: &[String], changed: &[&Mismatch]) -> String {
+    let mut out = String::new();
+    let add = |head: String, body: String, out: &mut String| {
+        if out.len() < QUOTES_CHARS && !body.trim().is_empty() {
+            out.push_str(&format!("\n--- {head}\n{}\n", clip(&body, QUOTE_CHARS)));
+        }
+    };
+    if !changed.is_empty() {
+        for m in changed {
+            let Citation::Code(c) = classify(&m.citation) else { continue };
+            let (Some(repo), Some(pin), Some(branch)) = (resolve_repo(project_root, &c.repo), m.pin.as_deref(), m.branch.as_deref()) else {
+                continue;
+            };
+            let diff = git(&repo, &["diff", "-U3", pin, branch, "--", &c.path]).unwrap_or_default();
+            add(format!("{} (git diff {} {branch})", m.citation, &pin[..pin.len().min(7)]), diff, &mut out);
+        }
+        return out;
+    }
+    for raw in sources {
+        let Citation::Code(c) = classify(raw) else { continue };
+        let Some(repo) = resolve_repo(project_root, &c.repo) else { continue };
+        let (branch, _) = default_branch(&repo);
+        let text = git(&repo, &["show", &format!("{branch}:{}", c.path)]).unwrap_or_default();
+        add(format!("{raw} (as it is on {branch})"), text, &mut out);
     }
     out
+}
+
+/// The re-read of one page (decision 28): the page and what changed under
+/// it; Claude answers CHECKED, or the one section to put in its place.
+pub fn reread_prompt(page: &str, text: &str, evidence: &str, aged: bool) -> String {
+    let why = if aged {
+        format!("It has not been checked in {AGE_DAYS} days; the code it cites is below as it is now")
+    } else {
+        "Code it cites has changed; the changes are below".to_string()
+    };
+    format!(
+        "You are checking one page of a team's knowledge base, `{page}`, against the code it cites. {why}.\n\n\
+         Rules:\n\
+         - If everything the page says still holds, reply exactly CHECKED.\n\
+         - If part of it no longer holds, reply with the one section that holds it, corrected: its heading line, then \
+           everything down to the next heading of the same or a higher level. Change only what the code changed; keep \
+           every other line of the section exactly as it is. The section you send replaces that section of the page.\n\
+         - Use only the page and the code below; do not use any tools.\n\
+         - Leave the frontmatter alone; Ken stamps it.\n\
+         - No preamble, no code fences.\n\n\
+         THE PAGE NOW:\n{text}\n\nTHE CODE:\n{evidence}\n"
+    )
+}
+
+/// Act on what a sweep found (decision 28), in the knowledge base at
+/// `project.root`, recording what was done in `run`:
+///
+/// - A void run does nothing but say so, as a finding.
+/// - A ruling whose cited code changed, or whose source is gone, becomes a
+///   finding against the ruling. A ruling is never edited.
+/// - A page's cited file that git says was renamed to one new path is
+///   followed: the citation is rewritten, and a rename row is added to the
+///   Vocabulary page when the file's name changed. A source that is gone
+///   otherwise becomes a finding.
+/// - A page whose sources changed only in whitespace or comments has its
+///   `checked:` stamp advanced.
+/// - A page with a real change, or past the age rule, is re-read with
+///   `reread`: CHECKED (or no change) stamps it; a section replaces its
+///   section through the ingest rules (`ingest::hold`), written or held for
+///   a person as a page proposal. Without `reread`, or when a call fails,
+///   the page waits for a later run.
+///
+/// A page holding a person's uncommitted work is left alone this run. What
+/// was written is one commit (`git::commit_paths`, never pushed) with one
+/// `log.md` line; the pages fixed wait for the lint after an edit.
+pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut reread: Option<&mut Reread<'_>>) -> Result<()> {
+    let root = project.root.as_path();
+    let now = run.at;
+    if let Some(why) = &run.void_reason {
+        let f = finding("", THE_RUN, "", format!("The last drift run is void: {why}. Nothing was stamped or fixed."));
+        crate::findings::file(db, &f, now)?;
+        run.findings += 1;
+        return Ok(());
+    }
+    // A run that holds clears the void one before it.
+    for (it, f) in crate::findings::open(db)? {
+        if f.kind == "drift" && f.against == THE_RUN {
+            db.resolve_review_item(it.id, now)?;
+        }
+    }
+
+    let dirty = crate::git::uncommitted(root);
+    let mut touched: Vec<String> = Vec::new();
+    let mut by_page: std::collections::BTreeMap<String, Vec<Mismatch>> = Default::default();
+    for m in run.mismatches.iter().filter(|m| !m.research) {
+        match m.subject.split_once('#') {
+            // A ruling: never edited, always for a person.
+            Some((log, id)) => {
+                if m.severity == Severity::AutoRecleared {
+                    continue;
+                }
+                let what = if m.severity == Severity::Finding { "is gone" } else { "changed" };
+                let text = format!(
+                    "{id} cites {}, which {what}: {}. A ruling is never edited: read it against the code, and supersede it if it no longer holds.",
+                    m.citation, m.detail
+                );
+                crate::findings::file(db, &finding(log, id, "ruling", text), now)?;
+                run.findings += 1;
+            }
+            None => by_page.entry(m.subject.clone()).or_default().push(m.clone()),
+        }
+    }
+    let aged: std::collections::HashSet<String> = run.aged.iter().map(|(p, _)| p.clone()).collect();
+    let mut pages: Vec<String> = by_page.keys().cloned().chain(aged.iter().cloned()).collect();
+    pages.sort();
+    pages.dedup();
+
+    for page in pages {
+        if dirty.contains(&page) {
+            continue;
+        }
+        let Ok(mut text) = std::fs::read_to_string(root.join(&page)) else { continue };
+        let found = by_page.remove(&page).unwrap_or_default();
+
+        // Gone: followed when git names the one new path, else a finding.
+        for m in found.iter().filter(|m| m.severity == Severity::Finding) {
+            let followed = match classify(&m.citation) {
+                Citation::Code(c) => resolve_repo(root, &c.repo).and_then(|repo| {
+                    let (pin, branch) = (m.pin.as_deref()?, m.branch.as_deref()?);
+                    renamed_to(&repo, pin, branch, &c.path).map(|new| (c.path.clone(), new))
+                }),
+                _ => None,
+            };
+            match followed {
+                Some((old, new)) if text.contains(m.citation.as_str()) => {
+                    let cited = m.citation.replacen(old.as_str(), &new, 1);
+                    text = text.replacen(m.citation.as_str(), &cited, 1);
+                    write_page(root, &page, &text)?;
+                    push_once(&mut touched, &page);
+                    run.renamed.push(format!("{page}: {} → {cited}", m.citation));
+                    if stem(&old) != stem(&new) && crate::vocab::add_rename(root, stem(&old), stem(&new), today)? {
+                        push_once(&mut touched, crate::vocab::VOCABULARY_PAGE);
+                    }
+                }
+                _ => {
+                    let text = format!("{page} cites {}: {}.", m.citation, m.detail);
+                    crate::findings::file(db, &finding(&page, &m.citation, "code", text), now)?;
+                    run.findings += 1;
+                }
+            }
+        }
+
+        let changed: Vec<&Mismatch> = found.iter().filter(|m| m.severity == Severity::Judgment).collect();
+        let is_aged = aged.contains(&page);
+        let sources = db.page_meta(&page)?.map(|m| m.sources).unwrap_or_default();
+        let sha = head_for(root, &sources);
+        if changed.is_empty() && !is_aged {
+            // Whitespace or comments only: the stamp advances, silently.
+            if found.iter().any(|m| m.severity == Severity::AutoRecleared) {
+                write_page(root, &page, &stamp_checked(&text, today, sha.as_deref()))?;
+                push_once(&mut touched, &page);
+                run.stamped.push(page.clone());
+            }
+            continue;
+        }
+
+        // A real change, or the age rule: Claude re-reads the page, unless
+        // an edit a run held for it still waits for a person.
+        if held_open(db, &page)? {
+            continue;
+        }
+        let Some(call) = reread.as_deref_mut() else {
+            run.waiting.push(page.clone());
+            continue;
+        };
+        let prompt = reread_prompt(&page, &text, &evidence(root, &sources, &changed), changed.is_empty());
+        let section = match call(&prompt) {
+            Ok(reply) if reply.trim().trim_end_matches('.').eq_ignore_ascii_case("CHECKED") => None,
+            Ok(reply) => match crate::ingest::finish_section(&reply) {
+                Ok(s) => s,
+                Err(_) => {
+                    run.waiting.push(page.clone());
+                    continue;
+                }
+            },
+            Err(_) => {
+                run.waiting.push(page.clone());
+                continue;
+            }
+        };
+        let stamped = stamp_checked(&text, today, sha.as_deref());
+        let Some(section) = section else {
+            write_page(root, &page, &stamped)?;
+            push_once(&mut touched, &page);
+            run.stamped.push(page.clone());
+            continue;
+        };
+        let proposed = stamp_checked(
+            &crate::ingest::stamp_updated(&crate::ingest::replace_section(&text, &section), today),
+            today,
+            sha.as_deref(),
+        );
+        if proposed.replace("\r\n", "\n") == stamped.replace("\r\n", "\n") {
+            write_page(root, &page, &stamped)?;
+            push_once(&mut touched, &page);
+            run.stamped.push(page.clone());
+            continue;
+        }
+        // The stamps are Ken's own: the size rule measures the section alone.
+        let on_disk = std::fs::read_to_string(root.join(&page)).unwrap_or_default();
+        let base = crate::ingest::stamp_updated(&stamped, today);
+        let held = if on_disk.replace("\r\n", "\n") != text.replace("\r\n", "\n") {
+            Some(crate::ingest::Held::Changed)
+        } else {
+            crate::ingest::hold(&page, &base, &base, &proposed, "")
+        };
+        match held {
+            None => {
+                write_page(root, &page, &proposed)?;
+                push_once(&mut touched, &page);
+                run.fixed.push(page.clone());
+            }
+            Some(why) => {
+                // Held against the page as it is now: the same section, put
+                // into a person's newer page, applies without undoing them.
+                let proposed = match why {
+                    crate::ingest::Held::Changed => stamp_checked(
+                        &crate::ingest::stamp_updated(&crate::ingest::replace_section(&on_disk, &section), today),
+                        today,
+                        sha.as_deref(),
+                    ),
+                    _ => proposed,
+                };
+                let p = crate::proposal::Proposal {
+                    from: Some(HELD_FROM.to_string()),
+                    ..crate::proposal::Proposal::new(page.clone(), on_disk, proposed)
+                };
+                let body = format!(
+                    "Held from the drift run of {today}: {}. The code it cites changed; read the change and apply it, or \
+                     discard it. It applies only while the page still reads as it does now.",
+                    why.reason()
+                );
+                crate::proposal::file_page_proposal(db, &p, &format!("Held: {page} from drift"), &body, now)?;
+                run.held.push(page.clone());
+            }
+        }
+    }
+
+    // One commit and one log line for what the run wrote (decisions 28, 36).
+    if !touched.is_empty() {
+        let title = format!(
+            "{} checked, {} fixed, {} held, {} renames followed",
+            run.stamped.len(),
+            run.fixed.len(),
+            run.held.len(),
+            run.renamed.len()
+        );
+        let log = crate::ingest::append_log(root, today, "drift", &title)?;
+        let mut paths: Vec<String> = touched.iter().filter(|p| !dirty.contains(p)).cloned().collect();
+        if !dirty.contains(&log) {
+            paths.push(log);
+        }
+        match crate::git::commit_paths(root, &paths, &commit_message(run, today)) {
+            Ok(c) => run.commit = c,
+            Err(e) => run.commit_error = Some(e),
+        }
+        crate::lint::queue_after_edit(db, &run.fixed)?;
+    }
+    Ok(())
+}
+
+/// Whether an edit a drift run held for `page` still waits for a person:
+/// the page is not read again until it is applied or discarded.
+fn held_open(db: &Db, page: &str) -> Result<bool> {
+    Ok(db.list_open_review_items()?.into_iter().any(|it| {
+        it.kind == crate::proposal::PROPOSAL_KIND
+            && it.source_ref == page
+            && it
+                .payload
+                .as_deref()
+                .and_then(|p| serde_json::from_str::<crate::proposal::Proposal>(p).ok())
+                .is_some_and(|p| p.from.as_deref() == Some(HELD_FROM))
+    }))
+}
+
+fn push_once(list: &mut Vec<String>, item: &str) {
+    if !list.iter().any(|p| p == item) {
+        list.push(item.to_string());
+    }
+}
+
+fn write_page(root: &Path, page: &str, text: &str) -> Result<()> {
+    let path = root.join(page);
+    std::fs::write(&path, text).map_err(|e| crate::Error::io(&path, e))
+}
+
+/// A run's commit message: what it checked, fixed, held and followed, and
+/// what waits.
+pub fn commit_message(run: &DriftRun, today: &str) -> String {
+    let mut s = format!("drift: the run of {today}\n");
+    let mut list = |title: &str, items: &[String]| {
+        if !items.is_empty() {
+            s.push_str(&format!("\n{title}:\n"));
+            for i in items {
+                s.push_str(&format!("- {i}\n"));
+            }
+        }
+    };
+    list("Checked", &run.stamped);
+    list("Fixed", &run.fixed);
+    list("Held for a person", &run.held);
+    list("Renames followed", &run.renamed);
+    list("Waiting for a re-read", &run.waiting);
+    if run.findings > 0 {
+        s.push_str(&format!("\n{} findings filed.\n", run.findings));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -1068,11 +1494,8 @@ updated: {{date}}
         fs::write(wiki.join("Platform/Combat.md"), page("  - game:src/combat.rs\n  - \"[[Save]]\"\n", "2026-09-05")).unwrap();
         fs::write(wiki.join("Platform/Old.md"), page("  - game:src/gone.rs\n  - game:src/save.rs:99\n", "2026-08-01")).unwrap();
         fs::write(wiki.join("Research/Spike.md"), page("  - game:src/save.rs\n", "2026-09-05")).unwrap();
-        let mut project = Project::create(&wiki, "wiki").unwrap();
-        project.config.extra.insert(
-            "drift".into(),
-            serde_json::json!({"controlMoved": "Platform/Save.md", "controlClean": "Platform/Combat.md", "minPages": 2}),
-        );
+        let project = Project::create(&wiki, "wiki").unwrap();
+        settings(&wiki, serde_json::json!({"controlMoved": "Platform/Save.md", "controlClean": "Platform/Combat.md", "minPages": 2}));
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
 
@@ -1114,26 +1537,159 @@ updated: {{date}}
         assert!(after.void_reason.as_deref().is_some_and(|v| v.contains("known-clean")), "the clean control moved");
 
         // A known-clean control that is flagged voids the run.
-        project.config.extra.insert("drift".into(), serde_json::json!({"controlMoved": "Platform/Save.md", "controlClean": "Platform/Old.md"}));
+        settings(&wiki, serde_json::json!({"controlMoved": "Platform/Save.md", "controlClean": "Platform/Old.md"}));
         let void = sweep(&project, &db, now).unwrap();
         assert!(void.void_reason.as_deref().unwrap().contains("known-clean"));
 
         // No controls: says so. Filing keeps a record, and no Review item.
-        project.config.extra.remove("drift");
+        settings(&wiki, serde_json::json!({}));
         let plain = sweep(&project, &db, now).unwrap();
         assert!(plain.uncontrolled);
         db.insert_review_item(REVIEW_KIND, "Drift: from before", "body", "", None, now - 1).unwrap();
         file_run(&mut db, &plain).unwrap();
         file_run(&mut db, &plain).unwrap();
         assert!(db.open_review_item_of_kind(REVIEW_KIND).unwrap().is_none(), "an old item is resolved");
-        let found = findings(&plain);
-        assert!(found.iter().any(|f| f.kind == "gone" && !f.path.contains('#')), "{found:?}");
-        assert_eq!(found.first().map(|f| f.kind.as_str()), Some("gone"), "what is gone comes first");
-        assert_eq!(findings(&void).len(), 1);
-        assert_eq!(findings(&void)[0].kind, "void");
         assert_eq!(db.last_drift_run_at().unwrap(), Some(now));
-        assert!(!due(&db, &project, now + 86_400).unwrap());
-        assert!(due(&db, &project, now + 8 * 86_400).unwrap());
+
+        // The next run: a week on for the age rule, else when the code moves.
+        assert!(!due(&db, now + 86_400).unwrap(), "nothing moved");
+        assert!(due(&db, now + 8 * 86_400).unwrap(), "the age rule's week");
+        commit_at(&code, "src/save.rs", "fn save() {\n    write_some();\n}\n", "2026-09-21");
+        assert!(due(&db, now + 60).unwrap(), "the branch moved");
+    }
+
+    /// The settings a knowledge base keeps in `.ken/knowledge.json`, with
+    /// `drift` set (one config, decision 28).
+    fn settings(wiki: &Path, drift: serde_json::Value) {
+        let all = serde_json::json!({ "drift": drift });
+        fs::create_dir_all(wiki.join(".ken")).unwrap();
+        fs::write(wiki.join(crate::wikinew::KNOWLEDGE_FILE), all.to_string()).unwrap();
+        assert_eq!(DriftConfig::for_repo(wiki), DriftConfig::from_settings(&all));
+    }
+
+    #[test]
+    fn the_config_is_read_from_the_knowledge_settings() {
+        let cfg = DriftConfig::from_settings(&serde_json::json!({
+            "drift": { "controlMoved": "A.md", "controlClean": "B.md", "minPages": 3, "fetch": false, "intervalDays": 3 }
+        }));
+        assert_eq!(cfg.control_moved.as_deref(), Some("A.md"));
+        assert_eq!(cfg.control_clean.as_deref(), Some("B.md"));
+        assert_eq!((cfg.min_pages, cfg.fetch), (Some(3), Some(false)), "an old intervalDays is ignored");
+        assert_eq!(DriftConfig::from_settings(&serde_json::json!({})), DriftConfig::default());
+    }
+
+    /// A run acts on what it found (decision 28): a comment-only change is
+    /// stamped silently, a real change is re-read and fixed, a Rules page's
+    /// fix is held, a ruling whose code changed is a finding, a renamed file
+    /// is followed, and what was written is one commit with one log line.
+    /// Without Claude the re-reads wait.
+    #[test]
+    fn a_run_stamps_fixes_holds_follows_and_commits() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("game");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&code, &["config", k, v]);
+        }
+        commit_at(&code, "src/save.rs", "fn save() {\n    write();\n}\n", "2026-09-01");
+        commit_at(&code, "src/combat.rs", "fn hit() {}\n", "2026-09-01");
+        commit_at(&code, "src/old_name.rs", "fn x() {}\n", "2026-09-01");
+        commit_at(&code, "src/rules.rs", "fn rule() {}\n", "2026-09-01");
+        commit_at(&code, "src/save.rs", "fn save() {\n    write_all();\n}\n", "2026-09-10");
+        commit_at(&code, "src/combat.rs", "// hits\nfn hit() {}\n", "2026-09-10");
+        commit_at(&code, "src/rules.rs", "fn rule() { strict(); }\n", "2026-09-10");
+        git_ok(&code, &["mv", "src/old_name.rs", "src/new_name.rs"]);
+        commit_at(&code, "src/other.rs", "fn other() {}\n", "2026-09-11");
+
+        let wiki = parent.path().join("wiki");
+        let page = |source: &str, body: &str| {
+            format!(
+                "---\ntitle: P\nchecked: 2026-09-05\nsources:\n  - {source}\n---\n# P\n\nWhat this covers.\n\n## Saving\n\n{body}\n\n\
+                 ## More\n\nOne.\nTwo.\nThree.\nFour.\n"
+            )
+        };
+        let log = "# Decisions\n\n## D-012 · 2026-09-05 · rules\n\n**Rules stay loose.**\n\nsources: game:src/rules.rs\n";
+        for (path, text) in [
+            ("Platform/Save.md", page("game:src/save.rs:2", "Saves call write().")),
+            ("Platform/Combat.md", page("game:src/combat.rs", "Hits land.")),
+            ("Platform/Moved.md", page("game:src/old_name.rs", "X lives in old_name.")),
+            ("Rules/Strict.md", page("game:src/rules.rs", "Rules are loose.")),
+            ("Decisions/DECISIONS.md", log.to_string()),
+        ] {
+            fs::create_dir_all(wiki.join(path).parent().unwrap()).unwrap();
+            fs::write(wiki.join(path), text).unwrap();
+        }
+        let project = Project::create(&wiki, "wiki").unwrap();
+        settings(&wiki, serde_json::json!({ "fetch": false }));
+        git_ok(&wiki, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&wiki, &["config", k, v]);
+        }
+        git_ok(&wiki, &["add", "-A"]);
+        git_ok(&wiki, &["commit", "-q", "-m", "wiki"]);
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let mut asked: Vec<String> = Vec::new();
+        let mut reread = |p: &str| -> Result<String> {
+            asked.push(p.lines().next().unwrap_or("").to_string());
+            Ok(if p.contains("`Platform/Save.md`") {
+                assert!(p.contains("write_all"), "the diff is in the prompt");
+                "## Saving\n\nSaves call write_all().\n".into()
+            } else if p.contains("`Rules/Strict.md`") {
+                "## Saving\n\nRules are strict.\n".into()
+            } else {
+                "CHECKED".into()
+            })
+        };
+        let now = chrono_free_epoch("2026-09-24").unwrap();
+        let r = run(&project, &mut db, now, "2026-09-24", Some(&mut reread as &mut Reread<'_>)).unwrap();
+        assert_eq!(asked.len(), 2, "only the real changes are read: {asked:?}");
+        assert_eq!(r.stamped, vec!["Platform/Combat.md".to_string()], "the comment-only change, silently");
+        assert_eq!(r.fixed, vec!["Platform/Save.md".to_string()]);
+        assert_eq!(r.held, vec!["Rules/Strict.md".to_string()], "a Rules page waits for a person");
+        assert_eq!(r.renamed.len(), 1, "{:?}", r.renamed);
+        assert!(r.waiting.is_empty(), "{:?}", r.waiting);
+
+        let read = |p: &str| fs::read_to_string(wiki.join(p)).unwrap();
+        assert!(read("Platform/Save.md").contains("Saves call write_all()") && read("Platform/Save.md").contains("checked: 2026-09-24 "));
+        assert!(read("Platform/Save.md").contains("## More\n\nOne."), "only the one section changed");
+        assert!(read("Platform/Combat.md").contains("checked: 2026-09-24 ") && read("Platform/Combat.md").contains("Hits land."));
+        assert!(read("Platform/Moved.md").contains("game:src/new_name.rs"), "the citation follows the rename");
+        assert!(read("Reference/Vocabulary.md").contains("old_name") && read("Reference/Vocabulary.md").contains("new_name"));
+        assert!(read("Rules/Strict.md").contains("Rules are loose."), "held, not written");
+        assert!(db.open_review_item_of_kind(crate::proposal::PROPOSAL_KIND).unwrap().is_some(), "the held edit waits");
+        let found = crate::findings::open(&db).unwrap();
+        assert!(
+            found.iter().any(|(_, f)| f.kind == "drift" && f.against == "D-012" && f.against_kind == "ruling"),
+            "the ruling is a finding: {found:?}"
+        );
+        assert!(read("Decisions/DECISIONS.md").contains("**Rules stay loose.**"), "a ruling is never edited");
+
+        // One commit, with one log line: only what the run wrote.
+        assert!(r.commit.is_some(), "{:?}", r.commit_error);
+        let shown = Command::new("git").args(["show", "--name-only", "--format=%s", "HEAD"]).current_dir(&wiki).output().unwrap();
+        let shown = String::from_utf8_lossy(&shown.stdout).to_string();
+        for f in ["log.md", "Platform/Save.md", "Platform/Combat.md", "Platform/Moved.md", "Reference/Vocabulary.md"] {
+            assert!(shown.contains(f), "{f} in {shown}");
+        }
+        assert!(shown.starts_with("drift: the run of 2026-09-24") && !shown.contains("Rules/Strict.md"), "{shown}");
+        assert!(read("log.md").contains("## [2026-09-24] drift | 1 checked, 1 fixed, 1 held, 1 renames followed"));
+        assert_eq!(crate::lint::queued(&db).unwrap(), vec!["Platform/Save.md".to_string()], "the fix waits for the lint");
+
+        // The code moves again; without Claude the re-read waits, and the
+        // next run is due an hour on.
+        commit_at(&code, "src/save.rs", "fn save() {\n    write_some();\n}\n", "2026-09-25");
+        crate::scan::scan(&project, &mut db).unwrap();
+        let later = chrono_free_epoch("2026-09-26").unwrap();
+        assert!(due(&db, later).unwrap(), "the branch moved");
+        let r = run(&project, &mut db, later, "2026-09-26", None).unwrap();
+        assert!(r.waiting.contains(&"Platform/Save.md".to_string()), "{:?}", r.waiting);
+        assert!(!r.waiting.contains(&"Rules/Strict.md".to_string()), "its held edit still waits: not read again");
+        assert!(r.commit.is_none(), "nothing written, nothing committed");
+        assert!(!due(&db, later + 60).unwrap(), "waits for the hour");
+        assert!(due(&db, later + RETRY_SECS).unwrap());
     }
 
     #[test]

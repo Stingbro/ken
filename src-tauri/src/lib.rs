@@ -1285,10 +1285,8 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                     }
                     enqueue_transcriptions(&scan_app, &scan_state, project_id, &stats.videos_needing_transcript);
                     emit_member(&scan_app, project_id, "index-updated", stats);
-                    // The standing sweep, when due: team and wiki repos only,
-                    // on the index this scan just brought up to date.
-                    run_drift_if_due(&scan_project, &mut db, false);
-                    // And the library inbox: anything waiting in Raw/.
+                    // The library inbox: anything waiting in Raw/. Drift and
+                    // the lint run in the background worker (`knowledge_checks`).
                     start_ingest_pass(&scan_project, &base, code_sources_of(&scan_state, &scan_project.root), false);
                 }
                 Err(e) => {
@@ -5613,6 +5611,25 @@ fn resolve_review_item(state: State<SharedState>, id: i64, project_id: Option<St
         .map_err(err)
 }
 
+/// Confirm a supersession finding (knowledge-core decision 25): Ken writes
+/// `supersedes:` on the later ruling and `[SUPERSEDED BY …]` on the earlier
+/// into the decisions log, as one commit in the knowledge base, and marks the
+/// finding done. Returns the commit, when one was made.
+#[tauri::command(async)]
+fn confirm_finding(state: State<SharedState>, id: i64, project_id: Option<String>) -> CmdResult<Option<String>> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, pid)?;
+    let (item, finding) = ken_core::findings::open(&active.db)
+        .map_err(err)?
+        .into_iter()
+        .find(|(it, _)| it.id == id)
+        .ok_or("no open finding with that id")?;
+    let commit = ken_core::supersede::confirm(&active.project.root, &finding)?;
+    active.db.resolve_review_item(item.id, engine::now_epoch()).map_err(err)?;
+    Ok(commit)
+}
+
 // ---------- ignored files (user-level, never synced) ----------
 
 /// Load the current project's private user-state from app-data. Helper for the
@@ -6506,29 +6523,148 @@ fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
     })
 }
 
-/// Run the drift sweep for a team or wiki repo when it is due (weekly unless
-/// `drift.intervalDays` says otherwise), or now when `force`. It spawns git
-/// per cited file, so callers run it off the UI thread. Returns the run.
-fn run_drift_if_due(project: &Project, db: &mut Db, force: bool) -> Option<ken_core::drift::DriftRun> {
+/// Longest one background check's Claude call may take (a drift re-read,
+/// a lint comparison, a supersession cluster).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A background Claude call for the knowledge checks (knowledge-core
+/// decisions 25, 28 and 29): through the Claude CLI with no tools, never the
+/// local model. Each call is made only while `backgroundExtraction` is on
+/// for the project, waits for the shared pace (`EXTRACT_PACING`), and takes
+/// one of the hourly calls summaries share (`summary::take_call`). A call
+/// refused (switched off, the hour full, asked to stop) is an error, which
+/// leaves its work waiting. None when Claude Code is not installed.
+fn background_claude(
+    state: &SharedState,
+    project_id: uuid::Uuid,
+    root: &Path,
+    stop: &Arc<AtomicBool>,
+) -> Option<impl FnMut(&str) -> ken_core::Result<String>> {
+    let binary = ken_core::runner::discover_claude()?;
+    let (state, root, stop) = (state.clone(), root.to_path_buf(), stop.clone());
+    Some(move |prompt: &str| -> ken_core::Result<String> {
+        let on = {
+            let guard = lock_tolerant(&state);
+            guard
+                .members
+                .get(&project_id)
+                .is_some_and(|a| ken_core::features::effective_flag(&guard.app_settings, &a.project, "backgroundExtraction"))
+        };
+        if !on {
+            return Err(ken_core::Error::Other("background reading is switched off".into()));
+        }
+        if !wait_for_extraction_slot(&stop) {
+            return Err(ken_core::Error::Other("stopped".into()));
+        }
+        if !ken_core::summary::take_call() {
+            return Err(ken_core::Error::Other("the hour's background calls are used".into()));
+        }
+        let out = ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, CHECK_TIMEOUT, &CancelToken::new());
+        stamp_extraction_slot();
+        match out? {
+            ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+            other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
+        }
+    })
+}
+
+/// One drift run for the knowledge base `project` (knowledge-core decision
+/// 28), when one is due (`drift::due`: its sources' branch moved, the age
+/// rule's week, or pages waiting for a re-read), or now when `force`: the
+/// sweep, what it found acted on with re-reads through
+/// [`background_claude`], and the run's commit. Then the code citations of
+/// the workspace's other repos are checked against the decisions log
+/// (decision 30). It spawns git per cited file, so callers run it off the
+/// UI thread. Returns the run.
+fn run_drift(state: &SharedState, project: &Project, db: &mut Db, force: bool, stop: &Arc<AtomicBool>) -> Option<ken_core::drift::DriftRun> {
     if !ken_core::registry::is_library(&project.root) && !force {
         return None;
     }
     let now = engine::now_epoch();
-    if !force && !ken_core::drift::due(db, project, now).unwrap_or(false) {
+    if !force && !ken_core::drift::due(db, now).unwrap_or(false) {
         return None;
     }
-    match ken_core::drift::sweep(project, db, now) {
-        Ok(run) => {
-            if let Err(e) = ken_core::drift::file_run(db, &run) {
-                eprintln!("warning: could not record the drift sweep: {e}");
-            }
-            Some(run)
-        }
+    let mut claude = background_claude(state, project.config.id, &project.root, stop);
+    let reread = claude.as_mut().map(|c| c as &mut ken_core::drift::Reread<'_>);
+    let run = match ken_core::drift::run(project, db, now, &local_date_today(), reread) {
+        Ok(run) => run,
         Err(e) => {
-            eprintln!("warning: drift sweep failed: {e}");
-            None
+            eprintln!("warning: drift run failed: {e}");
+            return None;
+        }
+    };
+    // Rulings cited in code (decision 30): the other repos' indexes, read only.
+    let base = lock_tolerant(state).base_dir.clone();
+    let code: Vec<ken_core::ingest::CodeSource> = code_sources_of(state, &project.root)
+        .into_iter()
+        .filter_map(|(name, id)| Db::open_read_only(&base, id).ok().map(|db| ken_core::ingest::CodeSource { name, db }))
+        .collect();
+    match ken_core::lint::unknown_rulings(db, &project.root, &code) {
+        Ok(found) => {
+            if let Err(e) = ken_core::findings::sync(db, &[ken_core::lint::UNKNOWN_RULING], &found, now) {
+                eprintln!("warning: could not file the code citations: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: could not read the code citations: {e}"),
+    }
+    Some(run)
+}
+
+/// How often the background worker looks at a knowledge base's checks.
+const CHECKS_EVERY: Duration = Duration::from_secs(300);
+/// How long the checks are left alone after a Claude call failed or was
+/// refused.
+const CHECKS_BACKOFF: Duration = Duration::from_secs(600);
+
+/// One turn of a knowledge base's checks (knowledge-core decisions 25, 28
+/// to 30), for a knowledge base only: a drift run when one is due
+/// ([`run_drift`]), then at most one background Claude call, the first of
+/// what waits: the lint after an edit, the weekly lint, the supersession
+/// pass over new decisions-log entries. The lint that needs no model and the
+/// supersession markers run with every scan (`scan::after_scan`).
+fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
+    let (base, project) = {
+        let guard = lock_tolerant(state);
+        let Some(active) = guard.members.get(&project_id) else {
+            return SummaryTick::Stopped;
+        };
+        (guard.base_dir.clone(), active.project.clone())
+    };
+    if !ken_core::registry::is_library(&project.root) {
+        return SummaryTick::Idle;
+    }
+    let Ok(mut db) = Db::open(&base, project_id) else {
+        return SummaryTick::Idle;
+    };
+    run_drift(state, &project, &mut db, false, stop);
+    if stop.load(Ordering::SeqCst) {
+        return SummaryTick::Stopped;
+    }
+    let Some(mut claude) = background_claude(state, project_id, &project.root, stop) else {
+        return SummaryTick::Idle;
+    };
+    let root = project.root.as_path();
+    let now = engine::now_epoch();
+    let done = |r: ken_core::Result<usize>| match r {
+        Ok(_) => SummaryTick::Ran,
+        Err(e) => {
+            eprintln!("checks: {e}");
+            SummaryTick::Failed
+        }
+    };
+    if let Ok(Some(p)) = ken_core::lint::after_edit_next(&db, root) {
+        return done(claude(&p.prompt).and_then(|reply| ken_core::lint::after_edit_done(&mut db, &p, &reply, now)));
+    }
+    if ken_core::lint::weekly_due(&db, now).unwrap_or(false) {
+        if let Ok(Some(p)) = ken_core::lint::weekly_next(&db, root, now) {
+            return done(claude(&p.prompt).and_then(|reply| ken_core::lint::weekly_done(&mut db, &reply, now)));
         }
     }
+    let roles = ken_core::authority::Roles::of_repo(root);
+    if let Ok(Some(p)) = ken_core::supersede::next_cluster(&db, &roles, &ken_core::supersede::Tuning::default()) {
+        return done(claude(&p.prompt).and_then(|reply| ken_core::supersede::judged(&mut db, &p, &reply, now)));
+    }
+    SummaryTick::Idle
 }
 
 /// Projects with an ingest pass in flight, so a scan that lands mid-pass
@@ -7548,11 +7684,10 @@ struct TeamOverviewDto {
     gaps: Vec<TeamGapDto>,
     /// The workspace's own ignore lines (`.kenignore` beside the repos).
     ignores: Vec<String>,
-    /// The wiki's last drift sweep.
+    /// The wiki's last drift run.
     sweep: Option<ken_core::drift::DriftRun>,
-    /// What waits on a person in the wiki: the last sweep's findings, the
-    /// link report, and what the wiki's drafts left (pages to read, pages
-    /// not drafted, proposals, repos that left the team).
+    /// What waits on a person in the wiki: the one findings list (drift,
+    /// lint, ingest, supersession).
     findings: Vec<TeamFindingDto>,
     rules: Vec<TeamPageDto>,
     templates: Vec<TeamPageDto>,
@@ -7561,9 +7696,10 @@ struct TeamOverviewDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TeamFindingDto {
-    /// From the sweep: `void` · `gone` · `changed` · `aged`. From the link
-    /// report: `missing-page` · `broken-link` · `ambiguous-name`. From the
-    /// findings list (`ken_core::findings`): `contradiction` · `question`.
+    /// The finding's kind (`ken_core::findings::Finding::kind`):
+    /// `contradiction` · `question` · `drift` · `broken-link` ·
+    /// `missing-page` · `ambiguous-name` · `orphan` · `suggested-page` ·
+    /// `unknown-ruling` · `supersession`.
     kind: String,
     title: String,
     detail: String,
@@ -7571,37 +7707,28 @@ struct TeamFindingDto {
     /// finding is about the sweep itself.
     path: String,
     project_id: String,
-    /// A stored finding's or a proposal's id, for `resolve_review_item` (and
-    /// `apply_page_proposal`).
+    /// The stored finding's id, for `resolve_review_item` (Mark as done)
+    /// and `confirm_finding`.
     item_id: Option<i64>,
 }
 
-/// The findings for the Team screen, from the wiki's index and its last
-/// sweep, at most 20 of each link-report kind, then the stored findings
-/// (an ingest's contradictions and open questions), each marked done once
-/// seen to.
-fn team_findings(wiki_id: &str, db: &Db, sweep: Option<&ken_core::drift::DriftRun>) -> Vec<TeamFindingDto> {
-    let mut out: Vec<TeamFindingDto> = Vec::new();
-    let mut push = |kind: String, title: String, detail: String, path: String, item_id: Option<i64>| {
-        out.push(TeamFindingDto { kind, title, detail, path, project_id: wiki_id.to_string(), item_id });
-    };
-    // A contradiction with a page or a ticket opens that page; anything
-    // else opens the note it was found in.
-    for (it, f) in ken_core::findings::open(db).unwrap_or_default() {
-        let path = if matches!(f.against_kind.as_str(), "page" | "ticket") && f.against.ends_with(".md") { f.against.clone() } else { f.source.clone() };
-        push(f.kind, it.title, it.body, path, Some(it.id));
-    }
-    if let Some(run) = sweep {
-        for f in ken_core::drift::findings(run) {
-            push(f.kind, f.title, f.detail, f.path, None);
-        }
-    }
-    if let Ok(report) = ken_core::links::report(db) {
-        for f in ken_core::links::findings(&report, 20) {
-            push(f.kind, f.title, f.detail, f.path, None);
-        }
-    }
-    out
+/// The findings for the Team screen and the Inbox: the knowledge base's one
+/// findings list (`ken_core::findings`), newest first, each marked done
+/// once seen to. Drift, the lint and the supersession pass file theirs as
+/// they run; nothing is worked out here.
+fn team_findings(wiki_id: &str, db: &Db) -> Vec<TeamFindingDto> {
+    ken_core::findings::open(db)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(it, f)| TeamFindingDto {
+            path: f.page(),
+            kind: f.kind,
+            title: it.title,
+            detail: it.body,
+            project_id: wiki_id.to_string(),
+            item_id: Some(it.id),
+        })
+        .collect()
 }
 
 fn git_line(root: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -7719,7 +7846,7 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             if let Some(d) = dbs.get(&id) {
                 let db = lock_tolerant(d);
                 sweep = db.last_drift_run().ok().flatten();
-                findings = team_findings(&w.id, &db, sweep.as_ref());
+                findings = team_findings(&w.id, &db);
             }
         }
         // The older layout kept the rules in Ways-of-Working/Rules.
@@ -7826,7 +7953,8 @@ fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> Cm
     Ok(rel)
 }
 
-/// Run the drift sweep now, whatever the interval or the repo's kind.
+/// Run drift now, whether or not a run is due or the repo is a knowledge
+/// base: the sweep, what it found acted on, and the code citations checked.
 #[tauri::command]
 async fn run_drift_now(state: State<'_, SharedState>, project_id: Option<String>) -> CmdResult<Option<ken_core::drift::DriftRun>> {
     let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
@@ -7835,9 +7963,10 @@ async fn run_drift_now(state: State<'_, SharedState>, project_id: Option<String>
         let active = member(&guard, id)?;
         (guard.base_dir.clone(), active.project.clone())
     };
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut db = Db::open(&base, project.config.id).map_err(err)?;
-        Ok(run_drift_if_due(&project, &mut db, true))
+        Ok(run_drift(&state, &project, &mut db, true, &Arc::new(AtomicBool::new(false))))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -11104,11 +11233,12 @@ const SUMMARY_BACKOFF: Duration = Duration::from_secs(600);
 /// Longest one batch of summaries may take.
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// What one turn of [`summarize_by_claude`] did.
+/// What one turn of a background Claude job did ([`summarize_by_claude`],
+/// [`knowledge_checks`]).
 enum SummaryTick {
     /// Nothing to do, or not allowed to.
     Idle,
-    /// A batch was summarized.
+    /// A call was made (a batch summarized, a check answered).
     Ran,
     /// The Claude call failed.
     Failed,
@@ -11196,6 +11326,11 @@ fn extraction_worker(
     let mut last_map_check = Instant::now() - MAP_CHECK;
     let mut last_summary_check = Instant::now() - SUMMARY_CHECK;
     let mut summaries_after = Instant::now();
+    // The first look at the checks a minute after the project opens, once
+    // its first scan has had time to land.
+    let soon = |wait: Duration| Instant::now().checked_sub(CHECKS_EVERY.saturating_sub(wait)).unwrap_or_else(Instant::now);
+    let mut last_checks = soon(Duration::from_secs(60));
+    let mut checks_after = Instant::now();
     while !stop.load(Ordering::SeqCst) {
         // The map comes from Claude: one read of the whole project for the
         // first map, and again once changes have settled (the automatic-build
@@ -11216,6 +11351,18 @@ fn extraction_worker(
                 // More may wait: look again on the next turn.
                 SummaryTick::Ran => last_summary_check = Instant::now() - SUMMARY_CHECK,
                 SummaryTick::Failed => summaries_after = Instant::now() + SUMMARY_BACKOFF,
+                SummaryTick::Idle => {}
+                SummaryTick::Stopped => return,
+            }
+        }
+        // A knowledge base's drift and lint (knowledge-core decisions 25, 28
+        // to 30): a drift run when one is due, then at most one background
+        // Claude call per turn while any check waits.
+        if last_checks.elapsed() >= CHECKS_EVERY && Instant::now() >= checks_after {
+            last_checks = Instant::now();
+            match knowledge_checks(&state, project_id, &stop) {
+                SummaryTick::Ran => last_checks = soon(SUMMARY_CHECK),
+                SummaryTick::Failed => checks_after = Instant::now() + CHECKS_BACKOFF,
                 SummaryTick::Idle => {}
                 SummaryTick::Stopped => return,
             }
@@ -12506,6 +12653,7 @@ pub fn run() {
             remove_model,
             set_model_selection,
             resolve_review_item,
+            confirm_finding,
             ignore_file,
             unignore_file,
             list_ignored,
@@ -12934,16 +13082,18 @@ mod ingest_record_tests {
     }
 
     #[test]
-    fn the_team_screen_reads_the_link_report_from_the_wiki() {
+    fn the_team_screen_reads_the_findings_list() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         std::fs::create_dir_all(root.join("Current")).unwrap();
+        // A knowledge base (it has the inbox): its scan runs the lint.
+        std::fs::create_dir_all(root.join("Research/Ingestion/Raw")).unwrap();
         std::fs::write(root.join("Current/Team.md"), "---\nstatus: draft\n---\n# Team\nSee [[Ghost]].\n").unwrap();
         let project = Project::create(root, "Wiki").unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut db = Db::open_at(&data.path().join("w.db")).unwrap();
         scan::scan(&project, &mut db).unwrap();
-        let found = team_findings("w1", &db, None);
+        let found = team_findings("w1", &db);
         assert!(found.iter().any(|f| f.kind == "missing-page" && f.path == "Current/Team.md" && f.project_id == "w1"), "{:?}", found.iter().map(|f| &f.title).collect::<Vec<_>>());
     }
 }

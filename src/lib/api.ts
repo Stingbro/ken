@@ -114,16 +114,20 @@ export interface TeamPage {
   title: string;
 }
 
-/** Something the wiki's own checks found: a page drifted from its source
- *  or not checked for thirty days, the link report, the first draft. */
+/** One entry of the knowledge base's one findings list: drift, the lint,
+ *  ingest and the supersession pass all file there. */
 export interface TeamFinding {
-  /** drift · aged · links · draft, as the backend names it. */
+  /** contradiction · question · drift · broken-link · missing-page ·
+   *  ambiguous-name · orphan · suggested-page · unknown-ruling ·
+   *  supersession, as the backend names it. */
   kind: string;
   title: string;
   detail: string;
   /** The page to open, inside `projectId`'s repo. */
   path: string | null;
   projectId: string | null;
+  /** The stored finding's id: Mark as done, or Confirm a supersession. */
+  itemId?: number | null;
 }
 
 /** The Team screen: the chosen team's repos and configuration. */
@@ -255,7 +259,7 @@ export interface IngestCard {
   writing: boolean;
 }
 
-/** Mirrors `drift::DriftRun`: one standing sweep. */
+/** Mirrors `drift::DriftRun`: one drift run, what it found and did. */
 export interface DriftRun {
   at: number;
   /** 0 clean · 1 a Finding or a broken instrument · 2 drift only. */
@@ -270,6 +274,8 @@ export interface DriftRun {
     severity: "autoRecleared" | "judgment" | "finding";
     detail: string;
     research: boolean;
+    pin?: string | null;
+    branch?: string | null;
   }[];
   aged: [string, string | null][];
   voidReason: string | null;
@@ -280,6 +286,17 @@ export interface DriftRun {
    *  last sweep because no commit since touched their file. */
   measured: number;
   reused: number;
+  /** What the run did: pages whose `checked` stamp advanced, pages fixed,
+   *  edits held for a person, citations rewritten after a rename, findings
+   *  filed, pages waiting for a re-read, and its commit. */
+  stamped: string[];
+  fixed: string[];
+  held: string[];
+  renamed: string[];
+  findings: number;
+  waiting: string[];
+  commit: string | null;
+  commitError: string | null;
 }
 
 /** What a file is for (`contenttype::of`); every search hit carries one. */
@@ -1535,6 +1552,10 @@ export const api = {
   /** Close a page proposal or another stored item without applying it. */
   resolveReviewItem: (id: number, projectId: string | null = null) =>
     invoke<void>("resolve_review_item", { id, projectId }),
+  /** Confirm a supersession finding: Ken writes it into the decisions log as
+   *  one commit, and returns the commit when it made one. */
+  confirmFinding: (id: number, projectId: string | null = null) =>
+    invoke<string | null>("confirm_finding", { id, projectId }),
   /// Silence a file's issues for this user only (app-data, never synced).
   ignoreFile: (relPath: string) =>
     invoke<void>("ignore_file", { relPath }),

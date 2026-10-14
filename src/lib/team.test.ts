@@ -7,18 +7,26 @@ const finding = (kind: string, title = kind): TeamFinding => ({ kind, title, det
 describe("findingLabel", () => {
   it("names each kind plainly", () => {
     expect(findingLabel("drift")).toBe("drift");
-    expect(findingLabel("aged")).toBe("unchecked");
-    expect(findingLabel("links")).toBe("links");
-    expect(findingLabel("wiki-draft")).toBe("first draft");
-    expect(findingLabel("other")).toBe("other");
+    expect(findingLabel("orphan")).toBe("links");
+    expect(findingLabel("broken-link")).toBe("links");
+    expect(findingLabel("unknown-ruling")).toBe("ruling");
+    expect(findingLabel("suggested-page")).toBe("page to write");
+    expect(findingLabel("question")).toBe("question");
     expect(findingLabel("")).toBe("finding");
   });
 });
 
 describe("orderFindings", () => {
   it("puts drift first and keeps the order within a kind", () => {
-    const list = [finding("links", "l"), finding("aged", "a1"), finding("drift", "d"), finding("x", "x"), finding("aged", "a2")];
-    expect(orderFindings(list).map((f) => f.title)).toEqual(["d", "a1", "a2", "l", "x"]);
+    const list = [
+      finding("orphan", "o"),
+      finding("contradiction", "c1"),
+      finding("drift", "d"),
+      finding("question", "q"),
+      finding("contradiction", "c2"),
+      finding("supersession", "s"),
+    ];
+    expect(orderFindings(list).map((f) => f.title)).toEqual(["d", "s", "c1", "c2", "o", "q"]);
   });
 });
 

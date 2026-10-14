@@ -6,25 +6,31 @@ import type { RepoKind, SetupRepoRow, TeamFinding, TeamRepo } from "./api";
 export function findingLabel(kind: string): string {
   switch (kind) {
     case "drift":
-    case "mismatch":
       return "drift";
-    case "aged":
-      return "unchecked";
-    case "links":
-    case "link":
+    case "supersession":
+      return "supersession";
+    case "unknown-ruling":
+      return "ruling";
+    case "contradiction":
+      return "contradiction";
+    case "broken-link":
+    case "missing-page":
+    case "ambiguous-name":
+    case "orphan":
       return "links";
-    case "draft":
-    case "wiki-draft":
-      return "first draft";
+    case "suggested-page":
+      return "page to write";
     default:
       return kind || "finding";
   }
 }
 
-/** Findings in the order Team lists them: drift first, then unchecked
- *  pages, links, the first draft and anything else. Stable within a kind. */
+/** Findings in the order Team lists them: drift first, then superseded
+ *  rulings, contradictions, rulings cited in code, links, pages to write and
+ *  anything else. Stable within a kind. */
 export function orderFindings(findings: readonly TeamFinding[]): TeamFinding[] {
-  const rank = (k: string) => ["drift", "unchecked", "links", "first draft"].indexOf(findingLabel(k));
+  const order = ["drift", "supersession", "contradiction", "ruling", "links", "page to write"];
+  const rank = (k: string) => order.indexOf(findingLabel(k));
   return findings
     .map((f, i) => ({ f, i, r: rank(f.kind) }))
     .sort((a, b) => (a.r === -1 ? 9 : a.r) - (b.r === -1 ? 9 : b.r) || a.i - b.i)

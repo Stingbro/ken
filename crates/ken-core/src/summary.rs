@@ -11,8 +11,10 @@
 //! knowledge-base repo (kind team or wiki), on the global background pace,
 //! and the `backgroundExtraction` flag switches it off. On top of the pace,
 //! at most [`MAX_CALLS_PER_HOUR`] calls are made in any hour, across the app
-//! ([`take_call`]). The generator stays this small on purpose: slice 11
-//! folds it into the build queue and its throttle replaces the cap.
+//! ([`take_call`]); the same cap counts every background Claude call (drift's
+//! re-reads, the lint's comparisons, the supersession pass). The generator
+//! stays this small on purpose: slice 11 folds it into the build queue and
+//! its throttle replaces the cap.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -21,16 +23,19 @@ use std::time::{Duration, Instant};
 use crate::db::Db;
 use crate::Result;
 
-/// Most summary calls to Claude in any rolling hour, across the app. The
-/// first pass over a knowledge base of 5,000 chunks is about 125 calls;
-/// at this cap it takes about six hours instead of running back to back.
+/// Most background calls to Claude in any rolling hour, across the app:
+/// summaries, drift's re-reads, the lint and the supersession pass share
+/// it. The first pass over a knowledge base of 5,000 chunks is about 125
+/// calls; at this cap it takes about six hours instead of running back to
+/// back.
 pub const MAX_CALLS_PER_HOUR: usize = 20;
 
 /// When the calls of the last hour were made.
 static CALLS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 
-/// Whether a summary call may be made now; when it may, it is counted.
-/// False once [`MAX_CALLS_PER_HOUR`] calls were made in the last hour.
+/// Whether a background Claude call may be made now; when it may, it is
+/// counted. False once [`MAX_CALLS_PER_HOUR`] calls were made in the last
+/// hour. Every background caller takes it, not only summaries.
 pub fn take_call() -> bool {
     take_call_at(&CALLS, Instant::now())
 }

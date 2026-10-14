@@ -1027,6 +1027,31 @@ impl Db {
         self.meta_set("drift_cache", json)
     }
 
+    /// What a check keeps between its runs, by name: the lint's queue of
+    /// pages to compare and when it last ran weekly, the supersession pass's
+    /// entries already read (see `lint` and `supersede`).
+    pub fn check_state(&self, name: &str) -> Result<Option<String>> {
+        self.meta_get(&format!("check:{name}"))
+    }
+
+    pub fn store_check_state(&self, name: &str, value: &str) -> Result<()> {
+        self.meta_set(&format!("check:{name}"), value)
+    }
+
+    /// The code files whose text holds `needle`, with their text: where a
+    /// code comment may cite a ruling (`lint::unknown_rulings`).
+    pub fn code_texts_containing(&self, needle: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.rel_path, c.text FROM files f JOIN contents c ON c.file_id = f.id
+              WHERE f.kind = 'code' AND f.status = 'indexed' AND instr(c.text, ?1) > 0
+              ORDER BY f.rel_path",
+        )?;
+        let rows = stmt
+            .query_map(params![needle], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Start a batch: the writes that follow, until [`Db::commit_batch`],
     /// land as one transaction. Each write method's own savepoint nests
     /// inside it, so a scan pays one commit per batch, not several per file.
@@ -5007,13 +5032,13 @@ mod tests {
     #[test]
     fn schema_17_marks_prose_files_to_read_again() {
         let mut db = Db::open_in_memory().unwrap();
-        for (path, status) in [("decisions/Cited-in-Code.md", "indexed"), ("logs/boot.txt", "indexed"), ("src/Stash.java", "indexed"), ("old.md", "metadata_only")] {
+        for (path, status) in [("Reference/Error-Codes.md", "indexed"), ("logs/boot.txt", "indexed"), ("src/Stash.java", "indexed"), ("old.md", "metadata_only")] {
             db.upsert_file(path, "code", 1, 5, status, None, "x").unwrap();
             db.set_file_byte_hash(path, "abc", 5).unwrap();
         }
         db.conn.execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'", []).unwrap();
         db.migrate().unwrap();
-        for (path, again) in [("decisions/Cited-in-Code.md", true), ("logs/boot.txt", true), ("src/Stash.java", false), ("old.md", false)] {
+        for (path, again) in [("Reference/Error-Codes.md", true), ("logs/boot.txt", true), ("src/Stash.java", false), ("old.md", false)] {
             assert_eq!(db.get_file(path).unwrap().unwrap().mtime == -1, again, "{path}");
             assert_eq!(db.file_byte_hash(path).unwrap().is_none(), again, "{path}");
         }
