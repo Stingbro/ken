@@ -53,7 +53,7 @@ On top of that base:
 2. **Entry point and indexes: kept current, plus a log.**
    - START-HERE and one index per section.
    - Every page Ken writes is added to its section index, with one line, in the same change.
-   - `log.md` gets one dated line per ingest, drift run and lint pass: `## [YYYY-MM-DD] kind | title`.
+   - `log.md` gets one dated line per ingest, per lint pass when it acts (files or resolves a finding), and per drift run only when it changed a page: `## [YYYY-MM-DD] kind | title`.
 3. **Sections:**
    - Rules: binding, incl. team conventions, never restated from lint config.
    - Decisions: `Decisions/DECISIONS.md`.
@@ -68,9 +68,10 @@ On top of that base:
    - Ship only files with content, plus the blanks in `Templates/`. No page that only holds placeholders. A page is created from its blank when something writes it.
    - Re-running setup reports missing or out-of-date files as a diff and never overwrites.
    - The tickets folder and the ticket template stay.
-5. **Frontmatter: six keys.**
+5. **Frontmatter: seven keys.**
    - `title`, `aliases`;
    - `status`: draft | current | superseded;
+   - `superseded_by`: a retired page's successor, written by Ken when it retires the page;
    - `updated`;
    - `sources`: each `repo@sha:path` or `[[Note]]`, with the pin inside;
    - `checked`: date and sha, written by the check that re-read the page;
@@ -78,7 +79,7 @@ On top of that base:
    - **Dropped:** `lens`, `changed_by`, `audience`, a separate `pin`, person-only `verified`.
 6. **Current:** Project, Roadmap and Feature Status, kept current by ingest and drift. Team and Who-Does-What are gone.
 7. **Retired, generated and moved pages:**
-   - Retired pages rank last and name their successor.
+   - Retired pages rank last and name their successor in `superseded_by`, which search shows on the hit. A retirement is written at once, like a plain fact update; a Rules page or a page with a person's uncommitted work is held for a person.
    - The retire, harvest and generated-page rules go in the brief.
    - When Ken moves or renames a page it rewrites every link where the target is certain, reports the rest, and writes a `log.md` line.
 8. **One knowledge-base repo:**
@@ -105,7 +106,7 @@ On top of that base:
     - **Cap:** about 10 updates and 10 new pages per source.
 12. **Git is the undo.**
     - No per-write undo records.
-    - **One commit per ingest** in the knowledge base: the note and every page it changed. The message names the note; the body lists pages changed, held edits, contradictions and open questions. Ken never pushes.
+    - **One commit per ingest** in the knowledge base: the note and every page it changed. The message names the note; the body lists pages changed, held edits, contradictions and open questions. Ken never pushes outside sync, which pulls and pushes the knowledge base.
     - **The card** shows takeaways, contradictions, open questions and held edits (Apply or Discard).
     - **A source is claimed when its note is written:** it moves beside its note, so two machines never ingest it twice.
 13. **Rulings.**
@@ -138,20 +139,20 @@ On top of that base:
 17. **Kinds and roles.**
     - Add the `decision` and `note` kinds.
     - **Tests are not indexed by default;** a team can add them back.
-    - **A code file's kind is its role** (service, controller, repository…): a small built-in core plus per-repo role rules proposed by a repo analysis when the repo is added, saved in `.ken/knowledge.json`, editable, applied without a model at index time.
+    - **A code file's kind is its role** (service, controller, repository…): a small built-in core plus per-repo role rules proposed by a repo analysis when the repo is added. The proposal waits as an Inbox card showing each rule; nothing applies until a person accepts it, which writes the rules into `.ken/knowledge.json` (one commit naming the file), and Dismiss drops them. Once there they are editable and applied without a model at index time.
     - **One label per hit:** kind · tier or role · date.
 18. **Vocabulary.**
     - Query rewrites come from the Vocabulary page and the decisions log's aliases only.
     - Page titles and aliases feed the names field, not rewrites.
     - Ingest and drift add rename rows.
 19. **Controls and health.**
-    - A few known questions per source, each with the file it must return near the top, run through the real pipeline on every rebuild, kept in `.ken/knowledge.json` and proposed at setup.
+    - A few known questions per source, each with the file it must return near the top, run through the real pipeline on every rebuild, kept in `.ken/knowledge.json`. Proposed at setup on the repo analysis's Inbox card, and kept only once a person accepts them.
     - **One health line:** indexed, failed or skipped; meaning built; controls; model missing.
     - Retire the title-query control on the old index.
 20. **Routing.**
     - Every question searches every source, merged once.
     - A named repo narrows the search.
-    - Reference repos join only for platform questions, when named, or when nothing else answers.
+    - Reference repos join only for platform questions, when named, or when nothing else answers. Only hits found by the question's words count as answering: a source with meaning-only hits has not answered, so the reference repos join.
     - **Dropped:** the graph-guided planner, the 5-repo cap, the band tie-break, the library-share rule.
     - A slow or building repo is reported, never silently dropped.
 21. **The project graph (kept, rebuilt).**
@@ -204,7 +205,7 @@ On top of that base:
     - **A real change:** Claude re-reads the page section against the diff, and either stamps it or fixes it through the ingest edit rules.
     - **A rename:** followed, and the citation rewritten when certain.
     - **A ruling whose code changed is never edited.** It becomes a finding.
-    - **After each run:** one commit and a `log.md` line.
+    - **After a run that changed a page:** one commit and a `log.md` line.
     - **One config:** the audience split and the unused second config are gone. Optional moved/clean controls stay.
 29. **Lint.**
     - **On every scan:** broken links, ambiguous names, orphans, missing pages.
@@ -232,12 +233,12 @@ On top of that base:
     - **Two states:** a path is indexed or it isn't.
     - **Rules live in one place,** `.ken/knowledge.json`, plus fixed built-ins: VCS, dependencies, build output, secrets, tests, minified and generated files, binaries.
     - **Re-reads** happen on a content-hash change; a file that fails three times is counted as failed.
-    - **One throttle for all background work** (Gentle / Normal / Fast, Pause) and one status panel: running, queued, progress, failed with reasons.
+    - **One throttle for all background work** (Gentle / Normal / Fast, Pause) and one status panel: running, queued, progress, failed with reasons. A person's own ingest (a source they drop or add) is paced and paused with the rest but is outside the hourly budget; the build queue, summaries, re-reads, supersession and repo analysis keep it.
 35. **Team cut from the knowledge layer:** no team repo, roster, owners, deciders or team bus. `team.json` becomes `.ken/knowledge.json`.
 
 ### The rest of Ken on this branch
 
-36. **Ken's commits:** only in the knowledge base, only its own changes. Never `git add -A`, never in a code repo.
+36. **Ken's commits:** only in the knowledge base, only its own changes. Never `git add -A`, never in a code repo. A person's other changes in the knowledge base are committed only when they ask, through sync's "commit my other changes", which lists each file first.
 37. **Feature by feature:**
     - **OpenSpec is removed entirely.**
     - **Your day and tasks stay.**

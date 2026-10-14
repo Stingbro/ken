@@ -339,6 +339,25 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. Tests: ken-core 856 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 15 passed; vitest 793 passed in 65 files; `npm run check` 0 errors, the 6 known warnings.
   - Not run: the app. The first scan of each source with older ignore lines and a knowledge base that lists it makes one commit in the knowledge base. The first weekly drift run files an `aged` finding for each page not checked in 30 days, where before it asked Claude to re-read them.
 
+- **Slice 15b: Chris's answers, the app half** (`9784580`, `3f4db17`, `009a4a8`, `3acd584`, `f323fbd`). Decisions 2, 5, 7, 12, 17, 19, 20, 28, 34, 36, with Chris's answers of 2026-10-14.
+  - A person's own ingest skips the hour (`9784580`; 34): `throttle::own_turn` waits while paused, while another call holds the turn and for the gap, but is not counted against the hour and a full hour does not hold it. The ingest pass takes it for a source a person dropped into Raw, added in the app or through the MCP `add_source`; a source the build queue placed (`buildqueue::placed`) keeps `claude_turn`, as do summaries, drift's re-reads, the lint, the supersession pass and the repo analysis. The status panel says so.
+  - An ingest card closes by itself (`3f4db17`): after a person applies or discards a held edit, ruling or ticket, or marks a finding done, `ingest::close_if_settled` marks the card of that note done once no proposal from it (`from`) and no finding it filed (`source`) is open, as Seen would. `resolve_review_item`, `apply_page_proposal` and `confirm_finding` share `settle_review_item`; `ingest::note_of` reads the note an item came from.
+  - The repo analysis waits for a person (`009a4a8`; 17, 19): one Inbox card in the knowledge base's index (`repo_analysis::KIND`, `Proposal`, `file`) lists each role rule and control. Accept (`accept_analysis`, `repo_analysis::accept`, `knowledge_settings::accept_proposals`) writes them where the file has none for the source yet, as one commit naming `.ken/knowledge.json` and listing them, then scans the source again; Dismiss is `resolve_review_item`. `save_proposals` and `analyze_and_save` are gone; the Inbox reads `analysis_proposals`. The template's notes and the role and control module docs say so.
+  - "Commit my other changes" (`3acd584`; 12, 36): `sync::other_changes` is the knowledge base's uncommitted files less Ken's own writes waiting for the cycle (`SyncEngine::pending`, the engine's set now shared) and the personal paths; `SyncStatus.others` carries it for the knowledge base only. The repo drawer's Sync card lists each file, then `sync_commit_others` (`sync::commit_others`) commits exactly those, its message naming each, and syncs. Refused outside the knowledge base. Sync keeps pulling and pushing.
+  - ken-mcp tells a running app (`f323fbd`): the app writes `app-listener.json` (`hooks::LISTENER_FILE`: its listener's `/ken-ui` URL, token and pid) in Ken's app data when the listener starts and removes it at exit; `hooks::signal_app` posts one request with short timeouts after `propose_decision` (`proposed`: the Inbox refreshes) and `add_source` (`source-added`: the knowledge base's ingest is scheduled, and the Inbox refreshes). No app, no file or nobody listening: it fails quietly, nothing queued, the app never started.
+  - Found on the way: a ruling proposed in chat, and an edit a drift run held, waited in no ingest card, so the Inbox never listed them. `loose_proposals` lists them, shown from "Ken, in a chat" or "Ken, checking drift" without "Open the note".
+  - Docs: DECISIONS.md says seven keys and `superseded_by` (5, 7), lint's line when it acts and drift's only when it changed a page (2, 28), Ken never pushes outside sync (12), the words-only reserve rule (20), the repo analysis's Inbox card (17, 19), the own-ingest exemption (34) and "commit my other changes" (36). Chris's three later answers are under "Decided by Chris".
+  - Tests: `a_persons_own_ingest_skips_the_hour_but_not_the_pace_or_the_pause` and the build queue's `placed`; `a_card_closes_by_itself_once_nothing_waits_from_it`; `a_proposal_waits_and_applies_only_when_accepted`; `other_changes_are_listed_and_committed_only_when_asked`; `a_signal_reaches_a_running_app_and_fails_quietly_without_one`.
+  - Choices:
+    - Only a source the build queue placed counts against the hour; when the queue cannot be read, the call is counted.
+    - A card closes only after a person settles its last waiting item; a card that never had anything waiting stays until Seen.
+    - A source proposed once (waiting, accepted or dismissed) is not analysed again (see Open for Chris). A code repo that keeps its own settings file gets no proposal: Ken writes nothing there.
+    - Accept writes only where the file has no rules or controls for the source yet, so an edit made in Settings › Workspace while the card waited stays; the commit is left out when the file holds a person's uncommitted work.
+    - "Commit my other changes" commits the list the person was shown, each file only if it still has changes.
+    - The app is found through a file in its app data, not an environment variable, so a ken-mcp registered with Claude Code reaches it too; only a loopback address is asked.
+  - The compile check is clean apart from the known warnings. Tests: ken-core 861 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 15 passed; vitest 793 passed in 65 files; `npm run check` 0 errors, the 6 known warnings. The sidecar was re-staged.
+  - Not run: the app. The first set-up or kind change after this files an analysis card for each source with no rules or controls yet and none proposed before; nothing is written until a person accepts.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
@@ -353,6 +372,9 @@ Chris answered the open questions. Slice 15 builds the ones that change code; th
   - The build queue starts only when a person presses Build the library.
   - Pass two reads at most 50 files a source.
   - The title weight (2.5) and the symbol weight (1.0) stay until decision 38's measurement exists.
+  - The reserve rule stays (after slice 14): only hits found by the question's words count as answering, so meaning-only hits let the reference repos join (decision 20).
+  - A lowercase section folder such as `design/` stays where it is: it is already its section (after slice 14).
+  - Retiring a page stays as built (after slice 15a): a retirement is written straight away; a Rules page and a page with uncommitted work are held for a person.
 - **To build (slice 15):**
   - A seventh key, `superseded_by`, names a retired page's successor; Ken writes it and search shows it.
   - The repo analysis's role rules and controls wait as an Inbox proposal card and apply only once a person accepts.
@@ -392,7 +414,7 @@ The test suite has been run (2026-10-14) and passes; the app has not been starte
     - Test, `abda68e`: a lowercase section folder (`design/`) is already its section, so the map tests move `designs/` instead.
 - [ ] **The end-to-end run** (manual, with Chris; it starts the app and makes Claude calls), on a throwaway workspace, never `hytale-shared-source`:
   - [ ] Set up: name a new workspace, save a new knowledge base, add one small code repo. Check the template lands (START-HERE, the brief, `Decisions/DECISIONS.md`, `tickets/`, `log.md`, `.ken/knowledge.json`), the first commit names its files, the code repo gets no commit, and search and the code index answer before anything is built.
-  - [ ] Health: Settings › Workspace shows one health line per source; the repo analysis proposes roles and controls into `.ken/knowledge.json`; the controls run after the meaning index builds.
+  - [ ] Health: Settings › Workspace shows one health line per source; the repo analysis proposes roles and controls as an Inbox card, and Accept writes them into `.ken/knowledge.json` as one commit; the controls run after the meaning index builds.
   - [ ] Ingest: drop a meeting note with a ruling, an action, a contradiction and an open question into `Research/Ingestion/Raw/`. Check the note's headings, the source moved beside it, section edits citing the note, a held edit for a Rules page, the ruling waiting as a ready entry (one click adds `## D-001 · date · topic`), a drafted ticket, both findings in the Inbox, one commit naming the note, one `log.md` line, no push, and the Timeline entry.
   - [ ] Search: a plain question returns hits labelled `kind · tier · date`, the new ruling ranked binding; "save world" style words reach a definition with its symbol and `next:` calls; `related` on the ruling shows the note and the page.
   - [ ] Drift: commit a real change under a page's `sources:` in the code repo, then a comment-only change. Check the first is re-read and stamped or fixed (`checked:` with the new commit), the second advances `checked:` silently, a ruling citing the changed code becomes a finding and is not edited, one commit and one `log.md` line, and nothing written in the code repo.
@@ -404,18 +426,18 @@ The test suite has been run (2026-10-14) and passes; the app has not been starte
 One lane at a time, a compile check, a commit and a push each, as before; the tests touched are re-run at the end.
 
 - [x] `superseded_by`: the seventh key (decisions 5, 7), written when a page is retired, shown on the hit's label; `replaced_by` still read on older pages.
-- [ ] Repo analysis proposals: an Inbox card holds the proposed role rules and controls; Accept writes them to `.ken/knowledge.json` (one commit), Dismiss drops them.
+- [x] Repo analysis proposals: an Inbox card holds the proposed role rules and controls; Accept writes them to `.ken/knowledge.json` (one commit), Dismiss drops them.
 - [x] Age rule: aged pages become findings; only pages whose `sources:` moved are re-read.
-- [ ] Throttle: a person's own ingest skips the hourly budget (still paced between calls).
-- [ ] Inbox: a card closes by itself once nothing waits from it.
+- [x] Throttle: a person's own ingest skips the hourly budget (still paced between calls).
+- [x] Inbox: a card closes by itself once nothing waits from it.
 - [x] Lint: a `log.md` line per pass that filed or resolved something (decision 2).
 - [x] Drift: `base` read when set, the remote default otherwise.
 - [x] Topic tags inside the ingest plan and the drift re-read; the tags call removed.
 - [x] Old ignore files: moved into `.ken/knowledge.json` once, then no longer read.
-- [ ] Sync: "commit my other changes", listing each file before it commits.
-- [ ] ken-mcp signals a running app after `propose_decision` and `add_source`.
-- [ ] Re-run the tests the slice touched; update DECISIONS.md where an answer changes a decision's wording (2, 5, 7, 12).
+- [x] Sync: "commit my other changes", listing each file before it commits.
+- [x] ken-mcp signals a running app after `propose_decision` and `add_source`.
+- [x] Re-run the tests the slice touched; update DECISIONS.md where an answer changes a decision's wording (2, 5, 7, 12).
 
 ### Open for Chris
 
-- **Retiring a page is written at once.** The ingest plan's `retire` writes `status: superseded` and `superseded_by:` without asking, unless the page is a Rules page or holds a person's work (slice 15a). Should every retirement wait for a person instead?
+- **A dismissed repo analysis is not proposed again.** Slice 15b asks Claude once per source: a card that was dismissed, like one accepted, keeps the source from being analysed again, so a person's no stays and no call is made unasked. The roles and controls can still be written by hand in Settings › Workspace. Should there be a way to ask for a fresh analysis?
