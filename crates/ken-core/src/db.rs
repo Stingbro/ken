@@ -4388,16 +4388,19 @@ mod tests {
         assert_eq!(hits.first().map(|h| h.path.as_str()), Some("src/chest/PoolRespawn.java"), "{hits:?}");
     }
 
+    /// Rewound to 16, every later migration runs too, and v23 reads prose
+    /// and code with a grammar again, so the file left alone is one no
+    /// migration reads again.
     #[test]
     fn schema_17_marks_prose_files_to_read_again() {
         let mut db = Db::open_in_memory().unwrap();
-        for (path, status) in [("Reference/Error-Codes.md", "indexed"), ("logs/boot.txt", "indexed"), ("src/Stash.java", "indexed"), ("old.md", "metadata_only")] {
+        for (path, status) in [("Reference/Error-Codes.md", "indexed"), ("logs/boot.txt", "indexed"), ("config/app.yaml", "indexed"), ("old.md", "metadata_only")] {
             db.upsert_file(path, "code", 1, 5, status, None, "x").unwrap();
             db.set_file_byte_hash(path, "abc", 5).unwrap();
         }
         db.conn.execute("UPDATE meta SET value = '16' WHERE key = 'schema_version'", []).unwrap();
         db.migrate().unwrap();
-        for (path, again) in [("Reference/Error-Codes.md", true), ("logs/boot.txt", true), ("src/Stash.java", false), ("old.md", false)] {
+        for (path, again) in [("Reference/Error-Codes.md", true), ("logs/boot.txt", true), ("config/app.yaml", false), ("old.md", false)] {
             assert_eq!(db.get_file(path).unwrap().unwrap().mtime == -1, again, "{path}");
             assert_eq!(db.file_byte_hash(path).unwrap().is_none(), again, "{path}");
         }
@@ -4411,6 +4414,8 @@ mod tests {
         text
     }
 
+    /// What v18 runs, on its own: rewound to 17, v23 reads every page again
+    /// too, so the migration as a whole cannot show which pages are logs.
     #[test]
     fn schema_18_marks_log_pages_to_read_again() {
         let mut db = Db::open_in_memory().unwrap();
@@ -4418,8 +4423,7 @@ mod tests {
             db.upsert_file(path, "md", 1, 5, "indexed", None, &text).unwrap();
             db.set_file_byte_hash(path, "abc", 5).unwrap();
         }
-        db.conn.execute("UPDATE meta SET value = '17' WHERE key = 'schema_version'", []).unwrap();
-        db.migrate().unwrap();
+        assert_eq!(db.mark_log_pages_for_reindex().unwrap(), 1);
         for (path, again) in [("decisions/DECISIONS.md", true), ("notes.md", false)] {
             assert_eq!(db.get_file(path).unwrap().unwrap().mtime == -1, again, "{path}");
         }
