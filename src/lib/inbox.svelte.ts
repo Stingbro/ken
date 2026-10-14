@@ -167,7 +167,7 @@ export function sortInbox(items: InboxItem[]): InboxItem[] {
 class InboxStore {
   /** Waiting items from the backend reads (ingest waits, findings). */
   private ken = $state<InboxItem[]>([]);
-  /** The wiki's findings, read apart: the read runs git in every repo. */
+  /** The knowledge base's findings, read apart from the cards. */
   private findings = $state<InboxItem[]>([]);
   /** The library's Raw sources from the last read: what Ingest is doing. */
   raw = $state<RawSource[]>([]);
@@ -225,9 +225,14 @@ class InboxStore {
       this.queue();
       void this.refreshFindings();
     });
-    // Indexing moves a source's state here, at most every few seconds; the
-    // findings are not read for it.
-    await api.onIndexUpdated(() => this.queue(INDEX_DEBOUNCE_MS));
+    // Indexing moves a source's state here, at most every few seconds. The
+    // findings are read for it too: an ingest, a drift run and the scan's
+    // lint file theirs and then write or commit files, which is the event
+    // that follows, and none of them says "review-changed".
+    await api.onIndexUpdated(() => {
+      this.queue(INDEX_DEBOUNCE_MS);
+      this.queueFindings(INDEX_DEBOUNCE_MS);
+    });
     $effect.root(() => {
       $effect(() => {
         void app.workspace?.id;
@@ -250,6 +255,7 @@ class InboxStore {
   });
 
   readonly queue = coalesce(() => void this.refresh(), DEBOUNCE_MS);
+  private readonly queueFindings = coalesce(() => void this.refreshFindings(), DEBOUNCE_MS);
 
   /** Read Ken's waiting items: every ingest card's waits, and the wiki's
    *  findings. Optional reads: a failure keeps what was there. One read at

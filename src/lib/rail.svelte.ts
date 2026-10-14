@@ -22,7 +22,9 @@ class RailStore {
   async subscribe() {
     if (this.subscribed) return;
     this.subscribed = true;
-    await api.onIndexUpdated(() => this.queue(false));
+    // An ingest, a drift run or the scan's lint files its findings and then
+    // writes files: the index event is the one that follows.
+    await api.onIndexUpdated(() => this.queue(true));
     await api.onReviewChanged(() => this.queue(true));
     setInterval(() => void this.refreshFindings(), FINDINGS_EVERY_MS);
     $effect.root(() => {
