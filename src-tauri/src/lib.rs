@@ -1289,7 +1289,7 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                     // on the index this scan just brought up to date.
                     run_drift_if_due(&scan_project, &mut db, false);
                     // And the library inbox: anything waiting in Raw/.
-                    start_ingest_pass(&scan_project, &base, workspace_root_of(&scan_state), false);
+                    start_ingest_pass(&scan_project, &base, code_sources_of(&scan_state, &scan_project.root), false);
                 }
                 Err(e) => {
                     let _ = scan_app.emit("scan-error", e.to_string());
@@ -4352,15 +4352,15 @@ fn finish_recording(app: &AppHandle, state: &SharedState, base: &Path, storage: 
     std::fs::write(raw_dir.join(&md_name), &doc).map_err(err)?;
 
     // Index it, then read it.
-    let (base_dir, ws_root) = {
+    let (base_dir, others) = {
         let mut guard = state.lock().unwrap();
         if let Some(m) = guard.members.get_mut(&take.project_id) {
             let _ = scan::refresh_path(&m.project, &mut m.db, &md_rel);
         }
-        (guard.base_dir.clone(), guard.workspace.as_ref().map(|w| w.ws.root.clone()))
+        (guard.base_dir.clone(), code_sources(&guard, &project.root))
     };
     emit_member(app, take.project_id, "index-updated", ScanStats::default());
-    start_ingest_pass(&project, &base_dir, ws_root, true);
+    start_ingest_pass(&project, &base_dir, others, true);
     let _ = app.emit("record-saved", RecordSaved { rel_path: md_rel, project_id: Some(take.project_id.to_string()) });
     Ok(())
 }
@@ -6559,9 +6559,28 @@ static INGEST_SETTLE_GEN: std::sync::LazyLock<Mutex<std::collections::HashMap<uu
 /// How long the inbox must stay unchanged before the watcher starts a pass.
 const INGEST_SETTLE: Duration = Duration::from_secs(5);
 
-/// The open workspace's folder, where Your day's tasks live.
-fn workspace_root_of(state: &SharedState) -> Option<std::path::PathBuf> {
-    lock_tolerant(state).workspace.as_ref().map(|w| w.ws.root.clone())
+/// The repos an ingest in the library at `root` checks a source against
+/// (knowledge-core decision 10): every other repo of the open workspace, by
+/// name and id. Their indexes are opened for reading on the pass's thread.
+fn code_sources(guard: &AppState, root: &Path) -> Vec<(String, uuid::Uuid)> {
+    guard
+        .workspace
+        .as_ref()
+        .map(|w| {
+            w.ws.members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) if !same_dir(&p.root, root) => Some((p.config.name.clone(), p.config.id)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`code_sources`], taking the lock.
+fn code_sources_of(state: &SharedState, root: &Path) -> Vec<(String, uuid::Uuid)> {
+    code_sources(&lock_tolerant(state), root)
 }
 
 /// The Whisper model a pass transcribes with: the selected one when it is
@@ -6587,21 +6606,22 @@ fn schedule_ingest_pass(state: &SharedState, project: &Project, base: &Path) {
         if INGEST_SETTLE_GEN.lock().unwrap().get(&id) != Some(&gen) {
             return; // a later change restarted the wait
         }
-        start_ingest_pass(&project, &base, workspace_root_of(&state), false);
+        start_ingest_pass(&project, &base, code_sources_of(&state, &project.root), false);
     });
 }
 
 /// Read every new source waiting in a library's `Research/Ingestion/Raw/`,
-/// one at a time on a background thread, through the Claude CLI
-/// (`ingest::run_pass`): a recording is transcribed first with the selected
-/// Whisper model; each source becomes its dated note and its card, and what
-/// follows from it is written at once (my next steps into `ws_root`'s Your
-/// day). A source that fails stays in Raw with its failure recorded and the
-/// pass moves on; the pass stops only when the CLI itself fails. A library is
-/// a repo with the inbox, whatever its kind (`registry::is_library`); `force`
-/// reads any repo with an inbox. Returns whether a pass started or was
-/// queued behind the one running.
-fn start_ingest_pass(project: &Project, base: &Path, ws_root: Option<std::path::PathBuf>, force: bool) -> bool {
+/// one at a time on a background thread, through the Claude CLI, never the
+/// local model (`ingest::run_pass`): a recording is transcribed first with
+/// the selected Whisper model; each source becomes its dated note, is
+/// claimed, is checked against the knowledge base and the code of `others`
+/// (the workspace's other repos, by name and id), and what follows from it
+/// is written and committed in the library. A source that fails stays in Raw
+/// with its failure recorded and the pass moves on; the pass stops only when
+/// the CLI itself fails. A library is a repo with the inbox, whatever its kind
+/// (`registry::is_library`); `force` reads any repo with an inbox. Returns
+/// whether a pass started or was queued behind the one running.
+fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::Uuid)>, force: bool) -> bool {
     let root = project.root.clone();
     if !ken_core::ingest::has_inbox(&root) || ken_core::ingest::waiting(&root).is_empty() {
         return false;
@@ -6622,31 +6642,19 @@ fn start_ingest_pass(project: &Project, base: &Path, ws_root: Option<std::path::
         }
     }
     let base = base.to_path_buf();
-    // Where a note's actions become tickets: the team repo on this library's team.
-    let team_repo: Option<std::path::PathBuf> = Registry::load(&base).ok().and_then(|reg| {
-        let team = reg.entry_at(&root)?.team.clone()?;
-        reg.projects
-            .iter()
-            .find(|e| {
-                e.team.as_deref() == Some(team.as_str())
-                    && e.kind.contains(&ken_core::registry::RepoKind::Team)
-                    && e.path.is_dir()
-            })
-            .map(|e| e.path.clone())
-    });
     std::thread::spawn(move || {
         loop {
             INGEST_STOPPED.lock().unwrap().remove(&id);
             match Db::open(&base, id) {
                 Ok(mut db) => {
-                    let me = cached_git_me();
-                    let stamp = local_stamp_now();
-                    let targets = ken_core::ingest::Targets {
-                        team_repo: team_repo.as_deref(),
-                        workspace: ws_root.as_deref(),
-                        me: &me,
-                        stamp: &stamp,
-                    };
+                    // The other repos' indexes, read only: what each source is
+                    // checked against. One that will not open is left out.
+                    let code: Vec<ken_core::ingest::CodeSource> = others
+                        .iter()
+                        .filter_map(|(name, other)| {
+                            Db::open_read_only(&base, *other).ok().map(|db| ken_core::ingest::CodeSource { name: name.clone(), db })
+                        })
+                        .collect();
                     let model = transcription_model(&base);
                     let ffmpeg = transcript::discover_ffmpeg();
                     let transcriber = ken_core::ingest::Transcriber { model: model.as_deref(), ffmpeg: ffmpeg.as_deref() };
@@ -6663,7 +6671,7 @@ fn start_ingest_pass(project: &Project, base: &Path, ws_root: Option<std::path::
                         ))
                     };
                     let today = local_date_today();
-                    match ken_core::ingest::run_pass(&root, &mut db, &targets, &today, engine::now_epoch, transcriber, call, &on_phase) {
+                    match ken_core::ingest::run_pass(&root, &mut db, &code, &today, engine::now_epoch, transcriber, call, &on_phase) {
                         Ok(report) => {
                             if let Some(why) = report.stopped {
                                 INGEST_STOPPED.lock().unwrap().insert(id, why);
@@ -6689,18 +6697,22 @@ fn start_ingest_pass(project: &Project, base: &Path, ws_root: Option<std::path::
 /// A pass over every open library, as after a transcription model is
 /// installed: recordings that waited for one are read.
 fn start_ingest_passes(state: &SharedState) {
-    let (libraries, base, ws_root) = {
+    let (libraries, base) = {
         let guard = lock_tolerant(state);
-        let libs: Vec<Project> = guard
+        let libs: Vec<(Project, Vec<(String, uuid::Uuid)>)> = guard
             .members
             .values()
             .map(|m| m.project.clone())
             .filter(|p| ken_core::ingest::has_inbox(&p.root))
+            .map(|p| {
+                let others = code_sources(&guard, &p.root);
+                (p, others)
+            })
             .collect();
-        (libs, guard.base_dir.clone(), guard.workspace.as_ref().map(|w| w.ws.root.clone()))
+        (libs, guard.base_dir.clone())
     };
-    for p in libraries {
-        start_ingest_pass(&p, &base, ws_root.clone(), false);
+    for (p, others) in libraries {
+        start_ingest_pass(&p, &base, others, false);
     }
 }
 
@@ -6749,15 +6761,11 @@ async fn setup_create_wiki(
     .map_err(|e| e.to_string())?
 }
 
-/// Whether I may accept a ruling `decider` made: I am the decider, or this
-/// machine does not say who I am.
-fn ruling_is_mine(decider: &str) -> bool {
-    let me = cached_git_me();
-    !me.is_known() || ken_core::ingest::is_me(&me, decider)
-}
-
 /// Apply a proposed change to a page a person keeps, only while the page
-/// still reads as it did when Ken proposed it.
+/// still reads as it did when Ken proposed it: a held edit, a drafted ticket,
+/// or a ready ruling, which takes the next number in the decisions log
+/// (anyone may add it; knowledge-core decision 13). In the knowledge base the
+/// change is then its own commit of that page alone (decision 36).
 #[tauri::command(async)]
 fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Option<String>) -> CmdResult<String> {
     let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
@@ -6772,12 +6780,6 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
         .ok_or("no open proposal with that id")?;
     let proposal: ken_core::proposal::Proposal =
         serde_json::from_str(item.payload.as_deref().unwrap_or("")).map_err(|_| "the card has no proposed change")?;
-    // A ruling is written by its decider.
-    if let Some(decider) = proposal.append.as_ref().and_then(|r| r.decider.as_deref()) {
-        if !ruling_is_mine(decider) {
-            return Err(format!("A ruling is written by its decider. Only {decider} can accept this one."));
-        }
-    }
     match ken_core::proposal::apply(&active.project.root, &proposal) {
         Ok(()) => {}
         Err(ken_core::proposal::ApplyError::Changed) => {
@@ -6787,6 +6789,9 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
             ))
         }
         Err(ken_core::proposal::ApplyError::Io(e)) => return Err(e),
+    }
+    if let Err(e) = ken_core::ingest::accepted(&active.project.root, &proposal) {
+        eprintln!("warning: could not commit {}: {e}", proposal.page);
     }
     active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
     Ok(proposal.page)
@@ -6877,10 +6882,11 @@ struct RawSourceDto {
     length: String,
     /// Who was present, from its note.
     present: Vec<String>,
-    /// Its card, once read.
+    /// Its card, once read (a source read before sources were claimed as
+    /// their note was written waits in Raw/ with its card).
     card_id: Option<i64>,
-    /// What was written from it, one kind per write (undone ones left out).
-    written: Vec<ken_core::ingest::WriteKind>,
+    /// How many pages were written from it.
+    pages: usize,
     /// What waits from it.
     waiting: usize,
 }
@@ -6897,12 +6903,14 @@ struct IngestedDto {
     present: Vec<String>,
     /// When the note was written (Unix seconds).
     at: i64,
-    /// Not yet seen, or seen and filed.
+    /// Not yet marked seen.
     open: bool,
-    /// What was written from it, one kind per write (undone ones left out).
-    written: Vec<ken_core::ingest::WriteKind>,
+    /// How many pages were written from it.
+    pages: usize,
     /// What waits from it: rulings, tickets, held edits.
     waiting: usize,
+    /// Its note is written and Claude is still writing the pages.
+    writing: bool,
 }
 
 /// What a source in Raw is before its note says: a guess from its name.
@@ -6924,11 +6932,6 @@ fn file_size(path: &Path) -> String {
         Ok(n) => format!("{n} bytes"),
         Err(_) => String::new(),
     }
-}
-
-/// The kinds of a card's writes still in place.
-fn live_writes(card: &ken_core::ingest::Card) -> Vec<ken_core::ingest::WriteKind> {
-    card.writes.iter().filter(|w| !w.undone).map(|w| w.kind).collect()
 }
 
 #[derive(Serialize)]
@@ -6969,12 +6972,13 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
     let db: &Db = &db_guard;
     let reading = INGEST_READING.lock().unwrap().get(&id).cloned();
     let open = db.list_open_review_items().map_err(err)?;
-    // The open cards of sources still in Raw: read, not yet seen.
+    // The open cards of sources still in Raw: read before a source was
+    // claimed as its note was written, not yet seen.
     let cards: Vec<(i64, ken_core::ingest::Card)> = open
         .iter()
         .filter(|it| it.kind == ken_core::ingest::REVIEW_KIND)
         .filter_map(|it| ken_core::ingest::card_of(it.payload.as_deref()).map(|c| (it.id, c)))
-        .filter(|(_, c)| !c.filed)
+        .filter(|(_, c)| root.join(&c.placement.raw).is_file())
         .collect();
     let counts = ken_core::ingest::proposal_counts(&open);
     let waits = |note: &str| counts.get(note).copied().unwrap_or(0);
@@ -6997,7 +7001,7 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
             };
             let (state, detail) = match (on_it, card, failed) {
                 (Some(ken_core::ingest::PassPhase::Transcribing(pct)), _, _) => ("transcribing", Some(format!("{pct}%"))),
-                (Some(ken_core::ingest::PassPhase::Reading), _, _) => ("reading", None),
+                (Some(ken_core::ingest::PassPhase::Reading | ken_core::ingest::PassPhase::Writing), _, _) => ("reading", None),
                 // Read since it failed: the card is what counts.
                 (None, Some(_), _) => ("read", None),
                 (None, None, Some(f)) => ("failed", Some(f.body.clone())),
@@ -7008,7 +7012,8 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
             };
             let (kind, length, present) = match card {
                 Some((_, c)) => {
-                    let t = ken_core::ingest::takeaways(&std::fs::read_to_string(root.join(&c.placement.note)).unwrap_or_default());
+                    let text = std::fs::read_to_string(root.join(&c.placement.note)).unwrap_or_default();
+                    let t = ken_core::ingest::takeaways(&c.placement.note, &text);
                     (t.kind, t.length, t.present)
                 }
                 None => (raw_kind(&name).to_string(), file_size(&root.join(&path)), Vec::new()),
@@ -7020,7 +7025,7 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
                 length,
                 present,
                 card_id: card.map(|(id, _)| *id),
-                written: card.map(|(_, c)| live_writes(c)).unwrap_or_default(),
+                pages: card.map(|(_, c)| c.pages.len()).unwrap_or(0),
                 waiting: card.map(|(_, c)| waits(&c.placement.note)).unwrap_or(0),
                 name,
                 path,
@@ -7028,6 +7033,8 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
         })
         .collect();
     let mut filed_waiting = 0;
+    // The source whose note is written and whose pages are being written.
+    let writing_raw = reading.as_ref().filter(|(_, phase)| *phase == ken_core::ingest::PassPhase::Writing).map(|(raw, _)| raw.clone());
     let ingested = db
         .review_items_of_kind(ken_core::ingest::REVIEW_KIND, 200)
         .map_err(err)?
@@ -7035,10 +7042,11 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
         .map(|it| {
             let note = it.source_ref.clone();
             let text = std::fs::read_to_string(root.join(&note)).unwrap_or_default();
-            let t = ken_core::ingest::takeaways(&text);
+            let t = ken_core::ingest::takeaways(&note, &text);
             let card = ken_core::ingest::card_of(it.payload.as_deref());
             let waiting = waits(&note);
-            if waiting > 0 && card.as_ref().is_some_and(|c| c.filed) {
+            let in_raw = card.as_ref().is_some_and(|c| root.join(&c.placement.raw).is_file());
+            if waiting > 0 && !in_raw {
                 filed_waiting += 1;
             }
             IngestedDto {
@@ -7049,8 +7057,9 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
                 present: t.present,
                 at: it.created_at,
                 open: it.status == "open",
-                written: card.as_ref().map(live_writes).unwrap_or_default(),
+                pages: card.as_ref().map_or(0, |c| c.pages.len()),
                 waiting,
+                writing: card.as_ref().is_some_and(|c| writing_raw.as_deref() == Some(c.placement.raw.as_str())),
                 note,
             }
         })
@@ -7073,8 +7082,9 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<Strin
 #[serde(rename_all = "camelCase")]
 struct IngestProposalDto {
     id: i64,
-    /// What waits: `ruling`, `ticket`, or an edit staging held, `page` (a
-    /// change to one) or `new page`.
+    /// What waits: `ruling` (a ready entry for the decisions log), `ticket`
+    /// (a drafted ticket), or an edit held for a person, `page` (a change to
+    /// one) or `new page`.
     kind: String,
     title: String,
     /// The page (or ticket file) it writes.
@@ -7082,26 +7092,19 @@ struct IngestProposalDto {
     body: String,
     /// The proposal itself (the page as it is and with the change), for the diff.
     payload: Option<String>,
-    /// A ruling's decider, when the note names one.
-    decider: Option<String>,
-    /// Whether I may accept it: a ruling only its decider, when known.
-    can_accept: bool,
+    /// Who made a ruling, as the note says; free text, never a check.
+    who: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IngestWriteDto {
-    /// Its place on the card, for Undo.
-    index: usize,
-    kind: ken_core::ingest::WriteKind,
-    /// The file, inside the repo `project_id` names.
+struct IngestPageDto {
+    /// The page, in the library.
     path: String,
+    /// The change in a line, or a new page's purpose.
     label: String,
-    to: Option<String>,
-    undone: bool,
-    /// The workspace member the file is in; none for a task on Your day,
-    /// or a repo no longer open.
-    project_id: Option<String>,
+    /// A new page, not an edit.
+    new: bool,
 }
 
 #[derive(Serialize)]
@@ -7109,19 +7112,20 @@ struct IngestWriteDto {
 struct IngestCardDto {
     id: i64,
     open: bool,
-    /// Undo all ran; the source waits in Raw/ until read again.
-    undone: bool,
     note: String,
     source: String,
     takeaways: ken_core::ingest::Takeaways,
-    /// What was written from it, in order.
-    writes: Vec<IngestWriteDto>,
+    /// The pages written from it, in order.
+    pages: Vec<IngestPageDto>,
     /// What waits from it.
     proposals: Vec<IngestProposalDto>,
-    /// What it calls for that stays on the card only.
-    listed: Vec<ken_core::ingest::Listed>,
-    /// My name, for "Accept as …".
-    me: Option<String>,
+    /// The knowledge base's commit holding the ingest (short sha), when
+    /// there is one: git is the undo.
+    commit: Option<String>,
+    /// Why the commit failed, when it did.
+    commit_error: Option<String>,
+    /// Its note is written and Claude is still writing the pages.
+    writing: bool,
 }
 
 /// Two folders the same, whatever the case and the slashes.
@@ -7130,32 +7134,18 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
-/// One ingested source for the Ingest screen: its key takeaways, what was
-/// written from it (each with Undo), what waits (rulings, tickets, held
-/// edits) and what stays on the card only.
+/// One ingested source for the Ingest screen: its takeaways, the pages
+/// written from it, what waits (ready rulings, drafted tickets, held edits)
+/// and the commit that holds it.
 #[tauri::command(async)]
 fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<IngestCardDto> {
     let id = inbox_member(&app, &state, team.as_deref())?;
-    let me = cached_git_me();
     // Cloned under the lock, read after it is released (the Inbox reads
     // every card that has something waiting).
-    let (root, search_db, members) = {
+    let (root, search_db) = {
         let guard = lock_tolerant(&state);
         let active = member(&guard, Some(id))?;
-        let members: Vec<(PathBuf, String)> = guard
-            .workspace
-            .as_ref()
-            .map(|w| {
-                w.ws.members
-                    .iter()
-                    .filter_map(|m| match &m.status {
-                        ken_core::workspace::MemberStatus::Ok(p) => Some((p.root.clone(), p.config.id.to_string())),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        (active.project.root.clone(), active.search_db.clone(), members)
+        (active.project.root.clone(), active.search_db.clone())
     };
     let db = lock_tolerant(&search_db);
     let item = db.get_review_item(item_id).map_err(err)?.ok_or("no ingest card with that id")?;
@@ -7166,59 +7156,36 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
         .into_iter()
         .map(|it| {
             let p: Option<ken_core::proposal::Proposal> = it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok());
-            let (kind, page) = match &p {
-                Some(p) if p.append.is_some() => ("ruling", p.page.clone()),
-                Some(p) if p.root.is_some() => ("ticket", p.page.clone()),
-                Some(p) if p.base.is_empty() => ("new page", p.page.clone()),
-                Some(p) => ("page", p.page.clone()),
-                None => ("page", String::new()),
-            };
-            let decider = p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.decider.clone());
-            let can_accept = decider.as_deref().is_none_or(|d| !me.is_known() || ken_core::ingest::is_me(&me, d));
             IngestProposalDto {
                 id: it.id,
-                kind: kind.into(),
+                kind: p.as_ref().map_or("page", ken_core::proposal::kind_of).into(),
+                page: p.as_ref().map(|p| p.page.clone()).unwrap_or_default(),
+                who: p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.decider.clone()),
                 title: it.title,
-                page,
                 body: it.body,
                 payload: it.payload,
-                decider,
-                can_accept,
             }
         })
         .collect();
     drop(db);
-    let member_at = |root: &Path| members.iter().find(|(r, _)| same_dir(r, root)).map(|(_, id)| id.clone());
-    let library = id.to_string();
-    let writes = card
-        .writes
-        .iter()
-        .enumerate()
-        .map(|(index, w)| IngestWriteDto {
-            index,
-            kind: w.kind,
-            path: w.path.clone(),
-            label: w.label.clone(),
-            to: w.to.clone(),
-            undone: w.undone,
-            project_id: match (&w.kind, &w.root) {
-                (ken_core::ingest::WriteKind::Task, _) => None,
-                (_, None) => Some(library.clone()),
-                (_, Some(root)) => member_at(Path::new(root)),
-            },
-        })
-        .collect();
+    let writing = INGEST_READING
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|(raw, phase)| *phase == ken_core::ingest::PassPhase::Writing && *raw == card.placement.raw);
+    // A source read before sources were claimed waits in Raw/ until Seen.
+    let source = if root.join(&card.placement.raw).is_file() { card.placement.raw.clone() } else { card.placement.source.clone() };
     Ok(IngestCardDto {
         id: item.id,
         open: item.status == "open",
-        undone: card.undone,
-        source: if card.filed { card.placement.source.clone() } else { card.placement.raw.clone() },
-        note: card.placement.note.clone(),
-        takeaways: ken_core::ingest::takeaways(&text),
-        writes,
+        source,
+        takeaways: ken_core::ingest::takeaways(&card.placement.note, &text),
+        pages: card.pages.iter().map(|p| IngestPageDto { path: p.path.clone(), label: p.label.clone(), new: p.new }).collect(),
         proposals,
-        listed: card.listed.clone(),
-        me: me.name.clone(),
+        commit: card.commit.clone(),
+        commit_error: card.commit_error.clone(),
+        writing,
+        note: card.placement.note.clone(),
     })
 }
 
@@ -7232,6 +7199,7 @@ fn ingest_add(app: AppHandle, state: State<SharedState>, team: Option<String>, p
         let guard = state.lock().unwrap();
         (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
     };
+    let others = code_sources_of(&state, &project.root);
     let mut added = Vec::new();
     for path in &paths {
         let from = std::path::Path::new(path);
@@ -7248,7 +7216,7 @@ fn ingest_add(app: AppHandle, state: State<SharedState>, team: Option<String>, p
     }
     // The watcher indexes the new files; the read starts now, not at the
     // next scan.
-    start_ingest_pass(&project, &base, workspace_root_of(&state), true);
+    start_ingest_pass(&project, &base, others, true);
     Ok(added)
 }
 
@@ -7331,7 +7299,7 @@ fn ingest_add_bytes(app: AppHandle, state: State<SharedState>, request: tauri::i
     if ken_core::runner::discover_claude().is_none() {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     }
-    start_ingest_pass(&project, &base, workspace_root_of(&state), true);
+    start_ingest_pass(&project, &base, code_sources_of(&state, &project.root), true);
     Ok(format!("{}/{}", ken_core::ingest::RAW, target.file_name().unwrap().to_string_lossy()))
 }
 
@@ -7353,7 +7321,7 @@ fn add_source(app: &AppHandle, state: &SharedState, team: Option<&str>, name: &s
     if ken_core::runner::discover_claude().is_none() {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     }
-    start_ingest_pass(&project, &base, workspace_root_of(state), true);
+    start_ingest_pass(&project, &base, code_sources_of(state, &project.root), true);
     Ok(format!("{}/{}", ken_core::ingest::RAW, target.file_name().unwrap().to_string_lossy()))
 }
 
@@ -7424,46 +7392,35 @@ fn raw_source(root: &Path, path: &str) -> CmdResult<String> {
 #[tauri::command(async)]
 fn ingest_retry(app: AppHandle, state: State<SharedState>, team: Option<String>, path: String) -> CmdResult<bool> {
     let id = inbox_member(&app, &state, team.as_deref())?;
-    let (project, base, ws_root) = {
+    let (project, base) = {
         let mut guard = state.lock().unwrap();
         let base = guard.base_dir.clone();
-        let ws_root = guard.workspace.as_ref().map(|w| w.ws.root.clone());
         let active = member_mut(&mut guard, Some(id))?;
         let rel = raw_source(&active.project.root, &path)?;
         ken_core::ingest::resolve_failure(&mut active.db, &rel, engine::now_epoch()).map_err(err)?;
-        (active.project.clone(), base, ws_root)
+        (active.project.clone(), base)
     };
     if ken_core::runner::discover_claude().is_none() {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     }
-    Ok(start_ingest_pass(&project, &base, ws_root, true))
+    let others = code_sources_of(&state, &project.root);
+    Ok(start_ingest_pass(&project, &base, others, true))
 }
 
 /// Take a source out of Raw/: the file goes to the trash (never a hard
-/// delete) and its failure is cleared. A source already read is filed with
-/// Seen, or its writes undone first.
+/// delete) and its failure is cleared. A source an older card still holds
+/// is filed with Seen instead.
 #[tauri::command]
 async fn ingest_remove(app: AppHandle, state: State<'_, SharedState>, team: Option<String>, path: String) -> CmdResult<()> {
     let id = inbox_member(&app, &state, team.as_deref())?;
-    let (abs, rel, undone_card) = {
+    let (abs, rel) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, Some(id))?;
         let rel = raw_source(&active.project.root, &path)?;
-        let card = active
-            .db
-            .list_open_review_items()
-            .map_err(err)?
-            .into_iter()
-            .filter(|it| it.kind == ken_core::ingest::REVIEW_KIND)
-            .find_map(|it| ken_core::ingest::card_of(it.payload.as_deref()).filter(|c| !c.filed && c.placement.raw == rel).map(|c| (it.id, c)));
-        let undone_card = match card {
-            Some((_, c)) if !c.undone => {
-                return Err("This source has been read. Mark it Seen to file it, or Undo all to take back what it wrote, then remove it.".into())
-            }
-            Some((item, _)) => Some(item),
-            None => None,
-        };
-        (active.project.resolve(&rel).map_err(err)?, rel, undone_card)
+        if ken_core::ingest::in_review(&active.project.root, &active.db).map_err(err)?.contains(&rel) {
+            return Err("This source has been read. Mark it Seen to file it beside its note.".into());
+        }
+        (active.project.resolve(&rel).map_err(err)?, rel)
     };
     let to_trash = abs.clone();
     tauri::async_runtime::spawn_blocking(move || trash_path(&to_trash)).await.map_err(|e| e.to_string())??;
@@ -7471,9 +7428,6 @@ async fn ingest_remove(app: AppHandle, state: State<'_, SharedState>, team: Opti
     let active = member_mut(&mut guard, Some(id))?;
     let now = engine::now_epoch();
     ken_core::ingest::resolve_failure(&mut active.db, &rel, now).map_err(err)?;
-    if let Some(item) = undone_card {
-        active.db.resolve_review_item(item, now).map_err(err)?;
-    }
     let _ = deindex_removed(&active.project, &mut active.db, &rel, false);
     Ok(())
 }
@@ -7484,7 +7438,7 @@ struct IngestStatusDto {
     has_inbox: bool,
     /// New sources in Raw, not yet processed.
     waiting: Vec<String>,
-    /// Sources in Raw whose note is written and waiting to be filed.
+    /// Sources in Raw an older card holds, waiting for Seen to file them.
     in_review: Vec<String>,
     running: bool,
     claude_found: bool,
@@ -7500,7 +7454,7 @@ fn ingest_status(app: AppHandle, state: State<SharedState>, team: Option<String>
     Ok(IngestStatusDto {
         has_inbox: ken_core::ingest::has_inbox(root),
         waiting: ken_core::ingest::waiting_new(root, &active.db).map_err(err)?,
-        in_review: ken_core::ingest::in_review(&active.db).map_err(err)?,
+        in_review: ken_core::ingest::in_review(root, &active.db).map_err(err)?,
         running: INGEST_RUNNING.lock().unwrap().contains(&active.project.config.id),
         claude_found: ken_core::runner::discover_claude().is_some(),
     })
@@ -7515,97 +7469,15 @@ fn ingest_now(app: AppHandle, state: State<SharedState>, team: Option<String>) -
     if ken_core::runner::discover_claude().is_none() {
         return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
     }
-    let ws_root = guard.workspace.as_ref().map(|w| w.ws.root.clone());
-    Ok(start_ingest_pass(&active.project, &guard.base_dir, ws_root, true))
+    let others = code_sources(&guard, &active.project.root);
+    Ok(start_ingest_pass(&active.project, &guard.base_dir, others, true))
 }
 
-/// Undo all on an ingest card, open or seen: every write from the source,
-/// last first (one whose file changed since is kept and named), then the
-/// note unless a person edited it, and the source back to Raw/. What waits
-/// is closed, and so is the card.
+/// Done with an ingest card: it is marked seen. A source an older card
+/// still holds in Raw/ moves beside its note first; a source read now was
+/// claimed as its note was written. Returns where the source is.
 #[tauri::command(async)]
-fn ingest_undo(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<ken_core::ingest::UndoReport> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
-    let report = {
-        let mut guard = state.lock().unwrap();
-        let active = member_mut(&mut guard, Some(id))?;
-        let item = active
-            .db
-            .get_review_item(item_id)
-            .map_err(err)?
-            .filter(|it| it.kind == ken_core::ingest::REVIEW_KIND)
-            .ok_or("no ingest card with that id")?;
-        let mut card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
-        let report = ken_core::ingest::undo_all(&active.project.root, &mut card, &local_date_today()).map_err(err)?;
-        let payload = serde_json::to_string(&card).map_err(err)?;
-        active.db.set_review_item_payload(item_id, &payload).map_err(err)?;
-        ken_core::ingest::withdraw(&mut active.db, &card.placement.note, engine::now_epoch()).map_err(err)?;
-        // The card stays open and undone, so the next pass leaves the source
-        // alone instead of writing it all again.
-        active.db.reopen_review_item(item_id).map_err(err)?;
-        report
-    };
-    emit_day_changed(&app, &state);
-    Ok(report)
-}
-
-/// Read an undone source again: its card closes and the next pass, started
-/// now, reads it from Raw/ as if it had just been dropped in.
-#[tauri::command(async)]
-fn ingest_read_again(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<bool> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
-    let mut guard = state.lock().unwrap();
-    let base_dir = guard.base_dir.clone();
-    let ws_root = guard.workspace.as_ref().map(|w| w.ws.root.clone());
-    let active = member_mut(&mut guard, Some(id))?;
-    let item = active
-        .db
-        .get_review_item(item_id)
-        .map_err(err)?
-        .filter(|it| it.kind == ken_core::ingest::REVIEW_KIND)
-        .ok_or("no ingest card with that id")?;
-    let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
-    if !card.undone {
-        return Err("only an undone source can be read again".into());
-    }
-    active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
-    if ken_core::runner::discover_claude().is_none() {
-        return Ok(false);
-    }
-    Ok(start_ingest_pass(&active.project, &base_dir, ws_root, true))
-}
-
-/// Undo one write on an ingest card (by its place on the card): an edit's
-/// page back as it was, a created page, idea or escalation removed, a task
-/// archived. Refused when the file changed since it was written.
-#[tauri::command(async)]
-fn ingest_undo_write(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64, index: usize) -> CmdResult<()> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
-    let task = {
-        let mut guard = state.lock().unwrap();
-        let active = member_mut(&mut guard, Some(id))?;
-        let item = active
-            .db
-            .get_review_item(item_id)
-            .map_err(err)?
-            .filter(|it| it.kind == ken_core::ingest::REVIEW_KIND)
-            .ok_or("no ingest card with that id")?;
-        let mut card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
-        ken_core::ingest::undo_write_at(&active.project.root, &mut card, index, &local_date_today()).map_err(err)?;
-        let payload = serde_json::to_string(&card).map_err(err)?;
-        active.db.set_review_item_payload(item_id, &payload).map_err(err)?;
-        card.writes[index].kind == ken_core::ingest::WriteKind::Task
-    };
-    if task {
-        emit_day_changed(&app, &state);
-    }
-    Ok(())
-}
-
-/// Done with an ingest: its source moves from Raw/ beside its note, in its
-/// kind's folder and month, and the card is resolved.
-#[tauri::command(async)]
-fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<String> {
+fn ingest_seen(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<String> {
     let id = inbox_member(&app, &state, team.as_deref())?;
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, Some(id))?;
@@ -7617,13 +7489,11 @@ fn ingest_file(app: AppHandle, state: State<SharedState>, team: Option<String>, 
         .find(|it| it.id == item_id && it.kind == ken_core::ingest::REVIEW_KIND)
         .ok_or("no open ingest card with that id")?;
     let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
-    let filed = ken_core::ingest::file(&active.project.root, &card).map_err(err)?;
-    // The card records where the source went, so Open source and Undo all
-    // find it there.
-    let payload = serde_json::to_string(&filed).map_err(err)?;
-    active.db.set_review_item_payload(item_id, &payload).map_err(err)?;
+    if active.project.root.join(&card.placement.raw).is_file() {
+        ken_core::ingest::claim(&active.project.root, &card.placement).map_err(err)?;
+    }
     active.db.resolve_review_item(item_id, engine::now_epoch()).map_err(err)?;
-    Ok(filed.placement.source)
+    Ok(card.placement.source)
 }
 
 #[derive(Serialize)]
@@ -7692,7 +7562,8 @@ struct TeamOverviewDto {
 #[serde(rename_all = "camelCase")]
 struct TeamFindingDto {
     /// From the sweep: `void` · `gone` · `changed` · `aged`. From the link
-    /// report: `missing-page` · `broken-link` · `ambiguous-name`.
+    /// report: `missing-page` · `broken-link` · `ambiguous-name`. From the
+    /// findings list (`ken_core::findings`): `contradiction` · `question`.
     kind: String,
     title: String,
     detail: String,
@@ -7700,17 +7571,26 @@ struct TeamFindingDto {
     /// finding is about the sweep itself.
     path: String,
     project_id: String,
-    /// A proposal's id, for `apply_page_proposal` and `resolve_review_item`.
+    /// A stored finding's or a proposal's id, for `resolve_review_item` (and
+    /// `apply_page_proposal`).
     item_id: Option<i64>,
 }
 
 /// The findings for the Team screen, from the wiki's index and its last
-/// sweep, at most 20 of each link-report kind.
+/// sweep, at most 20 of each link-report kind, then the stored findings
+/// (an ingest's contradictions and open questions), each marked done once
+/// seen to.
 fn team_findings(wiki_id: &str, db: &Db, sweep: Option<&ken_core::drift::DriftRun>) -> Vec<TeamFindingDto> {
     let mut out: Vec<TeamFindingDto> = Vec::new();
     let mut push = |kind: String, title: String, detail: String, path: String, item_id: Option<i64>| {
         out.push(TeamFindingDto { kind, title, detail, path, project_id: wiki_id.to_string(), item_id });
     };
+    // A contradiction with a page or a ticket opens that page; anything
+    // else opens the note it was found in.
+    for (it, f) in ken_core::findings::open(db).unwrap_or_default() {
+        let path = if matches!(f.against_kind.as_str(), "page" | "ticket") && f.against.ends_with(".md") { f.against.clone() } else { f.source.clone() };
+        push(f.kind, it.title, it.body, path, Some(it.id));
+    }
     if let Some(run) = sweep {
         for f in ken_core::drift::findings(run) {
             push(f.kind, f.title, f.detail, f.path, None);
@@ -12666,10 +12546,7 @@ pub fn run() {
             team_save_ignores,
             team_add_rule,
             ingest_now,
-            ingest_undo,
-            ingest_undo_write,
-            ingest_read_again,
-            ingest_file,
+            ingest_seen,
             setup_create_wiki,
             apply_page_proposal,
             sync_now,

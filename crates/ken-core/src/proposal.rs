@@ -1,11 +1,8 @@
 //! A change to one page that waits for a person: the page as Ken read it,
 //! the page as Ken would write it, and what to append when the change is a
-//! decisions-log entry. Ingest files one when staging holds an edit, a ruling
-//! waits for its confirm, or a ticket is drafted from an action; Apply
-//! writes it only while the page still reads as Ken read it.
-//!
-//! Also the prompt and the finishing for a new page an ingested note calls
-//! for, so ingest owns how it writes a page.
+//! decisions-log entry. Ingest files one when it holds an edit for a person,
+//! when a ruling waits as a ready entry, and when it drafts a ticket from an
+//! action; Apply writes it only while the page still reads as Ken read it.
 
 use std::fs;
 use std::path::Path;
@@ -18,14 +15,6 @@ use crate::{Error, Result};
 /// Review kind of a proposed change to one page.
 pub const PROPOSAL_KIND: &str = "page-proposal";
 
-/// One thing a page is written from, labelled the way the page cites it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Source {
-    /// `[[Note Name]]` for an ingested note, `repo:path` for a file.
-    pub label: String,
-    pub text: String,
-}
-
 /// A change to one page, held until a person applies it. `base` is the page
 /// as Ken read it; the change applies only while the page still reads so.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -34,7 +23,9 @@ pub struct Proposal {
     pub page: String,
     pub base: String,
     pub proposed: String,
-    /// The repo the page is in, when not the one whose Review holds the card.
+    /// The repo the page is in, when not the one whose Review holds the
+    /// card. Ingest no longer sets it: everything it proposes is in the
+    /// knowledge base. Older proposals for a team repo still apply there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     /// A decisions-log entry to append, worked out against the log as it is
@@ -46,14 +37,34 @@ pub struct Proposal {
     pub from: Option<String>,
 }
 
-/// A ruling to append to a decisions log.
+/// A ruling to append to a decisions log, as a ready entry in the one entry
+/// format (knowledge-core decision 13). Its number is taken when it is added.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RulingEntry {
+    /// The ruling, in one sentence.
     pub ruling: String,
+    /// Who made it, as free text, when the note says. Nobody's confirm is
+    /// waited for: one click adds the entry.
+    #[serde(default)]
     pub decider: Option<String>,
     pub date: String,
+    /// The note it was said in, by its file stem.
     pub note: String,
+    /// A few words for what it is about.
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub why: String,
+    /// The words it was made in.
+    #[serde(default)]
+    pub quote: String,
+    /// Other words anyone might search for it by.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// The rulings it replaces (`D-003`).
+    #[serde(default)]
+    pub supersedes: Vec<String>,
 }
 
 impl Proposal {
@@ -67,6 +78,21 @@ pub fn file_page_proposal(db: &mut Db, p: &Proposal, title: &str, body: &str, no
     let payload = serde_json::to_string(p).map_err(|e| Error::Other(e.to_string()))?;
     db.insert_review_item(PROPOSAL_KIND, title, body, &p.page, Some(&payload), now)?;
     Ok(())
+}
+
+/// What a proposal is, as its card names it: `ruling` (a ready entry for the
+/// decisions log), `ticket` (a drafted ticket), `new page` or `page` (an
+/// edit held for a person).
+pub fn kind_of(p: &Proposal) -> &'static str {
+    if p.append.is_some() {
+        "ruling"
+    } else if p.base.is_empty() && (p.page.starts_with("tickets/") || p.root.is_some()) {
+        "ticket"
+    } else if p.base.is_empty() {
+        "new page"
+    } else {
+        "page"
+    }
 }
 
 /// Why a proposal could not be applied.
@@ -87,7 +113,7 @@ pub fn apply(root: &Path, p: &Proposal) -> std::result::Result<(), ApplyError> {
     let now = fs::read_to_string(&path).unwrap_or_default();
     if let Some(r) = &p.append {
         let log = if now.trim().is_empty() { "# Decisions\n".to_string() } else { now };
-        let text = crate::ingest::decisions_entry(&log, &r.ruling, r.decider.as_deref(), &r.date, &r.note);
+        let text = crate::ingest::decisions_entry(&log, r);
         return write_page(&path, &text).map_err(|e| ApplyError::Io(e.to_string()));
     }
     if now.replace("\r\n", "\n") != p.base.replace("\r\n", "\n") {
@@ -103,112 +129,9 @@ fn write_page(path: &Path, text: &str) -> Result<()> {
     fs::write(path, text).map_err(|e| Error::io(path, e))
 }
 
-/// The prompt for a new page an ingested note calls for: written only from
-/// the note, citing it.
-pub fn page_prompt(page: &str, purpose: &str, sources: &[Source], today: &str) -> String {
-    let mut s = format!(
-        "You are writing one new page of a team's wiki, `{page}`, from what was just ingested. The page is: {purpose}.\n\n\
-         Rules:\n\
-         - Use only what the sources below say. Leave out anything they do not say; never write that something is unknown.\n\
-         - Cite each statement with the label of the source that says it, such as `[[Note Name]]`.\n\
-         - The wiki complements the code, it does not copy it: say what the sources say about why and what was decided, and \
-           point to a file by its path in backticks rather than restating it.\n\
-         - Frontmatter: title, status: draft, updated: {today}, and the labels you used under sources.\n\
-         - Plain words for a reader who has not seen the code.\n\
-         - Reply with the finished page only, in Markdown, starting with `---`. No preamble, no code fences around it.\n\n\
-         SOURCES:\n"
-    );
-    for src in sources {
-        s.push_str(&format!("\n=== {} ===\n{}\n", src.label, src.text));
-    }
-    s
-}
-
-/// The reply as a page: fences stripped, `status: draft` set, and any
-/// `checked:` or `reviewed_by:` line dropped (and the older `verified:`):
-/// a draft has been neither checked nor reviewed.
-pub fn finish(reply: &str) -> Result<String> {
-    let t = strip_fences(reply);
-    if !t.starts_with("---") {
-        return Err(Error::Other("the page did not start with its frontmatter".into()));
-    }
-    let mut out = String::new();
-    let (mut in_fm, mut closed, mut has_status) = (false, false, false);
-    for (i, line) in t.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if line.trim_end() == "---" {
-            if i == 0 {
-                in_fm = true;
-            } else if in_fm && !closed {
-                if !has_status {
-                    out.push_str("status: draft\n");
-                }
-                in_fm = false;
-                closed = true;
-            }
-            out.push_str("---\n");
-            continue;
-        }
-        if in_fm && ["checked:", "reviewed_by:", "verified:"].iter().any(|k| trimmed.starts_with(k)) {
-            continue;
-        }
-        if in_fm && trimmed.starts_with("status:") {
-            out.push_str("status: draft\n");
-            has_status = true;
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !closed {
-        return Err(Error::Other("the page's frontmatter was never closed".into()));
-    }
-    Ok(out)
-}
-
-/// The model's reply as a changed page, or `None` for no change.
-pub fn finish_update(reply: &str, existing: &str) -> Result<Option<String>> {
-    let t = reply.trim();
-    if t.eq_ignore_ascii_case("NO CHANGE") {
-        return Ok(None);
-    }
-    let t = strip_fences(t);
-    if existing.starts_with("---") && !t.starts_with("---") {
-        return Err(Error::Other("the proposed page lost its frontmatter".into()));
-    }
-    let page = format!("{t}\n");
-    Ok((page.trim() != existing.trim()).then_some(page))
-}
-
-fn strip_fences(reply: &str) -> &str {
-    let t = reply.trim();
-    match t.strip_prefix("```markdown").or_else(|| t.strip_prefix("```md")).or_else(|| t.strip_prefix("```")) {
-        Some(rest) => {
-            let rest = rest.trim_start();
-            rest.strip_suffix("```").unwrap_or(rest).trim()
-        }
-        None => t,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn finish_forces_draft_and_drops_checked() {
-        let page = finish("```md\n---\ntitle: X\nstatus: current\nchecked: 2026-01-01 f00218c\nreviewed_by: Chris\nverified: 2026-01-01\n---\n\nBody.\n```").unwrap();
-        assert!(page.starts_with("---\ntitle: X\nstatus: draft\n---\n"), "{page}");
-        assert!(!page.contains("checked") && !page.contains("reviewed_by") && !page.contains("verified"));
-        assert!(finish("no frontmatter").is_err());
-    }
-
-    #[test]
-    fn finish_update_reads_no_change_and_keeps_frontmatter() {
-        assert_eq!(finish_update("NO CHANGE", "---\na: 1\n---\n").unwrap(), None);
-        assert!(finish_update("Body only", "---\na: 1\n---\n").is_err());
-        assert_eq!(finish_update("---\na: 2\n---\n", "---\na: 1\n---\n").unwrap().as_deref(), Some("---\na: 2\n---\n"));
-    }
 
     #[test]
     fn apply_refuses_a_page_that_moved_on() {
@@ -219,5 +142,15 @@ mod tests {
         let p = Proposal::new("P.md", "now", "proposed");
         apply(dir.path(), &p).unwrap();
         assert_eq!(fs::read_to_string(dir.path().join("P.md")).unwrap(), "proposed");
+    }
+
+    #[test]
+    fn a_proposal_says_what_it_is() {
+        let ruling = Proposal { append: Some(RulingEntry::default()), ..Proposal::new("Decisions/DECISIONS.md", "# Decisions\n", "x") };
+        assert_eq!(kind_of(&ruling), "ruling");
+        assert_eq!(kind_of(&Proposal::new("tickets/SR-5.md", "", "x")), "ticket");
+        assert_eq!(kind_of(&Proposal { root: Some("team".into()), ..Proposal::new("SR-5.md", "", "x") }), "ticket", "an older team-repo ticket");
+        assert_eq!(kind_of(&Proposal::new("Rules/New.md", "", "x")), "new page");
+        assert_eq!(kind_of(&Proposal::new("Current/Project.md", "before", "after")), "page");
     }
 }

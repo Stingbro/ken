@@ -6,7 +6,8 @@
 //!
 //! [`log`] is the log reader the history tool uses. [`commits_citing`] lists
 //! the ticket and ruling ids a range of commits names, for slice 9's project
-//! graph (decision 21) to turn into edges.
+//! graph (decision 21) to turn into edges. [`commit_paths`] is the one way
+//! Ken commits: named paths only, in the knowledge base only (decision 36).
 
 use std::path::Path;
 use std::process::Command;
@@ -57,6 +58,88 @@ pub fn global_config(key: &str) -> Option<String> {
         .ok()?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// Every path in the repo at `dir` with work not yet committed: changed,
+/// staged, removed or untracked (each file, not its folder). Empty when `dir`
+/// is not a git repo. Ken reads it before it writes, so it never commits a
+/// person's own work with its own (decision 36).
+pub fn uncommitted(dir: &Path) -> Vec<String> {
+    let Some(out) = output_raw(dir, &["status", "--porcelain", "-z", "--untracked-files=all"]) else { return Vec::new() };
+    let mut paths = Vec::new();
+    let mut entries = out.split('\0');
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        // A rename or copy is followed by the path it came from.
+        if matches!(entry.as_bytes()[0], b'R' | b'C') {
+            if let Some(from) = entries.next() {
+                paths.push(from.to_string());
+            }
+        }
+        paths.push(entry[3..].to_string());
+    }
+    paths
+}
+
+/// Commit exactly `paths` (relative to `dir`) with `message`, and nothing
+/// else (knowledge-core decision 36): each path that is there is added by
+/// name, never `git add -A`; a path that is gone is committed as removed when
+/// git knew it; a path the repo ignores is left out. What a person had staged
+/// stays staged and out of the commit (`git commit -- paths` commits only
+/// those paths). Ken never pushes.
+///
+/// Returns the new commit's short sha, or None when `dir` is not a git repo
+/// or none of the paths changed.
+pub fn commit_paths(dir: &Path, paths: &[String], message: &str) -> Result<Option<String>, String> {
+    if output(dir, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        return Ok(None);
+    }
+    let mut unique: Vec<&str> = Vec::new();
+    for p in paths.iter().map(|p| p.trim_matches('/')).filter(|p| !p.is_empty()) {
+        if !unique.contains(&p) {
+            unique.push(p);
+        }
+    }
+    if unique.is_empty() {
+        return Ok(None);
+    }
+    // `check-ignore` names the ignored paths and exits 1 when there are none.
+    let ignored: Vec<String> = command(dir)
+        .arg("check-ignore")
+        .arg("--")
+        .args(&unique)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().replace('\\', "/")).collect())
+        .unwrap_or_default();
+    let mut present: Vec<&str> = Vec::new();
+    let mut gone: Vec<&str> = Vec::new();
+    for p in unique.into_iter().filter(|p| !ignored.iter().any(|i| i == p)) {
+        if dir.join(p).exists() {
+            present.push(p);
+        } else if output(dir, &["ls-files", "--", p]).is_some_and(|s| !s.is_empty()) {
+            gone.push(p);
+        }
+    }
+    if !present.is_empty() {
+        let mut args = vec!["add", "--"];
+        args.extend(&present);
+        run(dir, &args)?;
+    }
+    let all: Vec<&str> = present.into_iter().chain(gone).collect();
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let mut status = vec!["status", "--porcelain", "--"];
+    status.extend(&all);
+    if output(dir, &status).is_none_or(|s| s.is_empty()) {
+        return Ok(None);
+    }
+    let mut args = vec!["commit", "--quiet", "-m", message, "--"];
+    args.extend(&all);
+    run(dir, &args)?;
+    Ok(output(dir, &["rev-parse", "--short", "HEAD"]))
 }
 
 /// One commit as [`log`] reads it.
@@ -215,5 +298,57 @@ mod tests {
         assert_eq!(cited_ids("Fix SR-101: per D-410, see SR-101 again"), vec!["SR-101".to_string(), "D-410".to_string()]);
         assert!(cited_ids("bump x-1 and ABC- and -12").is_empty(), "lowercase, no number, no prefix");
         assert!(cited_ids("XSR-12a").is_empty(), "the number must end the word");
+    }
+
+    #[test]
+    fn a_commit_holds_the_named_paths_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.name", "Tess"]);
+        git_ok(root, &["config", "user.email", "t@t"]);
+        std::fs::create_dir_all(root.join("Raw")).unwrap();
+        std::fs::write(root.join("Raw/source.txt"), "said\n").unwrap();
+        std::fs::write(root.join("Page.md"), "old\n").unwrap();
+        std::fs::write(root.join("Other.md"), "a person's\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "cache/\n").unwrap();
+        git_ok(root, &["add", "-A"]);
+        git_ok(root, &["commit", "-q", "-m", "start"]);
+
+        // An ingest: the source moved, a page changed, a note made. A person's
+        // own edit and a staged file of theirs stay out.
+        std::fs::create_dir_all(root.join("Ingested")).unwrap();
+        std::fs::rename(root.join("Raw/source.txt"), root.join("Ingested/source.txt")).unwrap();
+        std::fs::write(root.join("Ingested/note.md"), "# Note\n").unwrap();
+        std::fs::write(root.join("Page.md"), "new\n").unwrap();
+        std::fs::write(root.join("Other.md"), "edited by a person\n").unwrap();
+        std::fs::write(root.join("Staged.md"), "theirs\n").unwrap();
+        git_ok(root, &["add", "Staged.md"]);
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        std::fs::write(root.join("cache/x"), "x").unwrap();
+        let paths: Vec<String> =
+            ["Ingested/note.md", "Ingested/source.txt", "Raw/source.txt", "Page.md", "cache/x", "Page.md"].iter().map(|s| s.to_string()).collect();
+        let sha = commit_paths(root, &paths, "ingest: note\n\nPages changed:\n- Page.md").unwrap().unwrap();
+        assert!(!sha.is_empty());
+
+        let files = output(root, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        let mut files: Vec<&str> = files.lines().collect();
+        files.sort();
+        assert_eq!(files, vec!["Ingested/note.md", "Ingested/source.txt", "Page.md", "Raw/source.txt"]);
+        assert_eq!(output(root, &["log", "-1", "--format=%s"]).unwrap(), "ingest: note");
+        let status = output(root, &["status", "--porcelain"]).unwrap();
+        assert!(status.contains(" M Other.md") && status.contains("A  Staged.md"), "a person's work is left as it was: {status}");
+        let mut open = uncommitted(root);
+        open.sort();
+        assert_eq!(open, vec!["Other.md", "Staged.md"], "ignored files are not work");
+        std::fs::create_dir_all(root.join("New")).unwrap();
+        std::fs::write(root.join("New/page one.md"), "x").unwrap();
+        assert!(uncommitted(root).contains(&"New/page one.md".to_string()), "an untracked file, not its folder");
+
+        // Nothing changed: no commit. Not a repo: no commit.
+        assert_eq!(commit_paths(root, &paths, "again").unwrap(), None);
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("a.md"), "x").unwrap();
+        assert_eq!(commit_paths(plain.path(), &["a.md".to_string()], "x").unwrap(), None);
     }
 }

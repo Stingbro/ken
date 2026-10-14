@@ -9,13 +9,13 @@ sources:
 
 # {{What It Was}} {{date}}
 
-The write-up of {{the source}}, as evidence at {{date}}: cite it, never read it as current rules. Not here: what is true now → [[Current]]; a ruling once its decider accepts it → the decisions log.
+The write-up of {{the source}}, as evidence at {{date}}: cite it, never read it as current rules. Not here: what is true now → [[Current]]; a ruling once it is added → the decisions log.
 
 Source: `{{source file}}` ({{length: turns, minutes or pages}}). {{Where it ends, if it ends early.}}
 
 Present: {{who was there, comma-separated}}
 
-Keep the sections this kind of source needs and drop the rest. A meeting or session needs most of them; a document needs Summary, Key Takeaways, What It Overturns, Contradictions and Escalations; a short note may need only Summary, Actions and Requests, and Next Steps. Keep each heading as written, because Ken reads rulings, actions, escalations and next steps back by their headings.
+Keep the sections this kind of source needs and drop the rest. A meeting or session needs most of them; a document needs Summary, Key Takeaways, What It Overturns, Contradictions and Open Questions; a short note may need only Summary and Actions. Keep each heading as written, because Ken reads contradictions, rulings, actions and open questions back by their headings.
 
 ## Summary
 
@@ -33,24 +33,20 @@ Keep the sections this kind of source needs and drop the rest. A meeting or sess
 
 ## Contradictions
 
-- {{Where the source disagrees with a library page, or with itself}} — {{the page, or the two places in the source}}.
+- `{{the page, ruling (D-nnn), ticket or code file it contradicts, or source}}`: {{how they differ}} — "{{the source's words}}"
 
 ## What Was Said
 
 - **{{Topic}}.** {{Name}}: *"{{quote}}"* → {{what follows from it}}.
 
-## Rulings Said in the Room
+## Rulings
 
-- {{The ruling, in the decider's words}} — {{decider}}. {{Accepted to the decisions log as D-{{nnn}} / still a quote.}}
+- {{The ruling, in the words it was made in}} — {{who made it, if the source says}}.
 
-## Actions and Requests
+## Actions
 
-- {{Action}} → {{ticket id, "on Intake", or the idea's I-nnn}}.
+- {{The action}} → {{who it is for, if the source says}}.
 
-## Escalations
+## Open Questions
 
-- {{Question only a person can answer}} → {{who}}.
-
-## Next Steps
-
-- {{Who}} will {{what}} → {{on their day, or the ticket id}}.
+- {{A question the source leaves open}}

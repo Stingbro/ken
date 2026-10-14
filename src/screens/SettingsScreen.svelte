@@ -246,19 +246,23 @@
         <div class="card">
           <div class="card-title">What Ken writes on its own</div>
           <p class="note">
-            When a source is added, Ken writes the note and what follows from it at once, each citing the note: page edits,
-            new pages, ideas, escalations and your next steps. Each has an Undo on its card in Ingest.
+            When a source is added, Ken writes the note and the pages it changes at once, each citing the note: one
+            section of a page at a time, and new pages in their section's index. Each ingest is one commit in the
+            knowledge base, so git takes it back.
           </p>
         </div>
         <div class="card">
           <div class="card-title">What waits for you</div>
           <ul class="rules">
-            <li>A ruling, in the words of the person who decides it. Only they can accept it.</li>
-            <li>A change to a page in Rules. It becomes a ticket.</li>
+            <li>A ruling, as a ready entry for the decisions log. One click adds it.</li>
+            <li>An edit to a page in Rules, or one that goes against a ruling or the code.</li>
             <li>An edit that rewrites more than a fifth of a page, or lands on a page someone changed while Ken was reading.</li>
             <li>An action. It becomes a ticket once accepted.</li>
           </ul>
-          <p class="note">These wait in the Inbox under Ken. Human edits always win.</p>
+          <p class="note">
+            These wait in the Inbox under Ken, with what the source contradicts and the questions it leaves open. Human
+            edits always win.
+          </p>
         </div>
         <div class="card">
           <div class="card-title">The team's own rules</div>

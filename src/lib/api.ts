@@ -141,9 +141,6 @@ export interface TeamOverview {
   findings: TeamFinding[];
 }
 
-/** What one write from an ingested note was. */
-export type IngestWriteKind = "edit" | "page" | "idea" | "escalation" | "task";
-
 /** Where a source in Raw/ is. `transcribing`: a recording being turned into
  *  text; `waiting`: it needs a transcript Ken cannot make yet (`detail` says
  *  why); `failed`: Ken could not read it (`detail` says why). */
@@ -160,10 +157,11 @@ export interface RawSource {
   /** "48 min", "14 pages" once read; the file's size before. */
   length: string;
   present: string[];
-  /** Its card, once read. */
+  /** Its card, once read (a source read before sources were claimed as
+   *  their note was written still waits in Raw with its card). */
   cardId: number | null;
-  /** One kind per write from it still in place. */
-  written: IngestWriteKind[];
+  /** How many pages were written from it. */
+  pages: number;
   /** What waits from it. */
   waiting: number;
 }
@@ -178,10 +176,12 @@ export interface IngestedSource {
   present: string[];
   at: number;
   open: boolean;
-  /** One kind per write from it still in place. */
-  written: IngestWriteKind[];
+  /** How many pages were written from it. */
+  pages: number;
   /** What waits from it: rulings, tickets, held edits. */
   waiting: number;
+  /** Its note is written and Claude is still writing the pages. */
+  writing: boolean;
 }
 
 /** The Ingest screen: the team library's inbox and its history. */
@@ -201,6 +201,7 @@ export interface IngestOverview {
 /** A note's key takeaways. */
 export interface IngestTakeaways {
   title: string;
+  /** meeting | recording | document | note | session, from the note's folder. */
   kind: string;
   present: string[];
   length: string;
@@ -210,12 +211,11 @@ export interface IngestTakeaways {
   contradictions: string[];
   rulings: string[];
   actions: string[];
-  escalations: string[];
-  nextSteps: string[];
+  openQuestions: string[];
 }
 
-/** What waits from a note: a ruling, a ticket, or an edit staging held
- *  ("page" a change to one, "new page"). */
+/** What waits from a note: a ready ruling for the decisions log, a drafted
+ *  ticket, or an edit held for a person ("page" a change to one, "new page"). */
 export interface IngestProposal {
   id: number;
   kind: "page" | "new page" | "ruling" | "ticket";
@@ -224,51 +224,35 @@ export interface IngestProposal {
   body: string;
   /** The proposal (page as it is and with the change), for the diff. */
   payload: string | null;
-  /** A ruling's decider, when the note names one. */
-  decider: string | null;
-  /** A ruling only its decider may accept. */
-  canAccept: boolean;
+  /** Who made a ruling, as the note says; anyone may add it. */
+  who: string | null;
 }
 
-/** One write from a note, with Open and Undo on its card. */
-export interface IngestWrite {
-  index: number;
-  kind: IngestWriteKind;
+/** One page an ingest wrote. */
+export interface IngestPage {
   path: string;
+  /** The change in a line, or a new page's purpose. */
   label: string;
-  to: string | null;
-  undone: boolean;
-  /** The member the file is in; null for a task on Your day. */
-  projectId: string | null;
+  /** A new page, not an edit. */
+  new: boolean;
 }
 
-/** Something a note calls for that stays on the card only. */
-export interface IngestListed {
-  kind: "idea" | "escalation" | "next step" | "ticket";
-  text: string;
-  to?: string | null;
-}
-
-/** One ingested source for its card on the Ingest screen. */
+/** One ingested source for its card on the Ingest screen. Git is the undo:
+ *  the ingest is one commit in the knowledge base. */
 export interface IngestCard {
   id: number;
   open: boolean;
-  /** Undo all ran; the source waits in Raw until it is read again. */
-  undone: boolean;
   note: string;
   source: string;
   takeaways: IngestTakeaways;
-  writes: IngestWrite[];
+  pages: IngestPage[];
   proposals: IngestProposal[];
-  listed: IngestListed[];
-  me: string | null;
-}
-
-/** What Undo all did. */
-export interface IngestUndoReport {
-  noteRemoved: boolean;
-  /** Writes left in place because their file changed since. */
-  kept: string[];
+  /** The commit that holds the ingest (short sha), when there is one. */
+  commit: string | null;
+  /** Why the commit failed, when it did. */
+  commitError: string | null;
+  /** Its note is written and Claude is still writing the pages. */
+  writing: boolean;
 }
 
 /** Mirrors `drift::DriftRun`: one standing sweep. */
@@ -1337,18 +1321,9 @@ export const api = {
   ingestRetry: (team: string | null, path: string) => invoke<boolean>("ingest_retry", { team, path }),
   /** Move a source out of Raw/ to the system trash. */
   ingestRemove: (team: string | null, path: string) => invoke<void>("ingest_remove", { team, path }),
-  /** Undo all on an ingest card: every write, last first, then the note
-   *  (unless edited) and the source back to Raw/; what waits is closed. */
-  ingestUndo: (itemId: number, team: string | null = null) =>
-    invoke<IngestUndoReport>("ingest_undo", { itemId, team }),
-  /** Read an undone source again: its card closes and a pass starts. */
-  ingestReadAgain: (itemId: number, team: string | null = null) =>
-    invoke<boolean>("ingest_read_again", { itemId, team }),
-  /** Undo one write on an ingest card; refused when its file changed since. */
-  ingestUndoWrite: (itemId: number, index: number, team: string | null = null) =>
-    invoke<void>("ingest_undo_write", { itemId, index, team }),
-  /** Seen: the source moves beside its note and the card closes. Returns where. */
-  ingestFile: (itemId: number, team: string | null = null) => invoke<string>("ingest_file", { itemId, team }),
+  /** Mark an ingest card seen. A source an older card still holds in Raw
+   *  moves beside its note first. Returns where the source is. */
+  ingestSeen: (itemId: number, team: string | null = null) => invoke<string>("ingest_seen", { itemId, team }),
   /** The last drift sweep (null before the first). */
   /** Run the drift sweep now. */
   runDriftNow: (projectId: string | null = null) => invoke<DriftRun | null>("run_drift_now", { projectId }),

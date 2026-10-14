@@ -43,8 +43,6 @@ pub const BY_YOU: &str = "you";
 pub const BY_CHAT: &str = "chat";
 /// `updated_by` for a change made through `ken-mcp`.
 pub const BY_MCP: &str = "mcp";
-/// `updated_by` for a next step an ingest put on my day.
-pub const BY_INGEST: &str = "ingest";
 
 /// Where ticket files live in a repo.
 pub const TICKETS_DIR: &str = "tickets";
@@ -1107,7 +1105,7 @@ impl Me {
     }
 
     /// Whether an escalation is for me: a `to:` value names me, or my first
-    /// name alone, as an ingest writes who a question is for.
+    /// name alone, as people are named in a meeting.
     pub fn addressed(&self, e: &Escalation) -> bool {
         let first = self.name.as_deref().and_then(|n| n.split_whitespace().next());
         e.to.iter().any(|t| {
@@ -1680,7 +1678,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let esc = dir.path().join(ESCALATIONS_DIR);
         fs::create_dir_all(&esc).unwrap();
-        let ingest = crate::ingest::escalation_text("E-002", "Which Jira types map to tune?", Some("chris"), "2026-09-24", "2026-09-24-standup");
+        let ingest = "---
+id: E-002
+raised_by: ingest of 2026-09-24-standup
+to: chris
+ticket:
+raised: 2026-09-24
+status: open
+                      blocks: nothing
+answer:
+---
+
+# Which Jira types map to tune?
+";
         fs::write(esc.join("E-002.md"), ingest).unwrap();
         fs::write(esc.join("E-001.md"), "---\nid: E-001\nto: Kate\nstatus: open\n---\n\n# Who owns saves?\n").unwrap();
         fs::write(esc.join("E-003.md"), "---\nid: E-003\nto: [Chris Staud, Kate]\nstatus: answered\nticket: SR-012\nblocks: SR-012\n---\n\n# Old one\n").unwrap();

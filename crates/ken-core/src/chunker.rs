@@ -484,12 +484,23 @@ fn plain_entry(t: &str) -> Option<(String, &str, &str)> {
     Some((id, &rest[..split], &rest[split..]))
 }
 
-/// An entry line with the bold taken off its id, so `**D-410** · …` reads
-/// as `D-410 · …`: the parsers written for the template's plain form (the
-/// drift check, the vocabulary, ingest's next id) then read a bold log too.
-/// Any other line comes back as it was.
+/// An entry line with the bold or the heading marks taken off its id, so
+/// `**D-410** · …` and the one entry format's `## D-410 · 2026-10-06 · topic`
+/// (knowledge-core decision 13) read as `D-410 · …`: the parsers written for
+/// the plain form (the drift check, the vocabulary, ingest's next id) then
+/// read every form. Any other line comes back as it was.
 pub fn unbold_id(line: &str) -> std::borrow::Cow<'_, str> {
     let t = line.trim_start();
+    if t.starts_with('#') {
+        let h = t.trim_start_matches('#');
+        if let Some(h) = h.strip_prefix(' ') {
+            let h = h.trim_start();
+            if take_id(h).is_some() {
+                return std::borrow::Cow::Owned(h.to_string());
+            }
+        }
+        return std::borrow::Cow::Borrowed(line);
+    }
     let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
     if let Some((id, rest)) = t.strip_prefix("**").and_then(take_id) {
         if let Some(rest) = rest.strip_prefix("**") {
@@ -497,6 +508,17 @@ pub fn unbold_id(line: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Borrowed(line)
+}
+
+/// The head of an entry in the one entry format, `## D-012 · 2026-10-13 ·
+/// topic`: what follows the id, when a date comes right after it. None for
+/// any other heading (`## R-12: Title`).
+fn dated_heading_head(t: &str) -> Option<&str> {
+    let h = t.strip_prefix('#')?.trim_start_matches('#').strip_prefix(' ')?.trim_start();
+    let (_, rest) = take_id(h)?;
+    let sep = [" · ", " - "].into_iter().find(|s| rest.starts_with(s))?;
+    crate::pagemeta::date_in(rest.get(sep.len()..sep.len() + 10)?)?;
+    Some(rest)
 }
 
 /// `D-123` at the start of `s`, and what follows it.
@@ -538,8 +560,24 @@ pub fn is_log(rel_path: &str, text: &str) -> bool {
 
 /// The entry a chunk of a log holds (id and title), read from its first
 /// lines: the chunk may start with the heading the entry sits under.
+/// An entry in the one entry format (`## D-012 · date · topic`, then the
+/// bold ruling on a line of its own) takes the bold ruling as its title.
 pub fn chunk_entry(chunk_text: &str) -> Option<(String, String)> {
-    entry_line(chunk_text).and_then(entry_start)
+    let line = entry_line(chunk_text)?;
+    let (id, title) = entry_start(line)?;
+    if dated_heading_head(line.trim_start()).is_some() {
+        let after = chunk_text.split_once(line).map_or("", |(_, rest)| rest);
+        let ruling = after
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .and_then(|l| l.strip_prefix("**"))
+            .map(|l| l.split_once("**").map_or(l, |(bold, _)| bold));
+        if let Some(r) = ruling.filter(|r| !r.trim().is_empty()) {
+            return Some((id, entry_title(r)));
+        }
+    }
+    Some((id, title))
 }
 
 /// The line that starts the entry a chunk of a log holds (see
@@ -556,13 +594,14 @@ pub fn entry_line(chunk_text: &str) -> Option<&str> {
 
 /// What an entry line carries between its id and its title: its date and
 /// topics (` · 2026-10-06 · anchors, tools — ` in `**D-410** · 2026-10-06 ·
-/// anchors, tools — **SPAWN ANCHORS…**`). None when the line starts no
-/// entry; empty for a heading entry (`## R-12: Title`).
+/// anchors, tools — **SPAWN ANCHORS…**`, ` · 2026-10-13 · saves` in the one
+/// entry format's `## D-012 · 2026-10-13 · saves`). None when the line starts
+/// no entry; empty for any other heading entry (`## R-12: Title`).
 pub fn entry_head(line: &str) -> Option<&str> {
     entry_start(line)?;
     let t = line.trim_start();
     if t.starts_with('#') {
-        return Some("");
+        return Some(dated_heading_head(t).unwrap_or(""));
     }
     let t = ["- ", "* ", "+ "].iter().find_map(|m| t.strip_prefix(m)).unwrap_or(t);
     let Some(bold) = t.strip_prefix("**") else {
@@ -688,25 +727,29 @@ fn chunk_log(text: &str, profile: &IndexProfile) -> Option<Vec<(usize, String)>>
     // A line in a fence is never an entry: the template's format example
     // (`D-001 - 2026-01-01 - topic - …`) sits in one.
     let mut in_fence = false;
-    let entries: Vec<bool> = lines
+    // Lines inside a fence, the fence lines included: the one entry format's
+    // example (`## D-001 · …`) is no heading either.
+    let fenced: Vec<bool> = lines
         .iter()
         .map(|l| {
             if l.trim_start().starts_with("```") {
                 in_fence = !in_fence;
-                return false;
+                return true;
             }
-            !in_fence && entry_start(l).is_some()
+            in_fence
         })
         .collect();
+    let entries: Vec<bool> = lines.iter().zip(&fenced).map(|(l, f)| !f && entry_start(l).is_some()).collect();
     if entries.iter().filter(|e| **e).count() < LOG_MIN_ENTRIES {
         return None;
     }
+    let is_heading_at = |i: usize| !fenced[i] && lines[i].trim_start().starts_with('#');
     let is_heading = |l: &str| l.trim_start().starts_with('#');
     // (is an entry, first line index, end line index)
     let mut regions: Vec<(bool, usize, usize)> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    for (i, _) in lines.iter().enumerate() {
         let open_other = regions.last().is_some_and(|r| !r.0);
-        if entries[i] || (is_heading(line) && !open_other) || regions.is_empty() {
+        if entries[i] || (is_heading_at(i) && !open_other) || regions.is_empty() {
             regions.push((entries[i], i, i + 1));
         } else if let Some(r) = regions.last_mut() {
             r.2 = i + 1;
@@ -738,8 +781,8 @@ fn chunk_log(text: &str, profile: &IndexProfile) -> Option<Vec<(usize, String)>>
         if lines[a..b].iter().any(|l| !l.trim().is_empty() && !is_heading(l)) {
             out.extend(chunk_prose(&body, profile).into_iter().map(|(l, p)| (a + l, p)));
         }
-        if let Some(h) = lines[a..b].iter().rev().find(|l| is_heading(l)) {
-            context = Some(h.trim());
+        if let Some(h) = (a..b).rev().find(|&i| is_heading_at(i)) {
+            context = Some(lines[h].trim());
         }
     }
     Some(out)
@@ -1688,6 +1731,29 @@ mod tests {
         assert_eq!(unbold_id("**D-410** · 2026-10-06 · anchors — **X.**"), "D-410 · 2026-10-06 · anchors — **X.**");
         assert_eq!(unbold_id("- **SR-12** · done"), "SR-12 · done");
         assert_eq!(unbold_id("**Note** a bold word"), "**Note** a bold word");
+    }
+
+    /// The one entry format (decision 13): `## D-nnn · date · topic`, the
+    /// bold ruling, the quote, Why, sources, aliases, supersedes. Each entry
+    /// is a chunk named by its ruling, dated and topped by its head.
+    #[test]
+    fn the_one_entry_format_reads_as_a_log() {
+        let mut text = String::from("# Decisions\n\nEvery ruling, added and never edited.\n\n```\n## D-001 · 2026-01-01 · topic\n\n**The ruling.**\n```\n\n");
+        for i in 1..=6 {
+            text.push_str(&format!(
+                "## D-00{i} · 2026-09-0{i} · saves, regions\n\n**Ruling number {i}.**\n\n> \"we said {i}\" (Ana)\n\nWhy: reason {i}.\nsources: [[note-{i}]]\naliases: region save {i}\n\n"
+            ));
+        }
+        let chunks = chunk_file("Decisions/DECISIONS.md", &text, &IndexProfile::default_for("x.md"));
+        let entries: Vec<_> = chunks.iter().filter_map(|c| chunk_entry(&c.text)).collect();
+        assert_eq!(entries.len(), 6, "one chunk per ruling, the fenced example none: {chunks:?}");
+        assert_eq!(entries[2], ("D-003".to_string(), "Ruling number 3".to_string()));
+        let line = "## D-003 · 2026-09-03 · saves, regions";
+        assert_eq!(entry_date(line).as_deref(), Some("2026-09-03"));
+        assert_eq!(entry_topics(line), vec!["saves", "regions"]);
+        assert_eq!(unbold_id(line), "D-003 · 2026-09-03 · saves, regions");
+        assert_eq!(entry_head("## R-12: Title"), Some(""), "an undated heading entry has no head");
+        assert_eq!(unbold_id("## Pages"), "## Pages");
     }
 
     fn code_profile(target_tokens: usize) -> IndexProfile {

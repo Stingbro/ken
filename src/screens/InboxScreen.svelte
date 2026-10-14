@@ -63,10 +63,10 @@
     switch (s.type) {
       case "proposal": {
         const p = s.proposal;
-        const apply = { label: p.kind === "page" || p.kind === "new page" ? "Apply" : "Accept", primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), p.kind === "ruling" ? "Accepted. It is in the decisions log." : p.kind === "ticket" ? "Accepted. The ticket is written." : "Applied. The page cites the note.") };
+        const apply = { label: p.kind === "page" || p.kind === "new page" ? "Apply" : p.kind === "ruling" ? "Add to the log" : "Accept", primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), p.kind === "ruling" ? "Added. It is in the decisions log." : p.kind === "ticket" ? "Accepted. The ticket is written." : "Applied. The page cites the note.") };
         const discard = { label: "Discard", run: () => void act(item, () => api.resolveReviewItem(p.id, s.projectId), "Discarded.") };
         const note = { label: "Open the note", run: () => void openInRepo(s.projectId, s.note) };
-        return p.kind === "ruling" && !p.canAccept ? [note, discard] : [apply, discard, note];
+        return [apply, discard, note];
       }
       case "finding": {
         const f = s.finding;
@@ -207,9 +207,6 @@
           {/if}
           {#if sel.source.proposal.payload && (sel.source.proposal.kind === "page" || sel.source.proposal.kind === "new page")}
             <ProposalDetail payload={sel.source.proposal.payload} />
-          {/if}
-          {#if sel.source.proposal.kind === "ruling" && !sel.source.proposal.canAccept}
-            <p class="t-small">Only {sel.source.proposal.decider ?? "its decider"} can accept this ruling.</p>
           {/if}
         {:else if sel.source.type === "finding"}
           <p class="body">{sel.source.finding.detail}</p>

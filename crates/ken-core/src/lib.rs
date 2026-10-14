@@ -23,6 +23,7 @@ pub mod engine;
 pub mod error;
 pub mod extract;
 pub mod features;
+pub mod findings;
 pub mod federation;
 pub mod fsops;
 pub mod git;

@@ -13,15 +13,15 @@
   // Ingest, the inbox that empties (the Wright white box, frame 8b). Four
   // ways to add a source: drop or choose files, record, write a note, or take
   // a chat. Each lands in the team library's Research/Ingestion/Raw/ and is
-  // read at once into a dated note in Ingested/. What follows from the note
-  // is written then and there, each write citing the note: page edits and
-  // new pages, ideas, escalations, my next steps. The card is read afterwards, not confirmed: each write has
-  // Open and Undo. Only four things wait: a ruling for its decider, a change
-  // to Ways-of-Working as a ticket, an edit staging held, an action as a
-  // ticket. Seen files the source beside its note; Undo all takes it back.
+  // read at once into a dated note in Ingested/, the source moving beside it.
+  // The pages the note changes are written then and there, one section each,
+  // citing the note. Three things wait on the card: a ruling as a ready entry
+  // for the decisions log, an action as a drafted ticket, and an edit held
+  // for a person. Contradictions and open questions are findings, in the
+  // Inbox. Each ingest is one commit in the knowledge base: git is the undo.
   import { onMount, untrack } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type IngestCard, type IngestOverview, type IngestProposal, type IngestWrite } from "../lib/api";
+  import { api, type IngestCard, type IngestOverview, type IngestProposal } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
   import { record } from "../lib/record.svelte";
@@ -33,6 +33,7 @@
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import {
     canReadNow,
+    commitLine,
     ingestBusy,
     pageName,
     rawActions,
@@ -182,7 +183,12 @@
         // card, the card is shown.
         const r = next.raw.find((x) => x.path === selectedRaw);
         if (r?.cardId != null) selectCard(r.cardId);
-        else if (!r) selectedRaw = null;
+        else if (!r) {
+          // Read: the source moved beside its note, and its card is the
+          // newest one.
+          selectedRaw = null;
+          selected = next.ingested[0]?.id ?? null;
+        }
       } else if (selected === null) {
         // The newest read source is shown until the person picks another.
         selected = next.raw.find((r) => r.cardId !== null)?.cardId ?? next.ingested[0]?.id ?? null;
@@ -351,33 +357,6 @@
     if (overview) await openIn(overview.projectId, path);
   }
 
-  async function openWrite(w: IngestWrite) {
-    if (w.kind === "task") {
-      app.screen = "home";
-      return;
-    }
-    if (!w.projectId) {
-      error = `${w.path} is in a repo that is not open in this workspace.`;
-      return;
-    }
-    await openIn(w.projectId, w.path);
-  }
-
-  async function undoWrite(w: IngestWrite) {
-    if (!card) return;
-    busy = `w${w.index}`;
-    notice = null;
-    try {
-      await api.ingestUndoWrite(card.id, w.index, team);
-      error = null;
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = null;
-      await reload();
-    }
-  }
-
   /** A ruling's words, from its waiting item. */
   function rulingOf(p: IngestProposal): string {
     try {
@@ -416,75 +395,29 @@
     if (!card) return;
     busy = "seen";
     try {
-      await api.ingestFile(card.id, team);
+      await api.ingestSeen(card.id, team);
     } catch (e) {
       error = String(e);
     } finally {
       busy = null;
       await reload();
-    }
-  }
-
-  async function undoAll() {
-    if (!card) return;
-    busy = "undo";
-    try {
-      const report = await api.ingestUndo(card.id, team);
-      const kept = report.kept.length > 0 ? ` Kept, changed since: ${report.kept.join(", ")}.` : "";
-      const note = report.noteRemoved ? "" : " The note was edited, so it stays.";
-      notice = `Undone.${kept}${note}`;
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = null;
-      await reload();
-    }
-  }
-
-  async function readAgain() {
-    if (!card) return;
-    busy = "again";
-    try {
-      const started = await api.ingestReadAgain(card.id, team);
-      notice = started ? "Reading it again." : "It is read on the next pass.";
-      const source = card.source;
-      selected = null;
-      selectedRaw = source;
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = null;
-      await refresh();
     }
   }
 
   // The note is written before the pages are: while Claude still writes
-  // them, the card says so and nothing on it can be undone or filed yet (an
-  // Undo then would be overwritten by the read's own record of the card).
-  const cardWriting = $derived(
-    !!card && !!overview && overview.raw.some((r) => r.cardId === card?.id && (r.state === "reading" || r.state === "transcribing")),
-  );
-  const written = $derived(card?.writes ?? []);
-  const live = $derived(written.filter((w) => !w.undone));
+  // them, the card says so and it cannot be marked seen yet.
+  const cardWriting = $derived(!!card?.writing);
+  const pages = $derived(card?.pages ?? []);
   const rulings = $derived((card?.proposals ?? []).filter((p) => p.kind === "ruling"));
   const tickets = $derived((card?.proposals ?? []).filter((p) => p.kind === "ticket"));
   const held = $derived((card?.proposals ?? []).filter((p) => p.kind === "page" || p.kind === "new page"));
-  const pageWrites = $derived(written.filter((w) => w.kind === "edit" || w.kind === "page").length);
   const contradictions = $derived((card?.takeaways.contradictions ?? []).filter((c) => !saysNothing(c)));
+  const questions = $derived((card?.takeaways.openQuestions ?? []).filter((q) => !saysNothing(q)));
   const decisionsTotal = $derived(rulings.length + tickets.length + held.length);
-  const decisionsLeft = $derived(decisionsTotal);
-
-  const writeTag: Record<IngestWrite["kind"], string> = {
-    edit: "page",
-    page: "new page",
-    idea: "idea",
-    escalation: "escalation",
-    task: "my day",
-  };
 
   function rawSub(r: IngestOverview["raw"][number]): string {
     const bits = [r.kind, r.length, r.present.length > 0 ? `${r.present.length} present` : "", rawStateLabel(r.state)];
-    if (r.state === "read") bits.push(writtenLine(r.written, r.waiting));
+    if (r.state === "read") bits.push(writtenLine(r.pages, r.waiting));
     return bits.filter((b) => b).join(" · ");
   }
 </script>
@@ -629,160 +562,140 @@
           <h2>{card.takeaways.title || card.note.split("/").pop()}</h2>
           <div class="t-small">{card.note}</div>
         </div>
-        {#if !card.undone}
-          <div class="cacts">
-            <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => card && openSource(card.source)}>Open source</button>
-            <button class="btn" onclick={() => card && inLibrary(card.note)}>Open the note</button>
-            {#if card.open}
-              <button class="btn btn-primary" disabled={busy !== null || cardWriting} onclick={seen}>Mark as seen</button>
-            {/if}
-          </div>
-        {/if}
+        <div class="cacts">
+          <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => card && openSource(card.source)}>Open source</button>
+          <button class="btn" onclick={() => card && inLibrary(card.note)}>Open the note</button>
+          {#if card.open}
+            <button class="btn btn-primary" disabled={busy !== null || cardWriting} onclick={seen}>Mark as seen</button>
+          {/if}
+        </div>
       </div>
 
-      {#if card.undone}
-        <div class="k-empty soft">
-          <span class="head">Undone</span>
-          <span class="body">What was written from this source is taken back, and the source is in Raw. Ken does not read it again until you ask.</span>
-          <div><button class="btn btn-primary" disabled={busy !== null} onclick={readAgain}>Read it again</button></div>
-        </div>
-      {:else}
-        <div class="progress-card">
-          {#if cardWriting}
-            <div class="pline"><b>Writing the pages</b><span class="grow"></span><span class="t-small">The note is written; Claude is updating the pages it changes</span></div>
-            <div class="k-progress fat"><span style="width: 80%"></span></div>
-          {:else}
-            <div class="pline"><b>Read and filed</b><span class="grow"></span><span class="t-small">Done</span></div>
-            <div class="k-progress fat"><span style="width: 100%" class="okbar"></span></div>
-          {/if}
-          <div class="steps">
-            {#each isRecording(card.source, card.takeaways.kind) ? RECORDING_STEPS : DOCUMENT_STEPS as s (s)}<span class="step done"><CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{s}</span>{/each}
-          </div>
-        </div>
-
-        {#if decisionsTotal > 0}
-          <section class="decisions">
-            <div class="shead">
-              <span class="adot"></span>
-              <h3>Needs your decision</h3>
-              <span class="t-small">{decisionsLeft} of {decisionsTotal} left · also in your Inbox</span>
-            </div>
-            <div class="dgrid">
-              {#each rulings as p (p.id)}
-                <div class="dcard">
-                  <div class="dkind"><Gavel size={14} strokeWidth={1.75} aria-hidden="true" />Ruling{p.decider ? ` · ${p.decider}` : ""}</div>
-                  <div class="dshort">“{rulingOf(p)}”</div>
-                  <div class="ddetail">Goes into the decisions log when {p.decider ?? "its decider"} accepts it.</div>
-                  <div class="dacts">
-                    <button class="btn btn-small btn-primary" disabled={busy !== null || !p.canAccept} title={p.canAccept ? "Write it to the decisions log" : `Only ${p.decider} can accept a ruling`} onclick={() => apply(p)}>{p.decider && p.canAccept ? `Accept as ${p.decider}` : "Accept"}</button>
-                    <button class="btn btn-small" disabled={busy !== null} onclick={() => discard(p)}>Drop</button>
-                  </div>
-                </div>
-              {/each}
-              {#each tickets as p (p.id)}
-                <div class="dcard">
-                  <div class="dkind"><Ticket size={14} strokeWidth={1.75} aria-hidden="true" />Ticket</div>
-                  <div class="dshort">{p.title}</div>
-                  <div class="ddetail">Accepting writes the ticket in the team's tickets folder.</div>
-                  {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
-                  <div class="dacts">
-                    <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Accept</button>
-                    <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
-                    <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
-                  </div>
-                </div>
-              {/each}
-              {#each held as p (p.id)}
-                <div class="dcard wide">
-                  <div class="dkind"><FilePen size={14} strokeWidth={1.75} aria-hidden="true" />Held page edit</div>
-                  <div class="dshort">{pageName(p.page)}</div>
-                  <div class="ddetail">{p.body}</div>
-                  <ProposalDetail payload={p.payload} />
-                  <div class="dacts">
-                    <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Apply</button>
-                    <button class="btn btn-small" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
-                  </div>
-                </div>
-              {/each}
-            </div>
-          </section>
+      <div class="progress-card">
+        {#if cardWriting}
+          <div class="pline"><b>Writing the pages</b><span class="grow"></span><span class="t-small">The note is written; Claude is updating the pages it changes</span></div>
+          <div class="k-progress fat"><span style="width: 80%"></span></div>
+        {:else}
+          <div class="pline"><b>Read and filed</b><span class="grow"></span><span class="t-small">Done</span></div>
+          <div class="k-progress fat"><span style="width: 100%" class="okbar"></span></div>
         {/if}
+        <div class="steps">
+          {#each isRecording(card.source, card.takeaways.kind) ? RECORDING_STEPS : DOCUMENT_STEPS as s (s)}<span class="step done"><CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{s}</span>{/each}
+        </div>
+      </div>
 
-        <div class="cols">
-          <section class="summary">
-            <h3>Summary</h3>
-            {#if card.takeaways.summary}
-              <div class="lead">{@html renderMarkdown(card.takeaways.summary)}</div>
-            {/if}
-            {#if card.takeaways.keyTakeaways.length > 0}
-              <ul class="takeaways">
-                {#each card.takeaways.keyTakeaways as k}<li>{@html renderMarkdown(k)}</li>{/each}
+      {#if decisionsTotal > 0}
+        <section class="decisions">
+          <div class="shead">
+            <span class="adot"></span>
+            <h3>Needs your decision</h3>
+            <span class="t-small">{decisionsTotal} left · also in your Inbox</span>
+          </div>
+          <div class="dgrid">
+            {#each rulings as p (p.id)}
+              <div class="dcard">
+                <div class="dkind"><Gavel size={14} strokeWidth={1.75} aria-hidden="true" />Ruling{p.who ? ` · ${p.who}` : ""}</div>
+                <div class="dshort">“{rulingOf(p)}”</div>
+                <div class="ddetail">Ready for the decisions log; adding it gives it the next number.</div>
+                {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
+                <div class="dacts">
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the decisions log" onclick={() => apply(p)}>Add to the log</button>
+                  <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
+                  <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
+                </div>
+              </div>
+            {/each}
+            {#each tickets as p (p.id)}
+              <div class="dcard">
+                <div class="dkind"><Ticket size={14} strokeWidth={1.75} aria-hidden="true" />Ticket</div>
+                <div class="dshort">{p.title}</div>
+                <div class="ddetail">Accepting writes the ticket in the knowledge base's tickets folder.</div>
+                {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
+                <div class="dacts">
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Accept</button>
+                  <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
+                  <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
+                </div>
+              </div>
+            {/each}
+            {#each held as p (p.id)}
+              <div class="dcard wide">
+                <div class="dkind"><FilePen size={14} strokeWidth={1.75} aria-hidden="true" />Held page edit</div>
+                <div class="dshort">{pageName(p.page)}</div>
+                <div class="ddetail">{p.body}</div>
+                <ProposalDetail payload={p.payload} />
+                <div class="dacts">
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Apply</button>
+                  <button class="btn btn-small" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
+
+      <div class="cols">
+        <section class="summary">
+          <h3>Summary</h3>
+          {#if card.takeaways.summary}
+            <div class="lead">{@html renderMarkdown(card.takeaways.summary)}</div>
+          {/if}
+          {#if card.takeaways.keyTakeaways.length > 0}
+            <ul class="takeaways">
+              {#each card.takeaways.keyTakeaways as k}<li>{@html renderMarkdown(k)}</li>{/each}
+            </ul>
+          {/if}
+          {#if !saysNothing(card.takeaways.overturns)}
+            <div class="well">
+              <span class="t-label">What it overturns</span>
+              <div class="md">{@html renderMarkdown(card.takeaways.overturns)}</div>
+            </div>
+          {/if}
+          {#if contradictions.length > 0}
+            <div class="well danger">
+              <span class="t-label">Contradictions · findings in your Inbox</span>
+              <ul>
+                {#each contradictions as c}<li>{@html renderMarkdown(c)}</li>{/each}
               </ul>
-            {/if}
-            {#if !saysNothing(card.takeaways.overturns)}
-              <div class="well">
-                <span class="t-label">What it overturns</span>
-                <div class="md">{@html renderMarkdown(card.takeaways.overturns)}</div>
+            </div>
+          {/if}
+          {#if questions.length > 0}
+            <div class="well">
+              <span class="t-label">Open questions · findings in your Inbox</span>
+              <ul>
+                {#each questions as q}<li>{@html renderMarkdown(q)}</li>{/each}
+              </ul>
+            </div>
+          {/if}
+        </section>
+
+        <div class="side">
+          <section>
+            <div class="shead"><h3>Pages Ken updated</h3><span class="t-small">{pages.length} · each cites the note</span></div>
+            {#each pages as w (w.path)}
+              <div class="wrow">
+                <span class="wtag">{w.new ? "new page" : "page"}</span>
+                <span class="wtext">
+                  <span class="wtarget">{pageName(w.path)}</span>
+                  <span class="t-small">{w.label}</span>
+                </span>
+                <span class="wacts">
+                  <button class="btn btn-small" onclick={() => inLibrary(w.path)}>Open</button>
+                </span>
               </div>
-            {/if}
-            {#if contradictions.length > 0}
-              <div class="well danger">
-                <span class="t-label">Contradictions</span>
-                <ul>
-                  {#each contradictions as c}<li>{@html renderMarkdown(c)}</li>{/each}
-                </ul>
-              </div>
+            {:else}
+              <p class="note">No page was written from this source.</p>
+            {/each}
+            {#if pages.length > 0 || held.length > 0}
+              <p class="note">{stagingLine(held.length)}</p>
             {/if}
           </section>
-
-          <div class="side">
-            {#if card.takeaways.nextSteps.length > 0}
-              <section>
-                <div class="shead"><h3>Next steps</h3><span class="t-small">{card.takeaways.nextSteps.length}</span></div>
-                {#each card.takeaways.nextSteps as n}
-                  <div class="nrow">{@html renderMarkdown(n)}</div>
-                {/each}
-              </section>
-            {/if}
-            <section>
-              <div class="shead"><h3>Pages Ken updated</h3><span class="t-small">{live.length} · each cites the note</span></div>
-              {#each written as w (w.index)}
-                <div class="wrow" class:undone={w.undone}>
-                  <span class="wtag">{writeTag[w.kind]}</span>
-                  <span class="wtext">
-                    <span class="wtarget">{w.kind === "task" ? w.label : pageName(w.path)}</span>
-                    <span class="t-small">{w.kind === "escalation" && w.to ? `to ${w.to}` : w.kind !== "task" && w.label ? w.label : ""}{w.undone ? " · undone" : ""}</span>
-                  </span>
-                  {#if !w.undone}
-                    <span class="wacts">
-                      <button class="btn btn-small" onclick={() => openWrite(w)}>Open</button>
-                      <button class="btn btn-small btn-ghost" disabled={busy !== null || cardWriting} onclick={() => undoWrite(w)}>Undo</button>
-                    </span>
-                  {/if}
-                </div>
-              {:else}
-                <p class="note">Nothing was written from this source.</p>
-              {/each}
-              {#if pageWrites > 0 || held.length > 0}
-                <p class="note">{stagingLine(held.length)}</p>
-              {/if}
-            </section>
-            {#if card.listed.length > 0}
-              <section>
-                <div class="shead"><h3>On this card only</h3><span class="t-small">nowhere to write it</span></div>
-                {#each card.listed as l, i (i)}
-                  <div class="nrow"><span class="wtag">{l.kind}</span> {l.text}{#if l.to} · {l.to}{/if}</div>
-                {/each}
-              </section>
-            {/if}
-          </div>
         </div>
+      </div>
 
-        <div class="foot">
-          <span class="t-small grow">Undo all takes back every page edit and puts the source back in Raw.</span>
-          <button class="btn btn-danger" disabled={busy !== null || cardWriting} onclick={undoAll}>Undo all</button>
-        </div>
-      {/if}
+      <div class="foot">
+        <span class="t-small grow">{commitLine(card.commit, card.commitError)}</span>
+      </div>
     {:else if rawSelected}
       {@const pct = rawPct(rawSelected)}
       {@const acts = rawActions(rawSelected.state)}
@@ -820,12 +733,12 @@
       </div>
       <div class="k-empty soft">
         <span class="head">{rawSelected.state === "failed" ? "Ken couldn't read this" : rawSelected.state === "waiting" ? "This waits for a transcript" : "Ken is still reading"}</span>
-        <span class="body">{rawSelected.detail ?? "The summary, decisions, next steps and page updates appear here when it finishes. You can leave this screen."}</span>
+        <span class="body">{rawSelected.detail ?? "The summary, what waits for you and the pages Ken updated appear here when it finishes. You can leave this screen."}</span>
       </div>
     {:else}
       <div class="k-empty soft">
         <span class="head">Add a source</span>
-        <span class="body">Drop a transcript, a recording, a document or a note. Ken reads it into a dated note, updates the pages it changes, and shows here what it did, with an Undo for each.</span>
+        <span class="body">Drop a transcript, a recording, a document or a note. Ken reads it into a dated note, updates the pages it changes, and shows here what it did. Each ingest is one commit in the knowledge base, so git takes it back.</span>
       </div>
     {/if}
     </div>
@@ -1300,25 +1213,12 @@
     display: flex;
     flex-direction: column;
   }
-  .nrow {
-    padding: 10px 0;
-    border-top: 1px solid var(--line-soft);
-    font-size: 14px;
-    line-height: 1.45;
-  }
-  .nrow :global(p) {
-    margin: 0;
-  }
   .wrow {
     display: flex;
     align-items: center;
     gap: 12px;
     padding: 9px 0;
     border-top: 1px solid var(--line-soft);
-  }
-  .wrow.undone .wtarget {
-    text-decoration: line-through;
-    color: var(--ink-3);
   }
   .wtag {
     font-size: 11px;

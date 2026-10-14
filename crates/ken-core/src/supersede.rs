@@ -117,11 +117,12 @@ const ID: &str = r"[A-Z][A-Z0-9]{0,7}-\d{1,6}";
 
 /// The pairs a log marks itself: an entry that says it is `[SUPERSEDED BY
 /// D-302]` or `[REFINED BY D-258: why]` (it is the earlier), or that it
-/// `[SUPERSEDES] D-114` or `[REFINES D-132]` (it is the later). Only pairs
-/// whose two entries are both in the log.
+/// `[SUPERSEDES] D-114`, `[REFINES D-132]` or, in the one entry format's own
+/// line, `supersedes: D-114` (it is the later). Only pairs whose two entries
+/// are both in the log.
 pub fn marked(log: &str, entries: &[Entry]) -> Vec<Supersession> {
     let by = regex::Regex::new(&format!(r"\[(?i:(superseded|refined))\s+(?i:by)\s+({ID})\s*(?::\s*([^\]]*))?\]")).expect("pattern");
-    let of = regex::Regex::new(&format!(r"\[(?i:(supersedes|refines))\]?\**\s*((?:{ID}[\s,]*(?:and\s+)?)+)")).expect("pattern");
+    let of = regex::Regex::new(&format!(r"(?m)(?:\[|^\s*)(?i:(supersedes|refines))\]?:?\**\s*((?:{ID}[\s,]*(?:and\s+)?)+)")).expect("pattern");
     let ids = regex::Regex::new(ID).expect("pattern");
     let at: HashMap<&str, &Entry> = entries.iter().map(|e| (e.id.as_str(), e)).collect();
     let relation = |verb: &str| if verb.to_ascii_lowercase().starts_with("refine") { "refines" } else { "supersedes" };
@@ -631,6 +632,14 @@ mod tests {
         assert!(m.iter().all(|s| s.source == "marked"));
         assert_eq!(m[0].earlier_note(), "superseded by D-381 on rolls per chest");
         assert_eq!(m[1].earlier_note(), "refined by D-411");
+
+        // The one entry format says it on its own line.
+        let mut later = entry("D-412", "2026-10-07", "loot, chests", "Chest pools roll three times.");
+        later.text.push_str("\nWhy: more loot.\nsupersedes: D-381\n");
+        let mut with_field = sorted(log());
+        with_field.push(later);
+        let m = marked("decisions/DECISIONS.md", &with_field);
+        assert!(m.iter().any(|s| s.earlier == "D-381" && s.later == "D-412" && s.relation == "supersedes"), "{m:?}");
     }
 
     #[test]

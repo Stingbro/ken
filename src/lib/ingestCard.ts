@@ -1,25 +1,14 @@
 // Pure helpers for the Ingest screen (the library inbox, white box 8b): the
-// one-line count of what a source wrote and what waits, page names as a row
-// says them, staging's line, and what a Raw/ row says and offers.
-import type { IngestOverview, IngestWriteKind, RawState } from "./api";
+// one-line count of the pages a source wrote and what waits, page names as a
+// row says them, the hold line, and what a Raw/ row says and offers.
+import type { IngestOverview, RawState } from "./api";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-/** "2 pages, 1 escalation written, 1 on my day · 3 wait" — what was written
- *  from a source and what waits, in one line. */
-export function writtenLine(written: IngestWriteKind[], waiting: number): string {
-  const count = (...kinds: IngestWriteKind[]) => written.filter((k) => kinds.includes(k)).length;
-  const parts: string[] = [];
-  const pages = count("edit", "page");
-  const ideas = count("idea");
-  const escalations = count("escalation");
-  const tasks = count("task");
-  if (pages > 0) parts.push(plural(pages, "page"));
-  if (ideas > 0) parts.push(plural(ideas, "idea"));
-  if (escalations > 0) parts.push(plural(escalations, "escalation"));
-  let line = parts.length > 0 ? `${parts.join(", ")} written` : "";
-  if (tasks > 0) line = line ? `${line}, ${tasks} on my day` : `${tasks} on my day`;
-  if (!line) line = "nothing written";
+/** "2 pages written · 3 wait": the pages written from a source and what
+ *  waits, in one line. */
+export function writtenLine(pages: number, waiting: number): string {
+  let line = pages > 0 ? `${plural(pages, "page")} written` : "nothing written";
   if (waiting > 0) line += ` · ${waiting} ${waiting === 1 ? "waits" : "wait"}`;
   return line;
 }
@@ -33,9 +22,16 @@ export function pageName(path: string): string {
     .join(" › ");
 }
 
-/** The line under the page edits: staging held none, or how many. */
+/** The line under the pages: none was held for a person, or how many. */
 export function stagingLine(held: number): string {
-  return held === 0 ? "Every page edit went through staging; none was held." : `${held} held, below.`;
+  return held === 0 ? "No page edit was held for you." : `${held} held for you, above.`;
+}
+
+/** Where the ingest's commit is, so git takes it back. */
+export function commitLine(commit: string | null, error: string | null): string {
+  if (commit) return `One commit, ${commit}, in the knowledge base. git revert ${commit} takes it all back.`;
+  if (error) return `Not committed: ${error}`;
+  return "Not committed: the knowledge base is not a git repo, or nothing changed.";
 }
 
 /** How a source in Raw/ reads in its row. */

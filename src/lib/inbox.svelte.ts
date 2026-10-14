@@ -1,7 +1,8 @@
 // The Inbox (the Briefing design): one list of everything waiting on you,
 // sorted by who it is from. People: escalations raised to you. Ken: what an
-// ingest waits on (rulings, tickets, held page
-// edits), what the wiki's checks found, and questions Ken asked in a chat.
+// ingest waits on (rulings, tickets, held page edits), the findings (what a
+// source contradicts and leaves open, what the wiki's checks found), and
+// questions Ken asked in a chat.
 // Sync & files: edit conflicts and files Ken could not read. Home's "Needs
 // you" is the top of this list and the sidebar count is its length. Resolving
 // an item here resolves it where it came from, so nothing lives in two places.
@@ -89,7 +90,7 @@ export function proposalItem(p: IngestProposal, cardId: number, note: string, pr
     group: "ken",
     kind,
     tone: "attn",
-    from: p.kind === "ruling" && p.decider ? `Ken, for ${p.decider}` : "Ken",
+    from: "Ken",
     title: p.title,
     short: p.kind === "page" || p.kind === "new page" ? `${leaf(p.page)} · held back for you to read` : p.body.split("\n")[0] ?? "",
     when: null,
@@ -117,7 +118,11 @@ export function findingItem(f: TeamFinding & { itemId?: number | null }, i: numb
                   ? "Couldn't draft"
                   : k === "repo-removed"
                     ? "Repo left the team"
-                    : "Out of date";
+                    : k === "contradiction"
+                      ? "Contradiction"
+                      : k === "question"
+                        ? "Open question"
+                        : "Out of date";
   return {
     id: `finding:${f.itemId ?? `${k}:${f.projectId ?? ""}:${f.path ?? i}:${f.title}`}`,
     group: "ken",
