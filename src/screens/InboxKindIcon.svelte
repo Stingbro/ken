@@ -5,6 +5,8 @@
   import ListTodo from "@lucide/svelte/icons/list-todo";
   import MessageSquare from "@lucide/svelte/icons/message-square";
   import Gavel from "@lucide/svelte/icons/gavel";
+  import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
+  import CircleAlert from "@lucide/svelte/icons/circle-alert";
   import Ticket from "@lucide/svelte/icons/ticket";
   import FilePen from "@lucide/svelte/icons/file-pen";
   import FilePlus from "@lucide/svelte/icons/file-plus";
@@ -26,6 +28,10 @@
         return MessageSquare;
       case "Ruling":
         return Gavel;
+      case "Risk":
+        return TriangleAlert;
+      case "Issue":
+        return CircleAlert;
       case "Ticket":
         return Ticket;
       case "Page edit":

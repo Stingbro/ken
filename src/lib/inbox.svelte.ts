@@ -59,10 +59,20 @@ function leaf(path: string): string {
   return path.split("/").pop() || path;
 }
 
+/** What each kind of proposal is called in the Inbox. */
+const PROPOSAL_KINDS: Record<IngestProposal["kind"], string> = {
+  ruling: "Ruling",
+  risk: "Risk",
+  issue: "Issue",
+  ticket: "Ticket",
+  "new page": "New page",
+  page: "Page edit",
+};
+
 /** A proposal waiting for a person. `note` is the ingest's note it came
  *  from; empty for one no card holds, then `origin` says where it came from. */
 export function proposalItem(p: IngestProposal, cardId: number, note: string, projectId: string, origin: "chat" | "drift" | null = null): InboxItem {
-  const kind = p.kind === "ruling" ? "Ruling" : p.kind === "ticket" ? "Ticket" : p.kind === "new page" ? "New page" : "Page edit";
+  const kind = PROPOSAL_KINDS[p.kind] ?? "Page edit";
   return {
     id: `proposal:${p.id}`,
     group: "ken",

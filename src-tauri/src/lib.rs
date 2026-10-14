@@ -5817,6 +5817,25 @@ fn confirm_finding(state: State<SharedState>, id: i64, project_id: Option<String
     Ok(commit)
 }
 
+/// Raise an open question an ingest left unsettled as an issue in the RAID
+/// register (Chris, 2026-10-14): the entry takes the next `I-nnn` and is one
+/// commit in the knowledge base, and the finding is marked done, since the
+/// register tracks it now. Returns the issue's id.
+#[tauri::command(async)]
+fn raise_issue(state: State<SharedState>, id: i64, project_id: Option<String>) -> CmdResult<String> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
+    let mut guard = state.lock().unwrap();
+    let active = member_mut(&mut guard, pid)?;
+    let (item, finding) = ken_core::findings::open(&active.db)
+        .map_err(err)?
+        .into_iter()
+        .find(|(it, _)| it.id == id)
+        .ok_or("no open finding with that id")?;
+    let (issue, _) = ken_core::raid::raise_question(&active.project.root, &finding, &local_date_today())?;
+    settle_review_item(&active.project.root, &mut active.db, item.id)?;
+    Ok(issue)
+}
+
 // ---------- ignored files (user-level, never synced) ----------
 
 /// Load the current project's private user-state from app-data. Helper for the
@@ -7601,9 +7620,9 @@ fn ingest_overview(app: AppHandle, state: State<SharedState>) -> CmdResult<Inges
 #[serde(rename_all = "camelCase")]
 struct IngestProposalDto {
     id: i64,
-    /// What waits: `ruling` (a ready entry for the decisions log), `ticket`
-    /// (a drafted ticket), or an edit held for a person, `page` (a change to
-    /// one) or `new page`.
+    /// What waits: `ruling` (a ready entry for the decisions log), `risk` or
+    /// `issue` (an entry for the RAID register), `ticket` (a drafted ticket),
+    /// or an edit held for a person, `page` (a change to one) or `new page`.
     kind: String,
     title: String,
     /// The page (or ticket file) it writes.
@@ -7611,7 +7630,8 @@ struct IngestProposalDto {
     body: String,
     /// The proposal itself (the page as it is and with the change), for the diff.
     payload: Option<String>,
-    /// Who made a ruling, as the note says; free text, never a check.
+    /// Who made a ruling, or who watches a risk or issue, as the note says;
+    /// free text, never a check.
     who: Option<String>,
 }
 
@@ -7660,7 +7680,9 @@ fn proposal_dto(it: ken_core::db::ReviewItemRow) -> IngestProposalDto {
         id: it.id,
         kind: p.as_ref().map_or("page", ken_core::proposal::kind_of).into(),
         page: p.as_ref().map(|p| p.page.clone()).unwrap_or_default(),
-        who: p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.who.clone()),
+        who: p
+            .as_ref()
+            .and_then(|p| p.append.as_ref().and_then(|r| r.who.clone()).or_else(|| p.raid.as_ref().and_then(|d| d.owner.clone()))),
         title: it.title,
         body: it.body,
         payload: it.payload,
@@ -12542,6 +12564,7 @@ pub fn run() {
             set_model_selection,
             resolve_review_item,
             confirm_finding,
+            raise_issue,
             accept_analysis,
             loose_proposals,
             analysis_proposals,

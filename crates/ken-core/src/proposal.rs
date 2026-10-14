@@ -1,8 +1,9 @@
 //! A change to one page that waits for a person: the page as Ken read it,
 //! the page as Ken would write it, and what to append when the change is a
-//! decisions-log entry. Ingest files one when it holds an edit for a person,
-//! when a ruling waits as a ready entry, and when it drafts a ticket from an
-//! action; Apply writes it only while the page still reads as Ken read it.
+//! decisions-log entry or a RAID register entry. Ingest files one when it
+//! holds an edit for a person, when a ruling waits as a ready entry, when it
+//! drafts a ticket from an action, and when a risk or issue waits for the
+//! register; Apply writes it only while the page still reads as Ken read it.
 
 use std::fs;
 use std::path::Path;
@@ -36,6 +37,10 @@ pub struct Proposal {
     /// when applied: rulings from one note then apply in any order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append: Option<RulingEntry>,
+    /// A risk or issue to add to the RAID register, numbered, like a ruling,
+    /// against the register as it is when applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raid: Option<crate::raid::Draft>,
     /// The ingested note this came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
@@ -86,10 +91,13 @@ pub fn file_page_proposal(db: &mut Db, p: &Proposal, title: &str, body: &str, no
 }
 
 /// What a proposal is, as its card names it: `ruling` (a ready entry for the
-/// decisions log), `ticket` (a drafted ticket), `new page` or `page` (an
-/// edit held for a person).
+/// decisions log), `risk` or `issue` (an entry for the RAID register),
+/// `ticket` (a drafted ticket), `new page` or `page` (an edit held for a
+/// person).
 pub fn kind_of(p: &Proposal) -> &'static str {
-    if p.append.is_some() {
+    if let Some(d) = &p.raid {
+        d.kind.as_str()
+    } else if p.append.is_some() {
         "ruling"
     } else if p.base.is_empty() && (p.page.starts_with("tickets/") || p.root.is_some()) {
         "ticket"
@@ -110,7 +118,8 @@ pub enum ApplyError {
 
 /// Write a proposal, only while the page still reads as `base`: a change
 /// made against an older page would undo whatever a person wrote since. A
-/// ruling to append goes onto the log as it is now, whatever was added since.
+/// ruling to append goes onto the log as it is now, whatever was added since,
+/// and a risk or issue onto the register the same way.
 /// `root` is the repo whose Review holds the card; `p.root` wins when set.
 pub fn apply(root: &Path, p: &Proposal) -> std::result::Result<(), ApplyError> {
     let root = p.root.as_deref().map(Path::new).unwrap_or(root);
@@ -119,6 +128,10 @@ pub fn apply(root: &Path, p: &Proposal) -> std::result::Result<(), ApplyError> {
     if let Some(r) = &p.append {
         let log = if now.trim().is_empty() { "# Decisions\n".to_string() } else { now };
         let text = crate::ingest::decisions_entry(&log, r);
+        return write_page(&path, &text).map_err(|e| ApplyError::Io(e.to_string()));
+    }
+    if let Some(d) = &p.raid {
+        let (text, _) = crate::raid::append(&now, d);
         return write_page(&path, &text).map_err(|e| ApplyError::Io(e.to_string()));
     }
     if now.replace("\r\n", "\n") != p.base.replace("\r\n", "\n") {
@@ -167,5 +180,21 @@ mod tests {
         assert_eq!(kind_of(&Proposal { root: Some("team".into()), ..Proposal::new("SR-5.md", "", "x") }), "ticket", "an older team-repo ticket");
         assert_eq!(kind_of(&Proposal::new("Rules/New.md", "", "x")), "new page");
         assert_eq!(kind_of(&Proposal::new("Current/Project.md", "before", "after")), "page");
+        let issue = crate::raid::Draft { kind: crate::raid::Kind::Issue, ..Default::default() };
+        assert_eq!(kind_of(&Proposal { raid: Some(issue), ..Proposal::new(crate::raid::RAID_PAGE, "", "x") }), "issue");
+    }
+
+    /// A risk waits like a ruling: numbered when it is added, against the
+    /// register as it is then, whatever was added since.
+    #[test]
+    fn a_risk_takes_the_next_number_when_it_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = crate::raid::Draft { title: "Saves may corrupt".into(), date: "2026-10-14".into(), ..Default::default() };
+        let p = Proposal { raid: Some(d), ..Proposal::new(crate::raid::RAID_PAGE, "", "shown, not written") };
+        apply(dir.path(), &p).unwrap();
+        apply(dir.path(), &p).unwrap();
+        let page = fs::read_to_string(dir.path().join(crate::raid::RAID_PAGE)).unwrap();
+        let ids: Vec<String> = crate::raid::parse(&page).into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec!["R-001", "R-002"]);
     }
 }

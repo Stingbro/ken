@@ -1093,14 +1093,19 @@ fn page_list(db: &Db) -> Result<Vec<(String, String)>> {
 
 /// The plan: which pages the note changes, which new pages it calls for,
 /// which pages it retires, its rulings written up for the decisions log, the
-/// renames it tells of, and the topics of the note and each page it names
-/// (decision 21: tagged at write time, in the same call).
+/// risks and issues it raises for the RAID register, the renames it tells
+/// of, and the topics of the note and each page it names (decision 21:
+/// tagged at write time, in the same call).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Plan {
     pub update: Vec<PageChange>,
     pub create: Vec<NewPage>,
     pub retire: Vec<Retire>,
     pub rulings: Vec<RulingDraft>,
+    /// Something that might go wrong.
+    pub risks: Vec<RaidItem>,
+    /// A problem now.
+    pub issues: Vec<RaidItem>,
     pub renames: Vec<Rename>,
     /// (page, topics); the note itself is [`NOTE_TOPICS`].
     pub topics: Vec<(String, Vec<String>)>,
@@ -1166,6 +1171,19 @@ pub struct RulingDraft {
     pub supersedes: Vec<String>,
 }
 
+/// A risk or issue as the plan writes it up for the RAID register: a title
+/// of a few words, what it is in a line, and who watches it when the note
+/// says.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct RaidItem {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub owner: String,
+}
+
 /// A list the model may write as one comma-separated string.
 fn list_or_string<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
@@ -1202,6 +1220,10 @@ struct RawPlan {
     #[serde(default)]
     rulings: Vec<RulingDraft>,
     #[serde(default)]
+    risks: Vec<RaidItem>,
+    #[serde(default)]
+    issues: Vec<RaidItem>,
+    #[serde(default)]
     renames: Vec<Rename>,
     #[serde(default)]
     topics: serde_json::Value,
@@ -1226,6 +1248,10 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str, topics
            a topic of two or three words, why it was made in one line (from the note), the words it was made in, who \
            made it when the note says, a few aliases (other words anyone might search for it by), and the ids of the \
            rulings it replaces, from the passages below.\n\
+         - risks: what the note says might go wrong and has not yet, each with a title of a few words, what would \
+           show it in one line, and who watches it when the note says. Most notes raise none.\n\
+         - issues: problems the note says exist now that no ruling or action settles, each the same way. A question \
+           the note leaves open is not an issue.\n\
          - renames: each thing the note says now goes by another name, old and new, for the Vocabulary page.\n\
          - topics: for the note (page \"note\") and each page you update, create or retire, ",
     );
@@ -1236,8 +1262,9 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str, topics
          \"what changes, in one line\", \"against\": \"\"}, …], \"create\": [{\"path\": \"Section/Name.md\", \"purpose\": \
          \"what the page is for\"}, …], \"retire\": [{\"path\": \"path\", \"by\": \"path\"}, …], \"rulings\": \
          [{\"ruling\": \"…\", \"topic\": \"…\", \"why\": \"…\", \"quote\": \"…\", \"who\": \"…\", \"aliases\": [\"…\"], \
-         \"supersedes\": [\"D-nnn\"]}, …], \"renames\": [{\"old\": \"…\", \"new\": \"…\"}, …], \"topics\": [{\"page\": \
-         \"note\", \"topics\": [\"…\"]}, {\"page\": \"path\", \"topics\": [\"…\"]}, …]}.\n\n\
+         \"supersedes\": [\"D-nnn\"]}, …], \"risks\": [{\"title\": \"…\", \"detail\": \"…\", \"owner\": \"…\"}, …], \
+         \"issues\": [{\"title\": \"…\", \"detail\": \"…\", \"owner\": \"…\"}, …], \"renames\": [{\"old\": \"…\", \"new\": \
+         \"…\"}, …], \"topics\": [{\"page\": \"note\", \"topics\": [\"…\"]}, {\"page\": \"path\", \"topics\": [\"…\"]}, …]}.\n\n\
          PAGES IN THE KNOWLEDGE BASE:\n",
     );
     for (p, t) in pages {
@@ -1285,6 +1312,12 @@ pub fn read_plan(reply: &str, pages: &[(String, String)], root: &Path) -> Plan {
     }
     retire.truncate(MAX_UPDATES);
     let rulings = raw.rulings.into_iter().filter(|r| !r.ruling.trim().is_empty()).collect();
+    let raid = |items: Vec<RaidItem>| -> Vec<RaidItem> {
+        let mut items: Vec<RaidItem> = items.into_iter().filter(|r| !r.title.trim().is_empty()).collect();
+        items.truncate(MAX_NEW);
+        items
+    };
+    let (risks, issues) = (raid(raw.risks), raid(raw.issues));
     let mut renames = raw.renames;
     renames.retain(|r| !r.old.trim().is_empty() && !r.new.trim().is_empty());
     renames.truncate(MAX_NEW);
@@ -1294,7 +1327,7 @@ pub fn read_plan(reply: &str, pages: &[(String, String)], root: &Path) -> Plan {
         .chain(retire.iter().map(|r| r.path.clone()))
         .collect();
     let topics = crate::graph::topics_from(&raw.topics, &named);
-    Plan { update, create, retire, rulings, renames, topics }
+    Plan { update, create, retire, rulings, risks, issues, renames, topics }
 }
 
 /// The prompt for one page edit from a note: the section that holds the
@@ -2100,6 +2133,9 @@ pub struct FollowUps {
     pub held: Vec<String>,
     /// Rulings waiting as ready entries.
     pub rulings: usize,
+    /// Risks and issues waiting for the RAID register.
+    pub risks: usize,
+    pub issues: usize,
     /// Tickets drafted, waiting to be accepted.
     pub tickets: Vec<String>,
     /// Contradictions filed as findings, one line each.
@@ -2119,8 +2155,9 @@ pub struct FollowUps {
 
 /// After a note is written: plan which pages it changes and which new pages
 /// it calls for, write each (or hold it for a person), then file what waits:
-/// its rulings as ready entries, its actions as drafted tickets, and its
-/// contradictions and open questions as findings. Each write cites the note.
+/// its rulings as ready entries, its risks and issues as entries for the
+/// RAID register, its actions as drafted tickets, and its contradictions and
+/// open questions as findings. Each write cites the note.
 /// `context` is what the knowledge base and the code said on the source's
 /// subject. `generate` is asked once for the plan, then once per page.
 #[allow(clippy::too_many_arguments)]
@@ -2314,6 +2351,41 @@ pub fn follow_ups(
         }
     }
 
+    // Risks and issues wait like rulings: one click adds each to the RAID
+    // register, which numbers it then.
+    let register = fs::read_to_string(root.join(crate::raid::RAID_PAGE)).unwrap_or_default();
+    for (kind, items) in [(crate::raid::Kind::Risk, &plan.risks), (crate::raid::Kind::Issue, &plan.issues)] {
+        for item in items {
+            let owner = Some(item.owner.trim().to_string()).filter(|o| !o.is_empty());
+            let draft = crate::raid::Draft {
+                kind,
+                title: item.title.trim().to_string(),
+                owner: owner.clone(),
+                text: item.detail.trim().to_string(),
+                date: date.to_string(),
+                note: stem.clone(),
+            };
+            let (proposed, _) = crate::raid::append(&register, &draft);
+            let name = match kind {
+                crate::raid::Kind::Risk => "Risk",
+                crate::raid::Kind::Issue => "Issue",
+            };
+            let card = format!("{name}: {}", card_title(&draft.title));
+            let who = owner.map(|o| format!(", for {o}")).unwrap_or_default();
+            let body = format!(
+                "{name} from {stem}{who}: \"{}\". Add it to the RAID register in one click; it takes the next number then. \
+                 Or discard it.",
+                draft.title
+            );
+            let p = Proposal { raid: Some(draft), from: from.clone(), ..Proposal::new(crate::raid::RAID_PAGE, register.clone(), proposed) };
+            file_page_proposal(db, &p, &card, &body, now)?;
+            match kind {
+                crate::raid::Kind::Risk => out.risks += 1,
+                crate::raid::Kind::Issue => out.issues += 1,
+            }
+        }
+    }
+
     // Each action waits as a drafted ticket in the knowledge base's tickets/.
     let actions = actions_of(note);
     if !actions.is_empty() {
@@ -2382,6 +2454,14 @@ pub fn commit_message(placement: &Placement, f: &FollowUps) -> String {
     if f.rulings > 0 {
         waits.push(format!("{} {} to add to the decisions log", f.rulings, if f.rulings == 1 { "ruling" } else { "rulings" }));
     }
+    let raid: Vec<String> = [(f.risks, "risk"), (f.issues, "issue")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, kind)| format!("{n} {kind}{}", if n == 1 { "" } else { "s" }))
+        .collect();
+    if !raid.is_empty() {
+        waits.push(format!("{} to add to the RAID register", raid.join(" and ")));
+    }
     if !f.tickets.is_empty() {
         waits.push(format!("tickets {} drafted", f.tickets.join(", ")));
     }
@@ -2419,7 +2499,8 @@ pub fn finish_ingest(root: &Path, db: &mut Db, placement: &Placement, note: &str
 }
 
 /// After a person applies what waited in the knowledge base (a ready ruling,
-/// a drafted ticket, a held edit): a held new page joins its section index,
+/// a risk or issue for the register, a drafted ticket, a held edit): a held
+/// new page, or a register made by its first entry, joins its section index,
 /// and the change is its own commit. Returns the commit; None when the
 /// proposal did not come from an ingest or a drift run (Ken commits only in
 /// the knowledge base, decision 36), is in another repo, or the knowledge
@@ -2435,12 +2516,18 @@ pub fn accepted(root: &Path, p: &crate::proposal::Proposal) -> std::result::Resu
             paths.push(index);
         }
     }
+    if p.raid.is_some() {
+        if let Ok(Some(index)) = add_to_index(root, &p.page, crate::raid::PURPOSE) {
+            paths.push(index);
+        }
+    }
     let message = match (kind, &p.append) {
         // An edit a drift run held (decision 28).
         _ if from == crate::drift::HELD_FROM => format!("drift: apply the held edit to {}", p.page),
         // A ruling a chat proposed (MCP `propose_decision`, decision 13).
         ("ruling", Some(r)) if from == crate::proposal::FROM_CHAT => format!("decisions: add the ruling proposed in chat\n\n{}", r.ruling),
         ("ruling", Some(r)) => format!("decisions: add the ruling from {from}\n\n{}", r.ruling),
+        ("risk" | "issue", _) => format!("raid: add the {kind} from {from}\n\n{}", p.raid.as_ref().map_or("", |d| d.title.as_str())),
         ("ticket", _) => format!("tickets: {} from {from}", note_stem(&p.page)),
         ("new page", _) => format!("ingest: add {} from {from}", p.page),
         _ => format!("ingest: apply the held edit to {} from {from}", p.page),
@@ -2841,7 +2928,7 @@ mod tests {
         fs::create_dir_all(d.path().join("Reference/Platform")).unwrap();
         fs::write(d.path().join("Reference/Platform/Save.md"), "x").unwrap();
         let pages = vec![("Current/Project.md".to_string(), "Project".to_string()), ("Design/Card.md".to_string(), String::new())];
-        let reply = "```json\n{\"update\": [\"Current/Project.md\", {\"path\": \"Design/Card.md\", \"change\": \"the label\", \"against\": \"D-003\"}, \"Current/Project.md\", \"Nope/Missing.md\"], \"create\": [{\"path\": \"Reference/Platform/Release-dates.md\", \"purpose\": \"when we ship\"}, {\"path\": \"Rules/New-rule.md\"}, {\"path\": \"Research/Ingestion/x.md\"}, {\"path\": \"Decisions/DECISIONS.md\"}, {\"path\": \"tickets/SR-9.md\"}, {\"path\": \"Reference/Platform/Save.md\"}, {\"path\": \"../escape.md\"}, {\"path\": \"Current/Index.md\"}], \"rulings\": [{\"ruling\": \"Saves are regions\", \"topic\": \"saves\", \"aliases\": \"region save, world file\"}, {\"ruling\": \"\"}]}\n```";
+        let reply = "```json\n{\"update\": [\"Current/Project.md\", {\"path\": \"Design/Card.md\", \"change\": \"the label\", \"against\": \"D-003\"}, \"Current/Project.md\", \"Nope/Missing.md\"], \"create\": [{\"path\": \"Reference/Platform/Release-dates.md\", \"purpose\": \"when we ship\"}, {\"path\": \"Rules/New-rule.md\"}, {\"path\": \"Research/Ingestion/x.md\"}, {\"path\": \"Decisions/DECISIONS.md\"}, {\"path\": \"tickets/SR-9.md\"}, {\"path\": \"Reference/Platform/Save.md\"}, {\"path\": \"../escape.md\"}, {\"path\": \"Current/Index.md\"}, {\"path\": \"Current/RAID.md\"}], \"rulings\": [{\"ruling\": \"Saves are regions\", \"topic\": \"saves\", \"aliases\": \"region save, world file\"}, {\"ruling\": \"\"}], \"risks\": [{\"title\": \"Saves may corrupt\", \"detail\": \"a crash mid-write\", \"owner\": \"Ana\"}, {\"title\": \" \"}], \"issues\": [{\"title\": \"The build is red\"}]}\n```";
         let plan = read_plan(reply, &pages, d.path());
         assert_eq!(
             plan.update,
@@ -2853,9 +2940,11 @@ mod tests {
         assert_eq!(
             plan.create.iter().map(|n| n.path.as_str()).collect::<Vec<_>>(),
             vec!["Reference/Platform/Release-dates.md", "Rules/New-rule.md"],
-            "a Rules page is planned (it is held); evidence, the log, tickets and indexes never are"
+            "a Rules page is planned (it is held); evidence, the log, the register, tickets and indexes never are"
         );
         assert_eq!(plan.rulings.len(), 1);
+        assert_eq!(plan.risks, vec![RaidItem { title: "Saves may corrupt".into(), detail: "a crash mid-write".into(), owner: "Ana".into() }]);
+        assert_eq!(plan.issues.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["The build is red"]);
         assert_eq!(plan.rulings[0].aliases, vec!["region save", "world file"], "a list written as one string");
         let retire = "{\"retire\": [{\"path\": \"Design/Card.md\", \"by\": \" Design/New.md \"}, {\"path\": \"Design/Card.md\", \"by\": \"x.md\"}, \
                       {\"path\": \"Nope/Missing.md\", \"by\": \"Design/New.md\"}, {\"path\": \"Current/Project.md\", \"by\": \"\"}]}";
@@ -2992,6 +3081,8 @@ mod tests {
          {\"path\": \"Rules/Sizes.md\", \"change\": \"a preset is effort\"}, {\"path\": \"Design/Save.md\", \"change\": \"one file\", \"against\": \"D-001\"}], \
          \"create\": [{\"path\": \"Reference/Platform/Release-dates.md\", \"purpose\": \"when we ship\"}, {\"path\": \"Rules/Ship-on-Fridays.md\", \"purpose\": \"the rule\"}], \
          \"rulings\": [{\"ruling\": \"We ship region saves before combat\", \"topic\": \"region saves\", \"why\": \"combat needs them\", \"quote\": \"regions first\", \"who\": \"Ana\", \"aliases\": [\"save regions\"]}], \
+         \"risks\": [{\"title\": \"Friday may slip\", \"detail\": \"the payment review is not booked\", \"owner\": \"Ben\"}], \
+         \"issues\": [{\"title\": \"The save bug loses worlds\"}], \
          \"renames\": [{\"old\": \"Guild\", \"new\": \"Clan\"}, {\"old\": \"\", \"new\": \"x\"}], \
          \"topics\": [{\"page\": \"note\", \"topics\": [\"Ship dates\", \"standups\"]}, {\"page\": \"Current/Project.md\", \"topics\": [\"ship dates\"]}, \
          {\"page\": \"Design/Card.md\", \"topics\": [\"cards\"]}]}"
@@ -3074,13 +3165,26 @@ mod tests {
         assert_eq!(fs::read_to_string(r.root.join("Design/Save.md")).unwrap(), SAVE, "against a ruling: held");
         assert!(!r.root.join("Rules/Ship-on-Fridays.md").exists());
 
-        // Waiting: four held edits, one ready ruling, one drafted ticket.
+        // Waiting: four held edits, one ready ruling, a risk and an issue for
+        // the register, one drafted ticket.
         let waits = waiting_from(&r);
-        assert_eq!(waits.len(), 6);
-        assert_eq!(proposal_counts(&r.db.list_open_review_items().unwrap()).get(&r.placement.note), Some(&6));
+        assert_eq!(waits.len(), 8);
+        assert_eq!(proposal_counts(&r.db.list_open_review_items().unwrap()).get(&r.placement.note), Some(&8));
         let kinds: Vec<&str> = waits.iter().map(crate::proposal::kind_of).collect();
         assert_eq!(kinds.iter().filter(|k| **k == "page").count(), 3);
         assert!(kinds.contains(&"new page") && kinds.contains(&"ruling") && kinds.contains(&"ticket"));
+        assert!(kinds.contains(&"risk") && kinds.contains(&"issue"));
+        // Added in any order, each takes the next number of its kind then,
+        // and the register is made from its template the first time.
+        let issue = waits.iter().find(|p| crate::proposal::kind_of(p) == "issue").unwrap();
+        let risk = waits.iter().find(|p| crate::proposal::kind_of(p) == "risk").unwrap();
+        assert_eq!(risk.page, crate::raid::RAID_PAGE);
+        assert!(risk.proposed.contains("## R-001 · 2026-09-24 · Friday may slip\n\nstatus: open\nowner: Ben\nsources: [[2026-09-24-standup]]\n\nthe payment review is not booked\n"), "{}", risk.proposed);
+        crate::proposal::apply(&r.root, issue).unwrap();
+        crate::proposal::apply(&r.root, risk).unwrap();
+        let register = crate::raid::parse(&fs::read_to_string(r.root.join(crate::raid::RAID_PAGE)).unwrap());
+        assert_eq!(register.iter().map(|e| (e.id.as_str(), e.title.as_str())).collect::<Vec<_>>(), vec![("I-001", "The save bug loses worlds"), ("R-001", "Friday may slip")]);
+        assert_eq!((done.risks, done.issues), (1, 1));
         let ruling = waits.iter().find(|p| p.append.is_some()).unwrap();
         assert_eq!(ruling.page, DECISIONS_LOG);
         let entry = ruling.append.as_ref().unwrap();
@@ -3124,7 +3228,7 @@ mod tests {
             "Contradictions:\n- Current/Project.md: ",
             "Open questions:\n- Which Jira",
             "Renames:\n- Guild → Clan",
-            "Waiting:\n- 1 ruling to add to the decisions log\n- tickets RD-005 drafted",
+            "Waiting:\n- 1 ruling to add to the decisions log\n- 1 risk and 1 issue to add to the RAID register\n- tickets RD-005 drafted",
         ] {
             assert!(msg.contains(part), "{part}: {msg}");
         }
@@ -3267,6 +3371,19 @@ mod tests {
             crate::git::output(root, &["log", "-1", "--format=%s"]).unwrap(),
             format!("tickets: {} from 2026-09-24-standup-notes", note_stem(&ticket.page))
         );
+
+        // So is a risk: the register, made by its first entry, and the
+        // section index it joins.
+        fs::write(root.join("Current/Index.md"), "# Current\n\n## Pages\n\n| page | holds |\n|---|---|\n").unwrap();
+        git(root, &["add", "Current/Index.md"]);
+        git(root, &["commit", "-q", "-m", "index"]);
+        let draft = crate::raid::Draft { title: "Friday may slip".into(), date: "2026-09-24".into(), note: "2026-09-24-standup-notes".into(), ..Default::default() };
+        let risk = crate::proposal::Proposal { raid: Some(draft), from: Some(p.note.clone()), ..crate::proposal::Proposal::new(crate::raid::RAID_PAGE, "", "") };
+        crate::proposal::apply(root, &risk).unwrap();
+        accepted(root, &risk).unwrap().unwrap();
+        let files = crate::git::output(root, &["show", "--name-status", "--format=%s", "HEAD"]).unwrap();
+        assert!(files.starts_with("raid: add the risk from 2026-09-24-standup-notes\n"), "{files}");
+        assert!(files.contains("A\tCurrent/RAID.md") && files.contains("M\tCurrent/Index.md") && !files.contains("Mine.md"), "{files}");
     }
 
     #[test]

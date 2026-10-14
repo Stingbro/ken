@@ -343,17 +343,19 @@ export interface IngestTakeaways {
   openQuestions: string[];
 }
 
-/** What waits from a note: a ready ruling for the decisions log, a drafted
- *  ticket, or an edit held for a person ("page" a change to one, "new page"). */
+/** What waits from a note: a ready ruling for the decisions log, a risk or
+ *  issue for the RAID register, a drafted ticket, or an edit held for a
+ *  person ("page" a change to one, "new page"). */
 export interface IngestProposal {
   id: number;
-  kind: "page" | "new page" | "ruling" | "ticket";
+  kind: "page" | "new page" | "ruling" | "risk" | "issue" | "ticket";
   title: string;
   page: string;
   body: string;
   /** The proposal (page as it is and with the change), for the diff. */
   payload: string | null;
-  /** Who made a ruling, as the note says; anyone may add it. */
+  /** Who made a ruling, or who watches a risk or issue, as the note says;
+   *  anyone may add it. */
   who: string | null;
 }
 
@@ -1585,6 +1587,9 @@ export const api = {
    *  one commit, and returns the commit when it made one. */
   confirmFinding: (id: number, projectId: string | null = null) =>
     invoke<string | null>("confirm_finding", { id, projectId }),
+  /** Raise an open question's finding as an issue in the RAID register: one
+   *  commit, and the finding is marked done. Returns the issue's id. */
+  raiseIssue: (id: number, projectId: string | null = null) => invoke<string>("raise_issue", { id, projectId }),
   /** Proposals no ingest card holds: rulings proposed in chat, edits drift held. */
   looseProposals: () => invoke<LooseProposal[]>("loose_proposals"),
   /** The repo analyses waiting in the knowledge base's Inbox. */

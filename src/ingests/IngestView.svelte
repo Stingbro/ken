@@ -8,6 +8,8 @@
   import Circle from "@lucide/svelte/icons/circle";
   import CircleX from "@lucide/svelte/icons/circle-x";
   import Gavel from "@lucide/svelte/icons/gavel";
+  import TriangleAlert from "@lucide/svelte/icons/triangle-alert";
+  import CircleAlert from "@lucide/svelte/icons/circle-alert";
   import Ticket from "@lucide/svelte/icons/ticket";
   import FilePen from "@lucide/svelte/icons/file-pen";
   // Ingest, the inbox that empties (the Wright white box, frame 8b). Four
@@ -15,9 +17,9 @@
   // a chat. Each lands in the knowledge base's Research/Ingestion/Raw/ and is
   // read at once into a dated note in Ingested/, the source moving beside it.
   // The pages the note changes are written then and there, one section each,
-  // citing the note. Three things wait on the card: a ruling as a ready entry
-  // for the decisions log, an action as a drafted ticket, and an edit held
-  // for a person. Contradictions and open questions are findings, in the
+  // citing the note. Four things wait on the card: a ruling as a ready entry
+  // for the decisions log, a risk or issue for the RAID register, an action
+  // as a drafted ticket, and an edit held for a person. Contradictions and open questions are findings, in the
   // Inbox. Each ingest is one commit in the knowledge base: git is the undo.
   import { onMount, untrack } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -354,6 +356,15 @@
     if (overview) await openIn(overview.projectId, path);
   }
 
+  /** A risk's or issue's title, from its waiting item. */
+  function raidOf(p: IngestProposal): string {
+    try {
+      return (JSON.parse(p.payload ?? "{}") as { raid?: { title?: string } }).raid?.title ?? p.title;
+    } catch {
+      return p.title;
+    }
+  }
+
   /** A ruling's words, from its waiting item. */
   function rulingOf(p: IngestProposal): string {
     try {
@@ -406,11 +417,12 @@
   const cardWriting = $derived(!!card?.writing);
   const pages = $derived(card?.pages ?? []);
   const rulings = $derived((card?.proposals ?? []).filter((p) => p.kind === "ruling"));
+  const raid = $derived((card?.proposals ?? []).filter((p) => p.kind === "risk" || p.kind === "issue"));
   const tickets = $derived((card?.proposals ?? []).filter((p) => p.kind === "ticket"));
   const held = $derived((card?.proposals ?? []).filter((p) => p.kind === "page" || p.kind === "new page"));
   const contradictions = $derived((card?.takeaways.contradictions ?? []).filter((c) => !saysNothing(c)));
   const questions = $derived((card?.takeaways.openQuestions ?? []).filter((q) => !saysNothing(q)));
-  const decisionsTotal = $derived(rulings.length + tickets.length + held.length);
+  const decisionsTotal = $derived(rulings.length + raid.length + tickets.length + held.length);
 
   function rawSub(r: IngestOverview["raw"][number]): string {
     const bits = [r.kind, r.length, r.present.length > 0 ? `${r.present.length} present` : "", rawStateLabel(r.state)];
@@ -597,6 +609,21 @@
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
                   <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the decisions log" onclick={() => apply(p)}>Add to the log</button>
+                  <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
+                  <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
+                </div>
+              </div>
+            {/each}
+            {#each raid as p (p.id)}
+              <div class="dcard">
+                <div class="dkind">
+                  {#if p.kind === "risk"}<TriangleAlert size={14} strokeWidth={1.75} aria-hidden="true" />Risk{:else}<CircleAlert size={14} strokeWidth={1.75} aria-hidden="true" />Issue{/if}{p.who ? ` · ${p.who}` : ""}
+                </div>
+                <div class="dshort">{raidOf(p)}</div>
+                <div class="ddetail">For the RAID register; adding it gives it the next number.</div>
+                {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
+                <div class="dacts">
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the RAID register" onclick={() => apply(p)}>Add to the register</button>
                   <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
                   <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
                 </div>

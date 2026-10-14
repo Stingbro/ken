@@ -3,7 +3,7 @@
   // who it is from. The list on the left, the item on the right with its
   // actions. Dealing with an item here deals with it where it came from.
   import { app } from "../lib/app.svelte";
-  import { api } from "../lib/api";
+  import { api, type IngestProposal } from "../lib/api";
   import { inbox, type InboxGroup, type InboxItem } from "../lib/inbox.svelte";
   import { conflicts } from "../lib/conflicts.svelte";
   import { chats } from "../lib/chats.svelte";
@@ -36,11 +36,13 @@
     return item.when ? timeAgo(item.when) : "";
   }
 
-  async function act(item: InboxItem, run: () => Promise<unknown>, note: string) {
+  /** Run an item's action; `note` says what it did, from its result when
+   *  it is a function. */
+  async function act<T>(item: InboxItem, run: () => Promise<T>, note: string | ((result: T) => string)) {
     busy = true;
     try {
-      await run();
-      doneNote = { ...doneNote, [item.id]: note };
+      const result = await run();
+      doneNote = { ...doneNote, [item.id]: typeof note === "function" ? note(result) : note };
       inbox.resolved(item);
       inbox.select(item.id);
     } catch (e) {
@@ -50,13 +52,27 @@
     }
   }
 
+  function applyLabel(kind: IngestProposal["kind"]): string {
+    if (kind === "page" || kind === "new page") return "Apply";
+    if (kind === "ruling") return "Add to the log";
+    if (kind === "risk" || kind === "issue") return "Add to the register";
+    return "Accept";
+  }
+
+  function appliedNote(kind: IngestProposal["kind"]): string {
+    if (kind === "ruling") return "Added. It is in the decisions log.";
+    if (kind === "risk" || kind === "issue") return "Added. It is in the RAID register with the next number.";
+    if (kind === "ticket") return "Accepted. The ticket is written.";
+    return "Applied. The page cites the note.";
+  }
+
   /** The actions an item offers: the first is primary, at most three. */
   function actions(item: InboxItem): { label: string; run: () => void; primary?: boolean }[] {
     const s = item.source;
     switch (s.type) {
       case "proposal": {
         const p = s.proposal;
-        const apply = { label: p.kind === "page" || p.kind === "new page" ? "Apply" : p.kind === "ruling" ? "Add to the log" : "Accept", primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), p.kind === "ruling" ? "Added. It is in the decisions log." : p.kind === "ticket" ? "Accepted. The ticket is written." : "Applied. The page cites the note.") };
+        const apply = { label: applyLabel(p.kind), primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), appliedNote(p.kind)) };
         const discard = { label: "Discard", run: () => void act(item, () => api.resolveReviewItem(p.id, s.projectId), "Discarded.") };
         // A ruling proposed in chat or an edit drift held comes from no note.
         if (!s.note) return [apply, discard];
@@ -71,6 +87,13 @@
         const confirms = f.kind === "supersession";
         if (confirms && f.itemId && f.projectId) {
           out.push({ label: "Confirm", primary: true, run: () => void act(item, () => api.confirmFinding(f.itemId as number, f.projectId), "Confirmed. The decisions log says so now.") });
+        }
+        // An open question left unsettled can go into the RAID register as
+        // an issue: one click, one commit, and the finding is done.
+        if (f.kind === "question" && f.itemId && f.projectId) {
+          const fid = f.itemId;
+          const pid = f.projectId;
+          out.push({ label: "Raise as an issue", primary: true, run: () => void act(item, () => api.raiseIssue(fid, pid), (id) => `Raised as ${id}. It is in the RAID register.`) });
         }
         if (f.path && f.projectId) out.push({ label: "Open the page", primary: out.length === 0, run: () => void openInRepo(f.projectId as string, f.path as string) });
         if (f.itemId && f.projectId) {
