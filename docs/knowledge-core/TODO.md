@@ -63,7 +63,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The title-query control is retired (19): `scan::control_query`, `ControlResult` and `IndexHealth.control` are gone. Slice 5 adds the new controls.
   - What only the old index did, now done by the chunk index:
     - OCR text is chunked when it lands (`mark_ocr_done`).
-    - A move (`rename_prefix`) moves the chunks, their keyword rows' path words, page facts, tiers, links and the code map.
+    - A move (`rename_prefix`) moves the chunks, their keyword rows' path words, page facts, tiers, links and the code map (the code index since slice 6).
     - A reindex drops the chunks of files that are gone (`drop_orphan_chunks`), keeping the vectors of the rest.
   - Lost: a file with no text (a cloud placeholder, a failed, binary or minified file) is no longer found by its name alone. Restored in slice 3.
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
@@ -133,6 +133,24 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
   - Not run: any test, and the app. The v24 migration refills the keyword index once on first open. The first scan after it drops indexed tests, works out every code file's role (dropping those files' vectors, so the next rebuild re-embeds all code with a role), and runs the controls by keyword. The first set-up or kind change after this makes one Claude call per source that has a knowledge base and no analysis yet.
 
+- **Slice 6: code index** (`299a665`). Decisions 26, 27.
+  - Renamed: `codemap.rs` is `codeindex.rs`; `Db::backfill_code_index`, `set_code_index`, `code_indexed_files` and `CODE_INDEX_BACKFILLED` (its stored meta key stays `code_map_backfilled`, so no index is filled twice); `src/files/CodeIndex.svelte`. Comments, MCP messages and `api.ts` say code index. The tables keep their names.
+  - Plain words reach a definition: `codeindex::joined_names` joins every run of two to four significant words in a row (stopwords dropped, at most 12 words read), plus a word that is itself a compound name (`saveWorld` as typed); `Db::definitions_by_joined_name` matches definitions whose name, ASCII lowercase without underscores, is one of them. "save world" finds `saveWorld`, `save_world` and `SaveWorld`. One plain word alone is not looked up.
+    - `routing::search_member` makes the chunk holding each such definition (at most 8, one per file, `codeindex::NAMED_MAX`) its file's keyword hit, cited at the definition's own line. "Where is get_current_user defined" leads with its definition at line 4 again (the test slice 2a removed is back in `routing.rs`).
+  - Each code hit names its symbol: `HybridHit.symbol` and `RoutedHit.symbol`, from `chunks.symbol` (`Db::chunk_line_symbol`), filled before the rerank. A definition the words named is shown under its own name when its chunk packs several. `RoutedHitDto` and `api.ts` carry it; the search overlay shows it beside the file name.
+  - The MCP result line names a code hit's symbol in backticks after its path, and a `next:` line under the snippet offers `find_usages <symbol> · file_outline <path> · related_files <path>` (`codeindex::next_calls`; files the index does not parse get none). `route_query`'s description says so.
+  - Use before grep: the four code tools' descriptions and the chat guide say to use the code index before Grep and Glob. The server `instructions` follow in slice 10.
+  - Chat card: a search's card lists its hits while folded, each place with its symbol beside it (`cardHits` in `toolCard.ts`, `ToolCard.svelte`); the engine's preview of a search result keeps the hit lines (up to 10) instead of the first eight lines. A code tool's card names the symbol it looked up (`summarize_tool` reads `name`).
+  - One git helper (`git.rs`): `command`, `output`, `run` and `global_config`, quiet and never prompting (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`), and the log reader `log` / `parse_log`. The MCP `history` tool, drift's `git()` and `fetch`, `wikinew::repo_facts` and its commit, and `day::git_me` use it. `cited_ids` and `commits_citing` list the `PREFIX-number` ids a commit range names, for slice 9.
+  - Schema v25: `code_symbols_joined`, an index on definitions by their joined name. Nothing is read again.
+  - Choices:
+    - The symbol's words count as name words in the rerank, like the path's (the names field holds both). That is the base score of decision 24, not a symbol nudge: there is no flat bonus for a definition.
+    - Runs of words anywhere in the question, not only a whole question of two to four words, so "how do we save world" still joins `save world`.
+    - `cited_ids` returns candidates by shape; slice 9 keeps the ids the knowledge base has as tickets or rulings (so `UTF-8` drops out there).
+    - `sync.rs` and `setup.rs` keep their own git calls: the sync engine is not history or drift, and slice 11 reworks setup.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
+  - Not run: any test, and the app. The v25 migration builds one index on `code_symbols` on first open.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
@@ -140,30 +158,30 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 - **The title weight in plain-word questions.** The breadcrumb field counts 2.5 times the body in the any-word fallback too, where names were cut to a quarter because one common word in a name outranked the body. If a common heading word ("Overview", "Notes") starts winning plain questions, lower `W_TITLE` there; it needs a measurement first (decision 38 left measurement to be designed).
 - **Confirming what the repo analysis proposes.** Role rules and controls are written into `.ken/knowledge.json` as soon as Claude proposes them, applied on the next scan, and a person edits them there (the settings screen is slice 12). Choose: keep that, or hold them as a proposal card in the Inbox until a person accepts them.
 
-## Next: slice 6, code index (26, 27)
+- **How much a symbol counts in the rerank.** Slice 6 counts a code chunk's symbol words like path words (1.0 each, beside 0.5 for the text and 3.0 for the file name), which brings a named definition above a note that only says the words. If definitions still lose to pages that merely mention them, they could count like the file name instead; that wants the measurement decision 38 left open.
+
+## Next: slice 7, ingest rework (9–14)
 
 Nothing has been edited yet.
 
-- [ ] Rename "code map" to "code index" (26): the module `codemap.rs` (to `codeindex.rs`, with its uses in `chunker.rs`, `db.rs`, `engine.rs`, `scan.rs`, `summary.rs`, `src-tauri/src/lib.rs`), `Db::backfill_code_map` and `CODE_MAP_BACKFILLED` (keep the stored meta key so an index is not filled twice), the comments, `api.ts` and `src/files/CodeMap.svelte` (and `EditorPane.svelte`'s use of it). The tables (`code_symbols` …) keep their names.
-- [ ] Each code hit names its symbol and role and offers the next calls (26): the hit already carries its role in its label; add the chunk's `symbol` to `HybridHit` / `RoutedHit` (from `chunks.symbol`, read with the line) and to `RoutedHitDto` and `api.ts`. The MCP result line says `symbol` and, for a code hit, the next calls by name (`find_usages <symbol>`, `file_outline <path>`, `related_files <path>`; slice 10 renames them `code_usages`, `code_outline`, `code_imports`).
-- [ ] Ken's chat card shows the symbol (26): where the chat shows a search hit or citation (`src/chat/ToolCard.svelte`, `toolCard.ts`), show the symbol beside the path.
-- [ ] Plain words match symbol names for code questions (26): "save world" finds `saveWorld`, `save_world`, `SaveWorld`. In `routing::search_member`, a query of two to four words is also looked up as one joined name in the code index's definitions (`Db::code_symbols` by a case- and separator-insensitive name), and the chunks holding those definitions join the keyword hits. A test in `routing.rs`.
-- [ ] "Use before grep" (26): the MCP tool descriptions of `find_definition`, `find_usages`, `file_outline` and `related_files`, and the code part of the chat guide (`chat.rs`), say to use the code index before Grep and Glob; the server `instructions` follow in slice 10.
-- [ ] One git helper shared by history and drift (27): a `git.rs` module in ken-core with the quiet, no-prompt runner (`proc::quiet`, `GIT_TERMINAL_PROMPT=0`) and the log reader the MCP `history` tool uses (`crates/ken-mcp/src/main.rs`, the `git log` runs around `history`); `drift.rs`'s `git()` and its other `Command::new("git")` calls, `wikinew::repo_facts` and `day.rs`'s git call use it. Commits citing tickets or rulings as graph edges wait for slice 9 (decision 21's graph); leave a function that lists a commit range's cited ids for it.
-- [ ] Tests to update or add: the renamed module's tests, the symbol on a routed hit, the joined-name lookup through `routing`, the git helper (a temp repo, as `drift.rs`'s tests do).
+- [ ] Context from the real ranker (9): `ingest::wiki_context` builds its query from the source's ten most repeated long words. Search instead with the source's title and key terms (its first heading or file name, and the words `significant_tokens` keeps) through `routing::search_member_with` and the workspace vocabulary, across the knowledge base's pages, decisions log and tickets, with each hit's label. Keep it out of `Research/Ingestion` and `Templates/`.
+- [ ] Contradictions (10): the note's Contradictions and the plan step check the source against the wiki, `Decisions/DECISIONS.md`, `tickets/` and the code (search, plus `codeindex::definitions_named` for names the source mentions). Each contradiction becomes a tracked finding: a review item of kind `finding` (the one findings list decision 29 and slice 8 share), naming the source note, the page, ruling, ticket or file it contradicts, and the quote. A contradiction with a ruling or the code is always held for a person.
+- [ ] Page edits (11): plan, then edit, then apply or hold.
+  - Edits are section replacements: `edit_prompt` asks for the changed section (heading to the next heading of its level), and the apply step replaces that section only.
+  - Held for a person: more than a fifth of the page (`rewrites_a_fifth`), a page changed during the run (`staging`), a Rules page (`is_method_page`), and anything contradicting a ruling or the code.
+  - New pages from their section's blank in `Templates/`, added to the section index with one line and to `log.md` in the same change. The new-page prompt lives in `ingest.rs`.
+  - Cap: about 10 updates and 10 new pages per source (`MAX_PAGES` is 5 today, for both).
+- [ ] Git is the undo (12): one commit per ingest in the knowledge base (the note and every page it changed, never `git add -A`; through `git::run`), the message naming the note and the body listing pages changed, held edits, contradictions and open questions. Ken never pushes. Remove the per-write undo records: `Written`/`WriteKind` undo data, `undo_write`, `undo_write_at`, `undo_all`, `undo`, `UndoReport`, the `ingest_undo` and `ingest_undo_write` commands, their `api.ts` wrappers and the card's undo buttons. The card shows takeaways, contradictions, open questions and held edits with Apply or Discard.
+- [ ] Claim a source when its note is written (12): the raw file moves beside its note (`Research/Ingestion/Ingested/…`) as the note is written, not when the card is filed (`ingest::file`), so a second machine never ingests it.
+- [ ] One ruling entry format (13): `## D-nnn · date · topic`, the bold ruling, the quote, Why, sources, aliases, supersedes. `decisions_entry` writes it (topic, why and aliases filled properly, `decider` optional free text), the template's `Decisions/DECISIONS.md` shows it, and every parser reads it (`chunker::chunk_entry`, `drift::parse_rulings`, `supersede`, `vocab`'s aliases). Older entries (`**D-007** · date · topic — …`) still read. A ruling found in a note waits as a ready entry; one click adds it, no decider check. Drop the hand-kept Topic Index, Conflicts and Open Questions sections from the template. Rulings proposed from chat wait for slice 10's `propose_decision`.
+- [ ] Note headings and where they go (14): `Templates/Ingested-note.md` and the prompt use Summary, Key Takeaways, What It Overturns, Contradictions, What Was Said, Rulings, Actions, Open Questions (today: "Rulings Said in the Room", "Actions and Requests", "Escalations", "Next Steps"; older headings still read). Rulings → ready entries (13); Actions → proposed tickets, confirmed; Open Questions and Contradictions → findings; Overturns → page edits.
+- [ ] Cut (14): idea files (`ideas_of`, `idea_text`), escalation files (`escalations_of`, `escalation_text`), Your day tasks from ingest (`next_steps_of`, `NextStep`, the `day::create_task` call in `follow_ups`), method-change tickets (`method_ticket_text`), "me" matching (`is_me`, `Targets.me`), with their tests, card entries, `api.ts` types and UI.
+- [ ] The note's `kind:` frontmatter (not one of decision 5's keys): the kind folder (`Ingested/Meetings|Documents|…`) says it; `kind_of` reads the folder, then `Present:`, and the prompt stops writing `kind:`.
+- [ ] Each ingest adds one line to `log.md` (`## [YYYY-MM-DD] ingest | title`, decision 2) in its commit, and every new page to its section index.
+- [ ] Tests to update or add: the ranker context, a contradiction finding, a section replacement and each hold rule, the commit (a temp repo), the claim on write, the entry format written and read, the headings, and that cut follow-ups are gone.
 
 ## Later slices
 
-- [ ] **7, ingest rework (9–14):**
-  - Context from the real ranker.
-  - Contradiction checks against the wiki, the log, the tickets and the code, each a finding.
-  - Section-replacement edits with the hold rules.
-  - One commit per ingest.
-  - Claim a source when its note is written.
-  - One ruling entry format.
-  - The note headings and where each goes.
-  - Cut: idea files, escalation files, Your day tasks, method-change tickets, "me" matching.
-  - A note's `kind:` frontmatter (set by the ingest prompt, read by `kind_of` and the card) is not one of decision 5's keys: fold it into the kind folder or the body.
 - [ ] **8, drift, lint and supersession (25, 28–30):**
   - Drift runs on each default-branch move, plus a weekly age rule.
   - It stamps `checked`, or re-reads and fixes. A ruling becomes a finding.
