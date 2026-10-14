@@ -13,7 +13,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - `hooks.rs`: an unreachable pattern.
   - `ocr`: an unused attribute.
   - `src-tauri/src/lib.rs`: an unused `profile` field.
-  - `svelte-check`: 8 warnings.
+  - `svelte-check`: 6 warnings (since slice 9; the old Timeline screen's two unused-style warnings went with it).
 - **A fresh checkout:** run `scripts\win-build.cmd sidecar` once before the Rust check, or the app's build script stops on the missing `ken-mcp` binary.
 - **Tests:** don't run test binaries or anything that spawns shells without asking first. Endpoint security on the dev machine flags it.
 
@@ -207,6 +207,28 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 8 warnings (the known ones).
   - Not run: any test, and the app. Nothing migrates. The first scan of a knowledge base after this files the scan lint's findings and stores its markers; the worker's first turn makes a drift run when one is due (a cited branch moved since the last sweep, or a week since it) and starts the supersession pass over the whole decisions log, one cluster per turn.
 
+- **Slice 9: project graph and Timeline** (`373cead`). Decisions 21, 37.
+  - One graph per knowledge base, from exact sources only (`graph.rs`). Nodes are written `kind:id`: a page, note or ticket by its path in the knowledge base, a ruling by id (`decision:D-012`), a code file or symbol by repo and path (`code:game:src/save.rs`, `symbol:game:src/save.rs#save`), a topic, a repo, and a commit that cites something (`commit:game@1a2b3c4`). Edges live in the knowledge base's own index (`graph_edges`, schema v26), each with what made it (`origin`):
+    - the scan (`graph::on_scan`, from `scan::after_scan` in a knowledge base, no model, made again every scan): page links (only when one Markdown page answers), `sources:` citations (`drift::classify`: a code file, a `[[note]]` one page answers, a ruling), each ruling's `in` edge to its log and its `sources:` line, the supersessions the log marks (`supersedes`, `refines`), and note to page `changed` from the ingest cards;
+    - code citations: `lint::rulings_in_code` reads the other repos' comments once after each drift run; the ids the log has become `code-cites` edges (`store_code_citations`), the rest stay `unknown-ruling` findings (`unknown_of`);
+    - commits: `graph::read_commits` reads each workspace repo (the knowledge base too) from the head it read last time (`check_state` `graph_commits:<repo>`; the newest 500 the first time, `FIRST_COMMITS`), in every checks turn, one git call for a repo whose head has not moved. Only ids the knowledge base has (`known_ids`: tickets by id or file name, log entries) become `commit` edges, so `UTF-8` drops out. `git::commits_citing` takes a limit and returns `git::Citing` (sha, date, subject, ids);
+    - imports and usages: read live from each repo's code index when `related` is asked (`codeindex::related`, `codeindex::usages`), never copied.
+  - Topic tags at write time only: `finish_ingest` queues the pages it wrote and the note, a drift run its fixed pages (`graph::queue_topics`). The checks turn then makes one Claude call for up to 12 of them (`topics_next`, `topics_done`) through `background_claude`: the CLI with no tools, the shared pace, the hourly cap, `backgroundExtraction`. At most 5 topics a page, lowercase, the topics in use offered first. Stored as `topic` edges, never in frontmatter; a move carries them (`Db::rename_prefix`), a scan drops those of pages no longer on disk, a reindex keeps them.
+  - Exposed as `related`: `graph::related(kb, code, node, limit)` gives neighbours by edge kind (`EDGE_ORDER`: supersedes, refines, cites, changed, code-cites, link, commit, imports, uses, in, topic), one hop then two through stored edges, each node once at its nearest.
+    - App: `graph_related(path, projectId)` (`api.graphRelated`) feeds a Related row under a page in Files (`PageLinks.svelte`), plain links left out since they show above; a neighbour that is a file opens in its repo.
+    - MCP: `related_files` answers from it, for a file of any repo or a ruling or ticket id, with ken:// addresses; the chat guide says so. `kg_search` is gone, from the server, the allowed list and the guide.
+  - Removed (21): the background local-model extraction (the `extractions` queue and its `Db` calls, the worker's local path, `profile_prompt_addendum`, the open-time extraction backfill), the Claude map build (`knowledge_model.rs`, `refresh_knowledge_model`, `start_knowledge_build`, `map_by_claude`, `AutoBuildTracker` and its signals), the federation (`federation.rs`, `workspace_kg_db.rs`, the `workspace_kg_*` commands and state, `federated_kg_enabled`), and person-centred entities (the `entities`, `entity_edges` and `events` tables and read models). v26 drops the tables and the build stamp. `content_hash` moved to `db`, `normalize_name` to `routing`. The worker is `background_worker`: summaries and checks only. The `backgroundExtraction` flag's text now says what it governs.
+  - The Map and Explore are gone (37): `MapScreen`, `ExploreScreen`, `EntityWikiPanel`, `knowledge.svelte.ts`, `knowledge.ts`, `workspaceKg.svelte.ts`, their api wrappers and events, Your day's map-build listener. `features::BUILT_IN` keeps the name `federatedKg` so an old value is still ignored.
+  - The Timeline is the raid log (37): `raidlog::raid_log` lists `log.md` runs (ingest, drift, lint), rulings (dated log entries, the bold ruling), ticket changes (`updated`, else the file's date, with status), the knowledge base's commits and the other repos' commits that cite its ids (from the graph, one entry a commit), findings filed and resolved (timed), and every repo's tags as releases (`git::tags`), newest first, each with its file and line, or its repo and sha or tag. The `raid_log` command reads the workspace's knowledge base (else the focused repo); `TimelineScreen` is its own sidebar screen with kind chips, search and day groups (`timeline.ts`).
+  - Choices:
+    - The graph lives in the knowledge base's index, not a new store; the edges a code repo's index already holds (imports, usages) are read live rather than copied.
+    - Topic tags are their own background call after the write, queued like the lint after an edit, rather than a field in the ingest and re-read prompts (see Open for Chris).
+    - A commit is linked only to ids the knowledge base has when it is read; a ticket made later does not reach back (see Open for Chris).
+    - The raid log's commits are the knowledge base's own and the other repos' commits that cite a ticket or ruling, not every commit of every repo.
+    - `related` goes two hops through stored edges only; the code index is asked for the node itself.
+  - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 6 warnings (the two the old Timeline screen had are gone with it).
+  - Not run: any test, and the app. The v26 migration drops the old model's tables on first open. The first scan of a knowledge base makes its edges; the first checks turn reads up to 500 commits per repo (one `git log` each), and the topic queue starts with the next ingest or drift fix.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
@@ -230,38 +252,41 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 
 - **The `base` a repo entry names.** `.ken/knowledge.json` says `base` is the branch drift measures against, but drift measures against the remote's default branch (or the checkout's upstream, said so), as before. Choose: read `base` when set, or drop it from the template.
 
-## Next: slice 9, project graph and Timeline (21, 37)
+- **Topic tags: a call of their own.** Tags are asked for in a separate background call after an ingest or drift writes (up to 12 pages a call, sharing the 20-an-hour cap). Choose: keep, or ask for them inside the ingest plan and the drift re-read so they cost no extra call.
+
+- **Commits that cite something made later.** A commit is read once, and linked only to tickets and rulings the knowledge base has then; a ticket filed after the commit that names it is not linked. Choose: keep, or re-read a repo's history when a ticket or ruling is added.
+
+- **The `entities` index state.** With the local reader gone, "read in full" (`entities`) indexes exactly like `search`; set-up and the Team screen still offer both. Slice 11 makes indexing two-state (decision 34); until then the choice does nothing.
+
+- **Where the memory and task tools go (slice 10).** Decision 22 takes them off the knowledge server, and decision 37 keeps Your day, tasks and memory. The plan below serves them as a second tool set from the same binary that only Ken's own chat registers. Choose: that, or leave them app-only (no MCP tools) so outside Claude sessions never see them.
+
+## Next: slice 10, MCP tools (22, with 1)
 
 Nothing has been edited yet.
 
-- [ ] One graph per knowledge base, from exact sources only (21). Nodes: pages, decisions-log entries, tickets, notes, repos, code files and symbols, topics. Edges, each with its kind:
-  - page links (`page_links`, resolved by `links::Resolver`);
-  - `sources:` citations (`page_meta.sources`, `drift::classify`: a code file, a `[[Note]]`, a `D-nnn`);
-  - note → page changed (an ingest card's `pages`, and the `Changed from [[note]]` lines it writes);
-  - supersedes (`supersessions`, the markers stored on every scan since slice 8);
-  - imports and usages (`codeindex::related`, the code index's usages);
-  - code comments citing a ruling (`lint::code_citations`, kept as edges for the ids the log has);
-  - commits citing tickets or rulings (`git::commits_citing`, kept to ids the knowledge base has as a ticket or a log entry, so `UTF-8` drops out).
-  Built from the index on a scan, no model. Where it lives (the knowledge base's index or a new table set) is the slice's first choice.
-- [ ] Topic tags at write time only (21): ingest's plan and page prompts, and drift's re-read, ask Claude for a few topics for what they write; stored beside the graph, not in frontmatter (decision 5 has six keys). No other topic extraction.
-- [ ] Remove what decision 21 drops: the background local-model extraction (the `extractions` queue, `knowledge_model::process_next_pending_for`, the local path of `extraction_worker`, `LOCAL_GENERATION`'s per-file use), the Claude map build (`map_by_claude`, `start_knowledge_build`, `refresh_knowledge_model`, `AutoBuildTracker`), the federation (`federation.rs`, `workspace_kg_db.rs`, the `workspace_kg_*` commands, `federated_kg_enabled`), and person-centred entities (`entities`, `entity_edges`, `events` read models), with their tests, `api.ts` wrappers and stores (`knowledge.svelte.ts`). Keep the worker's summaries and checks turns.
-- [ ] Expose it as `related` (21): `graph::related(node)` returns neighbours by edge kind, nearest first. An app command for the chat card and Files; the MCP `related_files` answers from it (slice 10 renames the tools); `kg_search` goes with the entity model.
-- [ ] Remove the Map and Explore (37): `MapScreen.svelte`, `ExploreScreen.svelte`, `EntityWikiPanel.svelte`, their Shell entries and routes, `knowledge_model` and its DTO.
-- [ ] The Timeline becomes the raid log (37): one chronological, timestamped list of every ingest (`log.md` lines), ruling (decisions-log entries), ticket change (ticket `updated` and status), commit (the knowledge base's git log), finding (filed and resolved) and release (tags), each linked to its source. `TimelineScreen.svelte` reads it in place of the `events` model.
-- [ ] Tests to update or add: each edge kind from a small knowledge base and code repo, commit edges kept to known ids, `related` ordering, topic tags stored from a write, the raid log's order and links, and nothing left reading the removed tables.
+- [ ] The knowledge server's tools are the twelve of decision 22, renamed and merged in `crates/ken-mcp/src/main.rs` (definitions, dispatch, the `tools_list` tests there and in `tests/stdio.rs`):
+  - `search` replaces `route_query` and `semantic_search`: one tool on `routing`, every source merged once, `project` narrowing it, `type` filtering, the label and `next:` line on each hit.
+  - `read` replaces `read_document`, and lists a folder when given one (`list_documents` folds in).
+  - `related` is `related_files` (slice 9's graph), same arguments.
+  - `code_definition`, `code_usages`, `code_outline` are `find_definition`, `find_usages`, `file_outline`; `code_imports` is new: a code file's imports, importers and libraries (`codeindex::related`, what `related_files` said before slice 9).
+  - `history` stays.
+  - `tickets` replaces `ticket_list` (read only).
+  - `propose_decision` is new: a ruling from chat as a ready entry in the Inbox (decision 13, `ingest::RulingEntry` and `decisions_entry`), never written to the log directly.
+  - `add_source` is new: a file or a pasted text put in the knowledge base's `Research/Ingestion/Raw/` for the next ingest pass, never ingested inline.
+  - `repos` replaces `list_projects`, with the one health line.
+- [ ] Server `instructions` from the brief (decision 1): the short form of the wiki `CLAUDE.md` in the `initialize` result: where the knowledge base is, the sections and tiers, "the code is the truth, the library complements it", use the code index before Grep, cite ken:// addresses.
+- [ ] Memory, task and family tools leave the knowledge server: `memory_write`, `journal_append`, `task_create`, `task_update`, `task_list` (and `open_in_ken`, which only Ken's chat can use) move to a second tool set Ken's own chat registers (say `ken-mcp --personal`), so Your day, tasks and memory keep working in chat (decision 37).
+- [ ] Callers follow the names: the chat guide and `KEN_MCP_ALLOWED` (`chat.rs`), `codeindex::next_calls` (`code_usages <symbol> · code_outline <path> · code_imports <path>`), the chat card's tool summaries (`summarize_tool`, `toolCard.ts`), the MCP set-up text in `src-tauri` (`mcp_info`), and the tool descriptions saying to use the code index before Grep.
+- [ ] Tests to update or add: the tool list, each renamed tool's reply, `search` over two projects and one, `read` of a folder, `code_imports`, `propose_decision` filing a ready entry, `add_source` landing in Raw, the `instructions` text, and the personal tool set.
 
 ## Later slices
 
-- [ ] **10, MCP tools (22):**
-  - The tools: `search`, `read`, `related`, `code_definition`, `code_usages`, `code_outline`, `code_imports`, `history`, `tickets`, `propose_decision`, `add_source`, `repos`.
-  - Server `instructions` from the brief (1).
-  - Memory, task and family tools move off the knowledge server.
 - [ ] **11, setup and building (32–34):**
   - The three-step setup.
   - The Files tab splits into Wiki and Sources.
   - The build queue with two passes.
   - Map an existing wiki after a dry run.
-  - Index rules in one place.
+  - Index rules in one place; the `entities` index state goes (see Open for Chris).
   - One throttle and one status panel.
   - Don't carry over `wikidraft.rs`, `wikiverify.rs` or `checkout.rs`.
 - [ ] **12, Wright leftovers (35–38):**
