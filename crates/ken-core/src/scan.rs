@@ -1558,9 +1558,10 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
         assert_eq!(db.index_health().unwrap().capped, 1);
-        // What is embedded starts with the path, the symbol and the role.
+        // What is embedded starts with the path, the symbols and the role.
+        // Two small neighbours share a chunk, which names them both.
         let (_, embed) = db.chunks_missing_vectors("store.py").unwrap().remove(0);
-        assert!(embed.starts_with("store.py › open_store (store)"), "the chunk names what it holds: {embed}");
+        assert!(embed.starts_with("store.py › open_store, Ledger (store)"), "the chunk names what it holds: {embed}");
     }
 
     #[test]
