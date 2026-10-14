@@ -58,7 +58,7 @@ On top of that base:
    - Rules: binding, incl. team conventions, never restated from lint config.
    - Decisions: `Decisions/DECISIONS.md`.
    - Design.
-   - Current: Project, Roadmap, Feature Status.
+   - Current: Project, Roadmap, Feature Status, and `RAID.md`, the risks and issues (decision 37).
    - Reference: Vocabulary, how-tos, where things live, plus `Platform/` with one page per upstream dependency (pin, quirks, where its source lives).
    - Research: dated findings, plus `Ingestion/Raw` and `Ingested`.
    - Templates.
@@ -119,7 +119,8 @@ On top of that base:
     - **Where each goes:**
       - Rulings → the log, confirmed (13);
       - Actions → proposed tickets, confirmed;
-      - Open Questions and Contradictions → findings;
+      - Risks and issues the plan finds → proposed entries for `Current/RAID.md`, confirmed (37);
+      - Open Questions and Contradictions → findings; an open question left unsettled can be raised as an issue;
       - Overturns → page edits.
     - **Cut:** idea files, escalation files, Your day tasks from ingest, method-change tickets, "me" matching.
 
@@ -245,7 +246,11 @@ On top of that base:
     - **Families and the team bus go.**
     - **The Team screen** becomes the workspace settings screen (sources, kinds, index rules, tiers, roles, controls, health).
     - **Memory stays,** personal and local, never pushed.
-    - **Explore and the Map go.** The Timeline becomes the project's raid log: a chronological, timestamped log of every ingest, ruling, ticket change, commit, finding and release, each linked to its source.
+    - **Explore and the Map go.** The Timeline becomes the Log: the project's RAID register (risks, actions, issues, decisions) and milestones, not a feed of every update (Chris, 2026-10-14).
+      - Risks and issues live in `Current/RAID.md`, one entry each (`## R-001 · date · title`, then `status:`, `owner:`, `sources:`); ingest proposes them, and an open question can be raised as an issue.
+      - Actions are the open tickets with an assignee; decisions are the decisions log's rulings, a superseded or refined one folded; milestones are the tickets marked `type: milestone`, the roadmap's rows and releases (tags).
+      - Each entry shows its status, owner and date and opens its source; closed items fold away.
+      - Ingests, drift, lint, findings, page changes, sync and commits are not on it; `log.md` keeps its line per run (decision 2).
 38. **Evaluation:** every eval set up on `knowledge-layer` is dropped (`eval_run`, the probes and benches, the `KEN_EVAL_*` hooks). Measurement is to be designed properly later. The controls in decision 19 remain the health check.
 
 ## Still open
