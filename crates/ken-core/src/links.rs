@@ -394,8 +394,9 @@ mod tests {
 
     /// End to end over a scanned library: the report counts both kinds,
     /// ranks the missing name asked for most, groups the broken path by
-    /// section, and gives page neighbours both ways. The lint files it as
-    /// findings (`lint::scan_findings`).
+    /// section (the legacy `Ways-of-Working/` reads as Rules), and gives
+    /// page neighbours both ways. The lint files it as findings
+    /// (`lint::scan_findings`).
     #[test]
     fn a_scanned_library_reports_its_links() {
         use crate::project::Project;
@@ -419,7 +420,7 @@ mod tests {
         assert_eq!(r.missing_names[0], ("Ghost".to_string(), vec!["Current/Team.md".to_string(), "Ways-of-Working/Rules.md".to_string()]));
         assert_eq!(r.missing_names[1].0, "Phantom");
         assert_eq!(
-            r.broken_paths.get("Ways-of-Working"),
+            r.broken_paths.get("Rules"),
             Some(&vec![("Ways-of-Working/Rules.md".to_string(), "Platform/Map.md".to_string())])
         );
         assert!(r.duplicate_names.is_empty());

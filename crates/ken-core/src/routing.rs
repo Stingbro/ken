@@ -1008,7 +1008,7 @@ mod tests {
         let hits = search_member(&db, "shard loads", None, 10).unwrap();
         let world = hits.iter().find(|h| h.path == "Platform/World.md").expect("found via region");
         assert_eq!(world.line, Some(1), "one chunk, from its heading");
-        assert_eq!(world.page.as_ref().and_then(|p| p.section), Some("Platform"));
+        assert_eq!(world.page.as_ref().and_then(|p| p.section), Some("Reference"), "Platform/ is in Reference");
     }
 
     /// Keyword search over chunks needs no model: a plain scan writes them,
