@@ -15,6 +15,10 @@ use crate::{Error, Result};
 /// Review kind of a proposed change to one page.
 pub const PROPOSAL_KIND: &str = "page-proposal";
 
+/// `Proposal::from` of a ruling a chat proposed through the MCP
+/// `propose_decision` (knowledge-core decision 13): no note holds it.
+pub const FROM_CHAT: &str = "chat";
+
 /// A change to one page, held until a person applies it. `base` is the page
 /// as Ken read it; the change applies only while the page still reads so.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

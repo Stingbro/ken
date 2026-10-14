@@ -655,7 +655,7 @@ fn sort(list: &mut [Neighbour]) {
 }
 
 /// A neighbour in a line: what joins them, the node, and the detail, as the
-/// MCP `related_files` tool and the app say it (`cites code:game:src/save.rs`,
+/// MCP `related` tool and the app say it (`cites code:game:src/save.rs`,
 /// `← changed note:…/2026-10-01-standup.md (the save rules)`).
 pub fn line_of(n: &Neighbour) -> String {
     let arrow = if n.outgoing { "" } else { "← " };

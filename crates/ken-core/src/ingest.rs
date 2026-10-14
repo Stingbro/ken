@@ -908,6 +908,38 @@ pub fn run_pass(
 // --- Sources Ken writes into the inbox itself: a note written on the
 // Ingest screen, and a chat sent to it. -----------------------------------
 
+/// Where a file named `name` goes in a library's Raw/: its own name, or with
+/// a number when that is taken. The folder is made if missing. The app's
+/// drops and the MCP `add_source` both land here.
+pub fn raw_target(root: &Path, name: &str) -> Result<std::path::PathBuf> {
+    let raw_dir = root.join(RAW);
+    fs::create_dir_all(&raw_dir).map_err(|e| Error::io(&raw_dir, e))?;
+    // A dropped name is only a name: no folders, nothing above Raw.
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(Error::Other("a file with no name".into()));
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    // Raw's own README and Index are not sources, so a source by that name
+    // gets another.
+    let (name, stem) = if name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("index.md") {
+        let s = format!("{stem} (source)");
+        (format!("{s}{ext}"), s)
+    } else {
+        (name.to_string(), stem)
+    };
+    let mut target = raw_dir.join(&name);
+    let mut n = 2;
+    while target.exists() {
+        target = raw_dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    Ok(target)
+}
+
 /// A name made safe for a file: no path separators or characters Windows
 /// refuses, trimmed, at most 80 characters.
 pub fn file_safe(name: &str) -> String {
@@ -1665,11 +1697,18 @@ pub fn decisions_entry(log: &str, e: &crate::proposal::RulingEntry) -> String {
         (q, None) => out.push_str(&format!("\n> \"{}\"\n", q.trim_matches('"'))),
         (q, Some(w)) => out.push_str(&format!("\n> \"{}\" ({w})\n", q.trim_matches('"'))),
     }
-    let why = match e.why.trim() {
-        "" => format!("as said in [[{}]].", e.note),
-        w => w.to_string(),
+    // A ruling proposed in chat may come from no note: then it has no
+    // sources line, and its Why says where it was proposed.
+    let note = e.note.trim();
+    let why = match (e.why.trim(), note) {
+        ("", "") => "proposed in a chat with Ken.".to_string(),
+        ("", n) => format!("as said in [[{n}]]."),
+        (w, _) => w.to_string(),
     };
-    out.push_str(&format!("\nWhy: {why}\nsources: [[{}]]\n", e.note));
+    out.push_str(&format!("\nWhy: {why}\n"));
+    if !note.is_empty() {
+        out.push_str(&format!("sources: [[{note}]]\n"));
+    }
     let aliases: Vec<&str> = e.aliases.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
     if !aliases.is_empty() {
         out.push_str(&format!("aliases: {}\n", aliases.join(", ")));
@@ -2286,6 +2325,8 @@ pub fn accepted(root: &Path, p: &crate::proposal::Proposal) -> std::result::Resu
     let message = match (kind, &p.append) {
         // An edit a drift run held (decision 28).
         _ if from == crate::drift::HELD_FROM => format!("drift: apply the held edit to {}", p.page),
+        // A ruling a chat proposed (MCP `propose_decision`, decision 13).
+        ("ruling", Some(r)) if from == crate::proposal::FROM_CHAT => format!("decisions: add the ruling proposed in chat\n\n{}", r.ruling),
         ("ruling", Some(r)) => format!("decisions: add the ruling from {from}\n\n{}", r.ruling),
         ("ticket", _) => format!("tickets: {} from {from}", note_stem(&p.page)),
         ("new page", _) => format!("ingest: add {} from {from}", p.page),
@@ -2587,6 +2628,12 @@ mod tests {
         let next = decisions_entry(old, &bare);
         assert!(next.contains("\n\n## D-411 · 2026-10-08 · anchors stay tool-written\n\n**Anchors stay tool-written.**\n\nWhy: as said in [[n]].\nsources: [[n]]\n"), "{next}");
         assert!(!next.contains("aliases:") && !next.contains("supersedes:") && !next.contains("> "));
+
+        // A ruling proposed in chat from no note: no sources line.
+        let chat = crate::proposal::RulingEntry { ruling: "Saves are regions".into(), date: "2026-10-13".into(), ..Default::default() };
+        let out = decisions_entry("# Decisions\n", &chat);
+        assert!(out.ends_with("**Saves are regions.**\n\nWhy: proposed in a chat with Ken.\n"), "{out}");
+        assert!(!out.contains("sources:"), "{out}");
     }
 
     #[test]
@@ -3136,5 +3183,16 @@ mod tests {
         let t = ticket_text("SRX-013", "Fix the save bug.", Some("Ben"), "n", "2026-09-24");
         assert!(t.contains("\n## What and Why\n\nFix the save bug. Asked for in [[n]].") && t.contains("updated: 2026-09-24\n"), "{t}");
         assert!(!t.contains("size:") && !t.contains("scope:") && !t.contains("verify:"), "Wright's keys are gone: {t}");
+    }
+
+    #[test]
+    fn a_source_lands_in_raw_under_a_free_name() {
+        let d = tempfile::tempdir().unwrap();
+        let first = raw_target(d.path(), "notes.txt").unwrap();
+        assert_eq!(first, d.path().join(RAW).join("notes.txt"), "Raw is made when missing");
+        fs::write(&first, "x").unwrap();
+        assert_eq!(raw_target(d.path(), "../../notes.txt").unwrap(), d.path().join(RAW).join("notes (2).txt"), "a name only, numbered");
+        assert_eq!(raw_target(d.path(), "README.md").unwrap(), d.path().join(RAW).join("README (source).md"));
+        assert!(raw_target(d.path(), "..").is_err());
     }
 }

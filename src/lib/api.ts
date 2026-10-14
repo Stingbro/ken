@@ -1608,7 +1608,7 @@ export const api = {
 
   onIndexUpdated: (fn: (stats: ScanStats) => void): Promise<UnlistenFn> =>
     listen<ScanStats>("index-updated", (e) => fn(e.payload)),
-  /** Claude, asked by the person, opens a file in Ken (ken-mcp open_in_ken). */
+  /** Claude, asked by the person, opens a file in Ken (`open_in_ken`, in the personal tool set `ken-mcp --personal`). */
   onKenOpen: (
     fn: (req: { projectId: string | null; path: string; line: number | null; anchor: string | null }) => void,
   ): Promise<UnlistenFn> =>

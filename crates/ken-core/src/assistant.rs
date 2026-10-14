@@ -328,10 +328,13 @@ pub fn chat_oneshot_traced(
 /// tools it may use without asking, and with `look` the read-only file tools
 /// over `dirs`.
 fn chat_args(project_root: &Path, dirs: &[std::path::PathBuf], mcp_config: &Path, look: bool) -> Vec<String> {
-    let mut allowed: Vec<String> = crate::chat::KEN_MCP_ALLOWED
+    use crate::chat::{KEN_MCP_ALLOWED, KEN_PERSONAL_ALLOWED, KEN_SERVER, PERSONAL_SERVER};
+    // The knowledge server's tools, and the personal set's (but opening a
+    // file, which needs the app) when the config registers it.
+    let mut allowed: Vec<String> = KEN_MCP_ALLOWED
         .iter()
-        .filter(|t| **t != "open_in_ken")
-        .map(|t| format!("mcp__ken__{t}"))
+        .map(|t| format!("mcp__{KEN_SERVER}__{t}"))
+        .chain(KEN_PERSONAL_ALLOWED.iter().filter(|t| **t != "open_in_ken").map(|t| format!("mcp__{PERSONAL_SERVER}__{t}")))
         .collect();
     if look {
         allowed.push(LOOK_TOOLS.to_string());
@@ -662,7 +665,7 @@ mod tests {
     const CLI_STREAM: &str = concat!(
         r#"{"type":"system","subtype":"init","session_id":"abc","tools":["Read"]}"#,
         "\n",
-        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__ken__route_query","input":{"query":"who decides"}}]}}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"mcp__ken__search","input":{"query":"who decides"}}]}}"#,
         "\n",
         "a warning the CLI printed\n",
         r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"1. doc people/README.md"}]}]}}"#,
@@ -904,5 +907,19 @@ mod tests {
             OneshotOutcome::Failed(msg) => assert!(msg.contains("isn't installed")),
             other => panic!("expected failure, got {other:?}"),
         }
+    }
+
+    /// A headless chat turn may use the knowledge server's twelve tools and
+    /// the personal set's, but not opening a file (there is no app).
+    #[test]
+    fn a_chat_turn_allows_both_tool_sets_by_their_server_names() {
+        let args = chat_args(Path::new("/p"), &[], Path::new("/cfg.json"), true);
+        let at = args.iter().position(|a| a == "--allowedTools").unwrap();
+        let allowed: Vec<&str> = args[at + 1].split(',').collect();
+        for t in ["mcp__ken__search", "mcp__ken__code_imports", "mcp__ken__propose_decision", "mcp__ken-personal__task_list"] {
+            assert!(allowed.contains(&t), "{t}: {allowed:?}");
+        }
+        assert!(!allowed.iter().any(|t| t.ends_with("open_in_ken")), "{allowed:?}");
+        assert!(!allowed.iter().any(|t| t.ends_with("route_query")), "{allowed:?}");
     }
 }

@@ -1,13 +1,22 @@
 //! ken-mcp — stdio MCP server over ken-core. Hand-rolled JSON-RPC 2.0:
 //! one JSON object per line on stdout, stdin read line-by-line, nothing
-//! but protocol on stdout (diagnostics go to stderr). Read-only on the
-//! SQLite index. It writes only through ken-core and only these: Your day
-//! tasks, Ken's memories, the workspace journal, and a team inbox item
-//! (which commits and pushes to the team's inbox repo).
+//! but protocol on stdout (diagnostics go to stderr).
 //!
-//! Scoping: `ken-mcp --project <path>` locks every tool to that project;
-//! unscoped, the project tools take a required `project` argument matched
-//! against Ken's registry.
+//! Two tool sets in one binary (knowledge-core decision 22):
+//! - **The knowledge server** (the default): `search`, `read`, `related`,
+//!   the four code tools, `history`, `tickets`, `propose_decision`,
+//!   `add_source` and `repos`, with the brief as its `instructions`
+//!   (decision 1). It reads the SQLite indexes read-only. Its two writes only
+//!   queue for a person: `propose_decision` files a ready ruling in the
+//!   knowledge base's Inbox, `add_source` puts a source in its inbox folder
+//!   for the next ingest. Nothing binding is written here.
+//! - **The personal set** (`--personal`): the person's Your day tasks, Ken's
+//!   memories and journal, and opening a file in Ken. Only Ken's own chat
+//!   registers it, beside the knowledge server.
+//!
+//! Scoping: `ken-mcp --project <path>` makes that project the one a path
+//! is read in; unscoped, a project-relative path needs a `project` argument
+//! matched against Ken's registry. Search covers every repo either way.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,7 +43,7 @@ use ken_core::tasks;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const KNOWN_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
-/// Cap on `read_document` output.
+/// Cap on `read` output.
 const MAX_DOCUMENT_BYTES: usize = 200 * 1024;
 
 #[derive(Default)]
@@ -42,6 +51,8 @@ struct Server {
     base_dir: PathBuf,
     /// Root the server is locked to (`--project <path>`), if any.
     scoped: Option<PathBuf>,
+    /// The personal tool set (`--personal`) rather than the knowledge server.
+    personal: bool,
     /// The embedding model, loaded by the first search that needs it.
     meaning: RefCell<Meaning>,
 }
@@ -58,6 +69,7 @@ enum Meaning {
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut scoped = None;
+    let mut personal = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--project" => match args.next() {
@@ -67,12 +79,13 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--personal" => personal = true,
             "--version" => {
                 eprintln!("ken-mcp {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             other => {
-                eprintln!("ken-mcp: unknown argument {other:?}\nusage: ken-mcp [--project <path>]");
+                eprintln!("ken-mcp: unknown argument {other:?}\nusage: ken-mcp [--project <path>] [--personal]");
                 std::process::exit(2);
             }
         }
@@ -91,7 +104,7 @@ fn main() {
     ken_core::local_llm::init(base_dir.clone());
     let use_gpu = AppSettings::load(&base_dir).extra.get("useGpu").and_then(Value::as_bool);
     ken_core::compute::set_use_gpu(use_gpu.unwrap_or(true));
-    let mut server = Server { base_dir, scoped, ..Default::default() };
+    let mut server = Server { base_dir, scoped, personal, ..Default::default() };
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -153,16 +166,16 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
     let params = obj.get("params").cloned().unwrap_or(Value::Null);
 
     let reply = match method {
-        "initialize" => rpc_result(&id, initialize_result(&params)),
+        "initialize" => rpc_result(&id, initialize_result(server, &params)),
         "ping" => rpc_result(&id, json!({})),
-        "tools/list" => rpc_result(&id, json!({ "tools": tool_definitions() })),
+        "tools/list" => rpc_result(&id, json!({ "tools": tool_definitions(server) })),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            // Any tool the server lists is dispatched: the list and the
-            // dispatch cannot drift apart (open_in_ken once was listed and
-            // refused).
-            let listed = tool_definitions()
+            // Any tool the server lists is dispatched, and only those: the
+            // list and the dispatch cannot drift apart (open_in_ken once was
+            // listed and refused), and neither set answers the other's tools.
+            let listed = tool_definitions(server)
                 .as_array()
                 .is_some_and(|tools| tools.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)));
             if listed {
@@ -185,7 +198,7 @@ fn handle_request(server: &mut Server, request: &Value) -> Option<Value> {
     Some(reply)
 }
 
-fn initialize_result(params: &Value) -> Value {
+fn initialize_result(server: &Server, params: &Value) -> Value {
     let requested = params
         .get("protocolVersion")
         .and_then(|v| v.as_str())
@@ -195,11 +208,70 @@ fn initialize_result(params: &Value) -> Value {
     } else {
         PROTOCOL_VERSION
     };
+    let name = if server.personal { "ken-personal" } else { "ken" };
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "ken", "version": env!("CARGO_PKG_VERSION") }
+        "serverInfo": { "name": name, "version": env!("CARGO_PKG_VERSION") },
+        "instructions": instructions(server)
     })
+}
+
+/// The brief, short form (knowledge-core decision 1): what the wiki's
+/// `CLAUDE.md` says about the library and how to answer from it, sent as the
+/// knowledge server's `instructions` so any Claude session gets it. Where
+/// the knowledge base is comes first ([`instructions`]).
+const BRIEF: &str = "\
+Ken indexes the team's knowledge base and its code repos; these tools search and read them with Ken's own ranking.
+
+The knowledge base is a library kept beside the code. The code is the truth for how the product works today; the \
+library complements it and never copies it: it holds why things are built as they are, what was decided and \
+reversed, what came out of a meeting, and how the parts fit. Its sections: Rules/ (how the team works, binding), \
+Decisions/DECISIONS.md (every ruling, added and never edited), Design/, Current/ (the project, roadmap and feature \
+status, true now), Reference/ (vocabulary, how-tos, Platform/ for each dependency), Research/ (dated findings; \
+Ingestion/Raw/ is the inbox, Ingestion/Ingested/ the notes), tickets/ (the work in flight and done) and log.md.
+
+How to answer:
+- Search first with search, then read a hit by its ken:// address (the #L line included). For code, use the code \
+index before Grep and Glob: code_definition, code_usages, code_outline and code_imports, then read the lines around a \
+hit, not the whole file. For when and why something changed, history; for what something is tied to, related.
+- Every hit carries one label: its kind, its tier (for code, its role) and its date (decision D-410 · binding · \
+2026-10-06, doc · current, ticket · superseded, code · service · 2026-10-01). The tiers run binding, current, \
+reference, record, superseded. Weigh hits by them: a later ruling over an earlier one on the same point (a hit marked \
+superseded by a later ruling holds only where that ruling does not reach), a binding ruling or rule over a ticket or \
+note, and a current page over a record.
+- A ruling is settled. Do not reopen it or recommend against it; where the code does not match a ruling, say the code \
+differs from it and cite both.
+- On what was built, the code wins: a page, ticket or plan says what was intended. When asked how something works, \
+read the code that does it; where code and a page disagree, say so and cite both. Several repos can hold the same \
+product: say which repo each finding is from.
+- An empty search proves nothing: the index can miss a file, a new change or other wording. Check the Vocabulary page \
+for the other word, then look directly with Grep, Glob and Read before saying something is not there, and say where \
+you looked.
+- A Research page or an ingested note is evidence from its date: cite it with its date.
+- Cite every fact by the ken:// address of the hit it came from, with #L<line> when it has one.
+- The knowledge base changes through a person. A ruling the person states goes in with propose_decision and a source \
+they want kept with add_source: both wait in Ken's Inbox for a person, and nothing binding is written here.";
+
+/// What the personal set tells a session about itself.
+const PERSONAL_BRIEF: &str = "Ken's personal tools: the person's Your day tasks (task_list, task_create, task_update), \
+Ken's memory (memory_write) and the workspace journal (journal_append), and open_in_ken. Use them only when the person \
+asks: their list is theirs, not yours. The team's knowledge is on Ken's knowledge server, not here.";
+
+/// The server's `instructions`: for the knowledge server, where the open
+/// workspace's knowledge base is, then [`BRIEF`].
+fn instructions(server: &Server) -> String {
+    if server.personal {
+        return PERSONAL_BRIEF.to_string();
+    }
+    let place = match knowledge_base(server) {
+        Ok((id, name, root)) => format!(
+            "The knowledge base of the open workspace is {name}, at {} (ken://{id}/); repos lists every repo Ken searches.",
+            root.display()
+        ),
+        Err(_) => "No knowledge base is set up in the open workspace yet; search still covers its repos, and repos lists them.".to_string(),
+    };
+    format!("{place}\n\n{BRIEF}")
 }
 
 fn rpc_result(id: &Value, result: Value) -> Value {
@@ -222,24 +294,92 @@ fn tool_content(outcome: Result<String, String>) -> Value {
     }
 }
 
-/// The tools this server lists. Search is one pipeline (knowledge-core
-/// decision 15): `route_query` over every source and `semantic_search` in
-/// one, both through `routing`.
-fn tool_definitions() -> Value {
+/// The tools this server lists: the knowledge server's twelve
+/// (knowledge-core decision 22), or with `--personal` the personal set.
+fn tool_definitions(server: &Server) -> Value {
+    if server.personal {
+        personal_tools()
+    } else {
+        knowledge_tools()
+    }
+}
+
+/// The knowledge server's tools, in decision 22's order. Search is one
+/// pipeline (decision 15): `search` over every source through `routing`.
+fn knowledge_tools() -> Value {
     let project_arg = json!({
         "type": "string",
-        "description": "Which Ken project to use — a project name or folder \
-path from list_projects. Required unless the server was started locked to \
-one project."
+        "description": "The Ken repo a project-relative path is in: a name from repos, or its folder. Not needed \
+for a ken:// address, or when the server was started locked to one project."
     });
-    let code_project = json!({ "type": "string", "description": "Only this project (by name). Default: every project Ken knows, so uses in other repos are found too." });
-    let mut tools = vec![
+    let code_project = json!({ "type": "string", "description": "Only this repo (by name). Default: every repo of the workspace, so uses in other repos are found too." });
+    let tools = vec![
         json!({
-            "name": "find_definition",
+            "name": "search",
+            "description": "START HERE to find where something is, or what the team knows about a question, in plain \
+words. Searches every repo of the workspace (only the one the question names when it names one, or the `project` you \
+give; a reference repo only for a question about the platform, when named, or when nothing else answers) by keyword \
+and by meaning, and returns one merged ranked list, with any repo still building its meaning index or slow to answer \
+said so. Each hit is short: its label (kind · tier or role · date), repo:path:line to cite, ken:// address, and about \
+300 characters around the best-matching lines, so ten hits cost about 6,000 characters. For more of a hit call read \
+with its ken:// address (the #L line included): the lines around it, one cheap call. A code hit names the definition \
+it holds (`saveWorld`; plain words like \"save world\" find it) and the calls that go further (code_usages, \
+code_outline, code_imports). Meaning search uses Ken's installed embedding model; without it the answer says it was \
+keyword only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "A question or search terms. A repo's name in it narrows the search to that repo." },
+                    "project": { "type": "string", "description": "Only these repos: names from repos (or folders), comma-separated. Default: every repo of the workspace." },
+                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket, decision, note (or any, the default). Every hit is labelled with its kind either way." },
+                    "limit": { "type": "integer", "description": "Maximum merged hits to return (default 10)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "read",
+            "description": "Read a document, or just some of its lines, after a search: the way to see more of a hit. \
+Give a hit's ken:// address as `path`: with its #L<n> a Markdown page gives the whole section n is in (its heading to \
+the next heading of the same level; in a decisions log, the entry), up to about 8,000 characters, and a code or text \
+file the lines around n (10 before, 40 after), numbered: one cheap call. start_line/end_line pick other lines. With no \
+line, the whole file comes back (up to 200 KB, so costly for a big file). Also takes a project-relative path (with \
+`project`). Binary formats (docx, xlsx, pptx, pdf, images) return the text Ken's indexer extracted. Given a folder \
+(`.` for the whole repo), lists its indexed files instead: path, kind, size and modification time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A ken:// address from a hit (#L<n> included), a project-relative file path, or a folder to list (`.` for the whole repo)." },
+                    "start_line": { "type": "integer", "description": "First line to return, 1-based. Alone, it returns 50 lines from there." },
+                    "end_line": { "type": "integer", "description": "Last line to return, inclusive." },
+                    "project": project_arg.clone()
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "related",
+            "description": "What a file, ruling or ticket is related to, from Ken's project graph (exact sources only), \
+nearest first: the pages that link to it or that it links to, what a page cites (code files, notes, rulings), the \
+note that changed a page, the ruling that supersedes another, code comments and commits that cite a ruling or a \
+ticket, the topics a page is tagged with and the pages that share them, and for a code file the files it imports and \
+that import it (from Ken's code index). For how something fits in and what depends on it; use it before Grep or Glob \
+for references.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The file's path relative to its project root, or a ruling or ticket id (D-012, SR-101)." },
+                    "project": code_project.clone()
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "code_definition",
             "description": "Where a symbol (function, method, class, struct, interface, module) is defined in the code, \
 from Ken's code index (tree-sitter, every indexed repo). Returns each definition's ken:// address with its line, its \
 kind and its doc comment. Use it like 'go to definition', before Grep or Glob: one call instead of a search through \
-every file; then read_document or Read the file at that line.",
+every file; then read the file at that line.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -250,7 +390,7 @@ every file; then read_document or Read the file at that line.",
             }
         }),
         json!({
-            "name": "find_usages",
+            "name": "code_usages",
             "description": "Every place a symbol is used (called, referenced, instantiated), each with the function or \
 class it sits in, so its callers. Like 'find usages': who calls this, what breaks if it changes. Use it before Grep \
 for a symbol's uses. Names only, no type resolution: two different symbols with one name both show.",
@@ -265,7 +405,7 @@ for a symbol's uses. Names only, no type resolution: two different symbols with 
             }
         }),
         json!({
-            "name": "file_outline",
+            "name": "code_outline",
             "description": "A code file's definitions in order, nested (classes and their methods), each with its line, \
 from Ken's code index. Drill into a file with it before reading all of it or grepping it.",
             "inputSchema": {
@@ -278,17 +418,14 @@ from Ken's code index. Drill into a file with it before reading all of it or gre
             }
         }),
         json!({
-            "name": "related_files",
-            "description": "What a file, ruling or ticket is related to, from Ken's project graph (exact sources only), \
-nearest first: the pages that link to it or that it links to, what a page cites (code files, notes, rulings), the \
-note that changed a page, the ruling that supersedes another, code comments and commits that cite a ruling or a \
-ticket, the topics a page is tagged with and the pages that share them, and for a code file the files it imports and \
-that import it (from Ken's code index). For how something fits in and what depends on it; use it before Grep or Glob \
-for imports or references.",
+            "name": "code_imports",
+            "description": "A code file's imports, from Ken's code index: the indexed files it imports, the files that \
+import it, and the libraries (imports Ken could not tie to a file). Use it before Grep or Glob for what a file \
+depends on and what depends on it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "The file's path relative to its project root, or a ruling or ticket id (D-012, SR-101)." },
+                    "path": { "type": "string", "description": "The file's path relative to its project root." },
                     "project": code_project.clone()
                 },
                 "required": ["path"]
@@ -309,151 +446,90 @@ for imports or references.",
             }
         }),
         json!({
-            "name": "read_document",
-            "description": "Read a document, or just some of its lines, after a search: the \
-way to see more of a hit. Give a hit's ken:// address as `path`: with its #L<n> a Markdown page \
-gives the whole section n is in (its heading to the next heading of the same level; in a \
-decisions log, the entry), up to about 8,000 characters, and a code or text file the lines \
-around n (10 before, 40 after), numbered — one cheap call. start_line/end_line pick other \
-lines. With no line, the whole file comes back (up to 200 KB, so costly for a big file). Also \
-takes a project-relative path (with `project`). Binary formats (docx, xlsx, pptx, pdf, images) \
-return the text Ken's indexer extracted.",
+            "name": "tickets",
+            "description": "The tickets (tickets/<ID>.md) in the workspace's repos: the work in flight and, with state \
+all, the work done. Each line shows the id, title, status, repo, target date and assignee, with its ken:// address. \
+Open ones by default; assignee me keeps the ones assigned to the person (matched against git's user.name and \
+user.email). Read-only: a ticket is changed as a file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "A ken:// address from a hit (#L<n> included), or a project-relative file path." },
-                    "start_line": { "type": "integer", "description": "First line to return, 1-based. Alone, it returns 50 lines from there." },
-                    "end_line": { "type": "integer", "description": "Last line to return, inclusive." },
-                    "project": project_arg
-                },
-                "required": ["path"]
+                    "state": { "type": "string", "enum": ["open", "all"], "description": "Default open." },
+                    "assignee": { "type": "string", "enum": ["all", "me"], "description": "Default all." }
+                }
             }
         }),
         json!({
-            "name": "list_documents",
-            "description": "List a Ken project's indexed files — path, kind, \
-size, and modification time — optionally only those under a folder.",
+            "name": "propose_decision",
+            "description": "Propose a ruling for the knowledge base's decisions log: one the person made or confirmed \
+in this conversation, never your own view. It never writes the log. It files a ready entry in the log's one entry \
+format in Ken's Inbox, and a person adds it in one click (it takes the next D-number then) or discards it; say that it \
+waits for them. Give the ruling in one sentence and why; add what it is about, the words it was made in and who made \
+it when you have them, and the rulings it replaces.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "folder": { "type": "string", "description": "Project-relative folder to list (default: whole project)." },
+                    "ruling": { "type": "string", "description": "The ruling, in one sentence." },
+                    "why": { "type": "string", "description": "Why it was decided, in a sentence or two." },
+                    "topic": { "type": "string", "description": "A few words for what it is about." },
+                    "quote": { "type": "string", "description": "The words it was made in, when the person said them." },
+                    "who": { "type": "string", "description": "Who made it, as free text." },
+                    "aliases": { "type": "array", "items": { "type": "string" }, "description": "Other words anyone might search for it by." },
+                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": "The rulings it replaces, by id (D-003)." },
+                    "source": { "type": "string", "description": "The note or page it was said in, by its name (2026-10-12-standup), when there is one." }
+                },
+                "required": ["ruling", "why"]
+            }
+        }),
+        json!({
+            "name": "add_source",
+            "description": "Put a source in the knowledge base's inbox (Research/Ingestion/Raw/) for Ken's next ingest \
+pass, which reads it into a dated note and updates the pages it changes (edits that need a person are held for one). \
+It never ingests here and never edits a page; say that it waits for the ingest. Give a file from one of the \
+workspace's repos (a ken:// address, or a path with `project`), or pasted `text` with a `title`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "A ken:// address, or a path relative to `project`, of the file to add." },
+                    "text": { "type": "string", "description": "Text to add as a note, when there is no file (at most 400,000 characters)." },
+                    "title": { "type": "string", "description": "The note's title, with `text`." },
                     "project": project_arg
                 }
             }
         }),
         json!({
-            "name": "list_projects",
-            "description": "List the Ken projects registered on this machine \
-— name, folder path, and whether the folder is currently available — each \
-with its index health in one line (files indexed, failed or skipped; how far \
-its meaning search has got; its controls; whether the embedding model is \
-missing) and, if it has one, its one-line `.ken/index-profile.json` summary.",
+            "name": "repos",
+            "description": "The repos Ken searches in the open workspace: name, folder, whether the folder is there, \
+and which one is the knowledge base, each with its index health in one line (files indexed, failed or skipped; how \
+far its meaning search has got; its controls; whether the embedding model is missing) and, if it has one, its \
+one-line `.ken/index-profile.json` summary.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ];
+    Value::Array(tools)
+}
 
-    {
-        tools.push(json!({
-            "name": "semantic_search",
-            "description": "route_query for ONE project you already know (the user named it, \
-or list_projects or an earlier hit told you): the same keyword and meaning search, ranked the \
-same way, and the same short hits — path:line, ken:// address, kind and about 300 characters \
-around the best-matching lines. Call read_document with a hit's address for more. Meaning \
-search uses Ken's installed embedding model; without it the answer says it was keyword only.",
+/// The personal set (`--personal`): the person's Your day tasks, Ken's
+/// memory and journal, and, when Ken's own chat started the server,
+/// opening a file in Ken.
+fn personal_tools() -> Value {
+    let mut tools = vec![
+        json!({
+            "name": "task_list",
+            "description": "List the user's tasks (Your day's Other list): open ones by \
+default. Each line shows the id (for task_update), the title, the target date, the \
+repeat and the links. Filter by state, by a target date before a day, or by a linked \
+ticket id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "A question or search terms." },
-                    "limit": { "type": "integer", "description": "Maximum hits to return (default 10)." },
-                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket, decision, note (or any, the default). Every hit is labelled with its kind either way." },
-                    "project": project_arg
-                },
-                "required": ["query"]
+                    "state": { "type": "string", "enum": ["open", "done", "all"], "description": "Default open." },
+                    "target_before": { "type": "string", "description": "Only tasks with a target before this date, YYYY-MM-DD." },
+                    "linked": { "type": "string", "description": "Only tasks linked to this ticket: <repo>/<ID>, or a bare <ID> for that id in any repo." }
+                }
             }
-        }));
-        tools.push(json!({
-            "name": "route_query",
-            "description": "START HERE to find where something is, or what the team knows \
-about a question, in plain words. Searches every Ken project of the workspace (only the \
-one the query names, when it names one; a reference repo only for a question about the \
-platform, when named, or when nothing else answers) by keyword and by meaning, and returns \
-one merged ranked list, with any project still building its meaning index or slow to \
-answer said so. Each hit is short — repo:path:line \
-to cite, ken:// address, kind, and about 300 characters around the best-matching lines — so \
-ten hits cost about 6,000 characters. For more of a hit call read_document with its ken:// \
-address (the #L line included): the lines around it, one cheap call. A code hit names \
-the definition it holds (`saveWorld`; plain words like \"save world\" find it) and the calls \
-that go further (find_usages, file_outline, related_files). Meaning search uses \
-Ken's installed embedding model; without it the answer says it was keyword only.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "A question or search terms. A project's name in it narrows the search to that project." },
-                    "limit": { "type": "integer", "description": "Maximum merged hits to return (default 10)." },
-                    "type": { "type": "string", "description": "Keep only these kinds of file, comma-separated: code, test, spec, doc, config, data, design, meeting, ticket, decision, note (or any, the default). Every hit is labelled with its kind either way." },
-                },
-                "required": ["query"]
-            }
-        }));
-    }
-
-    // ken-memory (task 3.1) adds `memory_write`/`journal_append`. Ken's
-    // memory is built in (`features::BUILT_IN`), so they are always listed.
-    {
-        tools.push(json!({
-            "name": "memory_write",
-            "description": "Create or update one of Ken's own long-term \
-memory files — durable notes on ways of working, conventions, or standing \
-decisions, either workspace-wide or scoped to one project. Distinct from \
-the day-to-day journal (use journal_append for that): memories are small, \
-curated, and always kept in context, not a running log. `scope` is \
-\"workspace\" for a workspace-wide memory, or a Ken project name (from \
-list_projects) for a project-scoped one. `slug` names the file \
-(<slug>.md) and is the memory's identity. By default this creates a new \
-memory and errors if that slug already exists — pass mode \"replace\" to \
-update an existing memory's body instead.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "scope": { "type": "string", "description": "\"workspace\", or a Ken project name for a project-scoped memory." },
-                    "slug": { "type": "string", "description": "File-name-safe identifier for the memory — creates <slug>.md." },
-                    "content": { "type": "string", "description": "The memory's body text." },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["create", "replace"],
-                        "description": "\"create\" (default): errors if the slug already exists. \"replace\": updates an existing memory's body (its slug must already exist)."
-                    }
-                },
-                "required": ["scope", "slug", "content"]
-            }
-        }));
-        tools.push(json!({
-            "name": "journal_append",
-            "description": "Append a timestamped entry to today's Ken \
-workspace journal, for a finding the person wants kept, creating the \
-day's file if it doesn't exist yet. Cite \
-ken:// addresses for anything referenced so the entry stays traceable \
-after Ken reindexes it. Optionally tag the entry with the Ken project it \
-concerns and free-form tags.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "text": { "type": "string", "description": "The journal entry's text." },
-                    "project": { "type": "string", "description": "Ken project name this entry concerns, if any." },
-                    "tags": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Free-form tags for this entry."
-                    }
-                },
-                "required": ["text"]
-            }
-        }));
-    }
-
-    // Your day: the user's tasks and the team's tickets. Always listed.
-    {
-        tools.push(json!({
+        }),
+        json!({
             "name": "task_create",
             "description": "Add a task to the user's Your day list in Ken: a markdown file \
 in the workspace's tasks folder. A task is a title and, optionally, a target date, a \
@@ -470,8 +546,8 @@ name). Returns the new task's id.",
                 },
                 "required": ["title"]
             }
-        }));
-        tools.push(json!({
+        }),
+        json!({
             "name": "task_update",
             "description": "Change one of the user's tasks by id (from task_list): its \
 title, target date (\"\" clears it), description, repeat (\"\" makes it a one-off), \
@@ -491,37 +567,57 @@ today's workspace journal. A recurring task marked done is done for today only."
                 },
                 "required": ["id"]
             }
-        }));
-        tools.push(json!({
-            "name": "task_list",
-            "description": "List the user's tasks (Your day's Other list): open ones by \
-default. Each line shows the id (for task_update), the title, the target date, the \
-repeat and the links. Filter by state, by a target date before a day, or by a linked \
-ticket id.",
+        }),
+        json!({
+            "name": "memory_write",
+            "description": "Create or update one of Ken's own long-term \
+memory files: durable notes on ways of working, conventions, or standing \
+decisions, either workspace-wide or scoped to one repo. Distinct from \
+the day-to-day journal (use journal_append for that): memories are small, \
+curated, and always kept in context, not a running log. `scope` is \
+\"workspace\" for a workspace-wide memory, or a Ken repo name for a \
+repo-scoped one. `slug` names the file (<slug>.md) and is the memory's \
+identity. By default this creates a new memory and errors if that slug \
+already exists; pass mode \"replace\" to update an existing memory's body \
+instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "state": { "type": "string", "enum": ["open", "done", "all"], "description": "Default open." },
-                    "target_before": { "type": "string", "description": "Only tasks with a target before this date, YYYY-MM-DD." },
-                    "linked": { "type": "string", "description": "Only tasks linked to this ticket: <repo>/<ID>, or a bare <ID> for that id in any repo." }
-                }
+                    "scope": { "type": "string", "description": "\"workspace\", or a Ken repo name for a repo-scoped memory." },
+                    "slug": { "type": "string", "description": "File-name-safe identifier for the memory: creates <slug>.md." },
+                    "content": { "type": "string", "description": "The memory's body text." },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["create", "replace"],
+                        "description": "\"create\" (default): errors if the slug already exists. \"replace\": updates an existing memory's body (its slug must already exist)."
+                    }
+                },
+                "required": ["scope", "slug", "content"]
             }
-        }));
-        tools.push(json!({
-            "name": "ticket_list",
-            "description": "List the ticket files (tickets/<ID>.md) in the workspace's \
-repos: the ones assigned to the user (matched against git's user.name and user.email) \
-and still open, by default. Each line shows the id, title, state, repo, target date and \
-how many of the user's tasks link to it. Read-only: tickets are edited as files.",
+        }),
+        json!({
+            "name": "journal_append",
+            "description": "Append a timestamped entry to today's Ken \
+workspace journal, for a finding the person wants kept, creating the \
+day's file if it doesn't exist yet. Cite \
+ken:// addresses for anything referenced so the entry stays traceable \
+after Ken reindexes it. Optionally tag the entry with the Ken repo it \
+concerns and free-form tags.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "assignee": { "type": "string", "enum": ["me", "all"], "description": "Default me." },
-                    "state": { "type": "string", "enum": ["open", "all"], "description": "Default open." }
-                }
+                    "text": { "type": "string", "description": "The journal entry's text." },
+                    "project": { "type": "string", "description": "Ken repo name this entry concerns, if any." },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Free-form tags for this entry."
+                    }
+                },
+                "required": ["text"]
             }
-        }));
-    }
+        }),
+    ];
 
     // Only when Ken's own chat started this server: it can reach the app.
     if app_bridge().is_some() {
@@ -529,14 +625,14 @@ how many of the user's tasks link to it. Read-only: tickets are edited as files.
             "name": "open_in_ken",
             "description": "Open a file in Ken for the person, at a line or a heading. Use this ONLY when the \
 person explicitly asks you to open, show or take them to something; otherwise cite the file as a link and let \
-them click it. Accepts a ken:// address from Ken's search tools, or a project-relative path.",
+them click it. Accepts a ken:// address from Ken's tools, or a project-relative path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "A ken://<project-id>/<path> address, or a project-relative path." },
                     "line": { "type": "integer", "description": "1-based line to scroll to." },
                     "heading": { "type": "string", "description": "A heading's text or slug to scroll to, in a Markdown page." },
-                    "project": project_arg
+                    "project": { "type": "string", "description": "The Ken repo a project-relative path is in." }
                 },
                 "required": ["target"]
             }
@@ -598,154 +694,148 @@ fn open_in_ken_via(server: &Server, args: &Value, (url, token): &(String, String
 
 fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String> {
     match name {
-        "list_projects" => list_projects(server),
-        "semantic_search" => semantic_search(server, args),
-        "route_query" => route_query(server, args),
-        "find_definition" => find_definition(server, args),
-        "find_usages" => find_usages(server, args),
-        "file_outline" => file_outline(server, args),
-        "related_files" => related_files(server, args),
+        // The knowledge server (decision 22).
+        "search" => search(server, args),
+        "read" => read(server, args),
+        "related" => related(server, args),
+        "code_definition" => code_definition(server, args),
+        "code_usages" => code_usages(server, args),
+        "code_outline" => code_outline(server, args),
+        "code_imports" => code_imports(server, args),
         "history" => history(server, args),
-        "open_in_ken" => open_in_ken(server, args),
+        "tickets" => tickets(server, args),
+        "propose_decision" => propose_decision(server, args),
+        "add_source" => add_source(server, args),
+        "repos" => repos(server),
+        // The personal set (`--personal`).
+        "task_list" => task_list_tool(server, args),
+        "task_create" => task_create_tool(server, args),
+        "task_update" => task_update_tool(server, args),
         "memory_write" => memory_write_tool(server, args),
         "journal_append" => journal_append_tool(server, args),
-        "task_create" => task_create_tool(server, args),
-        "task_list" => task_list_tool(server, args),
-        "task_update" => task_update_tool(server, args),
-        "ticket_list" => ticket_list_tool(server, args),
-        "read_document" => {
-            let path = require_str(args, "path")?;
-            // A ken://<project id>/<path>#L12 address, as search returns it,
-            // names its repo, its file and the line to read around.
-            let mut named = args.clone();
-            let path = match path.strip_prefix("ken://").and_then(|r| r.split_once('/')) {
-                Some((id, rel)) => {
-                    named["project"] = json!(id);
-                    rel.replace("%20", " ")
-                }
-                None => path,
-            };
-            let (path, fragment) = match path.split_once('#') {
-                Some((file, frag)) => (file.to_string(), Some(frag.to_string())),
-                None => (path, None),
-            };
-            let range = line_range(args, fragment.as_deref());
-            let pointed = address_line(args, fragment.as_deref());
-            let (project, note) = resolve_project(server, &named)?;
-            // Validate before anything else so `..`/absolute paths are
-            // refused outright, whatever the index says.
-            let abs = project
-                .resolve(&path)
-                .map_err(|_| format!("{path:?} is outside the project — paths are relative to the project root and may not contain \"..\""))?;
-            let db = open_index(server, &project)?;
-            let row = db
-                .get_file(&path)
-                .map_err(|e| format!("index lookup failed: {e}"))?
-                .ok_or_else(|| {
-                    format!(
-                        "{path:?} is not in project \"{}\"'s index. Use \
-list_documents or route_query to find valid paths.",
-                        project.config.name
-                    )
-                })?;
-            let mut out = note.unwrap_or_default();
-            match (row.kind.as_str(), range) {
-                // A page read from a hit's address: the section it is in.
-                ("md", Some(_)) if pointed.is_some() => {
-                    let bytes = std::fs::read(&abs)
-                        .map_err(|e| format!("could not read {path:?}: {e}"))?;
-                    out.push_str(&section_text(&db, &path, &String::from_utf8_lossy(&bytes), pointed.unwrap_or(1)));
-                }
-                ("md" | "txt" | "code", Some(r)) => {
-                    let bytes = std::fs::read(&abs)
-                        .map_err(|e| format!("could not read {path:?}: {e}"))?;
-                    out.push_str(&numbered_lines(&String::from_utf8_lossy(&bytes), r));
-                }
-                ("md" | "txt" | "code", None) => {
-                    let bytes = std::fs::read(&abs)
-                        .map_err(|e| format!("could not read {path:?}: {e}"))?;
-                    let truncated = bytes.len() > MAX_DOCUMENT_BYTES;
-                    let end = if truncated {
-                        floor_char_boundary_at(&bytes, MAX_DOCUMENT_BYTES)
-                    } else {
-                        bytes.len()
-                    };
-                    out.push_str(&String::from_utf8_lossy(&bytes[..end]));
-                    if truncated {
-                        out.push_str("\n\n[truncated — file exceeds the 200 KB read limit]");
-                    }
-                }
-                (kind, _) => {
-                    let text = db
-                        .get_text(&path)
-                        .map_err(|e| format!("index lookup failed: {e}"))?
-                        .filter(|t| !t.trim().is_empty())
-                        .ok_or_else(|| match &row.error {
-                            Some(reason) => format!(
-                                "Ken could not extract text from {path:?} ({reason})."
-                            ),
-                            None => format!(
-                                "{path:?} is a {kind} file with no extracted \
-text in the index (it is indexed by name only)."
-                            ),
-                        })?;
-                    let text = match range {
-                        Some(r) => numbered_lines(&text, r),
-                        None => text,
-                    };
-                    out.push_str(&format!(
-                        "[{kind} file — this is the text Ken's indexer \
-extracted, not the original bytes]\n\n{text}"
-                    ));
-                }
-            }
-            Ok(out)
-        }
-        "list_documents" => {
-            let folder = args
-                .get("folder")
-                .and_then(|f| f.as_str())
-                .map(|f| f.trim_matches('/').to_string())
-                .filter(|f| !f.is_empty());
-            let (project, note) = resolve_project(server, args)?;
-            let db = open_index(server, &project)?;
-            let files = db
-                .list_files()
-                .map_err(|e| format!("index lookup failed: {e}"))?;
-            let files: Vec<_> = match &folder {
-                Some(f) => files
-                    .into_iter()
-                    .filter(|row| row.rel_path.starts_with(&format!("{f}/")))
-                    .collect(),
-                None => files,
-            };
-            let mut out = note.unwrap_or_default();
-            let scope = match &folder {
-                Some(f) => format!("under \"{f}\" in project \"{}\"", project.config.name),
-                None => format!("in project \"{}\"", project.config.name),
-            };
-            if files.is_empty() {
-                out.push_str(&format!("No indexed files {scope}."));
-            } else {
-                out.push_str(&format!(
-                    "{} indexed file{} {scope} (path — kind, size, modified as unix seconds):\n",
-                    files.len(),
-                    if files.len() == 1 { "" } else { "s" },
-                ));
-                for row in files {
-                    out.push_str(&format!(
-                        "\n{} — {}, {} bytes, modified {}",
-                        row.rel_path, row.kind, row.size, row.mtime
-                    ));
-                }
-            }
-            Ok(out)
-        }
+        "open_in_ken" => open_in_ken(server, args),
         _ => Err(format!("unknown tool: {name:?}")),
     }
 }
 
-/// The lines read_document returns, 1-based and inclusive: `start_line` and
+/// A path as a tool was given it: a `ken://<project id>/<path>#L12` address,
+/// as search returns it, names its repo (put in `project`), its file and the
+/// fragment; anything else is a project-relative path. Returns the arguments
+/// to resolve the project with, the path and the fragment.
+fn split_address(args: &Value, path: &str) -> (Value, String, Option<String>) {
+    let mut named = args.clone();
+    let path = match path.strip_prefix("ken://").and_then(|r| r.split_once('/')) {
+        Some((id, rel)) => {
+            named["project"] = json!(id);
+            rel.replace("%20", " ")
+        }
+        None => path.replace('\\', "/"),
+    };
+    match path.split_once('#') {
+        Some((file, frag)) => (named, file.to_string(), Some(frag.to_string())),
+        None => (named, path, None),
+    }
+}
+
+/// `read`: a file, some of its lines or the section a line is in, or, for a
+/// folder, its indexed files (what `list_documents` was).
+fn read(server: &Server, args: &Value) -> Result<String, String> {
+    let given = require_str(args, "path")?;
+    let (named, path, fragment) = split_address(args, &given);
+    let (project, note) = resolve_project(server, &named)?;
+    let folder = path.trim_matches('/');
+    if folder.is_empty() || folder == "." {
+        return list_folder(server, &project, note, None);
+    }
+    // Validate before anything else so `..`/absolute paths are refused
+    // outright, whatever the index says.
+    let abs = project
+        .resolve(&path)
+        .map_err(|_| format!("{path:?} is outside the project — paths are relative to the project root and may not contain \"..\""))?;
+    if abs.is_dir() {
+        return list_folder(server, &project, note, Some(folder));
+    }
+    let range = line_range(args, fragment.as_deref());
+    let pointed = address_line(args, fragment.as_deref());
+    let db = open_index(server, &project)?;
+    let row = db
+        .get_file(&path)
+        .map_err(|e| format!("index lookup failed: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "{path:?} is not in project \"{}\"'s index. Use search, or read on its folder, to find valid paths.",
+                project.config.name
+            )
+        })?;
+    let mut out = note.unwrap_or_default();
+    match (row.kind.as_str(), range) {
+        // A page read from a hit's address: the section it is in.
+        ("md", Some(_)) if pointed.is_some() => {
+            let bytes = std::fs::read(&abs).map_err(|e| format!("could not read {path:?}: {e}"))?;
+            out.push_str(&section_text(&db, &path, &String::from_utf8_lossy(&bytes), pointed.unwrap_or(1)));
+        }
+        ("md" | "txt" | "code", Some(r)) => {
+            let bytes = std::fs::read(&abs).map_err(|e| format!("could not read {path:?}: {e}"))?;
+            out.push_str(&numbered_lines(&String::from_utf8_lossy(&bytes), r));
+        }
+        ("md" | "txt" | "code", None) => {
+            let bytes = std::fs::read(&abs).map_err(|e| format!("could not read {path:?}: {e}"))?;
+            let truncated = bytes.len() > MAX_DOCUMENT_BYTES;
+            let end = if truncated { floor_char_boundary_at(&bytes, MAX_DOCUMENT_BYTES) } else { bytes.len() };
+            out.push_str(&String::from_utf8_lossy(&bytes[..end]));
+            if truncated {
+                out.push_str("\n\n[truncated — file exceeds the 200 KB read limit]");
+            }
+        }
+        (kind, _) => {
+            let text = db
+                .get_text(&path)
+                .map_err(|e| format!("index lookup failed: {e}"))?
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| match &row.error {
+                    Some(reason) => format!("Ken could not extract text from {path:?} ({reason})."),
+                    None => format!("{path:?} is a {kind} file with no extracted text in the index (it is indexed by name only)."),
+                })?;
+            let text = match range {
+                Some(r) => numbered_lines(&text, r),
+                None => text,
+            };
+            out.push_str(&format!("[{kind} file — this is the text Ken's indexer extracted, not the original bytes]\n\n{text}"));
+        }
+    }
+    Ok(out)
+}
+
+/// A folder's indexed files (the whole project's with no folder): path,
+/// kind, size and modification time.
+fn list_folder(server: &Server, project: &Project, note: Option<String>, folder: Option<&str>) -> Result<String, String> {
+    let db = open_index(server, project)?;
+    let files = db.list_files().map_err(|e| format!("index lookup failed: {e}"))?;
+    let files: Vec<_> = match folder {
+        Some(f) => files.into_iter().filter(|row| row.rel_path.starts_with(&format!("{f}/"))).collect(),
+        None => files,
+    };
+    let mut out = note.unwrap_or_default();
+    let scope = match folder {
+        Some(f) => format!("under \"{f}\" in project \"{}\"", project.config.name),
+        None => format!("in project \"{}\"", project.config.name),
+    };
+    if files.is_empty() {
+        out.push_str(&format!("No indexed files {scope}."));
+        return Ok(out);
+    }
+    out.push_str(&format!(
+        "{} indexed file{} {scope} (path — kind, size, modified as unix seconds):\n",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+    ));
+    for row in files {
+        out.push_str(&format!("\n{} — {}, {} bytes, modified {}", row.rel_path, row.kind, row.size, row.mtime));
+    }
+    Ok(out)
+}
+
+/// The lines `read` returns, 1-based and inclusive: `start_line` and
 /// `end_line`, or the address's `#L88` (around it) or `#L88-L120`; None
 /// reads the whole file.
 fn line_range(args: &Value, fragment: Option<&str>) -> Option<(i64, i64)> {
@@ -784,7 +874,7 @@ fn address_line(args: &Value, fragment: Option<&str>) -> Option<i64> {
     frag.parse::<i64>().ok().filter(|n| *n >= 1)
 }
 
-/// About this many characters of a section read_document returns from an
+/// About this many characters of a section `read` returns from an
 /// address. Partly-right answers missed a fact in the same section as the
 /// hit, just past the 50 lines an address used to give (Shattered Realms,
 /// 2026-10-07); a decisions log's 50 lines were 24,000 characters of
@@ -876,7 +966,9 @@ fn require_str(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("the {key:?} argument is required"))
 }
 
-fn list_projects(server: &Server) -> Result<String, String> {
+/// `repos`: the repos of the open workspace, the knowledge base marked, each
+/// with the one health line (decision 19).
+fn repos(server: &Server) -> Result<String, String> {
     let registry = Registry::load(&server.base_dir)
         .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
     let inside = in_open_workspace(server, &registry);
@@ -893,8 +985,9 @@ folder in the Ken app first."
     );
     for s in statuses {
         out.push_str(&format!(
-            "\n{} — {}{}",
+            "\n{}{} — {}{}",
             s.entry.name,
+            if s.available && registry::is_library(&s.entry.path) { " (knowledge base)" } else { "" },
             s.entry.path.display(),
             if s.available { "" } else { " (folder currently missing)" }
         ));
@@ -915,61 +1008,6 @@ folder in the Ken app first."
                     out.push_str(&format!(" — \"{summary}\""));
                 }
             }
-        }
-    }
-    Ok(out)
-}
-
-/// One project's search: `routing::search_member_of`, the same pipeline
-/// route_query and the app use, with the question embedded by the app's own
-/// model when it is installed ([`query_vector`]) and keyword only, said in
-/// one line, when not.
-fn semantic_search(server: &Server, args: &Value) -> Result<String, String> {
-    let query = require_str(args, "query")?;
-    let limit = args
-        .get("limit")
-        .and_then(|l| l.as_u64())
-        .map(|l| l.clamp(1, 200) as usize)
-        .unwrap_or(ROUTE_LIMIT);
-    let (project, note) = resolve_project(server, args)?;
-    let db = open_index(server, &project)?;
-    let types = types_arg(args);
-    let qv = query_vector(server, &query);
-    let mut hits = routing::search_member_of(&db, &query, vector_for(&db, &qv), fetch_for(&types, limit), &types)
-        .map_err(|e| format!("search failed: {e}"))?;
-    hits.truncate(limit);
-    let mut out = note.unwrap_or_default();
-    out.push_str(&keyword_only_note(&qv));
-    if hits.is_empty() {
-        out.push_str(&format!(
-            "No matches for {query:?} in project \"{}\". {LOOK_YOURSELF}",
-            project.config.name
-        ));
-    } else {
-        out.push_str(&format!(
-            "{} result{} for {query:?} in project \"{}\":\n",
-            hits.len(),
-            if hits.len() == 1 { "" } else { "s" },
-            project.config.name
-        ));
-        for (i, hit) in hits.iter().enumerate() {
-            let (snippet, line) = short_hit(&db, Some(&project.root), &query, &hit.path, hit.chunk_id, &hit.snippet, hit.line, SNIPPET_CHARS);
-            out.push_str(&format!(
-                "\n{}. {} {}{}{} ({}{}) [{}]",
-                i + 1,
-                hit_tag(&hit.path, hit.label.as_deref()),
-                hit.path,
-                line.map(|l| format!(":{l}")).unwrap_or_default(),
-                symbol_tag(hit.symbol.as_deref()),
-                ken_address(project.config.id, &hit.path),
-                line.map(|l| format!("#L{l}")).unwrap_or_default(),
-                source_label(hit.source),
-            ));
-            if let Some(note) = hit.page.as_ref().and_then(|p| page_note(p, hit.label.is_some())) {
-                out.push_str(&format!(" ({note})"));
-            }
-            out.push_str(&indented(&snippet));
-            out.push_str(&next_line(&hit.path, hit.symbol.as_deref()));
         }
     }
     Ok(out)
@@ -1107,7 +1145,7 @@ fn code_indexes(server: &Server, args: &Value) -> Result<Vec<(Uuid, String, Db)>
         .collect())
 }
 
-fn find_definition(server: &Server, args: &Value) -> Result<String, String> {
+fn code_definition(server: &Server, args: &Value) -> Result<String, String> {
     let name = require_str(args, "name")?;
     let indexes = code_indexes(server, args)?;
     let mut out = String::new();
@@ -1133,7 +1171,7 @@ fn find_definition(server: &Server, args: &Value) -> Result<String, String> {
     Ok(format!("{n} definition{} of {name:?}:{out}", if n == 1 { "" } else { "s" }))
 }
 
-fn find_usages(server: &Server, args: &Value) -> Result<String, String> {
+fn code_usages(server: &Server, args: &Value) -> Result<String, String> {
     let name = require_str(args, "name")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).map(|l| l.clamp(1, 500) as usize).unwrap_or(60);
     let indexes = code_indexes(server, args)?;
@@ -1203,7 +1241,7 @@ fn index_with_file(server: &Server, args: &Value, path: &str) -> Result<(Uuid, S
     Ok(indexes.swap_remove(at))
 }
 
-fn file_outline(server: &Server, args: &Value) -> Result<String, String> {
+fn code_outline(server: &Server, args: &Value) -> Result<String, String> {
     let path = require_str(args, "path")?.replace('\\', "/");
     let (id, project, db) = index_with_file(server, args, &path)?;
     let outline = ken_core::codeindex::outline(&db, &path).map_err(|e| e.to_string())?;
@@ -1214,7 +1252,30 @@ fn file_outline(server: &Server, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-/// Most neighbours `related_files` lists.
+/// `code_imports`: what a code file imports (resolved to indexed files
+/// where Ken can tell), what imports it, and the libraries, from the code
+/// index (`codeindex::related`).
+fn code_imports(server: &Server, args: &Value) -> Result<String, String> {
+    let path = require_str(args, "path")?.replace('\\', "/");
+    let (id, project, db) = index_with_file(server, args, &path)?;
+    let r = ken_core::codeindex::related(&db, &path).map_err(|e| e.to_string())?;
+    let list = |files: &[String]| -> String {
+        if files.is_empty() {
+            " (none)".to_string()
+        } else {
+            files.iter().map(|f| format!("\n  - {}", ken_address(id, f))).collect()
+        }
+    };
+    Ok(format!(
+        "{} ({project})\nImports:{}\nImported by:{}\nLibraries and unresolved: {}",
+        ken_address(id, &path),
+        list(&r.imports),
+        list(&r.imported_by),
+        if r.external.is_empty() { "(none)".to_string() } else { r.external.join(", ") }
+    ))
+}
+
+/// Most neighbours `related` lists.
 const RELATED_LIMIT: usize = 40;
 
 /// What a file, ruling or ticket is related to (knowledge-core decision 21):
@@ -1223,7 +1284,7 @@ const RELATED_LIMIT: usize = 40;
 /// named project, else the knowledge base, else the first repo whose index
 /// has it; an id in a ruling's or a ticket's shape is looked up in the
 /// knowledge base.
-fn related_files(server: &Server, args: &Value) -> Result<String, String> {
+fn related(server: &Server, args: &Value) -> Result<String, String> {
     use ken_core::graph::Node;
     let path = require_str(args, "path")?.trim().replace('\\', "/");
     let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
@@ -1338,11 +1399,11 @@ fn next_line(path: &str, symbol: Option<&str>) -> String {
 // --- short hits and meaning search ---
 
 /// About this many characters of each hit are shown: whole chunks made a
-/// route_query answer a median 17,660 characters for 8 hits (Shattered
-/// Realms eval, 2026-10-06), and read_document gives the rest on request.
+/// search answer a median 17,660 characters for 8 hits (Shattered
+/// Realms eval, 2026-10-06), and `read` gives the rest on request.
 const SNIPPET_CHARS: usize = 300;
 
-/// Lines read_document shows before and after a single line it is pointed
+/// Lines `read` shows before and after a single line it is pointed
 /// at (`#L88`), so reading around a hit is one call of about 50 lines.
 const READ_BEFORE: i64 = 10;
 const READ_AFTER: i64 = 40;
@@ -1573,18 +1634,19 @@ fn keyword_only_note(qv: &QueryVector) -> String {
     }
 }
 
-/// Hits route_query and semantic_search return unless asked: eight short
-/// hits measured a median 4,554 characters (Shattered Realms eval,
-/// 2026-10-06), so ten cost about 6,000, where eight whole chunks took 17,660.
+/// Hits `search` returns unless asked: eight short hits measured a median
+/// 4,554 characters (Shattered Realms eval, 2026-10-06), so ten cost about
+/// 6,000, where eight whole chunks took 17,660.
 const ROUTE_LIMIT: usize = 10;
 
-/// Search every source and merge the hits once (knowledge-core decision
-/// 20): `routing::plan_route` picks the sources, `routing::search_target`
+/// `search`: every source searched and the hits merged once (knowledge-core
+/// decisions 15 and 20). `routing::plan_route` picks the sources, or the
+/// `project` argument names them (`RoutePlan::chosen`); `routing::search_target`
 /// searches each with the question's vector when its index was built by the
 /// same model ([`vector_for`]), the held-back reference repos only when
 /// nothing else answered, and `routing::merge_routed` merges. The question is
 /// embedded once; hits are cut short last.
-fn route_query(server: &Server, args: &Value) -> Result<String, String> {
+fn search(server: &Server, args: &Value) -> Result<String, String> {
     let query = require_str(args, "query")?;
     let limit = args
         .get("limit")
@@ -1600,31 +1662,55 @@ folder in the Ken app first."
     }
 
     // Every registered project of the open workspace whose folder is there is
-    // a source. Each index is opened once; one that will not open is
-    // searched as unavailable and reported.
+    // a source, and the one the server is locked to. Each index is opened
+    // once; one that will not open is searched as unavailable and reported.
+    let inside = in_open_workspace(server, &registry);
+    let locked = |p: &Path| server.scoped.as_deref().is_some_and(|r| same_canonical(p, r));
     let mut members: Vec<MemberInfo> = Vec::new();
     let mut dbs: HashMap<Uuid, Db> = HashMap::new();
-    let inside = in_open_workspace(server, &registry);
-    for entry in &registry.projects {
-        if !entry.path.is_dir() || !inside(&entry.path) {
-            continue;
-        }
+    let mut join = |entry: &registry::RegistryEntry, members: &mut Vec<MemberInfo>| {
         if let Ok(db) = Db::open_read_only(&server.base_dir, entry.id) {
             dbs.insert(entry.id, db);
         }
-        members.push(MemberInfo {
-            project_id: entry.id,
-            name: entry.name.clone(),
-            reference: routing::is_reference(&entry.kind),
-        });
+        members.push(MemberInfo { project_id: entry.id, name: entry.name.clone(), reference: routing::is_reference(&entry.kind) });
+    };
+    for entry in &registry.projects {
+        if entry.path.is_dir() && (inside(&entry.path) || locked(&entry.path)) {
+            join(entry, &mut members);
+        }
     }
 
-    let plan = routing::plan_route(&query, &members);
+    // `project` narrows the search to the repos it names, by name, id or
+    // folder, comma-separated; a registered repo outside the workspace may be
+    // named too.
+    let chosen = opt_str(args, "project");
+    let plan = match &chosen {
+        Some(list) => {
+            let mut ids: Vec<Uuid> = Vec::new();
+            for want in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+                let want_id = want.strip_prefix("ken://").unwrap_or(want).split('/').next().and_then(|s| s.parse::<Uuid>().ok());
+                let Some(entry) = registry.projects.iter().find(|p| {
+                    p.name.eq_ignore_ascii_case(want) || Some(p.id) == want_id || p.path == Path::new(want) || same_canonical(&p.path, Path::new(want))
+                }) else {
+                    let names: Vec<&str> = registry.projects.iter().map(|p| p.name.as_str()).collect();
+                    return Err(format!("No Ken project matches {want:?}. Available projects: {}.", names.join(", ")));
+                };
+                if !members.iter().any(|m| m.project_id == entry.id) {
+                    join(entry, &mut members);
+                }
+                if !ids.contains(&entry.id) {
+                    ids.push(entry.id);
+                }
+            }
+            routing::RoutePlan::chosen(ids)
+        }
+        None => routing::plan_route(&query, &members),
+    };
     let types = types_arg(args);
     // One vocabulary for the whole search (the team wiki's widens every repo).
     let shared_vocab = routing::workspace_vocabulary(dbs.values());
     let qv = if members.is_empty() { Err("nothing to search".to_string()) } else { query_vector(server, &query) };
-    let search = |ids: &[Uuid]| -> Vec<MemberHits> {
+    let run = |ids: &[Uuid]| -> Vec<MemberHits> {
         ids.iter()
             .map(|id| {
                 let name = members.iter().find(|m| m.project_id == *id).map_or("", |m| m.name.as_str());
@@ -1637,9 +1723,9 @@ folder in the Ken app first."
             })
             .collect()
     };
-    let mut member_hits = search(&plan.targets);
+    let mut member_hits = run(&plan.targets);
     if routing::needs_reserve(&plan, &member_hits) {
-        member_hits.extend(search(&plan.reserve));
+        member_hits.extend(run(&plan.reserve));
     }
 
     let mut report = routing::merge_routed(&plan, &member_hits, limit);
@@ -1656,7 +1742,7 @@ folder in the Ken app first."
         hit.snippet = snippet;
         hit.line = line;
     }
-    let mut out = format_execution_report(&report, &members);
+    let mut out = format_execution_report(&report, &members, chosen.is_some());
     if !members.is_empty() {
         let note = keyword_only_note(&qv);
         // After the Route and Sources lines, which a reader looks for first.
@@ -1677,12 +1763,13 @@ fn percent(part: i64, whole: i64) -> i64 {
     }
 }
 
-/// Renders a route_query [`routing::ExecutionReport`] as tool-call text:
-/// the route, how each source's search went, the reference repos held back,
-/// then the hits.
-fn format_execution_report(report: &routing::ExecutionReport, members: &[MemberInfo]) -> String {
+/// Renders a `search` [`routing::ExecutionReport`] as tool-call text: the
+/// route (`chosen` when the `project` argument named the sources), how each
+/// source's search went, the reference repos held back, then the hits.
+fn format_execution_report(report: &routing::ExecutionReport, members: &[MemberInfo], chosen: bool) -> String {
     let name_of = |id: &Uuid| members.iter().find(|m| m.project_id == *id).map_or_else(|| id.to_string(), |m| m.name.clone());
     let reason = match report.plan.reason {
+        RouteReason::Named if chosen => "the project asked for",
         RouteReason::Named => "named in the question",
         RouteReason::Every => "every source",
     };
@@ -1818,7 +1905,7 @@ fn journal_append_tool(server: &Server, args: &Value) -> Result<String, String> 
     ))
 }
 
-// --- Your day tools: task_create / task_update / task_list / ticket_list ---
+// --- The personal set: task_create / task_update / task_list ---
 //
 // The file logic is `ken_core::day`, the same core the app's Your day
 // commands use, so a task written here reads the same there.
@@ -1982,51 +2069,49 @@ fn task_list_tool(server: &Server, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-/// `ticket_list`: the ticket files in the workspace's repos, read-only.
-fn ticket_list_tool(server: &Server, args: &Value) -> Result<String, String> {
+/// `tickets`: the ticket files (`tickets/<ID>.md`) of the workspace's
+/// repos, read-only: the work in flight and done (knowledge-core decision 8).
+/// Every ticket by default; `assignee: me` keeps the person's.
+fn tickets(server: &Server, args: &Value) -> Result<String, String> {
     let mine = match args.get("assignee").and_then(Value::as_str).map(str::trim) {
-        None | Some("") | Some("me") => true,
-        Some("all") => false,
-        Some(other) => return Err(format!("invalid \"assignee\" {other:?} — use me or all")),
+        None | Some("") | Some("all") => false,
+        Some("me") => true,
+        Some(other) => return Err(format!("invalid \"assignee\" {other:?} — use all or me")),
     };
     let open_only = match args.get("state").and_then(Value::as_str).map(str::trim) {
         None | Some("") | Some("open") => true,
         Some("all") => false,
         Some(other) => return Err(format!("invalid \"state\" {other:?} — use open or all")),
     };
-    let workspace_root = resolve_workspace_root(server)?;
-    let ws = ken_core::workspace::Workspace::open(&workspace_root)
-        .map_err(|e| format!("could not open the workspace at {}: {e}", workspace_root.display()))?;
     let me = day::git_me();
     if mine && !me.is_known() {
         return Ok("git has no user.name or user.email on this machine, so no ticket can be matched to \
-you. Pass assignee \"all\" to list every ticket."
+you. Leave assignee out to list every ticket."
             .to_string());
     }
-    let (today, _) = task_clock();
-    let tasks_all = resolve_task_homes(server).map(|h| h.scan(&today)).unwrap_or_default();
-
+    let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let inside = in_open_workspace(server, &registry);
+    let repos: Vec<_> = registry.projects.iter().filter(|e| e.path.is_dir() && inside(&e.path)).collect();
     let mut found: Vec<(day::Ticket, String, Uuid)> = Vec::new();
-    for m in &ws.members {
-        let ken_core::workspace::MemberStatus::Ok(p) = &m.status else { continue };
-        for t in day::scan_tickets(&p.root) {
+    for e in &repos {
+        for t in day::scan_tickets(&e.path) {
             if (open_only && !t.open) || (mine && !me.assigned(&t)) {
                 continue;
             }
-            found.push((t, m.name.clone(), p.config.id));
+            found.push((t, e.name.clone(), e.id));
         }
     }
     if found.is_empty() {
         return Ok(format!(
-            "No {}tickets{}.",
+            "No {}tickets{} in {} repo(s).",
             if open_only { "open " } else { "" },
-            if mine { " assigned to you" } else { "" }
+            if mine { " assigned to you" } else { "" },
+            repos.len()
         ));
     }
     found.sort_by(|a, b| day::ticket_order(&a.0, &b.0));
     let mut out = format!("{} ticket{}:\n", found.len(), if found.len() == 1 { "" } else { "s" });
     for (t, repo, pid) in &found {
-        let (n, done) = day::linked_counts(&tasks_all, Some(repo.as_str()), &t.id);
         let mut parts = vec![if t.state.is_empty() { "no status".to_string() } else { t.state.clone() }];
         parts.push(format!("repo {repo}"));
         if let Some(d) = &t.target {
@@ -2035,12 +2120,138 @@ you. Pass assignee \"all\" to list every ticket."
         if !t.assignees.is_empty() {
             parts.push(format!("assignee {}", t.assignees.join(", ")));
         }
-        if n > 0 {
-            parts.push(format!("{n} task{}, {done} done", if n == 1 { "" } else { "s" }));
-        }
         out.push_str(&format!("\n{} — \"{}\" [{}] — {}", t.id, t.title, parts.join(", "), ken_address(*pid, &t.rel_path)));
     }
     Ok(out)
+}
+
+/// The open workspace's knowledge base: the first of its repos with an
+/// ingest inbox, else the first Ken counts as a library (`registry::is_library`).
+fn knowledge_base(server: &Server) -> Result<(Uuid, String, PathBuf), String> {
+    let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let inside = in_open_workspace(server, &registry);
+    let repos: Vec<_> = registry.projects.iter().filter(|e| e.path.is_dir() && inside(&e.path)).collect();
+    repos
+        .iter()
+        .find(|e| ken_core::ingest::has_inbox(&e.path))
+        .or_else(|| repos.iter().find(|e| registry::is_library(&e.path)))
+        .map(|e| (e.id, e.name.clone(), e.path.clone()))
+        .ok_or_else(|| "The open workspace has no knowledge base yet: set one up in Ken first.".to_string())
+}
+
+/// A note named the way a ruling's `sources:` line names it: its file stem,
+/// with any `[[ ]]`, folders and `.md` taken off.
+fn note_name(given: &str) -> String {
+    let s = given.trim().trim_start_matches("[[").trim_end_matches("]]");
+    let s = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    s.strip_suffix(".md").unwrap_or(s).trim().to_string()
+}
+
+/// `propose_decision`: a ruling from chat as a ready entry for the knowledge
+/// base's decisions log (knowledge-core decision 13), filed in its Inbox the
+/// way ingest files one (`proposal::file_page_proposal`, with `append` set).
+/// The log is never written here: a person adds the entry in one click, and
+/// it takes the next number then.
+fn propose_decision(server: &Server, args: &Value) -> Result<String, String> {
+    use ken_core::ingest::DECISIONS_LOG;
+    use ken_core::proposal::{self, Proposal, RulingEntry};
+    let ruling = require_str(args, "ruling")?;
+    let why = require_str(args, "why")?;
+    let (id, name, root) = knowledge_base(server)?;
+    // Only an index the app made: this never makes one of its own.
+    Db::open_read_only(&server.base_dir, id)
+        .map_err(|_| format!("The knowledge base \"{name}\" has no index yet: open it in Ken once so Ken can build it."))?;
+    let mut db = Db::open(&server.base_dir, id).map_err(|e| format!("could not open the knowledge base's index: {e}"))?;
+    let log = if root.join(DECISIONS_LOG).is_file() {
+        DECISIONS_LOG.to_string()
+    } else {
+        db.paths_named(&["decisions.md"]).ok().and_then(|p| p.into_iter().next()).unwrap_or_else(|| DECISIONS_LOG.to_string())
+    };
+    let text = std::fs::read_to_string(root.join(&log)).unwrap_or_else(|_| "# Decisions\n".to_string());
+    let (today, _) = local_today_and_time();
+    let entry = RulingEntry {
+        ruling: ruling.trim().to_string(),
+        decider: opt_str(args, "who"),
+        date: today,
+        note: opt_str(args, "source").map(|s| note_name(&s)).unwrap_or_default(),
+        topic: opt_str(args, "topic").unwrap_or_default(),
+        why: why.trim().to_string(),
+        quote: opt_str(args, "quote").unwrap_or_default(),
+        aliases: str_list(args, "aliases").unwrap_or_default(),
+        supersedes: str_list(args, "supersedes").unwrap_or_default(),
+    };
+    // Shown as the entry against the log now; added against the log as it is
+    // when a person adds it.
+    let proposed = ken_core::ingest::decisions_entry(&text, &entry);
+    let title = format!("Ruling: {}", entry.ruling.chars().take(60).collect::<String>());
+    let who = entry.decider.as_deref().map(|w| format!(", made by {w}")).unwrap_or_default();
+    let body = format!(
+        "Proposed in chat{who}: \"{}\". Add it to the decisions log in one click; it takes the next number then. Or discard it.",
+        entry.ruling
+    );
+    let p = Proposal { append: Some(entry), from: Some(proposal::FROM_CHAT.to_string()), ..Proposal::new(log.clone(), text, proposed) };
+    proposal::file_page_proposal(&mut db, &p, &title, &body, now_secs()).map_err(|e| format!("could not file the ruling: {e}"))?;
+    Ok(format!(
+        "Proposed for {log} in {name}: \"{}\". It waits in Ken's Inbox for a person to add it in one click (it takes the \
+next number then) or discard it. Nothing was written to the log.",
+        ruling.trim()
+    ))
+}
+
+/// `add_source`: a file of one of the workspace's repos, or a pasted text as
+/// a note (`ingest::note_source`), put in the knowledge base's inbox
+/// (`Research/Ingestion/Raw/`, under a free name: `ingest::raw_target`) for
+/// the next ingest pass. Nothing is ingested or edited here.
+fn add_source(server: &Server, args: &Value) -> Result<String, String> {
+    use ken_core::ingest::{self, MAX_SOURCE_CHARS, RAW};
+    let (kb_id, kb_name, kb_root) = knowledge_base(server)?;
+    let text = args.get("text").and_then(Value::as_str).filter(|t| !t.trim().is_empty());
+    let target = match (opt_str(args, "path"), text) {
+        (Some(_), Some(_)) => return Err("Give a file's path or the text, not both.".into()),
+        (None, None) => {
+            return Err("Give `path` (a file in one of the workspace's repos: a ken:// address, or a path with `project`) \
+or `text` with a `title`."
+                .into())
+        }
+        (Some(given), None) => {
+            // Only a file of a registered repo, refused outside it: a source
+            // is read by Claude and lands in a repo the team shares.
+            let (named, rel, _) = split_address(args, &given);
+            let (project, _) = resolve_project(server, &named)?;
+            let abs = project
+                .resolve(&rel)
+                .map_err(|_| format!("{rel:?} is outside the project — paths are relative to the project root and may not contain \"..\""))?;
+            if !abs.is_file() {
+                return Err(format!("{rel:?} is not a file in project \"{}\".", project.config.name));
+            }
+            let raw = kb_root.join(RAW);
+            if abs.canonicalize().ok().zip(raw.canonicalize().ok()).is_some_and(|(a, r)| a.starts_with(r)) {
+                return Err(format!("{rel} is in the inbox already; the next ingest pass reads it."));
+            }
+            let name = abs.file_name().map(|n| n.to_string_lossy().to_string()).ok_or("a file with no name")?;
+            let target = ingest::raw_target(&kb_root, &name).map_err(|e| e.to_string())?;
+            std::fs::copy(&abs, &target).map_err(|e| format!("could not copy {rel}: {e}"))?;
+            target
+        }
+        (None, Some(text)) => {
+            if text.len() > MAX_SOURCE_CHARS {
+                return Err(format!(
+                    "The text is longer than {MAX_SOURCE_CHARS} characters, the most one source may be; put it in a file in one of the repos and add that."
+                ));
+            }
+            let stamp = chrono::Local::now().format("%Y-%m-%d %H.%M").to_string();
+            let (name, doc) = ingest::note_source(&stamp, opt_str(args, "title").as_deref(), text, None);
+            let target = ingest::raw_target(&kb_root, &name).map_err(|e| e.to_string())?;
+            std::fs::write(&target, doc).map_err(|e| format!("could not write {name}: {e}"))?;
+            target
+        }
+    };
+    let rel = format!("{RAW}/{}", target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+    Ok(format!(
+        "Put {rel} in {kb_name}'s inbox ({}). Ken's next ingest pass reads it into a dated note and updates the pages it \
+changes; nothing was ingested or edited here.",
+        ken_address(kb_id, &rel)
+    ))
 }
 
 /// What an agent must know before it trusts a page hit, beyond its label
@@ -2095,7 +2306,7 @@ fn resolve_project(server: &Server, args: &Value) -> Result<(Project, Option<Str
 
     if let Some(root) = &server.scoped {
         // Another repo of the open workspace, when one is named (by name,
-        // folder, id or a ken://<id>/ address): a route_query hit in a code
+        // folder, id or a ken://<id>/ address): a search hit in a code
         // repo is read where it lives, not looked for in this one.
         if let Some(req) = requested.filter(|r| !r.is_empty()) {
             if let Ok(registry) = Registry::load(&server.base_dir) {
@@ -2423,6 +2634,25 @@ mod tests {
         assert_eq!(reply["error"]["code"], -32602);
     }
 
+    /// The knowledge server's tools, in decision 22's order.
+    const KNOWLEDGE_TOOLS: [&str; 12] = [
+        "search",
+        "read",
+        "related",
+        "code_definition",
+        "code_usages",
+        "code_outline",
+        "code_imports",
+        "history",
+        "tickets",
+        "propose_decision",
+        "add_source",
+        "repos",
+    ];
+
+    /// The personal set (`--personal`), without open_in_ken (no app here).
+    const PERSONAL_TOOLS: [&str; 5] = ["task_list", "task_create", "task_update", "memory_write", "journal_append"];
+
     #[test]
     fn tools_list_names_the_base_tools() {
         let mut fx = fixture(true);
@@ -2431,7 +2661,7 @@ mod tests {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
+            KNOWLEDGE_TOOLS
         );
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
@@ -2448,33 +2678,42 @@ mod tests {
         let mut db = Db::open(&fx.server.base_dir, project.config.id).unwrap();
         scan::scan(&project, &mut db).unwrap();
 
-        let (text, is_err) = tool(&mut fx.server, "find_definition", json!({"name": "save_world"}));
+        let (text, is_err) = tool(&mut fx.server, "code_definition", json!({"name": "save_world"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("function save_world") && text.contains("app/store.py#L2"), "{text}");
         assert!(text.contains("Keeps the world on disk"), "docs: {text}");
 
-        let (text, _) = tool(&mut fx.server, "find_usages", json!({"name": "save_world"}));
+        let (text, _) = tool(&mut fx.server, "code_usages", json!({"name": "save_world"}));
         assert!(text.contains("app/game.py#L4") && text.contains("called from: tick"), "{text}");
 
-        let (text, _) = tool(&mut fx.server, "file_outline", json!({"path": "app/store.py"}));
+        let (text, _) = tool(&mut fx.server, "code_outline", json!({"path": "app/store.py"}));
         assert!(text.contains("class Store") && text.contains("\n  method open") || text.contains("\n  function open"), "{text}");
 
         // The project graph answers, with the code index's imports for a
         // code file (decision 21).
-        let (text, _) = tool(&mut fx.server, "related_files", json!({"path": "app/game.py"}));
+        let (text, _) = tool(&mut fx.server, "related", json!({"path": "app/game.py"}));
         assert!(text.contains("\n  - imports ken://") && text.contains("app/store.py"), "{text}");
-        let (text, _) = tool(&mut fx.server, "related_files", json!({"path": "app/store.py"}));
+        let (text, _) = tool(&mut fx.server, "related", json!({"path": "app/store.py"}));
         assert!(text.contains("\n  - ← imports ken://") && text.contains("app/game.py"), "{text}");
 
-        let (text, _) = tool(&mut fx.server, "find_definition", json!({"name": "nothing_like_it"}));
+        // code_imports: a file's imports, importers and libraries (decision 22).
+        let (text, is_err) = tool(&mut fx.server, "code_imports", json!({"path": "app/game.py"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("\nImports:\n  - ken://") && text.contains("/app/store.py\nImported by: (none)"), "{text}");
+        let (text, _) = tool(&mut fx.server, "code_imports", json!({"path": "app/store.py"}));
+        assert!(text.contains("\nImports: (none)\nImported by:\n  - ken://") && text.contains("/app/game.py"), "{text}");
+        let (text, is_err) = tool(&mut fx.server, "code_imports", json!({"path": "notes/meeting.md"}));
+        assert!(is_err && text.contains("not in the code index"), "{text}");
+
+        let (text, _) = tool(&mut fx.server, "code_definition", json!({"name": "nothing_like_it"}));
         assert!(text.contains("look directly"), "empty says to look: {text}");
 
         // Plain words reach the definition; the hit names its symbol and
         // offers the calls that go further (decision 26).
-        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "save world"}));
+        let (text, _) = tool(&mut fx.server, "search", json!({"query": "save world"}));
         assert!(text.contains("app/store.py:2 `save_world`"), "{text}");
-        assert!(text.contains("next: find_usages save_world · file_outline app/store.py · related_files app/store.py"), "{text}");
-        assert!(!text.contains("next: file_outline notes/"), "pages offer no code calls: {text}");
+        assert!(text.contains("next: code_usages save_world · code_outline app/store.py · code_imports app/store.py"), "{text}");
+        assert!(!text.contains("next: code_outline notes/"), "pages offer no code calls: {text}");
     }
 
     #[test]
@@ -2539,55 +2778,58 @@ mod tests {
     #[test]
     fn hits_are_tagged_by_kind_and_a_kind_filter_keeps_only_that() {
         let mut fx = fixture(true);
-        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing"}));
+        let (text, is_err) = tool(&mut fx.server, "search", json!({"query": "billing"}));
         assert!(!is_err, "{text}");
-        assert!(text.contains("[note · ") && text.contains("] notes/meeting.md"), "a note labelled with its kind: {text}");
-        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "code"}));
+        assert!(text.contains("[note · ") && text.contains("] Atlas:notes/meeting.md"), "a note labelled with its kind: {text}");
+        let (text, _) = tool(&mut fx.server, "search", json!({"query": "billing", "type": "code"}));
         assert!(!text.contains("notes/meeting.md"), "code only: {text}");
-        let (text, _) = tool(&mut fx.server, "semantic_search", json!({"query": "billing", "type": "note,doc"}));
+        let (text, _) = tool(&mut fx.server, "search", json!({"query": "billing", "type": "note,doc"}));
         assert!(text.contains("notes/meeting.md"), "{text}");
     }
 
     #[test]
     fn scoped_tools_work_and_ignore_project_arg() {
         let mut fx = fixture(true);
-        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing cutover"}));
+        let (text, is_err) = tool(&mut fx.server, "search", json!({"query": "billing cutover"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("notes/meeting.md"), "{text}");
         assert!(!text.contains("<mark>"), "{text}");
 
-        // A supplied project arg is ignored with a note.
-        let (text, is_err) =
-            tool(&mut fx.server, "semantic_search", json!({"query": "billing", "project": "Other"}));
-        assert!(!is_err);
-        assert!(text.contains("locked to project \"Atlas\""), "{text}");
-
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": "People.md"}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "People.md"}));
         assert!(!is_err);
         assert!(text.contains("Priya Natarajan"), "{text}");
 
-        let (text, is_err) = tool(&mut fx.server, "list_documents", json!({"folder": "notes"}));
+        // A supplied project the registry lacks is ignored with a note.
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "People.md", "project": "Other"}));
         assert!(!is_err);
-        assert!(text.contains("notes/meeting.md"), "{text}");
+        assert!(text.contains("locked to project \"Atlas\"") && text.contains("Priya Natarajan"), "{text}");
+
+        // A folder lists its indexed files (what list_documents was), and `.`
+        // the whole project's.
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "notes"}));
+        assert!(!is_err);
+        assert!(text.contains("under \"notes\"") && text.contains("notes/meeting.md"), "{text}");
         assert!(!text.contains("People.md"), "{text}");
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "."}));
+        assert!(text.contains("notes/meeting.md") && text.contains("People.md"), "{text}");
     }
 
     #[test]
-    fn read_document_refuses_escapes() {
+    fn read_refuses_escapes() {
         let mut fx = fixture(true);
         for path in ["../etc/passwd", "/etc/passwd", "notes/../../etc/passwd"] {
-            let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": path}));
+            let (text, is_err) = tool(&mut fx.server, "read", json!({"path": path}));
             assert!(is_err, "{path} should be refused");
             assert!(text.contains("outside the project"), "{text}");
         }
         // And an unknown-but-safe path is a helpful index miss.
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": "nope.md"}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "nope.md"}));
         assert!(is_err);
         assert!(text.contains("not in project"), "{text}");
     }
 
     #[test]
-    fn read_document_caps_large_files() {
+    fn read_caps_large_files() {
         let mut fx = fixture(true);
         let big = "é".repeat(150 * 1024); // 300 KB of two-byte chars
         std::fs::write(fx.root.join("big.txt"), &big).unwrap();
@@ -2596,39 +2838,41 @@ mod tests {
         scan::scan(&project, &mut db).unwrap();
         drop(db);
 
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": "big.txt"}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "big.txt"}));
         assert!(!is_err, "{}", &text[..200.min(text.len())]);
         assert!(text.contains("[truncated"), "no truncation note");
         assert!(text.len() < 210 * 1024, "way over cap: {}", text.len());
     }
 
     #[test]
-    fn unscoped_requires_and_matches_project() {
+    fn unscoped_search_covers_every_repo_and_a_path_needs_its_project() {
         let mut fx = fixture(false);
-        // Missing project → helpful error naming projects.
-        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({"query": "billing"}));
-        assert!(is_err);
-        assert!(text.contains("Available projects: Atlas"), "{text}");
+        // Search needs no project: every repo of the workspace.
+        let (text, is_err) = tool(&mut fx.server, "search", json!({"query": "billing"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("notes/meeting.md"), "{text}");
 
-        // Unknown project → same courtesy.
-        let (text, is_err) =
-            tool(&mut fx.server, "semantic_search", json!({"query": "billing", "project": "Zeus"}));
+        // An unknown project is a helpful error naming the projects.
+        let (text, is_err) = tool(&mut fx.server, "search", json!({"query": "billing", "project": "Zeus"}));
         assert!(is_err);
-        assert!(text.contains("No Ken project matches"), "{text}");
+        assert!(text.contains("No Ken project matches") && text.contains("Available projects: Atlas"), "{text}");
 
         // Match by name (case-insensitive) and by path.
-        let (text, is_err) =
-            tool(&mut fx.server, "semantic_search", json!({"query": "billing", "project": "atlas"}));
+        let (text, is_err) = tool(&mut fx.server, "search", json!({"query": "billing", "project": "atlas"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("notes/meeting.md"));
         let root = fx.root.to_string_lossy().to_string();
-        let (text, is_err) =
-            tool(&mut fx.server, "list_documents", json!({"project": root}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": ".", "project": root}));
         assert!(!is_err, "{text}");
         assert!(text.contains("People.md"));
 
-        // list_projects works without any scoping.
-        let (text, is_err) = tool(&mut fx.server, "list_projects", json!({}));
+        // A project-relative path needs its project.
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "People.md"}));
+        assert!(is_err);
+        assert!(text.contains("Available projects: Atlas"), "{text}");
+
+        // repos works without any scoping.
+        let (text, is_err) = tool(&mut fx.server, "repos", json!({}));
         assert!(!is_err);
         assert!(text.contains("Atlas"), "{text}");
     }
@@ -2636,10 +2880,13 @@ mod tests {
     #[test]
     fn missing_required_args_are_tool_errors() {
         let mut fx = fixture(true);
-        let (text, is_err) = tool(&mut fx.server, "semantic_search", json!({}));
+        let (text, is_err) = tool(&mut fx.server, "search", json!({}));
         assert!(is_err);
         assert!(text.contains("\"query\" argument is required"), "{text}");
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({}));
+        let (text, is_err) = tool(&mut fx.server, "propose_decision", json!({"ruling": "x"}));
+        assert!(is_err);
+        assert!(text.contains("\"why\" argument is required"), "{text}");
+        let (text, is_err) = tool(&mut fx.server, "read", json!({}));
         assert!(is_err);
         assert!(text.contains("\"path\" argument is required"), "{text}");
     }
@@ -2709,55 +2956,40 @@ mod tests {
     }
 
     #[test]
-    fn route_query_searches_only_the_source_the_question_names() {
+    fn search_searches_only_the_source_the_question_names() {
         let (_base, _ra, _rb, mut server) = two_project_fixture();
         let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(
-            names,
-            [
-                "find_definition",
-                "find_usages",
-                "file_outline",
-                "related_files",
-                "history",
-                "read_document",
-                "list_documents",
-                "list_projects",
-                "semantic_search",
-                "route_query",
-                "memory_write",
-                "journal_append",
-                "task_create",
-                "task_update",
-                "task_list",
-                "ticket_list"
-            ]
-        );
+        assert_eq!(names, KNOWLEDGE_TOOLS);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
         }
 
         // "Atlas" names a member, so only Atlas is searched.
-        let (text, is_err) = tool(&mut server, "route_query", json!({"query": "Atlas launch schedule"}));
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "Atlas launch schedule"}));
         assert!(!is_err, "{text}");
         assert!(text.starts_with("Route: named in the question (1 searched)."), "{text}");
         assert!(text.contains("a.md"), "{text}");
         assert!(!text.contains("b.md"), "{text}");
 
         // Named by nothing: every source, merged once.
-        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule"}));
         assert!(text.starts_with("Route: every source (2 searched)."), "{text}");
         assert!(text.contains("Sources: Atlas (searched), Zeus (searched)") || text.contains("Sources: Zeus (searched), Atlas (searched)"), "{text}");
+        assert!(text.contains("a.md") && text.contains("b.md"), "{text}");
+
+        // Both named by `project`, in its order.
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule", "project": "Zeus, Atlas"}));
+        assert!(text.starts_with("Route: the project asked for (2 searched)."), "{text}");
         assert!(text.contains("a.md") && text.contains("b.md"), "{text}");
     }
 
     /// A reference repo is held back from a question about the team's own
     /// work and said so; it joins when nothing else answers.
     #[test]
-    fn route_query_holds_a_reference_repo_back_until_nothing_else_answers() {
+    fn search_holds_a_reference_repo_back_until_nothing_else_answers() {
         let (_base, _ra, rb, mut server) = two_project_fixture();
         let mut registry = Registry::load(&server.base_dir).unwrap();
         let zeus = registry.projects.iter().find(|e| e.name == "Zeus").unwrap().id;
@@ -2770,11 +3002,11 @@ mod tests {
         index_semantically(&project, &mut db);
         drop(db);
 
-        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule"}));
         assert!(text.contains("Held back: Zeus"), "{text}");
         assert!(text.contains("a.md") && !text.contains("b.md"), "{text}");
 
-        let (text, _) = tool(&mut server, "route_query", json!({"query": "rendering pipeline"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "rendering pipeline"}));
         assert!(!text.contains("Held back"), "{text}");
         assert!(text.contains("engine.md"), "nothing else answered: {text}");
     }
@@ -2798,26 +3030,18 @@ mod tests {
     }
 
     #[test]
-    fn semantic_search_with_explicit_project_touches_only_that_member() {
+    fn search_with_a_project_touches_only_that_member() {
         let (_base, _ra, _rb, mut server) = two_project_fixture();
-        let (text, is_err) = tool(
-            &mut server,
-            "semantic_search",
-            json!({"query": "launch schedule", "project": "Atlas"}),
-        );
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "launch schedule", "project": "Atlas"}));
         assert!(!is_err, "{text}");
-        assert!(text.contains("project \"Atlas\""), "{text}");
+        assert!(text.starts_with("Route: the project asked for (1 searched).\nSources: Atlas (searched)"), "{text}");
         assert!(text.contains("a.md"), "{text}");
         assert!(!text.contains("b.md"), "{text}");
         assert!(text.contains("ken://"), "{text}");
 
-        let (text, is_err) = tool(
-            &mut server,
-            "semantic_search",
-            json!({"query": "launch schedule", "project": "Zeus"}),
-        );
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "launch schedule", "project": "Zeus"}));
         assert!(!is_err, "{text}");
-        assert!(text.contains("project \"Zeus\""), "{text}");
+        assert!(text.contains("Sources: Zeus (searched)"), "{text}");
         assert!(text.contains("b.md"), "{text}");
         assert!(!text.contains("a.md"), "{text}");
     }
@@ -2826,20 +3050,20 @@ mod tests {
     fn search_uses_meaning_when_the_model_is_there_and_says_so_when_not() {
         let (_base, _ra, _rb, mut server) = two_project_fixture();
         // No model installed: keyword only, in one line.
-        let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "launch schedule", "project": "Atlas"}));
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "launch schedule", "project": "Atlas"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("Keyword search only: no embedding model is installed"), "{text}");
         assert!(text.contains("[keyword]") && !text.contains("semantic]"), "{text}");
-        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule"}));
         assert!(text.starts_with("Route: "), "the note follows the route: {text}");
         assert!(text.contains("\nKeyword search only:"), "{text}");
 
         // The model the indexes were built with: meaning joins keyword.
         server.meaning = RefCell::new(Meaning::Ready(Box::new(ken_core::embedder::FakeEmbedder::new())));
-        let (text, _) = tool(&mut server, "semantic_search", json!({"query": "launch schedule", "project": "Atlas"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule", "project": "Atlas"}));
         assert!(!text.contains("Keyword search only"), "{text}");
         assert!(text.contains("[keyword+semantic]"), "{text}");
-        let (text, _) = tool(&mut server, "route_query", json!({"query": "launch schedule"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule"}));
         assert!(!text.contains("Keyword search only"), "{text}");
         assert!(text.contains("semantic]"), "{text}");
     }
@@ -2889,7 +3113,7 @@ mod tests {
     }
 
     #[test]
-    fn route_query_hits_are_short_and_point_at_the_matching_line() {
+    fn search_hits_are_short_and_point_at_the_matching_line() {
         let (_base, ra, _rb, mut server) = two_project_fixture();
         let mut long = String::from("# Launch\n\n");
         for i in 0..40 {
@@ -2903,7 +3127,7 @@ mod tests {
         index_semantically(&project, &mut db);
         drop(db);
 
-        let (text, is_err) = tool(&mut server, "route_query", json!({"query": "Atlas rollback window ninety minutes"}));
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "Atlas rollback window ninety minutes"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("plan.md:83 ("), "the line of the match, not the chunk's: {text}");
         assert!(text.contains("plan.md#L83)"), "{text}");
@@ -2933,17 +3157,17 @@ mod tests {
         index_semantically(&project, &mut db);
         drop(db);
 
-        let (text, is_err) = tool(&mut server, "route_query", json!({"query": "companion pets follow the player"}));
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "companion pets follow the player"}));
         assert!(!is_err, "{text}");
         assert!(text.contains("tickets/AT-7.md"), "{text}");
         assert!(text.contains("[ticket · superseded · 2026-07-21]"), "{text}");
         assert!(text.contains("[decision D-007 · binding · 2026-10-07]"), "the entry's own id and date: {text}");
-        let (text, _) = tool(&mut server, "semantic_search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "companion pets follow the player", "project": "Atlas"}));
         assert!(text.contains("[ticket · superseded · 2026-07-21]") && text.contains("[decision D-007 · binding · 2026-10-07]"), "{text}");
     }
 
     #[test]
-    fn read_document_reads_lines_around_an_address_or_a_range() {
+    fn read_reads_lines_around_an_address_or_a_range() {
         let mut fx = fixture(true);
         let body: String = (1..=100).map(|i| format!("row {i}\n")).collect();
         std::fs::write(fx.root.join("rows.txt"), &body).unwrap();
@@ -2953,30 +3177,30 @@ mod tests {
         drop(db);
         let address = format!("ken://{}/rows.txt#L50", project.config.id);
 
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": address}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": address}));
         assert!(!is_err, "{text}");
         assert!(text.contains("[lines 40-90 of 100]\n40: row 40\n"), "{text}");
         assert!(text.ends_with("90: row 90\n"), "{text}");
 
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt", "start_line": 3, "end_line": 4}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "rows.txt", "start_line": 3, "end_line": 4}));
         assert_eq!(text, "[lines 3-4 of 100]\n3: row 3\n4: row 4\n");
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt#L98-L120"}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "rows.txt#L98-L120"}));
         assert!(text.starts_with("[lines 98-100 of 100]"), "{text}");
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt", "start_line": 500}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "rows.txt", "start_line": 500}));
         assert!(text.contains("no line 500"), "{text}");
         // No range: the whole file, as before.
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "rows.txt"}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "rows.txt"}));
         assert_eq!(text, body);
 
         // An unscoped server finds the project by the address's id.
         fx.server.scoped = None;
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": address}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": address}));
         assert!(!is_err, "{text}");
         assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
     }
 
     #[test]
-    fn read_document_reads_the_section_or_log_entry_an_address_is_in() {
+    fn read_reads_the_section_or_log_entry_an_address_is_in() {
         let mut fx = fixture(true);
         let mut page = String::from("---\ntitle: Law\n---\n\n# Law\n\n## Grades\n\n");
         for i in 1..=60 {
@@ -2999,24 +3223,24 @@ mod tests {
         drop(db);
 
         // Line 65 is the 57th of 60 levers: the whole section, not 10 lines before and 40 after.
-        let (text, is_err) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65"}));
+        let (text, is_err) = tool(&mut fx.server, "read", json!({"path": "Law.md#L65"}));
         assert!(!is_err, "{text}");
         assert!(text.starts_with("[section \"Grades\": lines 7-68 of"), "{text}");
         assert!(text.contains("\n9: Grade lever 1.\n") && text.ends_with("68: Grade lever 60.\n"), "{text}");
         assert!(!text.contains("Health"), "{text}");
         // A long section is cut at about 8,000 characters, and says where to read on.
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L300"}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "Law.md#L300"}));
         assert!(text.contains("cut at 8000 characters: read on with start_line="), "{text}");
         assert!(text.contains("\n300: A long line") && text.len() < 8_400, "{} characters", text.len());
         // A decisions log: the entry.
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "DECISIONS.md#L9"}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "DECISIONS.md#L9"}));
         assert_eq!(text, "[entry D-005: lines 9-9 of 18]\n9: **D-005** · 2026-10-06 · pets — **RULING 5.** Chris.\n");
         // Code keeps the line window; an explicit range still wins.
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "code.rs#L50"}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "code.rs#L50"}));
         assert!(text.starts_with("[lines 40-90 of 100]"), "{text}");
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65", "start_line": 65, "end_line": 66}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "Law.md#L65", "start_line": 65, "end_line": 66}));
         assert_eq!(text, "[lines 65-66 of 475]\n65: Grade lever 57.\n66: Grade lever 58.\n");
-        let (text, _) = tool(&mut fx.server, "read_document", json!({"path": "Law.md#L65-L66"}));
+        let (text, _) = tool(&mut fx.server, "read", json!({"path": "Law.md#L65-L66"}));
         assert!(text.starts_with("[lines 65-66 of"), "{text}");
     }
 
@@ -3050,31 +3274,192 @@ mod tests {
         drop(db);
 
         // The search finds D-379 by its words; D-410 comes in just above it.
-        let (text, is_err) = tool(&mut server, "semantic_search", json!({"query": "server never overwrites spawn anchors merge", "project": "Atlas"}));
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "server never overwrites spawn anchors merge", "project": "Atlas"}));
         assert!(!is_err, "{text}");
         let earlier = text.find("[decision D-379 · superseded · 2026-10-05 · superseded by D-410 on who writes anchors]").expect(&text);
         let later = text.find("[decision D-410 · binding · 2026-10-06 · supersedes D-379]").expect(&text);
         assert!(later < earlier, "the later ruling ranks first: {text}");
-        let (text, _) = tool(&mut server, "route_query", json!({"query": "server never overwrites spawn anchors merge"}));
+        let (text, _) = tool(&mut server, "search", json!({"query": "server never overwrites spawn anchors merge"}));
         assert!(text.contains("superseded by D-410 on who writes anchors"), "{text}");
 
-        let (text, _) = tool(&mut server, "read_document", json!({"path": "decisions/DECISIONS.md#L19", "project": "Atlas"}));
+        let (text, _) = tool(&mut server, "read", json!({"path": "decisions/DECISIONS.md#L19", "project": "Atlas"}));
         assert!(text.starts_with("[entry D-379: lines 19-19 of 19]"), "{text}");
         assert!(text.ends_with("[D-410 (line 7) supersedes this entry on who writes anchors]\n"), "{text}");
-        let (text, _) = tool(&mut server, "read_document", json!({"path": "decisions/DECISIONS.md#L7", "project": "Atlas"}));
+        let (text, _) = tool(&mut server, "read", json!({"path": "decisions/DECISIONS.md#L7", "project": "Atlas"}));
         assert!(text.ends_with("[this entry supersedes D-379 (line 19) on who writes anchors]\n"), "{text}");
     }
 
     #[test]
-    fn list_projects_says_which_projects_routed_search_can_use() {
+    fn repos_says_which_repos_search_can_use() {
         // Routed search is built in, whatever settings.json says.
         let mut fx = fixture(true);
         let mut settings = AppSettings::default();
         settings.features.insert("kgRouting".into(), false.into());
         settings.save(&fx.server.base_dir).unwrap();
-        let (text, is_err) = tool(&mut fx.server, "list_projects", json!({}));
+        let (text, is_err) = tool(&mut fx.server, "repos", json!({}));
         assert!(!is_err, "{text}");
         assert!(text.contains(" indexed") && text.contains("controls"), "the health line: {text}");
+        assert!(!text.contains("(knowledge base)"), "Atlas has no inbox: {text}");
+    }
+
+    // --- the brief, propose_decision and add_source (slice 10) ---
+
+    /// The knowledge server sends the brief as its `instructions` (decision
+    /// 1), led by where the knowledge base is; the personal set names itself
+    /// and says what it is for.
+    #[test]
+    fn initialize_sends_the_brief_as_instructions() {
+        let (_kb, mut server) = kb_fixture();
+        let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#).unwrap();
+        let text = reply["result"]["instructions"].as_str().unwrap().replace('\n', " ");
+        assert!(text.starts_with("The knowledge base of the open workspace is Wiki, at "), "{text}");
+        for words in [
+            "The code is the truth for how the product works today",
+            "never copies it",
+            "Decisions/DECISIONS.md",
+            "use the code index before Grep and Glob",
+            "a later ruling over an earlier one",
+            "over a ticket or note",
+            "a current page over a record",
+            "A ruling is settled",
+            "An empty search proves nothing",
+            "Cite every fact by the ken:// address",
+            "propose_decision",
+            "add_source",
+        ] {
+            assert!(text.contains(words), "{words}: {text}");
+        }
+        for tool in KNOWLEDGE_TOOLS {
+            assert!(text.contains(tool), "the brief names {tool}");
+        }
+        assert_eq!(reply["result"]["serverInfo"]["name"], "ken");
+
+        // No knowledge base yet: said, and the brief still follows.
+        let mut fx = fixture(true);
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#).unwrap();
+        let text = reply["result"]["instructions"].as_str().unwrap();
+        assert!(text.starts_with("No knowledge base is set up in the open workspace yet"), "{text}");
+        assert!(text.contains("The code is the truth"), "{text}");
+
+        fx.server.personal = true;
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#).unwrap();
+        assert_eq!(reply["result"]["serverInfo"]["name"], "ken-personal");
+        let text = reply["result"]["instructions"].as_str().unwrap();
+        assert!(text.contains("task_list") && text.contains("only when the person asks"), "{text}");
+    }
+
+    /// A registered knowledge base (an inbox and a decisions log) and a code
+    /// repo beside it, indexed, unscoped.
+    fn kb_fixture() -> (Vec<tempfile::TempDir>, Server) {
+        let base = tempfile::tempdir().unwrap();
+        let kb = tempfile::tempdir().unwrap();
+        let code = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(kb.path().join(ken_core::ingest::RAW)).unwrap();
+        std::fs::create_dir_all(kb.path().join("Decisions")).unwrap();
+        std::fs::write(kb.path().join("Decisions/DECISIONS.md"), "# Decisions\n\n## D-001 · 2026-10-01 · saves\n\n**Saves are regions.**\n").unwrap();
+        std::fs::create_dir_all(code.path().join("docs")).unwrap();
+        std::fs::write(code.path().join("docs/spec.md"), "# Save spec\n\nRegions are written whole.\n").unwrap();
+        let mut registry = Registry::default();
+        for (root, name) in [(kb.path(), "Wiki"), (code.path(), "Game")] {
+            let project = Project::create(root, name).unwrap();
+            let mut db = Db::open(base.path(), project.config.id).unwrap();
+            scan::scan(&project, &mut db).unwrap();
+            registry.add(&project);
+        }
+        registry.save(base.path()).unwrap();
+        let server = Server { base_dir: base.path().to_path_buf(), ..Default::default() };
+        (vec![base, kb, code], server)
+    }
+
+    /// A ruling from chat is filed as a ready entry in the knowledge base's
+    /// Inbox, the way ingest files one; the log is not touched (decision 13).
+    #[test]
+    fn propose_decision_files_a_ready_entry_and_never_writes_the_log() {
+        let (dirs, mut server) = kb_fixture();
+        let log_path = dirs[1].path().join("Decisions/DECISIONS.md");
+        let before = std::fs::read_to_string(&log_path).unwrap();
+        let (text, is_err) = tool(
+            &mut server,
+            "propose_decision",
+            json!({
+                "ruling": "Combat ships after region saves",
+                "why": "combat needs the region format",
+                "topic": "combat",
+                "who": "Ana",
+                "aliases": ["combat order"],
+                "supersedes": ["D-001"],
+                "source": "[[2026-10-12-standup]]"
+            }),
+        );
+        assert!(!is_err, "{text}");
+        assert!(text.contains("waits in Ken's Inbox") && text.contains("Nothing was written to the log"), "{text}");
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), before, "the log is never written here");
+
+        let registry = Registry::load(&server.base_dir).unwrap();
+        let wiki = registry.projects.iter().find(|e| e.name == "Wiki").unwrap().id;
+        let db = Db::open_read_only(&server.base_dir, wiki).unwrap();
+        let items = db.review_items_of_kind(ken_core::proposal::PROPOSAL_KIND, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].title.starts_with("Ruling: Combat ships after region saves"), "{}", items[0].title);
+        let p: ken_core::proposal::Proposal = serde_json::from_str(items[0].payload.as_deref().unwrap()).unwrap();
+        assert_eq!(ken_core::proposal::kind_of(&p), "ruling");
+        assert_eq!(p.page, "Decisions/DECISIONS.md");
+        assert_eq!(p.from.as_deref(), Some(ken_core::proposal::FROM_CHAT));
+        let entry = p.append.as_ref().unwrap();
+        assert_eq!((entry.note.as_str(), entry.decider.as_deref()), ("2026-10-12-standup", Some("Ana")));
+        assert!(p.proposed.contains("\n## D-002 · ") && p.proposed.contains("**Combat ships after region saves.**"), "{}", p.proposed);
+        assert!(p.proposed.contains("sources: [[2026-10-12-standup]]\naliases: combat order\nsupersedes: D-001\n"), "{}", p.proposed);
+
+        // Without a knowledge base there is nowhere to propose to.
+        let mut fx = fixture(false);
+        let (text, is_err) = tool(&mut fx.server, "propose_decision", json!({"ruling": "x", "why": "y"}));
+        assert!(is_err && text.contains("no knowledge base"), "{text}");
+    }
+
+    /// A source lands in the knowledge base's Raw/ under a free name, as a
+    /// pasted text or a file of a workspace repo; nothing is ingested.
+    #[test]
+    fn add_source_puts_a_text_or_a_repo_file_in_raw() {
+        let (dirs, mut server) = kb_fixture();
+        let raw = dirs[1].path().join(ken_core::ingest::RAW);
+
+        let (text, is_err) = tool(&mut server, "add_source", json!({"text": "Ana: ship combat after saves.", "title": "Combat call"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("Research/Ingestion/Raw/") && text.contains("Note - Combat call.md") && text.contains("nothing was ingested"), "{text}");
+        let notes: Vec<_> = std::fs::read_dir(&raw).unwrap().flatten().map(|e| e.path()).collect();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let doc = std::fs::read_to_string(&notes[0]).unwrap();
+        assert!(doc.starts_with("---\nkind: note\n") && doc.contains("# Combat call\n\nAna: ship combat after saves.\n"), "{doc}");
+
+        // A file of another repo, by project and path; twice gets a number.
+        for _ in 0..2 {
+            let (text, is_err) = tool(&mut server, "add_source", json!({"path": "docs/spec.md", "project": "Game"}));
+            assert!(!is_err, "{text}");
+        }
+        assert!(raw.join("spec.md").is_file() && raw.join("spec (2).md").is_file());
+        assert_eq!(std::fs::read_to_string(raw.join("spec.md")).unwrap(), "# Save spec\n\nRegions are written whole.\n");
+
+        // Refused: outside a repo, not a file, both or neither, and a file
+        // already in the inbox.
+        let (text, is_err) = tool(&mut server, "add_source", json!({"path": "../secret.txt", "project": "Game"}));
+        assert!(is_err && text.contains("outside the project"), "{text}");
+        let (text, is_err) = tool(&mut server, "add_source", json!({"path": "docs", "project": "Game"}));
+        assert!(is_err && text.contains("not a file"), "{text}");
+        let (_, is_err) = tool(&mut server, "add_source", json!({"path": "docs/spec.md", "project": "Game", "text": "x"}));
+        assert!(is_err);
+        let (_, is_err) = tool(&mut server, "add_source", json!({}));
+        assert!(is_err);
+        let (text, is_err) = tool(&mut server, "add_source", json!({"path": "Research/Ingestion/Raw/spec.md", "project": "Wiki"}));
+        assert!(is_err && text.contains("in the inbox already"), "{text}");
+    }
+
+    /// repos marks the knowledge base.
+    #[test]
+    fn repos_marks_the_knowledge_base() {
+        let (_dirs, mut server) = kb_fixture();
+        let (text, is_err) = tool(&mut server, "repos", json!({}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("\nWiki (knowledge base) — ") && text.contains("\nGame — "), "{text}");
     }
 
     // --- ken-memory (task 3.2) ---
@@ -3102,23 +3487,32 @@ mod tests {
         settings.features.insert("workspace".into(), true.into());
         settings.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, personal: true, ..Default::default() };
         (base, ws_parent, proj_root, server)
     }
 
+    /// Memory and tasks left the knowledge server (decision 22): they are
+    /// the personal set, which only Ken's own chat registers.
     #[test]
-    fn memory_tools_are_always_listed() {
-        // Default settings: Ken's memory is built in, so no flag is needed.
+    fn memory_and_task_tools_are_the_personal_set_only() {
         let mut fx = fixture(true);
-        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        let names: Vec<_> = reply["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
-        assert!(names.contains(&"memory_write".to_string()), "{names:?}");
-        assert!(names.contains(&"journal_append".to_string()), "{names:?}");
+        let list = |server: &mut Server| -> Vec<String> {
+            let reply = call(server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+            reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        };
+        let knowledge = list(&mut fx.server);
+        for gone in ["memory_write", "journal_append", "task_create", "task_update", "task_list", "open_in_ken"] {
+            assert!(!knowledge.iter().any(|n| n == gone), "{gone}: {knowledge:?}");
+        }
+        fx.server.personal = true;
+        assert_eq!(list(&mut fx.server), PERSONAL_TOOLS);
+
+        // Neither set answers the other's tools.
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"x"}}}"#).unwrap();
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        fx.server.personal = false;
+        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_list","arguments":{}}}"#).unwrap();
+        assert_eq!(reply["error"]["code"], -32602, "{reply}");
     }
 
     #[test]
@@ -3223,7 +3617,7 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.features.insert("workspace".into(), true.into());
         settings.save(base.path()).unwrap();
-        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
+        let mut server = Server { base_dir: base.path().to_path_buf(), scoped: None, personal: true, ..Default::default() };
 
         let (text, is_err) = tool(&mut server, "journal_append", json!({"text": "hi"}));
         assert!(is_err, "{text}");
@@ -3266,7 +3660,7 @@ mod tests {
         registry.last_workspace = Some(workspace.config.id);
         registry.save(base.path()).unwrap();
 
-        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, ..Default::default() };
+        let server = Server { base_dir: base.path().to_path_buf(), scoped: None, personal: true, ..Default::default() };
         (base, ws_parent, server)
     }
 
@@ -3297,10 +3691,10 @@ mod tests {
         let reply = call(&mut server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        for n in ["task_create", "task_update", "task_list", "ticket_list"] {
+        for n in ["task_create", "task_update", "task_list"] {
             assert!(names.contains(&n), "{names:?}");
         }
-        for gone in ["task_complete", "task_claim", "goal_create", "goal_list"] {
+        for gone in ["task_complete", "task_claim", "goal_create", "goal_list", "ticket_list", "tickets"] {
             assert!(!names.contains(&gone), "{gone} is gone: {names:?}");
         }
         let tc = tools.iter().find(|t| t["name"] == "task_create").unwrap();
@@ -3312,8 +3706,6 @@ mod tests {
         assert!(tu["description"].as_str().unwrap().contains("journal"));
         let tl = tools.iter().find(|t| t["name"] == "task_list").unwrap();
         assert!(tl["inputSchema"]["properties"]["target_before"].is_object());
-        let tk = tools.iter().find(|t| t["name"] == "ticket_list").unwrap();
-        assert!(tk["description"].as_str().unwrap().contains("Read-only"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "schema for {}", t["name"]);
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()), "{}", t["name"]);
@@ -3406,40 +3798,39 @@ mod tests {
     }
 
     #[test]
-    fn ticket_list_reads_the_repos_ticket_files() {
-        let (_base, _ws, mut server) = task_fixture();
-        let (t, e) = tool(&mut server, "task_create", json!({"title": "Linked", "links": ["ATT-014"]}));
-        assert!(!e, "{t}");
-        let (text, is_err) = tool(&mut server, "ticket_list", json!({"assignee": "all"}));
+    fn tickets_reads_the_repos_ticket_files() {
+        let (_base, _ws, server) = task_fixture();
+        // A knowledge-server tool: the same registry, not the personal set.
+        let mut server = Server { base_dir: server.base_dir.clone(), ..Default::default() };
+        let (text, is_err) = tool(&mut server, "tickets", json!({}));
         assert!(!is_err, "{text}");
-        assert!(text.contains("ATT-014 — \"Retry rule for the scheduler\" [in progress, repo atlas"), "{text}");
-        assert!(text.contains("1 task, 0 done"), "{text}");
+        assert!(text.contains("ATT-014 — \"Retry rule for the scheduler\" [in progress, repo atlas"), "every assignee by default: {text}");
+        assert!(text.contains("assignee nobody-here"), "{text}");
         assert!(text.contains("/tickets/ATT-014.md"), "{text}");
         assert!(!text.contains("ATT-009"), "done tickets are not open: {text}");
-        let (text, _) = tool(&mut server, "ticket_list", json!({"assignee": "all", "state": "all"}));
+        assert!(!text.contains(" task"), "the person's tasks are not the knowledge server's: {text}");
+        let (text, _) = tool(&mut server, "tickets", json!({"state": "all"}));
         assert!(text.contains("ATT-009 — \"Glossary names\""), "{text}");
         // Nobody on this machine is "nobody-here": "me" finds nothing (or
         // says git has no identity), and never errors.
-        let (text, is_err) = tool(&mut server, "ticket_list", json!({}));
+        let (text, is_err) = tool(&mut server, "tickets", json!({"assignee": "me"}));
         assert!(!is_err, "{text}");
         assert!(!text.contains("ATT-014 —"), "{text}");
+        let (text, is_err) = tool(&mut server, "tickets", json!({"assignee": "nobody"}));
+        assert!(is_err, "{text}");
     }
 
     #[test]
     fn tool_list_is_fixed_with_no_flags() {
-        // The task tools are always there: kenTasks is gone.
+        // The task tools are always in the personal set: kenTasks is gone.
         let mut fx = fixture(true);
-        let reply = call(&mut fx.server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
-        let names: Vec<_> = reply["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"],
-        );
+        let names = |server: &mut Server| -> Vec<String> {
+            let reply = call(server, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+            reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(names(&mut fx.server), KNOWLEDGE_TOOLS);
+        fx.server.personal = true;
+        assert_eq!(names(&mut fx.server), PERSONAL_TOOLS);
     }
 
     #[test]

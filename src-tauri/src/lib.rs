@@ -994,22 +994,10 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
             },
         ))
     });
-    // Ken's own MCP server in every chat session of this project: Ken's
-    // search, with ken:// citations, and opening a file when asked.
+    // Ken's own MCP servers in every chat session of this project: the
+    // knowledge server, and the personal set beside it (`chat_mcp_config`).
     if let (Some(engine), Some(mcp)) = (&chat_engine, find_ken_mcp()) {
-        let cfg = serde_json::json!({
-            "mcpServers": {
-                "ken": {
-                    "command": mcp,
-                    "args": ["--project", project.root],
-                    "env": {
-                        "KEN_APP_URL": hooks.ui_url(),
-                        "KEN_APP_TOKEN": hooks.token(),
-                        "KEN_PROJECT_ID": project.config.id.to_string(),
-                    }
-                }
-            }
-        });
+        let cfg = chat_mcp_config(&mcp, &project.root, &hooks.ui_url(), hooks.token());
         let dir = guard.base_dir.join("chat-mcp");
         let path = dir.join(format!("{}.json", project.config.id));
         if std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, cfg.to_string())).is_ok() {
@@ -4779,6 +4767,26 @@ struct McpInfo {
     llm_instruction: String,
 }
 
+/// The `--mcp-config` Ken's own chat runs with (knowledge-core decision 22):
+/// the knowledge server (`ken`, locked to the chat's project for paths), and
+/// beside it the personal set (`ken-personal`, `ken-mcp --personal`) with the
+/// app's listener, so the chat keeps the person's tasks and memory and can
+/// open a file when asked. Claude Code's own registration (`mcp_info`) gets
+/// the knowledge server only.
+fn chat_mcp_config(mcp: &Path, root: &Path, app_url: &str, app_token: &str) -> serde_json::Value {
+    let mut servers = serde_json::Map::new();
+    servers.insert(ken_core::chat::KEN_SERVER.into(), serde_json::json!({ "command": mcp, "args": ["--project", root] }));
+    servers.insert(
+        ken_core::chat::PERSONAL_SERVER.into(),
+        serde_json::json!({
+            "command": mcp,
+            "args": ["--personal"],
+            "env": { "KEN_APP_URL": app_url, "KEN_APP_TOKEN": app_token }
+        }),
+    );
+    serde_json::json!({ "mcpServers": servers })
+}
+
 /// Where is the `ken-mcp` binary? Installer layout first (sibling of the
 /// app executable; `%LOCALAPPDATA%\Programs\ken-mcp`, where `install.ps1`
 /// puts it on Windows; `~/.local/bin` from `install.sh`), then PATH, then a
@@ -4854,21 +4862,22 @@ fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
         }
     }))
     .map_err(err)?;
+    // The knowledge server only (decision 22): the person's tasks and memory
+    // are the personal set, which only Ken's own chat registers.
     let llm_instruction = format!(
         "Set up the Ken MCP server so you can search this team's knowledge base.\n\n\
 Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
-server binary, ken-mcp, runs on demand over stdio. Its tools: search (route_query \
-across the workspace, semantic_search in one project), reading \
-(read_document, list_documents, list_projects), code navigation (find_definition, \
-find_usages, file_outline), what a page, ruling, ticket or code file is related to \
-(related_files), history, the person's Your day tasks and \
-tickets (task_list, ticket_list). It never edits the person's files. Four tools \
-write: task_create and task_update (Your day tasks), and memory_write and \
-journal_append (Ken's memory and journal).\n\n\
+server binary, ken-mcp, runs on demand over stdio and tells you how to use it in its \
+instructions. Its tools: search (every repo of the workspace), read (a hit, a file or \
+a folder), related (what a page, ruling, ticket or file is tied to), the code index \
+(code_definition, code_usages, code_outline, code_imports), history, tickets and \
+repos. It never edits the person's files. Two tools only queue for a person: \
+propose_decision files a ruling in Ken's Inbox for one click into the decisions log, \
+and add_source puts a source in the knowledge base's inbox for the next ingest.\n\n\
 If you are Claude Code, register it by running:\n\n  {add_command}\n\n\
 Otherwise, add this to your MCP configuration:\n\n{json_config}\n\n\
-Once connected, start with route_query to find what answers a question, and \
-read_document to read it."
+Once connected, start with search to find what answers a question, and read to \
+read it."
     );
     Ok(McpInfo {
         binary_path,
@@ -7235,34 +7244,10 @@ fn ingest_add(app: AppHandle, state: State<SharedState>, team: Option<String>, p
 }
 
 /// Where a file named `name` goes in a library's Raw/: its own name, or with
-/// a number when that is taken. The folder is made if missing.
+/// a number when that is taken (`ingest::raw_target`, which the MCP
+/// `add_source` shares).
 fn raw_target(root: &std::path::Path, name: &str) -> CmdResult<std::path::PathBuf> {
-    let raw_dir = root.join(ken_core::ingest::RAW);
-    std::fs::create_dir_all(&raw_dir).map_err(err)?;
-    // A dropped name is only a name: no folders, nothing above Raw.
-    let name = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
-    if name.is_empty() || name == "." || name == ".." {
-        return Err("a file with no name".into());
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (name.to_string(), String::new()),
-    };
-    // Raw's own README and Index are not sources, so a source by that name
-    // gets another.
-    let (name, stem) = if name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("index.md") {
-        let s = format!("{stem} (source)");
-        (format!("{s}{ext}"), s)
-    } else {
-        (name.to_string(), stem)
-    };
-    let mut target = raw_dir.join(&name);
-    let mut n = 2;
-    while target.exists() {
-        target = raw_dir.join(format!("{stem} ({n}){ext}"));
-        n += 1;
-    }
-    Ok(target)
+    ken_core::ingest::raw_target(root, name).map_err(err)
 }
 
 /// `%XX` decoded (what the frontend's encodeURIComponent wrote), as UTF-8.
@@ -11957,6 +11942,28 @@ mod tests {
         assert!(paths.contains(&"Archive/Meetings/kickoff.md".to_string()), "got {paths:?}");
         assert!(paths.contains(&"Archive/Meetings/Q3/review.md".to_string()), "got {paths:?}");
         assert!(paths.contains(&"Meetings-old/stale.md".to_string()), "got {paths:?}");
+    }
+}
+
+#[cfg(test)]
+mod chat_mcp_config_tests {
+    use super::chat_mcp_config;
+    use std::path::Path;
+
+    /// Ken's chat registers the knowledge server and the personal set beside
+    /// it; only the personal set gets the app's listener (decision 22).
+    #[test]
+    fn the_chat_registers_the_knowledge_server_and_the_personal_set() {
+        let cfg = chat_mcp_config(Path::new("/bin/ken-mcp"), Path::new("/work/wiki"), "http://127.0.0.1:9/ui", "tok");
+        let servers = cfg["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 2);
+        let ken = &servers["ken"];
+        assert_eq!(ken["args"][0], "--project");
+        assert!(ken.get("env").is_none(), "{ken}");
+        let personal = &servers["ken-personal"];
+        assert_eq!(personal["args"], serde_json::json!(["--personal"]));
+        assert_eq!(personal["env"]["KEN_APP_TOKEN"], "tok");
+        assert_eq!(personal["command"], ken["command"]);
     }
 }
 

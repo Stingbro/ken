@@ -24,7 +24,12 @@ describe("parseToolCard", () => {
 describe("cardHits", () => {
   it("lists a search's hits with each code hit's symbol beside its path", () => {
     const result = [
+      "Route: every source (2 searched).",
+      "Sources: game (searched), wiki (searched)",
+      "",
       "1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld` (ken://a/src/world.ts#L3) [keyword]",
+      "   export function saveWorld(w: string) {",
+      "   next: code_usages saveWorld · code_outline src/world.ts · code_imports src/world.ts",
       "2. [decision D-410 · binding · 2026-10-06] [[DECISIONS]] · wiki:Decisions/DECISIONS.md:9 (ken://b/Decisions/DECISIONS.md#L9) [both]",
     ].join("\n");
     expect(cardHits(result)).toEqual([
@@ -36,5 +41,12 @@ describe("cardHits", () => {
   it("is empty for a result that lists no hits", () => {
     expect(cardHits("Read 40 lines")).toEqual([]);
     expect(cardHits(undefined)).toEqual([]);
+  });
+
+  it("finds no hits in the code tools' results", () => {
+    const imports = "ken://a/src/game.ts (game)\nImports:\n  - ken://a/src/world.ts\nImported by: (none)\nLibraries and unresolved: (none)";
+    expect(cardHits(imports)).toEqual([]);
+    const definition = '1 definition of "saveWorld":\n1. function saveWorld — ken://a/src/world.ts#L3 (lines 3-9, game)';
+    expect(cardHits(definition)).toEqual([]);
   });
 });

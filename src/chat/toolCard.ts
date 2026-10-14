@@ -27,10 +27,12 @@ export interface CardHit {
   symbol: string | null;
 }
 
-/** The hits in a Ken search's result, from lines like
+/** The hits in the result of Ken's `search` tool, from lines like
  *  `1. [code · service · 2026-10-01] repo:src/a.ts:12 `saveWorld` (ken://…)`:
  *  the place a person cites and, for a code hit, its symbol (knowledge-core
- *  decision 26). Empty for any other result. */
+ *  decision 26). The `next:` line under a code hit and the other tools'
+ *  results (`read`, `code_imports`, `related`) hold no hits. Empty for any
+ *  other result. */
 export function cardHits(result: string | undefined): CardHit[] {
   if (!result) return [];
   const out: CardHit[] = [];

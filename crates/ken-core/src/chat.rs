@@ -235,7 +235,9 @@ fn summarize_tool(block: &Value) -> String {
 pub const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
 
 /// What every chat session is told about working inside Ken, appended to
-/// Claude Code's own system prompt.
+/// Claude Code's own system prompt. Only the app's rules (knowledge-core
+/// decision 1): how to search, weigh and cite the knowledge base is the
+/// knowledge server's own `instructions`, which every Claude session gets.
 pub const KEN_GUIDE: &str = "You are working inside Ken, a desktop app where a person reads and edits their team's \
 wiki, docs and code. Rules for this app:\n\
 1. Edits are reviewed. Every Edit, MultiEdit or Write you make is shown to the person as a diff, and they accept or \
@@ -243,71 +245,64 @@ decline each change. If they decline some, the tool result says which; read the 
 and do not retry a declined change unless they ask.\n\
 2. Cite your sources so they can click them. Every fact that comes from a file gets a Markdown link to that file, \
 project-relative, with the line when you know it: [Save.md, line 12](Platform/Save.md#L12), or a heading: \
-[Save format](Platform/Save.md#save-format). A hit from Ken's search tools that carries a ken:// address is linked \
+[Save format](Platform/Save.md#save-format). A hit from Ken's tools that carries a ken:// address is linked \
 by that address, with #L<line> when it has a line. A file in another of the workspace's repos is linked by that \
 repo's ken:// address (each turn lists them), never a project-relative path; write a space in a path as %20. \
 Never open files or switch the person's screen yourself; a link \
 is how they go there.\n\
-3. Search with Ken first. Ken's tools (mcp__ken__route_query across the workspace, mcp__ken__semantic_search in one \
-project, mcp__ken__read_document) search \
-the team's wiki, docs and code with Ken's own ranking and return ken:// addresses to cite. For code, use Ken's code \
-index before Grep and Glob, and navigate like an IDE: mcp__ken__find_definition to go to a symbol, \
-mcp__ken__find_usages for every use and its callers, mcp__ken__file_outline to drill into a file, \
-mcp__ken__related_files for what it imports and what imports it; then read the lines they point to. \
-mcp__ken__related_files also says what a page, ruling or ticket is related to: what it cites and what cites it, the \
-note that changed it, the ruling that replaced it, the commits that name it, pages on the same topic. A code hit from \
-search names the symbol it holds and the calls that go further, and plain words find a symbol (\"save world\" finds \
-saveWorld). mcp__ken__history tells when and why something changed (a file's commits, commits \
-about some words, or with neither, what changed in the last `days` across every repo, git or not). Ken's tools and \
-Grep, Glob and Read cover every question about the files; do not run shell commands to look at them. \
-mcp__ken__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or show \
-something.\n\
-4. Never say something isn't there because Ken's search did not find it. Its index can miss a file, a new change or \
-different wording. When Ken finds nothing, or nothing that answers, look yourself with Grep, Glob and Read, in this \
-project and the workspace's other repos (you may read them all), then answer, say you found it by looking directly, \
-and cite the file. Glob and Grep search only the folder you start in unless given a path: pass each repo's folder \
-as the path. Only after looking may you say it isn't there, and say where you looked.\n\
-5. On what the system does, the code wins: a ticket, plan or doc says what was intended, not what was built. When \
-asked how something works, open the code that does it and cite that file; where the code and a doc disagree, say so. \
-Several repos can hold the same product (a prototype and the build that replaced it): before saying the code does \
-not do something, look in every repo of the workspace, and say which repo each finding is from.\n\
-6. The person's list is Ken's, not yours. Their tasks are read with mcp__ken__task_list and their tickets with \
-mcp__ken__ticket_list; add or change a task with mcp__ken__task_create and mcp__ken__task_update when they ask, and \
-say what you added. Your own task or todo tools are not their list. A ## Memories block at the top of a turn holds \
-the team's standing notes: follow them, and add one with mcp__ken__memory_write only when the person asks you to \
-remember something.\n\
-7. On what the team decided, the team's wiki wins. Who decides, what was ruled and why, the rules and conventions, \
-how work moves and what something is called are in the team's wiki and decisions log: search them first and answer \
-from them, citing the page. A ruling there is settled. Never recommend against it or present the question as open; \
-when the code does not match a ruling, say the code differs from the ruling and cite both. Every hit from Ken's \
-search carries one label: its kind, its tier (for code, its role) and its date (decision D-410 · binding · \
-2026-10-06, doc · current, ticket · superseded, code · service · 2026-10-01). The tiers run binding, current, reference, record, superseded, and you weigh hits by them: a \
-later ruling over an earlier one on the same point (a hit marked superseded by a later ruling holds only where that \
-ruling does not reach), a binding ruling or rule over a ticket or note, and a current page over a record.";
+3. Ken's knowledge server is how you search the team's knowledge base and code, and its instructions say how to weigh \
+what it finds. Start with mcp__ken__search, read a hit with mcp__ken__read, and for code use \
+mcp__ken__code_definition, mcp__ken__code_usages, mcp__ken__code_outline and mcp__ken__code_imports before Grep and \
+Glob. mcp__ken__related, mcp__ken__history, mcp__ken__tickets and mcp__ken__repos say what something is tied to, \
+when and why it changed, the work in flight and done, and which repos there are. Ken's tools and Grep, Glob and Read \
+cover every question about the files; do not run shell commands to look at them. When Ken finds nothing that \
+answers, look yourself with Grep, Glob and Read in this project and the workspace's other repos (you may read them \
+all; Glob and Grep search only the folder you start in unless given one, so pass each repo's folder as the path) \
+before saying something isn't there, and say where you looked.\n\
+4. The knowledge base changes through a person. A ruling the person states goes in with \
+mcp__ken__propose_decision and a source they want kept with mcp__ken__add_source: both wait in Ken's Inbox (the \
+ruling for one click into the decisions log, the source for the next ingest), so say that it waits. Edit a page of \
+the knowledge base only when they ask, as a reviewed edit.\n\
+5. The person's list is Ken's, not yours. Their tasks are read with mcp__ken-personal__task_list; add or change a \
+task with mcp__ken-personal__task_create and mcp__ken-personal__task_update when they ask, and say what you added. \
+Your own task or todo tools are not their list. A ## Memories block at the top of a turn holds the team's standing \
+notes: follow them, add one with mcp__ken-personal__memory_write only when the person asks you to remember \
+something, and keep a finding they want kept with mcp__ken-personal__journal_append.\n\
+6. mcp__ken-personal__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or \
+show something.";
 
-/// Ken's own MCP tools the chat may use without asking: they read Ken's
-/// index, open a file for the person when they asked, or keep the person's
-/// own list and Ken's memory when they ask (each write is dated and says who
-/// made it).
-pub const KEN_MCP_ALLOWED: [&str; 17] = [
+/// The server name Ken's chat gives its knowledge server, `ken-mcp`
+/// (`mcp__ken__search`): the same name Claude Code is told to register.
+pub const KEN_SERVER: &str = "ken";
+
+/// The server name Ken's chat gives the personal tool set, `ken-mcp
+/// --personal` (`mcp__ken-personal__task_list`). Only Ken's own chat
+/// registers it.
+pub const PERSONAL_SERVER: &str = "ken-personal";
+
+/// The knowledge server's tools (knowledge-core decision 22), which the chat
+/// may use without asking: they read Ken's index and the repos, and the two
+/// that write only queue for a person (`propose_decision` files a ready
+/// ruling in the Inbox, `add_source` puts a source in the inbox for ingest).
+pub const KEN_MCP_ALLOWED: [&str; 12] = [
+    "search",
+    "read",
+    "related",
+    "code_definition",
+    "code_usages",
+    "code_outline",
+    "code_imports",
     "history",
-    "find_definition",
-    "find_usages",
-    "file_outline",
-    "related_files",
-    "read_document",
-    "list_documents",
-    "list_projects",
-    "semantic_search",
-    "route_query",
-    "task_list",
-    "task_create",
-    "task_update",
-    "ticket_list",
-    "memory_write",
-    "journal_append",
-    "open_in_ken",
+    "tickets",
+    "propose_decision",
+    "add_source",
+    "repos",
 ];
+
+/// The personal tool set the chat may use without asking: the person's own
+/// Your day list and Ken's memory and journal when they ask (each write is
+/// dated and says who made it), and opening a file for them when they ask.
+pub const KEN_PERSONAL_ALLOWED: [&str; 6] = ["task_list", "task_create", "task_update", "memory_write", "journal_append", "open_in_ken"];
 
 /// Tools of Claude Code's own that the chat process does not get: no shell
 /// (Ken's tools and Read, Grep and Glob cover the files), no web, and no task
@@ -326,9 +321,11 @@ pub const CHAT_DISALLOWED: [&str; 10] = [
     "NotebookEdit",
 ];
 
-/// The name Claude Code gives a tool of Ken's MCP server (`ken`).
+/// The bare name of a tool of Ken's knowledge server or its personal tool
+/// set, as Claude Code names them (`mcp__ken__search`,
+/// `mcp__ken-personal__task_list`).
 fn ken_mcp_tool(tool: &str) -> Option<&str> {
-    tool.strip_prefix("mcp__ken__")
+    tool.strip_prefix("mcp__ken__").or_else(|| tool.strip_prefix("mcp__ken-personal__"))
 }
 
 /// An edit Claude asked to make, worked out against the file as it is now,
@@ -1042,12 +1039,13 @@ impl ChatEngine {
                                 detail: None,
                             });
                         } else if let Some(tool) = ken_mcp_tool(&tool_name) {
-                            // Ken's read tools run; its write tools are for
-                            // the person to do in Ken.
-                            let response = if KEN_MCP_ALLOWED.contains(&tool) {
+                            // Ken's tools run: they read, queue for a person,
+                            // or keep the person's own list when they ask.
+                            // Anything else is for the person to do in Ken.
+                            let response = if KEN_MCP_ALLOWED.contains(&tool) || KEN_PERSONAL_ALLOWED.contains(&tool) {
                                 serde_json::json!({ "behavior": "allow", "updatedInput": input, "toolUseID": tool_use_id })
                             } else {
-                                serde_json::json!({ "behavior": "deny", "message": format!("{tool} sends something to a teammate; the person does that in Ken.") })
+                                serde_json::json!({ "behavior": "deny", "message": format!("{tool} is not one of Ken's tools the chat may use; the person does that in Ken.") })
                             };
                             let reply = control_reply(&request_id, response);
                             let mut w = pump_stdin.lock().unwrap();
@@ -1332,25 +1330,45 @@ mod tests {
         assert!(KEN_GUIDE.contains("%20") && KEN_GUIDE.contains("never a project-relative path"));
     }
 
+    /// The guide keeps the app's rules only (decision 1): how to weigh a
+    /// hit's label is in the knowledge server's instructions now.
     #[test]
-    fn the_guide_says_how_to_weigh_a_hits_label() {
+    fn the_guide_keeps_the_apps_rules_only() {
         let guide = KEN_GUIDE.replace('\n', " ");
-        for word in ["carries one label", "a later ruling over an earlier one", "over a ticket or note", "a current page over a record"] {
+        for word in ["shown to the person as a diff", "Cite your sources", "wait in Ken's Inbox", "The person's list is Ken's"] {
             assert!(guide.contains(word), "{word}");
         }
+        assert!(!guide.contains("carries one label"), "the label is the server's instructions");
     }
 
     #[test]
     fn every_ken_tool_the_guide_names_is_one_the_chat_may_use() {
-        let named: Vec<&str> = KEN_GUIDE
-            .split("mcp__ken__")
-            .skip(1)
-            .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or(""))
-            .collect();
-        assert!(named.len() > 8, "the guide names Ken's tools in full: {named:?}");
-        for tool in named {
-            assert!(KEN_MCP_ALLOWED.contains(&tool), "{tool} is named in the guide but not allowed");
+        let named = |prefix: &str| -> Vec<String> {
+            KEN_GUIDE
+                .split(prefix)
+                .skip(1)
+                .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_string())
+                .collect()
+        };
+        let knowledge = named(&format!("mcp__{KEN_SERVER}__"));
+        for tool in &knowledge {
+            assert!(KEN_MCP_ALLOWED.contains(&tool.as_str()), "{tool} is named in the guide but not allowed");
         }
+        // Every knowledge tool is named; no old name is.
+        for tool in KEN_MCP_ALLOWED {
+            assert!(knowledge.iter().any(|t| t == tool), "{tool} is not in the guide");
+        }
+        let personal = named(&format!("mcp__{PERSONAL_SERVER}__"));
+        assert!(personal.len() >= 5, "{personal:?}");
+        for tool in &personal {
+            assert!(KEN_PERSONAL_ALLOWED.contains(&tool.as_str()), "{tool} is named in the guide but not allowed");
+        }
+        for gone in ["route_query", "semantic_search", "read_document", "find_definition", "related_files", "ticket_list"] {
+            assert!(!KEN_GUIDE.contains(gone), "{gone}");
+        }
+        assert_eq!(ken_mcp_tool("mcp__ken-personal__task_list"), Some("task_list"));
+        assert_eq!(ken_mcp_tool("mcp__ken__search"), Some("search"));
+        assert_eq!(ken_mcp_tool("mcp__other__search"), None);
     }
 
     #[test]
@@ -1614,13 +1632,13 @@ mod tests {
 
     #[test]
     fn a_message_yields_every_block_in_order() {
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Grep","input":{"pattern":"save"}},{"type":"tool_use","id":"t2","name":"mcp__ken__route_query","input":{"query":"save format"}}]}}"#;
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Grep","input":{"pattern":"save"}},{"type":"tool_use","id":"t2","name":"mcp__ken__search","input":{"query":"save format"}}]}}"#;
         assert_eq!(
             parse_events(line),
             vec![
                 ParsedEvent::AssistantText("Looking.".into()),
                 ParsedEvent::Tool { id: "t1".into(), name: "Grep".into(), summary: "Grep save".into() },
-                ParsedEvent::Tool { id: "t2".into(), name: "mcp__ken__route_query".into(), summary: "Ken route query save format".into() },
+                ParsedEvent::Tool { id: "t2".into(), name: "mcp__ken__search".into(), summary: "Ken search save format".into() },
             ]
         );
     }
@@ -1657,13 +1675,15 @@ line 2") && preview.ends_with("…"), "{preview}");
     /// its path, and a code tool's card names the symbol it looked up.
     #[test]
     fn a_search_card_lists_its_hits_and_their_symbols() {
-        let result = "Route: every source (1 searched).\nSources: game (searched)\n\n1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld` (ken://a/src/world.ts#L3) [keyword]\n   export function saveWorld(w: string) {\n   next: find_usages saveWorld · file_outline src/world.ts · related_files src/world.ts\n2. [doc · reference · 2026-09-01] game:README.md:1 (ken://a/README.md#L1) [keyword]\n   # Game";
+        let result = "Route: every source (1 searched).\nSources: game (searched)\n\n1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld` (ken://a/src/world.ts#L3) [keyword]\n   export function saveWorld(w: string) {\n   next: code_usages saveWorld · code_outline src/world.ts · code_imports src/world.ts\n2. [doc · reference · 2026-09-01] game:README.md:1 (ken://a/README.md#L1) [keyword]\n   # Game";
         let preview = result_preview(Some(&Value::String(result.into())));
         assert_eq!(preview.lines().count(), 2, "{preview}");
         assert!(preview.starts_with("1. [code · service · 2026-10-01] game:src/world.ts:3 `saveWorld`"), "{preview}");
         assert!(!preview.contains("export function"), "no snippets: {preview}");
-        let find = serde_json::json!({ "name": "mcp__ken__find_definition", "input": { "name": "save_world" } });
-        assert_eq!(summarize_tool(&find), "Ken find definition save_world");
+        let find = serde_json::json!({ "name": "mcp__ken__code_definition", "input": { "name": "save_world" } });
+        assert_eq!(summarize_tool(&find), "Ken code definition save_world");
+        let task = serde_json::json!({ "name": "mcp__ken-personal__task_create", "input": { "title": "Ship it" } });
+        assert_eq!(summarize_tool(&task), "Ken task create");
     }
 
     fn control_responses(dir: &Path) -> Vec<Value> {

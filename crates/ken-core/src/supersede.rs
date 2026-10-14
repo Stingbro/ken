@@ -10,7 +10,7 @@
 //! - **Markers on every scan** ([`store_marked`]): the pairs the log marks
 //!   itself (`[SUPERSEDED BY D-302]`, `[REFINES] D-425`, `supersedes: D-114`)
 //!   are stored in Ken's index, so search labels a superseded entry's hit
-//!   and ranks it under its successor, and read_document says so beside it.
+//!   and ranks it under its successor, and the MCP `read` says so beside it.
 //! - **The Claude pass on new entries only** ([`next_cluster`], [`judged`]):
 //!   the log's entries are read from the index (one chunk per entry), put in
 //!   small clusters of entries that may cover the same subject (the topics

@@ -355,17 +355,16 @@ pub fn lookup_name(symbol: &str) -> &str {
 
 /// The calls that go further from a code hit, by tool name (decision 26):
 /// where its symbol is used, the file's outline, what it imports and what
-/// imports it. None for a file the code index does not parse. Slice 10
-/// renames the tools (`code_usages`, `code_outline`, `code_imports`).
+/// imports it. None for a file the code index does not parse.
 pub fn next_calls(path: &str, symbol: Option<&str>) -> Option<String> {
     Lang::of(path)?;
     let path = path.replace('\\', "/");
     let mut calls = Vec::new();
     if let Some(name) = symbol.map(lookup_name).filter(|n| !n.is_empty() && *n != "…") {
-        calls.push(format!("find_usages {name}"));
+        calls.push(format!("code_usages {name}"));
     }
-    calls.push(format!("file_outline {path}"));
-    calls.push(format!("related_files {path}"));
+    calls.push(format!("code_outline {path}"));
+    calls.push(format!("code_imports {path}"));
     Some(calls.join(" · "))
 }
 
@@ -728,9 +727,9 @@ mod tests {
         assert_eq!(lookup_name("save, load, …"), "save");
         assert_eq!(
             next_calls("app/store.py", Some("Store.save")).as_deref(),
-            Some("find_usages save · file_outline app/store.py · related_files app/store.py")
+            Some("code_usages save · code_outline app/store.py · code_imports app/store.py")
         );
-        assert_eq!(next_calls("app\\store.py", None).as_deref(), Some("file_outline app/store.py · related_files app/store.py"));
+        assert_eq!(next_calls("app\\store.py", None).as_deref(), Some("code_outline app/store.py · code_imports app/store.py"));
         assert_eq!(next_calls("README.md", Some("x")), None, "not code the index parses");
     }
 }

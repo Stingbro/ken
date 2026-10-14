@@ -4,8 +4,8 @@ A desktop app that turns an ordinary folder into a team knowledge base.
 Point Ken at your folder — notes, Word docs, spreadsheets, PDFs — and it
 indexes everything, watches for changes, and makes every fact findable:
 full-text search with AI quick answers, AI-maintained structured documents,
-Claude chats, a daily digest, deep web research, a knowledge map and
-timeline, an MCP server for your agents, and Git/shared-drive sync with
+Claude chats, a daily digest, deep web research, a project graph and a
+timeline, an MCP knowledge server for your agents, and Git/shared-drive sync with
 conflict review. Specs live in `docs/superpowers/specs/`, and the
 knowledge layer's plan of record in `docs/knowledge-core/DECISIONS.md`.
 
@@ -102,8 +102,9 @@ transcripts are cached under `.ken/transcripts/` (never written next to your
 files) and their text is folded into the search index.
 
 The repo is a Cargo workspace: `crates/ken-core` (all domain logic —
-scanning, extraction, index, search, watching), `crates/ken-mcp` (MCP
-sidecar, stub for now), `src-tauri` (Tauri 2 shell), and `src/` (Svelte 5
+scanning, extraction, index, search, watching), `crates/ken-mcp` (the MCP
+knowledge server; with `--personal`, the tasks and memory tools Ken's own chat
+adds), `src-tauri` (Tauri 2 shell), and `src/` (Svelte 5
 frontend). Design reference: `docs/design/design-tokens.md` and
 `docs/design/ken-prototype-v2.dc.html`.
 
