@@ -392,12 +392,13 @@ mod tests {
         let sha = commit_paths(root, &paths, "ingest: note\n\nPages changed:\n- Page.md").unwrap().unwrap();
         assert!(!sha.is_empty());
 
-        let files = output(root, &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        // Without `--no-renames`, git shows the source's move as its new path alone.
+        let files = output(root, &["show", "--name-only", "--no-renames", "--format=", "HEAD"]).unwrap();
         let mut files: Vec<&str> = files.lines().collect();
         files.sort();
         assert_eq!(files, vec!["Ingested/note.md", "Ingested/source.txt", "Page.md", "Raw/source.txt"]);
         assert_eq!(output(root, &["log", "-1", "--format=%s"]).unwrap(), "ingest: note");
-        let status = output(root, &["status", "--porcelain"]).unwrap();
+        let status = output_raw(root, &["status", "--porcelain"]).unwrap();
         assert!(status.contains(" M Other.md") && status.contains("A  Staged.md"), "a person's work is left as it was: {status}");
         let mut open = uncommitted(root);
         open.sort();
