@@ -294,6 +294,29 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. `npm run check`: 0 errors, 6 warnings (the known ones; the unused `h2` style moved with the Team screen into `WorkspaceSettingsScreen.svelte`). The sidecar was re-staged.
   - Not run: any test, and the app. Nothing migrates: an older registry's team kind reads as the wiki and its team name is dropped at its next save; per-team digest files are no longer read; the next sync cycle in a code repo does nothing.
 
+- **Slice 13: the method pages in WoW** (Ways of Working `637dd4c`, `53666bb` on `docs/knowledge-core`, pushed; no PR is open). Decisions 1 to 8, 11, 12, 13, 25, 28 to 31, 33, 35 to 37, against the code after slice 12.
+  - Knowledge (`docs/manual/docs-system.html`):
+    - A Commits part under Layout: Ken commits only in the knowledge base, only its own changes, never in a code repo; memory stays personal and is never committed (36, 37). An ingest's commit is never pushed (12; see the gap below).
+    - Ingest holds an edit for a page someone changed while it was read or has not committed yet (11), and writes one section at a time. A good answer is filed back as a source, and ingest writes the page (33, slice 11).
+    - Building: a person starts the queue, set-up does not; a mapped wiki's pages are moved, relinked and added to their indexes, and keep their own frontmatter (no "given frontmatter").
+    - The timeline: ingests and drift runs, rulings, ticket changes, findings of every kind filed and settled, the knowledge base's commits and the code commits that cite a ticket or ruling, releases (37, slice 9).
+    - The templates are Ken's, linked at `crates/ken-core/templates` on `knowledge-core`; set-up run again reports and never overwrites (4). `superseded` names its successor in a banner (the banner rule, Open for Chris).
+  - Drift (`drift.html`): the Scope and Answer checks read a ticket, so they are the build method's, at G8 (31); the ticket-close trigger and the G8 callout went with them. Cosmetic is whitespace or comments (no import order). Pinned copies, the provable/stale/undated backfill, the generator pin and the instrument's exit code are gone: Ken has none of them. A never-checked page is measured from its citations' commits, else `updated:`. A void run is a finding until a run holds. Drift never writes in a code repo. The anchors other pages link to (`#triggers`, `#severity`, `#citations`) stay.
+  - Decisions (`decisions.html`): `refines:` and `[REFINED BY …]`; the marker under the bold ruling, where `supersede::mark_in_log` writes it (the page had it on the heading); the example in `decisions_entry`'s layout, with no product or person named; "who" is free text and nobody signs a ruling off; a comment or commit citing an id joins the graph, and a comment citing an unknown id is a finding.
+  - The cut team layer, elsewhere in the manual: `workspace.html` (one knowledge base and its sources, Ken's templates, set-up's three steps; the Roster section and the team repo row are gone), `index.html`, `tickets.html` (tickets in the knowledge base's `tickets/`; the knowledge layer reads `id`, `status`, `type`, `assignee`, the rest is the build method's, 8), `method.html` (Drift is two checks on every commit), `gates.html` (G8 is scope and answered escalations; cited rulings and page sources run on every commit), `intake-define.html` and `lifecycle.html` (the standing sweep and its Ideas rows are gone; drift and ingest findings go to the findings list), `conventions.html`, `adopting.html` (no decider), and the README's page map.
+  - Templates (4): WoW's `templates/wiki/` and `templates/code/CLAUDE.md` are removed, and `templates/README.md` describes the shape and links to Ken's. `templates/team/` is `templates/wright/`, what Wright adds to the knowledge base: `decisions/` (the log is the knowledge base's; Cited-in-Code, 30) and `people/` (the roster, 35) are gone; `.wright/team.json` keeps only protected paths, models, worktrees and the always-loaded set, and says the key, sources, index rules and drift settings are `.ken/knowledge.json`'s (35); the standing sweep is gone from it and from the Ideas files. `templates/code/.ken/gates.json` (Wright's gate manifest) stays.
+  - Choices:
+    - Where the code and the decisions differ, the pages follow the decisions: one `log.md` line per drift run (2, 28), and an ingest commit is never pushed (12).
+    - Wright's own pages are left alone (`docs/wright/*`, the white box, `personal-layer.html`, `agents.html`, the deck, `PROPOSAL.md`, `presets.json`), as the slice 12 hand-off said; see Open for Chris.
+    - The first WoW commit also carries the template removals and the `team/` → `wright/` rename (they were staged with it); the second carries the template edits.
+  - Gaps found between the code and the decisions:
+    - **Lint writes no `log.md` line.** Decision 2 says one line per lint pass; only ingest, drift (when it wrote) and the wiki map call `ingest::append_log`. The raid log reads lint runs from `log.md`, so it never shows one.
+    - **The template's decisions log** (`templates/wiki/Decisions/DECISIONS.md`) shows `supersedes:` only, not `refines:` and `[REFINED BY …]`, which Ken writes.
+    - **The template's brief** still says "file a good answer back as a page"; the guide offers `add_source`, and ingest writes the page. Same end, different words.
+    - **Sync pushes the knowledge base** (already open), where decision 12 says Ken never pushes; the page says never.
+    - **The templates link** points at the `knowledge-core` branch; repoint it when the branch merges.
+  - Checked: tag balance on every changed page, every relative link and anchor they hold (and every link into the five changed Knowledge pages from elsewhere in `docs/` and `design/`), and both JSON templates parse. Not done: a cold read against `research/PAGE-COLD-READ-RUBRIC.md`, and the artifacts were not republished.
+
 ## Open for Chris
 
 - **How a retired page names its successor.** Decision 7 says a retired page names its successor, but decision 5's six keys have no field for it. For now `status: superseded` retires a page and the brief says to put a banner naming the replacement in its text; `replaced_by` is read from older pages only. Choose: keep the banner, or add a seventh key (say `superseded_by`) that Ken writes and search shows.
@@ -335,30 +358,25 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 
 - **Signalling the app when an MCP tool files something.** A ruling `propose_decision` files, or a source `add_source` puts in Raw, reaches the open app at its next refresh (the Raw watcher starts an ingest for a source; nothing tells the Inbox about a ruling). Choose: keep, or have ken-mcp tell the app over its listener when one is running.
 
-## Next: slice 13, the method pages in WoW
+- **Lint and `log.md`.** Decision 2 wants a line per lint pass; lint writes none, so the Timeline shows no lint runs. Choose: a line per scan-lint, after-edit and weekly pass that filed or resolved something, or drop lint from decision 2.
 
-The pages on Ways of Working's `docs/knowledge-core` branch (`ae76475`) against DECISIONS.md and the code as it stands after slice 12. Nothing has been edited yet.
+- **Wright's pages in WoW.** `docs/wright/*`, the Wright white box, the deck, `personal-layer.html`, `agents.html`, `PROPOSAL.md` and `presets.json` still describe the team repo, the roster in `people/`, owners and deciders, `.wright/team.json` with the team kind, three index states and the standing sweep, and `pin:`/`verified:` (some as dated rulings). The templates now say Wright's files lay down into the knowledge base and `team.json` holds only Wright's own settings. Choose: bring the Wright pages in line in a later WoW slice, or cut Wright's team layer from WoW too.
 
-- [ ] Knowledge (`docs/manual/docs-system.html`):
-  - Building a Library: an existing wiki's pages are "given frontmatter" when mapped; `wikimap` moves them, rewrites path links and adds them to their indexes, but writes no frontmatter. Drop the words, or make it a Ken task. Say building starts when a person asks (Build the library), not at set-up.
-  - Finding Things: "A good answer is filed back as a page" should say it is filed back as a source and ingest writes the page (decision 33, slice 11).
-  - Ingest: the held edits also include a page someone changed while it was read (decision 11); the code also holds a page with a person's uncommitted work.
-  - The timeline: findings of every kind, filed and resolved, not only drift findings; commits are the knowledge base's own and the other repos' that cite a ticket or ruling (decision 37, slice 9).
-  - Add Ken's commit rule (36): only in the knowledge base, only its own changes, never `git add -A`, never in a code repo; and that memory stays personal and local (37).
-  - Frontmatter: "superseded, with the page that replaces it" holds only while the banner rule stands (Open for Chris, how a retired page names its successor).
-- [ ] Drift (`docs/manual/drift.html`):
-  - The Checks: the Answer row reads "the escalations in a ticket's thread"; escalations are cut (14, 37). The Scope and Answer checks stay with Wright (31): move them to Build, or mark them Wright's.
-  - Triggers: the ticket-close trigger and G8 are Wright's; drop them or point at Build.
-  - "Each run writes one line to log.md": Ken writes the line only when a run changed a page (Open for Chris, a log line for a run that changed nothing).
-  - What Happens to a Change: Ken classes whitespace and comments as cosmetic, not import order.
-  - Pinned copies, the backfill that sorts pages into provable, stale and undated, and the instrument's exit code have no counterpart in Ken on this branch: keep them as method for Wright, or drop them.
-  - Movement: Ken measures against the remote's default branch; `.ken/knowledge.json`'s `base` is not read (Open for Chris).
-- [ ] Decisions (`docs/manual/decisions.html`): the entry format matches `ingest::decisions_entry`. Add `refines:` and `[REFINED BY …]`, which Ken writes when a person confirms a narrowing. "Who said it" is already free text, with no decider (35).
-- [ ] Pages off the branch that still describe the cut team layer: `workspace.html` (three repos and a roster, `escalations/`, `ideas/`), `index.html` ("Three repos, one roster"), `tickets.html` (a ticket "in the team repo"). Decisions 8 and 35 put the tickets in the one knowledge base and cut the roster. `personal-layer.html` and `agents.html` describe the team bus and escalations as Wright's; leave them unless Chris wants them cut from WoW too.
-- [ ] Commit on `docs/knowledge-core` in WoW and push; note the WoW commit here.
+## Next: slice 14, verify
 
-## Later slices
+No test has been run and the app has not been started on this branch; only compile checks. The test suite spawns shells and git, so each run needs Chris's go-ahead first (see "How to pick it up"). Cap cargo at 4 jobs and 4 test threads while Chris works, and never start `ken-app` without asking.
 
-- [ ] **14, verify:**
-  - The full test suite (ask first, see above).
-  - An end-to-end run: set up a new knowledge base, ingest a source, search, drift on a commit.
+- [ ] **The full test suite** (ask first), from the checkout root, each into a log file:
+  - [ ] Rust, ken-core: `scripts\win-build.cmd cargo test --release -j 4 -p ken-core -- --test-threads=4`. Compare against a baseline from `ken-workspace-home` (60 failures there, all needing the `claude` CLI, git or fixtures); a failure not in the baseline is this branch's.
+  - [ ] Rust, ken-mcp: `scripts\win-build.cmd cargo test --release -j 4 -p ken-mcp -- --test-threads=4` (the twelve tools, the personal set, the instructions).
+  - [ ] Rust, the app: `scripts\win-build.cmd cargo test --release -j 4 -p ken-app -- --test-threads=4`, after `scripts\win-build.cmd sidecar` on a fresh checkout.
+  - [ ] Frontend: `npm test` (vitest) and `npm run check` (svelte-check: 0 errors, the 6 known warnings).
+  - [ ] Fix what fails, one commit per cause, and note each here.
+- [ ] **The end-to-end run** (manual, with Chris; it starts the app and makes Claude calls), on a throwaway workspace, never `hytale-shared-source`:
+  - [ ] Set up: name a new workspace, save a new knowledge base, add one small code repo. Check the template lands (START-HERE, the brief, `Decisions/DECISIONS.md`, `tickets/`, `log.md`, `.ken/knowledge.json`), the first commit names its files, the code repo gets no commit, and search and the code index answer before anything is built.
+  - [ ] Health: Settings › Workspace shows one health line per source; the repo analysis proposes roles and controls into `.ken/knowledge.json`; the controls run after the meaning index builds.
+  - [ ] Ingest: drop a meeting note with a ruling, an action, a contradiction and an open question into `Research/Ingestion/Raw/`. Check the note's headings, the source moved beside it, section edits citing the note, a held edit for a Rules page, the ruling waiting as a ready entry (one click adds `## D-001 · date · topic`), a drafted ticket, both findings in the Inbox, one commit naming the note, one `log.md` line, no push, and the Timeline entry.
+  - [ ] Search: a plain question returns hits labelled `kind · tier · date`, the new ruling ranked binding; "save world" style words reach a definition with its symbol and `next:` calls; `related` on the ruling shows the note and the page.
+  - [ ] Drift: commit a real change under a page's `sources:` in the code repo, then a comment-only change. Check the first is re-read and stamped or fixed (`checked:` with the new commit), the second advances `checked:` silently, a ruling citing the changed code becomes a finding and is not edited, one commit and one `log.md` line, and nothing written in the code repo.
+  - [ ] Throttle: Pause stops every background call; Gentle holds to 20 an hour; the status panel lists running, queued and failed work.
+  - [ ] Note what was run, what held and what did not here, then ask Chris before merging anything.
