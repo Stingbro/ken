@@ -8,8 +8,9 @@
 //!
 //! 1. The repo's own rules, a gitignore-style pattern to a role, in the
 //!    knowledge base's settings under the repo's `repos` entry
-//!    (`knowledge_settings`). The repo analysis proposes them when the repo
-//!    is added (`repo_analysis`), and a person edits them there. Where
+//!    (`knowledge_settings`). The repo analysis proposes them in the Inbox
+//!    when the repo is added (`repo_analysis`); once a person accepts they
+//!    are written there, and a person edits them there. Where
 //!    several patterns match, the longest wins.
 //! 2. Else the built-in core ([`core_role`]), read from the file's name and
 //!    then the folders it sits in: `UserService.java`, `services/user.py`.

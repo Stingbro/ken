@@ -185,23 +185,48 @@ fn shared_prefix(a: &Path, b: &Path) -> usize {
     a.components().zip(b.components()).take_while(|(x, y)| x == y).count()
 }
 
-/// Save what the repo analysis proposed for the source at `root`: its role
-/// rules under its `repos` entry and its controls in `controls`, each only
-/// when the file has none for it yet, so a person's edits are never
-/// overwritten. The entry is made when the file does not list the source.
-/// Returns whether the file changed; false when there is no settings file
-/// to write to.
-pub fn save_proposals(root: &Path, roles: &[(String, String)], controls: &[Control]) -> Result<bool> {
-    let Some(settings) = for_repo(root) else {
-        return Ok(false);
-    };
+/// What accepting a repo analysis did: whether the file changed, and the
+/// commit that holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Accepted {
+    pub written: bool,
+    /// None when nothing was written, the knowledge base is not a git repo,
+    /// or the file held a person's uncommitted work.
+    pub commit: Option<String>,
+}
+
+/// Write what a person accepted of the repo analysis for the source `name`
+/// (its role rules under its `repos` entry, its controls in `controls`) into
+/// the knowledge base's file at `kb_root`, each only when the file has none
+/// for it yet, so an edit made in Settings › Workspace while the proposal
+/// waited is never overwritten. `own` says the source is the knowledge base
+/// itself. Then one commit in the knowledge base names the file and lists
+/// what it took; it is left out when the file holds a person's uncommitted
+/// work, which Ken's commit would carry.
+pub fn accept_proposals(kb_root: &Path, name: &str, own: bool, roles: &[(String, String)], controls: &[Control]) -> Result<Accepted> {
+    let settings = Settings { kb_root: kb_root.to_path_buf(), name: name.to_string(), own, value: editable(kb_root)? };
     let Some(value) = with_proposals(&settings, roles, controls) else {
-        return Ok(false);
+        return Ok(Accepted { written: false, commit: None });
     };
-    let path = settings.kb_root.join(KNOWLEDGE_FILE);
-    let text = serde_json::to_string_pretty(&value).map_err(|e| Error::Other(e.to_string()))?;
-    std::fs::write(&path, text + "\n").map_err(|e| Error::io(&path, e))?;
-    Ok(true)
+    let dirty = crate::git::uncommitted(kb_root).iter().any(|p| p == KNOWLEDGE_FILE);
+    write(kb_root, &value)?;
+    if dirty {
+        return Ok(Accepted { written: true, commit: None });
+    }
+    let mut message = format!("settings: accept the repo analysis of {name} into {KNOWLEDGE_FILE}\n");
+    if !roles.is_empty() {
+        message.push_str("\nRoles:\n");
+        message.extend(roles.iter().map(|(p, r)| format!("- {p} = {r}\n")));
+    }
+    if !controls.is_empty() {
+        message.push_str("\nControls:\n");
+        message.extend(controls.iter().map(|c| format!("- {} | {}\n", c.question, c.expect)));
+    }
+    let commit = crate::git::commit_paths(kb_root, &[KNOWLEDGE_FILE.to_string()], &message).unwrap_or_else(|e| {
+        eprintln!("settings: could not commit {KNOWLEDGE_FILE}: {e}");
+        None
+    });
+    Ok(Accepted { written: true, commit })
 }
 
 /// The knowledge base's own top-level `ignore` lines, the rules every source
@@ -500,7 +525,7 @@ pub fn set_controls(kb_root: &Path, controls: &[Control]) -> Result<()> {
     write(kb_root, &value)
 }
 
-/// [`save_proposals`]'s change to the settings, None when nothing changes.
+/// [`accept_proposals`]'s change to the settings, None when nothing changes.
 pub fn with_proposals(settings: &Settings, roles: &[(String, String)], controls: &[Control]) -> Option<Value> {
     let mut value = settings.value.clone();
     let obj = value.as_object_mut()?;

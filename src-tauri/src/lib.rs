@@ -2148,12 +2148,13 @@ const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The repo analysis (knowledge-core decisions 17 and 19), when sources are
 /// added: for each source of the open workspace whose kind is said, whose
-/// knowledge base lists it and which has no analysis saved yet, one Claude
-/// call over its file list proposes its role rules and controls, saved in
-/// the knowledge base's `.ken/knowledge.json` for a person to edit. Without
-/// Claude nothing is asked and the built-in core roles apply. In the
-/// background; a source whose settings changed is scanned again so its
-/// roles apply.
+/// knowledge base lists it, which has no rules or controls there yet and was
+/// not proposed before, one Claude call over its file list proposes its role
+/// rules and controls. They wait as one Inbox card in the knowledge base's
+/// index for a person to accept or dismiss (Chris, 2026-10-14); nothing is
+/// written into `.ken/knowledge.json` until then ([`accept_analysis`]).
+/// Without Claude nothing is asked and the built-in core roles apply. In the
+/// background.
 fn analyze_new_sources(app: &AppHandle, state: &SharedState) {
     let (base, sources): (PathBuf, Vec<Project>) = {
         let guard = lock_tolerant(state);
@@ -2176,11 +2177,22 @@ fn analyze_new_sources(app: &AppHandle, state: &SharedState) {
         let Some(binary) = ken_core::runner::discover_claude() else {
             return;
         };
-        for project in sources {
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        for project in &sources {
             let kinds = ken_core::registry::kind_of(&project.root);
             if kinds.is_empty() {
                 continue;
             }
+            let Some(settings) = ken_core::repo_analysis::due(&project.root) else {
+                continue;
+            };
+            // The card waits in the knowledge base's own index.
+            let Some(kb) = sources.iter().find(|p| canon(&p.root) == canon(&settings.kb_root)) else {
+                continue;
+            };
+            let Ok(mut kb_db) = Db::open(&base, kb.config.id) else {
+                continue;
+            };
             let root = project.root.clone();
             // Background work: a turn of the one throttle (decision 34).
             let mut generate = |prompt: &str| -> ken_core::Result<String> {
@@ -2191,13 +2203,80 @@ fn analyze_new_sources(app: &AppHandle, state: &SharedState) {
                     other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
                 }
             };
-            match ken_core::repo_analysis::analyze_and_save(&project.root, &kinds, &mut generate) {
-                Ok(true) => rescan_member(&app, &base, &project),
-                Ok(false) => {}
+            let filed = ken_core::repo_analysis::analyze_and_propose(
+                &project.root,
+                Some(settings),
+                &kinds,
+                &mut kb_db,
+                &mut generate,
+                engine::now_epoch(),
+            );
+            match filed {
+                Ok(Some(_)) => {
+                    let _ = app.emit("review-changed", ());
+                }
+                Ok(None) => {}
                 Err(e) => eprintln!("repo analysis of {}: {e}", project.config.name),
             }
         }
     });
+}
+
+/// Accept the repo analysis waiting as Inbox item `item_id` in the
+/// workspace's knowledge base (Chris, 2026-10-14): its role rules and
+/// controls go into `.ken/knowledge.json` as one commit naming the file
+/// (`repo_analysis::accept`), and the source it is for is scanned again so
+/// its files take their roles. Dismiss is `resolve_review_item`. Returns the
+/// commit, when one was made.
+#[tauri::command(async)]
+fn accept_analysis(app: AppHandle, state: State<SharedState>, item_id: i64, project_id: Option<String>) -> CmdResult<Option<String>> {
+    let pid = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
+    let (source, accepted, base, open) = {
+        let mut guard = state.lock().unwrap();
+        let base = guard.base_dir.clone();
+        let open: Vec<Project> = guard.members.values().map(|m| m.project.clone()).collect();
+        let active = member_mut(&mut guard, pid)?;
+        let root = active.project.root.clone();
+        let (source, accepted) = ken_core::repo_analysis::accept(&root, &mut active.db, item_id, engine::now_epoch()).map_err(err)?;
+        (source, accepted, base, open)
+    };
+    if accepted.written {
+        for p in &open {
+            let named = ken_core::knowledge_settings::for_repo(&p.root).is_some_and(|s| s.name.eq_ignore_ascii_case(&source));
+            if named {
+                rescan_member(&app, &base, p);
+            }
+        }
+    }
+    let _ = app.emit("review-changed", ());
+    Ok(accepted.commit)
+}
+
+/// The repo analyses waiting in the workspace's knowledge base, for the
+/// Inbox: each with its role rules and controls.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisDto {
+    item_id: i64,
+    project_id: String,
+    title: String,
+    created_at: i64,
+    #[serde(flatten)]
+    proposal: ken_core::repo_analysis::Proposal,
+}
+
+#[tauri::command(async)]
+fn analysis_proposals(state: State<SharedState>) -> CmdResult<Vec<AnalysisDto>> {
+    let found = {
+        let guard = lock_tolerant(&state);
+        inbox_project(&guard).and_then(|p| guard.members.get(&p.config.id).map(|m| (p.config.id, m.search_db.clone())))
+    };
+    let Some((id, db)) = found else { return Ok(Vec::new()) };
+    let open = ken_core::repo_analysis::open(&lock_tolerant(&db)).map_err(err)?;
+    Ok(open
+        .into_iter()
+        .map(|(it, proposal)| AnalysisDto { item_id: it.id, project_id: id.to_string(), title: it.title, created_at: it.created_at, proposal })
+        .collect())
 }
 
 /// Say what a repo is for, in a person's words; the first-wiki draft reads it.
@@ -12032,6 +12111,8 @@ pub fn run() {
             set_model_selection,
             resolve_review_item,
             confirm_finding,
+            accept_analysis,
+            analysis_proposals,
             ignore_file,
             unignore_file,
             list_ignored,

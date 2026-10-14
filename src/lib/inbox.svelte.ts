@@ -1,12 +1,14 @@
 // The Inbox (the Briefing design): one list of everything waiting on you,
 // sorted by who it is from. Ken: what an ingest waits on (rulings, tickets, held page edits), the findings (what a
-// source contradicts and leaves open, what the wiki's checks found), and
-// questions Ken asked in a chat.
+// source contradicts and leaves open, what the wiki's checks found), the
+// repo analyses' proposed role rules and controls, and questions Ken asked
+// in a chat.
 // Sync & files: edit conflicts and files Ken could not read. Home's "Needs
 // you" is the top of this list and the sidebar count is its length. Resolving
 // an item here resolves it where it came from, so nothing lives in two places.
 import {
   api,
+  type AnalysisProposal,
   type ConflictItem,
   type Finding,
   type IngestProposal,
@@ -25,6 +27,7 @@ export type InboxTone = "attn" | "danger" | "accent" | "ink";
 export type InboxSource =
   | { type: "proposal"; proposal: IngestProposal; cardId: number; note: string; projectId: string }
   | { type: "finding"; finding: Finding }
+  | { type: "analysis"; analysis: AnalysisProposal }
   | { type: "conflict"; conflict: ConflictItem }
   | { type: "failed"; relPath: string; error: string | null }
   | { type: "chat"; chatId: string; title: string };
@@ -101,6 +104,27 @@ export function findingItem(f: Finding, i: number): InboxItem {
     when: null,
     where: f.path,
     source: { type: "finding", finding: f },
+  };
+}
+
+/** A repo analysis waiting for a person: the role rules and controls Ken
+ *  proposes for a source, applied only once accepted. */
+export function analysisItem(a: AnalysisProposal): InboxItem {
+  const parts = [
+    a.roles.length > 0 ? `${a.roles.length} role ${a.roles.length === 1 ? "rule" : "rules"}` : "",
+    a.controls.length > 0 ? `${a.controls.length} ${a.controls.length === 1 ? "control" : "controls"}` : "",
+  ].filter((p) => p);
+  return {
+    id: `analysis:${a.itemId}`,
+    group: "ken",
+    kind: "Proposal",
+    tone: "attn",
+    from: "Ken",
+    title: `Search settings for ${a.source}`,
+    short: `${parts.join(" and ")} · nothing applies until you accept`,
+    when: a.createdAt || null,
+    where: ".ken/knowledge.json",
+    source: { type: "analysis", analysis: a },
   };
 }
 
@@ -251,6 +275,9 @@ class InboxStore {
           for (const p of card.proposals) out.push(proposalItem(p, card.id, card.note, overview.projectId));
         }
       }
+      // The repo analyses that wait for a person (role rules and controls).
+      const analyses = await api.analysisProposals().catch(() => []);
+      for (const a of analyses) out.push(analysisItem(a));
       if (ws === app.workspace?.id) this.ken = out;
     } finally {
       this.loading = false;

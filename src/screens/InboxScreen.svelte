@@ -77,6 +77,14 @@
         }
         return out;
       }
+      case "analysis": {
+        // Nothing applies until accepted; Settings › Workspace edits what is.
+        const a = s.analysis;
+        return [
+          { label: "Accept", primary: true, run: () => void act(item, () => api.acceptAnalysis(a.itemId, a.projectId), "Accepted. They are in .ken/knowledge.json, and the source is read again.") },
+          { label: "Dismiss", run: () => void act(item, () => api.resolveReviewItem(a.itemId, a.projectId), "Dismissed. Nothing was written.") },
+        ];
+      }
       case "conflict":
         return [];
       case "failed":
@@ -170,6 +178,27 @@
           {/if}
         {:else if sel.source.type === "finding"}
           <p class="body">{sel.source.finding.detail}</p>
+        {:else if sel.source.type === "analysis"}
+          <p class="body">
+            Ken read {sel.source.analysis.source}'s files and proposes these for search. Accept writes them into
+            .ken/knowledge.json as one commit; Dismiss drops them. Nothing applies until you accept.
+          </p>
+          {#if sel.source.analysis.roles.length > 0}
+            <div class="t-label">Role rules</div>
+            <ul class="plist">
+              {#each sel.source.analysis.roles as r (r.pattern)}
+                <li><code>{r.pattern}</code> is a <strong>{r.role}</strong></li>
+              {/each}
+            </ul>
+          {/if}
+          {#if sel.source.analysis.controls.length > 0}
+            <div class="t-label">Controls: a question, and the file that must come back near the top</div>
+            <ul class="plist">
+              {#each sel.source.analysis.controls as c, i (i)}
+                <li>“{c.question}” → <code>{c.expect}</code></li>
+              {/each}
+            </ul>
+          {/if}
         {:else if sel.source.type === "conflict"}
           <ConflictDetail item={sel.source.conflict} />
         {:else if sel.source.type === "failed"}
@@ -360,6 +389,13 @@
     line-height: 1.65;
     color: var(--ink-2);
     white-space: pre-wrap;
+  }
+  .plist {
+    margin: 0;
+    padding-left: 20px;
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--ink-2);
   }
   .acts {
     display: flex;

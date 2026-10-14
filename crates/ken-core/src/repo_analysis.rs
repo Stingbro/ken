@@ -1,23 +1,34 @@
 //! The repo analysis (knowledge-core decisions 17 and 19): when a source is
 //! added, one Claude call over its file list proposes its role rules (for a
-//! code or reference repo) and a few controls (for every source). The
-//! proposals are saved in the knowledge base's `.ken/knowledge.json`
-//! (`knowledge_settings::save_proposals`), where a person edits them; they
-//! are applied without a model at index time (`coderole`, `controls`).
+//! code or reference repo) and a few controls (for every source). What it
+//! proposes waits for a person (Chris, 2026-10-14): one Inbox card in the
+//! knowledge base's index ([`KIND`], [`file`]) shows each rule and control.
+//! Accept ([`accept`]) writes them into the knowledge base's
+//! `.ken/knowledge.json` as one commit naming the file; Dismiss drops them.
+//! Nothing applies until accepted. Once in the file, a person edits them in
+//! Settings › Workspace, and they are applied without a model at index time
+//! (`coderole`, `controls`).
 //!
 //! Claude reads the prompt and answers with no tools; the local model is
-//! never asked. When Claude is not there, or the call fails, nothing is
-//! saved and the built-in core roles apply; the next time a source is added
-//! the analysis is tried again. A source whose analysis is saved is never
-//! analysed again, so a person's edits stay.
+//! never asked. When Claude is not there, or the call fails, nothing waits
+//! and the built-in core roles apply; the next time a source is added the
+//! analysis is tried again. A source whose analysis is in the file, or was
+//! proposed once (waiting, accepted or dismissed), is never analysed again,
+//! so a person's edits and a person's no both stay.
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::controls::Control;
+use crate::db::{Db, ReviewItemRow};
+use crate::knowledge_settings::Settings;
 use crate::registry::RepoKind;
-use crate::Result;
+use crate::{Error, Result};
+
+/// The Review kind of a repo analysis waiting for a person.
+pub const KIND: &str = "analysis";
 
 /// Most files listed in the prompt; a bigger repo is sampled evenly across
 /// its tree, so every folder shows.
@@ -192,18 +203,138 @@ pub fn analyze(root: &Path, name: &str, kinds: &[RepoKind], generate: &mut dyn F
     Ok(parse(&reply, &files, wants_roles(kinds)))
 }
 
-/// Analyse the source at `root` and save what it proposes, when it has a
-/// knowledge base to save into and no analysis saved yet. Returns whether
-/// the settings changed. No call is made when there is nothing to do.
-pub fn analyze_and_save(root: &Path, kinds: &[RepoKind], generate: &mut dyn FnMut(&str) -> Result<String>) -> Result<bool> {
-    let Some(settings) = crate::knowledge_settings::for_repo(root) else {
-        return Ok(false);
+/// One role rule as the Inbox card shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleRule {
+    pub pattern: String,
+    pub role: String,
+}
+
+/// What waits in the Inbox for one source: the card's payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Proposal {
+    /// The source's name, as the settings file's `repos` and `controls`
+    /// name it.
+    pub source: String,
+    /// Whether the source is the knowledge base itself.
+    #[serde(default)]
+    pub own: bool,
+    #[serde(default)]
+    pub roles: Vec<RoleRule>,
+    #[serde(default)]
+    pub controls: Vec<Control>,
+}
+
+impl Proposal {
+    fn role_pairs(&self) -> Vec<(String, String)> {
+        self.roles.iter().map(|r| (r.pattern.clone(), r.role.clone())).collect()
+    }
+}
+
+/// The settings of the source at `root` when it is due an analysis: it has
+/// a knowledge base to keep the settings in, and no rules or controls of its
+/// own there yet. None for a code repo that keeps its own settings file:
+/// Ken writes nothing in a code repo (decision 36).
+pub fn due(root: &Path) -> Option<Settings> {
+    due_of(crate::knowledge_settings::for_repo(root))
+}
+
+/// [`due`] with the settings already found.
+pub fn due_of(settings: Option<Settings>) -> Option<Settings> {
+    settings.filter(|s| !s.analyzed() && (!s.own || crate::registry::is_library(&s.kb_root)))
+}
+
+/// The proposal a Review item holds, when it is an analysis.
+pub fn proposal_of(it: &ReviewItemRow) -> Option<Proposal> {
+    (it.kind == KIND).then(|| it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok())).flatten()
+}
+
+/// Whether the source `name` was proposed before in this knowledge base's
+/// index: waiting, accepted or dismissed.
+pub fn proposed_before(db: &Db, name: &str) -> Result<bool> {
+    Ok(db.review_items_of_kind(KIND, 500)?.iter().filter_map(proposal_of).any(|p| p.source.eq_ignore_ascii_case(name)))
+}
+
+/// The analyses waiting for a person, newest first.
+pub fn open(db: &Db) -> Result<Vec<(ReviewItemRow, Proposal)>> {
+    Ok(db.list_open_review_items()?.into_iter().filter_map(|it| proposal_of(&it).map(|p| (it, p))).collect())
+}
+
+/// The card's text: each rule and each control, one a line.
+fn card_body(p: &Proposal) -> String {
+    let mut s = String::new();
+    if !p.roles.is_empty() {
+        s.push_str("Role rules (pattern = role):\n");
+        s.extend(p.roles.iter().map(|r| format!("- {} = {}\n", r.pattern, r.role)));
+    }
+    if !p.controls.is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str("Controls (the question, then the file that must come back near the top):\n");
+        s.extend(p.controls.iter().map(|c| format!("- {} | {}\n", c.question, c.expect)));
+    }
+    s.push_str(&format!(
+        "\nAccept writes them into {} as one commit; Dismiss drops them. Nothing applies until you accept.",
+        crate::wikinew::KNOWLEDGE_FILE
+    ));
+    s
+}
+
+/// File what the analysis proposed for the source as one Inbox card in the
+/// knowledge base's index `db`. Returns its id; None when it proposed
+/// nothing.
+pub fn file(db: &mut Db, settings: &Settings, analysis: &Analysis, now: i64) -> Result<Option<i64>> {
+    if analysis.roles.is_empty() && analysis.controls.is_empty() {
+        return Ok(None);
+    }
+    let p = Proposal {
+        source: settings.name.clone(),
+        own: settings.own,
+        roles: analysis.roles.iter().map(|(pattern, role)| RoleRule { pattern: pattern.clone(), role: role.clone() }).collect(),
+        controls: analysis.controls.clone(),
     };
-    if settings.analyzed() {
-        return Ok(false);
+    let title = match (p.roles.len(), p.controls.len()) {
+        (0, c) => format!("{c} controls proposed for {}", p.source),
+        (r, 0) => format!("{r} role rules proposed for {}", p.source),
+        (r, c) => format!("{r} role rules and {c} controls proposed for {}", p.source),
+    };
+    let payload = serde_json::to_string(&p).map_err(|e| Error::Other(e.to_string()))?;
+    Ok(Some(db.insert_review_item(KIND, &title, &card_body(&p), crate::wikinew::KNOWLEDGE_FILE, Some(&payload), now)?))
+}
+
+/// Analyse the source at `root` and file what it proposes for a person
+/// ([`file`]), when it is due ([`due_of`]) and was not proposed before in
+/// the knowledge base's index `kb_db`. No call is made when there is nothing
+/// to do. Returns the card's id.
+pub fn analyze_and_propose(
+    root: &Path,
+    settings: Option<Settings>,
+    kinds: &[RepoKind],
+    kb_db: &mut Db,
+    generate: &mut dyn FnMut(&str) -> Result<String>,
+    now: i64,
+) -> Result<Option<i64>> {
+    let Some(settings) = due_of(settings) else { return Ok(None) };
+    if proposed_before(kb_db, &settings.name)? {
+        return Ok(None);
     }
     let analysis = analyze(root, &settings.name, kinds, generate)?;
-    crate::knowledge_settings::save_proposals(root, &analysis.roles, &analysis.controls)
+    file(kb_db, &settings, &analysis, now)
+}
+
+/// Accept the analysis waiting as item `id` in the knowledge base at
+/// `kb_root`: its rules and controls are written into `.ken/knowledge.json`
+/// (only where the file has none for the source yet) as one commit naming
+/// the file (`knowledge_settings::accept_proposals`), and the card is done.
+/// Returns the source's name and what was written.
+pub fn accept(kb_root: &Path, db: &mut Db, id: i64, now: i64) -> Result<(String, crate::knowledge_settings::Accepted)> {
+    let (it, p) = open(db)?.into_iter().find(|(it, _)| it.id == id).ok_or_else(|| Error::Other("no repo analysis waits with that id".into()))?;
+    let accepted = crate::knowledge_settings::accept_proposals(kb_root, &p.source, p.own, &p.role_pairs(), &p.controls)?;
+    db.resolve_review_item(it.id, now)?;
+    Ok((p.source, accepted))
 }
 
 #[cfg(test)]
@@ -248,7 +379,81 @@ mod tests {
     #[test]
     fn with_no_settings_nothing_is_asked() {
         let d = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
         let mut never = |_: &str| -> Result<String> { panic!("no knowledge base to save into") };
-        assert!(!analyze_and_save(d.path(), &[RepoKind::Code], &mut never).unwrap());
+        assert_eq!(analyze_and_propose(d.path(), None, &[RepoKind::Code], &mut db, &mut never, 1).unwrap(), None);
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// The analysis waits as an Inbox card (Chris, 2026-10-14): nothing is
+    /// written until a person accepts, Accept is one commit naming the file,
+    /// and a source proposed once is not asked about again.
+    #[test]
+    fn a_proposal_waits_and_applies_only_when_accepted() {
+        let d = tempfile::tempdir().unwrap();
+        let (wiki, game) = (d.path().join("Wiki"), d.path().join("Game"));
+        std::fs::create_dir_all(wiki.join(crate::ingest::RAW)).unwrap();
+        std::fs::write(wiki.join(crate::ingest::RAW).join(".keep"), "").unwrap();
+        std::fs::create_dir_all(wiki.join(".ken")).unwrap();
+        let file = wiki.join(crate::wikinew::KNOWLEDGE_FILE);
+        std::fs::write(&file, "{ \"repos\": { \"Game\": { \"kind\": \"code\" }, \"Tools\": { \"kind\": \"code\" } } }\n").unwrap();
+        git(&wiki, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git(&wiki, &["config", k, v]);
+        }
+        git(&wiki, &["add", "-A"]);
+        git(&wiki, &["commit", "-q", "-m", "start"]);
+        std::fs::create_dir_all(game.join("src/net")).unwrap();
+        std::fs::write(game.join("src/net/Packet.java"), "class Packet {}").unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        let settings = || crate::knowledge_settings::among(&game, "Game", &[wiki.clone()]);
+        let mut asked = 0;
+        let mut claude = |_: &str| -> Result<String> {
+            asked += 1;
+            Ok(r#"{"roles": {"src/net/**": "protocol"}, "controls": [{"question": "how are packets framed", "expect": "src/net/Packet.java"}]}"#.into())
+        };
+        let id = analyze_and_propose(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 1).unwrap().expect("a card");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing applies until accepted");
+        let waiting = open(&db).unwrap();
+        assert_eq!(waiting.len(), 1);
+        let (card, p) = &waiting[0];
+        assert_eq!(card.title, "1 role rules and 1 controls proposed for Game");
+        assert!(card.body.contains("- src/net/** = protocol") && card.body.contains("- how are packets framed | src/net/Packet.java"), "{}", card.body);
+        assert_eq!(p.roles, vec![RoleRule { pattern: "src/net/**".into(), role: "protocol".into() }]);
+
+        assert_eq!(analyze_and_propose(&game, settings(), &[RepoKind::Code], &mut db, &mut claude, 2).unwrap(), None, "it waits already");
+        assert_eq!(asked, 1, "no second call");
+
+        let (source, accepted) = accept(&wiki, &mut db, id, 3).unwrap();
+        assert_eq!(source, "Game");
+        assert!(accepted.written && accepted.commit.is_some());
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["repos"]["Game"]["roles"]["src/net/**"], "protocol");
+        assert_eq!(v["controls"][0]["source"], "Game");
+        let shown = git(&wiki, &["show", "--name-only", "--format=%s", "HEAD"]);
+        assert!(shown.starts_with("settings: accept the repo analysis of Game into .ken/knowledge.json"), "{shown}");
+        assert!(shown.lines().any(|l| l == crate::wikinew::KNOWLEDGE_FILE), "{shown}");
+        assert!(open(&db).unwrap().is_empty(), "the card is done");
+        assert!(due_of(settings()).is_none(), "accepted: in the file now");
+
+        // Dismissed: dropped, and not asked about again.
+        let tools = d.path().join("Tools");
+        std::fs::create_dir_all(tools.join("cli")).unwrap();
+        std::fs::write(tools.join("cli/main.rs"), "fn main() {}").unwrap();
+        let tools_settings = || crate::knowledge_settings::among(&tools, "Tools", &[wiki.clone()]);
+        let mut claude = |_: &str| -> Result<String> { Ok(r#"{"roles": {"cli/**": "command"}, "controls": []}"#.into()) };
+        let id = analyze_and_propose(&tools, tools_settings(), &[RepoKind::Code], &mut db, &mut claude, 4).unwrap().expect("a card");
+        db.resolve_review_item(id, 5).unwrap();
+        let mut never = |_: &str| -> Result<String> { panic!("dismissed once, not asked again") };
+        assert_eq!(analyze_and_propose(&tools, tools_settings(), &[RepoKind::Code], &mut db, &mut never, 6).unwrap(), None);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(v["repos"]["Tools"].get("roles").is_none(), "a dismissed proposal is never written");
     }
 }

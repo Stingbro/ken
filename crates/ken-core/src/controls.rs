@@ -6,7 +6,8 @@
 //!
 //! The questions live in the knowledge base's `.ken/knowledge.json`
 //! (`controls`, each naming its source; see `knowledge_settings`). The repo
-//! analysis proposes them when a source is added (`repo_analysis`), and a
+//! analysis proposes them in the Inbox when a source is added
+//! (`repo_analysis`); once a person accepts they are written there, and a
 //! person edits them there. The last run's results are stored in the
 //! source's index, for the health line.
 //!

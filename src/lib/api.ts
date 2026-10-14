@@ -146,6 +146,23 @@ export interface Finding {
   itemId?: number | null;
 }
 
+/** Mirrors `AnalysisDto` (`repo_analysis::Proposal`): the role rules and
+ *  controls the repo analysis proposed for one source, waiting for a person
+ *  to accept or dismiss. Nothing applies until accepted. */
+export interface AnalysisProposal {
+  itemId: number;
+  /** The knowledge base the card waits in. */
+  projectId: string;
+  title: string;
+  /** Seconds since the epoch. */
+  createdAt: number;
+  /** The source's name in `.ken/knowledge.json`. */
+  source: string;
+  own: boolean;
+  roles: { pattern: string; role: string }[];
+  controls: { question: string; expect: string; source?: string | null }[];
+}
+
 /** Mirrors `wikinew::TemplateGap`: a template file the knowledge base lacks,
  *  or one Ken owns that differs from its template (`diff`: `- ` its lines,
  *  `+ ` the template's). */
@@ -1549,6 +1566,13 @@ export const api = {
    *  one commit, and returns the commit when it made one. */
   confirmFinding: (id: number, projectId: string | null = null) =>
     invoke<string | null>("confirm_finding", { id, projectId }),
+  /** The repo analyses waiting in the knowledge base's Inbox. */
+  analysisProposals: () => invoke<AnalysisProposal[]>("analysis_proposals"),
+  /** Accept a repo analysis: its rules and controls go into
+   *  `.ken/knowledge.json` as one commit, returned when one was made.
+   *  Dismiss is `resolveReviewItem`. */
+  acceptAnalysis: (itemId: number, projectId: string | null = null) =>
+    invoke<string | null>("accept_analysis", { itemId, projectId }),
   /// Silence a file's issues for this user only (app-data, never synced).
   ignoreFile: (relPath: string) =>
     invoke<void>("ignore_file", { relPath }),
