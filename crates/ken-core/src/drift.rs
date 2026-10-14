@@ -838,17 +838,63 @@ pub fn due(db: &Db, now: i64) -> Result<bool> {
     Ok(branch_moved(db))
 }
 
-/// Whether a repo the last run measured has moved on: its branch's head,
-/// as git has it here, is not the one the run measured at. Ken sees a move
-/// when that branch moves locally (a pull, or any fetch; each run fetches
-/// first); it does not fetch only to look.
+/// Whether a repo the last run measured, or one it watches
+/// ([`watch_repos`]), has moved on: its branch's head, as git has it here,
+/// is not the one the run saw. Ken sees a move when that branch moves
+/// locally (a commit, a pull or a push, which moves the remote-tracking
+/// branch too, or any fetch; each run fetches first); it does not fetch
+/// only to look.
 pub fn branch_moved(db: &Db) -> bool {
+    !moved_heads(db).is_empty()
+}
+
+/// The repos whose branch moved since the last run, each with its head now,
+/// in order: one `git rev-parse` a repo, cheap enough to ask often. The app
+/// asks it between its checks, so a commit starts a run within a minute
+/// rather than at the pace's next look.
+pub fn moved_heads(db: &Db) -> Vec<(String, String)> {
     let cache = PinCache::load(db);
-    cache.heads.iter().any(|(repo, head)| {
-        let root = Path::new(repo);
-        let branch = cache.branches.get(repo).cloned().unwrap_or_else(|| default_branch(root).0);
-        git(root, &["rev-parse", &branch]).is_some_and(|now| &now != head)
-    })
+    let mut out: Vec<(String, String)> = cache
+        .heads
+        .iter()
+        .filter_map(|(repo, head)| {
+            let root = Path::new(repo);
+            let branch = cache.branches.get(repo).cloned().unwrap_or_else(|| default_branch(root).0);
+            git(root, &["rev-parse", &branch]).filter(|now| now != head).map(|now| (repo.clone(), now))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Watch the workspace's code `repos` (name and folder) for a move: each one
+/// the last run did not measure, because no page cited it yet, gets its
+/// branch and head noted, so its next commit makes a run due. Without it a
+/// repo first cited after a run was never seen to move, and drift waited
+/// for the weekly age run (end-to-end finding 16). A repo the cache knows,
+/// or one without git, is left as it is.
+pub fn watch_repos(db: &Db, kb_root: &Path, repos: &[(String, PathBuf)]) -> Result<()> {
+    let mut cache = PinCache::load(db);
+    let mut changed = false;
+    for (name, folder) in repos {
+        // Keyed as the sweep keys it: by the folder a citation resolves to.
+        let root = resolve_repo(kb_root, name).unwrap_or_else(|| folder.clone());
+        let key = root.display().to_string();
+        if cache.heads.contains_key(&key) || git(&root, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+            continue;
+        }
+        let (branch, _) = branch_for(kb_root, name, &root);
+        if let Some(head) = git(&root, &["rev-parse", &branch]) {
+            cache.heads.insert(key.clone(), head);
+            cache.branches.insert(key, branch);
+            changed = true;
+        }
+    }
+    if changed {
+        let json = serde_json::to_string(&cache).map_err(|e| crate::Error::Other(e.to_string()))?;
+        db.store_drift_cache(&json)?;
+    }
+    Ok(())
 }
 
 /// The kind of the Review items earlier versions filed for a run.
@@ -1821,6 +1867,39 @@ updated: {{date}}
         let (branch, note) = branch_for(&wiki, "game", &code);
         assert_eq!(branch, "main");
         assert!(note.is_some_and(|n| n.contains("base nowhere was not found")));
+    }
+
+    /// A repo no page cited at the last run is watched from then on: its
+    /// next commit makes a run due (end-to-end finding 16), once.
+    #[test]
+    fn a_commit_in_a_watched_repo_makes_a_run_due() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("game");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&code, &["config", k, v]);
+        }
+        commit_at(&code, "src/save.rs", "fn save() {}\n", "2026-09-01");
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(&wiki).unwrap();
+        fs::write(wiki.join("START-HERE.md"), "# Start\n").unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        settings(&wiki, serde_json::json!({ "fetch": false }));
+        let mut db = Db::open_in_memory().unwrap();
+        let now = chrono_free_epoch("2026-09-24").unwrap();
+        let run = sweep(&project, &db, now).unwrap();
+        db.insert_drift_run(&run).unwrap();
+        assert!(!branch_moved(&db), "no page cites the repo: nothing measured, nothing watched");
+
+        let repos = vec![("game".to_string(), code.clone())];
+        watch_repos(&db, &wiki, &repos).unwrap();
+        assert!(!due(&db, now).unwrap(), "watched, and not moved");
+        commit_at(&code, "src/save.rs", "fn save() { write(); }\n", "2026-09-25");
+        assert!(due(&db, now).unwrap(), "a commit is a move");
+        assert_eq!(moved_heads(&db).len(), 1);
+        watch_repos(&db, &wiki, &repos).unwrap();
+        assert!(branch_moved(&db), "watching again does not hide a move; only a run does");
     }
 
     /// The age rule files a finding, never a re-read (Chris, 2026-10-14):

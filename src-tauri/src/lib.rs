@@ -6820,6 +6820,15 @@ fn run_drift(state: &SharedState, project: &Project, db: &mut Db, force: bool, s
         .into_iter()
         .filter_map(|(name, id)| Db::open_read_only(&base, id).ok().map(|db| ken_core::ingest::CodeSource { name, db }))
         .collect();
+    // Every code repo of the workspace is watched from now on, cited yet or
+    // not, so its next commit makes a run due (decision 28).
+    let watched: Vec<(String, PathBuf)> = {
+        let guard = lock_tolerant(state);
+        workspace_repos(&guard).into_iter().filter(|(_, id, _)| *id != project.config.id).map(|(name, _, root)| (name, root)).collect()
+    };
+    if let Err(e) = ken_core::drift::watch_repos(db, &project.root, &watched) {
+        eprintln!("warning: could not watch the workspace's repos: {e}");
+    }
     match ken_core::lint::rulings_in_code(db, &project.root, &code) {
         Ok(found) => {
             if let Err(e) = ken_core::findings::sync(db, &[ken_core::lint::UNKNOWN_RULING], &ken_core::lint::unknown_of(&found), now) {
@@ -11043,6 +11052,8 @@ fn background_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid,
     let mut last_checks = soon(Duration::from_secs(60));
     let mut checks_after = Instant::now();
     let mut last_build = Instant::now();
+    let mut last_move_look = Instant::now();
+    let mut moves_seen: Vec<(String, String)> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
         if ken_core::throttle::paused() {
             std::thread::sleep(Duration::from_secs(2));
@@ -11059,6 +11070,18 @@ fn background_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid,
                 SummaryTick::Idle => {}
                 SummaryTick::Stopped => return,
             }
+        }
+        // A commit in a source moves the checks forward (decision 28): the
+        // branches are looked at every minute, cheaply, rather than at the
+        // pace's next look (15 minutes when Gentle). A move that brought the
+        // checks forward once does not again until the heads move further.
+        if last_move_look.elapsed() >= MOVE_LOOK && Instant::now() >= checks_after {
+            last_move_look = Instant::now();
+            let moves = moved_since_drift(&state, project_id);
+            if !moves.is_empty() && moves != moves_seen {
+                last_checks = Instant::now() - ken_core::throttle::limits().checks_every;
+            }
+            moves_seen = moves;
         }
         // A knowledge base's drift, lint and graph (knowledge-core decisions
         // 21, 25, 28 to 30): a drift run when one is due, then at most one
@@ -11086,6 +11109,24 @@ fn background_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid,
 
 /// How often the background worker looks at the build queue.
 const BUILD_EVERY: Duration = Duration::from_secs(10);
+
+/// How often the background worker looks for a source's branch moving.
+const MOVE_LOOK: Duration = Duration::from_secs(60);
+
+/// The code repos whose branch moved since the knowledge base's last drift
+/// run (`drift::moved_heads`), with their heads now. Empty for a repo that is
+/// not a knowledge base, or whose index will not open.
+fn moved_since_drift(state: &SharedState, project_id: uuid::Uuid) -> Vec<(String, String)> {
+    let (base, root) = {
+        let guard = lock_tolerant(state);
+        let Some(m) = guard.members.get(&project_id) else { return Vec::new() };
+        (guard.base_dir.clone(), m.project.root.clone())
+    };
+    if !ken_core::registry::is_library(&root) {
+        return Vec::new();
+    }
+    Db::open_read_only(&base, project_id).map(|db| ken_core::drift::moved_heads(&db)).unwrap_or_default()
+}
 
 /// One turn of a knowledge base's build queue (knowledge-core decision 33):
 /// the queue is brought up to date with the inbox (an item read is done, one
