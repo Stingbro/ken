@@ -2362,7 +2362,7 @@ fn set_project_kind(
     }
     registry.save(&guard.base_dir).map_err(err)?;
     if let Some(member) = guard.members.get(&uuid) {
-        let status = sync_status_of(&member.project);
+        let status = sync_status_of(&member.project, &member.sync.pending());
         emit_member(&app, uuid, "sync-state", SyncStateEvent {
             state: if status.active { "synced" } else { "off" }.into(),
             detail: None,
@@ -5775,9 +5775,16 @@ struct SyncStatus {
     active: bool,
     remote: Option<String>,
     branch: Option<String>,
+    /// The knowledge base's changes not written through Ken
+    /// (`sync::other_changes`): a cycle never commits them, and "commit my
+    /// other changes" commits them only when a person asks. Empty in a code
+    /// or reference repo, where Ken never commits.
+    others: Vec<String>,
 }
 
-fn sync_status_of(project: &Project) -> SyncStatus {
+/// The sync card's state for `project`; `pending` is what Ken wrote there
+/// that its next cycle commits.
+fn sync_status_of(project: &Project, pending: &[String]) -> SyncStatus {
     let is_git = sync::is_git_repo(&project.root);
     let (remote, branch) = if is_git {
         sync::remote_and_branch(&project.root)
@@ -5785,23 +5792,53 @@ fn sync_status_of(project: &Project) -> SyncStatus {
         (None, None)
     };
     let auto = sync::sync_auto(project, &ken_core::registry::kind_of(&project.root));
+    let others = if is_git && ken_core::registry::is_library(&project.root) {
+        sync::other_changes(&project.root, pending)
+    } else {
+        Vec::new()
+    };
     SyncStatus {
         mode: if is_git { "git" } else { "drive" }.into(),
         auto,
         active: is_git && auto && remote.is_some(),
         remote,
         branch,
+        others,
     }
 }
 
 #[tauri::command(async)]
 fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
-    // git runs twice: with the lock released.
-    let project = {
+    // git runs a few times: with the lock released.
+    let (project, pending) = {
         let guard = lock_tolerant(&state);
-        member(&guard, None)?.project.clone()
+        let active = member(&guard, None)?;
+        (active.project.clone(), active.sync.pending())
     };
-    Ok(sync_status_of(&project))
+    Ok(sync_status_of(&project, &pending))
+}
+
+/// "Commit my other changes" (Chris, 2026-10-14): commit exactly the files
+/// a person was shown as changed outside Ken in the knowledge base
+/// (`sync::commit_others`), with a message naming each, then sync so the
+/// commit is pushed with the rest. Refused in a code or reference repo
+/// (decision 36). Returns the commit, when one was made.
+#[tauri::command(async)]
+fn sync_commit_others(state: State<SharedState>, paths: Vec<String>) -> CmdResult<Option<String>> {
+    let root = {
+        let guard = lock_tolerant(&state);
+        member(&guard, None)?.project.root.clone()
+    };
+    let commit = sync::commit_others(&root, &paths).map_err(err)?;
+    if commit.is_some() {
+        let guard = lock_tolerant(&state);
+        if let Ok(active) = member(&guard, None) {
+            if active.project.root == root {
+                active.sync.sync_now();
+            }
+        }
+    }
+    Ok(commit)
 }
 
 #[tauri::command]
@@ -5823,7 +5860,7 @@ fn set_sync_auto(app: AppHandle, state: State<SharedState>, auto: bool) -> CmdRe
         .insert("sync".into(), serde_json::Value::Object(obj));
     active.project.save().map_err(err)?;
 
-    let status = sync_status_of(&active.project);
+    let status = sync_status_of(&active.project, &active.sync.pending());
     // Reflect the toggle in the dot immediately; a fresh pull confirms.
     emit_member(&app, active.project.config.id, "sync-state", SyncStateEvent {
         state: if status.active { "synced" } else { "off" }.into(),
@@ -12172,6 +12209,7 @@ pub fn run() {
             setup_create_wiki,
             apply_page_proposal,
             sync_now,
+            sync_commit_others,
             resolve_conflict,
             resolve_conflict_copy,
             get_background_index,

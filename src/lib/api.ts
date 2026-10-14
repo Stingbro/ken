@@ -640,6 +640,9 @@ export interface SyncStatus {
   active: boolean;
   remote: string | null;
   branch: string | null;
+  /** The knowledge base's files changed outside Ken: sync never commits
+   *  them by itself; "commit my other changes" does, once shown. */
+  others: string[];
 }
 
 export type ChatStatus = "working" | "needs_input" | "done" | "error";
@@ -1593,6 +1596,9 @@ export const api = {
   setSyncAuto: (auto: boolean) =>
     invoke<SyncStatus>("set_sync_auto", { auto }),
   syncNow: () => invoke<void>("sync_now"),
+  /** Commit exactly these files changed outside Ken in the knowledge base,
+   *  named in the message, then sync. Returns the commit, when one was made. */
+  syncCommitOthers: (paths: string[]) => invoke<string | null>("sync_commit_others", { paths }),
   resolveConflict: (
     itemId: number,
     resolution: ConflictResolution,

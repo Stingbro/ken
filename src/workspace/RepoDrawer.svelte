@@ -136,6 +136,26 @@
     }
   }
 
+  // "Commit my other changes": the files changed outside Ken are listed
+  // first, one by one, and only those are committed once the person says so.
+  let showingOthers = $state(false);
+  let committingOthers = $state(false);
+
+  async function commitOthers() {
+    if (!sync || sync.others.length === 0) return;
+    committingOthers = true;
+    try {
+      const commit = await api.syncCommitOthers(sync.others);
+      toast.show(commit ?`Committed ${sync.others.length === 1 ? "1 file" : `${sync.others.length} files`} (${commit}).` : "Nothing was left to commit.");
+      showingOthers = false;
+      sync = await api.syncStatus();
+    } catch (e) {
+      toast.error("Could not commit those changes", e);
+    } finally {
+      committingOthers = false;
+    }
+  }
+
   function openInFiles() {
     close();
     app.screen = "files";
@@ -315,6 +335,31 @@
             Ken fetches others' changes when you come back to it, and commits and pushes only what it wrote here
             soon after. When two people change one file, the banner at the top of Files opens both versions.
           </p>
+          {#if sync.others.length > 0}
+            <div class="row">
+              <span class="small">
+                {sync.others.length === 1 ? "1 file" : `${sync.others.length} files`} changed outside Ken. Sync leaves
+                them to you.
+              </span>
+              {#if !showingOthers}
+                <button class="btn btn-small push" onclick={() => (showingOthers = true)}>Commit my other changes…</button>
+              {/if}
+            </div>
+            {#if showingOthers}
+              <ul class="others mono small">
+                {#each sync.others as path (path)}
+                  <li>{path}</li>
+                {/each}
+              </ul>
+              <div class="row">
+                <span class="note">One commit of exactly these files, its message naming each. Sync then pushes it.</span>
+                <button class="btn btn-small" onclick={() => (showingOthers = false)} disabled={committingOthers}>Cancel</button>
+                <button class="btn btn-small btn-primary" onclick={() => void commitOthers()} disabled={committingOthers}>
+                  {committingOthers ? "Committing…" : `Commit ${sync.others.length === 1 ? "this file" : `these ${sync.others.length}`}`}
+                </button>
+              </div>
+            {/if}
+          {/if}
         {:else}
           <p class="note">No remote, so Ken keeps everything on this computer.</p>
         {/if}
@@ -430,6 +475,14 @@
   }
   .small {
     font-size: 11.5px;
+  }
+  .others {
+    margin: 0;
+    padding-left: 18px;
+    max-height: 180px;
+    overflow-y: auto;
+    line-height: 1.6;
+    word-break: break-all;
   }
   .chip {
     font-size: 11.5px;

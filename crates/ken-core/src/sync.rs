@@ -11,7 +11,9 @@
 //! Ken's commits (knowledge-core decision 36): only in the knowledge base,
 //! only its own changes. A cycle commits exactly the paths Ken wrote there
 //! (`SyncEngine::wrote`) through `git::commit_paths`, never `git add -A`, so
-//! a person's other work in the tree stays theirs. A code or reference repo
+//! a person's other work in the tree stays theirs. Sync shows that other
+//! work ([`other_changes`]) and commits it only when the person says so,
+//! file by file as they were shown ([`commit_others`]). A code or reference repo
 //! is never committed in or pushed, whatever its `sync` block says. Memory
 //! (`.ken/memory/`) is personal and local: it is kept out of git and never
 //! committed or pushed.
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -241,6 +243,46 @@ pub fn ensure_excludes(root: &Path) -> Result<()> {
 pub fn commit_own(root: &Path, paths: &[String]) -> Result<bool> {
     let own: Vec<String> = paths.iter().filter(|p| !personal(p)).cloned().collect();
     crate::git::commit_paths(root, &own, COMMIT_MESSAGE).map(|c| c.is_some()).map_err(Error::Other)
+}
+
+/// The knowledge base's changes not written through Ken: every file with
+/// uncommitted work (changed, staged, removed or new), less Ken's own writes
+/// waiting for the next cycle (`own`, `SyncEngine::pending`) and the
+/// personal paths sync never commits. A cycle never commits these; sync
+/// shows them and offers "commit my other changes" ([`commit_others`]).
+/// Sorted; empty when `root` is not a git repo.
+pub fn other_changes(root: &Path, own: &[String]) -> Vec<String> {
+    let own: HashSet<String> = own.iter().map(|p| p.replace('\\', "/")).collect();
+    let mut out: Vec<String> = crate::git::uncommitted(root).into_iter().filter(|p| !personal(p) && !own.contains(p)).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Commit a person's other changes in the knowledge base, at their word
+/// (Chris, 2026-10-14): exactly `paths`, the files they were shown, each one
+/// that still has uncommitted work; a personal path is left out. The
+/// message names each file. Refused in a repo that is not the knowledge base
+/// (decision 36: Ken never commits in a code repo). The next cycle pushes it
+/// with the rest. Returns the commit; None when none of them had changes.
+pub fn commit_others(root: &Path, paths: &[String]) -> Result<Option<String>> {
+    if !registry::is_library(root) {
+        return Err(Error::Other("Ken commits only in the knowledge base, never in a code repo".into()));
+    }
+    let waiting: HashSet<String> = crate::git::uncommitted(root).into_iter().collect();
+    let mut chosen: Vec<String> =
+        paths.iter().map(|p| p.replace('\\', "/")).filter(|p| !personal(p) && waiting.contains(p)).collect();
+    chosen.sort();
+    chosen.dedup();
+    if chosen.is_empty() {
+        return Ok(None);
+    }
+    let subject = match chosen.as_slice() {
+        [one] => format!("Commit a change made outside Ken: {one}"),
+        many => format!("Commit {} changes made outside Ken", many.len()),
+    };
+    let message = format!("{subject}\n\n{}\n", chosen.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"));
+    crate::git::commit_paths(root, &chosen, &message).map_err(Error::Other)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -528,6 +570,8 @@ enum Msg {
 pub struct SyncEngine {
     tx: Sender<Msg>,
     cancel: Arc<AtomicBool>,
+    /// What Ken wrote since the last commit: the only paths a cycle commits.
+    own: Arc<Mutex<BTreeSet<String>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     draft_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -555,13 +599,16 @@ impl SyncEngine {
             draft_worker(draft_rx, worker_root, worker_db, worker_cfg, worker_cancel, worker_notify)
         });
 
+        let own = Arc::new(Mutex::new(BTreeSet::new()));
+        let loop_own = own.clone();
         let thread = std::thread::spawn(move || {
-            engine_loop(rx, draft_tx, project_root, db_path, cfg, notify)
+            engine_loop(rx, draft_tx, project_root, db_path, cfg, notify, loop_own)
         });
 
         Ok(SyncEngine {
             tx,
             cancel,
+            own,
             thread: Some(thread),
             draft_thread: Some(draft_thread),
         })
@@ -583,6 +630,12 @@ impl SyncEngine {
     /// commits them, and only them (decision 36). Also counts as a change.
     pub fn wrote(&self, paths: Vec<String>) {
         let _ = self.tx.send(Msg::Wrote(paths));
+    }
+
+    /// Ken's own writes waiting for the next cycle's commit: not a person's
+    /// other changes ([`other_changes`]).
+    pub fn pending(&self) -> Vec<String> {
+        self.own.lock().map(|o| o.iter().cloned().collect()).unwrap_or_default()
     }
 }
 
@@ -606,6 +659,7 @@ fn engine_loop(
     db_path: PathBuf,
     cfg: SyncConfig,
     notify: Notify,
+    own: Arc<Mutex<BTreeSet<String>>>,
 ) {
     let Ok(mut db) = Db::open_at(&db_path) else {
         return;
@@ -618,8 +672,6 @@ fn engine_loop(
 
     let mut last_pull: Option<Instant> = None;
     let mut next_push: Option<Instant> = None;
-    // What Ken wrote since the last commit: the only paths a cycle commits.
-    let mut own: BTreeSet<String> = BTreeSet::new();
     // See `sync_active_cached` — without this, every watcher event costs two
     // `git` spawns.
     let mut active_cache: Option<(Instant, bool)> = None;
@@ -631,14 +683,14 @@ fn engine_loop(
                     last_pull.is_some_and(|t| t.elapsed() < cfg.pull_throttle);
                 if sync_active_cached(&root, &mut active_cache, true) && !throttled {
                     last_pull = Some(Instant::now());
-                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true, &mut own);
+                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true, &own);
                 }
             }
             Ok(Msg::SyncNow) => {
                 if sync_active_cached(&root, &mut active_cache, true) {
                     last_pull = Some(Instant::now());
                     next_push = None;
-                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true, &mut own);
+                    cycle(&root, &mut db, &draft_tx, &cfg, &notify, true, &own);
                 } else {
                     emit_state(&notify, SyncState::Off, None);
                 }
@@ -653,7 +705,9 @@ fn engine_loop(
             Ok(Msg::Wrote(paths)) => {
                 detect_conflicted_copies(&root, &mut db, &paths, &notify);
                 if sync_active_cached(&root, &mut active_cache, false) {
-                    own.extend(paths.into_iter().map(|p| p.replace('\\', "/")));
+                    if let Ok(mut own) = own.lock() {
+                        own.extend(paths.into_iter().map(|p| p.replace('\\', "/")));
+                    }
                     next_push.get_or_insert(Instant::now() + cfg.push_debounce);
                 }
             }
@@ -664,7 +718,7 @@ fn engine_loop(
         if next_push.is_some_and(|t| t <= Instant::now()) {
             next_push = None;
             if sync_active_cached(&root, &mut active_cache, false) {
-                cycle(&root, &mut db, &draft_tx, &cfg, &notify, false, &mut own);
+                cycle(&root, &mut db, &draft_tx, &cfg, &notify, false, &own);
             }
         }
     }
@@ -684,7 +738,7 @@ fn cycle(
     _cfg: &SyncConfig,
     notify: &Notify,
     do_pull: bool,
-    own: &mut BTreeSet<String>,
+    own: &Mutex<BTreeSet<String>>,
 ) {
     emit_state(notify, SyncState::Syncing, None);
     let _ = ensure_excludes(root);
@@ -703,9 +757,15 @@ fn cycle(
     let mut conflicts: Vec<ConflictInfo> = Vec::new();
     let mut failure: Option<String> = None;
 
-    let paths: Vec<String> = own.iter().cloned().collect();
+    let paths: Vec<String> = own.lock().map(|o| o.iter().cloned().collect()).unwrap_or_default();
     match commit_own(root, &paths) {
-        Ok(_) => own.clear(),
+        Ok(_) => {
+            if let Ok(mut own) = own.lock() {
+                for p in &paths {
+                    own.remove(p);
+                }
+            }
+        }
         Err(e) => failure = Some(e.to_string()),
     }
 
@@ -1204,6 +1264,50 @@ mod tests {
         assert!(status.contains("person.md") && status.contains("notes.md"), "{status}");
         assert!(!status.contains(".ken/memory"), "memory is kept out of git: {status}");
         assert!(personal(".ken/memory/me.md") && personal(".ken-workspace/journal/x.md") && !personal("Rules/x.md"));
+    }
+
+    /// "Commit my other changes" (Chris, 2026-10-14): sync lists what a
+    /// person changed outside Ken, and commits exactly the files they were
+    /// shown, named in the message, only when asked. Never in a code repo.
+    #[test]
+    fn other_changes_are_listed_and_committed_only_when_asked() {
+        let (_d, _bare, _a, b) = fixture();
+        ensure_excludes(&b).unwrap();
+        fs::create_dir_all(b.join(crate::ingest::RAW)).unwrap();
+        fs::write(b.join(crate::ingest::RAW).join(".keep"), "").unwrap();
+        git(&b, &["add", "-A"]);
+        git(&b, &["commit", "-m", "the inbox"]);
+        let head = || run_git(&b, &["rev-parse", "HEAD"]).unwrap().stdout;
+        let before = head();
+
+        fs::write(b.join("ken.md"), "Ken wrote this, waiting for the cycle\n").unwrap();
+        fs::write(b.join("person.md"), "a new page\n").unwrap();
+        fs::write(b.join("notes.md"), "a person's edit\n").unwrap();
+        fs::create_dir_all(b.join(".ken/memory")).unwrap();
+        fs::write(b.join(".ken/memory/me.md"), "personal\n").unwrap();
+        let shown = other_changes(&b, &["ken.md".into()]);
+        assert_eq!(shown, vec!["notes.md".to_string(), "person.md".to_string()], "Ken's own and memory are not a person's other changes");
+        assert_eq!(head(), before, "listing commits nothing");
+
+        let mut asked = shown.clone();
+        asked.push(".ken/memory/me.md".into());
+        asked.push("never-there.md".into());
+        let commit = commit_others(&b, &asked).unwrap();
+        assert!(commit.is_some());
+        let log = run_git(&b, &["show", "--name-only", "--format=%B", "HEAD"]).unwrap().stdout;
+        assert!(log.starts_with("Commit 2 changes made outside Ken\n\n- notes.md\n- person.md\n"), "{log}");
+        let files: Vec<&str> = log.lines().filter(|l| !l.is_empty() && !l.starts_with("- ") && !l.starts_with("Commit")).collect();
+        assert_eq!(files, vec!["notes.md", "person.md"], "exactly those files");
+        let status = run_git(&b, &["status", "--porcelain"]).unwrap().stdout;
+        assert!(status.contains("ken.md"), "Ken's pending write waits for its own cycle: {status}");
+        assert_eq!(commit_others(&b, &["notes.md".into()]).unwrap(), None, "nothing left to commit there");
+
+        // A code repo: refused, whatever it is asked to commit.
+        let code = _d.path().join("code");
+        fs::create_dir_all(&code).unwrap();
+        git(&code, &["init", "-q"]);
+        fs::write(code.join("main.rs"), "fn main() {}\n").unwrap();
+        assert!(commit_others(&code, &["main.rs".into()]).is_err());
     }
 
     /// The `sync` block drives the engine's timers, and an absent block
