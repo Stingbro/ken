@@ -629,6 +629,24 @@ option {
   color: var(--ink-2);
   line-height: 1.55;
 }
+/* A notice in the flow of a page: what went wrong, said plainly, with at most
+   one action after it. A toast is for what happens out of view. */
+.k-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-card);
+  background: var(--panel);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.k-notice.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
 .k-progress {
   height: 4px;
   border-radius: 2px;

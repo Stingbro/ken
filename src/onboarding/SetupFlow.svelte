@@ -138,20 +138,20 @@
 </script>
 
 <div class="setup">
-  <ol class="steps" aria-label="Set-up steps">
+  <ol class="steps t-small" aria-label="Set-up steps">
     {#each STEPS as s, i (s.step)}
       <li class:current={step === s.step}>{i + 1} · {s.label}</li>
     {/each}
   </ol>
 
   {#if step === "name"}
-    <h2>Name the workspace</h2>
+    <h2 class="t-heading">Name the workspace</h2>
     <p class="note">
       A workspace is the sources Ken knows and the knowledge base it keeps beside them. Its name is how Ken and the
       knowledge base call it.
     </p>
     <label class="field">
-      <span class="field-label">Workspace name</span>
+      <span class="t-label">Workspace name</span>
       <input
         class="input"
         value={name}
@@ -171,12 +171,12 @@
       <button class="btn btn-ghost" onclick={onclose}>Cancel</button>
     </div>
   {:else if step === "base"}
-    <h2>Where the knowledge base is saved</h2>
+    <h2 class="t-heading">Where the knowledge base is saved</h2>
     <p class="note">
       The knowledge base is one repo: the library, the decisions log, the tickets and its settings. Ken writes and
       commits only there, never in a source.
     </p>
-    <div class="choice">
+    <div class="k-card choice">
       <label class="check-row">
         <input type="radio" name="kb" checked={kb.mode === "new"} onchange={() => (kb = defaultKb(name, commonParent(rows)))} />
         <span>A new repo, from Ken's template</span>
@@ -244,7 +244,7 @@
       <button class="btn btn-ghost" onclick={() => (step = "name")}>Back</button>
     </div>
   {:else}
-    <h2>Sources</h2>
+    <h2 class="t-heading">Sources</h2>
     <p class="note">
       Pick each repo or folder, wherever it lives; pick a folder of repos to add every repo in it. Ken reads what is in
       each to propose its kind, and reads nothing until you confirm. Say in a line what each is for: the knowledge
@@ -257,8 +257,8 @@
     </div>
 
     {#if rows.length > 0}
-      <div class="table" role="table">
-        <div class="tr head" role="row">
+      <div class="k-card table" role="table">
+        <div class="tr head t-label" role="row">
           <span>Index</span><span>Source</span><span>Kind</span><span></span>
         </div>
         {#each rows as row (row.path ?? row.member)}
@@ -311,7 +311,7 @@
     </p>
   {/if}
 
-  {#if error}<div class="error">{error}</div>{/if}
+  {#if error}<div class="k-notice danger">{error}</div>{/if}
 </div>
 
 <style>
@@ -323,26 +323,23 @@
   }
   .steps {
     display: flex;
-    gap: 14px;
+    gap: 16px;
     margin: 0 0 4px;
     padding: 0;
     list-style: none;
-    font-size: 12px;
-    color: var(--ink-tertiary);
   }
   .steps .current {
-    color: var(--accent);
+    color: var(--accent-ink);
     font-weight: 600;
   }
   h2 {
     margin: 0;
-    font-size: 18px;
   }
   .note {
     margin: 0;
     font-size: 13px;
     line-height: 1.5;
-    color: var(--ink-secondary);
+    color: var(--ink-2);
   }
   .indent {
     padding-left: 26px;
@@ -350,7 +347,7 @@
   .counts {
     margin: 0;
     font-size: 13px;
-    color: var(--ink-secondary);
+    color: var(--ink-2);
   }
   .actions {
     display: flex;
@@ -363,19 +360,11 @@
     gap: 6px;
     max-width: 360px;
   }
-  .field-label {
-    font-size: 12.5px;
-    font-weight: 600;
-    color: var(--ink-2);
-  }
   .choice {
     display: flex;
     flex-direction: column;
     gap: 8px;
     padding: 12px 14px;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: var(--surface);
   }
   .check-row {
     display: flex;
@@ -424,35 +413,17 @@
   .table {
     display: flex;
     flex-direction: column;
-    border: 1px solid var(--border);
-    border-radius: 8px;
     overflow: auto;
     max-height: 46vh;
+    font-size: 12.5px;
   }
   .tr {
     display: grid;
     grid-template-columns: 56px minmax(220px, 2.4fr) minmax(170px, 1.2fr) 28px;
     gap: 8px;
     align-items: start;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-    font-size: 12.5px;
-  }
-  .description {
-    width: 100%;
-    margin-top: 4px;
-    font: inherit;
-    font-size: 12.5px;
-    resize: vertical;
-  }
-  .remove {
-    border: none;
-    background: none;
-    color: var(--ink-tertiary);
-    cursor: pointer;
-  }
-  .remove:hover {
-    color: var(--needs-input);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line-soft);
   }
   .tr:last-child {
     border-bottom: none;
@@ -460,12 +431,28 @@
   .tr.head {
     position: sticky;
     top: 0;
-    background: var(--sunken-2);
-    font-weight: 600;
-    color: var(--ink-secondary);
+    z-index: 1;
+    background: var(--surface);
+    border-bottom-color: var(--line);
   }
   .tr.dim {
     opacity: 0.55;
+  }
+  .description {
+    width: 100%;
+    margin-top: 4px;
+    font-size: 12.5px;
+  }
+  .remove {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: var(--radius-chip);
+    color: var(--ink-3);
+  }
+  .remove:hover {
+    background: var(--line-soft);
+    color: var(--danger);
   }
   .repo {
     display: flex;
@@ -476,28 +463,26 @@
   }
   .evidence {
     font-size: 11.5px;
-    color: var(--ink-tertiary);
+    color: var(--ink-3);
   }
   .kinds {
     display: flex;
     flex-wrap: wrap;
     gap: 4px;
   }
-  .chip {
-    padding: 1px 8px;
-    font-size: 11.5px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--ink-secondary);
+  /* The app's chip, as a toggle: on is the selection, in the accent. */
+  .kinds .chip {
     cursor: pointer;
   }
-  .chip.on {
-    border-color: var(--accent);
-    color: var(--accent);
+  .kinds .chip:hover:not(.on) {
+    color: var(--ink);
   }
-  .error {
-    color: var(--needs-input);
-    font-size: 13px;
+  .kinds .chip.on {
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+  }
+  .kinds .chip:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--accent-soft);
   }
 </style>

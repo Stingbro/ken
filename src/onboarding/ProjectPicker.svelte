@@ -75,12 +75,14 @@
 
 <div class="wrap" data-tauri-drag-region>
   <div class="panel">
+    <!-- The brand as the sidebar shows it: the K on its ink tile, the name in
+         the interface's sans. -->
     <div class="brand">
-      <KenMark size={36} />
-      <span class="wordmark">Ken</span>
+      <KenMark size={30} />
+      <span class="t-heading">Ken</span>
     </div>
-    <h1>Your team's knowledge, in one calm place.</h1>
-    <p class="lede">
+    <h1 class="t-title">Your team's knowledge, in one calm place.</h1>
+    <p class="t-lead lede">
       Point Ken at a folder — notes, documents, spreadsheets, anything. Ken
       reads it, keeps watch, and makes every fact findable.
     </p>
@@ -90,38 +92,39 @@
     {:else}
       <!-- Ken works in workspaces: open one Ken already knows, or set up a
            new one. Set-up is offered on a fresh install too: confirming it
-           turns the workspace feature on. -->
-      <div class="choose-row stacked">
-        <button class="choice" onclick={openWorkspaceFolder}>
-          <span class="choice-title">Open a workspace</span>
-          <span class="choice-note">
+           turns the workspace feature on. Two real options: stacked cards,
+           equal weight, so neither wins by emphasis. -->
+      <div class="choices">
+        <button class="k-card choice" onclick={openWorkspaceFolder}>
+          <span class="t-heading">Open a workspace</span>
+          <span class="t-small">
             Pick the folder of a workspace set up before, on this machine or
             by a teammate.
           </span>
         </button>
-        <button class="choice" onclick={() => (setupOpen = true)}>
-          <span class="choice-title">Set up a new workspace</span>
-          <span class="choice-note">
+        <button class="k-card choice" onclick={() => (setupOpen = true)}>
+          <span class="t-heading">Set up a new workspace</span>
+          <span class="t-small">
             Pick the repos Ken should know, wherever they live. It proposes what
             each is; nothing is written until you confirm.
           </span>
         </button>
       </div>
       {#if noWorkspaceAt}
-        <div class="error">
-          No Ken workspace in {noWorkspaceAt}.
-          <button class="btn btn-ghost" onclick={() => { noWorkspaceAt = null; setupOpen = true; }}>Set one up</button>
+        <div class="k-notice danger">
+          <span class="grow">No Ken workspace in {noWorkspaceAt}.</span>
+          <button class="btn btn-small" onclick={() => { noWorkspaceAt = null; setupOpen = true; }}>Set one up</button>
         </div>
       {/if}
     {/if}
 
     {#if error}
-      <div class="error">{error}</div>
+      <div class="k-notice danger">{error}</div>
     {/if}
 
     {#if recentWorkspaces.length > 0 && !setupOpen}
-      <div class="recent-label">Recent workspaces</div>
-      <div class="recents">
+      <div class="t-label recent-label">Recent workspaces</div>
+      <div class="k-card recents">
         {#each recentWorkspaces as ws (ws.id)}
           <button
             class="recent"
@@ -132,15 +135,15 @@
             <span class="badge">{ws.name.charAt(0).toUpperCase()}</span>
             <span class="info">
               <span class="name">{ws.name}</span>
-              <span class="mono path-small">{ws.path}</span>
+              <span class="mono path">{ws.path}</span>
               {#if ws.available}
-                <span class="path-small">{timeAgo(ws.openedAt)}</span>
+                <span class="t-small">{timeAgo(ws.openedAt)}</span>
               {:else}
-                <span class="missing">Folder not found</span>
+                <span class="t-small missing">Folder not found</span>
               {/if}
             </span>
             {#if !ws.available}
-              <span class="forget" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); void forgetWorkspace(ws.id); }} onkeydown={() => {}}>Remove</span>
+              <span class="btn btn-small btn-danger" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); void forgetWorkspace(ws.id); }} onkeydown={() => {}}>Remove</span>
             {/if}
           </button>
         {/each}
@@ -161,16 +164,8 @@
     align-items: safe center;
     justify-content: center;
     overflow-y: auto;
-    /* Gentle lined paper: faint rules every 28px on the paper ground. */
-    background:
-      repeating-linear-gradient(
-        to bottom,
-        transparent,
-        transparent 27px,
-        var(--rule-line) 27px,
-        var(--rule-line) 28px
-      ),
-      var(--paper);
+    /* The app's own ground, as every screen behind the sidebar has. */
+    background: var(--bg);
   }
   .panel {
     width: 460px;
@@ -179,123 +174,89 @@
     flex: none;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
     padding: 32px;
   }
   .brand {
     display: flex;
     align-items: center;
-    gap: 12px;
-  }
-  .wordmark {
-    font-family: var(--font-script);
-    font-size: 26px;
-    line-height: 1;
-    color: var(--ink);
-    /* Script baseline sits low; nudge up so it aligns with the mark. */
-    transform: translateY(-3px);
+    gap: 10px;
   }
   h1 {
-    margin: 6px 0 0;
-    font-family: var(--font-serif);
-    font-size: 30px;
-    font-weight: 500;
-    line-height: 1.2;
-    letter-spacing: -0.01em;
+    margin: 8px 0 0;
   }
   .lede {
     margin: 0;
-    font-size: 14px;
-    line-height: 1.7;
-    color: var(--ink-secondary);
+    color: var(--ink-2);
   }
-  .choose-row {
+  .choices {
     display: flex;
-    gap: 10px;
-    align-items: center;
-  }
-  /* Two real options: stacked cards, equal weight, so neither wins by
-     emphasis. */
-  .choose-row.stacked {
     flex-direction: column;
-    align-items: stretch;
+    gap: 10px;
   }
   .choice {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 4px;
     width: 100%;
-    text-align: left;
-    padding: 12px 14px;
-    background: var(--surface);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-control);
-    box-shadow: var(--shadow-control);
+    padding: 14px 16px;
     font: inherit;
-    cursor: pointer;
+    text-align: left;
     color: var(--ink);
   }
   .choice:hover {
-    border-color: var(--accent);
+    border-color: var(--line-strong);
   }
   .choice:focus-visible {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent);
     outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
   }
-  .choice-title {
-    font-size: 14px;
-    font-weight: 600;
-  }
-  .choice-note {
-    font-size: 12px;
+  .choice .t-small {
     line-height: 1.5;
-    color: var(--ink-tertiary);
   }
-  .error {
-    font-size: 13px;
-    color: var(--danger);
-    background: color-mix(in srgb, var(--danger) 7%, transparent);
-    border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
-    border-radius: 10px;
-    padding: 10px 14px;
+  .grow {
+    flex: 1;
+    min-width: 0;
   }
   .recent-label {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--ink-tertiary);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    margin-top: 10px;
+    margin-top: 8px;
   }
   .recents {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    overflow: hidden;
   }
   .recent {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 9px 10px;
-    border-radius: 9px;
-    border: 1px solid var(--border);
-    background: var(--surface);
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    font: inherit;
     text-align: left;
-    font-size: 13px;
+    color: var(--ink);
+  }
+  .recent:last-child {
+    border-bottom: none;
   }
   .recent:hover {
-    background: var(--sunken);
+    background: color-mix(in oklch, var(--line-soft) 55%, transparent);
+  }
+  .recent:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--accent);
   }
   .recent.unavailable {
     opacity: 0.7;
   }
+  /* The workspace's initial, as the workspace switcher draws it. */
   .badge {
     width: 26px;
     height: 26px;
     border-radius: 7px;
     background: var(--ink);
-    color: var(--paper);
+    color: var(--bg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -310,22 +271,20 @@
     flex: 1;
   }
   .name {
+    font-size: 13.5px;
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .path-small {
-    font-size: 11px;
-    color: var(--ink-tertiary);
+  .path {
+    font-size: 11.5px;
+    color: var(--ink-3);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .missing {
-    font-size: 11.5px;
-    color: var(--danger);
-  }
-  .forget {
-    font-size: 12px;
-    font-weight: 600;
     color: var(--danger);
   }
 </style>
