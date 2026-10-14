@@ -9,7 +9,6 @@
   import ToolCardView from "./ToolCard.svelte";
   import { parseToolCard } from "./toolCard";
   import { api } from "../lib/api";
-  import { scope } from "../lib/scope.svelte";
   import { toast } from "../lib/toast.svelte";
   import { pickMessage, pickedIds, sendableMessages, type Pick } from "../lib/chatPick";
   import Layers from "@lucide/svelte/icons/layers";
@@ -71,7 +70,7 @@
     if (!chatId || !projectId || picked.length === 0 || sending) return;
     sending = true;
     try {
-      await api.ingestAddChat(scope.team, projectId, chatId, picked);
+      await api.ingestAddChat(projectId, chatId, picked);
       toast.show(`${picked.length} ${picked.length === 1 ? "message is" : "messages are"} in Ingest. Ken reads them now.`);
       pick = { selected: new Set(), anchor: null };
     } catch (e) {

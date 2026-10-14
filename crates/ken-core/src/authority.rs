@@ -139,11 +139,11 @@ impl Roles {
             .or_else(|_| std::fs::read_to_string(root.join(".wright").join("team.json")))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .map(|v| Roles::from_team_json(&v))
+            .map(|v| Roles::from_settings(&v))
             .unwrap_or_default()
     }
 
-    pub fn from_team_json(v: &serde_json::Value) -> Roles {
+    pub fn from_settings(v: &serde_json::Value) -> Roles {
         let path = |key: &str| v.get(key).and_then(|p| p.as_str()).map(|p| p.replace('\\', "/").trim_start_matches("./").to_string());
         let mut overrides = Vec::new();
         if let Some(weights) = v.pointer("/search/weights").and_then(|w| w.as_object()) {
@@ -417,7 +417,7 @@ mod tests {
                 "bad": "loud"
             } }
         });
-        let r = Roles::from_team_json(&settings);
+        let r = Roles::from_settings(&settings);
         let a = |p: &str, m: Option<PageMeta>| r.authority(p, m.as_ref());
         assert_eq!(a("log/RULINGS.md", None).tier, Tier::Binding);
         assert_eq!(a("notes/DECISIONS.md", None).tier, Tier::Record, "the settings named another log; this one sits in notes");

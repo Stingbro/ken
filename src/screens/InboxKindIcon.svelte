@@ -14,7 +14,6 @@
   import Link2Off from "@lucide/svelte/icons/link-2-off";
   import Clock from "@lucide/svelte/icons/clock";
   import BookOpen from "@lucide/svelte/icons/book-open";
-  import Flag from "@lucide/svelte/icons/flag";
 
   let { item, bare = false }: { item: InboxItem; bare?: boolean } = $props();
 
@@ -27,8 +26,6 @@
         return MessageSquare;
       case "Ruling":
         return Gavel;
-      case "Escalation":
-        return Flag;
       case "Ticket":
         return Ticket;
       case "Page edit":

@@ -172,11 +172,11 @@ describe("record store — transcription-model gate", () => {
     await record.init();
     vi.mocked(api.recordStart).mockClear();
 
-    await record.start("ATT");
+    await record.start();
 
     expect(api.recordStart).toHaveBeenCalledTimes(1);
-    // The take is for the team: its transcript goes to that wiki's Raw/.
-    expect(vi.mocked(api.recordStart).mock.calls[0][3]).toBe("ATT");
+    // The transcript goes to the knowledge base's Raw/: no team to name.
+    expect(vi.mocked(api.recordStart).mock.calls[0]).toHaveLength(3);
     expect(record.error).toBeNull();
   });
 

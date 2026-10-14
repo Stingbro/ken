@@ -1,5 +1,5 @@
 // Live recording state (Svelte 5 runes). One recorder at a time. Record is a
-// way to add a source on Ingest: the transcript goes to the team wiki's Raw/
+// way to add a source on Ingest: the transcript goes to the knowledge base's Raw/
 // and is read at once. The title bar shows a running take from any screen.
 import {
   api,
@@ -131,7 +131,7 @@ class RecordStore {
       if (this.storage !== "audio") this.transcribing = true;
     });
     await api.onTranscriptProgress((ev) => {
-      // The transcript lands in the team wiki, which need not be the focused
+      // The transcript lands in the knowledge base, which need not be the focused
       // repo, so the path decides; a video transcription never drives this bar.
       if (this.transcribing && isRecordingPath(ev.relPath)) {
         this.transcribePct = ev.pct;
@@ -173,8 +173,8 @@ class RecordStore {
     this.clock = null;
   }
 
-  /** Start a take for `team`; its transcript goes to that team wiki's Raw/. */
-  async start(team: string | null = null) {
+  /** Start a take; its transcript goes to the knowledge base's Raw/. */
+  async start() {
     this.error = null;
     this.savedPath = null;
     // Up-front gate: without the transcription model on disk the recording would
@@ -184,7 +184,7 @@ class RecordStore {
       this.error = "Download a transcription model first, so Ken can make a transcript.";
       return;
     }
-    await api.recordStart(this.micOn, this.systemOn, this.deviceId, team).catch((e) => {
+    await api.recordStart(this.micOn, this.systemOn, this.deviceId).catch((e) => {
       this.error = String(e);
     });
     await this.refreshPermissions();

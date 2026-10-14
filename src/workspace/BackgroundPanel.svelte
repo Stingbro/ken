@@ -39,7 +39,7 @@
     }
   }
 
-  const setting = $derived(status?.throttle.setting ?? { pace: "normal" as Pace, paused: false });
+  const setting = $derived(status?.throttle.setting ?? { pace: "gentle" as Pace, paused: false });
 
   function setPace(pace: Pace) {
     void act("Could not set the pace", () => api.backgroundSet(pace, setting.paused));

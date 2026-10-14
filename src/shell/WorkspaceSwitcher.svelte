@@ -1,11 +1,10 @@
 <script lang="ts">
-  // The sidebar's team switcher: the teams in this workspace, each chosen on
-  // its own (there is no "all teams"), then the other workspaces opened
-  // recently, and a way to open or set up another. Choosing a team scopes
-  // questions, search and Home to it; its repos are picked inside Files.
+  // The sidebar's workspace switcher: this workspace, then the other
+  // workspaces opened recently, and a way to open or set up another. A
+  // workspace has one knowledge base and is not split into teams (decision
+  // 35); its repos are picked inside Files.
   import { onMount } from "svelte";
   import { app } from "../lib/app.svelte";
-  import { scope } from "../lib/scope.svelte";
   import { api, type RecentWorkspace } from "../lib/api";
   import { timeAgo } from "../lib/format";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
@@ -22,11 +21,6 @@
     );
   });
 
-  async function pick(name: string) {
-    close();
-    await scope.selectTeam(name);
-  }
-
   async function switchTo(ws: RecentWorkspace) {
     close();
     await app.closeWorkspaceSession();
@@ -41,21 +35,18 @@
   }
 </script>
 
-<button class="scrim" onclick={close} aria-label="Close team switcher"></button>
+<button class="scrim" onclick={close} aria-label="Close workspace switcher"></button>
 <div class="menu" role="menu">
-  <div class="head" title={app.workspace?.root}>{app.workspace?.name ?? "This workspace"}</div>
-  {#if scope.groups.length === 0}
-    <div class="empty">No team yet. Set-up puts each repo on a team.</div>
-  {:else}
-    {#each scope.groups as team (team.name)}
-      <button class="row" class:current={team.name === scope.team} role="menuitem" onclick={() => pick(team.name)}>
-        <span class="badge">{team.name.charAt(0).toUpperCase()}</span>
-        <span class="info">
-          <span class="name">{team.name}</span>
-          <span class="sub">{team.projectIds.length} {team.projectIds.length === 1 ? "repo" : "repos"}</span>
-        </span>
-      </button>
-    {/each}
+  <div class="head">This workspace</div>
+  {#if app.workspace}
+    {@const n = app.workspace.members.length}
+    <button class="row current" role="menuitem" title={app.workspace.root} onclick={close}>
+      <span class="badge">{app.workspace.name.charAt(0).toUpperCase()}</span>
+      <span class="info">
+        <span class="name">{app.workspace.name}</span>
+        <span class="sub">{n} {n === 1 ? "repo" : "repos"}</span>
+      </span>
+    </button>
   {/if}
 
   {#if others.length > 0}
@@ -181,10 +172,5 @@
   .sub {
     font-size: 11.5px;
     color: var(--ink-3);
-  }
-  .empty {
-    padding: 6px 10px 10px;
-    font-size: 12.5px;
-    color: var(--ink-2);
   }
 </style>

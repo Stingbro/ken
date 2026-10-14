@@ -103,20 +103,20 @@ export function saveRecents(projectId: string, list: RecentEntry[]): void {
   }
 }
 
-/** One file in Home's recent list across the team's repos. */
-export interface TeamRecent {
+/** One file in Home's recent list across the workspace's repos. */
+export interface WorkspaceRecent {
   projectId: string;
   path: string;
   at: number;
 }
 
-/** Every team repo's open history merged, newest first. `known`, when
+/** Every workspace repo's open history merged, newest first. `known`, when
  *  given, is that repo's indexed paths: entries outside it are dropped
  *  (deleted or excluded since). */
-export function mergeTeamRecents(
+export function mergeWorkspaceRecents(
   lists: { projectId: string; entries: RecentEntry[]; known: Set<string> | null }[],
   limit = RECENT_LIMIT,
-): TeamRecent[] {
+): WorkspaceRecent[] {
   return lists
     .flatMap((l) =>
       l.entries

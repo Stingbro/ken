@@ -3,7 +3,7 @@
 import type { BackgroundJob, BuildProgress, Pace } from "./api";
 
 export const PACES: { value: Pace; label: string; note: string }[] = [
-  { value: "gentle", label: "Gentle", note: "a call every 10 seconds at most, 20 an hour; local work a quarter of the time" },
+  { value: "gentle", label: "Gentle", note: "the default: a call every 10 seconds at most, 20 an hour; local work a quarter of the time" },
   { value: "normal", label: "Normal", note: "a call every 2 seconds at most, 60 an hour; local work half the time" },
   { value: "fast", label: "Fast", note: "calls back to back, 240 an hour; local work without rests" },
 ];

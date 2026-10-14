@@ -1,12 +1,11 @@
 <script lang="ts">
-  // The header (the Briefing design): search or ask the team, then what the
+  // The header (the Briefing design): search or ask the workspace, then what the
   // app wants of you right now (a take running, an update ready), then Ask
-  // Ken, which opens the chat panel on any screen. The team and the screens
+  // Ken, which opens the chat panel on any screen. The workspace and the screens
   // are in the sidebar.
   import { app } from "../lib/app.svelte";
   import { chats } from "../lib/chats.svelte";
   import { updater } from "../lib/updater.svelte";
-  import { scope } from "../lib/scope.svelte";
   import { record, recordClock } from "../lib/record.svelte";
   import { shortcut } from "../lib/platform";
   import Search from "@lucide/svelte/icons/search";
@@ -15,7 +14,7 @@
 
   updater.start();
 
-  const teamLabel = $derived(scope.team ?? app.workspace?.name ?? app.project?.name ?? "");
+  const workspaceLabel = $derived(app.workspace?.name ?? app.project?.name ?? "");
   const updateTitle = $derived.by(() => {
     if (updater.phase === "downloading") {
       return updater.progress === null
@@ -29,7 +28,7 @@
 <header data-tauri-drag-region>
   <button class="search" onclick={() => (app.searchOpen = true)}>
     <Search size={15} strokeWidth={1.75} aria-hidden="true" />
-    <span class="hint">{teamLabel ? `Search or ask ${teamLabel}…` : "Search or ask…"}</span>
+    <span class="hint">{workspaceLabel ? `Search or ask ${workspaceLabel}…` : "Search or ask…"}</span>
     <span class="kbd">{shortcut("mod+K")}</span>
   </button>
 

@@ -19,7 +19,6 @@
   import X from "@lucide/svelte/icons/x";
   import Layers from "@lucide/svelte/icons/layers";
   import { openContextMenu } from "../lib/ui/ContextMenu.svelte";
-  import { scope } from "../lib/scope.svelte";
   import { toast } from "../lib/toast.svelte";
   import ResearchModal from "../research/ResearchModal.svelte";
   import ChatResizer from "./ChatResizer.svelte";
@@ -55,12 +54,12 @@
     ]);
   }
 
-  // The whole chat, the person's and Ken's turns, into the team wiki's Raw/.
+  // The whole chat, the person's and Ken's turns, into the knowledge base's Raw/.
   async function sendToIngest(row: ChatRow) {
     const projectId = app.focused;
     if (!projectId) return;
     try {
-      await api.ingestAddChat(scope.team, projectId, row.id, null);
+      await api.ingestAddChat(projectId, row.id, null);
       toast.show(`"${row.title}" is in Ingest. Ken reads it now.`);
     } catch (err) {
       toast.error("Could not send the chat to Ingest", err);

@@ -1,7 +1,7 @@
-// Your day: the team's tickets assigned to me, escalations addressed to me,
-// my tasks, the team digest and the team's index health. Refreshes on `day-changed`, the team-digest
-// events, `index-updated` (those two coalesced), a change of team, and a new
-// local day: at midnight, or on wake or focus when the timer ran late.
+// Your day: the workspace's tickets assigned to me, my tasks, the digest and
+// the workspace's index health. Refreshes on `day-changed`, the day-digest
+// events, `index-updated` (those two coalesced), a change of workspace, and a
+// new local day: at midnight, or on wake or focus when the timer ran late.
 import {
   api,
   memberLeaf,
@@ -10,10 +10,9 @@ import {
   type DayTaskInput,
   type DayTaskPatch,
   type IndexHealth,
-  type TeamDigest,
+  type DayDigest,
 } from "./api";
 import { app } from "./app.svelte";
-import { scope } from "./scope.svelte";
 import { localToday, orderTasks } from "./day";
 import { coalesce, singleFlight } from "./refresh";
 import { toast } from "./toast.svelte";
@@ -43,7 +42,7 @@ class DayStore {
   state = $state<DayState | null>(null);
   loadError = $state<string | null>(null);
 
-  digest = $state<TeamDigest | null>(null);
+  digest = $state<DayDigest | null>(null);
   generating = $state(false);
   digestError = $state<string | null>(null);
   /** Optimistic until claude_doctor answers. */
@@ -68,11 +67,6 @@ class DayStore {
     return this.state?.tickets ?? [];
   }
 
-  /** Open escalations addressed to me, from every team repo. */
-  get escalations() {
-    return this.state?.escalations ?? [];
-  }
-
   /** The task open in the panel, when editing: today's copy, else the one
    *  it was opened with. */
   get panelTask(): DayTask | null {
@@ -81,37 +75,28 @@ class DayStore {
     return this.state?.tasks.find((t) => t.id === p.id) ?? p.task ?? null;
   }
 
-  private get team(): string | null {
-    return scope.team;
-  }
-
   async init() {
     if (this.initDone) return;
     this.initDone = true;
     await api.onDayChanged(() => this.queueRefresh({ state: true }));
     // Whoever started it (the morning schedule, opening the workspace, the
-    // button), a digest for this team shows as being written.
-    await api.onTeamDigestGenerating((team) => {
-      if (team === this.team) {
-        this.generating = true;
-        this.digestError = null;
-      }
+    // button), the digest shows as being written.
+    await api.onDayDigestGenerating(() => {
+      this.generating = true;
+      this.digestError = null;
     });
-    await api.onTeamDigestUpdated(() => {
-      // The event carries a digest but not which team it was for; read
-      // ours back rather than show another team's.
+    await api.onDayDigestUpdated(() => {
+      // Read it back for the workspace open now.
       void this.refreshDigest();
     });
-    await api.onTeamDigestError((team, message) => {
-      if (team !== this.team) return;
+    await api.onDayDigestError((message) => {
       this.generating = false;
       this.digestError = message;
     });
     await api.onIndexUpdated(() => this.queueRefresh({ state: true, health: true }));
-    // A change of team (or workspace) reads everything again.
+    // A change of workspace reads everything again.
     $effect.root(() => {
       $effect(() => {
-        void scope.team;
         void app.workspace?.id;
         void this.refresh();
       });
@@ -169,17 +154,16 @@ class DayStore {
       this.state = null;
       return;
     }
-    const team = this.team;
     const ws = app.workspace.id;
     try {
-      const next = await api.dayState(team);
-      if (team !== this.team || ws !== app.workspace?.id) return;
+      const next = await api.dayState();
+      if (ws !== app.workspace?.id) return;
       this.state = next;
       this.loadError = null;
       this.today = localToday();
       void this.resolvePanel();
     } catch (e) {
-      if (team === this.team && ws === app.workspace?.id) this.loadError = String(e);
+      if (ws === app.workspace?.id) this.loadError = String(e);
     }
   });
 
@@ -188,13 +172,9 @@ class DayStore {
       this.digest = null;
       return;
     }
-    const team = this.team;
     const ws = app.workspace.id;
-    const [d, writing] = await Promise.all([
-      api.teamDigest(team).catch(() => null),
-      api.teamDigestWriting(team).catch(() => false),
-    ]);
-    if (team !== this.team || ws !== app.workspace?.id) return;
+    const [d, writing] = await Promise.all([api.dayDigest().catch(() => null), api.dayDigestWriting().catch(() => false)]);
+    if (ws !== app.workspace?.id) return;
     this.digest = d;
     this.generating = writing;
   });
@@ -204,10 +184,9 @@ class DayStore {
       this.health = null;
       return;
     }
-    const team = this.team;
     const ws = app.workspace.id;
-    const h = await api.indexHealth(team).catch(() => null);
-    if (team === this.team && ws === app.workspace?.id) this.health = h;
+    const h = await api.indexHealth().catch(() => null);
+    if (ws === app.workspace?.id) this.health = h;
   });
 
   /** "Write it now". */
@@ -215,7 +194,7 @@ class DayStore {
     this.digestError = null;
     this.generating = true;
     try {
-      await api.refreshTeamDigest(this.team);
+      await api.refreshDayDigest();
     } catch (e) {
       this.generating = false;
       this.digestError = String(e);
@@ -369,7 +348,7 @@ export async function openInRepo(projectId: string, relPath: string, where: Wher
   else app.openInFiles(relPath);
 }
 
-/** Open a member-relative path (`repo/path/to/file.md`), as the team digest
+/** Open a member-relative path (`repo/path/to/file.md`), as the digest
  *  cites them. The longest member name (full or leaf) that prefixes the
  *  path wins; with none, the path opens in the focused repo. */
 export async function openMemberPath(path: string, where: Where = {}) {

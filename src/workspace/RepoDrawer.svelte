@@ -1,11 +1,11 @@
 <script lang="ts">
-  // One repo's settings, opened from its row on Team: what it is for,
-  // reindex, its profile, the folders Ken watches, cloud files, video
-  // transcription and sync. The
+  // One repo's settings, opened from its row on the workspace settings
+  // screen: what it is for, reindex, its profile, the folders Ken watches,
+  // cloud files, video transcription and sync (the knowledge base only). The
   // repo is focused before this opens; every card acts on the focused repo.
   import { onMount, untrack } from "svelte";
   import { app, forFocused } from "../lib/app.svelte";
-  import { api, memberLeaf, type FeatureInfo, type ProjectProfile, type SyncStatus, type TeamRepo } from "../lib/api";
+  import { api, memberLeaf, type FeatureInfo, type ProjectProfile, type SourceRow, type SyncStatus } from "../lib/api";
   import { toast } from "../lib/toast.svelte";
   import {
     buildFolderTree,
@@ -21,7 +21,7 @@
     repo,
     close,
     changed,
-  }: { repo: TeamRepo; close: () => void; changed?: () => void } = $props();
+  }: { repo: SourceRow; close: () => void; changed?: () => void } = $props();
 
   // What the repo is for, in a person's words: Ken reads it when it decides
   // where something belongs.
@@ -291,7 +291,12 @@
 
     <div class="card">
       <div class="card-title">Sync</div>
-      {#if sync?.mode === "git"}
+      {#if sync?.mode === "git" && !repo.kind.includes("wiki") && !sync.auto}
+        <p class="note">
+          Only the knowledge base syncs. Ken never commits or pushes in a code or reference repo, so its branch is
+          yours to pull and push.
+        </p>
+      {:else if sync?.mode === "git"}
         {#if sync.remote}
           <div class="row">
             <span class="chip mono">git</span>
@@ -307,8 +312,8 @@
             </button>
           </div>
           <p class="note">
-            Ken fetches the team's changes when you come back to it and shares your saves soon after. When two
-            people change one file, the banner at the top of Files opens both versions.
+            Ken fetches others' changes when you come back to it, and commits and pushes only what it wrote here
+            soon after. When two people change one file, the banner at the top of Files opens both versions.
           </p>
         {:else}
           <p class="note">No remote, so Ken keeps everything on this computer.</p>

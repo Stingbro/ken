@@ -11,7 +11,7 @@ export interface ProjectInfo {
   ingestRunner?: "hidden-tui" | "headless";
 }
 
-/** The team's index in one health line (mirrors `TeamIndexHealthDto` and
+/** The workspace's index in one health line (mirrors `IndexHealthDto` and
  *  `db::IndexHealth`): repos indexed of all, then their files indexed,
  *  failed, skipped (name only) and queued; passages and how many have a
  *  meaning vector; controls passing of all; whether the embedding model is
@@ -52,7 +52,7 @@ export interface SetupRepoRow {
   description: string;
 }
 
-/** Mirrors `wikinew::Covered`: a repo a new wiki or team repo names. */
+/** Mirrors `wikinew::Covered`: a repo a new knowledge base names. */
 export interface CoveredRepo {
   name: string;
   description: string;
@@ -84,8 +84,9 @@ export type SetupMoved =
   | { change: "Gone"; member: string }
   | { change: "NewWorktree"; pattern: string; evidence: string };
 
-/** One repo of a team, as set-up wrote it (the Team screen's rows). */
-export interface TeamRepo {
+/** One source of the workspace, as set-up wrote it (the workspace settings
+ *  screen's rows). Mirrors `SourceDto`. */
+export interface SourceRow {
   id: string;
   name: string;
   path: string;
@@ -98,23 +99,40 @@ export interface TeamRepo {
   head: string | null;
   behind: number | null;
   files: number;
+  /** The one health line (decision 19), null before it has an index. */
+  health: string | null;
+  /** Its name in `.ken/knowledge.json` (`repos`, a control's `source`). */
+  settingsName: string;
+  /** Its role rules (decision 17), `pattern = role` lines. */
+  roles: string[];
 }
 
-/** Something a repo lacks for its kind, or a team lacks. */
-export interface TeamGap {
+/** Something a source lacks for its kind, or the workspace lacks. */
+export interface SettingsGap {
   repo: string | null;
   text: string;
   open: string | null;
 }
 
-export interface TeamPage {
+export interface SettingsPage {
   path: string;
   title: string;
 }
 
+/** One control (decision 19) with its source's last run. */
+export interface ControlRow {
+  question: string;
+  expect: string;
+  /** Its source's settings name; null is the knowledge base. */
+  source: string | null;
+  ran: boolean;
+  rank: number | null;
+  passed: boolean;
+}
+
 /** One entry of the knowledge base's one findings list: drift, the lint,
  *  ingest and the supersession pass all file there. */
-export interface TeamFinding {
+export interface Finding {
   /** contradiction · question · drift · broken-link · missing-page ·
    *  ambiguous-name · orphan · suggested-page · unknown-ruling ·
    *  supersession, as the backend names it. */
@@ -128,7 +146,6 @@ export interface TeamFinding {
   itemId?: number | null;
 }
 
-/** The Team screen: the chosen team's repos and configuration. */
 /** Mirrors `wikinew::TemplateGap`: a template file the knowledge base lacks,
  *  or one Ken owns that differs from its template (`diff`: `- ` its lines,
  *  `+ ` the template's). */
@@ -202,22 +219,28 @@ export interface BackgroundStatus {
   build: BuildProgress | null;
 }
 
-export interface TeamOverview {
-  team: string | null;
+/** The workspace settings screen (knowledge-core decision 37): the
+ *  workspace's sources and its knowledge base's settings. Mirrors
+ *  `WorkspaceSettingsDto`. */
+export interface WorkspaceSettings {
   workspace: string;
   root: string;
-  repos: TeamRepo[];
-  wiki: TeamRepo | null;
-  gaps: TeamGap[];
+  repos: SourceRow[];
+  /** The knowledge base, when the workspace has one. */
+  wiki: SourceRow | null;
+  gaps: SettingsGap[];
   /** The index rules in the knowledge base's `.ken/knowledge.json`. */
   ignores: string[];
   /** Older workspace `.kenignore` lines, still read, never written. */
   legacyIgnores: string[];
+  /** The tier overrides (`search.weights`), `pattern = tier` lines. */
+  weights: string[];
+  controls: ControlRow[];
   templateGaps: TemplateGap[];
   sweep: DriftRun | null;
-  rules: TeamPage[];
-  templates: TeamPage[];
-  findings: TeamFinding[];
+  rules: SettingsPage[];
+  templates: SettingsPage[];
+  findings: Finding[];
 }
 
 /** Where a source in Raw/ is. `transcribing`: a recording being turned into
@@ -263,7 +286,7 @@ export interface IngestedSource {
   writing: boolean;
 }
 
-/** The Ingest screen: the team library's inbox and its history. */
+/** The Ingest screen: the knowledge base's inbox and its history. */
 export interface IngestOverview {
   projectId: string;
   library: string;
@@ -424,7 +447,7 @@ export interface CodeUsages {
 export type KindFilter = string | null;
 
 /** What a repo is for; decides sync and how deep Ken reads it. */
-export type RepoKind = "team" | "wiki" | "code" | "reference";
+export type RepoKind = "wiki" | "code" | "reference";
 
 export interface RegistryEntryStatus {
   id: string;
@@ -433,7 +456,6 @@ export interface RegistryEntryStatus {
   available: boolean;
   /** Absent until someone says what the repo is. */
   kind?: RepoKind[];
-  team?: string;
   /** Set only when a person chose other than what the kind implies. */
   index?: IndexState;
   /** What the repo is for, in a person's words. */
@@ -970,7 +992,7 @@ export interface FeatureInfo {
   description: string;
   /** Plain name for Settings ("Search by meaning"). */
   label: string;
-  /** Where it applies: this repo, this machine, the team, mine. */
+  /** Where it applies: this repo, this machine, the workspace, mine. */
   applies: string;
   global: boolean;
   projectOverride: boolean | null;
@@ -1209,31 +1231,11 @@ export interface DayTicket {
   linkedDone: number;
 }
 
-/** Mirrors the Rust `DayEscalation`: an open `escalations/*.md` in a team
- *  repo, addressed to me. Read only; the row opens the file. */
-export interface DayEscalation {
-  id: string;
-  title: string;
-  raisedBy: string;
-  status: string;
-  ticket: string | null;
-  /** When it was raised, as the file states it. */
-  raised: string | null;
-  /** What it blocks, as the file states it. */
-  blocks: string | null;
-  projectId: string;
-  repo: string;
-  /** Inside that repo. */
-  relPath: string;
-}
-
 export interface DayState {
   tickets: DayTicket[];
-  /** Escalations addressed to me, from every team repo. */
-  escalations?: DayEscalation[];
   tasks: DayTask[];
   me: { name: string | null; email: string | null };
-  /** The team has any ticket file at all. */
+  /** Any repo of the workspace has a ticket file at all. */
   hasTickets: boolean;
 }
 
@@ -1255,9 +1257,9 @@ export interface DayTaskPatch {
   state?: DayTaskState;
 }
 
-/** The digest written for the team, across all its repos. `sources` are
- *  member-relative paths, `repo/path`. */
-export interface TeamDigest {
+/** The digest written for the workspace, across all its repos. `sources`
+ *  are member-relative paths, `repo/path`. */
+export interface DayDigest {
   generatedAt: number;
   body: string;
   sources: string[];
@@ -1281,7 +1283,7 @@ export const api = {
    *  one commit. Nothing is deleted. */
   wikiMapApply: (dir: string, moves: WikiMove[]) => invoke<WikiMapApplied>("wiki_map_apply", { dir, moves }),
   /** Lay down template files the knowledge base lacks; never overwrites. */
-  teamAddTemplateFiles: (paths: string[]) => invoke<string[]>("team_add_template_files", { paths }),
+  workspaceAddTemplateFiles: (paths: string[]) => invoke<string[]>("workspace_add_template_files", { paths }),
   /** Start building the library from the workspace's sources. */
   buildStart: (atOnce: number | null = null) => invoke<BuildProgress>("build_start", { atOnce }),
   buildStop: () => invoke<void>("build_stop"),
@@ -1293,47 +1295,58 @@ export const api = {
   /** Apply a proposed page change; returns the page written. */
   applyPageProposal: (itemId: number, projectId: string | null = null) =>
     invoke<string>("apply_page_proposal", { itemId, projectId }),
-  /** The Ingest screen for the team's library (its wiki's inbox). */
-  ingestOverview: (team: string | null) => invoke<IngestOverview>("ingest_overview", { team }),
-  ingestCard: (team: string | null, itemId: number) => invoke<IngestCard>("ingest_card", { team, itemId }),
-  /** Copy files into the library's Raw/ and start reading them. */
-  ingestAdd: (team: string | null, paths: string[]) => invoke<string[]>("ingest_add", { team, paths }),
-  /** A file dropped in the window (bytes, no path) into the library's Raw/. */
-  ingestAddBytes: async (team: string | null, file: File) =>
+  /** The Ingest screen for the knowledge base's inbox. */
+  ingestOverview: () => invoke<IngestOverview>("ingest_overview"),
+  ingestCard: (itemId: number) => invoke<IngestCard>("ingest_card", { itemId }),
+  /** Copy files into the knowledge base's Raw/ and start reading them. */
+  ingestAdd: (paths: string[]) => invoke<string[]>("ingest_add", { paths }),
+  /** A file dropped in the window (bytes, no path) into the knowledge base's Raw/. */
+  ingestAddBytes: async (file: File) =>
     invoke<string>("ingest_add_bytes", new Uint8Array(await file.arrayBuffer()), {
-      headers: { "x-name": encodeURIComponent(file.name), "x-team": encodeURIComponent(team ?? "") },
+      headers: { "x-name": encodeURIComponent(file.name) },
     }),
   /** Read what waits in Raw/ now; false when a pass is already running. */
-  ingestNow: (team: string | null = null) => invoke<boolean>("ingest_now", { team }),
+  ingestNow: () => invoke<boolean>("ingest_now"),
   /** A note written in Ken, into Raw/ as `<date> Note - <title>.md`, then
    *  read at once. Returns its path. */
-  ingestAddText: (team: string | null, title: string | null, text: string) =>
-    invoke<string>("ingest_add_text", { team, title, text }),
+  ingestAddText: (title: string | null, text: string) => invoke<string>("ingest_add_text", { title, text }),
   /** A chat, whole or a few of its messages (only the person's and Ken's
    *  turns), into Raw/ as `<date> Chat - <title>.md`, then read at once.
    *  `messageIds` null is the whole chat. Returns its path. */
-  ingestAddChat: (team: string | null, projectId: string, chatId: string, messageIds: number[] | null) =>
-    invoke<string>("ingest_add_chat", { team, projectId, chatId, messageIds }),
+  ingestAddChat: (projectId: string, chatId: string, messageIds: number[] | null) =>
+    invoke<string>("ingest_add_chat", { projectId, chatId, messageIds }),
   /** Try a source that failed again: its failure is cleared and a pass starts. */
-  ingestRetry: (team: string | null, path: string) => invoke<boolean>("ingest_retry", { team, path }),
+  ingestRetry: (path: string) => invoke<boolean>("ingest_retry", { path }),
   /** Move a source out of Raw/ to the system trash. */
-  ingestRemove: (team: string | null, path: string) => invoke<void>("ingest_remove", { team, path }),
+  ingestRemove: (path: string) => invoke<void>("ingest_remove", { path }),
   /** Mark an ingest card seen. A source an older card still holds in Raw
    *  moves beside its note first. Returns where the source is. */
-  ingestSeen: (itemId: number, team: string | null = null) => invoke<string>("ingest_seen", { itemId, team }),
+  ingestSeen: (itemId: number) => invoke<string>("ingest_seen", { itemId }),
   /** The last drift sweep (null before the first). */
   /** Run the drift sweep now. */
   runDriftNow: (projectId: string | null = null) => invoke<DriftRun | null>("run_drift_now", { projectId }),
-  /** The Team screen for the chosen team. */
-  teamOverview: (team: string | null) => invoke<TeamOverview>("team_overview", { team }),
-  /** The team's wiki (the repo with the inbox), or null. */
-  teamWiki: (team: string | null) => invoke<string | null>("team_wiki", { team }),
-  teamSaveIgnores: (lines: string[]) => invoke<void>("team_save_ignores", { lines }),
-  /** Sync conflicts and conflicted copies across the team's repos: the
+  /** The workspace settings screen (decision 37). */
+  workspaceSettings: () => invoke<WorkspaceSettings>("workspace_settings"),
+  /** The knowledge base's findings list alone, for the Inbox and the
+   *  sidebar's count. */
+  knowledgeFindings: () => invoke<Finding[]>("knowledge_findings"),
+  /** The workspace's knowledge base (the repo with the inbox), or null. */
+  knowledgeBaseId: () => invoke<string | null>("knowledge_base_id"),
+  workspaceSaveIgnores: (lines: string[]) => invoke<void>("workspace_save_ignores", { lines }),
+  /** The tier overrides, `pattern = tier` lines; refused with the bad line. */
+  workspaceSaveWeights: (lines: string[]) => invoke<void>("workspace_save_weights", { lines }),
+  /** One source's role rules, `pattern = role` lines, under its settings
+   *  name; the source is scanned again. */
+  workspaceSaveRoles: (projectId: string, name: string, lines: string[]) =>
+    invoke<void>("workspace_save_roles", { projectId, name, lines }),
+  /** Every control; they run at each source's next rebuild or scan. */
+  workspaceSaveControls: (controls: { question: string; expect: string; source?: string | null }[]) =>
+    invoke<void>("workspace_save_controls", { controls }),
+  /** Sync conflicts and conflicted copies across the workspace's repos: the
    *  banner at the top of Files. */
-  filesBanner: (team: string | null) => invoke<FilesBanner>("files_banner", { team }),
-  /** A new rule page in the wiki, from its rule template; returns its path. */
-  teamAddRule: (wikiId: string, rule: string) => invoke<string>("team_add_rule", { wikiId, rule }),
+  filesBanner: () => invoke<FilesBanner>("files_banner"),
+  /** A new rule page in the knowledge base, from its rule template; returns its path. */
+  workspaceAddRule: (wikiId: string, rule: string) => invoke<string>("workspace_add_rule", { wikiId, rule }),
   /** A page's links both ways: pages it reaches, pages that reach it. */
   pageLinks: (path: string) =>
     invoke<{ outgoing: string[]; incoming: string[] }>("page_links", { path }),
@@ -1344,8 +1357,7 @@ export const api = {
   codeUsages: (name: string) => invoke<CodeUsages>("code_usages", { name }),
   setProjectIndex: (id: string, index: IndexState | null) =>
     invoke<RegistryEntryStatus[]>("set_project_index", { id, index }),
-  setProjectKind: (id: string, kind: RepoKind[], team: string | null) =>
-    invoke<RegistryEntryStatus[]>("set_project_kind", { id, kind, team }),
+  setProjectKind: (id: string, kind: RepoKind[]) => invoke<RegistryEntryStatus[]>("set_project_kind", { id, kind }),
   createProject: (path: string, name: string) =>
     invoke<ProjectInfo>("create_project", { path, name }),
   openProject: (path: string) => invoke<ProjectInfo>("open_project", { path }),
@@ -1361,7 +1373,7 @@ export const api = {
    *  folder names, then open it (same activation path as `openWorkspace`). */
   createWorkspace: (parent: string, name: string, members: string[]) =>
     invoke<WorkspaceOverview>("create_workspace", { parent, name, members }),
-  /** Set-up Confirm: writes the manifest, kinds, teams, index states and
+  /** Set-up Confirm: writes the manifest, kinds and the ticked
    *  ignore lines, then opens the workspace. */
   setupConfirm: (parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) =>
     invoke<WorkspaceOverview>("setup_confirm", { parent, name, rows, ignores }),
@@ -1425,7 +1437,7 @@ export const api = {
   workspaceRemoveGroup: (name: string) =>
     invoke<ProjectGroup[]>("workspace_remove_group", { name }),
   /** Take a repo out of the workspace (its folder and files stay). Its
-   *  team wiki's link report names the pages that still cite it. */
+   *  knowledge base's link report names the pages that still cite it. */
   workspaceRemoveMember: (name: string) =>
     invoke<{ members: MemberOverview[] }>("workspace_remove_member", { name }),
   /** Join an existing sibling folder to the open workspace. It lands
@@ -1784,10 +1796,10 @@ export const api = {
   },
   /** What this machine can capture: the mic, the system audio, and why not. */
   recordSupport: () => invoke<RecordSupport>("record_support"),
-  /** Start a take for `team`: the transcript goes to that team wiki's Raw/
-   *  and is read at once. Errors when nothing could start capturing. */
-  recordStart: (mic: boolean, system: boolean, deviceId: string | null, team: string | null = null) =>
-    invoke<void>("record_start", { mic, system, deviceId, team }),
+  /** Start a take: the transcript goes to the knowledge base's Raw/ and is
+   *  read at once. Errors when nothing could start capturing. */
+  recordStart: (mic: boolean, system: boolean, deviceId: string | null) =>
+    invoke<void>("record_start", { mic, system, deviceId }),
   recordPause: () => invoke<void>("record_pause"),
   recordResume: () => invoke<void>("record_resume"),
   recordStop: (storage: RecordStorage) =>
@@ -1821,8 +1833,8 @@ export const api = {
     listen<RecordErrorEvent>("record-error", (e) => fn(e.payload)),
 
   // ---- Your day ----
-  /** Your day for `team` (a group name; null = every workspace member). */
-  dayState: (team: string | null) => invoke<DayState>("day_state", { team }),
+  /** Your day, across every repo of the workspace. */
+  dayState: () => invoke<DayState>("day_state"),
   /** A new task in the workspace home; updated_by "you". */
   dayTaskCreate: (input: DayTaskInput) => invoke<DayTask>("day_task_create", { input }),
   /** Patch a task: only the keys named change; `target: null` clears it. */
@@ -1832,29 +1844,25 @@ export const api = {
   /** Tasks linked to a ticket, done included. */
   ticketTasks: (projectId: string, ticketId: string) =>
     invoke<DayTask[]>("ticket_tasks", { projectId, ticketId }),
-  /** The newest stored digest for the team, or null. */
-  teamDigest: (team: string | null) => invoke<TeamDigest | null>("team_digest", { team }),
-  /** Write the team digest now. Outcome arrives on the team-digest events. */
-  refreshTeamDigest: (team: string | null) => invoke<void>("refresh_team_digest", { team }),
+  /** The newest stored digest for the workspace, or null. */
+  dayDigest: () => invoke<DayDigest | null>("day_digest"),
+  /** Write the digest now. Outcome arrives on the day-digest events. */
+  refreshDayDigest: () => invoke<void>("refresh_day_digest"),
   /** Move a ticket to a status (todo, in-progress, blocked, in-review, testing, done, cancelled). */
   ticketSetStatus: (projectId: string, relPath: string, status: string) =>
     invoke<void>("ticket_set_status", { projectId, relPath, status }),
-  /** Reply in an escalation's thread; `resolve` also closes it. */
-  escalationReply: (projectId: string, relPath: string, text: string, resolve: boolean) =>
-    invoke<void>("escalation_reply", { projectId, relPath, text, resolve }),
-  /** Whether the team's digest is being written or waits its turn. */
-  teamDigestWriting: (team: string | null) => invoke<boolean>("team_digest_writing", { team }),
-  /** Repos indexed, files queued and failed, across the team. */
-  indexHealth: (team: string | null) => invoke<IndexHealth>("index_health", { team }),
-  /** A task file, ticket file or team inbox changed. */
+  /** Whether the digest is being written or waits its turn. */
+  dayDigestWriting: () => invoke<boolean>("day_digest_writing"),
+  /** Repos indexed, files queued and failed, across the workspace. */
+  indexHealth: () => invoke<IndexHealth>("index_health"),
+  /** A task file or ticket file changed. */
   onDayChanged: (fn: () => void): Promise<UnlistenFn> => listen<null>("day-changed", () => fn()),
-  onTeamDigestUpdated: (fn: (digest: TeamDigest) => void): Promise<UnlistenFn> =>
-    listen<TeamDigest>("team-digest-updated", (e) => fn(e.payload)),
-  /** A team's digest was asked for: it is being written or waits its turn. */
-  onTeamDigestGenerating: (fn: (team: string | null) => void): Promise<UnlistenFn> =>
-    listen<{ team: string | null }>("team-digest-generating", (e) => fn(e.payload?.team ?? null)),
-  onTeamDigestError: (fn: (team: string | null, message: string) => void): Promise<UnlistenFn> =>
-    listen<{ team: string | null; message: string | null }>("team-digest-error", (e) =>
-      fn(e.payload?.team ?? null, e.payload?.message ?? ""),
+  onDayDigestUpdated: (fn: (digest: DayDigest) => void): Promise<UnlistenFn> =>
+    listen<DayDigest>("day-digest-updated", (e) => fn(e.payload)),
+  /** The digest was asked for: it is being written or waits its turn. */
+  onDayDigestGenerating: (fn: () => void): Promise<UnlistenFn> => listen<unknown>("day-digest-generating", () => fn()),
+  onDayDigestError: (fn: (message: string) => void): Promise<UnlistenFn> =>
+    listen<{ message: string | null }>("day-digest-error", (e) =>
+      fn(e.payload?.message ?? ""),
     ),
 };

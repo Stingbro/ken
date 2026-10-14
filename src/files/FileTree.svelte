@@ -33,11 +33,9 @@
   // with a menu when there are several. Files opens on the wiki. A file
   // opened from another repo (a search hit, a citation) shows that repo here.
   // Choosing one stays on Files.
-  const teamRepos = $derived.by(() => {
-    const ids = scope.groups.find((g) => g.name === scope.team)?.projectIds ?? null;
+  const repos = $derived.by(() => {
     return app.members
       .filter((m): m is typeof m & { id: string } => !!m.id && (m.status === "active" || m.status === "dormant"))
-      .filter((m) => ids === null || ids.includes(m.id))
       .sort((a, b) => (a.id === scope.wikiId ? -1 : b.id === scope.wikiId ? 1 : a.name.localeCompare(b.name)));
   });
 
@@ -45,7 +43,7 @@
     if (id && id !== app.focused) void app.focusMember(id, { stay: true });
   }
 
-  const split = $derived(splitRepos(teamRepos, scope.wikiId));
+  const split = $derived(splitRepos(repos, scope.wikiId));
   const side = $derived(sideOf(app.focused, scope.wikiId));
   // The source last shown, so Sources opens where a person left it.
   let lastSource = $state<string | null>(null);
@@ -165,7 +163,7 @@
 </script>
 
 <div class="tree" style:width="{width}px">
-  {#if app.workspace && teamRepos.length > 1}
+  {#if app.workspace && repos.length > 1}
     <div class="split" role="tablist" aria-label="Wiki or sources">
       <button class="side" class:on={side === "wiki"} role="tab" aria-selected={side === "wiki"} disabled={!split.wiki} onclick={() => showSide("wiki")}
         >Wiki</button

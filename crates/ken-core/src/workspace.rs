@@ -1,7 +1,7 @@
 //! Workspace lifecycle: `<parent>/.ken-workspace/workspace.json` is the
 //! shared, text-only source of truth for a parent folder whose child
-//! projects are opened together (`openspec/changes/workspace`). Same
-//! philosophy as `project.rs`'s `.ken/project.json` — unknown fields survive
+//! projects are opened together. Same philosophy as `project.rs`'s
+//! `.ken/project.json` — unknown fields survive
 //! a rewrite, and a manifest already on disk is adopted rather than
 //! clobbered.
 //!

@@ -6,7 +6,7 @@ The method these follow is the Knowledge page of Ways of Working (`docs/manual/d
 
 ## What Ken Fills
 
-At set-up Ken fills `{{team_name}}`, `{{wiki_repo}}`, `{{KEY}}`, the repo table on Start Here, the repos in `.ken/knowledge.json`, and every `updated:` date. The blanks in `Templates/` keep their placeholders: a page is copied from one when something writes it, so no page ships that only holds placeholders.
+At set-up Ken fills `{{workspace_name}}`, `{{wiki_repo}}`, `{{KEY}}`, the repo table on Start Here, the repos in `.ken/knowledge.json`, and every `updated:` date. The blanks in `Templates/` keep their placeholders: a page is copied from one when something writes it, so no page ships that only holds placeholders.
 
 ## Frontmatter
 

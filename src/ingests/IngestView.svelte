@@ -12,7 +12,7 @@
   import FilePen from "@lucide/svelte/icons/file-pen";
   // Ingest, the inbox that empties (the Wright white box, frame 8b). Four
   // ways to add a source: drop or choose files, record, write a note, or take
-  // a chat. Each lands in the team library's Research/Ingestion/Raw/ and is
+  // a chat. Each lands in the knowledge base's Research/Ingestion/Raw/ and is
   // read at once into a dated note in Ingested/, the source moving beside it.
   // The pages the note changes are written then and there, one section each,
   // citing the note. Three things wait on the card: a ruling as a ready entry
@@ -23,7 +23,6 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api, type IngestCard, type IngestOverview, type IngestProposal } from "../lib/api";
   import { app } from "../lib/app.svelte";
-  import { scope } from "../lib/scope.svelte";
   import { record } from "../lib/record.svelte";
   import { rail } from "../lib/rail.svelte";
   import { renderMarkdown } from "../lib/markdown";
@@ -153,8 +152,6 @@
   let noteTitle = $state("");
   let noteText = $state("");
 
-  const team = $derived(scope.team);
-
   // Coming to Ingest while a take runs (the title-bar pill) shows the recorder.
   $effect(() => {
     if (app.screen === "ingests" && (record.recording || record.transcribing)) untrack(() => (source = "record"));
@@ -171,10 +168,10 @@
   // One read at a time: the 4-second follow and the events would otherwise
   // stack reads up behind a slow one (see `singleFlight`).
   const refresh = singleFlight(async () => {
-    const t = team;
+    const ws = app.workspace?.id;
     try {
-      const next = await api.ingestOverview(t);
-      if (t !== team) return;
+      const next = await api.ingestOverview();
+      if (ws !== app.workspace?.id) return;
       overview = next;
       rail.setIngest(next.waiting ?? 0);
       loadError = null;
@@ -204,7 +201,7 @@
       return;
     }
     try {
-      card = await api.ingestCard(team, id);
+      card = await api.ingestCard(id);
     } catch (e) {
       card = null;
       error = String(e);
@@ -217,7 +214,7 @@
   });
 
   $effect(() => {
-    void team;
+    void app.workspace?.id;
     void refresh();
   });
   $effect(() => {
@@ -246,7 +243,7 @@
     if (paths.length === 0) return;
     adding += paths.length;
     try {
-      await api.ingestAdd(team, paths);
+      await api.ingestAdd(paths);
     } catch (e) {
       error = String(e);
     } finally {
@@ -263,7 +260,7 @@
     adding += files.length;
     for (const f of files) {
       try {
-        await api.ingestAddBytes(team, f);
+        await api.ingestAddBytes(f);
       } catch (err) {
         error = String(err);
       } finally {
@@ -278,7 +275,7 @@
     if (!text) return;
     busy = "note";
     try {
-      await api.ingestAddText(team, noteTitle.trim() || null, text);
+      await api.ingestAddText(noteTitle.trim() || null, text);
       noteTitle = "";
       noteText = "";
       notice = "The note is in Raw. Ken reads it now.";
@@ -300,7 +297,7 @@
   async function readNow() {
     busy = "now";
     try {
-      const started = await api.ingestNow(team);
+      const started = await api.ingestNow();
       notice = started ? "Reading what is queued." : "A read is already running; the queue is next.";
     } catch (e) {
       error = errorText(e);
@@ -313,7 +310,7 @@
   async function retry(r: IngestOverview["raw"][number]) {
     busy = `r${r.path}`;
     try {
-      const started = await api.ingestRetry(team, r.path);
+      const started = await api.ingestRetry(r.path);
       notice = started ? `Reading ${r.name} again.` : `${r.name} is read on the next pass.`;
       error = null;
     } catch (e) {
@@ -337,7 +334,7 @@
   async function remove(r: IngestOverview["raw"][number]) {
     busy = `x${r.path}`;
     try {
-      await api.ingestRemove(team, r.path);
+      await api.ingestRemove(r.path);
       notice = `${r.name} is in the trash.`;
       error = null;
     } catch (e) {
@@ -395,7 +392,7 @@
     if (!card) return;
     busy = "seen";
     try {
-      await api.ingestSeen(card.id, team);
+      await api.ingestSeen(card.id);
     } catch (e) {
       error = String(e);
     } finally {
@@ -458,7 +455,7 @@
     </div>
 
     {#if source === "record"}
-      <div class="panel"><RecordPanel {team} /></div>
+      <div class="panel"><RecordPanel /></div>
     {:else if source === "note"}
       <div class="panel note-form">
         <input class="input" bind:value={noteTitle} placeholder="Title (optional)" aria-label="Title" />
@@ -468,7 +465,7 @@
         </div>
       </div>
     {:else if source === "chat"}
-      <div class="panel"><ChatSource {team} onAdded={chatAdded} /></div>
+      <div class="panel"><ChatSource onAdded={chatAdded} /></div>
     {/if}
     {#if adding > 0}<p class="note">Adding {adding} {adding === 1 ? "file" : "files"}…</p>{/if}
     {#if error}<p class="warn">{error}</p>{/if}

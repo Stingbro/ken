@@ -72,9 +72,10 @@ export type Screen =
   | "timeline"
   | "settings";
 
-/** Settings' sections (the Briefing design's sub-nav). Team library holds what
- *  the Team screen did: the team's folders, ignore list, checks and rules. */
-export type SettingsSection = "general" | "team" | "sync" | "ai" | "agents" | "rules";
+/** Settings' sections (the Briefing design's sub-nav). Workspace holds the
+ *  workspace settings (knowledge-core decision 37): sources, kinds, index
+ *  rules, tiers, roles, controls and health. */
+export type SettingsSection = "general" | "workspace" | "sync" | "ai" | "agents" | "rules";
 
 /** One entry in `app.members` (workspace task 4.3). In Single mode (no
  *  workspace open) this is just the one open project, `status: "active"`
@@ -179,7 +180,7 @@ class AppStore {
   /** The place an open file should scroll to, set by a clicked citation. */
   revealAt = $state<Reveal | null>(null);
 
-  /** Team-sync state for the title-bar dot ("off" = not a synced project). */
+  /** Sync state for the title-bar dot ("off" = not a synced project). */
   syncState = $state<SyncStateName>("off");
   syncDetail = $state<string | null>(null);
 
@@ -674,7 +675,7 @@ class AppStore {
   async focusMember(id: string, opts: { stay?: boolean } = {}) {
     if (!this.workspace || this.workspace.focused === id) return;
     // A change of focus lands on Home; `stay` keeps the screen the person
-    // is on (a Team repo's settings, a conflict in Files).
+    // is on (a repo's settings, a conflict in Files).
     this.keepScreen = !!opts.stay;
     try {
       await api.focusProject(id);
@@ -813,9 +814,9 @@ class AppStore {
     this.searchOpen = false;
   }
 
-  /** The team's folders, rules and checks (was the Team screen). */
-  openTeam() {
-    this.openSettings("team");
+  /** The workspace settings (was the Team screen). */
+  openWorkspaceSettings() {
+    this.openSettings("workspace");
   }
 
   /** The project's raid log (knowledge-core decision 37). */

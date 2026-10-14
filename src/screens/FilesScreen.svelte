@@ -29,17 +29,17 @@
   import { bannerLine } from "../lib/conflicts";
   import ConflictsPanel from "../files/ConflictsPanel.svelte";
 
-  // Sync conflicts and conflicted copies in the team's repos: a line at the
+  // Sync conflicts and conflicted copies in the workspace's repos: a line at the
   // top of Files that opens the conflict view in place of the open file.
   const banner = $derived(bannerLine(conflicts.banner));
 
-  // A ticket file (`tickets/<ID>.md`) in one of the team's repos gets the
+  // A ticket file (`tickets/<ID>.md`) in one of the workspace's repos gets the
   // column of my tasks for it beside the file.
   const ticket = $derived.by(() => {
     const id = ticketIdForPath(app.activeTab);
     const projectId = app.focused;
     if (!id || !projectId || !app.workspace) return null;
-    if (!scope.teamProjectIds.includes(projectId)) return null;
+    if (!scope.workspaceProjectIds.includes(projectId)) return null;
     return { id, projectId };
   });
 

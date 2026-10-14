@@ -1,4 +1,4 @@
-//! Ken's own working memory (`openspec/changes/ken-memory`): long-term
+//! Ken's own working memory, personal and local, never pushed: long-term
 //! memory files (`.ken-workspace/memory/`, `<project>/.ken/memory/`) and
 //! the short-term journal (`.ken-workspace/journal/YYYY-MM-DD.md`).
 //!

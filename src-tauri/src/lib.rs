@@ -167,12 +167,8 @@ struct AppState {
     /// git pull) and gets exactly one emit for the whole tick. Notes expire
     /// after `TASK_WRITE_NOTE_TTL`, so the map stays small.
     task_recent_writes: Arc<Mutex<std::collections::HashMap<PathBuf, TaskWriteNote>>>,
-    /// The team Your day last asked about (`day_state`, `team_digest`, …):
-    /// the morning schedule writes that team's digest. Also saved in app
-    /// data (`TeamDigestSchedule`), so it survives a restart.
-    last_team: Option<String>,
-    /// True while a team-digest thread is running (one at a time).
-    team_digest_running: Arc<AtomicBool>,
+    /// True while a digest thread is running (one at a time).
+    digest_running: Arc<AtomicBool>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -1264,9 +1260,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         background_hydrate_worker(bg_app, bg_state, bg_id, bg_stop);
     });
 
-    // The team digest may be due the moment a repo opens (it waits for
+    // The digest may be due the moment a repo opens (it waits for
     // the workspace to be installed; see `open_workspace_inner`).
-    maybe_generate_team_digest(app, state);
+    maybe_generate_digest(app, state);
 
     Ok(info)
 }
@@ -1490,7 +1486,7 @@ fn close_member(state: State<SharedState>, project_id: String) -> CmdResult<()> 
     Ok(())
 }
 
-// ── Workspace mode (openspec/changes/workspace, tasks 3.1–3.4) ─────────────
+// ── Workspace mode ─────────────────────────────────────────────────────────
 //
 // Built on the committed S9 shape (`AppState::members` map + `focused`), NOT
 // design.md D2's `AppMode { Single | Workspace }` enum — see tasks.md 2.1's
@@ -1923,16 +1919,13 @@ fn open_workspace_inner(
         );
     }
 
-    // A repo with the inbox and no kind said is the team's wiki: say so,
-    // with the team of the group it is in.
+    // A repo with the inbox and no kind said is the knowledge base: say so.
     {
         let guard = state.lock().unwrap();
         if let Ok(mut reg) = Registry::load(&guard.base_dir) {
-            let groups = ws.config.effective_groups();
             let mut changed = false;
-            for (name, root, _) in &ok_members {
-                let team = groups.iter().find(|g| g.members.contains(name)).map(|g| g.name.as_str());
-                changed |= reg.infer_library(root, team);
+            for (_, root, _) in &ok_members {
+                changed |= reg.infer_library(root);
             }
             if changed {
                 if let Err(e) = reg.save(&guard.base_dir) {
@@ -1984,8 +1977,8 @@ fn open_workspace_inner(
             ws_state.task_watch = Some(handle);
         }
     }
-    // The morning team digest, now that the workspace is installed.
-    maybe_generate_team_digest(app, state);
+    // The morning digest, now that the workspace is installed.
+    maybe_generate_digest(app, state);
 
     // Restore focus, or default to the first resident member. Routed through
     // the shared focus path so a dormant restore target activates + evicts
@@ -2076,7 +2069,7 @@ fn focus_project(app: AppHandle, state: State<SharedState>, id: String) -> CmdRe
 }
 
 /// Set-up, step one to three: scan a code folder and propose a row per repo
-/// (kind, team, index state, evidence) and the ignore entries. Reads only.
+/// (kind, evidence) and the ignore entries. Reads only.
 #[tauri::command]
 async fn setup_propose(parent: String) -> CmdResult<ken_core::setup::Proposal> {
     // Not flag-gated: set-up is how a fresh install opts into several repos
@@ -2087,8 +2080,8 @@ async fn setup_propose(parent: String) -> CmdResult<ken_core::setup::Proposal> {
         .map_err(|e| e.to_string())?
 }
 
-/// Set-up, Confirm: write the manifest, the registry's kinds, teams and
-/// index states, and the ticked ignore lines, then open the workspace so
+/// Set-up, Confirm: write the manifest, the registry's kinds and the ticked
+/// ignore lines, then open the workspace so
 /// indexing starts. The only set-up step that writes.
 #[tauri::command(async)]
 fn setup_confirm(
@@ -2270,21 +2263,20 @@ fn close_workspace(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     Ok(())
 }
 
-/// Say what a repo is for: its kinds and team. Kept in the local registry,
-/// never in the repo. Sync follows the kind unless `project.json` sets it,
-/// and the dot is refreshed at once for an open member.
+/// Say what a repo is for: its kinds. Kept in the local registry, never in
+/// the repo. Only the knowledge base syncs (decision 36), and the dot is
+/// refreshed at once for an open member.
 #[tauri::command]
 fn set_project_kind(
     app: AppHandle,
     state: State<SharedState>,
     id: String,
     kind: Vec<ken_core::registry::RepoKind>,
-    team: Option<String>,
 ) -> CmdResult<Vec<RegistryEntryStatus>> {
     let guard = state.lock().unwrap();
     let uuid: uuid::Uuid = id.parse().map_err(err)?;
     let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
-    if !registry.set_kind(uuid, kind, team) {
+    if !registry.set_kind(uuid, kind) {
         return Err(format!("no project with id {id}"));
     }
     registry.save(&guard.base_dir).map_err(err)?;
@@ -2960,10 +2952,13 @@ async fn hydrate_file(
 }
 
 /// Post-write bookkeeping shared by `save_file` and `save_file_bytes`: reindex
-/// the file, mark the version as seen, notify the frontend, return the mtime.
-/// Assumes the bytes are already on disk at `rel_path`.
-fn finish_save(app: &AppHandle, project: &Project, base: &Path, rel_path: &str) -> CmdResult<i64> {
+/// the file, mark the version as seen, tell sync Ken wrote it (decision 36:
+/// in the knowledge base, sync commits only what Ken wrote), notify the
+/// frontend, return the mtime. Assumes the bytes are already on disk at
+/// `rel_path`.
+fn finish_save(app: &AppHandle, project: &Project, base: &Path, rel_path: &str, sync: &SyncEngine) -> CmdResult<i64> {
     let abs = project.resolve(rel_path).map_err(err)?;
+    sync.wrote(vec![rel_path.to_string()]);
     let project_id = project.config.id;
     // Index it now, on its own connection: no wait for the watcher, and no
     // other command waits on the lock meanwhile. The file is written; an
@@ -3001,12 +2996,13 @@ fn finish_save(app: &AppHandle, project: &Project, base: &Path, rel_path: &str) 
     Ok(mtime)
 }
 
-/// The focused member's project and the app data dir, cloned under the lock
-/// for a save that writes and indexes after releasing it.
-fn save_target(state: &SharedState) -> CmdResult<(Project, PathBuf)> {
+/// The focused member's project, the app data dir and its sync engine,
+/// cloned under the lock for a save that writes and indexes after releasing
+/// it.
+fn save_target(state: &SharedState) -> CmdResult<(Project, PathBuf, Arc<SyncEngine>)> {
     let guard = lock_tolerant(state);
     let active = member(&guard, None)?;
-    Ok((active.project.clone(), guard.base_dir.clone()))
+    Ok((active.project.clone(), guard.base_dir.clone(), active.sync.clone()))
 }
 
 // Saves stay on the main thread, so they run in the order they were made.
@@ -3017,10 +3013,10 @@ fn save_file(
     rel_path: String,
     content: String,
 ) -> CmdResult<i64> {
-    let (project, base) = save_target(state.inner())?;
+    let (project, base, sync) = save_target(state.inner())?;
     let abs = project.resolve(&rel_path).map_err(err)?;
     std::fs::write(&abs, &content).map_err(err)?;
-    finish_save(&app, &project, &base, &rel_path)
+    finish_save(&app, &project, &base, &rel_path, &sync)
 }
 
 /// Overwrite a file with raw bytes. Used by the PDF form filler: `bytes` is the
@@ -3033,10 +3029,10 @@ fn save_file_bytes(
     rel_path: String,
     bytes: Vec<u8>,
 ) -> CmdResult<i64> {
-    let (project, base) = save_target(state.inner())?;
+    let (project, base, sync) = save_target(state.inner())?;
     let abs = project.resolve(&rel_path).map_err(err)?;
     std::fs::write(&abs, &bytes).map_err(err)?;
-    finish_save(&app, &project, &base, &rel_path)
+    finish_save(&app, &project, &base, &rel_path, &sync)
 }
 
 /// Create a NEW folder `name` inside `dir_rel` ("" = root) for a folder dropped
@@ -3044,7 +3040,7 @@ fn save_file_bytes(
 /// (`Photos` → `Photos-1`) so a drop never merges into an existing folder.
 #[tauri::command]
 fn create_unique_folder(state: State<SharedState>, dir_rel: String, name: String) -> CmdResult<String> {
-    let (project, _) = save_target(state.inner())?;
+    let (project, _, _) = save_target(state.inner())?;
     let dir = project.resolve(&dir_rel).map_err(err)?;
     let created = ken_core::fsops::create_unique_dir(&dir, &name).map_err(err)?;
     Ok(if dir_rel.is_empty() {
@@ -3082,7 +3078,7 @@ fn write_new_file(
     let dir_rel = header("x-dir")?;
     let file_name = header("x-name")?;
 
-    let (project, base) = save_target(state.inner())?;
+    let (project, base, sync) = save_target(state.inner())?;
     // `resolve` keeps the folder inside the project; the name is reduced to a
     // single sanitized component, so the file cannot land anywhere else.
     let dir = project.resolve(&dir_rel).map_err(err)?;
@@ -3097,7 +3093,7 @@ fn write_new_file(
     } else {
         format!("{dir_rel}/{name}")
     };
-    finish_save(&app, &project, &base, &rel_path)?;
+    finish_save(&app, &project, &base, &rel_path, &sync)?;
     Ok(rel_path)
 }
 
@@ -3835,8 +3831,7 @@ fn record_open_settings(app: AppHandle, url: String) -> CmdResult<()> {
 }
 
 /// Start a take: the microphone and/or system audio, into WAVs in app data.
-/// The transcript goes into the team wiki's Raw/ (`team`'s library) when
-/// the take stops. Refused when no requested source could start.
+/// The transcript goes into the knowledge base's Raw/ when the take stops. Refused when no requested source could start.
 #[tauri::command]
 fn record_start(
     app: AppHandle,
@@ -3844,7 +3839,6 @@ fn record_start(
     mic: bool,
     system: bool,
     device_id: Option<String>,
-    team: Option<String>,
 ) -> CmdResult<()> {
     if !mic && !system {
         return Err("Pick at least one source to record.".into());
@@ -3863,7 +3857,7 @@ fn record_start(
     }
     // Where the transcript will go, found now so a take is never made with
     // nowhere to put it.
-    let project_id = inbox_member(&app, &state, team.as_deref())?;
+    let project_id = inbox_member(&app, &state)?;
     let base = { state.lock().unwrap().base_dir.clone() };
     let slot = { state.lock().unwrap().record.clone() };
     // Guard against a second recording.
@@ -4146,7 +4140,7 @@ fn finish_recording(app: &AppHandle, state: &SharedState, base: &Path, storage: 
     let Some(project) = project else {
         let kept = keep_audio()?;
         return fail(format!(
-            "The team wiki closed before the transcript was written. The audio is kept in {}.",
+            "The knowledge base closed before the transcript was written. The audio is kept in {}.",
             kept.first().map(|p| p.display().to_string()).unwrap_or_else(|| audio_dir.display().to_string())
         ));
     };
@@ -4359,6 +4353,7 @@ fn move_file(
 
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
+    active.sync.wrote(vec![from_rel.clone(), to_rel.clone()]);
     if from_is_dir {
         // Pure index bookkeeping: every child row moves to the new prefix with
         // its content and queue state intact. No rescan, no re-extraction.
@@ -4462,6 +4457,7 @@ async fn delete_file(
 
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, None)?;
+    active.sync.wrote(vec![rel_path.clone()]);
     deindex_removed(&active.project, &mut active.db, &rel_path, is_dir).map_err(err)?;
     let project_id = active.project.config.id;
     drop(guard);
@@ -4738,7 +4734,7 @@ fn import_commit(
     };
     if changed {
         let paths = vec![final_rel.clone()];
-        sync.changed(paths.clone());
+        sync.wrote(paths.clone());
         emit_member(
             &app,
             project.config.id,
@@ -4868,7 +4864,7 @@ fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
     // The knowledge server only (decision 22): the person's tasks and memory
     // are the personal set, which only Ken's own chat registers.
     let llm_instruction = format!(
-        "Set up the Ken MCP server so you can search this team's knowledge base.\n\n\
+        "Set up the Ken MCP server so you can search this workspace's knowledge base.\n\n\
 Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
 server binary, ken-mcp, runs on demand over stdio and tells you how to use it in its \
 instructions. Its tools: search (every repo of the workspace), read (a hit, a file or \
@@ -5807,7 +5803,7 @@ fn resolve_conflict(
         .db
         .resolve_review_item(item_id, engine::now_epoch())
         .map_err(err)?;
-    active.sync.changed(vec![path.clone()]);
+    active.sync.wrote(vec![path.clone()]);
     let _ = app.emit("file-saved", &path);
     let _ = app.emit("review-changed", ());
     Ok(path)
@@ -5881,7 +5877,7 @@ fn resolve_conflict_copy(
         .db
         .resolve_review_item(item_id, engine::now_epoch())
         .map_err(err)?;
-    active.sync.changed(vec![survivor.clone(), copy_rel]);
+    active.sync.wrote(vec![survivor.clone(), copy_rel]);
     let _ = app.emit("review-changed", ());
     Ok(survivor)
 }
@@ -5910,24 +5906,23 @@ struct ConflictItemDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FilesBannerDto {
-    /// Every open conflict and conflicted copy in the team's open repos,
-    /// newest first.
+    /// Every open conflict and conflicted copy in the workspace's open
+    /// repos, newest first.
     conflicts: Vec<ConflictItemDto>,
     /// How many of them are conflicted copies (a shared drive's).
     conflicted_copies: usize,
 }
 
 /// The banner at the top of Files: the sync conflicts and conflicted copies
-/// waiting in the chosen team's open repos (every open repo with no team),
-/// less those on files I ignore.
+/// waiting in the workspace's open repos, less those on files I ignore.
 #[tauri::command(async)]
-fn files_banner(state: State<SharedState>, team: Option<String>) -> CmdResult<FilesBannerDto> {
+fn files_banner(state: State<SharedState>) -> CmdResult<FilesBannerDto> {
     // Cloned under the lock, read after it is released: this is read again
     // on every index update.
     let (base_dir, repos) = {
         let guard = lock_tolerant(&state);
         let ids: Vec<(uuid::Uuid, String)> = match guard.workspace.as_ref() {
-            Some(ws) => team_repos(&ws.ws, team.as_deref()).into_iter().map(|r| (r.id, r.name)).collect(),
+            Some(ws) => ws_repos(&ws.ws).into_iter().map(|r| (r.id, r.name)).collect(),
             None => guard.members.values().map(|m| (m.project.config.id, m.project.config.name.clone())).collect(),
         };
         let repos: Vec<(uuid::Uuid, String, Arc<Mutex<Db>>)> = ids
@@ -6743,7 +6738,7 @@ fn start_ingest_passes(state: &SharedState) {
 /// Ken's generation policy: the on-device model embeds (meaning search) and
 /// nothing else. Everything that writes, extracts, judges or answers runs
 /// through Claude, in-agent Ken; the local 4B model, measured on a real
-/// team's vault, left half its extractions unparseable at ~42 s each and
+/// knowledge base, left half its extractions unparseable at ~42 s each and
 /// merged near-miss names it should not have.
 const LOCAL_GENERATION: bool = false;
 
@@ -6753,7 +6748,7 @@ fn claude_text(root: &Path, prompt: &str) -> Result<String, String> {
     claude_generate(binary, root.to_path_buf(), Vec::new())(prompt).map_err(|e| e.to_string())
 }
 
-/// Claude from `root`, also reading `dirs` (the team's repos a draft reads).
+/// Claude from `root`, also reading `dirs` (the workspace's repos a draft reads).
 fn claude_generate(
     binary: std::path::PathBuf,
     root: std::path::PathBuf,
@@ -6868,11 +6863,11 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
     Ok(proposal.page)
 }
 
-/// The library the Ingest screen works on: a repo of the workspace with an
-/// inbox (`Research/Ingestion/Raw/`), the chosen team's first and its wiki
-/// before its team repo, whichever repo is focused. With no workspace, the
-/// focused repo.
-fn inbox_project(guard: &AppState, team: Option<&str>) -> Option<Project> {
+/// The knowledge base the Ingest screen works on: the workspace's repo with
+/// an inbox (`Research/Ingestion/Raw/`), a wiki before any other, then
+/// whichever repo is focused. With no workspace, the focused repo. A
+/// workspace has one knowledge base (decision 35: no team repo).
+fn inbox_project(guard: &AppState) -> Option<Project> {
     let reg = Registry::load(&guard.base_dir).ok();
     let mut best: Option<(i32, Project)> = None;
     let mut consider = |p: &Project| {
@@ -6881,9 +6876,6 @@ fn inbox_project(guard: &AppState, team: Option<&str>) -> Option<Project> {
         }
         let entry = reg.as_ref().and_then(|r| r.entry_at(&p.root));
         let mut score = 0;
-        if team.is_some() && entry.and_then(|e| e.team.as_deref()) == team {
-            score += 4;
-        }
         if entry.is_some_and(|e| e.kind.contains(&ken_core::registry::RepoKind::Wiki)) {
             score += 2;
         }
@@ -6911,19 +6903,19 @@ fn inbox_project(guard: &AppState, team: Option<&str>) -> Option<Project> {
     best.map(|(_, p)| p)
 }
 
-/// The team's wiki: the repo with the inbox, the one Files opens on. None
-/// when no repo of the team has one.
+/// The workspace's knowledge base: the repo with the inbox, the one Files
+/// opens on under Wiki. None when no repo has one.
 #[tauri::command(async)]
-fn team_wiki(state: State<SharedState>, team: Option<String>) -> CmdResult<Option<String>> {
+fn knowledge_base_id(state: State<SharedState>) -> CmdResult<Option<String>> {
     let guard = state.lock().unwrap();
-    Ok(inbox_project(&guard, team.as_deref()).map(|p| p.config.id.to_string()))
+    Ok(inbox_project(&guard).map(|p| p.config.id.to_string()))
 }
 
 /// [`inbox_project`], opened if it was dormant, focus left where it was.
-fn inbox_member(app: &AppHandle, state: &SharedState, team: Option<&str>) -> CmdResult<uuid::Uuid> {
+fn inbox_member(app: &AppHandle, state: &SharedState) -> CmdResult<uuid::Uuid> {
     let (project, open, focused) = {
         let guard = state.lock().unwrap();
-        let project = inbox_project(&guard, team).ok_or("No repo of this team has an inbox (Research/Ingestion/Raw/). A wiki made from the Ways of Working template has one.")?;
+        let project = inbox_project(&guard).ok_or("No repo of this workspace has an inbox (Research/Ingestion/Raw/). A knowledge base made by set-up has one.")?;
         let open = guard.members.contains_key(&project.config.id);
         (project, open, guard.focused)
     };
@@ -7025,12 +7017,12 @@ struct IngestOverviewDto {
     stopped: Option<String>,
 }
 
-/// The Ingest screen: the library's inbox for the chosen team, every source
+/// The Ingest screen: the knowledge base's inbox, every source
 /// in Raw with where it is in the read, and what has been ingested, newest
 /// first.
 #[tauri::command(async)]
-fn ingest_overview(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestOverviewDto> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_overview(app: AppHandle, state: State<SharedState>) -> CmdResult<IngestOverviewDto> {
+    let id = inbox_member(&app, &state)?;
     // Cloned under the lock, read after it is released: Home, Inbox and the
     // sidebar ask for this on every index update.
     let (base, root, library, search_db) = {
@@ -7209,8 +7201,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 /// written from it, what waits (ready rulings, drafted tickets, held edits)
 /// and the commit that holds it.
 #[tauri::command(async)]
-fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<IngestCardDto> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_card(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<IngestCardDto> {
+    let id = inbox_member(&app, &state)?;
     // Cloned under the lock, read after it is released (the Inbox reads
     // every card that has something waiting).
     let (root, search_db) = {
@@ -7231,7 +7223,7 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
                 id: it.id,
                 kind: p.as_ref().map_or("page", ken_core::proposal::kind_of).into(),
                 page: p.as_ref().map(|p| p.page.clone()).unwrap_or_default(),
-                who: p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.decider.clone()),
+                who: p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.who.clone()),
                 title: it.title,
                 body: it.body,
                 payload: it.payload,
@@ -7264,8 +7256,8 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, team: Option<String>, 
 /// `Research/Ingestion/Raw/` (a name already there gets a number) and the
 /// read starts. Returns the paths in Raw.
 #[tauri::command(async)]
-fn ingest_add(app: AppHandle, state: State<SharedState>, team: Option<String>, paths: Vec<String>) -> CmdResult<Vec<String>> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_add(app: AppHandle, state: State<SharedState>, paths: Vec<String>) -> CmdResult<Vec<String>> {
+    let id = inbox_member(&app, &state)?;
     let (project, base) = {
         let guard = state.lock().unwrap();
         (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
@@ -7319,8 +7311,8 @@ fn percent_decode(s: &str) -> String {
 
 /// A file dropped on the Ingest screen, as its bytes (a drop in the window
 /// carries no path): the request body is the file, the `x-name` header its
-/// name and `x-team` the team, both URI-encoded. Written into the library's
-/// Raw/ and the read starts. Returns its path in Raw.
+/// name, URI-encoded. Written into the knowledge base's Raw/ and the read
+/// starts. Returns its path in Raw.
 #[tauri::command(async)]
 fn ingest_add_bytes(app: AppHandle, state: State<SharedState>, request: tauri::ipc::Request<'_>) -> CmdResult<String> {
     let header = |key: &str| -> Option<String> {
@@ -7332,11 +7324,10 @@ fn ingest_add_bytes(app: AppHandle, state: State<SharedState>, request: tauri::i
             .filter(|v| !v.is_empty())
     };
     let name = header("x-name").ok_or("the dropped file has no name")?;
-    let team = header("x-team");
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("the dropped file came without its bytes".into());
     };
-    let id = inbox_member(&app, &state, team.as_deref())?;
+    let id = inbox_member(&app, &state)?;
     let (project, base) = {
         let guard = state.lock().unwrap();
         (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
@@ -7357,8 +7348,8 @@ fn local_source_stamp() -> String {
 
 /// Write a source Ken made (a note, a chat) into the library's Raw/ and
 /// start the read. Returns its path in Raw.
-fn add_source(app: &AppHandle, state: &SharedState, team: Option<&str>, name: &str, text: &str) -> CmdResult<String> {
-    let id = inbox_member(app, state, team)?;
+fn add_source(app: &AppHandle, state: &SharedState, name: &str, text: &str) -> CmdResult<String> {
+    let id = inbox_member(app, state)?;
     let (project, base) = {
         let guard = state.lock().unwrap();
         (member(&guard, Some(id))?.project.clone(), guard.base_dir.clone())
@@ -7376,13 +7367,13 @@ fn add_source(app: &AppHandle, state: &SharedState, team: Option<&str>, name: &s
 /// `YYYY-MM-DD HH.MM Note - <title>.md` (`kind: note`, by me) and is read
 /// at once. Returns its path in Raw.
 #[tauri::command(async)]
-fn ingest_add_text(app: AppHandle, state: State<SharedState>, team: Option<String>, title: Option<String>, text: String) -> CmdResult<String> {
+fn ingest_add_text(app: AppHandle, state: State<SharedState>, title: Option<String>, text: String) -> CmdResult<String> {
     if text.trim().is_empty() {
         return Err("Write the note first.".into());
     }
     let me = cached_git_me();
     let (name, doc) = ken_core::ingest::note_source(&local_source_stamp(), title.as_deref(), &text, me.name.as_deref().or(me.email.as_deref()));
-    add_source(&app, state.inner(), team.as_deref(), &name, &doc)
+    add_source(&app, state.inner(), &name, &doc)
 }
 
 /// Send a chat to Ingest, whole or the messages named: the person's and
@@ -7394,7 +7385,6 @@ fn ingest_add_text(app: AppHandle, state: State<SharedState>, team: Option<Strin
 fn ingest_add_chat(
     app: AppHandle,
     state: State<SharedState>,
-    team: Option<String>,
     project_id: String,
     chat_id: String,
     message_ids: Option<Vec<i64>>,
@@ -7422,7 +7412,7 @@ fn ingest_add_chat(
     let me = cached_git_me();
     let (name, doc) = ken_core::ingest::chat_source(&local_source_stamp(), &chat.title, &chat.id, me.name.as_deref().or(me.email.as_deref()), &turns)
         .ok_or("Nothing to send: pick a message from you or from Ken.")?;
-    add_source(&app, state.inner(), team.as_deref(), &name, &doc)
+    add_source(&app, state.inner(), &name, &doc)
 }
 
 /// The library's source at `path` (in Raw/), checked to be one.
@@ -7437,8 +7427,8 @@ fn raw_source(root: &Path, path: &str) -> CmdResult<String> {
 /// Try a source that could not be read again: its failure is cleared and a
 /// read starts. Returns whether one started.
 #[tauri::command(async)]
-fn ingest_retry(app: AppHandle, state: State<SharedState>, team: Option<String>, path: String) -> CmdResult<bool> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_retry(app: AppHandle, state: State<SharedState>, path: String) -> CmdResult<bool> {
+    let id = inbox_member(&app, &state)?;
     let (project, base) = {
         let mut guard = state.lock().unwrap();
         let base = guard.base_dir.clone();
@@ -7458,8 +7448,8 @@ fn ingest_retry(app: AppHandle, state: State<SharedState>, team: Option<String>,
 /// delete) and its failure is cleared. A source an older card still holds
 /// is filed with Seen instead.
 #[tauri::command]
-async fn ingest_remove(app: AppHandle, state: State<'_, SharedState>, team: Option<String>, path: String) -> CmdResult<()> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+async fn ingest_remove(app: AppHandle, state: State<'_, SharedState>, path: String) -> CmdResult<()> {
+    let id = inbox_member(&app, &state)?;
     let (abs, rel) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, Some(id))?;
@@ -7493,8 +7483,8 @@ struct IngestStatusDto {
 
 /// What waits in the focused project's library inbox.
 #[tauri::command(async)]
-fn ingest_status(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<IngestStatusDto> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_status(app: AppHandle, state: State<SharedState>) -> CmdResult<IngestStatusDto> {
+    let id = inbox_member(&app, &state)?;
     let guard = state.lock().unwrap();
     let active = member(&guard, Some(id))?;
     let root = &active.project.root;
@@ -7509,8 +7499,8 @@ fn ingest_status(app: AppHandle, state: State<SharedState>, team: Option<String>
 
 /// Read what waits in Raw/ now, whatever the repo's kind.
 #[tauri::command(async)]
-fn ingest_now(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<bool> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_now(app: AppHandle, state: State<SharedState>) -> CmdResult<bool> {
+    let id = inbox_member(&app, &state)?;
     let guard = state.lock().unwrap();
     let active = member(&guard, Some(id))?;
     if ken_core::runner::discover_claude().is_none() {
@@ -7524,8 +7514,8 @@ fn ingest_now(app: AppHandle, state: State<SharedState>, team: Option<String>) -
 /// still holds in Raw/ moves beside its note first; a source read now was
 /// claimed as its note was written. Returns where the source is.
 #[tauri::command(async)]
-fn ingest_seen(app: AppHandle, state: State<SharedState>, team: Option<String>, item_id: i64) -> CmdResult<String> {
-    let id = inbox_member(&app, &state, team.as_deref())?;
+fn ingest_seen(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdResult<String> {
+    let id = inbox_member(&app, &state)?;
     let mut guard = state.lock().unwrap();
     let active = member_mut(&mut guard, Some(id))?;
     let item = active
@@ -7545,7 +7535,7 @@ fn ingest_seen(app: AppHandle, state: State<SharedState>, team: Option<String>, 
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TeamRepoDto {
+struct SourceDto {
     id: String,
     name: String,
     path: String,
@@ -7563,11 +7553,18 @@ struct TeamRepoDto {
     /// Commits its upstream has that it does not, as of the last fetch.
     behind: Option<u32>,
     files: i64,
+    /// The one health line (decision 19), None when it has no index yet.
+    health: Option<String>,
+    /// What `.ken/knowledge.json` calls it: its `repos` key, a control's
+    /// `source`.
+    settings_name: String,
+    /// Its role rules (decision 17) as `pattern = role` lines.
+    roles: Vec<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TeamGapDto {
+struct GapDto {
     /// The repo it is about, when it is about one.
     repo: Option<String>,
     text: String,
@@ -7577,42 +7574,64 @@ struct TeamGapDto {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TeamPageDto {
+struct PageDto {
     path: String,
     title: String,
 }
 
+/// One control (decision 19) with how it did on its source's last run.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TeamOverviewDto {
-    team: Option<String>,
+struct ControlRowDto {
+    question: String,
+    expect: String,
+    /// The source it belongs to, by its settings name; None is the
+    /// knowledge base itself.
+    source: Option<String>,
+    /// Whether its source has run it yet.
+    ran: bool,
+    /// Where its file came, from 1, on the last run.
+    rank: Option<usize>,
+    passed: bool,
+}
+
+/// The workspace settings screen (knowledge-core decision 37): what used to
+/// be the Team screen, for the one workspace and its knowledge base.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSettingsDto {
     workspace: String,
     /// The folder the workspace lives in (what Scan again reads).
     root: String,
-    repos: Vec<TeamRepoDto>,
-    /// The team's wiki, when it has one.
-    wiki: Option<TeamRepoDto>,
-    gaps: Vec<TeamGapDto>,
+    repos: Vec<SourceDto>,
+    /// The knowledge base, when the workspace has one.
+    wiki: Option<SourceDto>,
+    gaps: Vec<GapDto>,
     /// The index rules every source reads, from the knowledge base's
     /// `.ken/knowledge.json` (knowledge-core decision 34).
     ignores: Vec<String>,
     /// The older workspace `.kenignore` lines, still read, never written.
     legacy_ignores: Vec<String>,
+    /// The tier overrides (`search.weights`, decision 23) as
+    /// `pattern = tier` lines.
+    weights: Vec<String>,
+    /// Every control in `.ken/knowledge.json`, with its last result.
+    controls: Vec<ControlRowDto>,
     /// Running set-up again: the template files the knowledge base lacks,
     /// and the ones Ken owns that differ from its template, as a diff.
     template_gaps: Vec<ken_core::wikinew::TemplateGap>,
-    /// The wiki's last drift run.
+    /// The knowledge base's last drift run.
     sweep: Option<ken_core::drift::DriftRun>,
-    /// What waits on a person in the wiki: the one findings list (drift,
-    /// lint, ingest, supersession).
-    findings: Vec<TeamFindingDto>,
-    rules: Vec<TeamPageDto>,
-    templates: Vec<TeamPageDto>,
+    /// What waits on a person in the knowledge base: the one findings list
+    /// (drift, lint, ingest, supersession).
+    findings: Vec<FindingDto>,
+    rules: Vec<PageDto>,
+    templates: Vec<PageDto>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TeamFindingDto {
+struct FindingDto {
     /// The finding's kind (`ken_core::findings::Finding::kind`):
     /// `contradiction` · `question` · `drift` · `broken-link` ·
     /// `missing-page` · `ambiguous-name` · `orphan` · `suggested-page` ·
@@ -7629,15 +7648,14 @@ struct TeamFindingDto {
     item_id: Option<i64>,
 }
 
-/// The findings for the Team screen and the Inbox: the knowledge base's one
-/// findings list (`ken_core::findings`), newest first, each marked done
-/// once seen to. Drift, the lint and the supersession pass file theirs as
-/// they run; nothing is worked out here.
-fn team_findings(wiki_id: &str, db: &Db) -> Vec<TeamFindingDto> {
+/// The knowledge base's one findings list (`ken_core::findings`), newest
+/// first, each marked done once seen to. Drift, the lint and the
+/// supersession pass file theirs as they run; nothing is worked out here.
+fn kb_findings(wiki_id: &str, db: &Db) -> Vec<FindingDto> {
     ken_core::findings::open(db)
         .unwrap_or_default()
         .into_iter()
-        .map(|(it, f)| TeamFindingDto {
+        .map(|(it, f)| FindingDto {
             path: f.page(),
             kind: f.kind,
             title: it.title,
@@ -7646,6 +7664,20 @@ fn team_findings(wiki_id: &str, db: &Db) -> Vec<TeamFindingDto> {
             item_id: Some(it.id),
         })
         .collect()
+}
+
+/// The findings for the Inbox and the sidebar's count: the knowledge base's
+/// findings list, without the rest of the settings screen.
+#[tauri::command(async)]
+fn knowledge_findings(state: State<SharedState>) -> CmdResult<Vec<FindingDto>> {
+    let found = {
+        let guard = lock_tolerant(&state);
+        inbox_project(&guard).and_then(|p| guard.members.get(&p.config.id).map(|m| (p.config.id, m.search_db.clone())))
+    };
+    Ok(match found {
+        Some((id, db)) => kb_findings(&id.to_string(), &lock_tolerant(&db)),
+        None => Vec::new(),
+    })
 }
 
 fn git_line(root: &std::path::Path, args: &[&str]) -> Option<String> {
@@ -7668,8 +7700,8 @@ fn page_title(root: &std::path::Path, rel: &str) -> String {
 /// The `.md` pages directly in `dir` of `root`, titled, the copy template a
 /// wiki laid down before the 2026-10 template kept among its rules
 /// (`RULE.md`) left out.
-fn pages_in(root: &std::path::Path, dir: &str) -> Vec<TeamPageDto> {
-    let mut out: Vec<TeamPageDto> = std::fs::read_dir(root.join(dir))
+fn pages_in(root: &std::path::Path, dir: &str) -> Vec<PageDto> {
+    let mut out: Vec<PageDto> = std::fs::read_dir(root.join(dir))
         .into_iter()
         .flatten()
         .flatten()
@@ -7677,21 +7709,65 @@ fn pages_in(root: &std::path::Path, dir: &str) -> Vec<TeamPageDto> {
             let name = e.file_name().to_string_lossy().to_string();
             (name.ends_with(".md") && name != "RULE.md" && name != "Index.md").then(|| format!("{dir}/{name}"))
         })
-        .map(|path| TeamPageDto { title: page_title(root, &path), path })
+        .map(|path| PageDto { title: page_title(root, &path), path })
         .collect();
     out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     out
 }
 
-/// The Team screen (the Wright white box, frame 9): the chosen team's repos
-/// as set-up wrote them (kind, index, branch, commit, how far behind its
-/// upstream), what each lacks for its kind, the workspace's ignore lines,
-/// the wiki's last drift sweep, and its rules and templates.
+/// Run `f` on a repo's index: a resident repo through its read connection
+/// (held for `f` only), a dormant one through a read-only open. None when it
+/// has no index yet.
+fn with_index<T>(
+    dbs: &std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>>,
+    base_dir: &Path,
+    id: uuid::Uuid,
+    f: impl Fn(&Db) -> T,
+) -> Option<T> {
+    match dbs.get(&id) {
+        Some(d) => Some(f(&lock_tolerant(d))),
+        None if db_path(base_dir, id).exists() => Db::open_read_only(base_dir, id).ok().map(|db| f(&db)),
+        None => None,
+    }
+}
+
+/// Each control with its last result: a control's source is the source
+/// whose settings name it gives (the knowledge base when it gives none),
+/// and its result is that source's stored run of the same question and file.
+fn control_rows(
+    controls: Vec<ken_core::controls::Control>,
+    sources: &[(String, Vec<ken_core::controls::ControlResult>)],
+    kb_name: Option<&str>,
+) -> Vec<ControlRowDto> {
+    controls
+        .into_iter()
+        .map(|c| {
+            let owner = c.source.as_deref().or(kb_name);
+            let result = owner
+                .and_then(|o| sources.iter().find(|(name, _)| name.eq_ignore_ascii_case(o)))
+                .and_then(|(_, results)| results.iter().find(|r| r.question == c.question && r.expect == c.expect));
+            ControlRowDto {
+                ran: result.is_some(),
+                rank: result.and_then(|r| r.rank),
+                passed: result.is_some_and(|r| r.passed),
+                question: c.question,
+                expect: c.expect,
+                source: c.source,
+            }
+        })
+        .collect()
+}
+
+/// The workspace settings screen (knowledge-core decision 37): every source
+/// as set-up wrote it (kind, indexed or off, branch, commit, how far behind
+/// its upstream, its health line and role rules), what each lacks for its
+/// kind, the index rules, the tiers and the controls in the knowledge base's
+/// `.ken/knowledge.json`, the knowledge base's last drift run and findings,
+/// and its rules and templates.
 #[tauri::command(async)]
-fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<TeamOverviewDto> {
-    // Cloned under the lock; the registry, the file counts, the wiki's
-    // findings and git are read after it is released. Home, Inbox and the
-    // sidebar ask for this while indexing runs.
+fn workspace_settings(state: State<SharedState>) -> CmdResult<WorkspaceSettingsDto> {
+    // Cloned under the lock; the registry, the indexes and git are read
+    // after it is released.
     let (ws, base_dir, dbs) = {
         let guard = lock_tolerant(&state);
         let ws = guard.workspace.as_ref().ok_or("no workspace open")?.ws.clone();
@@ -7700,19 +7776,24 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         (ws, guard.base_dir.clone(), dbs)
     };
     let registry = Registry::load(&base_dir).map_err(err)?;
-    let in_team: Option<Vec<String>> = team.as_deref().map(|t| ws.config.effective_group_members(t));
-    let mut repos: Vec<TeamRepoDto> = Vec::new();
+    let model_missing = ken_core::embedder::selected_profile().is_none();
+    let mut repos: Vec<SourceDto> = Vec::new();
+    // Each source's stored control results, by its settings name.
+    let mut results: Vec<(String, Vec<ken_core::controls::ControlResult>)> = Vec::new();
     for m in &ws.members {
-        if in_team.as_ref().is_some_and(|names| !names.contains(&m.name)) {
-            continue;
-        }
         let ken_core::workspace::MemberStatus::Ok(p) = &m.status else { continue };
         let entry = registry.entry_at(&p.root);
         let kind = entry.map(|e| e.kind.clone()).unwrap_or_default();
         let index = entry.and_then(|e| e.index);
         let git = p.root.join(".git").exists();
-        let files = dbs.get(&p.config.id).and_then(|d| lock_tolerant(d).file_count().ok()).unwrap_or(-1);
-        repos.push(TeamRepoDto {
+        let (files, health, stored) =
+            with_index(&dbs, &base_dir, p.config.id, |db| (db.file_count().unwrap_or(-1), db.index_health().ok(), ken_core::controls::stored(db)))
+                .unwrap_or((-1, None, Vec::new()));
+        let settings_name = ken_core::knowledge_settings::for_repo(&p.root)
+            .map(|s| s.name)
+            .unwrap_or_else(|| ken_core::knowledge_settings::repo_name(&p.root));
+        results.push((settings_name.clone(), stored));
+        repos.push(SourceDto {
             id: p.config.id.to_string(),
             name: m.name.clone(),
             path: p.root.display().to_string(),
@@ -7727,14 +7808,20 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             head: None,
             behind: None,
             files,
+            health: health.filter(|h| h.files > 0).map(|mut h| {
+                h.model_missing = model_missing;
+                h.line()
+            }),
+            settings_name,
+            roles: Vec::new(),
         });
     }
-    let is_wiki = |r: &TeamRepoDto| r.kind.contains(&ken_core::registry::RepoKind::Wiki);
+    let is_wiki = |r: &SourceDto| r.kind.contains(&ken_core::registry::RepoKind::Wiki);
     let wiki_index = repos.iter().position(is_wiki);
 
-    let mut gaps: Vec<TeamGapDto> = Vec::new();
+    let mut gaps: Vec<GapDto> = Vec::new();
     if wiki_index.is_none() {
-        gaps.push(TeamGapDto {
+        gaps.push(GapDto {
             repo: None,
             text: "This workspace has no knowledge base. Set-up makes one from Ken's template, or lays it over an existing wiki.".into(),
             open: None,
@@ -7743,31 +7830,32 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     for r in &repos {
         let root = std::path::Path::new(&r.path);
         if !r.available {
-            gaps.push(TeamGapDto { repo: Some(r.name.clone()), text: format!("{}'s folder is not there any more.", r.name), open: None });
+            gaps.push(GapDto { repo: Some(r.name.clone()), text: format!("{}'s folder is not there any more.", r.name), open: None });
             continue;
         }
         if r.kind.contains(&ken_core::registry::RepoKind::Code) && !["CLAUDE.md", "AGENTS.md"].iter().any(|f| root.join(f).exists()) {
-            gaps.push(TeamGapDto {
+            gaps.push(GapDto {
                 repo: Some(r.name.clone()),
                 text: format!("{} has no CLAUDE.md or AGENTS.md, so an agent starts in it without its conventions.", r.name),
                 open: None,
             });
         }
         if r.kind.is_empty() {
-            gaps.push(TeamGapDto { repo: Some(r.name.clone()), text: format!("Nobody has said what {} is: pick its kind.", r.name), open: None });
+            gaps.push(GapDto { repo: Some(r.name.clone()), text: format!("Nobody has said what {} is: pick its kind.", r.name), open: None });
         }
     }
-    let wiki = wiki_index.map(|i| repos.remove(i));
+    let mut wiki = wiki_index.map(|i| repos.remove(i));
     let mut sweep = None;
     let mut findings = Vec::new();
     let (mut rules, mut templates) = (Vec::new(), Vec::new());
+    let (mut ignores, mut weights, mut controls, mut template_gaps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     if let Some(w) = &wiki {
         let root = std::path::Path::new(&w.path);
         if let Ok(id) = w.id.parse::<uuid::Uuid>() {
             if let Some(d) = dbs.get(&id) {
                 let db = lock_tolerant(d);
                 sweep = db.last_drift_run().ok().flatten();
-                findings = team_findings(&w.id, &db);
+                findings = kb_findings(&w.id, &db);
             }
         }
         // The older layout kept the rules in Ways-of-Working/Rules.
@@ -7776,22 +7864,24 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             rules = pages_in(root, "Ways-of-Working/Rules");
         }
         templates = pages_in(root, "Templates");
+        ignores = ken_core::knowledge_settings::ignore_lines(root);
+        weights = ken_core::knowledge_settings::weight_lines(root);
+        controls = control_rows(ken_core::knowledge_settings::all_controls(root), &results, Some(&w.settings_name));
+        template_gaps = ken_core::wikinew::template_gaps(root, &ws.config.name, &local_date_today());
     }
-    let ignores = wiki.as_ref().map(|w| ken_core::knowledge_settings::ignore_lines(Path::new(&w.path))).unwrap_or_default();
+    if let Some(root) = wiki.as_ref().map(|w| PathBuf::from(&w.path)) {
+        for r in repos.iter_mut().chain(wiki.iter_mut()) {
+            r.roles = ken_core::knowledge_settings::role_lines(&root, &r.settings_name);
+        }
+    }
     let legacy_ignores = std::fs::read_to_string(ws.root.join(".kenignore"))
         .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty() && !l.starts_with('#')).collect())
-        .unwrap_or_default();
-    let template_gaps = wiki
-        .as_ref()
-        .map(|w| ken_core::wikinew::template_gaps(Path::new(&w.path), &ws.config.name, &local_date_today()))
         .unwrap_or_default();
     let workspace = ws.config.name.clone();
     let ws_root = ws.root.display().to_string();
 
     // Each repo's branch, commit and how far behind its upstream, the repos
     // side by side.
-    let mut repos = repos;
-    let mut wiki = wiki;
     std::thread::scope(|s| {
         for r in repos.iter_mut().chain(wiki.iter_mut()) {
             if r.branch.is_none() {
@@ -7807,15 +7897,14 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     });
     for r in repos.iter().chain(wiki.iter()) {
         if let Some(n) = r.behind.filter(|n| *n > 0) {
-            gaps.push(TeamGapDto {
+            gaps.push(GapDto {
                 repo: Some(r.name.clone()),
                 text: format!("{} is {n} commit{} behind its upstream: pull it so Ken reads what is merged.", r.name, if n == 1 { "" } else { "s" }),
                 open: None,
             });
         }
     }
-    Ok(TeamOverviewDto {
-        team,
+    Ok(WorkspaceSettingsDto {
         workspace,
         root: ws_root,
         repos,
@@ -7823,6 +7912,8 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         gaps,
         ignores,
         legacy_ignores,
+        weights,
+        controls,
         template_gaps,
         sweep,
         findings,
@@ -7831,18 +7922,21 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     })
 }
 
+/// The workspace's knowledge base and the open repos, for a settings save.
+fn kb_and_open(state: &SharedState) -> CmdResult<((String, uuid::Uuid, PathBuf), PathBuf, Vec<Project>)> {
+    let guard = state.lock().unwrap();
+    let kb = knowledge_base_of(&workspace_repos(&guard), None).ok_or("this workspace has no knowledge base to keep the settings in")?;
+    let open: Vec<Project> = guard.members.values().map(|m| m.project.clone()).collect();
+    Ok((kb, guard.base_dir.clone(), open))
+}
+
 /// Write the index rules every source reads: the top-level `ignore` lines of
 /// the knowledge base's `.ken/knowledge.json`, the one place they live
 /// (knowledge-core decision 34). Every open repo is scanned again, so a path
 /// newly left out leaves the index and one brought back is read.
 #[tauri::command(async)]
-fn team_save_ignores(app: AppHandle, state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
-    let (kb, base, open) = {
-        let guard = state.lock().unwrap();
-        let kb = knowledge_base_of(&workspace_repos(&guard), None).ok_or("this workspace has no knowledge base to keep the rules in")?;
-        let open: Vec<Project> = guard.members.values().map(|m| m.project.clone()).collect();
-        (kb, guard.base_dir.clone(), open)
-    };
+fn workspace_save_ignores(app: AppHandle, state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
+    let (kb, base, open) = kb_and_open(&state)?;
     ken_core::knowledge_settings::set_ignore_lines(&kb.2, &lines).map_err(err)?;
     for p in &open {
         rescan_member(&app, &base, p);
@@ -7850,11 +7944,46 @@ fn team_save_ignores(app: AppHandle, state: State<SharedState>, lines: Vec<Strin
     Ok(())
 }
 
+/// Write the tier overrides (`search.weights`, decision 23) from
+/// `pattern = tier` lines. The knowledge base is scanned again so its pages
+/// take their new tiers.
+#[tauri::command(async)]
+fn workspace_save_weights(app: AppHandle, state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
+    let (kb, base, open) = kb_and_open(&state)?;
+    ken_core::knowledge_settings::set_weight_lines(&kb.2, &lines).map_err(err)?;
+    if let Some(p) = open.iter().find(|p| p.config.id == kb.1) {
+        rescan_member(&app, &base, p);
+    }
+    Ok(())
+}
+
+/// Write one source's role rules (decision 17) from `pattern = role` lines,
+/// under its `repos` entry in the knowledge base. The source is scanned again
+/// so its files take their roles.
+#[tauri::command(async)]
+fn workspace_save_roles(app: AppHandle, state: State<SharedState>, project_id: String, name: String, lines: Vec<String>) -> CmdResult<()> {
+    let (kb, base, open) = kb_and_open(&state)?;
+    ken_core::knowledge_settings::set_role_lines(&kb.2, &name, &lines).map_err(err)?;
+    let id: uuid::Uuid = project_id.parse().map_err(err)?;
+    if let Some(p) = open.iter().find(|p| p.config.id == id) {
+        rescan_member(&app, &base, p);
+    }
+    Ok(())
+}
+
+/// Write the knowledge base's controls (decision 19). They run at each
+/// source's next rebuild or scan, as they always do; nothing runs now.
+#[tauri::command(async)]
+fn workspace_save_controls(state: State<SharedState>, controls: Vec<ken_core::controls::Control>) -> CmdResult<()> {
+    let (kb, _, _) = kb_and_open(&state)?;
+    ken_core::knowledge_settings::set_controls(&kb.2, &controls).map_err(err)
+}
+
 /// Lay down the template files the knowledge base lacks that a person
 /// chose (running set-up again, decision 4): never over a file it has, and
 /// committed by name. Returns the files written.
 #[tauri::command(async)]
-fn team_add_template_files(state: State<SharedState>, paths: Vec<String>) -> CmdResult<Vec<String>> {
+fn workspace_add_template_files(state: State<SharedState>, paths: Vec<String>) -> CmdResult<Vec<String>> {
     let (kb, name) = {
         let guard = state.lock().unwrap();
         let kb = knowledge_base_of(&workspace_repos(&guard), None).ok_or("this workspace has no knowledge base")?;
@@ -7867,7 +7996,7 @@ fn team_add_template_files(state: State<SharedState>, paths: Vec<String>) -> Cmd
 /// A new rule in the knowledge base's Rules/, from its own
 /// rule template, named as the rule. Returns its path, to open and write.
 #[tauri::command(async)]
-fn team_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> CmdResult<String> {
+fn workspace_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> CmdResult<String> {
     let guard = state.lock().unwrap();
     let id: uuid::Uuid = wiki_id.parse().map_err(err)?;
     let root = guard.members.get(&id).map(|m| m.project.root.clone()).ok_or("the wiki is not open")?;
@@ -8537,7 +8666,7 @@ async fn route_search(
     .await
     .map_err(|e| e.to_string())?;
 
-    // One vocabulary for the whole search: the team wiki's Vocabulary page
+    // One vocabulary for the whole search: the knowledge base's Vocabulary page
     // and decisions aliases widen the search in every repo, not only the wiki.
     let vocab = {
         let vocabs: Vec<ken_core::vocab::Vocabulary> = dbs
@@ -8860,31 +8989,27 @@ fn resolve_distill_candidate(state: State<SharedState>, slug: String, approve: b
 }
 
 // ---------------------------------------------------------------------
-// Your day: my tasks, the team's ticket files, the team digest, index
+// Your day: my tasks, the workspace's ticket files, the digest, index
 // health, and the watcher behind `day-changed`. The file logic lives in
 // `ken_core::day`, shared with ken-mcp; this layer finds the homes, the
-// team's repos and the inboxes, and shapes the wire DTOs.
+// workspace's repos and the inboxes, and shapes the wire DTOs.
 // ---------------------------------------------------------------------
 
-/// One repo of a team: a resolvable workspace member.
+/// One repo of the workspace: a resolvable member.
 #[derive(Clone)]
-struct TeamRepo {
+struct WsRepo {
     id: uuid::Uuid,
     name: String,
     root: PathBuf,
 }
 
-/// The repos of `team` (a manifest group, by name), or every member when
-/// no team is given. Same membership `team_overview` uses.
-fn team_repos(ws: &ken_core::workspace::Workspace, team: Option<&str>) -> Vec<TeamRepo> {
-    let names: Option<Vec<String>> = team.filter(|t| !t.is_empty()).map(|t| ws.config.effective_group_members(t));
+/// Every resolvable repo of the workspace. Groups only sort repos; a
+/// workspace is not split into teams (decision 35).
+fn ws_repos(ws: &ken_core::workspace::Workspace) -> Vec<WsRepo> {
     ws.members
         .iter()
-        .filter(|m| names.as_ref().is_none_or(|n| n.contains(&m.name)))
         .filter_map(|m| match &m.status {
-            ken_core::workspace::MemberStatus::Ok(p) => {
-                Some(TeamRepo { id: p.config.id, name: m.name.clone(), root: p.root.clone() })
-            }
+            ken_core::workspace::MemberStatus::Ok(p) => Some(WsRepo { id: p.config.id, name: m.name.clone(), root: p.root.clone() }),
             _ => None,
         })
         .collect()
@@ -8892,7 +9017,7 @@ fn team_repos(ws: &ken_core::workspace::Workspace, team: Option<&str>) -> Vec<Te
 
 /// The task home Your day reads: the workspace home, where every task lives.
 /// A repo's own `.ken/tasks/` is not read: tasks live in your own folder, not
-/// inside a team repo (Ways of Working).
+/// inside a repo (Ways of Working).
 struct DayHomes {
     ws_root: PathBuf,
 }
@@ -8951,61 +9076,13 @@ struct DayMeDto {
     email: Option<String>,
 }
 
-/// An open escalation addressed to me (`escalations/*.md` in a team repo),
-/// read-only: its row opens the file in Files.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct DayEscalationDto {
-    id: String,
-    title: String,
-    raised_by: Option<String>,
-    status: String,
-    ticket: Option<String>,
-    raised: Option<String>,
-    blocks: Option<String>,
-    project_id: String,
-    repo: String,
-    rel_path: String,
-}
-
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DayStateDto {
     tickets: Vec<DayTicketDto>,
     tasks: Vec<DayTaskDto>,
-    /// Open escalations addressed to me, from every repo of the team.
-    escalations: Vec<DayEscalationDto>,
     me: DayMeDto,
     has_tickets: bool,
-}
-
-/// Open escalations addressed to me in `repos`, oldest raised first.
-fn my_escalations(repos: &[TeamRepo], me: &ken_core::day::Me) -> Vec<DayEscalationDto> {
-    if !me.is_known() {
-        return Vec::new();
-    }
-    let mut out: Vec<DayEscalationDto> = repos
-        .iter()
-        .flat_map(|repo| {
-            ken_core::day::scan_escalations(&repo.root)
-                .into_iter()
-                .filter(|e| e.open && me.addressed(e))
-                .map(move |e| DayEscalationDto {
-                    id: e.id,
-                    title: e.title,
-                    raised_by: e.raised_by,
-                    status: e.status,
-                    ticket: e.ticket,
-                    raised: e.raised,
-                    blocks: e.blocks,
-                    project_id: repo.id.to_string(),
-                    repo: repo.name.clone(),
-                    rel_path: e.rel_path,
-                })
-        })
-        .collect();
-    out.sort_by(|a, b| (a.raised.is_none(), &a.raised, &a.id).cmp(&(b.raised.is_none(), &b.raised, &b.id)));
-    out
 }
 
 fn ws_rel_path(ws_root: &Path, path: &Path) -> String {
@@ -9075,41 +9152,22 @@ fn lock_tolerant<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The open workspace, the app data dir and the settings, cloned so no
-/// filesystem work happens under the lock. Remembers `team` as the last
-/// one asked for (the morning digest writes it), in memory and on disk.
-fn day_snapshot(
-    state: &SharedState,
-    team: Option<&str>,
-) -> CmdResult<(ken_core::workspace::Workspace, PathBuf, ken_core::settings::AppSettings)> {
-    let (snapshot, remembered) = {
-        let mut guard = lock_tolerant(state);
-        let ws = guard.workspace.as_ref().ok_or("no workspace open")?.ws.clone();
-        let mut remembered = false;
-        if let Some(t) = team.map(str::trim).filter(|t| !t.is_empty()) {
-            if guard.last_team.as_deref() != Some(t) {
-                guard.last_team = Some(t.to_string());
-                remembered = true;
-            }
-        }
-        ((ws, guard.base_dir.clone(), guard.app_settings.clone()), remembered)
-    };
-    if remembered {
-        let (ws, base_dir, _) = &snapshot;
-        let last = team.map(|t| t.trim().to_string());
-        update_digest_schedule(base_dir, ws.config.id, |s| s.last_team = last);
-    }
-    Ok(snapshot)
+/// filesystem work happens under the lock.
+fn day_snapshot(state: &SharedState) -> CmdResult<(ken_core::workspace::Workspace, PathBuf, ken_core::settings::AppSettings)> {
+    let guard = lock_tolerant(state);
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?.ws.clone();
+    Ok((ws, guard.base_dir.clone(), guard.app_settings.clone()))
 }
 
-/// My open tickets in the team, with how many of my tasks link to each.
-/// The second value is whether the team has any ticket file at all.
+/// My open tickets in the workspace, with how many of my tasks link to
+/// each. The second value is whether any repo has a ticket file at all.
 fn my_tickets(
-    repos: &[TeamRepo],
+    repos: &[WsRepo],
     me: &ken_core::day::Me,
     all_tasks: &[ken_core::day::DayTask],
 ) -> (Vec<DayTicketDto>, bool) {
     let mut has_tickets = false;
-    let mut found: Vec<(ken_core::day::Ticket, &TeamRepo)> = Vec::new();
+    let mut found: Vec<(ken_core::day::Ticket, &WsRepo)> = Vec::new();
     for repo in repos {
         let tickets = ken_core::day::scan_tickets(&repo.root);
         has_tickets |= !tickets.is_empty();
@@ -9141,11 +9199,11 @@ fn my_tickets(
     (out, has_tickets)
 }
 
-/// Your day (frame Y1): my open tickets in the team, and my tasks for
-/// today.
+/// Your day (frame Y1): my open tickets in the workspace, and my tasks
+/// for today.
 #[tauri::command(async)]
-fn day_state(state: State<SharedState>, team: Option<String>) -> CmdResult<DayStateDto> {
-    let (ws, _base_dir, _settings) = day_snapshot(state.inner(), team.as_deref())?;
+fn day_state(state: State<SharedState>) -> CmdResult<DayStateDto> {
+    let (ws, _base_dir, _settings) = day_snapshot(state.inner())?;
     let today = local_date_today();
     let all = DayHomes::new(&ws).scan(&today);
 
@@ -9154,13 +9212,11 @@ fn day_state(state: State<SharedState>, team: Option<String>) -> CmdResult<DaySt
     let tasks_out = listed.iter().map(|t| day_task_dto(&ws.root, t)).collect();
 
     let me = cached_git_me();
-    let repos = team_repos(&ws, team.as_deref());
+    let repos = ws_repos(&ws);
     let (tickets, has_tickets) = my_tickets(&repos, &me, &all);
-    let escalations = my_escalations(&repos, &me);
     Ok(DayStateDto {
         tickets,
         tasks: tasks_out,
-        escalations,
         me: DayMeDto { name: me.name, email: me.email },
         has_tickets,
     })
@@ -9198,8 +9254,9 @@ fn member_root(state: &SharedState, project_id: &str) -> CmdResult<PathBuf> {
 }
 
 /// Move one of my tickets to `status` (todo, in-progress, blocked,
-/// in-review, testing, done, cancelled) in its file. The team repo's sync
-/// carries it to the team; done and cancelled leave Your day.
+/// in-review, testing, done, cancelled) in its file. In the knowledge base,
+/// sync commits it as Ken's own change (decision 36); done and cancelled
+/// leave Your day.
 #[tauri::command(async)]
 fn ticket_set_status(app: AppHandle, state: State<SharedState>, project_id: String, rel_path: String, status: String) -> CmdResult<()> {
     let status = status.trim().to_lowercase();
@@ -9213,49 +9270,11 @@ fn ticket_set_status(app: AppHandle, state: State<SharedState>, project_id: Stri
     let path = member_root(state.inner(), &project_id)?.join(&rel);
     let raw = std::fs::read_to_string(&path).map_err(err)?;
     std::fs::write(&path, ken_core::day::set_frontmatter(&raw, "status", &status)).map_err(err)?;
-    let _ = app.emit("day-changed", ());
-    Ok(())
-}
-
-/// Reply to an escalation raised to me, in its file's thread; `resolve`
-/// also closes it (`status: resolved`). The team repo's sync carries it to
-/// whoever raised it.
-#[tauri::command(async)]
-fn escalation_reply(
-    app: AppHandle,
-    state: State<SharedState>,
-    project_id: String,
-    rel_path: String,
-    text: String,
-    resolve: bool,
-) -> CmdResult<()> {
-    if text.trim().is_empty() {
-        return Err("Write the reply first.".into());
+    if let Ok(id) = project_id.parse::<uuid::Uuid>() {
+        if let Some(m) = lock_tolerant(&state).members.get(&id) {
+            m.sync.wrote(vec![rel.clone()]);
+        }
     }
-    let rel = rel_path.replace('\\', "/");
-    if !rel.starts_with("escalations/") || rel.split('/').any(|p| p == "..") || !rel.ends_with(".md") {
-        return Err(format!("{rel_path} is not an escalation"));
-    }
-    let id: uuid::Uuid = project_id.parse().map_err(err)?;
-    let root = {
-        let guard = lock_tolerant(&state);
-        guard
-            .workspace
-            .as_ref()
-            .and_then(|w| {
-                w.ws.members.iter().find_map(|m| match &m.status {
-                    ken_core::workspace::MemberStatus::Ok(p) if p.config.id == id => Some(p.root.clone()),
-                    _ => None,
-                })
-            })
-            .ok_or("that repo is not open")?
-    };
-    let path = root.join(&rel);
-    let raw = std::fs::read_to_string(&path).map_err(err)?;
-    let me = cached_git_me();
-    let who = me.name.clone().or(me.email.clone()).unwrap_or_else(|| "me".into());
-    let next = ken_core::day::escalation_reply(&raw, &who, &local_date_today(), &text, resolve);
-    std::fs::write(&path, next).map_err(err)?;
     let _ = app.emit("day-changed", ());
     Ok(())
 }
@@ -9263,7 +9282,7 @@ fn escalation_reply(
 /// Add a task to the workspace home (`updated_by: you`).
 #[tauri::command(async)]
 fn day_task_create(app: AppHandle, state: State<SharedState>, input: ken_core::day::DayTaskInput) -> CmdResult<DayTaskDto> {
-    let (ws, _, _) = day_snapshot(state.inner(), None)?;
+    let (ws, _, _) = day_snapshot(state.inner())?;
     let (today, now) = (local_date_today(), local_stamp_now());
     let stamp = ken_core::day::Stamp { today: &today, now: &now, by: ken_core::day::BY_YOU };
     // The id, and so the path, is known before the write: the watcher is
@@ -9284,7 +9303,7 @@ fn day_task_update(
     id: String,
     patch: ken_core::day::DayTaskPatch,
 ) -> CmdResult<DayTaskDto> {
-    let (ws, _, _) = day_snapshot(state.inner(), None)?;
+    let (ws, _, _) = day_snapshot(state.inner())?;
     let (today, now) = (local_date_today(), local_stamp_now());
     let task = find_day_task(&ws, &id, &today)?;
     let stamp = ken_core::day::Stamp { today: &today, now: &now, by: ken_core::day::BY_YOU };
@@ -9298,7 +9317,7 @@ fn day_task_update(
 /// Delete a task: the file moves to its home's `archive/YYYY-MM/`.
 #[tauri::command(async)]
 fn day_task_delete(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
-    let (ws, _, _) = day_snapshot(state.inner(), None)?;
+    let (ws, _, _) = day_snapshot(state.inner())?;
     let today = local_date_today();
     let task = find_day_task(&ws, &id, &today)?;
     with_task_writes(&app, state.inner(), &[task.path.clone()], || {
@@ -9311,8 +9330,8 @@ fn day_task_delete(app: AppHandle, state: State<SharedState>, id: String) -> Cmd
 /// those linked by the bare `<ID>` (older links, any repo).
 #[tauri::command(async)]
 fn ticket_tasks(state: State<SharedState>, project_id: String, ticket_id: String) -> CmdResult<Vec<DayTaskDto>> {
-    let (ws, _, _) = day_snapshot(state.inner(), None)?;
-    let repo = team_repos(&ws, None)
+    let (ws, _, _) = day_snapshot(state.inner())?;
+    let repo = ws_repos(&ws)
         .into_iter()
         .find(|r| r.id.to_string().eq_ignore_ascii_case(project_id.trim()))
         .map(|r| r.name);
@@ -9327,93 +9346,80 @@ fn ticket_tasks(state: State<SharedState>, project_id: String, ticket_id: String
     Ok(ken_core::day::query(&all, &q).into_iter().map(|t| day_task_dto(&ws.root, t)).collect())
 }
 
-// ---------- the team digest ----------
+// ---------- the digest ----------
 
 #[derive(Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TeamDigestDto {
+struct DigestDto {
     generated_at: i64,
     body: String,
     sources: Vec<String>,
 }
 
-/// What is stored per team: the DTO plus the local day it was written for.
+/// What is stored: the DTO plus the local day it was written for.
 #[derive(Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct StoredTeamDigest {
+struct StoredDigest {
     date: String,
     #[serde(flatten)]
-    digest: TeamDigestDto,
+    digest: DigestDto,
 }
 
-/// `<app data>/team-digests/<workspace id>/<team>.json` (`_all` for the
-/// whole workspace). App data, not the workspace folder: the digest is
-/// this machine's reading of the day, not something to commit.
-fn team_digest_path(base_dir: &Path, workspace_id: uuid::Uuid, team: Option<&str>) -> PathBuf {
-    let key = match team.filter(|t| !t.is_empty()) {
-        Some(t) => {
-            let slug: String = t
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
-                .collect();
-            format!("team-{slug}-{:08x}", content_hash(t.as_bytes()) as u32)
-        }
-        None => "_all".to_string(),
-    };
-    base_dir.join("team-digests").join(workspace_id.to_string()).join(format!("{key}.json"))
+/// `<app data>/team-digests/<workspace id>/_all.json`: the folder keeps its
+/// older name so a digest written before decision 35 is still found. App
+/// data, not the workspace folder: the digest is this machine's reading of
+/// the day, not something to commit.
+fn digest_path(base_dir: &Path, workspace_id: uuid::Uuid) -> PathBuf {
+    base_dir.join("team-digests").join(workspace_id.to_string()).join("_all.json")
 }
 
-fn load_team_digest(base_dir: &Path, workspace_id: uuid::Uuid, team: Option<&str>) -> Option<StoredTeamDigest> {
-    let text = std::fs::read_to_string(team_digest_path(base_dir, workspace_id, team)).ok()?;
+fn load_digest(base_dir: &Path, workspace_id: uuid::Uuid) -> Option<StoredDigest> {
+    let text = std::fs::read_to_string(digest_path(base_dir, workspace_id)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-fn save_team_digest(base_dir: &Path, workspace_id: uuid::Uuid, team: Option<&str>, stored: &StoredTeamDigest) -> CmdResult<()> {
-    let path = team_digest_path(base_dir, workspace_id, team);
+fn save_digest(base_dir: &Path, workspace_id: uuid::Uuid, stored: &StoredDigest) -> CmdResult<()> {
+    let path = digest_path(base_dir, workspace_id);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(err)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(stored).map_err(err)?).map_err(err)
 }
 
-/// The team's newest digest, whatever day it was written.
+/// The workspace's newest digest, whatever day it was written.
 #[tauri::command(async)]
-fn team_digest(state: State<SharedState>, team: Option<String>) -> CmdResult<Option<TeamDigestDto>> {
-    let (ws, base_dir, _) = day_snapshot(state.inner(), team.as_deref())?;
-    Ok(load_team_digest(&base_dir, ws.config.id, team.as_deref()).map(|s| s.digest))
+fn day_digest(state: State<SharedState>) -> CmdResult<Option<DigestDto>> {
+    let (ws, base_dir, _) = day_snapshot(state.inner())?;
+    Ok(load_digest(&base_dir, ws.config.id).map(|s| s.digest))
 }
 
-/// Write the team digest now ("Write it now").
+/// Write the digest now ("Write it now").
 #[tauri::command(async)]
-fn refresh_team_digest(app: AppHandle, state: State<SharedState>, team: Option<String>) -> CmdResult<()> {
-    day_snapshot(state.inner(), team.as_deref())?;
-    generate_team_digests(&app, state.inner(), vec![team], true)
+fn refresh_day_digest(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
+    day_snapshot(state.inner())?;
+    generate_digest(&app, state.inner(), true)
 }
 
-/// Whether `team`'s digest is being written, or waits its turn: Your day
-/// shows "Writing…" for one it did not start itself.
+/// Whether the digest is being written: Your day shows "Writing…" for one
+/// it did not start itself.
 #[tauri::command(async)]
-fn team_digest_writing(state: State<SharedState>, team: Option<String>) -> CmdResult<bool> {
+fn day_digest_writing(state: State<SharedState>) -> CmdResult<bool> {
     let ws = lock_tolerant(&state).workspace.as_ref().map(|w| w.ws.config.id);
-    Ok(ws.is_some_and(|id| digest_writing(id, &team)))
+    Ok(ws.is_some_and(digest_writing))
 }
 
 /// The morning schedule's memory, per workspace, in app data
-/// (`team-digests/<workspace id>/schedule.json`): the team Your day last
-/// asked about (so a fresh launch writes that team's digest, not every
-/// group's), and each team's last attempt (so a failure is not retried on
-/// every window focus).
+/// (`team-digests/<workspace id>/schedule.json`): the last attempt, so a
+/// failure is not retried on every window focus.
 #[derive(Serialize, serde::Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase", default)]
-struct TeamDigestSchedule {
-    last_team: Option<String>,
-    /// Keyed by team name; `""` is the whole workspace.
-    attempts: std::collections::HashMap<String, TeamDigestAttempt>,
+struct DigestSchedule {
+    last: Option<DigestAttempt>,
 }
 
 #[derive(Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TeamDigestAttempt {
+struct DigestAttempt {
     /// Epoch seconds.
     at: i64,
     /// The local day it was for.
@@ -9422,17 +9428,13 @@ struct TeamDigestAttempt {
 }
 
 /// After a failed attempt, the schedule waits this long before trying again.
-const TEAM_DIGEST_RETRY_AFTER_SECS: i64 = 30 * 60;
-
-fn digest_schedule_key(team: Option<&str>) -> String {
-    team.map(str::trim).unwrap_or("").to_string()
-}
+const DIGEST_RETRY_AFTER_SECS: i64 = 30 * 60;
 
 fn digest_schedule_path(base_dir: &Path, workspace_id: uuid::Uuid) -> PathBuf {
     base_dir.join("team-digests").join(workspace_id.to_string()).join("schedule.json")
 }
 
-fn load_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid) -> TeamDigestSchedule {
+fn load_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid) -> DigestSchedule {
     std::fs::read_to_string(digest_schedule_path(base_dir, workspace_id))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -9441,7 +9443,7 @@ fn load_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid) -> TeamDigest
 
 /// Read, change and write the schedule (best effort: a failed write only
 /// means the schedule forgets). One writer at a time.
-fn update_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid, change: impl FnOnce(&mut TeamDigestSchedule)) {
+fn update_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid, change: impl FnOnce(&mut DigestSchedule)) {
     static WRITE: Mutex<()> = Mutex::new(());
     let _one = lock_tolerant(&WRITE);
     let mut s = load_digest_schedule(base_dir, workspace_id);
@@ -9455,69 +9457,53 @@ fn update_digest_schedule(base_dir: &Path, workspace_id: uuid::Uuid, change: imp
     }
 }
 
-/// Should the schedule try `team` now? Not when today's digest is stored,
-/// not when an attempt already succeeded today, and not within
-/// `TEAM_DIGEST_RETRY_AFTER_SECS` of a failed one.
-fn digest_due(schedule: &TeamDigestSchedule, team: Option<&str>, stored_today: bool, today: &str, now: i64) -> bool {
+/// Should the schedule try now? Not when today's digest is stored, not when
+/// an attempt already succeeded today, and not within
+/// `DIGEST_RETRY_AFTER_SECS` of a failed one.
+fn digest_due(schedule: &DigestSchedule, stored_today: bool, today: &str, now: i64) -> bool {
     if stored_today {
         return false;
     }
-    match schedule.attempts.get(&digest_schedule_key(team)) {
+    match &schedule.last {
         Some(a) if a.ok => a.date != today,
-        Some(a) => now - a.at >= TEAM_DIGEST_RETRY_AFTER_SECS,
+        Some(a) => now - a.at >= DIGEST_RETRY_AFTER_SECS,
         None => true,
     }
 }
 
 /// The morning schedule (workspace open, window focus): past 07:00, write
-/// today's digest for the last team asked about (remembered across
-/// launches), else the first team, else the whole workspace when it has no
-/// teams. One team per run; see `digest_due` for when it is skipped.
-fn maybe_generate_team_digest(app: &AppHandle, state: &SharedState) {
+/// today's digest for the workspace; see `digest_due` for when it is
+/// skipped.
+fn maybe_generate_digest(app: &AppHandle, state: &SharedState) {
     if local_hour() < 7 {
         return;
     }
-    let (last_team, first_team, ws_id, base_dir) = {
+    let (ws_id, base_dir) = {
         let guard = lock_tolerant(state);
         let Some(ws) = guard.workspace.as_ref() else { return };
-        let first = ws.ws.config.effective_groups().into_iter().next().map(|g| g.name);
-        (guard.last_team.clone(), first, ws.ws.config.id, guard.base_dir.clone())
+        (ws.ws.config.id, guard.base_dir.clone())
     };
     let schedule = load_digest_schedule(&base_dir, ws_id);
-    let team = match last_team {
-        Some(t) => Some(t),
-        None => {
-            let remembered = schedule.last_team.clone().filter(|t| !t.trim().is_empty());
-            if let Some(t) = &remembered {
-                let mut guard = lock_tolerant(state);
-                if guard.last_team.is_none() {
-                    guard.last_team = Some(t.clone());
-                }
-            }
-            remembered.or(first_team)
-        }
-    };
     let today = local_date_today();
-    let stored_today = load_team_digest(&base_dir, ws_id, team.as_deref()).is_some_and(|s| s.date == today);
-    if digest_due(&schedule, team.as_deref(), stored_today, &today, engine::now_epoch()) {
-        let _ = generate_team_digests(app, state, vec![team], false);
+    let stored_today = load_digest(&base_dir, ws_id).is_some_and(|s| s.date == today);
+    if digest_due(&schedule, stored_today, &today, engine::now_epoch()) {
+        let _ = generate_digest(app, state, false);
     }
 }
 
-/// One team's digest inputs, read off the lock: each repo's last day
-/// (resident repos through their read connection, dormant ones through a
-/// read-only open of their index), and my day's tickets and tasks.
-struct TeamDigestJob {
-    team: Option<String>,
+/// The digest's inputs, read off the lock: each repo's last day (resident
+/// repos through their read connection, dormant ones through a read-only
+/// open of their index), and my day's tickets and tasks.
+struct DigestJob {
     repos: Vec<(String, ken_core::digest::DigestSources)>,
     /// The repos' folders, for Claude to read.
     roots: Vec<PathBuf>,
     mine: Vec<String>,
 }
 
-fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamDigestJob> {
-    let (ws, base_dir, _) = day_snapshot(state, None)?;
-    let repos = team_repos(&ws, team.as_deref());
+fn digest_job(state: &SharedState) -> CmdResult<DigestJob> {
+    let (ws, base_dir, _) = day_snapshot(state)?;
+    let repos = ws_repos(&ws);
     let live: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = {
         let guard = lock_tolerant(state);
         repos
@@ -9528,13 +9514,7 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
     let since = engine::now_epoch() - 86_400;
     let mut out = Vec::new();
     for r in &repos {
-        let sources = match live.get(&r.id) {
-            Some(db) => ken_core::digest::gather(&lock_tolerant(db), since).ok(),
-            None if db_path(&base_dir, r.id).exists() => {
-                Db::open_read_only(&base_dir, r.id).ok().and_then(|db| ken_core::digest::gather(&db, since).ok())
-            }
-            None => None,
-        };
+        let sources = with_index(&live, &base_dir, r.id, |db| ken_core::digest::gather(db, since).ok()).flatten();
         out.push((r.name.clone(), sources.unwrap_or_default()));
     }
 
@@ -9565,39 +9545,38 @@ fn team_digest_job(state: &SharedState, team: Option<String>) -> CmdResult<TeamD
         ));
     }
     let roots = repos.iter().map(|r| r.root.clone()).collect();
-    Ok(TeamDigestJob { team, repos: out, roots, mine })
+    Ok(DigestJob { repos: out, roots, mine })
 }
 
-/// Write the digest for each team, one after another, on one background
-/// thread: Claude Code runs from the folder that holds the repos so it can
-/// read across them. A quiet day stores the quiet line without calling it.
-/// Emits `team-digest-generating`, then `team-digest-updated` (the digest)
-/// or `team-digest-error` (a string) per team.
-/// The teams whose digest is being written or waits its turn, by
-/// workspace. The writer takes them in order; asking while it runs adds to
-/// the queue, and Your day reads it to show "Writing…" for its team.
-fn digest_queue() -> &'static Mutex<std::collections::HashMap<uuid::Uuid, std::collections::VecDeque<Option<String>>>> {
-    static Q: OnceLock<Mutex<std::collections::HashMap<uuid::Uuid, std::collections::VecDeque<Option<String>>>>> = OnceLock::new();
-    Q.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+/// The workspaces whose digest is being written or waits its turn. The
+/// writer takes them in order; asking while it runs adds to the queue, and
+/// Your day reads it to show "Writing…".
+fn digest_queue() -> &'static Mutex<std::collections::VecDeque<uuid::Uuid>> {
+    static Q: OnceLock<Mutex<std::collections::VecDeque<uuid::Uuid>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
 }
 
-/// Is `team`'s digest being written, or waiting to be, in workspace `ws`?
-fn digest_writing(ws: uuid::Uuid, team: &Option<String>) -> bool {
-    lock_tolerant(digest_queue()).get(&ws).is_some_and(|q| q.contains(team))
+/// Is workspace `ws`'s digest being written, or waiting to be?
+fn digest_writing(ws: uuid::Uuid) -> bool {
+    lock_tolerant(digest_queue()).contains(&ws)
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TeamDigestEvent {
-    team: Option<String>,
+struct DigestEvent {
     message: Option<String>,
 }
 
-fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option<String>>, force: bool) -> CmdResult<()> {
-    let (running, ws_root, ws_id, base_dir) = {
+/// Write the open workspace's digest on one background thread: Claude Code
+/// runs from the folder that holds the repos so it can read across them. A
+/// quiet day stores the quiet line without calling it. Emits
+/// `day-digest-generating`, then `day-digest-updated` (the digest) or
+/// `day-digest-error` (a string).
+fn generate_digest(app: &AppHandle, state: &SharedState, force: bool) -> CmdResult<()> {
+    let (running, ws_root, ws_id, ws_name, base_dir) = {
         let guard = lock_tolerant(state);
         let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-        (guard.team_digest_running.clone(), ws.ws.root.clone(), ws.ws.config.id, guard.base_dir.clone())
+        (guard.digest_running.clone(), ws.ws.root.clone(), ws.ws.config.id, ws.ws.config.name.clone(), guard.base_dir.clone())
     };
     let binary = ken_core::runner::discover_claude();
     if binary.is_none() && force {
@@ -9605,16 +9584,13 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
     }
     {
         let mut q = lock_tolerant(digest_queue());
-        let queue = q.entry(ws_id).or_default();
-        for t in teams {
-            if !queue.contains(&t) {
-                queue.push_back(t.clone());
-                let _ = app.emit("team-digest-generating", TeamDigestEvent { team: t, message: None });
-            }
+        if !q.contains(&ws_id) {
+            q.push_back(ws_id);
+            let _ = app.emit("day-digest-generating", DigestEvent { message: None });
         }
     }
     if running.swap(true, Ordering::SeqCst) {
-        // The writer that is running takes the new teams too.
+        // The writer that is running takes it too.
         return Ok(());
     }
     // Cleared however the thread ends: done, an early return, or a panic.
@@ -9628,21 +9604,24 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
     let thread_app = app.clone();
     let thread_state = state.clone();
     std::thread::spawn(move || {
-        let next = || lock_tolerant(digest_queue()).get(&ws_id).and_then(|q| q.front().cloned());
-        let done = |team: &Option<String>| {
-            if let Some(q) = lock_tolerant(digest_queue()).get_mut(&ws_id) {
-                if let Some(i) = q.iter().position(|t| t == team) {
-                    q.remove(i);
-                }
+        let next = || lock_tolerant(digest_queue()).front().copied();
+        let done = |ws: uuid::Uuid| {
+            let mut q = lock_tolerant(digest_queue());
+            if let Some(i) = q.iter().position(|w| *w == ws) {
+                q.remove(i);
             }
         };
         loop {
-            while let Some(team) = next() {
-                write_team_digest(&thread_app, &thread_state, &base_dir, &ws_root, ws_id, binary.as_ref(), team.clone());
-                done(&team);
+            while let Some(ws) = next() {
+                // Only the open workspace is written; another left in the
+                // queue (closed meanwhile) is dropped.
+                if ws == ws_id {
+                    write_digest(&thread_app, &thread_state, &base_dir, &ws_root, ws_id, &ws_name, binary.as_ref());
+                }
+                done(ws);
             }
             running.0.store(false, Ordering::SeqCst);
-            // A team asked for between the last look and the flag falling.
+            // Asked for between the last look and the flag falling.
             if next().is_none() || running.0.swap(true, Ordering::SeqCst) {
                 break;
             }
@@ -9651,90 +9630,79 @@ fn generate_team_digests(app: &AppHandle, state: &SharedState, teams: Vec<Option
     Ok(())
 }
 
-/// One team's digest: stored, or an error event saying why not.
-fn write_team_digest(
+/// The workspace's digest: stored, or an error event saying why not.
+fn write_digest(
     thread_app: &AppHandle,
     thread_state: &SharedState,
     base_dir: &Path,
     ws_root: &Path,
     ws_id: uuid::Uuid,
+    ws_name: &str,
     binary: Option<&PathBuf>,
-    team: Option<String>,
 ) {
     let fail = |message: String| {
-        let _ = thread_app.emit("team-digest-error", TeamDigestEvent { team: team.clone(), message: Some(message) });
+        let _ = thread_app.emit("day-digest-error", DigestEvent { message: Some(message) });
     };
-    {
-        {
-            let today = local_date_today();
-            let key = digest_schedule_key(team.as_deref());
-            // Recorded as failed until it is stored, so a failure (or a
-            // crash) backs the schedule off instead of retrying each focus.
-            let attempt = |ok: bool| {
-                let (key, date) = (key.clone(), today.clone());
-                update_digest_schedule(&base_dir, ws_id, move |s| {
-                    s.attempts.insert(key, TeamDigestAttempt { at: engine::now_epoch(), date, ok });
-                });
-            };
-            attempt(false);
-            let job = match team_digest_job(thread_state, team.clone()) {
-                Ok(j) => j,
-                Err(e) => {
-                    fail(e);
-                    return;
-                }
-            };
-            let store = |body: String, sources: Vec<String>| {
-                let stored = StoredTeamDigest {
-                    date: today.clone(),
-                    digest: TeamDigestDto { generated_at: engine::now_epoch(), body, sources },
-                };
-                match save_team_digest(base_dir, ws_id, job.team.as_deref(), &stored) {
-                    Ok(()) => {
-                        attempt(true);
-                        let _ = thread_app.emit("team-digest-updated", stored.digest);
-                    }
-                    Err(e) => fail(e),
-                }
-            };
-            if ken_core::digest::team_is_quiet(&job.repos, &job.mine) {
-                store(ken_core::digest::QUIET_TEAM_DIGEST.to_string(), Vec::new());
-                return;
-            }
-            let Some(binary) = binary else {
-                return; // the schedule without Claude Code: nothing to write with
-            };
-            let name = job.team.clone().unwrap_or_else(|| "this workspace".into());
-            let prompt = ken_core::digest::compose_team_digest_prompt(&name, &job.repos, &job.mine);
-            // From the folder that holds the repos, when they share one, so
-            // a repo's name is its folder; each repo is readable either way.
-            let cwd = shared_parent(&job.roots).unwrap_or_else(|| ws_root.to_path_buf());
-            match assistant::oneshot_in(binary, &cwd, &job.roots, &prompt, Duration::from_secs(240), &CancelToken::new()) {
-                Ok(OneshotOutcome::Completed(text)) => {
-                    let parsed = digest::parse_digest(&text);
-                    store(parsed.body, parsed.sources);
-                }
-                Ok(OneshotOutcome::TimedOut) => {
-                    fail("Writing the digest took too long and was stopped. It will try again later.".into())
-                }
-                Ok(OneshotOutcome::Failed(detail)) => fail(detail),
-                Err(e) => fail(e.to_string()),
-                Ok(OneshotOutcome::Cancelled) => {}
-            }
+    let today = local_date_today();
+    // Recorded as failed until it is stored, so a failure (or a crash) backs
+    // the schedule off instead of retrying each focus.
+    let attempt = |ok: bool| {
+        let date = today.clone();
+        update_digest_schedule(base_dir, ws_id, move |s| {
+            s.last = Some(DigestAttempt { at: engine::now_epoch(), date, ok });
+        });
+    };
+    attempt(false);
+    let job = match digest_job(thread_state) {
+        Ok(j) => j,
+        Err(e) => {
+            fail(e);
+            return;
         }
+    };
+    let store = |body: String, sources: Vec<String>| {
+        let stored = StoredDigest { date: today.clone(), digest: DigestDto { generated_at: engine::now_epoch(), body, sources } };
+        match save_digest(base_dir, ws_id, &stored) {
+            Ok(()) => {
+                attempt(true);
+                let _ = thread_app.emit("day-digest-updated", stored.digest);
+            }
+            Err(e) => fail(e),
+        }
+    };
+    if ken_core::digest::workspace_is_quiet(&job.repos, &job.mine) {
+        store(ken_core::digest::QUIET_WORKSPACE_DIGEST.to_string(), Vec::new());
+        return;
+    }
+    let Some(binary) = binary else {
+        return; // the schedule without Claude Code: nothing to write with
+    };
+    let prompt = ken_core::digest::compose_workspace_digest_prompt(ws_name, &job.repos, &job.mine);
+    // From the folder that holds the repos, when they share one, so a repo's
+    // name is its folder; each repo is readable either way.
+    let cwd = shared_parent(&job.roots).unwrap_or_else(|| ws_root.to_path_buf());
+    match assistant::oneshot_in(binary, &cwd, &job.roots, &prompt, Duration::from_secs(240), &CancelToken::new()) {
+        Ok(OneshotOutcome::Completed(text)) => {
+            let parsed = digest::parse_digest(&text);
+            store(parsed.body, parsed.sources);
+        }
+        Ok(OneshotOutcome::TimedOut) => fail("Writing the digest took too long and was stopped. It will try again later.".into()),
+        Ok(OneshotOutcome::Failed(detail)) => fail(detail),
+        Err(e) => fail(e.to_string()),
+        Ok(OneshotOutcome::Cancelled) => {}
     }
 }
 
-// ---------- index health for a team ----------
+// ---------- index health for the workspace ----------
 
 /// The one health line for Your day (knowledge-core decision 19): how many
-/// of the team's repos have an index with files in it, and their health
+/// of the workspace's repos have an index with files in it, and their health
 /// summed (`Db::index_health`: counting queries only): files indexed,
 /// failed or skipped, meaning built, controls passing, whether the
 /// embedding model is missing, files cut at the chunk cap.
 #[derive(Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-struct TeamIndexHealthDto {
+struct IndexHealthDto {
     repos_indexed: usize,
     repos: usize,
     #[serde(flatten)]
@@ -9742,9 +9710,9 @@ struct TeamIndexHealthDto {
 }
 
 #[tauri::command(async)]
-fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<TeamIndexHealthDto> {
-    let (ws, base_dir, _) = day_snapshot(state.inner(), team.as_deref())?;
-    let repos = team_repos(&ws, team.as_deref());
+fn index_health(state: State<SharedState>) -> CmdResult<IndexHealthDto> {
+    let (ws, base_dir, _) = day_snapshot(state.inner())?;
+    let repos = ws_repos(&ws);
     let live: std::collections::HashMap<uuid::Uuid, Arc<Mutex<Db>>> = {
         let guard = lock_tolerant(state.inner());
         repos
@@ -9752,7 +9720,7 @@ fn index_health(state: State<SharedState>, team: Option<String>) -> CmdResult<Te
             .filter_map(|r| guard.members.get(&r.id).map(|m| (r.id, m.search_db.clone())))
             .collect()
     };
-    let mut out = TeamIndexHealthDto { repos: repos.len(), ..Default::default() };
+    let mut out = IndexHealthDto { repos: repos.len(), ..Default::default() };
     for r in &repos {
         let health = match live.get(&r.id) {
             // The index lock is held for the counting queries only.
@@ -9820,16 +9788,15 @@ struct TaskWriteNote {
 /// that died mid-write).
 const TASK_WRITE_NOTE_TTL: Duration = Duration::from_secs(30);
 
-/// The folders Your day reads: the workspace home, each member's ticket
-/// files (`tickets/` and one folder deeper) and escalations. Only paths are
-/// taken under the lock; the folder listing happens after. `None` when no
-/// workspace is open.
+/// The folders Your day reads: the workspace home and each member's ticket
+/// files (`tickets/` and one folder deeper). Only paths are taken under the
+/// lock; the folder listing happens after. `None` when no workspace is open.
 fn day_watch_dirs(state: &SharedState) -> Option<Vec<PathBuf>> {
     let (mut dirs, repo_roots) = {
         let guard = lock_tolerant(state);
         let w = guard.workspace.as_ref()?;
         let dirs = vec![tasks::workspace_tasks_dir(&w.ws.root)];
-        let roots: Vec<PathBuf> = team_repos(&w.ws, None).into_iter().map(|r| r.root).collect();
+        let roots: Vec<PathBuf> = ws_repos(&w.ws).into_iter().map(|r| r.root).collect();
         (dirs, roots)
     };
     for root in repo_roots {
@@ -9842,7 +9809,6 @@ fn day_watch_dirs(state: &SharedState) -> Option<Vec<PathBuf>> {
             }
         }
         dirs.push(tickets);
-        dirs.push(root.join(ken_core::day::ESCALATIONS_DIR));
     }
     Some(dirs)
 }
@@ -10492,7 +10458,7 @@ enum SummaryTick {
 
 /// Summarize one batch of this project's knowledge-base chunks with Claude
 /// (`summary`, knowledge-core decision 16). Only for a knowledge-base repo
-/// (kind team or wiki), each call a turn of the one background throttle
+/// (kind wiki), each call a turn of the one background throttle
 /// (decision 34). Claude reads the prompt and answers, with no tools. The
 /// local model never writes them.
 fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
@@ -10504,7 +10470,7 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
         (guard.base_dir.clone(), active.project.root.clone(), active.project.config.name.clone())
     };
     let (kinds, _) = ken_core::registry::index_of(&root);
-    if !kinds.iter().any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki)) {
+    if !kinds.contains(&ken_core::registry::RepoKind::Wiki) {
         return SummaryTick::Idle;
     }
     let Ok(mut db) = Db::open(&base, project_id) else {
@@ -11872,8 +11838,7 @@ pub fn run() {
         memory_distill_running: Arc::new(AtomicBool::new(false)),
         memory_distill_candidates: Arc::new(Mutex::new(Vec::new())),
         task_recent_writes: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        last_team: None,
-        team_digest_running: Arc::new(AtomicBool::new(false)),
+        digest_running: Arc::new(AtomicBool::new(false)),
     }));
 
     tauri::Builder::default()
@@ -11954,7 +11919,7 @@ pub fn run() {
                 for sync in syncs {
                     sync.pull_now();
                 }
-                maybe_generate_team_digest(window.app_handle(), state.inner());
+                maybe_generate_digest(window.app_handle(), state.inner());
             }
             _ => {}
         })
@@ -12045,7 +12010,7 @@ pub fn run() {
             set_project_description,
             ingest_status,
             ingest_overview,
-            team_wiki,
+            knowledge_base_id,
             embedding_state,
             gpu_info,
             set_use_gpu,
@@ -12057,9 +12022,13 @@ pub fn run() {
             ingest_retry,
             ingest_remove,
             files_banner,
-            team_overview,
-            team_save_ignores,
-            team_add_template_files,
+            workspace_settings,
+            knowledge_findings,
+            workspace_save_ignores,
+            workspace_save_weights,
+            workspace_save_roles,
+            workspace_save_controls,
+            workspace_add_template_files,
             build_start,
             build_stop,
             build_set_at_once,
@@ -12068,7 +12037,7 @@ pub fn run() {
             setup_overlay_wiki,
             wiki_map_plan,
             wiki_map_apply,
-            team_add_rule,
+            workspace_add_rule,
             ingest_now,
             ingest_seen,
             setup_create_wiki,
@@ -12124,11 +12093,10 @@ pub fn run() {
             day_task_update,
             day_task_delete,
             ticket_tasks,
-            team_digest,
-            refresh_team_digest,
-            team_digest_writing,
+            day_digest,
+            refresh_day_digest,
+            day_digest_writing,
             resolve_page_link,
-            escalation_reply,
             ticket_set_status,
             workspace_groups,
             workspace_set_group,
@@ -12339,39 +12307,38 @@ mod ken_mcp_refresh_tests {
 mod your_day_tests {
     use super::*;
 
-    fn attempt(at: i64, date: &str, ok: bool) -> TeamDigestAttempt {
-        TeamDigestAttempt { at, date: date.into(), ok }
+    fn attempt(at: i64, date: &str, ok: bool) -> DigestAttempt {
+        DigestAttempt { at, date: date.into(), ok }
     }
 
     #[test]
     fn the_schedule_backs_off_after_a_failure_and_runs_once_a_day_after_success() {
-        let mut s = TeamDigestSchedule::default();
+        let mut s = DigestSchedule::default();
         let today = "2026-10-01";
-        assert!(digest_due(&s, Some("Ops"), false, today, 10_000), "never tried");
-        assert!(!digest_due(&s, Some("Ops"), true, today, 10_000), "stored today");
+        assert!(digest_due(&s, false, today, 10_000), "never tried");
+        assert!(!digest_due(&s, true, today, 10_000), "stored today");
 
-        s.attempts.insert("Ops".into(), attempt(10_000, today, false));
-        assert!(!digest_due(&s, Some("Ops"), false, today, 10_000 + 60), "a minute after a failure");
-        assert!(digest_due(&s, Some("Ops"), false, today, 10_000 + TEAM_DIGEST_RETRY_AFTER_SECS), "30 minutes on");
+        s.last = Some(attempt(10_000, today, false));
+        assert!(!digest_due(&s, false, today, 10_000 + 60), "a minute after a failure");
+        assert!(digest_due(&s, false, today, 10_000 + DIGEST_RETRY_AFTER_SECS), "30 minutes on");
 
-        s.attempts.insert("Ops".into(), attempt(10_000, today, true));
-        assert!(!digest_due(&s, Some("Ops"), false, today, 90_000), "succeeded today");
-        assert!(digest_due(&s, Some("Ops"), false, "2026-10-02", 90_000), "a new day");
-        assert!(digest_due(&s, None, false, today, 10_000), "the whole workspace is its own key");
+        s.last = Some(attempt(10_000, today, true));
+        assert!(!digest_due(&s, false, today, 90_000), "succeeded today");
+        assert!(digest_due(&s, false, "2026-10-02", 90_000), "a new day");
     }
 
     #[test]
     fn the_schedule_file_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let ws = uuid::Uuid::new_v4();
-        assert!(load_digest_schedule(dir.path(), ws).last_team.is_none());
-        update_digest_schedule(dir.path(), ws, |s| s.last_team = Some("Ops".into()));
-        update_digest_schedule(dir.path(), ws, |s| {
-            s.attempts.insert(digest_schedule_key(None), attempt(5, "2026-10-01", true));
-        });
+        assert!(load_digest_schedule(dir.path(), ws).last.is_none());
+        update_digest_schedule(dir.path(), ws, |s| s.last = Some(attempt(5, "2026-10-01", true)));
         let s = load_digest_schedule(dir.path(), ws);
-        assert_eq!(s.last_team.as_deref(), Some("Ops"));
-        assert!(s.attempts[""].ok);
+        assert!(s.last.is_some_and(|a| a.ok && a.date == "2026-10-01"));
+        // An older schedule (per team, with the last team) reads as never
+        // tried, so the workspace's digest is written once more.
+        std::fs::write(digest_schedule_path(dir.path(), ws), r#"{"lastTeam":"Ops","attempts":{"":{"at":5,"date":"2026-10-01","ok":true}}}"#).unwrap();
+        assert!(load_digest_schedule(dir.path(), ws).last.is_none());
     }
 
     #[test]
@@ -12446,35 +12413,72 @@ mod ingest_record_tests {
         assert!(!from.exists() && to.is_file());
     }
 
+    /// Your day reads my open tickets from every repo of the workspace; an
+    /// `escalations/` folder (cut with decision 14) is not read at all.
     #[test]
-    fn your_day_lists_open_escalations_for_me_from_every_team_repo() {
+    fn your_day_lists_my_tickets_from_every_repo_and_no_escalations() {
         let d = tempfile::tempdir().unwrap();
-        let team = d.path().join("Team");
         let wiki = d.path().join("Wiki");
+        let game = d.path().join("Game");
         for (root, file, text) in [
-            (&team, "E-001.md", "---\nid: E-001\nto: chris\nstatus: open\nraised: 2026-09-20\n---\n\n# Which save format?\n"),
-            (&team, "E-002.md", "---\nid: E-002\nto: Kate\nstatus: open\n---\n\n# Not mine\n"),
-            (&wiki, "E-003.md", "---\nid: E-003\nto: Chris Staud\nstatus: open\nraised: 2026-09-01\nblocks: SR-4\n---\n\n# Older one\n"),
-            (&wiki, "E-004.md", "---\nid: E-004\nto: Chris Staud\nstatus: answered\n---\n\n# Done\n"),
+            (&wiki, "tickets/SR-001.md", "---\nid: SR-001\nstatus: todo\nassignee: Chris Staud\n---\n# Save the world\n"),
+            (&wiki, "tickets/SR-002.md", "---\nid: SR-002\nstatus: done\nassignee: Chris Staud\n---\n# Done\n"),
+            (&game, "tickets/G-1.md", "---\nid: G-1\nstatus: in-progress\nassignee: chris\n---\n# Load it\n"),
+            (&game, "tickets/G-2.md", "---\nid: G-2\nstatus: todo\nassignee: Kate\n---\n# Not mine\n"),
+            (&wiki, "escalations/E-001.md", "---\nid: E-001\nto: Chris Staud\nstatus: open\n---\n# Which save format?\n"),
         ] {
-            std::fs::create_dir_all(root.join("escalations")).unwrap();
-            std::fs::write(root.join("escalations").join(file), text).unwrap();
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
         }
         let repos = vec![
-            TeamRepo { id: uuid::Uuid::new_v4(), name: "Team".into(), root: team },
-            TeamRepo { id: uuid::Uuid::new_v4(), name: "Wiki".into(), root: wiki },
+            WsRepo { id: uuid::Uuid::new_v4(), name: "Wiki".into(), root: wiki },
+            WsRepo { id: uuid::Uuid::new_v4(), name: "Game".into(), root: game },
         ];
-        let me = ken_core::day::Me { name: Some("Chris Staud".into()), email: None };
-        let found = my_escalations(&repos, &me);
-        assert_eq!(found.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["E-003", "E-001"], "oldest raised first");
-        assert_eq!(found[0].repo, "Wiki");
-        assert_eq!(found[0].rel_path, "escalations/E-003.md");
-        assert_eq!(found[0].blocks.as_deref(), Some("SR-4"));
-        assert!(my_escalations(&repos, &ken_core::day::Me::default()).is_empty(), "no identity, no list");
+        let me = ken_core::day::Me { name: Some("Chris Staud".into()), email: Some("chris@example.com".into()) };
+        let (tickets, has_tickets) = my_tickets(&repos, &me, &[]);
+        assert!(has_tickets);
+        let mut ids: Vec<&str> = tickets.iter().map(|t| t.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["G-1", "SR-001"], "open and mine, from both repos");
+        assert!(my_tickets(&repos, &ken_core::day::Me::default(), &[]).0.is_empty(), "no identity, no list");
+        let json = serde_json::to_value(DayStateDto {
+            tickets,
+            tasks: Vec::new(),
+            me: DayMeDto { name: None, email: None },
+            has_tickets,
+        })
+        .unwrap();
+        assert!(json.get("escalations").is_none(), "{json}");
+    }
+
+    /// The settings screen pairs each control with its source's last run:
+    /// by the source the control names, else the knowledge base.
+    #[test]
+    fn controls_carry_their_last_result() {
+        use ken_core::controls::{Control, ControlResult};
+        let c = |q: &str, e: &str, s: Option<&str>| Control { question: q.into(), expect: e.into(), source: s.map(str::to_string) };
+        let r = |q: &str, e: &str, rank: Option<usize>| ControlResult { question: q.into(), expect: e.into(), rank, passed: rank.is_some() };
+        let sources = vec![
+            ("Wiki".to_string(), vec![r("where do rules live", "Rules/Index.md", Some(2))]),
+            ("Game".to_string(), vec![r("how are worlds saved", "src/Save.java", None)]),
+        ];
+        let rows = control_rows(
+            vec![
+                c("where do rules live", "Rules/Index.md", None),
+                c("how are worlds saved", "src/Save.java", Some("game")),
+                c("what is new", "Current/Project.md", Some("Tools")),
+            ],
+            &sources,
+            Some("Wiki"),
+        );
+        assert!(rows[0].ran && rows[0].passed && rows[0].rank == Some(2), "no source: the knowledge base's run");
+        assert!(rows[1].ran && !rows[1].passed && rows[1].rank.is_none(), "a source by name, any case");
+        assert!(!rows[2].ran && !rows[2].passed, "a source that has not run it");
     }
 
     #[test]
-    fn the_team_screen_reads_the_findings_list() {
+    fn the_settings_screen_reads_the_findings_list() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
         std::fs::create_dir_all(root.join("Current")).unwrap();
@@ -12485,7 +12489,7 @@ mod ingest_record_tests {
         let data = tempfile::tempdir().unwrap();
         let mut db = Db::open_at(&data.path().join("w.db")).unwrap();
         scan::scan(&project, &mut db).unwrap();
-        let found = team_findings("w1", &db);
+        let found = kb_findings("w1", &db);
         assert!(found.iter().any(|f| f.kind == "missing-page" && f.path == "Current/Team.md" && f.project_id == "w1"), "{:?}", found.iter().map(|f| &f.title).collect::<Vec<_>>());
     }
 }

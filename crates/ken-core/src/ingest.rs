@@ -1690,7 +1690,7 @@ pub fn decisions_entry(log: &str, e: &crate::proposal::RulingEntry) -> String {
     let crlf = log.contains("\r\n");
     let mut out = log.replace("\r\n", "\n").trim_end().to_string();
     out.push_str(&format!("\n\n## D-{next:03} · {} · {topic}\n\n**{ruling}.**\n", e.date));
-    let who = e.decider.as_deref().map(str::trim).filter(|w| !w.is_empty());
+    let who = e.who.as_deref().map(str::trim).filter(|w| !w.is_empty());
     match (e.quote.trim(), who) {
         ("", None) => {}
         ("", Some(w)) => out.push_str(&format!("\n> Made by {w}.\n")),
@@ -2175,7 +2175,7 @@ pub fn follow_ups(
         for d in &drafts {
             let entry = RulingEntry {
                 ruling: d.ruling.trim().to_string(),
-                decider: Some(d.who.trim().to_string()).filter(|w| !w.is_empty()),
+                who: Some(d.who.trim().to_string()).filter(|w| !w.is_empty()),
                 date: date.to_string(),
                 note: stem.clone(),
                 topic: d.topic.trim().to_string(),
@@ -2188,7 +2188,7 @@ pub fn follow_ups(
             // as it is then, so rulings from one note go in in any order.
             let proposed = decisions_entry(&text, &entry);
             let title = format!("Ruling: {}", entry.ruling.chars().take(60).collect::<String>());
-            let who = entry.decider.as_deref().map(|w| format!(", made by {w}")).unwrap_or_default();
+            let who = entry.who.as_deref().map(|w| format!(", made by {w}")).unwrap_or_default();
             let body = format!(
                 "Said in {stem}{who}: \"{}\". Add it to the decisions log in one click; it takes the next number then. \
                  Or discard it.",
@@ -2595,7 +2595,7 @@ mod tests {
     fn a_ruling_is_written_in_the_one_entry_format_and_read_back() {
         let entry = crate::proposal::RulingEntry {
             ruling: "We ship region saves before combat".into(),
-            decider: Some("Ana".into()),
+            who: Some("Ana".into()),
             date: "2026-09-24".into(),
             note: "2026-09-24-standup".into(),
             topic: "region saves".into(),
@@ -2864,7 +2864,7 @@ mod tests {
         let ruling = waits.iter().find(|p| p.append.is_some()).unwrap();
         assert_eq!(ruling.page, DECISIONS_LOG);
         let entry = ruling.append.as_ref().unwrap();
-        assert_eq!((entry.topic.as_str(), entry.why.as_str(), entry.decider.as_deref()), ("region saves", "combat needs them", Some("Ana")));
+        assert_eq!((entry.topic.as_str(), entry.why.as_str(), entry.who.as_deref()), ("region saves", "combat needs them", Some("Ana")));
         crate::proposal::apply(&r.root, ruling).unwrap();
         let log = fs::read_to_string(r.root.join(DECISIONS_LOG)).unwrap();
         assert!(log.contains("## D-002 · 2026-09-24 · region saves\n\n**We ship region saves before combat.**"), "one click, no decider check: {log}");

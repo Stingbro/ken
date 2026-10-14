@@ -12,23 +12,26 @@ use crate::project::Project;
 use crate::workspace::Workspace;
 use crate::{Error, Result};
 
-/// What a repo is for, which decides what Ken does there: team and wiki
-/// repos sync and are where Ken writes; code and reference repos Ken never
-/// commits into. Every kind is indexed the same way (decision 34). A repo
-/// can be more than one kind (a wiki that also carries code).
+/// What a repo is for, which decides what Ken does there: the wiki is the
+/// knowledge base, where Ken writes and commits its own changes; code and
+/// reference repos Ken never commits into (knowledge-core decision 36).
+/// Every kind is indexed the same way (decision 34). A repo can be more than
+/// one kind (a wiki that also carries code). There is no team repo any more
+/// (decision 35): an older registry's `team` reads as the wiki.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RepoKind {
-    Team,
+    #[serde(alias = "team")]
     Wiki,
     Code,
     Reference,
 }
 
 impl RepoKind {
-    /// Kinds whose repos Ken keeps in step with the team by default.
+    /// Whether a repo of this kind is a knowledge base, the only kind Ken
+    /// commits in and keeps in step with its remote.
     pub fn syncs(self) -> bool {
-        matches!(self, RepoKind::Team | RepoKind::Wiki)
+        matches!(self, RepoKind::Wiki)
     }
 }
 
@@ -42,9 +45,6 @@ pub struct RegistryEntry {
     /// in the repo, so a code repo gets no file from Ken.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kind: Vec<RepoKind>,
-    /// The team this repo belongs to, by name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team: Option<String>,
     /// `Some(Off)` when a person switched the whole repo off; None means it
     /// is indexed. An older registry's `search` or `entities` reads as
     /// indexed.
@@ -202,10 +202,10 @@ pub fn kind_of(root: &Path) -> Vec<RepoKind> {
         .unwrap_or_default()
 }
 
-/// Whether the repo at `root` is a team's library: said to be a team or wiki
-/// repo, or holding the inbox (`Research/Ingestion/Raw/`) whatever its kind.
+/// Whether the repo at `root` is a knowledge base: said to be a wiki, or
+/// holding the inbox (`Research/Ingestion/Raw/`) whatever its kind.
 pub fn is_library(root: &Path) -> bool {
-    crate::ingest::has_inbox(root) || kind_of(root).iter().any(|k| matches!(k, RepoKind::Team | RepoKind::Wiki))
+    crate::ingest::has_inbox(root) || kind_of(root).contains(&RepoKind::Wiki)
 }
 
 /// Whether a project folder is a workspace's own `.ken-workspace` (its
@@ -221,7 +221,16 @@ impl Registry {
             return Ok(Registry::default());
         }
         let raw = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
-        serde_json::from_str(&raw).map_err(|e| Error::Other(format!("bad registry: {e}")))
+        let mut reg: Registry = serde_json::from_str(&raw).map_err(|e| Error::Other(format!("bad registry: {e}")))?;
+        // An older `["team", "wiki"]` reads as the wiki twice: say it once.
+        for entry in &mut reg.projects {
+            let mut seen = Vec::new();
+            entry.kind.retain(|k| !seen.contains(k) && {
+                seen.push(*k);
+                true
+            });
+        }
+        Ok(reg)
     }
 
     pub fn save(&self, base: &Path) -> Result<()> {
@@ -234,8 +243,7 @@ impl Registry {
 
     /// Register (or re-register) a project. Same id updates path/name in
     /// place — e.g. a moved folder or a teammate's clone with the shared id.
-    /// Kind and team are what a person said about the repo, so a re-add
-    /// keeps them.
+    /// The kind is what a person said about the repo, so a re-add keeps it.
     pub fn add(&mut self, project: &Project) {
         // One entry per folder: a repo made again in the same folder (a new
         // id) replaces the old entry, which lookups by folder would otherwise
@@ -252,16 +260,15 @@ impl Registry {
                 name: project.config.name.clone(),
                 path: project.root.clone(),
                 kind: Vec::new(),
-                team: None,
                 index: None,
                 description: None,
             }),
         }
     }
 
-    /// A repo with an inbox and no kind said is the team's wiki: give it the
-    /// wiki kind, and `team` when it has none. Returns whether it changed.
-    pub fn infer_library(&mut self, root: &Path, team: Option<&str>) -> bool {
+    /// A repo with an inbox and no kind said is the knowledge base: give it
+    /// the wiki kind. Returns whether it changed.
+    pub fn infer_library(&mut self, root: &Path) -> bool {
         if !crate::ingest::has_inbox(root) {
             return false;
         }
@@ -273,9 +280,6 @@ impl Registry {
             return false;
         }
         entry.kind = vec![RepoKind::Wiki];
-        if entry.team.is_none() {
-            entry.team = team.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
-        }
         true
     }
 
@@ -287,8 +291,8 @@ impl Registry {
         self.projects.len() != before
     }
 
-    /// Set a project's kind and team. Returns false for an unknown id.
-    pub fn set_kind(&mut self, id: Uuid, kind: Vec<RepoKind>, team: Option<String>) -> bool {
+    /// Set a project's kind. Returns false for an unknown id.
+    pub fn set_kind(&mut self, id: Uuid, kind: Vec<RepoKind>) -> bool {
         let Some(entry) = self.projects.iter_mut().find(|e| e.id == id) else {
             return false;
         };
@@ -298,7 +302,6 @@ impl Registry {
                 entry.kind.push(k);
             }
         }
-        entry.team = team.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         true
     }
 
@@ -399,14 +402,14 @@ mod tests {
         let first = Project::create(dir.path(), "Wiki").unwrap();
         let mut reg = Registry::default();
         reg.add(&first);
-        reg.set_kind(first.config.id, vec![RepoKind::Wiki], None);
+        reg.set_kind(first.config.id, vec![RepoKind::Wiki]);
         std::fs::remove_dir_all(dir.path().join(".ken")).unwrap();
         let again = Project::create(dir.path(), "Wiki").unwrap();
         assert_ne!(first.config.id, again.config.id);
         reg.add(&again);
-        reg.set_kind(again.config.id, vec![RepoKind::Team, RepoKind::Wiki], None);
+        reg.set_kind(again.config.id, vec![RepoKind::Wiki, RepoKind::Code]);
         assert_eq!(reg.projects.len(), 1);
-        assert_eq!(reg.entry_at(dir.path()).unwrap().kind, vec![RepoKind::Team, RepoKind::Wiki]);
+        assert_eq!(reg.entry_at(dir.path()).unwrap().kind, vec![RepoKind::Wiki, RepoKind::Code]);
     }
     use tempfile::tempdir;
 
@@ -490,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn kind_and_team_survive_a_re_add_and_a_reload() {
+    fn the_kind_survives_a_re_add_and_a_reload() {
         let app = tempdir().unwrap();
         let proj_dir = tempdir().unwrap();
         let project = Project::create(proj_dir.path(), "Atlas").unwrap();
@@ -499,17 +502,14 @@ mod tests {
         assert!(reg.set_kind(
             project.config.id,
             vec![RepoKind::Wiki, RepoKind::Code, RepoKind::Wiki],
-            Some("  Atlas team ".into()),
         ));
         assert_eq!(reg.projects[0].kind, vec![RepoKind::Wiki, RepoKind::Code], "duplicates dropped, order kept");
-        assert_eq!(reg.projects[0].team.as_deref(), Some("Atlas team"));
 
         reg.add(&project); // reopening re-registers
         reg.save(app.path()).unwrap();
         let loaded = Registry::load(app.path()).unwrap();
         assert_eq!(loaded.projects[0].kind, vec![RepoKind::Wiki, RepoKind::Code]);
-        assert_eq!(loaded.projects[0].team.as_deref(), Some("Atlas team"));
-        assert!(!reg.set_kind(Uuid::new_v4(), vec![RepoKind::Code], None), "unknown id");
+        assert!(!reg.set_kind(Uuid::new_v4(), vec![RepoKind::Code]), "unknown id");
     }
 
     #[test]
@@ -518,9 +518,9 @@ mod tests {
         let project = Project::create(proj_dir.path(), "Atlas").unwrap();
         let mut reg = Registry::default();
         reg.add(&project);
-        reg.set_kind(project.config.id, vec![RepoKind::Team], None);
+        reg.set_kind(project.config.id, vec![RepoKind::Code]);
         let dotted = proj_dir.path().join(".");
-        assert_eq!(reg.kind_of(&dotted), vec![RepoKind::Team]);
+        assert_eq!(reg.kind_of(&dotted), vec![RepoKind::Code]);
         let other = tempdir().unwrap();
         assert!(reg.kind_of(other.path()).is_empty(), "unregistered folder has no kind");
     }
@@ -532,9 +532,22 @@ mod tests {
         fs::write(registry_path(app.path()), old_json).unwrap();
         let loaded = Registry::load(app.path()).unwrap();
         assert!(loaded.projects[0].kind.is_empty());
-        assert_eq!(loaded.projects[0].team, None);
         let raw = serde_json::to_string(&loaded).unwrap();
-        assert!(!raw.contains("kind") && !raw.contains("team"), "unset fields are not written");
+        assert!(!raw.contains("kind"), "unset fields are not written");
+    }
+
+    /// Decision 35: there is no team repo. An older registry's `team` kind
+    /// reads as the wiki, said once, and its `team` name is dropped.
+    #[test]
+    fn an_older_team_repo_reads_as_the_wiki() {
+        let app = tempdir().unwrap();
+        let old_json = r#"{"projects":[{"id":"6f1c2c1e-9a55-4c55-9d7a-1d2a3b4c5d6e","name":"Docs","path":"/docs","kind":["team","wiki"],"team":"ATT"}]}"#;
+        fs::write(registry_path(app.path()), old_json).unwrap();
+        let loaded = Registry::load(app.path()).unwrap();
+        assert_eq!(loaded.projects[0].kind, vec![RepoKind::Wiki]);
+        let raw = serde_json::to_string(&loaded).unwrap();
+        assert!(!raw.contains("team"), "{raw}");
+        assert!(RepoKind::Wiki.syncs() && !RepoKind::Code.syncs() && !RepoKind::Reference.syncs());
     }
 
     #[test]
@@ -547,13 +560,12 @@ mod tests {
         let mut reg = Registry::default();
         reg.add(&wiki);
         reg.add(&code);
-        assert!(reg.infer_library(wiki_dir.path(), Some("ATT")));
+        assert!(reg.infer_library(wiki_dir.path()));
         assert_eq!(reg.kind_of(wiki_dir.path()), vec![RepoKind::Wiki]);
-        assert_eq!(reg.entry_at(wiki_dir.path()).unwrap().team.as_deref(), Some("ATT"));
-        assert!(!reg.infer_library(wiki_dir.path(), Some("Other")), "said once, kept");
-        assert!(!reg.infer_library(code_dir.path(), Some("ATT")), "no inbox, no kind");
-        reg.set_kind(wiki.config.id, vec![RepoKind::Team], None);
-        assert!(!reg.infer_library(wiki_dir.path(), Some("ATT")), "a kind a person said stands");
+        assert!(!reg.infer_library(wiki_dir.path()), "said once, kept");
+        assert!(!reg.infer_library(code_dir.path()), "no inbox, no kind");
+        reg.set_kind(wiki.config.id, vec![RepoKind::Reference]);
+        assert!(!reg.infer_library(wiki_dir.path()), "a kind a person said stands");
     }
 
     #[test]

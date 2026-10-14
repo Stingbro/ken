@@ -25,12 +25,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// How fast background work goes.
+/// How fast background work goes. Gentle is the default, so a fresh install
+/// makes at most 20 background Claude calls an hour, as before the throttle;
+/// Normal and Fast are a person's choice in Settings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Pace {
-    Gentle,
     #[default]
+    Gentle,
     Normal,
     Fast,
 }
@@ -151,7 +153,7 @@ struct State {
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
-    setting: Setting { pace: Pace::Normal, paused: false },
+    setting: Setting { pace: Pace::Gentle, paused: false },
     next: None,
     held_until: None,
     calls: VecDeque::new(),
@@ -393,7 +395,8 @@ mod tests {
         let s: Setting = serde_json::from_str(r#"{"pace":"gentle","paused":true}"#).unwrap();
         assert_eq!(s, Setting { pace: Pace::Gentle, paused: true });
         assert_eq!(serde_json::from_str::<Setting>("{}").unwrap(), Setting::default());
-        assert_eq!(Setting::default().pace, Pace::Normal);
+        assert_eq!(Setting::default().pace, Pace::Gentle, "a fresh install goes gently");
+        assert_eq!(Setting::default().pace.limits().calls_per_hour, 20, "20 background Claude calls an hour, as before");
     }
 
     #[test]

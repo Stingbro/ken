@@ -13,10 +13,7 @@
 //! and replaced it with **Condition B: B4 "FTS-priority fill"** — FTS
 //! ordering is preserved exactly as given, and KNN contributes only the
 //! hits FTS didn't already surface, appended below, in KNN's own order
-//! (not re-ranked, not interleaved). `openspec/changes/semantic-index/
-//! tasks.md` (task 1.7) and `specs/semantic-index/spec.md`'s "Hybrid search
-//! merges FTS and KNN by FTS-priority fill" requirement have both already
-//! been updated to this design; this module implements it.
+//! (not re-ranked, not interleaved). This module implements it.
 //!
 //! Dedupe/tagging/grouping shape is preserved from the original design:
 //! results are deduped and grouped by `path` (one entry per file, best

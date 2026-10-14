@@ -1,10 +1,10 @@
 <script lang="ts">
-  import TeamScreen from "./TeamScreen.svelte";
-  import BackgroundPanel from "../team/BackgroundPanel.svelte";
+  import WorkspaceSettingsScreen from "./WorkspaceSettingsScreen.svelte";
+  import BackgroundPanel from "../workspace/BackgroundPanel.svelte";
   import type { SettingsSection } from "../lib/app.svelte";
   // Settings: what is yours (You), what is this computer's (This machine),
   // Ken's features, the connector for agents, and About. Each repo's own
-  // settings open from its row on Team.
+  // settings open from its row under Workspace.
   import { onMount, untrack } from "svelte";
   import { app } from "../lib/app.svelte";
   import { memory } from "../lib/memory.svelte";
@@ -45,8 +45,8 @@
 
   const sections: { key: SettingsSection; label: string; sub: string }[] = [
     { key: "general", label: "General", sub: "Appearance, files, updates" },
-    { key: "team", label: "Team library", sub: "Folders, rules, weekly check" },
-    { key: "sync", label: "Sync", sub: "Git and the team inbox" },
+    { key: "workspace", label: "Workspace", sub: "Sources, index rules, tiers, controls" },
+    { key: "sync", label: "Sync", sub: "The knowledge base's Git remote" },
     { key: "ai", label: "AI", sub: "Claude Code and models" },
     { key: "agents", label: "Agents", sub: "The connector for your tools" },
     { key: "rules", label: "Ingest rules", sub: "What Ken may write" },
@@ -226,16 +226,17 @@
   <div class="inner">
     <h2 class="stitle">{sections.find((s) => s.key === app.settingsSection)?.label}</h2>
 
-    {#if app.settingsSection === "team"}
-      <TeamScreen />
+    {#if app.settingsSection === "workspace"}
+      <WorkspaceSettingsScreen />
     {/if}
 
     {#if app.settingsSection === "sync"}
       <section class="group">
         <div class="card">
-          <div class="card-title">How the team's files sync</div>
+          <div class="card-title">How the knowledge base syncs</div>
           <p class="note">
-            Each folder Ken reads syncs through its own Git remote, set in its row under Team library. A file two people
+            Only the knowledge base syncs, through its own Git remote: Ken commits what it wrote there, never anything
+            else in the folder, and never commits in a code repo. Memory stays on this computer. A file two people
             changed at once shows in the Inbox under Sync &amp; files, with both versions side by side.
           </p>
         </div>
@@ -266,9 +267,9 @@
           </p>
         </div>
         <div class="card">
-          <div class="card-title">The team's own rules</div>
-          <p class="note">The rules reviewers check work against are pages in the wiki. Add one under Team library.</p>
-          <div class="row"><button class="btn btn-small" onclick={() => (app.settingsSection = "team")}>Open Team library</button></div>
+          <div class="card-title">The project's own rules</div>
+          <p class="note">The rules reviewers check work against are pages in the knowledge base. Add one under Workspace.</p>
+          <div class="row"><button class="btn btn-small" onclick={() => (app.settingsSection = "workspace")}>Open Workspace</button></div>
         </div>
       </section>
     {/if}
@@ -541,8 +542,9 @@
           {/if}
         </div>
         <p class="note">
-          Ken's connector lets Claude Code, Cursor and other agents search the team's repos and read their files. It
-          writes only Your day tasks, memories, the journal and team inbox messages, never your files.
+          Ken's connector lets Claude Code, Cursor and other agents search the workspace's repos and read their files.
+          It proposes rulings and adds sources for a person to accept, and Ken's own chat also writes Your day tasks,
+          memories and the journal; never your files.
         </p>
         {#if mcp?.binaryPath}
           <div class="mcp-block">
@@ -582,7 +584,7 @@
           <span class="about-version">Ken v{whatsNew.version}</span>
           <button class="whats-new" onclick={() => whatsNew.show()}>What's new in this version</button>
         </div>
-        <p class="note">Each folder's own settings (reindex, watched folders, cloud files, sync) open from its row in Team library.</p>
+        <p class="note">Each folder's own settings (reindex, watched folders, cloud files, sync) open from its row under Workspace.</p>
       </div>
     </section>
     {/if}

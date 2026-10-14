@@ -1,6 +1,6 @@
 // The banner at the top of Files: sync conflicts and conflicted copies in
-// the team's repos, and the conflict view it opens. Read on start, on a
-// change of team, and when a sync, a scan or a filed conflict says so.
+// the workspace's repos, and the conflict view it opens. Read on start, on a
+// change of workspace, and when a sync, a scan or a filed conflict says so.
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   api,
@@ -10,7 +10,6 @@ import {
   type FilesBanner,
 } from "./api";
 import { app } from "./app.svelte";
-import { scope } from "./scope.svelte";
 import { numericId } from "./conflicts";
 import { coalesce, singleFlight } from "./refresh";
 
@@ -44,7 +43,6 @@ class ConflictsStore {
     ]);
     $effect.root(() => {
       $effect(() => {
-        void scope.team;
         void app.workspace?.id;
         void this.refresh();
       });
@@ -56,10 +54,10 @@ class ConflictsStore {
   /** One read at a time (see `singleFlight`). */
   readonly refresh = singleFlight(async () => {
     if (!app.project) return;
-    const team = scope.team;
+    const ws = app.workspace?.id;
     // An optional read: a failure leaves the last banner in place.
-    const next = await api.filesBanner(team).catch(() => null);
-    if (next === null || team !== scope.team) return;
+    const next = await api.filesBanner().catch(() => null);
+    if (next === null || ws !== app.workspace?.id) return;
     this.banner = next;
     if (this.items.length === 0) this.open = false;
     if (this.selected && !this.items.some((c) => c.id === this.selected)) this.selected = null;

@@ -152,11 +152,10 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
     .filter(|(p, _)| dir.join(p).exists())
     .map(|(_, e)| e)
     .collect();
-    // A repo that holds the tickets says so with its settings file. A folder
-    // name is not evidence: a code repo can keep a `tickets/README.md`
-    // pointing at where tickets moved, and that one file made it a team repo
-    // read in full.
-    let team: Vec<&str> = [crate::wikinew::KNOWLEDGE_FILE, ".wright/team.json"]
+    // A knowledge base says so with its settings file. A folder name is not
+    // evidence: a code repo can keep a `tickets/README.md` pointing at where
+    // tickets moved, and that one file once made it a team repo read in full.
+    let settings: Vec<&str> = [crate::wikinew::KNOWLEDGE_FILE, ".wright/team.json"]
         .into_iter()
         .filter(|f| dir.join(f).is_file())
         .take(1)
@@ -183,13 +182,12 @@ pub fn detect(dir: &Path) -> (Vec<RepoKind>, Vec<String>) {
     if code.is_empty() && dir.join(".git").exists() {
         code = nested_markers(dir, 2);
     }
-    if !team.is_empty() {
-        kind.push(RepoKind::Team);
-        ev.push(team.join(", "));
-    }
-    if library.len() >= 1 {
+    if !settings.is_empty() || !library.is_empty() {
         kind.push(RepoKind::Wiki);
-        ev.push(library.join(", "));
+        ev.extend(settings.iter().map(|s| s.to_string()));
+        if !library.is_empty() {
+            ev.push(library.join(", "));
+        }
     }
     if !code.is_empty() {
         kind.push(RepoKind::Code);
@@ -233,15 +231,6 @@ fn nested_markers(dir: &Path, depth: usize) -> Vec<String> {
         level = next;
     }
     found
-}
-
-/// The owner in a git remote URL (`github.com/owner/repo`, `git@host:owner/repo`).
-pub fn remote_owner(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
-    let path = rest.split_once([':', '/']).map(|(_, p)| p)?;
-    let owner = path.trim_start_matches('/').split('/').next()?;
-    (!owner.is_empty()).then(|| owner.to_string())
 }
 
 /// Second checkouts of the repos found: every `git worktree list` path under
@@ -480,7 +469,7 @@ fn register(base: &Path, ws: &Workspace, chosen: &[&RepoRow]) -> Result<()> {
         let workspace::MemberStatus::Ok(p) = &m.status else { continue };
         let Some(row) = chosen.iter().find(|r| r.member == m.name) else { continue };
         reg.add(p);
-        reg.set_kind(p.config.id, row.kind.clone(), None);
+        reg.set_kind(p.config.id, row.kind.clone());
         reg.set_index(p.config.id, None);
         reg.set_description(p.config.id, &row.description);
     }
@@ -612,8 +601,7 @@ pub fn overlay_wiki(dir: &Path, name: &str, repos: &[crate::wikinew::Covered], t
     Ok((row, added))
 }
 
-/// The set-up row of the knowledge base at `dir`: a team and wiki repo,
-/// included.
+/// The set-up row of the knowledge base at `dir`: the wiki, included.
 fn knowledge_base_row(dir: &Path, name: &str, taken: &[String]) -> Result<RepoRow> {
     let mut row = propose_repos(&[dir.to_path_buf()], taken)?
         .rows
@@ -621,7 +609,7 @@ fn knowledge_base_row(dir: &Path, name: &str, taken: &[String]) -> Result<RepoRo
         .next()
         .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
     row.include = true;
-    row.kind = vec![RepoKind::Team, RepoKind::Wiki];
+    row.kind = vec![RepoKind::Wiki];
     row.description = format!("The {name} knowledge base: what was decided and why, what is true now, and the tickets.");
     Ok(row)
 }
@@ -679,13 +667,13 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("Realms-Wiki");
         let row = create_wiki(&dir, "Realms", &[], &[], "2026-10-06").unwrap();
-        assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
+        assert_eq!(row.kind, vec![RepoKind::Wiki]);
         for f in ["tickets/README.md", "Decisions/DECISIONS.md", ".ken/knowledge.json", "Current/Project.md", "log.md"] {
             assert!(dir.join(f).exists(), "{f}");
         }
         let settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join(".ken/knowledge.json")).unwrap()).unwrap();
-        assert_eq!(settings["repos"]["Realms-Wiki"]["kind"], serde_json::json!(["wiki", "team"]));
+        assert_eq!(settings["repos"]["Realms-Wiki"]["kind"], "wiki");
     }
 
     #[test]
@@ -700,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stray_tickets_folder_does_not_make_a_team_repo() {
+    fn a_stray_tickets_folder_does_not_make_a_knowledge_base() {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir_all(d.path().join("tickets")).unwrap();
         fs::write(d.path().join("tickets/README.md"), "Tickets moved to the docs repo.").unwrap();
@@ -709,7 +697,7 @@ mod tests {
         assert_eq!(kind, vec![RepoKind::Code]);
         fs::create_dir_all(d.path().join(".ken")).unwrap();
         fs::write(d.path().join(".ken/knowledge.json"), "{}").unwrap();
-        assert!(detect(d.path()).0.contains(&RepoKind::Team));
+        assert_eq!(detect(d.path()).0, vec![RepoKind::Wiki, RepoKind::Code], "the settings file says it is the knowledge base");
     }
     use std::process::Command;
 
@@ -795,7 +783,6 @@ mod tests {
         let reg = Registry::load(base.path()).unwrap();
         let game = reg.entry_at(&d.path().join("Realms-Game")).unwrap();
         assert_eq!(game.kind, vec![RepoKind::Code]);
-        assert_eq!(game.team, None);
         assert_eq!(game.index, None, "indexed: the default is not stored");
 
         let ignore = fs::read_to_string(d.path().join(".kenignore")).unwrap();
@@ -891,19 +878,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_owners() {
-        assert_eq!(remote_owner("git@github.com:Stingbro/ken.git").as_deref(), Some("Stingbro"));
-        assert_eq!(remote_owner("https://github.com/smo-key/ken.git").as_deref(), Some("smo-key"));
-    }
-
-    #[test]
     fn a_new_wiki_joins_set_up_as_the_knowledge_base() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("Realms-Wiki");
         let covered = vec![crate::wikinew::Covered { name: "Game".into(), description: "The client.".into(), ..Default::default() }];
         let row = create_wiki(&dir, "Realms", &covered, &["Game".into()], "2026-09-25").unwrap();
         assert_eq!(row.member, "Realms-Wiki");
-        assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
+        assert_eq!(row.kind, vec![RepoKind::Wiki]);
         assert!(row.include && row.has_git);
         assert!(fs::read_to_string(dir.join("START-HERE.md")).unwrap().contains("| `Game` | The client. |"));
     }
@@ -919,7 +900,7 @@ mod tests {
         fs::write(dir.join("START-HERE.md"), "# Our own start page\n").unwrap();
         fs::write(dir.join("design/payments.md"), "# Payments\n").unwrap();
         let (row, added) = overlay_wiki(&dir, "Realms", &[], &[], "2026-10-13").unwrap();
-        assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
+        assert_eq!(row.kind, vec![RepoKind::Wiki]);
         assert!(added.contains(&"Decisions/DECISIONS.md".to_string()), "{added:?}");
         assert!(!added.contains(&"START-HERE.md".to_string()), "a file it has is never written");
         assert_eq!(fs::read_to_string(dir.join("START-HERE.md")).unwrap(), "# Our own start page\n");

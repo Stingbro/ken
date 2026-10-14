@@ -12,7 +12,7 @@
   } from "../lib/api";
   import { app, forFocused } from "../lib/app.svelte";
   import { scope as sharedScope } from "../lib/scope.svelte";
-  const teamName = $derived(sharedScope.team ?? app.workspace?.name ?? "the workspace");
+  const workspaceName = $derived(app.workspace?.name ?? "the workspace");
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
   import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
@@ -30,7 +30,7 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   // Two scopes, one search (knowledge-core decisions 15 and 20): "This repo"
-  // is a routed search pinned to the focused member, and the team scope is a
+  // is a routed search pinned to the focused member, and the workspace scope is a
   // routed search over every source. The toggle is visible only in Workspace
   // mode (`app.workspace` set).
   type Scope = "project" | "all";
@@ -61,7 +61,7 @@
     /** `"keyword"` | `"semantic"` | `"both"`. */
     source: string;
     projectId: string;
-    /** Shown in the team scope only: in "This repo" every hit is its own. */
+    /** Shown in the workspace scope only: in "This repo" every hit is its own. */
     memberName: string | null;
     /** What the file is for: code, spec, doc, … */
     contentType: ContentType;
@@ -257,7 +257,7 @@
   }
 
   async function search(q: string) {
-    // The team scope is every source unless narrowed: the shared scope store
+    // The workspace scope is every source unless narrowed: the shared scope store
     // wins when it is (a group, or a project chosen on Home), and
     // `pinnedMember` is the overlay's own narrowing for one query. "This
     // repo" is the focused member alone.
@@ -309,8 +309,8 @@
       pinnedMember = null;
       sharedScope.set("project", app.focused ?? null);
     } else {
-      // The broad scope is the team chosen in the title bar.
-      sharedScope.setTeamScope();
+      // The broad scope is the whole workspace.
+      sharedScope.setWorkspaceScope();
     }
     void run();
   }
@@ -368,7 +368,7 @@
       bind:value={query}
       oninput={onInput}
       onkeydown={onKeydown}
-      placeholder={scope === "all" ? `Search ${teamName}…` : "Search this repo…"}
+      placeholder={scope === "all" ? `Search ${workspaceName}…` : "Search this repo…"}
       spellcheck="false"
     />
   </div>
@@ -383,7 +383,7 @@
         This repo
       </button>
       <button class="scope-btn" class:active={scope === "all"} onclick={() => setScope("all")}>
-        {teamName}
+        {workspaceName}
       </button>
       {#if scope === "all"}
         <!-- Narrowing within all-projects: pins routing to one member,
@@ -540,7 +540,7 @@
   {:else if results.length === 0 && searched}
     <div class="empty">
       {#if scope === "all"}
-        Nothing in {teamName} matches “{query}”.
+        Nothing in {workspaceName} matches “{query}”.
       {:else if app.scanning}
         Nothing matches “{query}” <em>yet</em> — Ken is still reading your folder.
         Search lights up as files are indexed.

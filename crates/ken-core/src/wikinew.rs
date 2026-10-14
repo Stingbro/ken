@@ -1,9 +1,9 @@
 //! A new knowledge base, laid down at set-up from Ken's own template
-//! (`templates/wiki`, bundled so set-up works offline and every team starts
-//! from the same version). One repo holds the library, the decisions log, the
+//! (`templates/wiki`, bundled so set-up works offline and every workspace
+//! starts from the same version). One repo holds the library, the decisions log, the
 //! tickets, `log.md` and the settings in `.ken/knowledge.json`.
 //!
-//! Only the facts Ken knows are filled in: the team's name, the repo's own
+//! Only the facts Ken knows are filled in: the workspace's name, the repo's own
 //! name, the ticket key, the repos it covers with what each is for, and
 //! `updated:` dates. Every other `{{…}}` stays for a person. The folder
 //! becomes a git repo with one commit; publishing it (a remote, a push) is a
@@ -74,15 +74,15 @@ pub(crate) fn is_copy_template(path: &str) -> bool {
     path.starts_with("Templates/") && path != "Templates/Index.md"
 }
 
-/// A ticket key from the team's name: the initials of its words when it has
-/// two or more (`Shattered-Realms` → SR), else its first six letters and
+/// A ticket key from the workspace's name: the initials of its words when it
+/// has two or more (`Shattered-Realms` → SR), else its first six letters and
 /// digits; in upper case, TEAM when it has none.
-pub fn ticket_key(team: &str) -> String {
-    let words: Vec<&str> = team.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+pub fn ticket_key(name: &str) -> String {
+    let words: Vec<&str> = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
     let k: String = if words.len() >= 2 {
         words.iter().filter_map(|w| w.chars().next()).collect()
     } else {
-        team.chars().filter(|c| c.is_ascii_alphanumeric()).take(6).collect()
+        name.chars().filter(|c| c.is_ascii_alphanumeric()).take(6).collect()
     };
     let k = k.to_uppercase();
     if k.is_empty() {
@@ -116,7 +116,7 @@ fn knowledge_repos(wiki: &str, repos: &[Covered]) -> String {
     use crate::registry::RepoKind;
     use serde_json::{json, Value};
     let q = |s: &str| serde_json::to_string(s).unwrap_or_default();
-    let mut entries = vec![format!("    {}: {}", q(wiki), json!({ "kind": ["wiki", "team"], "base": "main" }))];
+    let mut entries = vec![format!("    {}: {}", q(wiki), json!({ "kind": "wiki", "base": "main" }))];
     for r in repos.iter().filter(|r| r.name != wiki) {
         let kinds: Vec<Value> = r.kind.iter().map(|k| serde_json::to_value(k).unwrap_or(Value::Null)).collect();
         let kind = match kinds.as_slice() {
@@ -142,8 +142,8 @@ fn knowledge_repos(wiki: &str, repos: &[Covered]) -> String {
 }
 
 /// One template file with what Ken knows filled in.
-pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], today: &str) -> String {
-    let key = ticket_key(team);
+pub fn fill(path: &str, text: &str, workspace: &str, wiki: &str, repos: &[Covered], today: &str) -> String {
+    let key = ticket_key(workspace);
     let mut t = text.replace("{{KEY}}", &key);
     if path == KNOWLEDGE_FILE {
         // The one `repos` line of the template becomes every repo's entry.
@@ -156,9 +156,9 @@ pub fn fill(path: &str, text: &str, team: &str, wiki: &str, repos: &[Covered], t
             let quoted = serde_json::to_string(s).unwrap_or_default();
             quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"')).unwrap_or(&quoted).to_string()
         };
-        return t.replace("{{team_name}}", &inner(team)).replace("{{wiki_repo}}", &inner(wiki));
+        return t.replace("{{workspace_name}}", &inner(workspace)).replace("{{wiki_repo}}", &inner(wiki));
     }
-    t = t.replace("{{team_name}}", team).replace("{{wiki_repo}}", wiki);
+    t = t.replace("{{workspace_name}}", workspace).replace("{{wiki_repo}}", wiki);
     if !is_copy_template(path) {
         t = t
             .lines()
@@ -195,11 +195,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
     crate::git::run(dir, args).map_err(Error::Other)
 }
 
-/// Lay a new knowledge base down at `dir` (missing or empty) for `team`,
-/// covering `repos`, then make it a git repo with one commit. Refuses a
-/// folder that already holds anything, so it never writes over a person's
-/// files.
-pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<()> {
+/// Lay a new knowledge base down at `dir` (missing or empty) for the
+/// workspace named `workspace`, covering `repos`, then make it a git repo
+/// with one commit. Refuses a folder that already holds anything, so it
+/// never writes over a person's files.
+pub fn create(dir: &Path, workspace: &str, repos: &[Covered], today: &str) -> Result<()> {
     if dir.exists() && fs::read_dir(dir).map_err(|e| Error::io(dir, e))?.next().is_some() {
         return Err(Error::Other(format!("{} is not empty; pick a new folder for the knowledge base", dir.display())));
     }
@@ -211,9 +211,10 @@ pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<
         }
         // LF, whatever the checkout Ken was built from used.
         let text = text.replace("\r\n", "\n");
-        fs::write(&dest, fill(path, &text, team, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
+        fs::write(&dest, fill(path, &text, workspace, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
     }
-    git_commit_all(dir, &format!("Start the {team} knowledge base from Ken's template"))
+    let paths: Vec<&str> = TEMPLATE.iter().map(|(path, _)| *path).collect();
+    git_commit_new(dir, &paths, &format!("Start the {workspace} knowledge base from Ken's template"))
 }
 
 /// Overlay Ken's structure on an existing wiki at `dir` (decision 32, step
@@ -335,12 +336,21 @@ pub fn add_missing(dir: &Path, name: &str, paths: &[String], today: &str) -> Res
     Ok(added)
 }
 
-/// `git init` in `dir` and one commit of everything in it. The person's own
-/// git identity when they have one; Ken's otherwise, so a machine with no
+/// `git init` in `dir` and one commit of exactly `paths`, the files Ken laid
+/// down there, added by name (decision 36: never `git add -A`). The person's
+/// own git identity when they have one; Ken's otherwise, so a machine with no
 /// identity set can still make the first commit.
-pub(crate) fn git_commit_all(dir: &Path, msg: &str) -> Result<()> {
+pub(crate) fn git_commit_new(dir: &Path, paths: &[&str], msg: &str) -> Result<()> {
     git(dir, &["init", "-q"])?;
-    git(dir, &["add", "-A"])?;
+    // A path the person's global ignore rules leave out stays out, as it
+    // would have with `git add -A`.
+    let mut check = vec!["check-ignore", "--"];
+    check.extend_from_slice(paths);
+    let ignored = crate::git::output(dir, &check).unwrap_or_default();
+    let ignored: Vec<&str> = ignored.lines().map(str::trim).collect();
+    let mut add = vec!["add", "--"];
+    add.extend(paths.iter().filter(|p| !ignored.contains(p)));
+    git(dir, &add)?;
     if git(dir, &["commit", "-q", "-m", msg]).is_err() {
         git(dir, &["-c", "user.name=Ken", "-c", "user.email=ken@localhost", "commit", "-q", "-m", msg])?;
     }
@@ -376,15 +386,16 @@ pub(crate) mod tests {
     fn the_knowledge_file_names_every_repo_and_is_json() {
         let t = fill(KNOWLEDGE_FILE, template(KNOWLEDGE_FILE), "Shattered Realms", "SR-Wiki", &repos(), "2026-09-25");
         let v: serde_json::Value = serde_json::from_str(&t).unwrap();
-        assert_eq!(v["team"], "Shattered Realms");
+        assert_eq!(v["workspace"], "Shattered Realms");
+        assert!(v.get("team").is_none(), "no team (decision 35)");
         assert_eq!(v["key"], "SR");
-        assert_eq!(v["repos"]["SR-Wiki"]["kind"], serde_json::json!(["wiki", "team"]));
+        assert_eq!(v["repos"]["SR-Wiki"]["kind"], "wiki");
         assert_eq!(v["repos"]["Game"]["kind"], "code");
         assert!(v["repos"]["Tools"].is_object());
     }
 
     #[test]
-    fn ticket_keys_come_from_the_teams_initials() {
+    fn ticket_keys_come_from_the_workspaces_initials() {
         assert_eq!(ticket_key("Shattered-Realms"), "SR");
         assert_eq!(ticket_key("ken"), "KEN");
         assert_eq!(ticket_key("--"), "TEAM");

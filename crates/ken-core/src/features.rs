@@ -147,8 +147,8 @@ mod tests {
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);
-        // The task board and the team inbox are how Ken works now (Your day,
-        // the inbox once one is set up), not switches.
+        // The task board is how Ken works now (Your day), not a switch; the
+        // families and their team bus are gone (decision 37).
         assert!(flag("kenTasks").is_none());
         assert!(flag("kenFamilies").is_none());
     }

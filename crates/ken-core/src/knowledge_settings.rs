@@ -218,6 +218,133 @@ pub fn set_ignore_lines(kb_root: &Path, lines: &[String]) -> Result<()> {
     std::fs::write(&path, text + "\n").map_err(|e| Error::io(&path, e))
 }
 
+/// Write `value` into the knowledge base's file, every other key kept.
+fn write(kb_root: &Path, value: &Value) -> Result<()> {
+    let path = kb_root.join(KNOWLEDGE_FILE);
+    let text = serde_json::to_string_pretty(value).map_err(|e| Error::Other(e.to_string()))?;
+    std::fs::write(&path, text + "\n").map_err(|e| Error::io(&path, e))
+}
+
+/// The file at `kb_root`, or why there is none to edit.
+fn editable(kb_root: &Path) -> Result<Value> {
+    read(kb_root).ok_or_else(|| Error::Other(format!("{} has no readable {KNOWLEDGE_FILE}", kb_root.display())))
+}
+
+/// One `pattern = value` line, as the workspace settings screen edits tiers
+/// and roles: split at the last `=`, both sides trimmed. None for a blank
+/// line or one without both sides.
+pub fn parse_pair(line: &str) -> Option<(String, String)> {
+    let (pattern, value) = line.rsplit_once('=')?;
+    let (pattern, value) = (pattern.trim(), value.trim());
+    (!pattern.is_empty() && !value.is_empty()).then(|| (pattern.to_string(), value.to_string()))
+}
+
+/// An object of pattern to value as `pattern = value` lines.
+fn pair_lines(map: Option<&Value>) -> Vec<String> {
+    map.and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(p, v)| match v {
+                    Value::String(s) => Some(format!("{p} = {s}")),
+                    Value::Number(n) => Some(format!("{p} = {n}")),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tier overrides (`search.weights`, decision 23) as `pattern = tier`
+/// lines; a value is a tier name or a number added to a hit's score.
+pub fn weight_lines(kb_root: &Path) -> Vec<String> {
+    pair_lines(read(kb_root).as_ref().and_then(|v| v.pointer("/search/weights")))
+}
+
+/// Write `search.weights` from `pattern = value` lines: a tier name
+/// (binding, current, reference, record, superseded) or a number. A line
+/// that is neither is refused, with the line said, and nothing is written.
+pub fn set_weight_lines(kb_root: &Path, lines: &[String]) -> Result<()> {
+    let mut weights = serde_json::Map::new();
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        let (pattern, value) = parse_pair(line).ok_or_else(|| Error::Other(format!("\"{}\" is not pattern = tier", line.trim())))?;
+        let v = if let Some(t) = crate::authority::Tier::parse(&value) {
+            Value::String(t.name().to_string())
+        } else if let Some(n) = value.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+            Value::Number(n)
+        } else {
+            return Err(Error::Other(format!("\"{value}\" is not a tier (binding, current, reference, record, superseded) or a number")));
+        };
+        weights.insert(pattern, v);
+    }
+    let mut value = editable(kb_root)?;
+    let obj = value.as_object_mut().ok_or_else(|| Error::Other("the settings are not an object".into()))?;
+    let search = obj.entry("search").or_insert_with(|| Value::Object(Default::default()));
+    if !search.is_object() {
+        *search = Value::Object(Default::default());
+    }
+    if let Some(s) = search.as_object_mut() {
+        s.insert("weights".into(), Value::Object(weights));
+    }
+    write(kb_root, &value)
+}
+
+/// A source's role rules (decision 17) as `pattern = role` lines, from its
+/// entry in the knowledge base's `repos`.
+pub fn role_lines(kb_root: &Path, repo: &str) -> Vec<String> {
+    let value = read(kb_root);
+    let entry = value.as_ref().and_then(|v| v.get("repos")).and_then(|r| r.as_object()).and_then(|r| {
+        r.iter().find(|(k, _)| k.eq_ignore_ascii_case(repo)).map(|(_, e)| e)
+    });
+    pair_lines(entry.and_then(|e| e.get("roles")))
+}
+
+/// Write a source's role rules from `pattern = role` lines, roles in lower
+/// case, under its `repos` entry (made when the file does not list it).
+pub fn set_role_lines(kb_root: &Path, repo: &str, lines: &[String]) -> Result<()> {
+    let mut roles = serde_json::Map::new();
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        let (pattern, role) = parse_pair(line).ok_or_else(|| Error::Other(format!("\"{}\" is not pattern = role", line.trim())))?;
+        roles.insert(pattern, Value::String(role.to_lowercase()));
+    }
+    let mut value = editable(kb_root)?;
+    let obj = value.as_object_mut().ok_or_else(|| Error::Other("the settings are not an object".into()))?;
+    let repos = obj.entry("repos").or_insert_with(|| Value::Object(Default::default()));
+    let repos = repos.as_object_mut().ok_or_else(|| Error::Other("repos is not an object".into()))?;
+    let key = repos.keys().find(|k| k.eq_ignore_ascii_case(repo)).cloned().unwrap_or_else(|| repo.to_string());
+    let entry = repos.entry(key).or_insert_with(|| Value::Object(Default::default()));
+    let entry = entry.as_object_mut().ok_or_else(|| Error::Other(format!("the {repo} entry is not an object")))?;
+    entry.insert("roles".into(), Value::Object(roles));
+    write(kb_root, &value)
+}
+
+/// Every control in the knowledge base's file, in its order.
+pub fn all_controls(kb_root: &Path) -> Vec<Control> {
+    read(kb_root)
+        .and_then(|v| v.get("controls").cloned())
+        .and_then(|c| serde_json::from_value::<Vec<Value>>(c).ok())
+        .map(|list| list.into_iter().filter_map(|c| serde_json::from_value::<Control>(c).ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Write the knowledge base's `controls`: those with a question and a file,
+/// trimmed; a blank source means the knowledge base itself.
+pub fn set_controls(kb_root: &Path, controls: &[Control]) -> Result<()> {
+    let list: Vec<Value> = controls
+        .iter()
+        .filter(|c| !c.question.trim().is_empty() && !c.expect.trim().is_empty())
+        .map(|c| Control {
+            question: c.question.trim().to_string(),
+            expect: c.expect.trim().replace('\\', "/"),
+            source: c.source.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        })
+        .filter_map(|c| serde_json::to_value(c).ok())
+        .collect();
+    let mut value = editable(kb_root)?;
+    let obj = value.as_object_mut().ok_or_else(|| Error::Other("the settings are not an object".into()))?;
+    obj.insert("controls".into(), Value::Array(list));
+    write(kb_root, &value)
+}
+
 /// [`save_proposals`]'s change to the settings, None when nothing changes.
 pub fn with_proposals(settings: &Settings, roles: &[(String, String)], controls: &[Control]) -> Option<Value> {
     let mut value = settings.value.clone();
@@ -290,6 +417,40 @@ mod tests {
         assert_eq!(ignore_lines(&wiki), vec!["build-cache/"]);
         assert_eq!(read(&wiki).unwrap()["repos"]["Game"]["kind"], "code", "the rest of the file stays");
         assert!(set_ignore_lines(&d.path().join("None"), &[]).is_err());
+    }
+
+    /// The workspace settings screen's editors: tiers, roles and controls,
+    /// each written back with every other key kept.
+    #[test]
+    fn tiers_roles_and_controls_are_edited_in_place() {
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Wiki");
+        kb(&wiki, r#"{ "key": "SR", "repos": { "Game": { "kind": "code", "base": "main" } }, "search": { "weights": { "Research/": "record" } } }"#);
+        assert_eq!(parse_pair(" src/net/** = protocol "), Some(("src/net/**".into(), "protocol".into())));
+        assert_eq!(parse_pair("no value ="), None);
+        assert_eq!(parse_pair(""), None);
+
+        assert_eq!(weight_lines(&wiki), vec!["Research/ = record"]);
+        set_weight_lines(&wiki, &["Rules/ = binding".into(), "".into(), "Old/ = -0.5".into(), "Research/ = Record".into()]).unwrap();
+        let v = read(&wiki).unwrap();
+        assert_eq!(v["search"]["weights"]["Rules/"], "binding");
+        assert_eq!(v["search"]["weights"]["Old/"], -0.5);
+        assert_eq!(v["search"]["weights"]["Research/"], "record", "a tier is written by its name");
+        assert_eq!(v["key"], "SR", "the rest of the file stays");
+        assert!(set_weight_lines(&wiki, &["Rules/ = very".into()]).is_err(), "neither a tier nor a number");
+        assert_eq!(read(&wiki).unwrap()["search"]["weights"]["Rules/"], "binding", "a refused edit writes nothing");
+
+        set_role_lines(&wiki, "game", &["src/net/** = Protocol".into()]).unwrap();
+        assert_eq!(role_lines(&wiki, "Game"), vec!["src/net/** = protocol"]);
+        assert_eq!(read(&wiki).unwrap()["repos"]["Game"]["base"], "main", "the entry keeps its other keys");
+        set_role_lines(&wiki, "Tools", &["cli/** = command".into()]).unwrap();
+        assert_eq!(role_lines(&wiki, "Tools"), vec!["cli/** = command"], "an entry is made for a source the file lacks");
+        assert!(set_role_lines(&wiki, "Game", &["just words".into()]).is_err());
+
+        let c = |q: &str, e: &str, s: Option<&str>| Control { question: q.into(), expect: e.into(), source: s.map(str::to_string) };
+        set_controls(&wiki, &[c(" how are worlds saved ", "src\\world\\Save.java", Some("Game")), c("", "x.md", None), c("where do rules live", "Rules/Index.md", Some(" "))]).unwrap();
+        assert_eq!(all_controls(&wiki), vec![c("how are worlds saved", "src/world/Save.java", Some("Game")), c("where do rules live", "Rules/Index.md", None)]);
+        assert!(set_controls(&d.path().join("None"), &[]).is_err(), "no settings file, nothing written");
     }
 
     #[test]

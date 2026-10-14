@@ -108,24 +108,24 @@ What the index saw in the last 24 hours:\n"
     p
 }
 
-/// The team digest's quiet fallback: nothing in any repo, nothing of mine.
-pub const QUIET_TEAM_DIGEST: &str = "A quiet day: nothing new in the team's repos since yesterday.";
+/// The workspace digest's quiet fallback: nothing in any repo, nothing of mine.
+pub const QUIET_WORKSPACE_DIGEST: &str = "A quiet day: nothing new in the workspace's repos since yesterday.";
 
-/// How many changed paths one repo contributes to the team prompt.
-const MAX_TEAM_FILES_PER_REPO: usize = 10;
+/// How many changed paths one repo contributes to the workspace prompt.
+const MAX_FILES_PER_REPO: usize = 10;
 
-/// Nothing to say for the whole team.
-pub fn team_is_quiet(repos: &[(String, DigestSources)], mine: &[String]) -> bool {
+/// Nothing to say for the whole workspace.
+pub fn workspace_is_quiet(repos: &[(String, DigestSources)], mine: &[String]) -> bool {
     mine.is_empty() && repos.iter().all(|(_, s)| s.is_quiet())
 }
 
-/// The team digest prompt (Your day): one paragraph across every repo of
-/// the team, run from the folder that holds the repos so every path is
+/// The workspace digest prompt (Your day): one paragraph across every repo of
+/// the workspace, run from the folder that holds the repos so every path is
 /// `<repo>/<path>`. `mine` is what the user has on today (their open
 /// tickets and tasks, one line each), so the paragraph can lead with it.
-pub fn compose_team_digest_prompt(team: &str, repos: &[(String, DigestSources)], mine: &[String]) -> String {
+pub fn compose_workspace_digest_prompt(workspace: &str, repos: &[(String, DigestSources)], mine: &[String]) -> String {
     let mut p = format!(
-        "You are Ken, writing the morning digest for the team \"{team}\": one \
+        "You are Ken, writing the morning digest for the workspace \"{workspace}\": one \
 paragraph across all of its repos.\n\n\
 Write ONE plain, concrete paragraph (at most 120 words): what changed in the \
 last day across the repos, what is waiting on the user, and which of their \
@@ -153,13 +153,13 @@ naming up to 5 of the paths below the digest draws on, each as \
             p.push_str("- nothing new\n");
             continue;
         }
-        for path in s.changed_files.iter().take(MAX_TEAM_FILES_PER_REPO) {
+        for path in s.changed_files.iter().take(MAX_FILES_PER_REPO) {
             p.push_str(&format!("- changed: {repo}/{path}\n"));
         }
-        if s.changed_files.len() > MAX_TEAM_FILES_PER_REPO {
+        if s.changed_files.len() > MAX_FILES_PER_REPO {
             p.push_str(&format!(
                 "- …and {} more changed\n",
-                s.changed_files.len() - MAX_TEAM_FILES_PER_REPO
+                s.changed_files.len() - MAX_FILES_PER_REPO
             ));
         }
         for run in &s.finished_runs {
@@ -295,19 +295,19 @@ mod tests {
     }
 
     #[test]
-    fn team_prompt_names_every_repo_with_repo_relative_paths() {
+    fn workspace_prompt_names_every_repo_with_repo_relative_paths() {
         let db = seeded();
         let s = gather(&db, 500).unwrap();
         let repos = vec![("att-opmodel".to_string(), s), ("Project Docs".to_string(), DigestSources::default())];
         let mine = vec!["ticket ATT-014 Retry rule (in progress), target 2026-10-02".to_string()];
-        let prompt = compose_team_digest_prompt("ATT", &repos, &mine);
+        let prompt = compose_workspace_digest_prompt("ATT", &repos, &mine);
         assert!(prompt.contains("\"ATT\""));
         assert!(prompt.contains("SOURCES: repo/path1"));
         assert!(prompt.contains("- changed: att-opmodel/notes/fresh.md"));
         assert!(prompt.contains("Repo Project Docs:\n- nothing new"));
         assert!(prompt.contains("- ticket ATT-014"));
-        assert!(!team_is_quiet(&repos, &mine));
-        assert!(team_is_quiet(&[("a".into(), DigestSources::default())], &[]));
+        assert!(!workspace_is_quiet(&repos, &mine));
+        assert!(workspace_is_quiet(&[("a".into(), DigestSources::default())], &[]));
     }
 
     #[test]

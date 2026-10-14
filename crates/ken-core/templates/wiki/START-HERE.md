@@ -7,7 +7,7 @@ updated: {{date}}
 
 # Start Here
 
-The {{team_name}} knowledge base: the traps that cost the most, the repos it covers, its sections and the order to read them in. The code is the truth for how things work; this library holds why, what was decided, and what is true now.
+The {{workspace_name}} knowledge base: the traps that cost the most, the repos it covers, its sections and the order to read them in. The code is the truth for how things work; this library holds why, what was decided, and what is true now.
 
 [[#Traps]] · [[#Repos]] · [[#Sections]] · [[#Reading Order]]
 

@@ -1,24 +1,25 @@
 <script lang="ts">
-  // Team (the Wright white box, frame 9): the chosen team's repos as set-up
-  // wrote them, one row each (kind, indexed or off, branch, commit, how far
-  // behind its upstream), the index rules in the knowledge base's
-  // `.ken/knowledge.json`, what a scan found and what a repo lacks for its
-  // kind, the template files the knowledge base lacks, the pages outside its
-  // sections, the wiki's weekly sweep and what its checks found, and the
-  // team's rules and templates. It is Settings › Team library in the
-  // Briefing design.
-  // Each row opens that repo's own settings in a drawer. Add a repo (9b) and
-  // Scan again sit at the top.
+  // Workspace settings (knowledge-core decision 37; it was the Team screen):
+  // every source as set-up wrote it, one row each (indexed or off, kind,
+  // branch, commit, how far behind its upstream, its health line), what the
+  // knowledge base's `.ken/knowledge.json` holds and nothing else shows (the
+  // index rules, the tiers, each source's roles, the controls with their last
+  // results), what a scan found and what a source lacks for its kind, the
+  // template files the knowledge base lacks, the pages outside its sections,
+  // its drift runs and what its checks found, and its rules and templates.
+  // Each row opens that repo's own settings in a drawer. Add a repo and Scan
+  // again sit at the top.
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     api,
     memberLeaf,
+    type Finding,
     type IndexState,
     type RepoKind,
     type SetupMoved,
-    type TeamOverview,
-    type TeamRepo,
+    type SourceRow,
     type WikiMapPlan,
+    type WorkspaceSettings,
   } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
@@ -26,28 +27,32 @@
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import { toast } from "../lib/toast.svelte";
   import { rail } from "../lib/rail.svelte";
-  import { findingLabel, kindlessRepos, orderFindings, proposedKinds } from "../lib/team";
-  import type { TeamFinding } from "../lib/api";
-  import RepoDrawer from "../team/RepoDrawer.svelte";
+  import {
+    controlLine,
+    controlResult,
+    editorLines,
+    findingLabel,
+    kindlessRepos,
+    orderFindings,
+    parseControls,
+    proposedKinds,
+  } from "../lib/workspaceSettings";
+  import RepoDrawer from "../workspace/RepoDrawer.svelte";
   import Loading from "../lib/ui/Loading.svelte";
   import X from "@lucide/svelte/icons/x";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import SlidersHorizontal from "@lucide/svelte/icons/sliders-horizontal";
 
-  let overview = $state<TeamOverview | null>(null);
+  let overview = $state<WorkspaceSettings | null>(null);
   let moved = $state<SetupMoved[]>([]);
   let error = $state<string | null>(null);
   let busy = $state<string | null>(null);
-  let editingIgnores = $state(false);
-  let ignoresDraft = $state("");
   let newRule = $state("");
   let scanned = $state<number | null>(null);
 
-  const team = $derived(scope.team);
-
   async function refresh() {
     try {
-      overview = await api.teamOverview(team);
+      overview = await api.workspaceSettings();
       rail.setFindings(overview.findings?.length ?? 0);
       error = null;
     } catch (e) {
@@ -55,11 +60,11 @@
     }
   }
   $effect(() => {
-    void team;
+    void app.workspace?.id;
     void refresh();
   });
 
-  /** An action on Team: `what` names it in the notice when it fails. */
+  /** An action here: `what` names it in the notice when it fails. */
   async function run(label: string, what: string, f: () => Promise<unknown>) {
     busy = label;
     try {
@@ -81,24 +86,23 @@
     });
   }
 
-  // One kind per repo here; a repo set up as two (a team repo that is also
-  // its wiki) keeps both unless a person picks one.
+  // One kind per repo here; a repo set up as two (a wiki that also carries
+  // code) keeps both unless a person picks one.
   const KINDS: { v: RepoKind | ""; label: string }[] = [
     { v: "code", label: "code" },
     { v: "wiki", label: "wiki" },
-    { v: "team", label: "team" },
     { v: "reference", label: "reference" },
     { v: "", label: "not said" },
   ];
-  const kindValue = (r: TeamRepo) => (r.kind.length > 1 ? r.kind.join("+") : (r.kind[0] ?? ""));
+  const kindValue = (r: SourceRow) => (r.kind.length > 1 ? r.kind.join("+") : (r.kind[0] ?? ""));
 
-  function setKind(r: TeamRepo, value: string) {
+  function setKind(r: SourceRow, value: string) {
     const kind = value === "" ? [] : (value.split("+") as RepoKind[]);
-    void run(`k${r.id}`, "Could not set the kind", () => api.setProjectKind(r.id, kind, team));
+    void run(`k${r.id}`, "Could not set the kind", () => api.setProjectKind(r.id, kind));
   }
 
   // Two states (knowledge-core decision 34): a repo is indexed or it is off.
-  function setIndex(r: TeamRepo, value: string) {
+  function setIndex(r: SourceRow, value: string) {
     void run(`i${r.id}`, "Could not change whether Ken indexes it", () =>
       api.setProjectIndex(r.id, value === "off" ? ("off" as IndexState) : null),
     );
@@ -109,7 +113,7 @@
   function addMissing() {
     const paths = (overview?.templateGaps ?? []).filter((g) => g.state === "missing").map((g) => g.path);
     if (paths.length === 0) return;
-    void run("templates", "Could not add the template files", () => api.teamAddTemplateFiles(paths));
+    void run("templates", "Could not add the template files", () => api.workspaceAddTemplateFiles(paths));
   }
 
   // The wiki's pages outside the sections, placed after a dry run.
@@ -134,10 +138,10 @@
     });
   }
 
-  function takeOut(e: MouseEvent, r: TeamRepo) {
+  function takeOut(e: MouseEvent, r: SourceRow) {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     openConfirm(rect.left - 220, rect.bottom + 4, {
-      title: `Remove ${memberLeaf(r.name)} from the team?`,
+      title: `Remove ${memberLeaf(r.name)} from the workspace?`,
       body: "Ken stops indexing it. The folder and its files stay on disk.",
       confirmLabel: "Remove",
       onConfirm: () =>
@@ -150,7 +154,7 @@
 
   async function addRepos() {
     if (!overview) return;
-    const picked = await openDialog({ directory: true, multiple: true, title: "Add a repo to the team" });
+    const picked = await openDialog({ directory: true, multiple: true, title: "Add a repo to the workspace" });
     const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
     if (paths.length === 0) return;
     const name = overview.workspace;
@@ -158,7 +162,7 @@
       const proposal = await api.setupProposeRepos(paths);
       const rows = proposal.rows.map((r) => ({ ...r, include: true }));
       await app.confirmSetupRepos(name, rows, true);
-      app.openTeam();
+      app.openWorkspaceSettings();
       await scope.refreshGroups();
     });
   }
@@ -172,11 +176,48 @@
     });
   }
 
+  // ── The editors of `.ken/knowledge.json` ────────────────────────────
+  // One open at a time: `editing` names it, `draft` holds its text.
+  let editing = $state<string | null>(null);
+  let draft = $state("");
+  function edit(what: string, lines: string[]) {
+    editing = what;
+    draft = lines.join("\n");
+  }
+
   function saveIgnores() {
-    const lines = ignoresDraft.split("\n");
-    void run("ignores", "Could not save the ignore list", async () => {
-      await api.teamSaveIgnores(lines);
-      editingIgnores = false;
+    const lines = editorLines(draft);
+    void run("ignores", "Could not save the index rules", async () => {
+      await api.workspaceSaveIgnores(lines);
+      editing = null;
+    });
+  }
+
+  function saveWeights() {
+    const lines = editorLines(draft);
+    void run("weights", "Could not save the tiers", async () => {
+      await api.workspaceSaveWeights(lines);
+      editing = null;
+    });
+  }
+
+  function saveRoles(r: SourceRow) {
+    const lines = editorLines(draft);
+    void run(`roles${r.id}`, `Could not save ${memberLeaf(r.name)}'s roles`, async () => {
+      await api.workspaceSaveRoles(r.id, r.settingsName, lines);
+      editing = null;
+    });
+  }
+
+  function saveControls() {
+    const { controls, bad } = parseControls(draft);
+    if (bad.length > 0) {
+      toast.error("Each control needs a question and a file", bad.join(" · "));
+      return;
+    }
+    void run("controls", "Could not save the controls", async () => {
+      await api.workspaceSaveControls(controls);
+      editing = null;
     });
   }
 
@@ -191,7 +232,7 @@
     const rule = newRule.trim();
     if (!id || !rule) return;
     void run("rule", "Could not add the rule", async () => {
-      const path = await api.teamAddRule(id, rule);
+      const path = await api.workspaceAddRule(id, rule);
       newRule = "";
       await openInWiki(path);
     });
@@ -204,7 +245,7 @@
     app.openInFiles(path);
   }
 
-  async function openFinding(f: TeamFinding) {
+  async function openFinding(f: Finding) {
     if (!f.path) return;
     const id = f.projectId ?? overview?.wiki?.id;
     if (id && app.focused !== id) await app.focusMember(id);
@@ -212,8 +253,8 @@
   }
 
   // ── A repo's own settings, in a drawer from its row ─────────────────
-  let drawer = $state<TeamRepo | null>(null);
-  async function openDrawer(r: TeamRepo) {
+  let drawer = $state<SourceRow | null>(null);
+  async function openDrawer(r: SourceRow) {
     drawer = r;
     try {
       await app.focusMember(r.id, { stay: true });
@@ -238,20 +279,22 @@
     const chosen = Object.entries(kindDraft).filter(([, v]) => v !== "");
     if (chosen.length === 0) return;
     void run("kinds", "Could not set the kinds", async () => {
-      for (const [id, v] of chosen) await api.setProjectKind(id, v.split("+") as RepoKind[], team);
+      for (const [id, v] of chosen) await api.setProjectKind(id, v.split("+") as RepoKind[]);
       kindsOpen = false;
     });
   }
 
   const rows = $derived(overview ? [...(overview.wiki ? [overview.wiki] : []), ...overview.repos] : []);
+  const codeRows = $derived(rows.filter((r) => r.kind.includes("code") || r.kind.includes("reference")));
   const driftCount = $derived(moved.length + rows.filter((r) => (r.behind ?? 0) > 0).length);
   const findings = $derived(orderFindings(overview?.findings ?? []));
   const kindless = $derived(kindlessRepos(rows));
+  const controlsPassing = $derived((overview?.controls ?? []).filter((c) => c.passed).length);
 </script>
 
 <div class="team">
   <div class="head">
-    <strong class="tname">{team ?? overview?.workspace ?? ""}</strong>
+    <strong class="tname">{overview?.workspace ?? app.workspace?.name ?? ""}</strong>
     <span class="spacer"></span>
     {#if overview}
       <span class="chip" class:warn={driftCount > 0}>drifted · {driftCount}</span>
@@ -263,7 +306,7 @@
   </div>
   {#if error}<p class="warn-text">{error}</p>{/if}
   {#if !overview && !error}
-    <Loading label="Reading the team's folders…" lines={4} />
+    <Loading label="Reading the workspace's folders…" lines={4} />
   {/if}
 
   {#if overview && kindless.length > 0}
@@ -271,8 +314,8 @@
       <div class="kinds-head">
         <span>
           <strong>Set what each repo is.</strong>
-          {kindless.length} {kindless.length === 1 ? "repo has" : "repos have"} no kind, so Ken does not know how deep to read
-          {kindless.length === 1 ? "it" : "them"} or where the team's tickets and escalations go.
+          {kindless.length} {kindless.length === 1 ? "repo has" : "repos have"} no kind, so Ken does not know whether
+          {kindless.length === 1 ? "it is" : "they are"} the knowledge base, code or a reference.
         </span>
         {#if !kindsOpen}
           <button class="btn btn-small btn-primary" onclick={() => void openKinds()}>Set kinds</button>
@@ -292,7 +335,7 @@
             </span>
           </div>
         {/each}
-        <p class="note">Filled in from what is in each repo. A wiki is the repo with the Research/Ingestion inbox.</p>
+        <p class="note">Filled in from what is in each repo. The knowledge base (wiki) is the repo with the Research/Ingestion inbox.</p>
         <div class="actions">
           <button class="btn btn-ghost btn-small" onclick={() => (kindsOpen = false)}>Cancel</button>
           <button class="btn btn-primary btn-small" disabled={busy !== null} onclick={saveKinds}>Save</button>
@@ -305,11 +348,11 @@
     <div class="cols">
       <div class="left">
         <div class="divider">
-          repos · {rows.length}{#if scanned} · last scan {timeAgo(scanned)}{/if}
+          sources · {rows.length}{#if scanned} · last scan {timeAgo(scanned)}{/if}
         </div>
         <table>
           <thead>
-            <tr><th>index</th><th>repo</th><th>kind</th><th>branch</th><th>commit</th><th>drift</th><th></th></tr>
+            <tr><th>index</th><th>source</th><th>kind</th><th>branch</th><th>commit</th><th>drift</th><th></th></tr>
           </thead>
           <tbody>
             {#each rows as r (r.id)}
@@ -330,8 +373,9 @@
                 </td>
                 <td>
                   <button class="repo" title="{memberLeaf(r.name)}: its settings" onclick={() => void openDrawer(r)}>
-                    <span class="rname">{memberLeaf(r.name)}</span>
+                    <span class="rname">{memberLeaf(r.name)}{r.id === overview.wiki?.id ? " · knowledge base" : ""}</span>
                     <span class="sub mono" title={r.path}>{r.description || r.path}</span>
+                    <span class="sub">{r.health ?? "not indexed yet"}</span>
                   </button>
                 </td>
                 <td>
@@ -365,8 +409,8 @@
                       class="remove"
                       disabled={busy !== null}
                       onclick={(e) => takeOut(e, r)}
-                      title="Remove from the team"
-                      aria-label="Remove {memberLeaf(r.name)} from the team"
+                      title="Remove from the workspace"
+                      aria-label="Remove {memberLeaf(r.name)} from the workspace"
                     >
                       <X size={14} strokeWidth={1.75} />
                     </button>
@@ -378,27 +422,20 @@
         </table>
 
         <div class="divider">index rules · .ken/knowledge.json · {overview.ignores.length} {overview.ignores.length === 1 ? "line" : "lines"}</div>
-        {#if editingIgnores}
-          <textarea class="mono" rows="8" bind:value={ignoresDraft}></textarea>
+        {#if editing === "ignores"}
+          <textarea class="mono" rows="8" bind:value={draft}></textarea>
           <p class="note">
             One path or pattern a line: a path is indexed or it isn't. A bare line leaves it out, a
             <span class="mono">!path/</span> line brings it back. Saved in the knowledge base; every repo is scanned again.
           </p>
           <div class="actions">
-            <button class="btn btn-ghost" onclick={() => (editingIgnores = false)}>Cancel</button>
+            <button class="btn btn-ghost" onclick={() => (editing = null)}>Cancel</button>
             <button class="btn btn-primary" disabled={busy !== null} onclick={saveIgnores}>Save</button>
           </div>
         {:else}
           <div class="ignores">
             <span class="mono">{overview.ignores.length > 0 ? overview.ignores.join(" · ") : "VCS, dependencies, build output, secrets, tests, minified and generated files and binaries are left out already"}</span>
-            <button
-              class="btn btn-ghost"
-              onclick={() => {
-                ignoresDraft = (overview?.ignores ?? []).join("\n");
-                editingIgnores = true;
-              }}
-              disabled={!overview.wiki}>Edit</button
-            >
+            <button class="btn btn-ghost" onclick={() => edit("ignores", overview?.ignores ?? [])} disabled={!overview.wiki}>Edit</button>
           </div>
           {#if overview.legacyIgnores.length > 0}
             <p class="note">
@@ -406,6 +443,77 @@
               <span class="mono">{overview.legacyIgnores.join(" · ")}</span>
             </p>
           {/if}
+        {/if}
+
+        <div class="divider">tiers · search.weights · {overview.weights.length}</div>
+        {#if editing === "weights"}
+          <textarea class="mono" rows="6" bind:value={draft}></textarea>
+          <p class="note">
+            One <span class="mono">pattern = tier</span> a line: binding, current, reference, record or superseded, or a
+            number added to a hit's score. The longest pattern wins. The knowledge base is scanned again.
+          </p>
+          <div class="actions">
+            <button class="btn btn-ghost" onclick={() => (editing = null)}>Cancel</button>
+            <button class="btn btn-primary" disabled={busy !== null} onclick={saveWeights}>Save</button>
+          </div>
+        {:else}
+          <div class="ignores">
+            <span class="mono">{overview.weights.length > 0 ? overview.weights.join(" · ") : "The built-in tiers only: rulings and Rules bind, Current and Design pages are current, records and notes weigh less"}</span>
+            <button class="btn btn-ghost" onclick={() => edit("weights", overview?.weights ?? [])} disabled={!overview.wiki}>Edit</button>
+          </div>
+        {/if}
+
+        <div class="divider">roles · code and reference sources · {codeRows.length}</div>
+        {#each codeRows as r (r.id)}
+          {#if editing === `roles${r.id}`}
+            <div class="entry"><span><strong>{memberLeaf(r.name)}</strong></span></div>
+            <textarea class="mono" rows="5" bind:value={draft}></textarea>
+            <p class="note">
+              One <span class="mono">pattern = role</span> a line, such as <span class="mono">src/net/** = protocol</span>. The
+              longest pattern wins; a file no rule names gets a built-in role. {memberLeaf(r.name)} is scanned again.
+            </p>
+            <div class="actions">
+              <button class="btn btn-ghost" onclick={() => (editing = null)}>Cancel</button>
+              <button class="btn btn-primary" disabled={busy !== null} onclick={() => saveRoles(r)}>Save</button>
+            </div>
+          {:else}
+            <div class="entry">
+              <span>
+                <strong>{memberLeaf(r.name)}</strong>
+                <span class="mono">{r.roles.length > 0 ? r.roles.join(" · ") : "built-in roles only"}</span>
+              </span>
+              <span class="e-actions"><button class="btn btn-ghost" disabled={!overview.wiki} onclick={() => edit(`roles${r.id}`, r.roles)}>Edit</button></span>
+            </div>
+          {/if}
+        {:else}
+          <p class="note">No code or reference source yet.</p>
+        {/each}
+
+        <div class="divider">controls · {controlsPassing} of {overview.controls.length} passing</div>
+        {#if editing === "controls"}
+          <textarea class="mono" rows="6" bind:value={draft}></textarea>
+          <p class="note">
+            One <span class="mono">question | file | source</span> a line: the file the question must find in the top 5. No
+            source means the knowledge base. They run at each source's next rebuild.
+          </p>
+          <div class="actions">
+            <button class="btn btn-ghost" onclick={() => (editing = null)}>Cancel</button>
+            <button class="btn btn-primary" disabled={busy !== null} onclick={saveControls}>Save</button>
+          </div>
+        {:else}
+          {#each overview.controls as c, i (i)}
+            <div class="entry">
+              <span>
+                {c.question} → <span class="mono">{c.expect}</span>{#if c.source}<span class="sub"> · {c.source}</span>{/if}
+              </span>
+              <span class="e-actions"><span class:bad={c.ran && !c.passed}>{controlResult(c)}</span></span>
+            </div>
+          {:else}
+            <p class="note">No controls yet. Set-up proposes a few for each source once Claude has read its file list.</p>
+          {/each}
+          <div class="actions">
+            <button class="btn btn-ghost" disabled={!overview.wiki} onclick={() => edit("controls", (overview?.controls ?? []).map(controlLine))}>Edit</button>
+          </div>
         {/if}
 
         {#if overview.wiki}
@@ -458,7 +566,7 @@
           <div class="entry">
             {#if m.change === "NewFolder"}
               <span><strong>{memberLeaf(m.member)}</strong> is a new folder beside the repos.</span>
-              <span class="e-actions"><button class="btn btn-primary" disabled={busy !== null} onclick={() => addFolder(m.member)}>Add to team</button></span>
+              <span class="e-actions"><button class="btn btn-primary" disabled={busy !== null} onclick={() => addFolder(m.member)}>Add to the workspace</button></span>
             {:else if m.change === "Gone"}
               <span><strong>{memberLeaf(m.member)}</strong>'s folder is gone.</span>
             {:else}
@@ -480,7 +588,7 @@
 
         <div class="divider">drift · runs when the code moves, and weekly</div>
         {#if !overview.wiki}
-          <p class="note">No wiki, so nothing to check.</p>
+          <p class="note">No knowledge base, so nothing to check.</p>
         {:else if overview.sweep}
           <div class="entry">
             <span>
@@ -518,7 +626,7 @@
             {/if}
           </div>
         {:else}
-          <p class="note">{overview.wiki ? "Nothing found." : "No wiki, so nothing to check."}</p>
+          <p class="note">{overview.wiki ? "Nothing found." : "No knowledge base, so nothing to check."}</p>
         {/each}
 
         <div class="divider">rules · Rules · {overview.rules.length}</div>
@@ -542,7 +650,6 @@
         {/each}
       </div>
     </div>
-
   {/if}
 </div>
 

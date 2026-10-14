@@ -72,11 +72,11 @@ describe("setup flow", () => {
   it("lists the sources on the knowledge base and lets its own row replace a source", () => {
     const rows = [row("docs"), row("game", { kind: ["code"], description: "The client" }), row("old", { include: false })];
     expect(coveredRepos(rows, "C:/Code/docs")).toEqual([{ name: "game", description: "The client", kind: ["code"], path: "C:/Code/game" }]);
-    const kb = row("docs", { kind: ["team", "wiki"] });
+    const kb = row("docs", { kind: ["wiki"] });
     expect(withKnowledgeBase(rows, kb).map((r) => [r.member, r.kind])).toEqual([
       ["game", ["code"]],
       ["old", []],
-      ["docs", ["team", "wiki"]],
+      ["docs", ["wiki"]],
     ]);
     expect(commonParent(rows)).toBe("C:/Code");
   });

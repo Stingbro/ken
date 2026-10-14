@@ -11,7 +11,7 @@
   import SetupFlow from "./SetupFlow.svelte";
 
   // Ken works in workspaces: this screen opens one it knows, or sets up a
-  // new one (Folder, Team, Repos, Index).
+  // new one (its name, where the knowledge base is saved, its sources).
   let error = $state<string | null>(null);
   let setupOpen = $state(false);
 
@@ -103,8 +103,7 @@
           <span class="choice-title">Set up a new workspace</span>
           <span class="choice-note">
             Pick the repos Ken should know, wherever they live. It proposes what
-            each is, its team and how deep to read it; nothing is written until
-            you confirm.
+            each is; nothing is written until you confirm.
           </span>
         </button>
       </div>

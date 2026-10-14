@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { findingLabel, kindlessRepos, orderFindings, proposedKinds } from "./team";
-import type { RepoKind, TeamFinding } from "./api";
+import { controlLine, controlResult, editorLines, findingLabel, kindlessRepos, orderFindings, parseControls, proposedKinds } from "./workspaceSettings";
+import type { Finding, RepoKind } from "./api";
 
-const finding = (kind: string, title = kind): TeamFinding => ({ kind, title, detail: "", path: null, projectId: null });
+const finding = (kind: string, title = kind): Finding => ({ kind, title, detail: "", path: null, projectId: null });
 
 describe("findingLabel", () => {
   it("names each kind plainly", () => {
@@ -54,5 +54,38 @@ describe("proposedKinds", () => {
       { member: "notes", path: "C:/notes", kind: [] as RepoKind[] },
     ];
     expect(proposedKinds(repos, rows)).toEqual({ "1": ["wiki"], "2": ["code"] });
+  });
+});
+
+describe("editorLines", () => {
+  it("trims each line and drops the blank ones", () => {
+    expect(editorLines(" Rules/ = binding \r\n\n  \nResearch/ = record")).toEqual(["Rules/ = binding", "Research/ = record"]);
+    expect(editorLines("")).toEqual([]);
+  });
+});
+
+describe("controls", () => {
+  it("reads question | file | source lines, and says which it could not", () => {
+    const { controls, bad } = parseControls(
+      "how are worlds saved | src/Save.java | Game\nwhere do rules live | Rules/Index.md\njust a question\n | x.md",
+    );
+    expect(controls).toEqual([
+      { question: "how are worlds saved", expect: "src/Save.java", source: "Game" },
+      { question: "where do rules live", expect: "Rules/Index.md", source: null },
+    ]);
+    expect(bad).toEqual(["just a question", "| x.md"]);
+  });
+
+  it("writes a control back as the editor reads it", () => {
+    const c = { question: "how are worlds saved", expect: "src/Save.java", source: "Game" };
+    expect(controlLine(c)).toBe("how are worlds saved | src/Save.java | Game");
+    expect(controlLine({ ...c, source: null })).toBe("how are worlds saved | src/Save.java");
+    expect(parseControls(controlLine(c)).controls).toEqual([c]);
+  });
+
+  it("says how a control did on its last run", () => {
+    expect(controlResult({ ran: false, rank: null, passed: false })).toBe("not run yet");
+    expect(controlResult({ ran: true, rank: 2, passed: true })).toBe("passes, at 2");
+    expect(controlResult({ ran: true, rank: null, passed: false })).toBe("fails: not in the top 5");
   });
 });

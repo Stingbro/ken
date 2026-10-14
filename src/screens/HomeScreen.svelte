@@ -1,6 +1,6 @@
 <script lang="ts">
   // Home (the Briefing design): your morning briefing. The digest Ken wrote
-  // for the team, your list (tickets are square, tasks are round), the files
+  // for the workspace, your list (tickets are square, tasks are round), the files
   // you were in, and on the right the top of the Inbox and what Ken is
   // reading. Clicking a task opens its panel in place of the right rail.
   import { onMount } from "svelte";
@@ -12,7 +12,7 @@
   import { digestMarkdown } from "../lib/assist";
   import { renderMarkdown } from "../lib/markdown";
   import { parseCitation } from "../lib/citation";
-  import { loadRecents, mergeTeamRecents, fallbackRecents } from "../lib/recent";
+  import { loadRecents, mergeWorkspaceRecents, fallbackRecents } from "../lib/recent";
   import { kindForPath, timeAgo } from "../lib/format";
   import { toast } from "../lib/toast.svelte";
   import type { DayTask } from "../lib/api";
@@ -128,14 +128,14 @@
   // ── Picked up where you left off ──────────────────────────────────
 
   const recents = $derived.by(() => {
-    const ids = scope.teamProjectIds;
+    const ids = scope.workspaceProjectIds;
     const focused = app.focused;
     const lists = ids.map((id) => ({
       projectId: id,
       entries: id === focused ? app.recents : loadRecents(id),
       known: id === focused ? new Set(app.files.map((f) => f.relPath)) : null,
     }));
-    const merged = mergeTeamRecents(lists);
+    const merged = mergeWorkspaceRecents(lists);
     if (merged.length > 0) return merged.slice(0, 8);
     return focused ? fallbackRecents(app.files).slice(0, 8).map((f) => ({ projectId: focused, path: f.relPath, at: f.at })) : [];
   });

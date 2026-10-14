@@ -79,7 +79,6 @@ pub fn prompt(name: &str, kinds: &[RepoKind], files: &[String], titles: &[(Strin
     let kinds: Vec<&str> = kinds
         .iter()
         .map(|k| match k {
-            RepoKind::Team => "team",
             RepoKind::Wiki => "wiki",
             RepoKind::Code => "code",
             RepoKind::Reference => "reference",
@@ -230,7 +229,7 @@ mod tests {
         let titles = vec![("Design/Saving.md".to_string(), "How worlds save".to_string())];
         let p = prompt("Game", &[RepoKind::Code], &files, &titles);
         assert!(p.contains("\"Game\" (kind: code)") && p.contains("service, ") && p.contains("Design/Saving.md | How worlds save\n"), "{p}");
-        let p = prompt("Wiki", &[RepoKind::Wiki, RepoKind::Team], &files, &[]);
+        let p = prompt("Wiki", &[RepoKind::Wiki], &files, &[]);
         assert!(p.contains("propose no roles"), "{p}");
     }
 

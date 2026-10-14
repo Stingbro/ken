@@ -1,16 +1,15 @@
 // The rail's counts that come from the backend: sources with something
-// waiting on Ingest, and what the wiki's checks found on Team (Team adds
-// the unread team inbox messages itself). Read on a change of team and
-// after the events that move them; Ingest and Team hand in what they read.
+// waiting on Ingest, and what the knowledge base's checks found. Read on a
+// change of workspace and after the events that move them; Ingest and the
+// workspace settings screen hand in what they read.
 import { api } from "./api";
 import { app } from "./app.svelte";
-import { scope } from "./scope.svelte";
 import { coalesce, singleFlight } from "./refresh";
 
 /** Scans fire in bursts; read the counts once, after this quiet spell. */
 const DEBOUNCE_MS = 1500;
-/** Team's findings come from a sweep that runs now and then; look again
- *  this often in case one ran with Team closed. */
+/** The findings come from checks that run now and then; look again this
+ *  often in case one ran with the settings screen closed. */
 const FINDINGS_EVERY_MS = 5 * 60 * 1000;
 
 class RailStore {
@@ -28,7 +27,6 @@ class RailStore {
     setInterval(() => void this.refreshFindings(), FINDINGS_EVERY_MS);
     $effect.root(() => {
       $effect(() => {
-        void scope.team;
         void app.workspace?.id;
         void this.refreshIngest();
         void this.refreshFindings();
@@ -51,16 +49,16 @@ class RailStore {
    *  (see `singleFlight`). */
   readonly refreshIngest = singleFlight(async () => {
     if (!app.workspace) return;
-    const team = scope.team;
-    const o = await api.ingestOverview(team).catch(() => null);
-    if (o && team === scope.team) this.setIngest(o.waiting ?? 0);
+    const ws = app.workspace.id;
+    const o = await api.ingestOverview().catch(() => null);
+    if (o && ws === app.workspace?.id) this.setIngest(o.waiting ?? 0);
   });
 
   readonly refreshFindings = singleFlight(async () => {
     if (!app.workspace) return;
-    const team = scope.team;
-    const o = await api.teamOverview(team).catch(() => null);
-    if (o && team === scope.team) this.setFindings(o.findings?.length ?? 0);
+    const ws = app.workspace.id;
+    const found = await api.knowledgeFindings().catch(() => null);
+    if (found && ws === app.workspace?.id) this.setFindings(found.length);
   });
 
   setIngest(n: number) {

@@ -1707,7 +1707,7 @@ folder in the Ken app first."
         None => routing::plan_route(&query, &members),
     };
     let types = types_arg(args);
-    // One vocabulary for the whole search (the team wiki's widens every repo).
+    // One vocabulary for the whole search (the knowledge base's widens every repo).
     let shared_vocab = routing::workspace_vocabulary(dbs.values());
     let qv = if members.is_empty() { Err("nothing to search".to_string()) } else { query_vector(server, &query) };
     let run = |ids: &[Uuid]| -> Vec<MemberHits> {
@@ -1912,7 +1912,7 @@ fn journal_append_tool(server: &Server, args: &Value) -> Result<String, String> 
 
 /// The task home for one call: the workspace home, where every task lives.
 /// A repo's own `.ken/tasks/` is not a home (tasks live in your own folder,
-/// not in a team repo).
+/// not in a repo).
 struct TaskHomes {
     workspace_root: PathBuf,
 }
@@ -2171,7 +2171,7 @@ fn propose_decision(server: &Server, args: &Value) -> Result<String, String> {
     let (today, _) = local_today_and_time();
     let entry = RulingEntry {
         ruling: ruling.trim().to_string(),
-        decider: opt_str(args, "who"),
+        who: opt_str(args, "who"),
         date: today,
         note: opt_str(args, "source").map(|s| note_name(&s)).unwrap_or_default(),
         topic: opt_str(args, "topic").unwrap_or_default(),
@@ -2184,7 +2184,7 @@ fn propose_decision(server: &Server, args: &Value) -> Result<String, String> {
     // when a person adds it.
     let proposed = ken_core::ingest::decisions_entry(&text, &entry);
     let title = format!("Ruling: {}", entry.ruling.chars().take(60).collect::<String>());
-    let who = entry.decider.as_deref().map(|w| format!(", made by {w}")).unwrap_or_default();
+    let who = entry.who.as_deref().map(|w| format!(", made by {w}")).unwrap_or_default();
     let body = format!(
         "Proposed in chat{who}: \"{}\". Add it to the decisions log in one click; it takes the next number then. Or discard it.",
         entry.ruling
@@ -2993,7 +2993,7 @@ mod tests {
         let (_base, _ra, rb, mut server) = two_project_fixture();
         let mut registry = Registry::load(&server.base_dir).unwrap();
         let zeus = registry.projects.iter().find(|e| e.name == "Zeus").unwrap().id;
-        assert!(registry.set_kind(zeus, vec![registry::RepoKind::Reference], None));
+        assert!(registry.set_kind(zeus, vec![registry::RepoKind::Reference]));
         registry.save(&server.base_dir).unwrap();
         std::fs::write(rb.path().join("engine.md"), "The rendering pipeline draws every chunk.\n").unwrap();
         let project = Project::open(rb.path()).unwrap();
@@ -3406,7 +3406,7 @@ mod tests {
         assert_eq!(p.page, "Decisions/DECISIONS.md");
         assert_eq!(p.from.as_deref(), Some(ken_core::proposal::FROM_CHAT));
         let entry = p.append.as_ref().unwrap();
-        assert_eq!((entry.note.as_str(), entry.decider.as_deref()), ("2026-10-12-standup", Some("Ana")));
+        assert_eq!((entry.note.as_str(), entry.who.as_deref()), ("2026-10-12-standup", Some("Ana")));
         assert!(p.proposed.contains("\n## D-002 · ") && p.proposed.contains("**Combat ships after region saves.**"), "{}", p.proposed);
         assert!(p.proposed.contains("sources: [[2026-10-12-standup]]\naliases: combat order\nsupersedes: D-001\n"), "{}", p.proposed);
 

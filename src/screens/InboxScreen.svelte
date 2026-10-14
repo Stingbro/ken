@@ -3,7 +3,6 @@
   // who it is from. The list on the left, the item on the right with its
   // actions. Dealing with an item here deals with it where it came from.
   import { app } from "../lib/app.svelte";
-  import { scope } from "../lib/scope.svelte";
   import { api } from "../lib/api";
   import { inbox, type InboxGroup, type InboxItem } from "../lib/inbox.svelte";
   import { conflicts } from "../lib/conflicts.svelte";
@@ -22,7 +21,6 @@
   let filter = $state<Filter>("all");
   const filters: { key: Filter; label: string }[] = [
     { key: "all", label: "All" },
-    { key: "people", label: "People" },
     { key: "ken", label: "Ken" },
     { key: "sync", label: "Sync & files" },
   ];
@@ -32,10 +30,6 @@
   const isDone = $derived(!!sel && inbox.done.some((d) => d.id === sel.id));
 
   let busy = $state(false);
-  let reply = $state("");
-  /** Answering an escalation: a reply in its thread, or the answer that
-   *  resolves it. */
-  let escMode = $state<"reply" | "resolve" | null>(null);
   let doneNote = $state<Record<string, string>>({});
 
   function when(item: InboxItem): string {
@@ -49,7 +43,6 @@
       doneNote = { ...doneNote, [item.id]: note };
       inbox.resolved(item);
       inbox.select(item.id);
-      reply = "";
     } catch (e) {
       toast.error("That did not go through", e);
     } finally {
@@ -86,14 +79,6 @@
       }
       case "conflict":
         return [];
-      case "escalation": {
-        const e = s.escalation;
-        return [
-          { label: "Resolve", primary: true, run: () => ((escMode = "resolve"), (reply = "")) },
-          { label: "Reply", run: () => ((escMode = "reply"), (reply = "")) },
-          { label: "Open it", run: () => void openInRepo(e.projectId, e.relPath) },
-        ];
-      }
       case "failed":
         return [{ label: "Open in Files", primary: true, run: () => app.openInFiles(s.relPath) }];
       case "chat":
@@ -110,30 +95,6 @@
     }
   }
 
-  async function sendEscalation(item: InboxItem) {
-    const s = item.source;
-    if (s.type !== "escalation" || !reply.trim() || !escMode) return;
-    const e = s.escalation;
-    const text = reply.trim();
-    if (escMode === "resolve") {
-      await act(item, () => api.escalationReply(e.projectId, e.relPath, text, true), "Resolved. Your answer is in its thread.");
-      escMode = null;
-      return;
-    }
-    // A reply keeps it open: it stays in the list.
-    busy = true;
-    try {
-      await api.escalationReply(e.projectId, e.relPath, text, false);
-      toast.show("Your reply is in its thread.");
-      reply = "";
-      escMode = null;
-    } catch (err) {
-      toast.error("That did not go through", err);
-    } finally {
-      busy = false;
-    }
-  }
-
   async function ignoreFile(item: InboxItem) {
     if (item.source.type !== "failed") return;
     const rel = item.source.relPath;
@@ -142,8 +103,6 @@
 
   function selectItem(id: string) {
     inbox.select(id);
-    escMode = null;
-    reply = "";
   }
 
   const emptyHead = $derived(filter === "all" ? "Nothing waiting on you" : "Nothing here");
@@ -218,12 +177,6 @@
             Ken couldn't read {sel.source.relPath.split("/").pop()}{sel.source.error ? `: ${sel.source.error}` : ""}. It may be a scan
             with no text, or a protected file. It is still found by name.
           </p>
-        {:else if sel.source.type === "escalation"}
-          <p class="body">
-            {sel.source.escalation.raisedBy || "A teammate"} raised this decision to you{sel.source.escalation.ticket ? ` on ${sel.source.escalation.ticket}` : ""}.{sel.source.escalation.blocks ? ` It blocks ${sel.source.escalation.blocks}.` : ""}
-            Resolve it with your answer, or reply in its thread to ask something first. Both are written to
-            the file in {sel.source.escalation.repo}.
-          </p>
         {:else if sel.source.type === "chat"}
           <p class="body">Ken stopped in “{sel.source.title || "a chat"}” to ask you something. Answer it in Ask Ken and it carries on.</p>
         {/if}
@@ -234,25 +187,10 @@
             {doneNote[sel.id] ?? "Done."}
           </div>
         {:else}
-          {#if escMode && sel.source.type === "escalation"}
-            <textarea
-              class="textarea"
-              bind:value={reply}
-              rows="3"
-              placeholder={escMode === "resolve" ? "Your answer, as the decision…" : `Reply to ${sel.source.escalation.raisedBy || "them"}…`}
-            ></textarea>
-          {/if}
           <div class="acts">
-            {#if escMode && sel.source.type === "escalation"}
-              <button class="btn btn-primary" disabled={busy || !reply.trim()} onclick={() => sel && void sendEscalation(sel)}>
-                {escMode === "resolve" ? "Resolve" : "Send reply"}
-              </button>
-              <button class="btn btn-ghost" onclick={() => (escMode = null)}>Cancel</button>
-            {:else}
-              {#each actions(sel) as a, i}
-                <button class="btn" class:btn-primary={a.primary && i === 0} disabled={busy} onclick={a.run}>{a.label}</button>
-              {/each}
-            {/if}
+            {#each actions(sel) as a, i}
+              <button class="btn" class:btn-primary={a.primary && i === 0} disabled={busy} onclick={a.run}>{a.label}</button>
+            {/each}
             <span class="grow"></span>
             {#if sel.source.type === "failed"}
               <button class="btn btn-ghost" title="Stop showing this file's problems (only for you)" disabled={busy} onclick={() => sel && void ignoreFile(sel)}>
@@ -265,7 +203,7 @@
     {:else}
       <div class="k-empty quiet">
         <span class="head">{emptyHead}</span>
-        <span class="body">When a teammate sends you something, or Ken needs a decision, it shows up here.</span>
+        <span class="body">When Ken needs a decision, or sync needs you, it shows up here.</span>
       </div>
     {/if}
   </main>

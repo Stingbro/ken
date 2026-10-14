@@ -3,7 +3,7 @@
 // 32): the workspace's name, where its knowledge base is saved, its sources.
 import type { CoveredRepo, RepoKind, SetupRepoRow } from "../lib/api";
 
-export const KINDS: RepoKind[] = ["team", "wiki", "code", "reference"];
+export const KINDS: RepoKind[] = ["wiki", "code", "reference"];
 
 export type Step = "name" | "base" | "sources";
 export const STEPS: { step: Step; label: string }[] = [
@@ -57,12 +57,12 @@ export type KbChoice =
 
 /** A new knowledge base named after the workspace. */
 export function defaultKb(workspace: string, parent: string | null = null): KbChoice {
-  return { mode: "new", parent, name: `${workspace.trim() || "Team"}-Wiki` };
+  return { mode: "new", parent, name: `${workspace.trim() || "Workspace"}-Wiki` };
 }
 
 /** The new knowledge base still named after the workspace takes its new name. */
 export function renamedKb(c: KbChoice, from: string, to: string): KbChoice {
-  return c.mode === "new" && c.name === `${from.trim() || "Team"}-Wiki` ? { ...c, name: `${to.trim() || "Team"}-Wiki` } : c;
+  return c.mode === "new" && c.name === `${from.trim() || "Workspace"}-Wiki` ? { ...c, name: `${to.trim() || "Workspace"}-Wiki` } : c;
 }
 
 /** Step 2 is done: a new repo has a folder and a name, an existing wiki a folder. */

@@ -1,6 +1,6 @@
 <script lang="ts">
   // The conflict view, opened from the banner at the top of Files: every
-  // sync conflict and conflicted copy in the team's repos, one shown at a
+  // sync conflict and conflicted copy in the workspace's repos, one shown at a
   // time with its versions and the ways to settle it.
   import { app } from "../lib/app.svelte";
   import { conflicts } from "../lib/conflicts.svelte";

@@ -9,16 +9,16 @@ vi.mock("./api", () => ({
     onDayChanged: vi.fn(async (cb: () => void) => {
       listeners.dayChanged = cb;
     }),
-    onTeamDigestGenerating: vi.fn(async () => {}),
-    onTeamDigestUpdated: vi.fn(async () => {}),
-    onTeamDigestError: vi.fn(async () => {}),
+    onDayDigestGenerating: vi.fn(async () => {}),
+    onDayDigestUpdated: vi.fn(async () => {}),
+    onDayDigestError: vi.fn(async () => {}),
     onIndexUpdated: vi.fn(async (cb: () => void) => {
       listeners.indexUpdated = cb;
     }),
     claudeDoctor: vi.fn(async () => ({ found: true })),
     dayState: vi.fn(async () => ({ tickets: [], tasks: [], me: { name: null, email: null }, hasTickets: false })),
-    teamDigest: vi.fn(async () => null),
-    teamDigestWriting: vi.fn(async () => false),
+    dayDigest: vi.fn(async () => null),
+    dayDigestWriting: vi.fn(async () => false),
     indexHealth: vi.fn(async () => ({
       reposIndexed: 0,
       repos: 0,
@@ -42,8 +42,6 @@ vi.mock("./api", () => ({
 vi.mock("./app.svelte", () => ({
   app: { workspace: { id: "ws1", members: [] }, registry: [], screen: "home" },
 }));
-
-vi.mock("./scope.svelte", () => ({ scope: { team: null } }));
 
 import { day, REFRESH_DEBOUNCE_MS } from "./day.svelte";
 import { api } from "./api";

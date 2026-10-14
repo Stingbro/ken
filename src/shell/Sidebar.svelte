@@ -1,5 +1,5 @@
 <script lang="ts">
-  // The sidebar (the Briefing design): the team at the top with how its sync
+  // The sidebar (the Briefing design): the workspace at the top with how its sync
   // stands, then Home, Inbox, Files, Ingest and Timeline, with Settings and
   // Collapse at the foot. Counts are amber only when they count things
   // waiting on you; a teal dot means something new with nothing to do.
@@ -11,7 +11,7 @@
   import { record } from "../lib/record.svelte";
   import { timeAgo } from "../lib/format";
   import { isMac } from "../lib/platform";
-  import TeamSwitcher from "./TeamSwitcher.svelte";
+  import WorkspaceSwitcher from "./WorkspaceSwitcher.svelte";
   import House from "@lucide/svelte/icons/house";
   import Inbox from "@lucide/svelte/icons/inbox";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
@@ -46,7 +46,7 @@
     if (app.workspace?.id) void scope.refreshGroups();
   });
 
-  const teamName = $derived(scope.team ?? app.workspace?.name ?? app.project?.name ?? "Ken");
+  const workspaceName = $derived(app.workspace?.name ?? app.project?.name ?? "Ken");
 
   /** How sync stands, in a few words, and its colour. */
   const status = $derived.by((): { text: string; tone: "ok" | "attn" | "danger" | "muted" } => {
@@ -81,11 +81,11 @@
     <div class="traffic" data-tauri-drag-region></div>
   {/if}
 
-  <button class="team" onclick={() => (switcherOpen = !switcherOpen)} title="Switch team">
+  <button class="team" onclick={() => (switcherOpen = !switcherOpen)} title="Switch workspace">
     <span class="k">K</span>
     {#if !collapsed}
       <span class="tinfo">
-        <span class="tname">{teamName}</span>
+        <span class="tname">{workspaceName}</span>
         <span class="tstatus {status.tone}"><span class="sdot"></span>{status.text}</span>
       </span>
       <ChevronsUpDown size={14} strokeWidth={1.75} aria-hidden="true" />
@@ -130,7 +130,7 @@
   </button>
 
   {#if switcherOpen}
-    <TeamSwitcher close={() => (switcherOpen = false)} />
+    <WorkspaceSwitcher close={() => (switcherOpen = false)} />
   {/if}
 </aside>
 

@@ -213,7 +213,7 @@ pub fn search_member(db: &Db, query: &str, query_vec: Option<&[f32]>, limit: usi
 }
 
 /// [`search_member`] with the workspace's vocabulary as well as the
-/// member's own: a Vocabulary page in the team's wiki then widens the search
+/// member's own: a Vocabulary page in the knowledge base then widens the search
 /// in every repo, not only in the wiki. Routed searches build it once with
 /// [`workspace_vocabulary`] and pass it to every member.
 pub fn search_member_with(
@@ -401,7 +401,7 @@ pub fn search_member_of_with(
 }
 
 /// One vocabulary for a routed search: every member's stored vocabulary
-/// together, so the team wiki's Vocabulary page and decisions aliases widen
+/// together, so the knowledge base's Vocabulary page and decisions aliases widen
 /// the search in the code repos too. Members are read once per search.
 pub fn workspace_vocabulary<'a>(dbs: impl IntoIterator<Item = &'a Db>) -> Vocabulary {
     let vocabs: Vec<Vocabulary> = dbs.into_iter().filter_map(|db| Vocabulary::cached(db).ok()).collect();
@@ -613,7 +613,7 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
             Some((root, kind)) => (head_sha(&root), kind),
             None => (None, Vec::new()),
         };
-        let wiki = kinds.iter().any(|k| matches!(k, RepoKind::Team | RepoKind::Wiki));
+        let wiki = kinds.contains(&RepoKind::Wiki);
         let order = plan_order.get(&mh.project_id).copied().unwrap_or(usize::MAX);
         for (rank, hit) in mh.hits.iter().enumerate() {
             candidates.push((

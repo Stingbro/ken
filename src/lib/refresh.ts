@@ -10,8 +10,8 @@
 //   started: when events came faster than a slow read returned, dropping the
 //   older answer meant none ever landed.
 //
-// A read applies its answer when the team and workspace it was for are
-// still the open ones; when they changed, the change asked for another read.
+// A read applies its answer when the workspace it was for is
+// still the open one; when it changed, the change asked for another read.
 
 export function singleFlight(read: () => Promise<void>): () => Promise<void> {
   let running: Promise<void> | null = null;

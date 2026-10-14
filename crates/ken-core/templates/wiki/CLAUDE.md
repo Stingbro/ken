@@ -1,6 +1,6 @@
 # {{wiki_repo}}
 
-The {{team_name}} knowledge base. Entry point: `START-HERE.md`.
+The {{workspace_name}} knowledge base. Entry point: `START-HERE.md`.
 
 This file loads into every session, so it holds the short form of every rule and how to work in this library. The full rules are in `Rules/`. If the two disagree, this file wins and the rule's page is fixed the same day.
 

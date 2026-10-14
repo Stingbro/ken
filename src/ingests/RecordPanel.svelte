@@ -1,8 +1,8 @@
 <script lang="ts">
   // Record, as a way to add a source on Ingest: the microphone and, where
   // the machine can capture it, the system audio (the other side of a call).
-  // Stop and the take is transcribed on this computer, saved to the team
-  // wiki's Raw/ and read at once. The title bar shows a take that runs on.
+  // Stop and the take is transcribed on this computer, saved to the
+  // knowledge base's Raw/ and read at once. The title bar shows a take that runs on.
   import { onMount } from "svelte";
   import { record, recordClock } from "../lib/record.svelte";
   import { systemAudioLabel } from "../lib/platform";
@@ -12,8 +12,6 @@
   import ProgressBar from "../lib/ProgressBar.svelte";
   import Mic from "@lucide/svelte/icons/mic";
   import Speaker from "@lucide/svelte/icons/volume-2";
-
-  let { team }: { team: string | null } = $props();
 
   onMount(() => void record.init());
 
@@ -92,7 +90,7 @@
         {recordClock(record.elapsedMs)}
       </span>
       {#if !record.recording}
-        <button class="btn btn-small btn-primary rec" disabled={!canStart || record.transcribing} onclick={() => void record.start(team)}>
+        <button class="btn btn-small btn-primary rec" disabled={!canStart || record.transcribing} onclick={() => void record.start()}>
           <span class="rec-dot"></span> Record
         </button>
       {:else if !record.transcribing}

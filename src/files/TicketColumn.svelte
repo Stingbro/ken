@@ -3,7 +3,6 @@
   // add one already linked, and the wiki pages that cite the ticket id.
   import { api, type DayTask, type RoutedHit } from "../lib/api";
   import { app } from "../lib/app.svelte";
-  import { scope } from "../lib/scope.svelte";
   import { onMount } from "svelte";
   import { day, openInRepo, ticketLink } from "../lib/day.svelte";
   import { shortTarget, stampLabel } from "../lib/day";
@@ -40,7 +39,7 @@
     pages = [];
     pagesLoaded = false;
     const id = ticketId;
-    const res = await api.routeSearch(id, 30, null, scope.team).catch(() => null);
+    const res = await api.routeSearch(id, 30, "all").catch(() => null);
     if (n !== pageSeq) return;
     const needle = id.toLowerCase();
     const seen = new Set<string>();

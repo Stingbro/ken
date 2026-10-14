@@ -10,7 +10,7 @@
   import { errorText } from "../lib/toast.svelte";
   import Check from "@lucide/svelte/icons/check";
 
-  let { team, onAdded }: { team: string | null; onAdded: (path: string) => void } = $props();
+  let { onAdded }: { onAdded: (path: string) => void } = $props();
 
   let rows = $state<ChatRow[]>([]);
   let chatId = $state("");
@@ -59,7 +59,7 @@
     busy = true;
     error = null;
     try {
-      const path = await api.ingestAddChat(team, projectId, chatId, whole ? null : pickedIds(order, pick.selected));
+      const path = await api.ingestAddChat(projectId, chatId, whole ? null : pickedIds(order, pick.selected));
       pick = { selected: new Set(), anchor: null };
       onAdded(path);
     } catch (e) {

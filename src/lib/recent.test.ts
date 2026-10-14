@@ -4,7 +4,7 @@ import {
   fallbackRecents,
   homeRecents,
   loadRecents,
-  mergeTeamRecents,
+  mergeWorkspaceRecents,
   recentlyOpened,
   recordRecent,
   saveRecents,
@@ -127,9 +127,9 @@ describe("recents persistence", () => {
   });
 });
 
-describe("mergeTeamRecents", () => {
+describe("mergeWorkspaceRecents", () => {
   it("merges every repo's history, newest first, up to the limit", () => {
-    const out = mergeTeamRecents(
+    const out = mergeWorkspaceRecents(
       [
         { projectId: "a", entries: [{ path: "x.md", at: 30 }, { path: "y.md", at: 10 }], known: null },
         { projectId: "b", entries: [{ path: "z.md", at: 20 }], known: null },
@@ -143,7 +143,7 @@ describe("mergeTeamRecents", () => {
   });
 
   it("drops entries a repo's index no longer has", () => {
-    const out = mergeTeamRecents([
+    const out = mergeWorkspaceRecents([
       { projectId: "a", entries: [{ path: "gone.md", at: 5 }, { path: "here.md", at: 4 }], known: new Set(["here.md"]) },
     ]);
     expect(out.map((r) => r.path)).toEqual(["here.md"]);

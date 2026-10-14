@@ -44,8 +44,8 @@
 //! becomes a finding, as does a source that is gone. Each run that writes is
 //! one commit in the knowledge base and one `log.md` line.
 //!
-//! The Scope and Answer checks read a ticket's diff and its escalations, so
-//! they arrive with Wright, not here.
+//! The Scope and Answer checks read a ticket and its diff, so they stay with
+//! Wright (decision 31), not here.
 
 use std::path::{Path, PathBuf};
 
@@ -579,7 +579,7 @@ fn is_template(text: &str) -> bool {
         .any(|l| l.trim_start().starts_with("title:") && l.contains("{{"))
 }
 
-/// Run the sweep over one wiki or team repo.
+/// Run the sweep over one knowledge base.
 pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     let cfg = DriftConfig::for_repo(&project.root);
     let mut run = DriftRun { at: now, ..Default::default() };

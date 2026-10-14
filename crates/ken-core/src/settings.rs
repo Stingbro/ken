@@ -30,7 +30,7 @@ pub fn settings_path(base_dir: &Path) -> PathBuf {
 }
 
 impl AppSettings {
-    /// The throttle setting: what a person set, else Normal, paused when an
+    /// The throttle setting: what a person set, else Gentle, paused when an
     /// older `backgroundExtraction: false` switched background work off.
     pub fn throttle(&self) -> crate::throttle::Setting {
         self.background.unwrap_or_else(|| crate::throttle::Setting {

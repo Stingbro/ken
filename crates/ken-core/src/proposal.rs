@@ -49,9 +49,10 @@ pub struct RulingEntry {
     /// The ruling, in one sentence.
     pub ruling: String,
     /// Who made it, as free text, when the note says. Nobody's confirm is
-    /// waited for: one click adds the entry.
-    #[serde(default)]
-    pub decider: Option<String>,
+    /// waited for: one click adds the entry (there are no deciders, decision
+    /// 35). An older proposal stored it as `decider`.
+    #[serde(default, alias = "decider")]
+    pub who: Option<String>,
     pub date: String,
     /// The note it was said in, by its file stem.
     pub note: String,
@@ -136,6 +137,16 @@ fn write_page(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 35: no deciders. Who made a ruling is free text, and a
+    /// proposal stored with the older `decider` key still reads.
+    #[test]
+    fn who_made_a_ruling_reads_from_the_older_key() {
+        let old: RulingEntry = serde_json::from_str(r#"{"ruling":"We ship saves.","decider":"Ana","date":"2026-09-24","note":"standup"}"#).unwrap();
+        assert_eq!(old.who.as_deref(), Some("Ana"));
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(json.contains(r#""who":"Ana""#) && !json.contains("decider"), "{json}");
+    }
 
     #[test]
     fn apply_refuses_a_page_that_moved_on() {
