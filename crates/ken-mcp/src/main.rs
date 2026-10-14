@@ -2151,7 +2151,8 @@ fn note_name(given: &str) -> String {
 /// base's decisions log (knowledge-core decision 13), filed in its Inbox the
 /// way ingest files one (`proposal::file_page_proposal`, with `append` set).
 /// The log is never written here: a person adds the entry in one click, and
-/// it takes the next number then.
+/// it takes the next number then. A running app is told, so its Inbox
+/// shows it at once (`hooks::signal_app`).
 fn propose_decision(server: &Server, args: &Value) -> Result<String, String> {
     use ken_core::ingest::DECISIONS_LOG;
     use ken_core::proposal::{self, Proposal, RulingEntry};
@@ -2191,6 +2192,8 @@ fn propose_decision(server: &Server, args: &Value) -> Result<String, String> {
     );
     let p = Proposal { append: Some(entry), from: Some(proposal::FROM_CHAT.to_string()), ..Proposal::new(log.clone(), text, proposed) };
     proposal::file_page_proposal(&mut db, &p, &title, &body, now_secs()).map_err(|e| format!("could not file the ruling: {e}"))?;
+    // A running app refreshes its Inbox now; with none, it shows at the next start.
+    ken_core::hooks::signal_app(&server.base_dir, &json!({ "signal": "proposed", "projectId": id.to_string() }));
     Ok(format!(
         "Proposed for {log} in {name}: \"{}\". It waits in Ken's Inbox for a person to add it in one click (it takes the \
 next number then) or discard it. Nothing was written to the log.",
@@ -2201,7 +2204,8 @@ next number then) or discard it. Nothing was written to the log.",
 /// `add_source`: a file of one of the workspace's repos, or a pasted text as
 /// a note (`ingest::note_source`), put in the knowledge base's inbox
 /// (`Research/Ingestion/Raw/`, under a free name: `ingest::raw_target`) for
-/// the next ingest pass. Nothing is ingested or edited here.
+/// the next ingest pass. Nothing is ingested or edited here; a running app
+/// is told, and starts the ingest (`hooks::signal_app`).
 fn add_source(server: &Server, args: &Value) -> Result<String, String> {
     use ken_core::ingest::{self, MAX_SOURCE_CHARS, RAW};
     let (kb_id, kb_name, kb_root) = knowledge_base(server)?;
@@ -2247,6 +2251,9 @@ or `text` with a `title`."
         }
     };
     let rel = format!("{RAW}/{}", target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+    // A running app starts the ingest now; with none, nothing is queued and
+    // the next pass reads it.
+    ken_core::hooks::signal_app(&server.base_dir, &json!({ "signal": "source-added", "projectId": kb_id.to_string(), "path": rel }));
     Ok(format!(
         "Put {rel} in {kb_name}'s inbox ({}). Ken's next ingest pass reads it into a dated note and updates the pages it \
 changes; nothing was ingested or edited here.",

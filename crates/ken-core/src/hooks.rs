@@ -174,6 +174,73 @@ impl Drop for HookListener {
     }
 }
 
+/// Where the running app says how to reach its listener, in Ken's app data:
+/// the screen request's URL and token, new each run. Ken's MCP server reads
+/// it to tell a running app that it filed something (a ruling proposed in
+/// chat, a source added), whichever Claude session started the server.
+pub const LISTENER_FILE: &str = "app-listener.json";
+
+/// Write [`LISTENER_FILE`] for the listener the app just started.
+pub fn write_listener_file(base: &Path, url: &str, token: &str) -> Result<()> {
+    let path = base.join(LISTENER_FILE);
+    let text = json!({ "url": url, "token": token, "pid": std::process::id() }).to_string();
+    std::fs::write(&path, text).map_err(|e| Error::io(&path, e))
+}
+
+/// Take [`LISTENER_FILE`] away as the app quits, when it is still this
+/// listener's (a second app started since keeps its own).
+pub fn remove_listener_file(base: &Path, token: &str) {
+    let path = base.join(LISTENER_FILE);
+    if read_listener_file(base).is_some_and(|(_, t)| t == token) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The URL and token [`LISTENER_FILE`] holds, when there is one.
+pub fn read_listener_file(base: &Path) -> Option<(String, String)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(base.join(LISTENER_FILE)).ok()?).ok()?;
+    let url = v.get("url")?.as_str()?.to_string();
+    let token = v.get("token")?.as_str()?.to_string();
+    (!url.is_empty() && !token.is_empty()).then_some((url, token))
+}
+
+/// How long a signal waits to reach the app, and for its answer.
+const SIGNAL_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// Tell a running app that something changed for it: one POST of `body`
+/// to its listener with the token ([`LISTENER_FILE`]), waiting at most a
+/// moment. Whether the app took it. With no app running (no file, or no one
+/// listening), it fails quietly: nothing is queued, and the app is never
+/// started; what was filed is there at the app's next refresh.
+pub fn signal_app(base: &Path, body: &Value) -> bool {
+    let Some((url, token)) = read_listener_file(base) else { return false };
+    post_ui_request(&url, &token, body).is_ok_and(|status| status == 200)
+}
+
+/// POST `body` to a screen-request URL (`http://127.0.0.1:port/ken-ui`) with
+/// `token`, with short timeouts. The reply's status.
+pub fn post_ui_request(url: &str, token: &str, body: &Value) -> std::result::Result<u16, String> {
+    use std::io::{Read, Write};
+    let rest = url.strip_prefix("http://").ok_or("not a local URL")?;
+    let (host, route) = rest.split_once('/').map(|(h, r)| (h, format!("/{r}"))).unwrap_or((rest, "/".into()));
+    let addr: std::net::SocketAddr = host.parse().map_err(|_| format!("not an address: {host}"))?;
+    if !addr.ip().is_loopback() {
+        return Err("only this computer's own listener is asked".into());
+    }
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, SIGNAL_WAIT).map_err(|e| e.to_string())?;
+    let _ = stream.set_read_timeout(Some(SIGNAL_WAIT));
+    let _ = stream.set_write_timeout(Some(SIGNAL_WAIT));
+    let body = body.to_string();
+    let req = format!(
+        "POST {route} HTTP/1.1\r\nHost: {host}\r\nX-Ken-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    reply.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or_else(|| "no reply".to_string())
+}
+
 /// The command Claude Code runs for each hook event.
 fn hook_command(hook_url: &str) -> String {
     format!("curl -s -X POST {hook_url} -H 'Content-Type: application/json' -d @- >/dev/null 2>&1 || true")
@@ -293,6 +360,39 @@ mod tests {
         let v = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(v["open"], "a.md");
         assert!(rx.try_recv().is_err(), "the refused request never reached the app");
+    }
+
+    /// Ken's MCP server tells a running app it filed something, through the
+    /// listener file; with no app there it fails quietly and queues nothing.
+    #[test]
+    fn a_signal_reaches_a_running_app_and_fails_quietly_without_one() {
+        let base = tempfile::tempdir().unwrap();
+        let signal = json!({ "signal": "proposed", "projectId": "abc" });
+        assert!(!signal_app(base.path(), &signal), "no app: no file");
+
+        let listener = HookListener::start().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        listener.set_ui_handler(move |v| {
+            let _ = tx.send(v);
+        });
+        write_listener_file(base.path(), &listener.ui_url(), listener.token()).unwrap();
+        assert!(signal_app(base.path(), &signal));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()["signal"], "proposed");
+
+        write_listener_file(base.path(), &listener.ui_url(), "not-the-token").unwrap();
+        assert!(!signal_app(base.path(), &signal), "a wrong token is refused");
+        assert!(rx.try_recv().is_err());
+
+        // The app quit: its listener is gone, the file names a closed port.
+        write_listener_file(base.path(), &listener.ui_url(), listener.token()).unwrap();
+        let token = listener.token().to_string();
+        drop(listener);
+        assert!(!signal_app(base.path(), &signal), "nobody listening");
+        remove_listener_file(base.path(), "someone-elses");
+        assert!(read_listener_file(base.path()).is_some(), "another run's file stays");
+        remove_listener_file(base.path(), &token);
+        assert!(read_listener_file(base.path()).is_none());
+        assert!(post_ui_request("http://example.com:80/ken-ui", "t", &signal).is_err(), "only this computer");
     }
 
     #[test]

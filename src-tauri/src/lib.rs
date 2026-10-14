@@ -864,11 +864,21 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         None => {
             let h = Arc::new(HookListener::start().map_err(err)?);
             // Ken's MCP server asks the app to open a file (only when the
-            // person asked Claude to): the frontend focuses and opens it.
+            // person asked Claude to): the frontend focuses and opens it. It
+            // also signals what it filed (`app_signal`).
             let ui_app = app.clone();
             h.set_ui_handler(move |v| {
-                let _ = ui_app.emit("ken-open", v);
+                if v.get("signal").is_some() {
+                    app_signal(&ui_app, v);
+                } else {
+                    let _ = ui_app.emit("ken-open", v);
+                }
             });
+            // Any Claude session's ken-mcp finds the listener here; the file
+            // goes when the app quits.
+            if let Err(e) = ken_core::hooks::write_listener_file(&guard.base_dir, &h.ui_url(), h.token()) {
+                eprintln!("warning: could not write the listener file: {e}");
+            }
             guard.hooks = Some(h.clone());
             h
         }
@@ -6736,6 +6746,30 @@ fn transcription_model(base: &Path) -> Option<PathBuf> {
         .or_else(|| Some(transcript::model_path(base)).filter(|p| p.is_file()))
 }
 
+/// What Ken's MCP server signals a running app once it filed something
+/// (`hooks::signal_app`; Chris, 2026-10-14): `proposed` (a ruling from chat
+/// waits in the knowledge base's Inbox) refreshes the Inbox; `source-added`
+/// (a source put in Raw) starts the ingest of the knowledge base it names,
+/// when that is open, and refreshes the Inbox. The listener serves one
+/// request at a time, so the work is done off its thread.
+fn app_signal(app: &AppHandle, v: serde_json::Value) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if v.get("signal").and_then(|s| s.as_str()) == Some("source-added") {
+            let state = tauri::Manager::state::<SharedState>(&app);
+            let id = v.get("projectId").and_then(|s| s.as_str()).and_then(|s| s.parse::<uuid::Uuid>().ok());
+            let found = {
+                let guard = lock_tolerant(state.inner());
+                id.and_then(|id| guard.members.get(&id)).map(|m| (m.project.clone(), guard.base_dir.clone()))
+            };
+            if let Some((project, base)) = found {
+                schedule_ingest_pass(state.inner(), &project, &base);
+            }
+        }
+        let _ = app.emit("review-changed", ());
+    });
+}
+
 /// A pass over `project`'s inbox once its changes settle ([`INGEST_SETTLE`]):
 /// the watcher's way in, so a file copied into Raw/ by hand is read too.
 fn schedule_ingest_pass(state: &SharedState, project: &Project, base: &Path) {
@@ -7351,6 +7385,54 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     norm(a) == norm(b)
 }
 
+/// One waiting proposal as the Ingest screen and the Inbox show it.
+fn proposal_dto(it: ken_core::db::ReviewItemRow) -> IngestProposalDto {
+    let p: Option<ken_core::proposal::Proposal> = it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok());
+    IngestProposalDto {
+        id: it.id,
+        kind: p.as_ref().map_or("page", ken_core::proposal::kind_of).into(),
+        page: p.as_ref().map(|p| p.page.clone()).unwrap_or_default(),
+        who: p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.who.clone()),
+        title: it.title,
+        body: it.body,
+        payload: it.payload,
+    }
+}
+
+/// A proposal that waits from no ingest card: a ruling proposed in chat
+/// (MCP `propose_decision`) or an edit a drift run held.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LooseProposalDto {
+    #[serde(flatten)]
+    proposal: IngestProposalDto,
+    /// `chat` or `drift`.
+    from: String,
+    project_id: String,
+}
+
+/// The proposals waiting in the knowledge base that no ingest card holds,
+/// for the Inbox: a ruling proposed in chat, an edit a drift run held.
+/// The ones from a note are read through their card.
+#[tauri::command(async)]
+fn loose_proposals(state: State<SharedState>) -> CmdResult<Vec<LooseProposalDto>> {
+    let found = {
+        let guard = lock_tolerant(&state);
+        inbox_project(&guard).and_then(|p| guard.members.get(&p.config.id).map(|m| (p.config.id, m.search_db.clone())))
+    };
+    let Some((id, db)) = found else { return Ok(Vec::new()) };
+    let open = lock_tolerant(&db).list_open_review_items().map_err(err)?;
+    Ok(open
+        .into_iter()
+        .filter(|it| it.kind == ken_core::proposal::PROPOSAL_KIND)
+        .filter_map(|it| {
+            let from = it.payload.as_deref().and_then(|p| serde_json::from_str::<ken_core::proposal::Proposal>(p).ok())?.from?;
+            (from == ken_core::proposal::FROM_CHAT || from == ken_core::drift::HELD_FROM)
+                .then(|| LooseProposalDto { proposal: proposal_dto(it), from, project_id: id.to_string() })
+        })
+        .collect())
+}
+
 /// One ingested source for the Ingest screen: its takeaways, the pages
 /// written from it, what waits (ready rulings, drafted tickets, held edits)
 /// and the commit that holds it.
@@ -7368,22 +7450,7 @@ fn ingest_card(app: AppHandle, state: State<SharedState>, item_id: i64) -> CmdRe
     let item = db.get_review_item(item_id).map_err(err)?.ok_or("no ingest card with that id")?;
     let card = ken_core::ingest::card_of(item.payload.as_deref()).ok_or("the card has no record of where things went")?;
     let text = std::fs::read_to_string(root.join(&card.placement.note)).unwrap_or_default();
-    let proposals = ken_core::ingest::proposals_from(&db, &card.placement.note)
-        .map_err(err)?
-        .into_iter()
-        .map(|it| {
-            let p: Option<ken_core::proposal::Proposal> = it.payload.as_deref().and_then(|p| serde_json::from_str(p).ok());
-            IngestProposalDto {
-                id: it.id,
-                kind: p.as_ref().map_or("page", ken_core::proposal::kind_of).into(),
-                page: p.as_ref().map(|p| p.page.clone()).unwrap_or_default(),
-                who: p.as_ref().and_then(|p| p.append.as_ref()).and_then(|r| r.who.clone()),
-                title: it.title,
-                body: it.body,
-                payload: it.payload,
-            }
-        })
-        .collect();
+    let proposals = ken_core::ingest::proposals_from(&db, &card.placement.note).map_err(err)?.into_iter().map(proposal_dto).collect();
     drop(db);
     let writing = INGEST_READING
         .lock()
@@ -12149,6 +12216,7 @@ pub fn run() {
             resolve_review_item,
             confirm_finding,
             accept_analysis,
+            loose_proposals,
             analysis_proposals,
             ignore_file,
             unignore_file,
@@ -12286,6 +12354,14 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                // The listener goes with the app: ken-mcp then finds no file
+                // and signals nothing.
+                if let Some(state) = tauri::Manager::try_state::<SharedState>(_app) {
+                    let guard = lock_tolerant(state.inner());
+                    if let Some(h) = guard.hooks.as_ref() {
+                        ken_core::hooks::remove_listener_file(&guard.base_dir, h.token());
+                    }
+                }
                 // ggml (statically linked via llama-cpp-2 / whisper-rs) frees
                 // its Metal device in a C++ static destructor, which
                 // GGML_ASSERTs that no residency sets remain. Our LLM engine

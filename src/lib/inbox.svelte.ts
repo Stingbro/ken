@@ -59,18 +59,20 @@ function leaf(path: string): string {
   return path.split("/").pop() || path;
 }
 
-export function proposalItem(p: IngestProposal, cardId: number, note: string, projectId: string): InboxItem {
+/** A proposal waiting for a person. `note` is the ingest's note it came
+ *  from; empty for one no card holds, then `origin` says where it came from. */
+export function proposalItem(p: IngestProposal, cardId: number, note: string, projectId: string, origin: "chat" | "drift" | null = null): InboxItem {
   const kind = p.kind === "ruling" ? "Ruling" : p.kind === "ticket" ? "Ticket" : p.kind === "new page" ? "New page" : "Page edit";
   return {
     id: `proposal:${p.id}`,
     group: "ken",
     kind,
     tone: "attn",
-    from: "Ken",
+    from: origin === "chat" ? "Ken, in a chat" : origin === "drift" ? "Ken, checking drift" : "Ken",
     title: p.title,
     short: p.kind === "page" || p.kind === "new page" ? `${leaf(p.page)} · held back for you to read` : p.body.split("\n")[0] ?? "",
     when: null,
-    where: note,
+    where: note || p.page || null,
     source: { type: "proposal", proposal: p, cardId, note, projectId },
   };
 }
@@ -275,6 +277,9 @@ class InboxStore {
           for (const p of card.proposals) out.push(proposalItem(p, card.id, card.note, overview.projectId));
         }
       }
+      // Proposals no card holds: rulings proposed in chat, edits drift held.
+      const loose = await api.looseProposals().catch(() => []);
+      for (const p of loose) out.push(proposalItem(p, 0, "", p.projectId, p.from));
       // The repo analyses that wait for a person (role rules and controls).
       const analyses = await api.analysisProposals().catch(() => []);
       for (const a of analyses) out.push(analysisItem(a));

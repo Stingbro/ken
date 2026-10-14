@@ -58,6 +58,8 @@
         const p = s.proposal;
         const apply = { label: p.kind === "page" || p.kind === "new page" ? "Apply" : p.kind === "ruling" ? "Add to the log" : "Accept", primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), p.kind === "ruling" ? "Added. It is in the decisions log." : p.kind === "ticket" ? "Accepted. The ticket is written." : "Applied. The page cites the note.") };
         const discard = { label: "Discard", run: () => void act(item, () => api.resolveReviewItem(p.id, s.projectId), "Discarded.") };
+        // A ruling proposed in chat or an edit drift held comes from no note.
+        if (!s.note) return [apply, discard];
         const note = { label: "Open the note", run: () => void openInRepo(s.projectId, s.note) };
         return [apply, discard, note];
       }

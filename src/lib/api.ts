@@ -348,6 +348,13 @@ export interface IngestProposal {
   who: string | null;
 }
 
+/** Mirrors `LooseProposalDto`: a proposal no ingest card holds, a ruling
+ *  proposed in chat or an edit a drift run held. */
+export interface LooseProposal extends IngestProposal {
+  from: "chat" | "drift";
+  projectId: string;
+}
+
 /** One page an ingest wrote. */
 export interface IngestPage {
   path: string;
@@ -1569,6 +1576,8 @@ export const api = {
    *  one commit, and returns the commit when it made one. */
   confirmFinding: (id: number, projectId: string | null = null) =>
     invoke<string | null>("confirm_finding", { id, projectId }),
+  /** Proposals no ingest card holds: rulings proposed in chat, edits drift held. */
+  looseProposals: () => invoke<LooseProposal[]>("loose_proposals"),
   /** The repo analyses waiting in the knowledge base's Inbox. */
   analysisProposals: () => invoke<AnalysisProposal[]>("analysis_proposals"),
   /** Accept a repo analysis: its rules and controls go into
