@@ -11,7 +11,8 @@
 //!   [`after_edit_done`]).
 //! - **Weekly**: the binding and current pages read together for
 //!   contradictions, with pages they call for that do not exist yet
-//!   ([`weekly_next`], [`weekly_done`]).
+//!   ([`weekly_next`], [`weekly_done`]). First due a week after the
+//!   knowledge base's first scan, not at first launch.
 //! - **Rulings cited in code** ([`unknown_rulings`]): a code comment citing a
 //!   ruling id the decisions log does not have.
 //!
@@ -22,7 +23,9 @@
 //! Each pass that filed or resolved a finding writes one `log.md` line,
 //! `## [date] lint | scan: 2 filed, 1 resolved`, committed like the other
 //! runs' lines (decision 2, [`log_pass`]); a pass that changed nothing
-//! writes nothing.
+//! writes nothing, and nor does a scan that files again only what an
+//! earlier pass already filed (a finding a person marked done that is
+//! still there).
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -135,12 +138,21 @@ pub fn scan_findings(db: &Db) -> Result<Vec<Finding>> {
 
 /// The lint on every scan of the knowledge base at `root`: files what
 /// [`scan_findings`] finds and resolves what it no longer finds, with its
-/// `log.md` line ([`log_pass`]) when it did either. Returns (filed,
-/// resolved).
+/// `log.md` line ([`log_pass`]) when it filed something no pass filed
+/// before, or resolved something. The first scan also starts the weekly
+/// pass's week. Returns (filed, resolved).
 pub fn on_scan(db: &mut Db, root: &Path, now: i64, today: &str) -> Result<(usize, usize)> {
+    if weekly_at(db)?.is_none() {
+        db.store_check_state(WEEKLY_AT, &now.to_string())?;
+    }
     let found = scan_findings(db)?;
+    let mut before: HashSet<(String, String, String)> = HashSet::new();
+    for kind in SCAN_KINDS {
+        before.extend(crate::findings::ever(db, kind)?.iter().map(Finding::key));
+    }
     let (filed, resolved) = crate::findings::sync(db, &SCAN_KINDS, &found, now)?;
-    log_pass(root, today, "scan", filed, resolved)?;
+    let first_time: HashSet<(String, String, String)> = found.iter().map(Finding::key).filter(|k| !before.contains(k)).collect();
+    log_pass(root, today, "scan", first_time.len(), resolved)?;
     Ok((filed, resolved))
 }
 
@@ -341,9 +353,11 @@ pub fn weekly_at(db: &Db) -> Result<Option<i64>> {
     Ok(db.check_state(WEEKLY_AT)?.and_then(|v| v.trim().parse().ok()))
 }
 
-/// Whether the weekly lint is due: never run, or a week since.
+/// Whether the weekly lint is due: a week since it last ran, or since the
+/// knowledge base's first scan ([`on_scan`] starts the week). Never before
+/// a scan, so a fresh install does not run it at first launch.
 pub fn weekly_due(db: &Db, now: i64) -> Result<bool> {
-    Ok(weekly_at(db)?.is_none_or(|at| now - at >= WEEK))
+    Ok(weekly_at(db)?.is_some_and(|at| now - at >= WEEK))
 }
 
 /// The binding and current pages (decision 23's top two tiers), the
@@ -617,6 +631,23 @@ mod tests {
         assert_eq!(lines, vec!["## [2026-10-14] lint | scan: 3 filed", "## [2026-10-15] lint | scan: 3 resolved"]);
     }
 
+    /// A finding a person marked done that is still there is filed again,
+    /// but that is not news: the scan writes no `log.md` line for it.
+    #[test]
+    fn a_scan_that_files_again_what_was_filed_before_writes_no_line() {
+        let (dir, _project, mut db) = library(&[
+            ("START-HERE.md", "# Start\nSee [[Payments]] and [[Ghost]].\n"),
+            ("Design/Payments.md", "# Payments\n"),
+        ]);
+        assert_eq!(on_scan(&mut db, dir.path(), 1, "2026-10-14").unwrap(), (1, 0));
+        let (item, _) = crate::findings::open(&db).unwrap().remove(0);
+        db.resolve_review_item(item.id, 2).unwrap();
+        assert_eq!(on_scan(&mut db, dir.path(), 3, "2026-10-15").unwrap(), (1, 0), "still there: filed again");
+        let log = fs::read_to_string(dir.path().join("log.md")).unwrap();
+        let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("## [")).collect();
+        assert_eq!(lines, vec!["## [2026-10-14] lint | scan: 1 filed"]);
+    }
+
     #[test]
     fn edited_pages_queue_for_one_comparison_with_their_neighbours() {
         let (dir, _p, mut db) = library(&[
@@ -683,7 +714,10 @@ mod tests {
             ("Current/Project.md", "---\nstatus: current\n---\n# Project\nOne approval is enough.\n"),
             ("Reference/Glossary.md", "# Glossary\n"),
         ]);
-        assert!(weekly_due(&db, 100).unwrap());
+        assert!(!weekly_due(&db, 100).unwrap(), "never before a scan");
+        on_scan(&mut db, dir.path(), 100 - WEEK, "2026-10-07").unwrap();
+        assert!(!weekly_due(&db, 99).unwrap(), "not in the first scan's week");
+        assert!(weekly_due(&db, 100).unwrap(), "a week after the first scan");
         let pending = weekly_next(&db, dir.path(), 100).unwrap().expect("two pages to compare");
         assert!(pending.prompt.contains("--- Rules/Reviews.md") && pending.prompt.contains("--- Current/Project.md"));
         assert!(!pending.prompt.contains("--- Reference/Glossary.md"), "reference pages wait for their own checks");
