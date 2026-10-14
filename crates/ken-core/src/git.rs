@@ -195,8 +195,9 @@ pub fn parse_log(out: &str) -> Vec<Commit> {
 
 /// The ids a commit message names: ticket ids and ruling ids, both written
 /// `PREFIX-number` (`SR-101`, `D-410`), in order, each once. These are
-/// candidates: slice 9 keeps the ones the knowledge base has as a ticket or
-/// a ruling, so a word of the same shape (`UTF-8`) is dropped there.
+/// candidates: the graph keeps the ones the knowledge base has as a ticket
+/// or a ruling (`graph::read_commits`), so a word of the same shape
+/// (`UTF-8`) is dropped there.
 pub fn cited_ids(message: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let chars: Vec<char> = message.chars().collect();
@@ -231,18 +232,69 @@ pub fn cited_ids(message: &str) -> Vec<String> {
     out
 }
 
-/// Each commit in `range` (`old..new`) whose message names an id, with the
-/// ids it names ([`cited_ids`]), newest first. For slice 9: a commit citing
-/// a ticket or a ruling becomes a graph edge (decision 21). None when git
-/// cannot read the range.
-pub fn commits_citing(dir: &Path, range: &str) -> Option<Vec<(String, Vec<String>)>> {
-    let out = output_raw(dir, &["log", "--format=%x1e%h%x1f%B", range])?;
+/// A commit whose message names ids ([`commits_citing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Citing {
+    /// The short sha.
+    pub sha: String,
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    /// The message's first line.
+    pub subject: String,
+    /// The ids it names, in order ([`cited_ids`]).
+    pub ids: Vec<String>,
+}
+
+/// Each commit in `range` (`old..new`, or one ref for its whole history),
+/// at most `limit` of them, whose message names an id, newest first. A
+/// commit citing a ticket or a ruling becomes a graph edge (decision 21;
+/// `graph::read_commits` keeps the ids the knowledge base has). None when
+/// git cannot read the range.
+pub fn commits_citing(dir: &Path, range: &str, limit: usize) -> Option<Vec<Citing>> {
+    let n = format!("-n{limit}");
+    let out = output_raw(dir, &["log", &n, "--date=short", "--format=%x1e%h%x1f%ad%x1f%B", range])?;
     Some(
         out.split('\u{1e}')
             .filter_map(|record| {
-                let (sha, message) = record.split_once('\u{1f}')?;
+                let mut fields = record.splitn(3, '\u{1f}');
+                let (sha, date, message) = (fields.next()?, fields.next()?, fields.next()?);
                 let ids = cited_ids(message);
-                (!ids.is_empty()).then(|| (sha.trim().to_string(), ids))
+                (!ids.is_empty()).then(|| Citing {
+                    sha: sha.trim().to_string(),
+                    date: date.trim().to_string(),
+                    subject: message.trim().lines().next().unwrap_or("").trim().to_string(),
+                    ids,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// A tag, as [`tags`] reads it: a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    /// `YYYY-MM-DD`: the tag's own date when it is annotated, else its
+    /// commit's.
+    pub date: String,
+    /// The tag's message, else its commit's subject.
+    pub subject: String,
+}
+
+/// The newest `limit` tags in `dir`, newest first. None when git is missing
+/// or `dir` is not a repo.
+pub fn tags(dir: &Path, limit: usize) -> Option<Vec<Tag>> {
+    let count = format!("--count={limit}");
+    let out = output_raw(
+        dir,
+        &["for-each-ref", "--sort=-creatordate", &count, "--format=%(creatordate:short)%1f%(refname:short)%1f%(subject)", "refs/tags"],
+    )?;
+    Some(
+        out.lines()
+            .filter_map(|line| {
+                let mut f = line.splitn(3, '\u{1f}');
+                let (date, name, subject) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+                (!name.trim().is_empty()).then(|| Tag { name: name.trim().into(), date: date.trim().into(), subject: subject.trim().into() })
             })
             .collect(),
     )
@@ -283,14 +335,23 @@ mod tests {
         assert!(by_change[0].files.is_empty(), "no --name-only, no files");
 
         let first = output(dir.path(), &["rev-list", "--max-parents=0", "HEAD"]).unwrap();
-        let cited = commits_citing(dir.path(), &format!("{first}..HEAD")).unwrap();
+        let cited = commits_citing(dir.path(), &format!("{first}..HEAD"), 50).unwrap();
         assert_eq!(cited.len(), 1, "the range leaves the first commit out");
-        assert_eq!(cited[0].1, vec!["D-410".to_string(), "SR-101".to_string()]);
+        assert_eq!(cited[0].ids, vec!["D-410".to_string(), "SR-101".to_string()]);
+        assert_eq!(cited[0].subject, "harden it per D-410 and SR-101");
+        assert_eq!(cited[0].date.len(), 10, "YYYY-MM-DD");
+
+        git_ok(dir.path(), &["tag", "-a", "v1.0", "-m", "First release"]);
+        let tagged = tags(dir.path(), 10).unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!((tagged[0].name.as_str(), tagged[0].subject.as_str()), ("v1.0", "First release"));
+        assert_eq!(tagged[0].date.len(), 10, "YYYY-MM-DD");
 
         assert_eq!(output(dir.path(), &["no-such-command"]), None);
         assert!(run(dir.path(), &["no-such-command"]).is_err());
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(log(plain.path(), 5, None, &[]), None, "not a repo");
+        assert_eq!(tags(plain.path(), 5), None, "not a repo");
     }
 
     #[test]

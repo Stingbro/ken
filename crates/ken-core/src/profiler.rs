@@ -3,10 +3,10 @@
 //! Background-priority LLM refinement pass over that scan
 //! (`compose_profile_prompt` + `parse_profile_refinement`), and the
 //! human-editable `.ken/index-profile.json` the result lives in
-//! (`ProjectProfile`). Downstream consumers (chunking, exclusions, the
-//! knowledge-model prompt) read the saved profile through narrow seams —
-//! see `engine::rebuild_semantic_index_with_profile`,
-//! `Project::effective_excluded`, and `profile_prompt_addendum`.
+//! (`ProjectProfile`). Downstream consumers (chunking, exclusions) read the
+//! saved profile through narrow seams: see
+//! `engine::rebuild_semantic_index_with_profile` and
+//! `Project::effective_excluded`.
 //!
 //! Design D1 (two-stage: deterministic floor, LLM ceiling): every project
 //! gets a usable profile with zero LLM involvement; the LLM only refines,
@@ -446,7 +446,7 @@ impl ProjectProfile {
     /// has no way to know it wasn't confirmed).
     pub fn save(&self, root: &Path) -> Result<()> {
         let mut to_write = self.clone();
-        to_write.generated_hash = crate::knowledge_model::content_hash(&canonical_for_hash(&to_write));
+        to_write.generated_hash = crate::db::content_hash(&canonical_for_hash(&to_write));
 
         let dir = root.join(crate::project::CONFIG_DIR);
         std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
@@ -465,7 +465,7 @@ impl ProjectProfile {
         if self.generated_hash.is_empty() {
             return false;
         }
-        crate::knowledge_model::content_hash(&canonical_for_hash(self)) != self.generated_hash
+        crate::db::content_hash(&canonical_for_hash(self)) != self.generated_hash
     }
 }
 
@@ -602,8 +602,8 @@ pub fn tree_sample(stats: &ScanStats) -> Vec<String> {
 }
 
 /// The Background-priority refinement prompt (design D4): stats summary +
-/// capped tree sample, no file contents. Asks for a single JSON object the
-/// same tolerant-parsing idiom as `knowledge_model.rs` expects back.
+/// capped tree sample, no file contents. Asks for a single JSON object, read
+/// back tolerantly by [`parse_profile_refinement`].
 pub fn compose_profile_prompt(stats: &ScanStats, tree_sample: &[String]) -> String {
     let mut p = String::new();
     p.push_str(
@@ -654,15 +654,13 @@ pub struct ProfileRefinement {
 }
 
 /// Cap on how many focus hints a single refinement can contribute — bounds
-/// the junk one bad generation could inject, same spirit as
-/// `knowledge_model`'s per-file caps.
+/// the junk one bad generation could inject.
 const MAX_FOCUS_HINTS: usize = 20;
 
 /// Parse a refinement answer tolerantly (design D4/spec "LLM refinement is
 /// additive and validated"): find the JSON object (fences/prose stripped),
 /// ignore unknown fields, drop anything the wrong shape. Deliberately
-/// infallible — unlike `knowledge_model::parse_extraction`, unparseable
-/// input here must NOT be an error (spec: "model failure falls back... \
+/// infallible: unparseable input here must NOT be an error (spec: "model failure falls back... \
 /// profile-state reaches ready, not error"), so this returns an empty
 /// (no-op) [`ProfileRefinement`] instead of `Result`.
 pub fn parse_profile_refinement(raw: &str) -> ProfileRefinement {
@@ -767,34 +765,6 @@ pub fn apply_refinement(profile: &mut ProjectProfile, refinement: &ProfileRefine
         }
         profile.excludes.push(format!("{normalized}/"));
     }
-}
-
-/// Cap on the knowledge-model prompt addendum this profile contributes
-/// (design D3: "capped at 500 chars ... inside EXTRACT_CHAR_BUDGET").
-pub const PROFILE_PROMPT_ADDENDUM_CHAR_CAP: usize = 500;
-
-/// Format `profile`'s summary/focus hints for the knowledge-model
-/// extraction prompt: `"Project summary: {summary}\nFocus areas: {hints}"`,
-/// truncated to [`PROFILE_PROMPT_ADDENDUM_CHAR_CAP`] characters. Empty when
-/// the profile has neither a summary nor hints (pure-deterministic profile,
-/// no refinement yet) — callers should skip appending it entirely in that
-/// case rather than inserting a blank block.
-pub fn profile_prompt_addendum(profile: &ProjectProfile) -> String {
-    if profile.summary.trim().is_empty() && profile.focus_hints.is_empty() {
-        return String::new();
-    }
-    let mut s = String::new();
-    if !profile.summary.trim().is_empty() {
-        s.push_str("Project summary: ");
-        s.push_str(profile.summary.trim());
-        s.push('\n');
-    }
-    if !profile.focus_hints.is_empty() {
-        s.push_str("Focus areas: ");
-        s.push_str(&profile.focus_hints.join(", "));
-        s.push('\n');
-    }
-    s.chars().take(PROFILE_PROMPT_ADDENDUM_CHAR_CAP).collect()
 }
 
 #[cfg(test)]
@@ -1127,36 +1097,6 @@ mod tests {
         let refinement = ProfileRefinement { excludes: vec!["target".to_string()], ..Default::default() };
         apply_refinement(&mut profile, &refinement, dir.path());
         assert_eq!(profile.excludes, vec!["target/".to_string()], "must not duplicate");
-    }
-
-    // ---- prompt addendum ----
-
-    #[test]
-    fn profile_prompt_addendum_empty_when_no_summary_or_hints() {
-        assert_eq!(profile_prompt_addendum(&ProjectProfile::default()), "");
-    }
-
-    #[test]
-    fn profile_prompt_addendum_contains_summary_and_hints_within_cap() {
-        let profile = ProjectProfile {
-            summary: "A tool for managing widgets.".into(),
-            focus_hints: vec!["widgets".into(), "billing".into()],
-            ..Default::default()
-        };
-        let addendum = profile_prompt_addendum(&profile);
-        assert!(addendum.contains("Project summary: A tool for managing widgets."));
-        assert!(addendum.contains("Focus areas: widgets, billing"));
-        assert!(addendum.chars().count() <= PROFILE_PROMPT_ADDENDUM_CHAR_CAP);
-    }
-
-    #[test]
-    fn profile_prompt_addendum_is_capped_at_500_chars() {
-        let profile = ProjectProfile {
-            summary: "x".repeat(2000),
-            ..Default::default()
-        };
-        let addendum = profile_prompt_addendum(&profile);
-        assert_eq!(addendum.chars().count(), PROFILE_PROMPT_ADDENDUM_CHAR_CAP);
     }
 
     // ---- compose_profile_prompt / tree_sample ----

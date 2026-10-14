@@ -355,8 +355,7 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     }
 
     // Re-tier. An unchanged file skipped `index_one` above, so a change of
-    // the repo's kind or a new `~` line reaches it only here; files that are
-    // now search-only also leave the extraction queue.
+    // the repo's kind or a new `~` line reaches it only here.
     let tiers: Vec<(String, crate::kenignore::Tier)> =
         on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
     db.set_file_tiers(&tiers)?;
@@ -389,12 +388,16 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
 /// What every scan ends with: the supersessions the decisions log marks
 /// itself, stored for search (knowledge-core decision 25), and in a
 /// knowledge base the lint that needs no model (decision 29), its findings
-/// filed and the fixed ones resolved.
+/// filed and the fixed ones resolved, and the project graph's edges that
+/// the knowledge base's own index holds (decision 21).
 fn after_scan(project: &Project, db: &mut Db) -> Result<()> {
     crate::supersede::store_marked(db, &crate::authority::Roles::of_repo(&project.root))?;
     if crate::registry::is_library(&project.root) {
         if let Err(e) = crate::lint::on_scan(db, crate::engine::now_epoch()) {
             eprintln!("lint: {e}");
+        }
+        if let Err(e) = crate::graph::on_scan(db, &project.root) {
+            eprintln!("graph: {e}");
         }
     }
     Ok(())
@@ -557,22 +560,9 @@ fn index_one(
     if let Some(map) = &map {
         db.set_code_index(rel, map)?;
     }
-    // Incremental Map: an indexed file whose content changed is queued for
-    // local-LLM extraction. The hash is over the extracted text, so mtime/size
-    // churn without a content change never re-runs extraction. kenignore D3/
-    // task 1.5: search-only files are searchable but never enter the
-    // knowledge model, so extraction is gated to full-tier only. FTS (the
-    // upsert_file call above) and OCR (the enqueue below) both stay
-    // tier-blind (both tiers are searchable) — only this extraction enqueue
-    // is gated.
-    if status == STATUS_INDEXED && tier == crate::kenignore::Tier::Full {
-        let hash = crate::knowledge_model::content_hash(&text);
-        db.enqueue_extraction_if_changed(rel, &hash)?;
-    }
     // OCR enqueue (Phase 2): images and low-text (scanned) PDFs get queued for
-    // a background OCR pass so their pixels become searchable text. Keep this
-    // OUT of the knowledge-model extraction queue/coverage — it's a separate
-    // pipeline. Never run OCR inline here: it reads bytes and hits Vision, which
+    // a background OCR pass so their pixels become searchable text. Never run
+    // OCR inline here: it reads bytes and hits Vision, which
     // would stall the scan. Keyed by a cheap per-version hash so an unchanged
     // rescan (which never re-runs `index_one`) never re-OCRs, and a real change
     // (new size/mtime → new hash) re-queues. Only reached when the file was read
@@ -580,7 +570,7 @@ fn index_one(
     // where the OS has no OCR engine: marking such files done unread would keep
     // them unread once one exists.
     if status != STATUS_FAILED && crate::ocr::available() {
-        let ocr_hash = crate::knowledge_model::content_hash(&format!("{size}:{mtime}"));
+        let ocr_hash = crate::db::content_hash(&format!("{size}:{mtime}"));
         match kind {
             FileKind::Image if !is_vector_image(rel) && size <= MAX_OCR_IMAGE_BYTES => {
                 db.enqueue_ocr_if_changed(rel, &ocr_hash)?;
@@ -864,8 +854,7 @@ fn is_hidden_rel(rel: &str) -> bool {
 /// "Everything" includes the on-disk transcript cache (`.ken/transcripts`): a
 /// reindex means "start from scratch", so regenerated transcripts must not
 /// reuse stale VTTs keyed off paths that may no longer exist. The DB is cleared
-/// (files, contents, extractions, entities, events, knowledge-model stamp) and
-/// the cache dir removed before the fresh scan repopulates the index.
+/// (files, contents, OCR) and the cache dir removed before the fresh scan repopulates the index.
 pub fn reindex(project: &Project, db: &mut Db) -> Result<ScanStats> {
     db.clear()?;
     // Remove the generated-transcript cache. Ignore a missing dir (nothing was
@@ -941,31 +930,6 @@ mod tests {
         let row = db.get_file("PartyMemberChip.ui").unwrap().unwrap();
         assert_eq!((row.kind.as_str(), row.status.as_str()), ("code", STATUS_INDEXED));
         assert_eq!(db.search_chunks_fts("NameCell", 5).unwrap().first().map(|h| h.path.as_str()), Some("PartyMemberChip.ui"));
-    }
-
-    #[test]
-    fn indexing_enqueues_changed_files_for_extraction() {
-        let (dir, project) = temp_project();
-        let mut db = Db::open(&PathBuf::from(dir.path()).join("idx"), project.config.id)
-            .unwrap_or_else(|_| Db::open_in_memory().unwrap());
-        // Index a real indexed file directly through index_one.
-        fs::write(project.root.join("note.md"), "Priya leads billing.").unwrap();
-        let meta = project.root.join("note.md").metadata().unwrap();
-        let status = index_one(
-            &project, &mut db, "note.md",
-            meta.len() as i64, 0, false, crate::kenignore::Tier::Full,
-        ).unwrap();
-        assert_eq!(status, STATUS_INDEXED);
-        // The file is now queued with the hash of its extracted text.
-        assert_eq!(
-            db.next_pending_extraction().unwrap(),
-            Some(("note.md".into(), crate::knowledge_model::content_hash("Priya leads billing.").into()))
-        );
-
-        // Re-indexing identical content does NOT re-queue once it's done.
-        db.mark_extraction_done("note.md", &crate::knowledge_model::content_hash("Priya leads billing."), 1).unwrap();
-        index_one(&project, &mut db, "note.md", meta.len() as i64, 0, false, crate::kenignore::Tier::Full).unwrap();
-        assert!(db.next_pending_extraction().unwrap().is_none());
     }
 
     #[test]
@@ -1411,56 +1375,6 @@ mod tests {
                 "is_ken_allowlisted_path({rel:?})"
             );
         }
-    }
-
-    /// Making a whole repo search-only (a code or reference kind writes the
-    /// same `~*` rule) must reach files already indexed, though none of them
-    /// changed: they leave the extraction queue and the coverage count, and
-    /// a project reopen's backfill does not put them back.
-    #[test]
-    fn a_repo_made_search_only_leaves_the_extraction_queue_without_a_file_change() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("plan.md"), "# Plan\nShip it.\n").unwrap();
-        fs::write(dir.path().join("notes.md"), "Some notes.\n").unwrap();
-        let project = Project::create(dir.path(), "Retier").unwrap();
-        let mut db = Db::open_in_memory().unwrap();
-        scan(&project, &mut db).unwrap();
-        assert!(db.next_pending_extraction().unwrap().is_some(), "full tier: queued");
-        assert_eq!(db.extraction_coverage().unwrap().1, 2);
-        // What the graph read out of them: one entity from plan.md alone, one
-        // also backed by a file that stays full, and an event from notes.md.
-        let entity = |name: &str, sources: &[&str]| crate::db::EntityInput {
-            kind: "topic".into(),
-            name: name.into(),
-            summary: String::new(),
-            sources: sources.iter().map(|s| s.to_string()).collect(),
-            connections: Vec::new(),
-        };
-        db.replace_knowledge_model(
-            &[entity("Ship", &["plan.md"]), entity("Notes", &["notes.md", "elsewhere.md"])],
-            &[crate::db::EventInput { date: "2026-09-25".into(), category: "note".into(), text: "x".into(), source: "notes.md".into() }],
-            1,
-        )
-        .unwrap();
-
-        fs::write(dir.path().join(".kenignore"), "~*\n").unwrap();
-        let stats = scan(&project, &mut db).unwrap();
-        assert_eq!(stats.updated + stats.added, 0, "no file changed: {stats:?}");
-        assert!(db.next_pending_extraction().unwrap().is_none(), "search-only: off the queue");
-        assert_eq!(db.extraction_coverage().unwrap().1, 0, "not counted as extractable");
-        assert_eq!(db.backfill_extractions().unwrap(), 0, "backfill leaves search-only alone");
-        assert_eq!(db.unqueued_extractable_count().unwrap(), 0);
-        // Their entities left the graph with them; one another file backs stays.
-        let (entities, _) = db.list_entities_with_edges().unwrap();
-        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["Notes"], "{names:?}");
-        assert_eq!(entities[0].sources, vec!["elsewhere.md".to_string()]);
-
-        // Back to full: the files are extractable again and backfill queues them.
-        fs::remove_file(dir.path().join(".kenignore")).unwrap();
-        scan(&project, &mut db).unwrap();
-        assert_eq!(db.extraction_coverage().unwrap().1, 2);
-        assert_eq!(db.backfill_extractions().unwrap(), 2);
     }
 
     /// A folder a `.kenignore` line drops leaves the code index with its files,

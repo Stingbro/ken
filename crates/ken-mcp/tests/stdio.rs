@@ -153,7 +153,7 @@ fn scoped_server_full_session() {
         .collect();
     assert_eq!(
         names,
-        ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
+        ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
     );
 
     // search finds seeded content.

@@ -222,7 +222,7 @@
 
     <div class="card">
       <div class="card-title">Watched folders</div>
-      <p class="note">Ken watches every folder. Untick one to leave it, and everything in it, out of search and the map.</p>
+      <p class="note">Ken watches every folder. Untick one to leave it, and everything in it, out of search.</p>
       {#if app.folders.length === 0}
         <p class="note">No subfolders.</p>
       {:else}

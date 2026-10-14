@@ -2255,8 +2255,10 @@ pub fn finish_ingest(root: &Path, db: &mut Db, placement: &Placement, note: &str
     };
     // The pages written wait for the lint after an edit (decision 29): one
     // Claude call compares them with their neighbours, in the background.
+    // They wait for their topic tags too (decision 21), the note with them.
     let written: Vec<String> = f.pages.iter().map(|p| p.path.clone()).collect();
     crate::lint::queue_after_edit(db, &written)?;
+    crate::graph::queue_topics(db, &[written.as_slice(), std::slice::from_ref(&placement.note)].concat())?;
     record(db, &placement.note, |card| {
         card.pages = f.pages.clone();
         card.commit = commit;

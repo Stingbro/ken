@@ -29,11 +29,11 @@ impl Person {
     }
 
     /// Whether an entity called `name` is this person: their name, an alias
-    /// or an address, compared after [`crate::federation::normalize_name`].
+    /// or an address, compared after [`crate::routing::normalize_name`].
     pub fn is_named(&self, name: &str) -> bool {
-        let norm = crate::federation::normalize_name(name);
+        let norm = crate::routing::normalize_name(name);
         !norm.is_empty()
-            && self.names().chain(self.emails.iter()).any(|n| crate::federation::normalize_name(n) == norm)
+            && self.names().chain(self.emails.iter()).any(|n| crate::routing::normalize_name(n) == norm)
     }
 
     fn names(&self) -> impl Iterator<Item = &String> {

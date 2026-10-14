@@ -634,33 +634,56 @@ export interface QuickAnswerDelta {
   project_id?: string;
 }
 
-/** A knowledge-model entity (Map node). */
-export interface EntityRow {
-  id: number;
-  kind: "person" | "organization" | "repo" | "topic" | "decision" | "other";
-  name: string;
-  summary: string;
-  /** Project-relative paths this entity is grounded in. */
-  sources: string[];
-}
-
-/** A relation between two entities (Map edge). */
-export interface EntityEdge {
-  id: number;
-  a: number;
-  b: number;
+/** One neighbour in the project graph (knowledge-core decision 21), from
+ *  `graph_related`: nearest first, by edge kind. */
+export interface RelatedNeighbour {
+  /** `kind:id`, e.g. `page:Design/Saves.md`, `decision:D-012`. */
+  key: string;
+  /** `page` | `note` | `ticket` | `decision` | `code` | `symbol` | `topic` |
+   *  `repo` | `commit`. */
+  kind: string;
+  /** A file's name, a ruling's id, a topic, a commit. */
   label: string;
+  /** `supersedes` | `refines` | `cites` | `changed` | `code-cites` | `link` |
+   *  `commit` | `imports` | `uses` | `in` | `topic`. */
+  edge: string;
+  /** The edge goes from the file asked about (or the node it came through)
+   *  to this one. */
+  outgoing: boolean;
+  detail: string;
+  /** 1 for a direct neighbour, 2 for one reached through `via`. */
+  hops: number;
+  via: string | null;
+  /** Where it opens as a file: the member that holds it, and its path. */
+  projectId: string | null;
+  path: string | null;
 }
 
-/** A knowledge-model event (Timeline entry). */
-export interface EventRow {
-  id: number;
-  /** Best-effort yyyy-mm-dd. */
+/** One entry of the project's raid log (knowledge-core decision 37). */
+export interface RaidEntry {
+  /** `YYYY-MM-DD`. */
   date: string;
-  category: string;
+  /** Unix seconds, when the source says the time (a finding). */
+  at: number | null;
+  /** `ingest` | `drift` | `lint` | `ruling` | `ticket` | `commit` |
+   *  `finding` | `release` (or another kind a `log.md` line names). */
+  kind: string;
   text: string;
-  /** Project-relative path the event came from. */
-  source: string;
+  /** Another repo's name, for its commit or release. */
+  repo: string | null;
+  /** The file it comes from, in the repo the log was read from. */
+  path: string | null;
+  line: number | null;
+  /** A commit's sha or a release's tag. */
+  reference: string | null;
+}
+
+/** The Timeline: the raid log of the workspace's knowledge base, else the
+ *  focused repo. */
+export interface RaidLog {
+  projectId: string | null;
+  name: string | null;
+  entries: RaidEntry[];
 }
 
 /**
@@ -676,142 +699,6 @@ export interface OcrRegion {
   bbox: [number, number, number, number];
 }
 
-/** The whole stored knowledge model — small by construction. */
-export interface KnowledgeModel {
-  entities: EntityRow[];
-  edges: EntityEdge[];
-  events: EventRow[];
-  /** Epoch seconds of the last build; null before the first one. */
-  builtAt: number | null;
-  /** A manual Deep rebuild is running right now. */
-  building: boolean;
-  /** Files extracted so far / indexed files — the coverage line. */
-  analyzed: number;
-  total: number;
-  /** Files whose extraction terminally failed (retry budget exhausted). */
-  failed: number;
-  /** `ready` | `notInstalled` | `error`. */
-  llmStatus: "ready" | "notInstalled" | "error";
-  llmError: string | null;
-}
-
-export interface KnowledgeModelState {
-  /** `idle` = an automatic build stopped without a model; not an error. */
-  state: "building" | "ready" | "error" | "idle";
-  detail: string | null;
-  /** Set on member-scoped emits of `knowledge-model-state` (S9 step 5). */
-  project_id?: string;
-}
-
-/** Entity kinds shared by per-project (`EntityRow`) and workspace-KG global
- *  entities — the proposal's own words: workspace-KG "kinds reuse the
- *  per-project set". Duplicated as a literal union here (rather than
- *  imported from `./knowledge`) to avoid a circular import back into this
- *  module — federated-kg task 3.1. */
-type EntityKind = "person" | "organization" | "repo" | "topic" | "decision" | "other";
-
-/** Mirrors `WorkspaceKgMemberStatusDto` (federated-kg task 2.2) — one open
- *  member's staleness in `workspace_kg_overview`. */
-export interface WorkspaceKgMemberStatus {
-  projectId: string;
-  name: string;
-  /** This member's current `knowledge_model_built_at` watermark; `null` =
-   *  no knowledge model built yet. */
-  currentWatermark: number | null;
-  /** True when the workspace-KG's cached snapshot for this member is
-   *  missing or behind `currentWatermark` — the next build will re-read it
-   *  (spec: "unchanged members are skipped"). */
-  stale: boolean;
-}
-
-/** Mirrors `WorkspaceKgOverviewDto` (federated-kg task 2.2) — counts +
- *  per-member staleness. */
-export interface WorkspaceKgOverview {
-  /** `null` before the first build ever completes. */
-  builtAt: number | null;
-  llmPasses: boolean;
-  globalEntities: number;
-  entityLinks: number;
-  edges: number;
-  /** Only currently-open members — no workspace manifest exists yet to
-   *  enumerate members that aren't open (see Rust doc comment on
-   *  `WorkspaceKgOverviewDto`). */
-  members: WorkspaceKgMemberStatus[];
-}
-
-/** Mirrors `WorkspaceKgEdgeDto` — one edge in a `workspace_kg_entity` wiki
- *  page, an out-link or a back-link depending which list it's in.
- *  `otherId`/`otherName` always name the OTHER endpoint (design D4:
- *  back-links are `global_edges` queried in reverse, not a separate table). */
-export interface WorkspaceKgEdge {
-  id: number;
-  otherId: number;
-  otherName: string;
-  relation: string;
-  weight: number;
-  /** `"imported"` | `"cooccur"` | `"llm"`. */
-  provenance: string;
-}
-
-/** Mirrors `WorkspaceKgPointerDto` — a `doc_pointers` row: a "mentioned in"
- *  entry pointing into one member's file. */
-export interface WorkspaceKgPointer {
-  projectId: string;
-  relPath: string;
-  snippet: string;
-  /** `ken://<project-id>/<rel-path>` (design D4 addressing). */
-  uri: string;
-  /** True if this pointer's file is confirmed missing on disk. Only
-   *  checkable for a currently-open member; a pointer into a closed member
-   *  is never flagged stale by this field alone (never a crash either way). */
-  stale: boolean;
-}
-
-/** Mirrors `WorkspaceKgEntityDto` — the full wiki-page payload for one
- *  global entity in a single call (federated-kg task 2.2 / design D4: "the
- *  frontend never joins") — summary, both edge directions, and per-project
- *  doc pointers. */
-export interface WorkspaceKgEntity {
-  id: number;
-  kind: EntityKind;
-  name: string;
-  summary: string;
-  updatedAt: number;
-  /** `kg://<id>` (design D4 addressing). */
-  uri: string;
-  outLinks: WorkspaceKgEdge[];
-  backLinks: WorkspaceKgEdge[];
-  pointers: WorkspaceKgPointer[];
-}
-
-/** Mirrors `WorkspaceKgSearchHitDto` — one `workspace_kg_search` hit. */
-export interface WorkspaceKgSearchHit {
-  id: number;
-  kind: EntityKind;
-  name: string;
-  summary: string;
-  uri: string;
-}
-
-/** Mirrors the Rust `WorkspaceKgStateEvent` internally-tagged enum
- *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape
- *  convention as `SemanticIndexState` above. `building` is only ever
- *  emitted once up front (`done: 0`) — the ken-core build has no per-member
- *  progress callback yet (see Rust doc comment on `WorkspaceKgStateEvent`),
- *  so `total` (the real member count) is the only progress signal today. */
-export type WorkspaceKgState =
-  | { state: "building"; done: number; total: number }
-  | {
-      state: "ready";
-      globalEntities: number;
-      entityLinks: number;
-      importedEdges: number;
-      cooccurEdges: number;
-      llmEdges: number;
-      llmPasses: boolean;
-    }
-  | { state: "unavailable"; reason: string };
-
 /** Mirrors ken-core's `DistillCandidate` (design D6) — one proposed
  *  long-term memory awaiting approval. Always workspace-scope (the journal
  *  has no per-project home); `sources` are journal-relative paths (e.g.
@@ -826,7 +713,7 @@ export interface DistillCandidate {
 
 /** Mirrors the Rust `MemoryStateEvent` internally-tagged enum
  *  (`#[serde(tag = "state", rename_all = "camelCase")]`), same shape
- *  convention as `WorkspaceKgState`/`SemanticIndexState` above. App-global
+ *  convention as `SemanticIndexState` above. App-global
  *  (a distillation run reads the whole workspace journal, no owning
  *  project) — fired by `distill_journal`. */
 export type MemoryStateEvent =
@@ -842,8 +729,7 @@ export interface ClaudeDoctor {
   help: string;
 }
 
-/** What an on-device model is for: speech to text, search by meaning, or
- *  building the map on this computer instead of with Claude. */
+/** What an on-device model is for: speech to text, or search by meaning. */
 export type ModelCategory = "transcription" | "embedding";
 
 /** A downloadable on-device model and whether it's installed. */
@@ -1631,27 +1517,13 @@ export const api = {
   /// streams without paying the load. No-op when no local model is installed.
   warmLlm: () => invoke<void>("warm_llm"),
 
-  knowledgeModel: () => invoke<KnowledgeModel>("knowledge_model"),
-  refreshKnowledgeModel: () => invoke<void>("refresh_knowledge_model"),
-
-  /** Manually rebuild the workspace knowledge graph now (federated-kg task
-   *  3.1). Returns as soon as the build thread is spawned; progress and
-   *  outcome arrive via `onWorkspaceKgState` events. Rejects if the
-   *  `federatedKg` flag is off, or a build is already running. */
-  rebuildWorkspaceKg: () => invoke<void>("rebuild_workspace_kg"),
-  /** Workspace-KG summary: counts + per-member staleness. Rejects with the
-   *  flag-off error before `kg.sqlite` is ever opened. */
-  workspaceKgOverview: (team: string | null = null) =>
-    invoke<WorkspaceKgOverview>("workspace_kg_overview", { team }),
-  /** The full wiki-page payload for one global entity — summary, out-links,
-   *  back-links, and per-project doc pointers in one call. */
-  workspaceKgEntity: (id: number) =>
-    invoke<WorkspaceKgEntity>("workspace_kg_entity", { id }),
-  /** Case-insensitive substring search over global entity names + summaries
-   *  (name matches ranked above summary-only matches), capped at 50 hits.
-   *  An empty/whitespace-only query always returns `[]` (no "list all"). */
-  workspaceKgSearch: (query: string, team: string | null = null) =>
-    invoke<WorkspaceKgSearchHit[]>("workspace_kg_search", { query, team }),
+  /** A file's neighbours in the project graph (knowledge-core decision
+   *  21): `path` in the member `projectId` (default the focused one). */
+  graphRelated: (path: string, projectId: string | null = null) =>
+    invoke<RelatedNeighbour[]>("graph_related", { path, projectId }),
+  /** The Timeline, the project's raid log (knowledge-core decision 37),
+   *  newest first. */
+  raidLog: (limit: number | null = null) => invoke<RaidLog>("raid_log", { limit }),
 
   // ---- Memory (ken-memory task 4.1) ----
   /** Kick off a distillation pass over the current journal window. Returns
@@ -1666,7 +1538,7 @@ export const api = {
   resolveDistillCandidate: (slug: string, approve: boolean) =>
     invoke<void>("resolve_distill_candidate", { slug, approve }),
   /** `memory-state`: `planning` → `distilling` → `ready` (candidates) |
-   *  `error` (reason). App-global like `onWorkspaceKgState`. */
+   *  `error` (reason). App-global: a run reads the whole workspace journal. */
   onMemoryState: (fn: (ev: MemoryStateEvent) => void): Promise<UnlistenFn> =>
     listen<MemoryStateEvent>("memory-state", (e) => fn(e.payload)),
 
@@ -1766,20 +1638,6 @@ export const api = {
     listen<QuickAnswer>("quick-answer", (e) => fn(e.payload)),
   onQuickAnswerDelta: (fn: (ev: QuickAnswerDelta) => void): Promise<UnlistenFn> =>
     listen<QuickAnswerDelta>("quick-answer-delta", (e) => fn(e.payload)),
-  onKnowledgeModelState: (
-    fn: (ev: KnowledgeModelState) => void,
-  ): Promise<UnlistenFn> =>
-    listen<KnowledgeModelState>("knowledge-model-state", (e) => fn(e.payload)),
-  onKnowledgeUpdated: (fn: () => void): Promise<UnlistenFn> =>
-    listen<null>("knowledge-updated", () => fn()),
-  /** `workspace-kg-state`: `building` (once, up front) → `ready` |
-   *  `unavailable` (federated-kg task 3.1). App-global — a workspace-KG
-   *  build spans every open member, so unlike `onKnowledgeModelState` there
-   *  is no `project_id` to filter on. */
-  onWorkspaceKgState: (
-    fn: (ev: WorkspaceKgState) => void,
-  ): Promise<UnlistenFn> =>
-    listen<WorkspaceKgState>("workspace-kg-state", (e) => fn(e.payload)),
   /** `workspace-state`: `opening` → `open` | `focus` | `closed`
    *  (workspace task 4.1). App-global — a workspace lifecycle spans every
    *  member at once, so there's no `project_id` to filter on. */

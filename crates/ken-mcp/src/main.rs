@@ -28,7 +28,6 @@ use ken_core::routing::{self, MemberHits, MemberInfo, MemberStatus, RouteReason}
 use ken_core::search::Source;
 use ken_core::settings::AppSettings;
 use ken_core::tasks;
-use ken_core::workspace_kg_db::WorkspaceKgDb;
 
 /// The protocol revision we implement. Newer revisions we know to be
 /// wire-compatible with our subset are echoed back on request.
@@ -280,13 +279,16 @@ from Ken's code index. Drill into a file with it before reading all of it or gre
         }),
         json!({
             "name": "related_files",
-            "description": "A code file's neighbours: the files it imports, the files that import it, and the libraries \
-it uses, from Ken's code index. For how a module fits in and what depends on it; use it before Grep or Glob for \
-imports.",
+            "description": "What a file, ruling or ticket is related to, from Ken's project graph (exact sources only), \
+nearest first: the pages that link to it or that it links to, what a page cites (code files, notes, rulings), the \
+note that changed a page, the ruling that supersedes another, code comments and commits that cite a ruling or a \
+ticket, the topics a page is tagged with and the pages that share them, and for a code file the files it imports and \
+that import it (from Ken's code index). For how something fits in and what depends on it; use it before Grep or Glob \
+for imports or references.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "The file's path relative to its project root." },
+                    "path": { "type": "string", "description": "The file's path relative to its project root, or a ruling or ticket id (D-012, SR-101)." },
                     "project": code_project.clone()
                 },
                 "required": ["path"]
@@ -351,24 +353,6 @@ missing) and, if it has one, its one-line `.ken/index-profile.json` summary.",
     ];
 
     {
-        tools.push(json!({
-            "name": "kg_search",
-            "description": "Search the workspace knowledge graph — entity \
-names and summaries merged across every project's own knowledge model — and \
-return kg:// ids. Use this to find out which project(s) know about a topic \
-before calling semantic_search on one of them directly; for a one-shot \
-answer where you don't need to see the entities first, call route_query \
-instead. When the graph is off, this returns an explanation rather than an \
-error; semantic_search and route_query keep working without it.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search terms — matched against entity names and summaries, case-insensitive." },
-                    "limit": { "type": "integer", "description": "Maximum entities to return (default 50)." }
-                },
-                "required": ["query"]
-            }
-        }));
         tools.push(json!({
             "name": "semantic_search",
             "description": "route_query for ONE project you already know (the user named it, \
@@ -615,7 +599,6 @@ fn open_in_ken_via(server: &Server, args: &Value, (url, token): &(String, String
 fn call_tool(server: &Server, name: &str, args: &Value) -> Result<String, String> {
     match name {
         "list_projects" => list_projects(server),
-        "kg_search" => kg_search(server, args),
         "semantic_search" => semantic_search(server, args),
         "route_query" => route_query(server, args),
         "find_definition" => find_definition(server, args),
@@ -937,55 +920,6 @@ folder in the Ken app first."
     Ok(out)
 }
 
-/// Search the workspace knowledge graph (task 3.2). Delegates to the same
-/// `WorkspaceKgDb` reads src-tauri's `workspace_kg_search` command uses
-/// (D4: "delegate, never reimplement" as far as this layer allows — the
-/// name/summary substring match + name-first sort is duplicated from that
-/// command's body rather than shared, since no reusable ken-core function
-/// for it exists to call instead; see the final report).
-fn kg_search(server: &Server, args: &Value) -> Result<String, String> {
-    let query = require_str(args, "query")?;
-    let limit = args
-        .get("limit")
-        .and_then(|l| l.as_u64())
-        .map(|l| l.clamp(1, 200) as usize)
-        .unwrap_or(50);
-    if !federated_kg_enabled(&AppSettings::load(&server.base_dir)) {
-        return Ok("The workspace knowledge graph is off, so kg_search has \
-nothing to search yet. semantic_search and route_query work without it."
-            .to_string());
-    }
-    let kg = WorkspaceKgDb::open(&kg_root(server))
-        .map_err(|e| format!("could not open the workspace knowledge graph: {e}"))?;
-    let q = query.trim().to_lowercase();
-    let mut hits: Vec<_> = kg
-        .list_global_entities()
-        .map_err(|e| format!("knowledge graph read failed: {e}"))?
-        .into_iter()
-        .filter(|e| e.name.to_lowercase().contains(&q) || e.summary.to_lowercase().contains(&q))
-        .collect();
-    // Name matches rank above summary-only matches; stable by id within each
-    // tier — same ranking as the src-tauri command this mirrors.
-    hits.sort_by(|a, b| {
-        let a_name = a.name.to_lowercase().contains(&q);
-        let b_name = b.name.to_lowercase().contains(&q);
-        b_name.cmp(&a_name).then(a.id.cmp(&b.id))
-    });
-    hits.truncate(limit);
-    if hits.is_empty() {
-        return Ok(format!("No workspace knowledge-graph entities match {query:?}."));
-    }
-    let mut out = format!(
-        "{} entit{} match {query:?}:\n",
-        hits.len(),
-        if hits.len() == 1 { "y" } else { "ies" }
-    );
-    for h in hits {
-        out.push_str(&format!("\nkg://{} — {} ({}): {}", h.id, h.name, h.kind, h.summary));
-    }
-    Ok(out)
-}
-
 /// One project's search: `routing::search_member_of`, the same pipeline
 /// route_query and the app use, with the question embedded by the app's own
 /// model when it is installed ([`query_vector`]) and keyword only, said in
@@ -1280,24 +1214,82 @@ fn file_outline(server: &Server, args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Most neighbours `related_files` lists.
+const RELATED_LIMIT: usize = 40;
+
+/// What a file, ruling or ticket is related to (knowledge-core decision 21):
+/// `graph::related` over the workspace's knowledge base (its stored edges)
+/// and the code index of every other repo. The path is looked for in the
+/// named project, else the knowledge base, else the first repo whose index
+/// has it; an id in a ruling's or a ticket's shape is looked up in the
+/// knowledge base.
 fn related_files(server: &Server, args: &Value) -> Result<String, String> {
-    let path = require_str(args, "path")?.replace('\\', "/");
-    let (id, project, db) = index_with_file(server, args, &path)?;
-    let r = ken_core::codeindex::related(&db, &path).map_err(|e| e.to_string())?;
-    let list = |files: &[String]| -> String {
-        if files.is_empty() {
-            " (none)".to_string()
+    use ken_core::graph::Node;
+    let path = require_str(args, "path")?.trim().replace('\\', "/");
+    let registry = Registry::load(&server.base_dir).map_err(|e| format!("could not read Ken's project registry: {e}"))?;
+    let inside = in_open_workspace(server, &registry);
+    let mut repos: Vec<(Uuid, String, PathBuf, Db)> = registry
+        .projects
+        .iter()
+        .filter(|e| e.path.is_dir() && inside(&e.path))
+        .filter_map(|e| Db::open_read_only(&server.base_dir, e.id).ok().map(|db| (e.id, e.name.clone(), e.path.clone(), db)))
+        .collect();
+    let kb_at = repos.iter().position(|r| registry::is_library(&r.2));
+    let kb = kb_at.map(|i| repos.remove(i));
+    let named = args.get("project").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty());
+    let has = |db: &Db| db.get_file(&path).is_ok_and(|f| f.is_some());
+    let id_like = !path.contains('/') && !path.contains('.') && path.contains('-');
+    let (node, label) = if let Some(k) = kb.as_ref().filter(|k| named.is_none_or(|n| k.1.eq_ignore_ascii_case(n))) {
+        if has(&k.3) {
+            (Node::of_path(&path), ken_address(k.0, &path))
+        } else if id_like {
+            let known = ken_core::graph::known_ids(&k.3, &k.2).map_err(|e| e.to_string())?;
+            match known.get(&path) {
+                Some(n) => (n.clone(), n.key()),
+                None => return Ok(format!("{path} is not a ruling or a ticket the knowledge base has. {LOOK_YOURSELF}")),
+            }
         } else {
-            files.iter().map(|f| format!("\n  - {}", ken_address(id, f))).collect()
+            code_node(&repos, named, &path)?
         }
+    } else {
+        code_node(&repos, named, &path)?
     };
-    Ok(format!(
-        "{} ({project})\nImports:{}\nImported by:{}\nLibraries and unresolved: {}",
-        ken_address(id, &path),
-        list(&r.imports),
-        list(&r.imported_by),
-        if r.external.is_empty() { "(none)".to_string() } else { r.external.join(", ") }
-    ))
+    let code: Vec<ken_core::ingest::CodeSource> =
+        repos.into_iter().map(|(_, name, _, db)| ken_core::ingest::CodeSource { name, db }).collect();
+    let found = ken_core::graph::related(kb.as_ref().map(|k| &k.3), &code, &node, RELATED_LIMIT).map_err(|e| e.to_string())?;
+    if found.is_empty() {
+        return Ok(format!("Nothing in the project graph is related to {label} yet. {LOOK_YOURSELF}"));
+    }
+    let address = |n: &Node| -> String {
+        if let (Some(p), Some(k)) = (n.kb_path(), kb.as_ref()) {
+            return ken_address(k.0, p);
+        }
+        if let Some((repo, p, symbol)) = n.code_place() {
+            if let Some(id) = registry.projects.iter().find(|e| e.name == repo).map(|e| e.id) {
+                return format!("{}{}", ken_address(id, p), symbol.map(|s| format!(" `{s}`")).unwrap_or_default());
+            }
+        }
+        n.key()
+    };
+    let mut out = format!("{label}: {} related, nearest first:", found.len());
+    for n in &found {
+        let arrow = if n.outgoing { "" } else { "← " };
+        let detail = if n.detail.is_empty() { String::new() } else { format!(" ({})", n.detail) };
+        let via = n.via.as_ref().map(|v| format!(", through {}", address(v))).unwrap_or_default();
+        out.push_str(&format!("\n  - {arrow}{} {}{detail}{via}", n.edge, address(&n.node)));
+    }
+    Ok(out)
+}
+
+/// The code node for `path`: in the named repo, else the first repo whose
+/// index has the file. With its address, for the reply's first line.
+fn code_node(repos: &[(Uuid, String, PathBuf, Db)], named: Option<&str>, path: &str) -> Result<(ken_core::graph::Node, String), String> {
+    repos
+        .iter()
+        .filter(|r| named.is_none_or(|n| r.1.eq_ignore_ascii_case(n)))
+        .find(|r| r.3.get_file(path).is_ok_and(|f| f.is_some()))
+        .map(|r| (ken_core::graph::Node::code(&r.1, path), format!("{} ({})", ken_address(r.0, path), r.1)))
+        .ok_or_else(|| format!("{path:?} is not indexed in any repo of the open workspace. {LOOK_YOURSELF}"))
 }
 
 /// Said with every empty search: the index is not the last word. An agent
@@ -2092,12 +2084,6 @@ fn ken_address(project_id: Uuid, rel_path: &str) -> String {
     format!("ken://{project_id}/{}", rel_path.replace('\\', "/"))
 }
 
-/// The workspace graph is how Ken works, not a switch
-/// (`features::BUILT_IN`), as in the app.
-fn federated_kg_enabled(_app_settings: &AppSettings) -> bool {
-    true
-}
-
 fn opt_str(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
@@ -2174,20 +2160,6 @@ argument is required (a name or folder path). {available}"
     Ok((project, None))
 }
 
-/// The workspace ken-mcp should read/write memories and the journal for:
-/// Ken's registry `lastWorkspace` entry (task brief: "resolve the current
-/// workspace as last_workspace's entry; if none, the tools should return a
-/// clear 'no workspace' message"). Unlike `resolve_project`, there is no
-/// `--project`-style scoping flag for a workspace to fall back on — ken-mcp
-/// only ever knows "the workspace Ken last had open," mirroring how the app
-/// itself reopens `lastWorkspace` on launch.
-/// Where the app keeps the merged graph: beside the last-opened workspace's
-/// manifest, else app data (no workspace open) — the same rule as the app's
-/// `workspace_kg_root`.
-fn kg_root(server: &Server) -> PathBuf {
-    resolve_workspace_root(server).unwrap_or_else(|_| server.base_dir.clone())
-}
-
 /// Whether a registered project belongs to the workspace open in Ken: its
 /// folder is inside the workspace's. With no workspace open, every project
 /// does. A search with no project named stays inside the workspace the person
@@ -2231,6 +2203,11 @@ fn norm_path(path: &std::path::Path) -> String {
     }
 }
 
+/// The workspace ken-mcp should read/write memories and the journal for:
+/// Ken's registry `lastWorkspace` entry, or a clear "no workspace" message.
+/// There is no `--project`-style scoping flag for a workspace to fall back
+/// on: ken-mcp only ever knows the workspace Ken last had open, as the app
+/// itself reopens `lastWorkspace` on launch.
 fn resolve_workspace_root(server: &Server) -> Result<PathBuf, String> {
     let registry = Registry::load(&server.base_dir)
         .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
@@ -2454,7 +2431,7 @@ mod tests {
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"]
         );
         for t in tools {
             assert!(t["inputSchema"]["type"] == "object", "schema for {}", t["name"]);
@@ -2482,10 +2459,12 @@ mod tests {
         let (text, _) = tool(&mut fx.server, "file_outline", json!({"path": "app/store.py"}));
         assert!(text.contains("class Store") && text.contains("\n  method open") || text.contains("\n  function open"), "{text}");
 
+        // The project graph answers, with the code index's imports for a
+        // code file (decision 21).
         let (text, _) = tool(&mut fx.server, "related_files", json!({"path": "app/game.py"}));
-        assert!(text.contains("Imports:\n  - ken://") && text.contains("app/store.py"), "{text}");
+        assert!(text.contains("\n  - imports ken://") && text.contains("app/store.py"), "{text}");
         let (text, _) = tool(&mut fx.server, "related_files", json!({"path": "app/store.py"}));
-        assert!(text.contains("Imported by:\n  - ken://") && text.contains("app/game.py"), "{text}");
+        assert!(text.contains("\n  - ← imports ken://") && text.contains("app/game.py"), "{text}");
 
         let (text, _) = tool(&mut fx.server, "find_definition", json!({"name": "nothing_like_it"}));
         assert!(text.contains("look directly"), "empty says to look: {text}");
@@ -2746,7 +2725,6 @@ mod tests {
                 "read_document",
                 "list_documents",
                 "list_projects",
-                "kg_search",
                 "semantic_search",
                 "route_query",
                 "memory_write",
@@ -3460,7 +3438,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "kg_search", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"],
+            ["find_definition", "find_usages", "file_outline", "related_files", "history", "read_document", "list_documents", "list_projects", "semantic_search", "route_query", "memory_write", "journal_append", "task_create", "task_update", "task_list", "ticket_list"],
         );
     }
 

@@ -419,7 +419,7 @@
           </p>
           <p class="note">Ken writes, reads sources in, judges and answers with it.</p>
         {:else if doctor}
-          <p class="note warn">Not found. Ingest, the digest, answers and the map need it.</p>
+          <p class="note warn">Not found. Ingest, the digest, answers and the background checks need it.</p>
           <p class="note">{doctor.help || claudeInstallHelp()}</p>
         {:else}
           <p class="note">Checking…</p>

@@ -388,12 +388,26 @@ pub fn code_citations(text: &str, prefixes: &BTreeSet<String>) -> Vec<(usize, St
     out
 }
 
-/// Code comments citing a ruling the decisions log does not have (decision
-/// 30), in each of `code` (the workspace's other repos), against the logs
-/// of the knowledge base `db` at `root`. The ids' shape is the log's own
-/// (its ids' prefixes), so a ticket id or `UTF-8` is never read as a
-/// ruling. Nothing when the knowledge base has no log yet.
-pub fn unknown_rulings(db: &Db, root: &Path, code: &[crate::ingest::CodeSource]) -> Result<Vec<Finding>> {
+/// One code comment citing a ruling id ([`rulings_in_code`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeRuling {
+    /// The repo, by its name in the workspace.
+    pub repo: String,
+    pub path: String,
+    pub line: usize,
+    pub id: String,
+    /// Whether the decisions log has the id.
+    pub known: bool,
+}
+
+/// Every code comment citing a ruling (decision 30), in each of `code` (the
+/// workspace's other repos), checked against the logs of the knowledge base
+/// `db` at `root`. The ids' shape is the log's own (its ids' prefixes), so a
+/// ticket id or `UTF-8` is never read as a ruling. Nothing when the
+/// knowledge base has no log yet. The known ones are graph edges
+/// (`graph::store_code_citations`); the rest are findings
+/// ([`unknown_rulings`]).
+pub fn rulings_in_code(db: &Db, root: &Path, code: &[crate::ingest::CodeSource]) -> Result<Vec<CodeRuling>> {
     let roles = crate::authority::Roles::of_repo(root);
     let mut ids: HashSet<String> = HashSet::new();
     for log in crate::supersede::log_paths(db, &roles)? {
@@ -402,32 +416,47 @@ pub fn unknown_rulings(db: &Db, root: &Path, code: &[crate::ingest::CodeSource])
         }
     }
     let prefixes: BTreeSet<String> = ids.iter().filter_map(|id| id.rsplit_once('-').map(|(p, _)| p.to_string())).collect();
-    let mut out = Vec::new();
+    let mut out: Vec<CodeRuling> = Vec::new();
     for source in code {
         for prefix in &prefixes {
             for (path, text) in source.db.code_texts_containing(&format!("{prefix}-"))? {
                 for (line, id) in code_citations(&text, &prefixes) {
-                    if ids.contains(&id) || out.len() >= MAX_PER_KIND {
+                    if out.iter().any(|c| c.repo == source.name && c.path == path && c.line == line && c.id == id) {
                         continue;
                     }
-                    let at = format!("{}:{path}:{line}", source.name);
-                    if out.iter().any(|f: &Finding| f.subject == at && f.against == id) {
-                        continue;
-                    }
-                    out.push(Finding {
-                        kind: UNKNOWN_RULING.into(),
-                        source: SOURCE.into(),
-                        text: format!("`{at}` cites {id}, which the decisions log does not have."),
-                        subject: at,
-                        against: id,
-                        against_kind: "ruling".into(),
-                        ..Default::default()
-                    });
+                    out.push(CodeRuling { repo: source.name.clone(), path: path.clone(), line, known: ids.contains(&id), id });
                 }
             }
         }
     }
     Ok(out)
+}
+
+/// Code comments citing a ruling the decisions log does not have (decision
+/// 30), at most [`MAX_PER_KIND`], from [`rulings_in_code`].
+pub fn unknown_rulings(db: &Db, root: &Path, code: &[crate::ingest::CodeSource]) -> Result<Vec<Finding>> {
+    Ok(unknown_of(&rulings_in_code(db, root, code)?))
+}
+
+/// The findings for the citations the log does not have.
+pub fn unknown_of(citations: &[CodeRuling]) -> Vec<Finding> {
+    let mut out: Vec<Finding> = Vec::new();
+    for c in citations.iter().filter(|c| !c.known) {
+        let at = format!("{}:{}:{}", c.repo, c.path, c.line);
+        if out.len() >= MAX_PER_KIND || out.iter().any(|f| f.subject == at && f.against == c.id) {
+            continue;
+        }
+        out.push(Finding {
+            kind: UNKNOWN_RULING.into(),
+            source: SOURCE.into(),
+            text: format!("`{at}` cites {}, which the decisions log does not have.", c.id),
+            subject: at,
+            against: c.id.clone(),
+            against_kind: "ruling".into(),
+            ..Default::default()
+        });
+    }
+    out
 }
 
 #[cfg(test)]

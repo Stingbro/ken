@@ -23,7 +23,6 @@ use uuid::Uuid;
 use crate::contenttype::ContentType;
 use crate::db::Db;
 use crate::embedder::Embedder;
-use crate::federation::normalize_name;
 use crate::registry::RepoKind;
 use crate::search::{self, HybridHit, Source};
 use crate::vocab::Vocabulary;
@@ -109,6 +108,28 @@ pub fn plan_route(query: &str, members: &[MemberInfo]) -> RoutePlan {
 /// some back and no source searched so far answered.
 pub fn needs_reserve(plan: &RoutePlan, searched: &[MemberHits]) -> bool {
     !plan.reserve.is_empty() && searched.iter().all(|m| m.hits.is_empty())
+}
+
+/// A name as a question would say it, for matching one against the other:
+/// lowercased, every run of other characters one space, trimmed.
+/// `"Shattered  Realms!"` and `"shattered-realms"` both read
+/// `"shattered realms"`.
+pub fn normalize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = true;
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push(' ');
+            prev_sep = true;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 /// Word-boundary-aware "does `haystack` contain `needle`" over text already
@@ -652,6 +673,14 @@ pub fn merge_routed(plan: &RoutePlan, member_hits: &[MemberHits], limit: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_normalize_as_a_question_says_them() {
+        assert_eq!(normalize_name("Shattered  Realms!"), "shattered realms");
+        assert_eq!(normalize_name("shattered-realms"), "shattered realms");
+        assert_eq!(normalize_name("  Priya N. "), "priya n");
+        assert_eq!(normalize_name("!!"), "");
+    }
     use crate::embedder::FakeEmbedder;
 
     fn member(project_id: Uuid, name: &str) -> MemberInfo {

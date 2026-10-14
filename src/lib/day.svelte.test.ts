@@ -12,7 +12,6 @@ vi.mock("./api", () => ({
     onTeamDigestGenerating: vi.fn(async () => {}),
     onTeamDigestUpdated: vi.fn(async () => {}),
     onTeamDigestError: vi.fn(async () => {}),
-    onKnowledgeModelState: vi.fn(async () => {}),
     onIndexUpdated: vi.fn(async (cb: () => void) => {
       listeners.indexUpdated = cb;
     }),

@@ -69,15 +69,12 @@ export type Screen =
   | "inbox"
   | "files"
   | "ingests"
-  | "explore"
+  | "timeline"
   | "settings";
 
 /** Settings' sections (the Briefing design's sub-nav). Team library holds what
  *  the Team screen did: the team's folders, ignore list, checks and rules. */
 export type SettingsSection = "general" | "team" | "sync" | "ai" | "agents" | "rules";
-
-/** Explore's two views of the same knowledge. */
-export type ExploreView = "timeline" | "map";
 
 /** One entry in `app.members` (workspace task 4.3). In Single mode (no
  *  workspace open) this is just the one open project, `status: "active"`
@@ -99,7 +96,6 @@ class AppStore {
   registry = $state<RegistryEntryStatus[]>([]);
   screen = $state<Screen>("home");
   settingsSection = $state<SettingsSection>("general");
-  exploreView = $state<ExploreView>("timeline");
 
   files = $state<FileRow[]>([]);
   folders = $state<FolderInfo[]>([]);
@@ -822,9 +818,9 @@ class AppStore {
     this.openSettings("team");
   }
 
-  openExplore(view?: ExploreView) {
-    if (view) this.exploreView = view;
-    this.screen = "explore";
+  /** The project's raid log (knowledge-core decision 37). */
+  openTimeline() {
+    this.screen = "timeline";
     this.searchOpen = false;
   }
 

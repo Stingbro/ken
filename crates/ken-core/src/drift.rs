@@ -1177,6 +1177,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
             Err(e) => run.commit_error = Some(e),
         }
         crate::lint::queue_after_edit(db, &run.fixed)?;
+        crate::graph::queue_topics(db, &run.fixed)?;
     }
     Ok(())
 }

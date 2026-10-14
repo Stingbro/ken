@@ -64,16 +64,19 @@ pub const FLAGS: &[FlagDef] = &[
         applies: "this machine",
         scope: FlagScope::Global,
         default: true,
-        description: "Read new files with the local model in the background \
-                      so the Map and Timeline fill in on their own. On by \
-                      default. Turn it off to leave the GPU alone — queued \
-                      files stay queued and resume when it goes back on.",
+        description: "Let Ken ask Claude in the background, a few calls an \
+                      hour: one-line summaries of the knowledge base's pages \
+                      for search, drift re-reads, the lint, and topic tags \
+                      for pages it writes. On by default. Turn it off and that \
+                      work waits until it goes back on.",
     },
 ];
 
 /// What were flags and are now how Ken works: a workspace of several repos,
-/// its knowledge graph, search routed across it, and Ken's memory. Always on; a value an
-/// older `settings.json` still holds for one is ignored, and none is shown.
+/// search routed across it, and Ken's memory. Always on; a value an older
+/// `settings.json` still holds for one is ignored, and none is shown.
+/// `federatedKg` named the merged workspace graph, gone with knowledge-core
+/// decision 21; it stays listed so an old value is still ignored.
 pub const BUILT_IN: &[&str] = &["workspace", "federatedKg", "kgRouting", "kenMemory"];
 
 /// Is `name` one of the [`BUILT_IN`] features, always on?

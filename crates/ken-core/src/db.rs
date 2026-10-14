@@ -11,11 +11,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::knowledge_model;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// Meta key: the code index was filled from stored text for this index. The
 /// stored key keeps its old name, so an index filled before the rename is not
@@ -64,14 +63,19 @@ fn load_vec_extension(conn: &Connection) -> bool {
     }
 }
 
-/// How many times an errored extraction is automatically re-queued before it is
-/// left `error` for good. Bounds retries so a persistently/deterministically
-/// failing file self-heals from a *transient* fault (bad model load, momentary
-/// unparseable JSON) but can never wedge the queue in an infinite retry loop.
-pub const MAX_EXTRACTION_ATTEMPTS: i64 = 3;
+/// A deterministic 64-bit FNV-1a of `text`, hex-encoded: a cheap
+/// fingerprint for telling whether content changed (the OCR queue's
+/// per-version key, a profile's generated hash).
+pub fn content_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
 
-/// Bounded retries for the OCR queue, mirroring [`MAX_EXTRACTION_ATTEMPTS`]. A
-/// scanned page that deterministically fails Vision (unrasterizable, corrupt)
+/// Bounded retries for the OCR queue. A scanned page that deterministically fails Vision (unrasterizable, corrupt)
 /// self-heals from a transient fault but never wedges the queue.
 pub const MAX_OCR_ATTEMPTS: i64 = 3;
 
@@ -116,7 +120,7 @@ pub struct OcrRegionRow {
 /// decision 19): files indexed, failed or skipped; how much of the meaning
 /// index is built; how the controls did; whether the embedding model is
 /// missing. Counting queries only, so it is cheap on a large index (see
-/// [`Db::index_health`]). Background reading for entities is not part of it.
+/// [`Db::index_health`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexHealth {
@@ -254,7 +258,7 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Multiple writers share this file on separate connections (the state
-        // mutex's Db, the scanner's, the extraction worker's). WAL allows
+        // mutex's Db, the scanner's, the background worker's). WAL allows
         // concurrent readers but still one writer at a time — without a busy
         // handler a second writer gets SQLITE_BUSY *immediately*: the worker
         // would waste a whole re-generation on retry, and a scanner write could
@@ -903,6 +907,33 @@ impl Db {
                 "CREATE INDEX IF NOT EXISTS code_symbols_joined ON code_symbols(lower(replace(name, '_', ''))) WHERE is_def = 1;",
             )?;
         }
+        if version < 26 {
+            // knowledge-core decision 21: the project graph from exact sources
+            // (`graph`), one edge per row between two nodes written
+            // `kind:id`, with what made it (`origin`: the scan, the code
+            // citations, the commits, or a write's topic tags). The model the
+            // local reader extracted goes: its entities, their edges, its
+            // events, its queue and its build stamp. Nothing is read again;
+            // the next scan of a knowledge base makes its edges.
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS entity_edges;
+                DROP TABLE IF EXISTS entities;
+                DROP TABLE IF EXISTS events;
+                DROP TABLE IF EXISTS extractions;
+                DELETE FROM meta WHERE key = 'knowledge_model_built_at';
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                    src    TEXT NOT NULL,
+                    dst    TEXT NOT NULL,
+                    kind   TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (src, dst, kind)
+                );
+                CREATE INDEX IF NOT EXISTS graph_edges_dst ON graph_edges(dst);
+                "#,
+            )?;
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -1519,8 +1550,6 @@ impl Db {
         if let Some(id) = file_id {
             tx.execute("DELETE FROM contents WHERE file_id = ?1", params![id])?;
             tx.execute("DELETE FROM files WHERE id = ?1", params![id])?;
-            strip_file(&tx, rel_path)?;
-            tx.execute("DELETE FROM extractions WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
             tx.execute("DELETE FROM page_meta WHERE rel_path = ?1", params![rel_path])?;
@@ -1658,9 +1687,9 @@ impl Db {
     /// moved.
     ///
     /// This is the cheap alternative to "forget the subtree and rescan": a move
-    /// changes no file's bytes, mtime or size, so re-extracting (or worse,
-    /// clearing the whole index) would throw away extractions, OCR and
-    /// transcripts to achieve a pure string rename. Everything happens in one
+    /// changes no file's bytes, mtime or size, so re-reading it (or worse,
+    /// clearing the whole index) would throw away OCR and transcripts to
+    /// achieve a pure string rename. Everything happens in one
     /// transaction so a crash can't leave half the subtree at each path.
     ///
     /// Matching mirrors [`Self::remove_folder`]: the exact path (so a single
@@ -1669,12 +1698,13 @@ impl Db {
     /// trailing slash is what keeps a string-sibling like `docs2/` out of a
     /// `docs` move.
     ///
-    /// Tables covered: `files`, `extractions`, `ocr_regions`, `ocr_pending`,
-    /// `events.source`, `entities.sources` (a JSON array), the file-valued
-    /// `review_items.source_ref` kinds, and what search reads by path: the
-    /// chunks (with the path words in their keyword row, `fts_names`), page
-    /// facts, tiers, page links and the code index. `contents` is keyed by
-    /// `file_id`, not by path, so its rows need no move.
+    /// Tables covered: `files`, `ocr_regions`, `ocr_pending`, the file-valued
+    /// `review_items.source_ref` kinds, what search reads by path (the chunks,
+    /// with the path words in their keyword row, `fts_names`; page facts,
+    /// tiers, page links and the code index), and the topic tags of the
+    /// project graph (`graph_edges`), which only a write makes again. The
+    /// graph's other edges are made again by the next scan. `contents` is
+    /// keyed by `file_id`, not by path, so its rows need no move.
     pub fn rename_prefix(&mut self, from_rel: &str, to_rel: &str) -> Result<usize> {
         let from = from_rel.trim_matches('/').to_string();
         let to = to_rel.trim_matches('/').to_string();
@@ -1688,8 +1718,7 @@ impl Db {
         let cut = from.chars().count() as i64 + 1;
         let tx = self.conn.transaction()?;
 
-        // Which rows are moving, and where to. Needed up front because the
-        // JSON `entities.sources` can't be rewritten by a single UPDATE.
+        // Which rows are moving, and where to.
         let pairs: Vec<(String, String)> = {
             let mut stmt = tx.prepare(
                 "SELECT rel_path FROM files
@@ -1725,7 +1754,7 @@ impl Db {
                 tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![id])?;
             }
         }
-        for (table, col) in PATH_KEYED.iter().filter(|(table, _)| *table != "events") {
+        for (table, col) in PATH_KEYED {
             tx.execute(
                 &format!(
                     "DELETE FROM {table}
@@ -1784,33 +1813,8 @@ impl Db {
             }
         }
 
-        // `entities.sources` is a JSON array of rel_paths, so it needs a
-        // decode/rewrite/encode rather than SQL string surgery.
-        let renames: std::collections::HashMap<&str, &str> =
-            pairs.iter().map(|(o, n)| (o.as_str(), n.as_str())).collect();
-        let ent_rows: Vec<(i64, String)> = {
-            let mut stmt = tx.prepare("SELECT id, sources FROM entities")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
-        for (id, json) in ent_rows {
-            let mut sources: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-            let mut touched = false;
-            for src in sources.iter_mut() {
-                if let Some(new) = renames.get(src.as_str()) {
-                    *src = (*new).to_string();
-                    touched = true;
-                }
-            }
-            if touched {
-                tx.execute(
-                    "UPDATE entities SET sources = ?2 WHERE id = ?1",
-                    params![id, serde_json::to_string(&sources).unwrap()],
-                )?;
-            }
-        }
+        // The topic tags of the pages that moved follow them.
+        move_graph_topics(&tx, &pairs)?;
 
         tx.commit()?;
         Ok(pairs.len())
@@ -1967,21 +1971,12 @@ impl Db {
         let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM contents", [])?;
         tx.execute("DELETE FROM files", [])?;
-        tx.execute("DELETE FROM extractions", [])?;
         // OCR is derived like everything else: a reindex starts from scratch, so
-        // stored regions and the OCR queue are wiped too.
+        // stored regions and the OCR queue are wiped too. User data (chats)
+        // and what a scan does not make again (the graph's topic tags and
+        // commit edges) are left untouched.
         tx.execute("DELETE FROM ocr_regions", [])?;
         tx.execute("DELETE FROM ocr_pending", [])?;
-        tx.execute("DELETE FROM entities", [])?; // cascades entity_edges
-        tx.execute("DELETE FROM events", [])?;
-        // Drop the knowledge-model build stamp too, so after a reindex the Map
-        // reads as "not built yet" instead of showing a stale "built at" time
-        // for a model whose entities/events we just deleted. User data
-        // (chats/chat_messages) is intentionally left untouched.
-        tx.execute(
-            "DELETE FROM meta WHERE key = 'knowledge_model_built_at'",
-            [],
-        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2041,55 +2036,6 @@ impl Db {
             controls_total: controls.len() as i64,
             model_missing: false,
         })
-    }
-
-    /// Count of files whose content is actually in the index (status
-    /// `indexed`). The auto-build guard ("nothing to read → don't build")
-    /// and the model builder both read only these rows, so a folder of
-    /// image (metadata_only) / failed / cloud_only files — nonzero
-    /// `file_count` but zero readable content — must count as nothing to
-    /// build, or the tick launches a paid session that reads nothing.
-    pub fn indexed_file_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE status = 'indexed'",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Count of indexed files that actually have a stored `contents` row — the
-    /// exact population `backfill_extractions` can enqueue and the worker can
-    /// process. This is the extraction-coverage denominator: an `indexed` row
-    /// with no `contents` row (a legacy/corrupt state) can never be extracted,
-    /// so counting it toward "N of M analyzed" would strand coverage below 100%
-    /// forever with no queued work to close the gap. In the healthy case every
-    /// `indexed` file has a `contents` row (`upsert_file` always writes one), so
-    /// this equals `indexed_file_count`; it only diverges to drop files that are
-    /// uncountable by construction.
-    pub fn extractable_file_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM files f
-             WHERE f.status = 'indexed' AND f.tier = 0
-               AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Count of indexed-with-content files that have NO `extractions` row yet —
-    /// i.e. the queue never picked them up. Should be 0 after `backfill_extractions`;
-    /// a nonzero value means the coverage denominator and the enqueuable
-    /// population disagree (the Map would stick below 100% with no work queued).
-    /// Used as a lightweight post-backfill sanity check.
-    pub fn unqueued_extractable_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM files f
-             WHERE f.status = 'indexed' AND f.tier = 0
-               AND EXISTS (SELECT 1 FROM contents c WHERE c.file_id = f.id)
-               AND NOT EXISTS (SELECT 1 FROM extractions e WHERE e.rel_path = f.rel_path)",
-            [],
-            |r| r.get(0),
-        )?)
     }
 
     // --- ingest run log ---
@@ -2544,175 +2490,6 @@ impl Db {
             })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
-    }
-
-    // --- incremental extraction queue (Map worker bookkeeping) ---
-
-    /// Enqueue a file for extraction unless its content is already extracted.
-    /// Returns true if a `pending` row was written (a new file or a changed
-    /// hash), false if an identical hash is already `done`.
-    pub fn enqueue_extraction_if_changed(
-        &mut self,
-        rel_path: &str,
-        content_hash: &str,
-    ) -> Result<bool> {
-        let already_done: bool = self.conn.query_row(
-            "SELECT 1 FROM extractions
-             WHERE rel_path = ?1 AND content_hash = ?2 AND status = 'done'",
-            params![rel_path, content_hash],
-            |_| Ok(true),
-        ).unwrap_or(false);
-        if already_done {
-            return Ok(false);
-        }
-        // A changed file starts its retries over: the three attempts belong to
-        // the content that failed, not the path. The same content re-queued
-        // keeps its count.
-        self.conn.execute(
-            "INSERT INTO extractions (rel_path, content_hash, status)
-             VALUES (?1, ?2, 'pending')
-             ON CONFLICT(rel_path) DO UPDATE SET
-               attempts = CASE WHEN extractions.content_hash = ?2 THEN extractions.attempts ELSE 0 END,
-               content_hash = ?2, status = 'pending', error = NULL",
-            params![rel_path, content_hash],
-        )?;
-        Ok(true)
-    }
-
-    /// The oldest `pending` file (insertion order via implicit rowid) and the
-    /// hash to stamp when it completes.
-    pub fn next_pending_extraction(&self) -> Result<Option<(String, String)>> {
-        match self.conn.query_row(
-            "SELECT rel_path, content_hash FROM extractions
-             WHERE status = 'pending' ORDER BY rowid LIMIT 1",
-            [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        ) {
-            Ok(row) => Ok(Some(row)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Mark a file's extraction `done`, stamping the hash the worker actually
-    /// extracted — but ONLY while that hash is still the one on the row. The
-    /// worker pops a hash, drops the DB lock for the (slow) generation, and marks
-    /// done on its own connection; meanwhile the scanner may re-index the file and
-    /// re-enqueue it under a NEW hash. Guarding on `content_hash` keeps this call
-    /// from clobbering that fresher `pending` row back to `done` (which would lose
-    /// the change until the next scan) — a mismatch is a harmless no-op and the
-    /// newer hash stays queued for a re-run.
-    pub fn mark_extraction_done(
-        &mut self,
-        rel_path: &str,
-        content_hash: &str,
-        at: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE extractions
-             SET extracted_at = ?3, status = 'done', error = NULL
-             WHERE rel_path = ?1 AND content_hash = ?2",
-            params![rel_path, content_hash, at],
-        )?;
-        Ok(())
-    }
-
-    /// Every file still waiting for extraction (pending or errored), with the
-    /// hash it was queued at.
-    pub fn waiting_extractions(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT rel_path, content_hash FROM extractions WHERE status IN ('pending', 'error')")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
-    }
-
-    /// Mark these queued files done in one transaction, each only while its
-    /// hash still matches (a file edited since stays queued).
-    pub fn settle_extractions(&mut self, rows: &[(String, String)], at: i64) -> Result<usize> {
-        let tx = self.conn.transaction()?;
-        let mut n = 0;
-        {
-            let mut stmt = tx.prepare(
-                "UPDATE extractions SET extracted_at = ?3, status = 'done', error = NULL
-                 WHERE rel_path = ?1 AND content_hash = ?2",
-            )?;
-            for (path, hash) in rows {
-                n += stmt.execute(params![path, hash, at])?;
-            }
-        }
-        tx.commit()?;
-        Ok(n)
-    }
-
-    /// How many entities the knowledge model holds.
-    pub fn entity_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))?)
-    }
-
-    /// Mark a file's extraction `error` and bump its retry counter — but ONLY
-    /// while the queued `content_hash` still matches the row (same guard as
-    /// `mark_extraction_done`). The worker pops a hash, drops the DB lock for the
-    /// slow generation, then reports back on its own connection; meanwhile the
-    /// scanner may re-index the file and re-enqueue it under a NEW hash. Guarding
-    /// on `content_hash` keeps a stale generation failure from flipping that
-    /// freshly re-enqueued `pending` row back to `error` — a mismatch is a
-    /// harmless no-op and the newer hash stays queued for a re-run.
-    pub fn mark_extraction_error(
-        &mut self,
-        rel_path: &str,
-        content_hash: &str,
-        message: &str,
-        _at: i64,
-    ) -> Result<()> {
-        // Deliberately do NOT stamp `extracted_at` — it must reflect the LAST
-        // SUCCESS only. Stamping it here would let an errored-then-changed file
-        // (re-enqueued to `pending`, keeping this timestamp) count toward
-        // `extraction_coverage`, inflating "N of M analyzed" for a file that
-        // never actually succeeded. `attempts` is bumped so bounded retries
-        // (see `requeue_errored_extractions`) eventually give up.
-        self.conn.execute(
-            "UPDATE extractions
-             SET status = 'error', error = ?3, attempts = attempts + 1
-             WHERE rel_path = ?1 AND content_hash = ?2",
-            params![rel_path, content_hash, message],
-        )?;
-        Ok(())
-    }
-
-    /// `(files extracted, extractable files)` — the Map coverage line's
-    /// numerator and denominator. A file counts once it has a successful
-    /// `extracted_at` on record and is not currently in `error`; it keeps
-    /// counting after a content change re-queues it (`pending` with the prior
-    /// `extracted_at` preserved) until the re-run overwrites or it errors.
-    ///
-    /// The denominator is `extractable_file_count` (indexed AND has content),
-    /// NOT the raw indexed count: that is exactly the population `backfill_extractions`
-    /// enqueues, so an `indexed` file that can never be extracted (no `contents`
-    /// row) can't create a permanent gap that freezes the count at "0 of N".
-    pub fn extraction_coverage(&self) -> Result<(i64, i64)> {
-        let done: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM extractions
-             WHERE extracted_at IS NOT NULL AND status <> 'error'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok((done, self.extractable_file_count()?))
-    }
-
-    /// Count of files whose extraction has failed *permanently*: `status =
-    /// 'error'` with the retry budget exhausted (`attempts >= MAX_EXTRACTION_ATTEMPTS`).
-    /// These are excluded from the coverage numerator forever, so the Map can
-    /// surface them explicitly ("Y failed") instead of showing a silent gap
-    /// below 100% that looks identical to "no progress". A row still within its
-    /// retry budget is NOT counted — it may yet succeed on a self-heal requeue.
-    pub fn extraction_failed_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM extractions
-             WHERE status = 'error' AND attempts >= ?1",
-            params![MAX_EXTRACTION_ATTEMPTS],
-            |r| r.get(0),
-        )?)
     }
 
     /// Store (or, with None, forget) what a page's frontmatter says. A
@@ -3316,6 +3093,69 @@ impl Db {
         Ok(out)
     }
 
+    // --- the project graph (knowledge-core decision 21, `graph`) ---
+
+    /// Replace every edge `origin` made with `edges`, in one transaction.
+    pub fn replace_graph_edges(&mut self, origin: &str, edges: &[crate::graph::Edge]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM graph_edges WHERE origin = ?1", params![origin])?;
+        insert_graph_edges(&tx, origin, edges)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Add edges `origin` made, keeping the ones already stored. Returns how
+    /// many were new.
+    pub fn add_graph_edges(&mut self, origin: &str, edges: &[crate::graph::Edge]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let n = insert_graph_edges(&tx, origin, edges)?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Replace the edges `origin` made from `src` with `edges`.
+    pub fn replace_graph_edges_from(&self, origin: &str, src: &str, edges: &[crate::graph::Edge]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM graph_edges WHERE origin = ?1 AND src = ?2", params![origin, src])?;
+        insert_graph_edges(&tx, origin, edges)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every stored edge from or to `node` (written `kind:id`).
+    pub fn graph_edges_touching(&self, node: &str) -> Result<Vec<crate::graph::Edge>> {
+        self.graph_edges_where("WHERE src = ?1 OR dst = ?1", &[&node])
+    }
+
+    /// Every stored edge `origin` made.
+    pub fn graph_edges_of(&self, origin: &str) -> Result<Vec<crate::graph::Edge>> {
+        self.graph_edges_where("WHERE origin = ?1", &[&origin])
+    }
+
+    fn graph_edges_where(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<crate::graph::Edge>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT src, dst, kind, detail FROM graph_edges {filter} ORDER BY src, kind, dst"))?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(crate::graph::Edge { src: r.get(0)?, dst: r.get(1)?, kind: r.get(2)?, detail: r.get(3)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Drop the edges `origin` made from any of `srcs`.
+    pub fn delete_graph_edges_from(&mut self, origin: &str, srcs: &[String]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut del = tx.prepare("DELETE FROM graph_edges WHERE origin = ?1 AND src = ?2")?;
+            for src in srcs {
+                n += del.execute(params![origin, src])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// What a page's frontmatter said when it was last indexed.
     pub fn page_meta(&self, rel_path: &str) -> Result<Option<crate::pagemeta::PageMeta>> {
         let list = |s: String| serde_json::from_str::<Vec<String>>(&s).unwrap_or_default();
@@ -3388,98 +3228,20 @@ impl Db {
         Ok(())
     }
 
-    /// Indexed files at the full tier: the ones read for entities.
-    pub fn entity_tier_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT rel_path FROM files WHERE status = 'indexed' AND tier = 0 ORDER BY rel_path",
-        )?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Store each file's current kenignore tier, then take every file that is
-    /// not at the full tier off the extraction queue. This is how a change of
-    /// a repo's kind, or a new `~` line, reaches files already indexed:
-    /// the scan skips an unchanged file, but not this. Done and errored rows
-    /// stay, so nothing already in the graph loses its record. Returns
-    /// (files re-tiered, pending extractions dropped).
-    pub fn set_file_tiers(&mut self, tiers: &[(String, crate::kenignore::Tier)]) -> Result<(usize, usize)> {
+    /// Store each file's current kenignore tier. This is how a change of a
+    /// repo's kind, or a new `~` line, reaches files already indexed: the scan
+    /// skips an unchanged file, but not this. Returns how many were re-tiered.
+    pub fn set_file_tiers(&mut self, tiers: &[(String, crate::kenignore::Tier)]) -> Result<usize> {
         let tx = self.conn.savepoint()?;
         let mut retiered = 0;
-        // Files leaving the full tier: what was read out of them for the graph
-        // leaves with them, and their extraction record goes, so a file that
-        // comes back to full is read again rather than counted as done.
-        let mut demoted: Vec<&str> = Vec::new();
         {
-            let mut was = tx.prepare("SELECT tier FROM files WHERE rel_path = ?1")?;
-            let mut stmt =
-                tx.prepare("UPDATE files SET tier = ?2 WHERE rel_path = ?1 AND tier <> ?2")?;
+            let mut stmt = tx.prepare("UPDATE files SET tier = ?2 WHERE rel_path = ?1 AND tier <> ?2")?;
             for (rel, tier) in tiers {
-                let before: Option<i64> = was.query_row(params![rel], |r| r.get(0)).ok();
-                let changed = stmt.execute(params![rel, *tier as i64])?;
-                retiered += changed;
-                if changed > 0 && before == Some(0) && *tier as i64 != 0 {
-                    demoted.push(rel.as_str());
-                }
+                retiered += stmt.execute(params![rel, *tier as i64])?;
             }
         }
-        strip_files(&tx, &demoted)?;
-        {
-            let mut del = tx.prepare("DELETE FROM extractions WHERE rel_path = ?1")?;
-            for rel in &demoted {
-                del.execute(params![rel])?;
-            }
-        }
-        let dropped = tx.execute(
-            "DELETE FROM extractions
-              WHERE status = 'pending'
-                AND rel_path IN (SELECT rel_path FROM files WHERE tier <> 0)",
-            [],
-        )?;
         tx.commit()?;
-        Ok((retiered, dropped))
-    }
-
-    pub fn remove_extraction(&mut self, rel_path: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM extractions WHERE rel_path = ?1",
-            params![rel_path],
-        )?;
-        Ok(())
-    }
-
-    /// One-time catch-up for the incremental Map: enqueue extraction for every
-    /// `indexed` file that has NO `extractions` row yet. Projects indexed before
-    /// the extraction queue existed have no rows, and the scanner never re-runs
-    /// `index_one` for unchanged files, so those files would never reach the
-    /// queue. Hashes the already-stored `contents` text (no byte re-read), and
-    /// leaves any file that already has a row (pending/done/error) untouched, so
-    /// it's idempotent and safe to call on every project open. Returns how many
-    /// files were enqueued.
-    /// A search-only file (`files.tier` <> 0) is never enqueued (kenignore D3).
-    pub fn backfill_extractions(&mut self) -> Result<usize> {
-        let mut stmt = self.conn.prepare(
-            "SELECT f.rel_path, c.text
-               FROM files f JOIN contents c ON c.file_id = f.id
-              WHERE f.status = 'indexed' AND f.tier = 0
-                AND NOT EXISTS (
-                  SELECT 1 FROM extractions e WHERE e.rel_path = f.rel_path
-                )",
-        )?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(stmt);
-        let mut n = 0;
-        for (rel, text) in rows {
-            let hash = crate::knowledge_model::content_hash(&text);
-            if self.enqueue_extraction_if_changed(&rel, &hash)? {
-                n += 1;
-            }
-        }
-        Ok(n)
+        Ok(retiered)
     }
 
     /// Sentinel `mtime` stamped on a row that must be re-indexed by the next
@@ -3548,32 +3310,12 @@ impl Db {
         Ok(n)
     }
 
-    /// Return `error` extraction rows that still have retries left (attempts <
-    /// `MAX_EXTRACTION_ATTEMPTS`) to `pending` so the worker retries them. Called
-    /// both when the local model becomes ready (install / selection / error
-    /// recovery) AND every time the worker drains the queue and goes idle, so a
-    /// file that errored under a transient fault — the batch-overflow bug, a bad
-    /// load, momentary unparseable JSON — self-heals without a model restart or a
-    /// content edit. The content hash is preserved, so a still-failing file
-    /// simply errors again; once it exhausts the attempt cap it stays `error`
-    /// permanently and won't be re-queued, so the queue can never spin forever.
-    /// Returns how many rows were re-queued.
-    pub fn requeue_errored_extractions(&mut self) -> Result<usize> {
-        let n = self.conn.execute(
-            "UPDATE extractions SET status = 'pending', error = NULL
-             WHERE status = 'error' AND attempts < ?1",
-            params![MAX_EXTRACTION_ATTEMPTS],
-        )?;
-        Ok(n)
-    }
-
     // --- OCR queue + region storage (Phase 2; independent of extraction) ---
 
     /// Enqueue a file for OCR unless it is already `done` at this exact hash.
     /// The hash is a cheap per-version fingerprint (see `scan::index_one`), so a
     /// rescan that leaves a file unchanged never re-OCRs it, while a real change
     /// (new hash) re-queues it. Returns true if a `pending` row was written.
-    /// Mirrors [`Self::enqueue_extraction_if_changed`].
     pub fn enqueue_ocr_if_changed(&mut self, rel_path: &str, content_hash: &str) -> Result<bool> {
         let already_done: bool = self
             .conn
@@ -3719,8 +3461,8 @@ impl Db {
     }
 
     /// Return `error` OCR rows that still have retries left to `pending` so the
-    /// worker retries them when it next goes idle. Mirrors
-    /// [`Self::requeue_errored_extractions`]. Returns how many were re-queued.
+    /// worker retries them when it next goes idle. Returns how many were
+    /// re-queued.
     pub fn requeue_errored_ocr(&mut self) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE ocr_pending SET status = 'pending', error = NULL
@@ -3784,271 +3526,6 @@ impl Db {
         Ok(())
     }
 
-    // --- knowledge model (entities, edges, events — derived read model
-    //     for the Map and Timeline screens; replaced wholesale on build) ---
-
-    /// Replace the whole knowledge model in one transaction: entities,
-    /// their edges (given as indices into `entities`), events, and the
-    /// build timestamp (`knowledge_model_built_at` in `meta`).
-    pub fn replace_knowledge_model(
-        &mut self,
-        entities: &[EntityInput],
-        events: &[EventInput],
-        built_at: i64,
-    ) -> Result<()> {
-        let tx = self.conn.savepoint()?;
-        tx.execute("DELETE FROM entities", [])?; // cascades to entity_edges
-        tx.execute("DELETE FROM events", [])?;
-        let mut ids: Vec<i64> = Vec::with_capacity(entities.len());
-        for e in entities {
-            let sources = serde_json::to_string(&e.sources)
-                .unwrap_or_else(|_| "[]".into());
-            tx.execute(
-                "INSERT INTO entities (kind, name, summary, sources)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![e.kind, e.name, e.summary, sources],
-            )?;
-            ids.push(tx.last_insert_rowid());
-        }
-        for (from, e) in entities.iter().enumerate() {
-            for (to, label) in &e.connections {
-                let (Some(a), Some(b)) = (ids.get(from), ids.get(*to)) else {
-                    continue;
-                };
-                tx.execute(
-                    "INSERT INTO entity_edges (a, b, label) VALUES (?1, ?2, ?3)",
-                    params![a, b, label],
-                )?;
-            }
-        }
-        for ev in events {
-            tx.execute(
-                "INSERT INTO events (date, category, text, source)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![ev.date, ev.category, ev.text, ev.source],
-            )?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO meta(key, value)
-             VALUES ('knowledge_model_built_at', ?1)",
-            params![built_at.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Merge one file's extraction delta into the persisted model. This is the
-    /// convergence guarantee: it first strips the file's PRIOR contribution
-    /// (so a rewrite replaces rather than accretes), then applies the delta
-    /// with entity dedup (kind + normalized name), source union, longer-summary
-    /// wins, unordered-pair edge dedup (first label wins), and (date,text)
-    /// event dedup. Every entity/event is attributed to `rel_path`.
-    pub fn merge_knowledge_delta(
-        &mut self,
-        rel_path: &str,
-        delta: &knowledge_model::Extraction,
-        at: i64,
-    ) -> Result<()> {
-        let tx = self.conn.savepoint()?;
-        strip_file(&tx, rel_path)?;
-
-        // 1. Existing entity identity → row id (over what survived the strip).
-        let mut by_key: std::collections::HashMap<String, i64> = Default::default();
-        {
-            let mut stmt = tx.prepare("SELECT id, kind, name FROM entities")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-            })?;
-            for row in rows {
-                let (id, kind, name) = row?;
-                by_key.insert(entity_key(&kind, &name), id);
-            }
-        }
-
-        // 2. Upsert delta entities; record batch index → row id for edges.
-        let mut ids: Vec<i64> = Vec::with_capacity(delta.entities.len());
-        for e in &delta.entities {
-            let key = entity_key(&e.kind, &e.name);
-            if let Some(&id) = by_key.get(&key) {
-                // Union sources (add this file), keep the longer summary.
-                let existing_sources: String = tx.query_row(
-                    "SELECT sources FROM entities WHERE id = ?1",
-                    params![id],
-                    |r| r.get(0),
-                )?;
-                let mut sources: Vec<String> =
-                    serde_json::from_str(&existing_sources).unwrap_or_default();
-                if !sources.iter().any(|s| s == rel_path) {
-                    sources.push(rel_path.to_string());
-                }
-                let existing_summary: String = tx.query_row(
-                    "SELECT summary FROM entities WHERE id = ?1",
-                    params![id],
-                    |r| r.get(0),
-                )?;
-                let summary = if e.summary.chars().count() > existing_summary.chars().count() {
-                    e.summary.clone()
-                } else {
-                    existing_summary
-                };
-                tx.execute(
-                    "UPDATE entities SET summary = ?2, sources = ?3 WHERE id = ?1",
-                    params![id, summary, serde_json::to_string(&sources).unwrap()],
-                )?;
-                ids.push(id);
-            } else {
-                let sources = serde_json::to_string(&vec![rel_path.to_string()]).unwrap();
-                tx.execute(
-                    "INSERT INTO entities (kind, name, summary, sources)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![e.kind, e.name, e.summary, sources],
-                )?;
-                let id = tx.last_insert_rowid();
-                by_key.insert(key, id);
-                ids.push(id);
-            }
-        }
-
-        // 3. Edges: dedup by unordered pair across the WHOLE model, first wins.
-        let mut pairs: std::collections::HashSet<(i64, i64)> = Default::default();
-        {
-            let mut stmt = tx.prepare("SELECT a, b FROM entity_edges")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (a, b) = row?;
-                pairs.insert((a.min(b), a.max(b)));
-            }
-        }
-        for (from, e) in delta.entities.iter().enumerate() {
-            for (to, label) in &e.connections {
-                let (Some(&a), Some(&b)) = (ids.get(from), ids.get(*to)) else {
-                    continue;
-                };
-                if a == b {
-                    continue;
-                }
-                let pair = (a.min(b), a.max(b));
-                if !pairs.insert(pair) {
-                    continue;
-                }
-                tx.execute(
-                    "INSERT INTO entity_edges (a, b, label) VALUES (?1, ?2, ?3)",
-                    params![a, b, label],
-                )?;
-            }
-        }
-
-        // 4. Events: dedup by (date, text) across the whole model.
-        let mut event_keys: std::collections::HashSet<(String, String)> = Default::default();
-        {
-            let mut stmt = tx.prepare("SELECT date, text FROM events")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                event_keys.insert(row?);
-            }
-        }
-        for ev in &delta.events {
-            let key = (ev.date.clone(), ev.text.clone());
-            if !event_keys.insert(key) {
-                continue;
-            }
-            tx.execute(
-                "INSERT INTO events (date, category, text, source)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![ev.date, ev.category, ev.text, rel_path],
-            )?;
-        }
-
-        // Stamp the model timestamp so the Map treats the growing model as
-        // "built" (the frontend's empty check also honours entity presence).
-        tx.execute(
-            "INSERT OR REPLACE INTO meta(key, value)
-             VALUES ('knowledge_model_built_at', ?1)",
-            params![at.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Remove a file's entire contribution from the model (used when the file
-    /// is deleted or excluded). Entities grounded elsewhere survive; orphans
-    /// and their edges are GC'd.
-    pub fn purge_file_knowledge(&mut self, rel_path: &str) -> Result<()> {
-        let tx = self.conn.savepoint()?;
-        strip_file(&tx, rel_path)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn list_entities_with_edges(&self) -> Result<(Vec<EntityRow>, Vec<EdgeRow>)> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, name, summary, sources FROM entities ORDER BY id",
-        )?;
-        let entities: Vec<EntityRow> = stmt
-            .query_map([], |r| {
-                let sources: String = r.get(4)?;
-                Ok(EntityRow {
-                    id: r.get(0)?,
-                    kind: r.get(1)?,
-                    name: r.get(2)?,
-                    summary: r.get(3)?,
-                    sources: serde_json::from_str(&sources).unwrap_or_default(),
-                })
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, a, b, label FROM entity_edges ORDER BY id",
-        )?;
-        let edges: Vec<EdgeRow> = stmt
-            .query_map([], |r| {
-                Ok(EdgeRow {
-                    id: r.get(0)?,
-                    a: r.get(1)?,
-                    b: r.get(2)?,
-                    label: r.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok((entities, edges))
-    }
-
-    /// Events newest first (`yyyy-mm-dd` sorts chronologically).
-    pub fn list_events(&self) -> Result<Vec<EventRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, date, category, text, source FROM events
-             ORDER BY date DESC, id DESC",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(EventRow {
-                    id: r.get(0)?,
-                    date: r.get(1)?,
-                    category: r.get(2)?,
-                    text: r.get(3)?,
-                    source: r.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(rows)
-    }
-
-    /// Epoch seconds of the last knowledge-model build; None before the
-    /// first one.
-    pub fn knowledge_model_built_at(&self) -> Result<Option<i64>> {
-        match self.conn.query_row(
-            "SELECT value FROM meta WHERE key = 'knowledge_model_built_at'",
-            [],
-            |r| r.get::<_, String>(0),
-        ) {
-            Ok(v) => Ok(v.parse().ok()),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4129,68 +3606,29 @@ pub struct ChatMessage {
     pub created_at: i64,
 }
 
-/// A stored knowledge-model entity.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EntityRow {
-    pub id: i64,
-    /// `person` | `organization` | `topic` | `decision` | `other`
-    pub kind: String,
-    pub name: String,
-    pub summary: String,
-    /// Project-relative paths this entity is grounded in.
-    pub sources: Vec<String>,
+/// Insert graph edges made by `origin`, an edge already stored left as it
+/// is. Returns how many were new.
+fn insert_graph_edges(conn: &Connection, origin: &str, edges: &[crate::graph::Edge]) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO graph_edges (src, dst, kind, origin, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut n = 0;
+    for e in edges {
+        n += stmt.execute(params![e.src, e.dst, e.kind, origin, e.detail])?;
+    }
+    Ok(n)
 }
 
-/// A stored relation between two entities.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EdgeRow {
-    pub id: i64,
-    pub a: i64,
-    pub b: i64,
-    pub label: String,
-}
-
-/// A stored knowledge-model event.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventRow {
-    pub id: i64,
-    /// Best-effort `yyyy-mm-dd`.
-    pub date: String,
-    pub category: String,
-    pub text: String,
-    /// Project-relative path the event came from.
-    pub source: String,
-}
-
-/// An entity as the extractor produced it, edges as indices into the
-/// same batch — `replace_knowledge_model` maps them to row ids.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EntityInput {
-    pub kind: String,
-    pub name: String,
-    pub summary: String,
-    pub sources: Vec<String>,
-    /// (index of the other entity in this batch, edge label)
-    pub connections: Vec<(usize, String)>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct EventInput {
-    pub date: String,
-    pub category: String,
-    pub text: String,
-    pub source: String,
-}
-
-/// The entity identity used by incremental merge: kind plus a
-/// whitespace-normalized, case-folded name. `\u{1}` can't occur in a real
-/// name, so it's a safe key separator.
-fn entity_key(kind: &str, name: &str) -> String {
-    let name = name.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-    format!("{kind}\u{1}{name}")
+/// The topic tags of moved pages follow them (`Db::rename_prefix`): each
+/// (old path, new path) pair's node is written again, its kind worked out
+/// from the new path (a note moved out of the notes is a page).
+fn move_graph_topics(conn: &Connection, pairs: &[(String, String)]) -> Result<()> {
+    let mut stmt = conn.prepare("UPDATE OR REPLACE graph_edges SET src = ?2 WHERE origin = ?3 AND src = ?1")?;
+    for (old, new) in pairs {
+        let (from, to) = (crate::graph::Node::of_path(old).key(), crate::graph::Node::of_path(new).key());
+        stmt.execute(params![from, to, crate::graph::ORIGIN_TOPICS])?;
+    }
+    Ok(())
 }
 
 /// Whether a table or virtual table named `name` exists. Used by the
@@ -4216,82 +3654,12 @@ fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Strip one file's prior contribution to the knowledge model, in the caller's
-/// transaction: delete its events, remove it from every entity's `sources`,
-/// and delete entities left with no sources (their edges cascade via the
-/// `entity_edges` FK `ON DELETE CASCADE`).
-/// [`strip_file`] for many files at once, reading the entities once: a whole
-/// repo re-tiered to search-only would otherwise scan them once per file.
-fn strip_files(conn: &Connection, rel_paths: &[&str]) -> Result<()> {
-    if rel_paths.is_empty() {
-        return Ok(());
-    }
-    {
-        let mut del = conn.prepare("DELETE FROM events WHERE source = ?1")?;
-        for p in rel_paths {
-            del.execute(params![p])?;
-        }
-    }
-    let gone: std::collections::HashSet<&str> = rel_paths.iter().copied().collect();
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT id, sources FROM entities")?;
-        let mapped = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-        mapped.collect::<std::result::Result<_, _>>()?
-    };
-    for (id, sources_json) in rows {
-        let mut sources: Vec<String> = serde_json::from_str(&sources_json).unwrap_or_default();
-        let before = sources.len();
-        sources.retain(|s| !gone.contains(s.as_str()));
-        if sources.len() == before {
-            continue;
-        }
-        if sources.is_empty() {
-            conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
-        } else {
-            conn.execute("UPDATE entities SET sources = ?2 WHERE id = ?1", params![id, serde_json::to_string(&sources).unwrap()])?;
-        }
-    }
-    Ok(())
-}
-
-fn strip_file(conn: &Connection, rel_path: &str) -> Result<()> {
-    conn.execute("DELETE FROM events WHERE source = ?1", params![rel_path])?;
-
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT id, sources FROM entities")?;
-        let mapped = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
-        mapped.collect::<std::result::Result<_, _>>()?
-    };
-    for (id, sources_json) in rows {
-        let mut sources: Vec<String> =
-            serde_json::from_str(&sources_json).unwrap_or_default();
-        if !sources.iter().any(|s| s == rel_path) {
-            continue;
-        }
-        sources.retain(|s| s != rel_path);
-        if sources.is_empty() {
-            conn.execute("DELETE FROM entities WHERE id = ?1", params![id])?;
-        } else {
-            conn.execute(
-                "UPDATE entities SET sources = ?2 WHERE id = ?1",
-                params![id, serde_json::to_string(&sources).unwrap()],
-            )?;
-        }
-    }
-    Ok(())
-}
-
 /// The tables a move rewrites by path (`Db::rename_prefix`), each with its
-/// path column. A stale row at the destination is cleared first in every one
-/// but `events`, which is history.
-const PATH_KEYED: [(&str, &str); 11] = [
+/// path column. A stale row at the destination is cleared first.
+const PATH_KEYED: [(&str, &str); 9] = [
     ("files", "rel_path"),
-    ("extractions", "rel_path"),
     ("ocr_regions", "rel_path"),
     ("ocr_pending", "rel_path"),
-    ("events", "source"),
     ("chunks", "path"),
     ("page_meta", "rel_path"),
     ("file_authority", "rel_path"),
@@ -4613,18 +3981,6 @@ fn build_chunk_query(tokens: &[String], any: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge_model::Extraction;
-
-    /// Build a one-entity delta quickly (connections empty).
-    fn ent(kind: &str, name: &str, summary: &str) -> EntityInput {
-        EntityInput {
-            kind: kind.into(),
-            name: name.into(),
-            summary: summary.into(),
-            sources: Vec::new(),
-            connections: Vec::new(),
-        }
-    }
 
     // --- semantic-index task 1.2: v12 schema migration ---
 
@@ -5279,117 +4635,6 @@ mod tests {
         assert!(db.list_runs_of_kind("weekly-jira", "ingest", 10).unwrap().is_empty());
     }
 
-    #[test]
-    fn merge_dedups_entities_unions_sources_keeps_longer_summary() {
-        let mut db = Db::open_in_memory().unwrap();
-        // File 1: Priya (short summary), edge Priya→Billing.
-        let mut a = ent("person", "Priya N.", "Owns it.");
-        a.connections = vec![(1, "owns".into())];
-        let d1 = Extraction {
-            entities: vec![a, ent("topic", "Billing cutover", "")],
-            events: vec![],
-        };
-        db.merge_knowledge_delta("f1.md", &d1, 10).unwrap();
-
-        // File 2: same Priya (normalized name, longer summary), different file.
-        let d2 = Extraction {
-            entities: vec![ent("person", "priya   n.", "Owns the whole billing cutover programme.")],
-            events: vec![],
-        };
-        db.merge_knowledge_delta("f2.md", &d2, 20).unwrap();
-
-        let (entities, edges) = db.list_entities_with_edges().unwrap();
-        assert_eq!(entities.len(), 2, "Priya deduped across files");
-        let priya = entities.iter().find(|e| e.kind == "person").unwrap();
-        assert_eq!(priya.summary, "Owns the whole billing cutover programme.");
-        let mut srcs = priya.sources.clone();
-        srcs.sort();
-        assert_eq!(srcs, vec!["f1.md".to_string(), "f2.md".to_string()]);
-        assert_eq!(edges.len(), 1, "edge preserved, not duplicated");
-    }
-
-    #[test]
-    fn merge_dedups_edges_first_label_wins() {
-        let mut db = Db::open_in_memory().unwrap();
-        let mk = |label: &str| {
-            let mut a = ent("person", "A", "");
-            a.connections = vec![(1, label.into())];
-            Extraction { entities: vec![a, ent("person", "B", "")], events: vec![] }
-        };
-        db.merge_knowledge_delta("f1.md", &mk("knows"), 10).unwrap();
-        db.merge_knowledge_delta("f2.md", &mk("later label"), 20).unwrap();
-        let (_, edges) = db.list_entities_with_edges().unwrap();
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].label, "knows", "first label wins");
-    }
-
-    #[test]
-    fn merge_dedups_events_by_date_and_text() {
-        let mut db = Db::open_in_memory().unwrap();
-        let ev = || Extraction {
-            entities: vec![],
-            events: vec![EventInput {
-                date: "2026-07-11".into(),
-                category: "decision".into(),
-                text: "Sign-off.".into(),
-                source: String::new(),
-            }],
-        };
-        db.merge_knowledge_delta("f1.md", &ev(), 10).unwrap();
-        db.merge_knowledge_delta("f2.md", &ev(), 20).unwrap();
-        let events = db.list_events().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source, "f1.md", "first occurrence kept");
-    }
-
-    #[test]
-    fn re_extraction_removes_the_file_then_gcs_orphans() {
-        let mut db = Db::open_in_memory().unwrap();
-        // f1 grounds Priya + Billing + their edge + an event.
-        let mut a = ent("person", "Priya N.", "Owns it.");
-        a.connections = vec![(1, "owns".into())];
-        db.merge_knowledge_delta("f1.md", &Extraction {
-            entities: vec![a, ent("topic", "Billing cutover", "")],
-            events: vec![EventInput {
-                date: "2026-07-11".into(), category: "decision".into(),
-                text: "Sign-off.".into(), source: String::new(),
-            }],
-        }, 10).unwrap();
-        // f2 also grounds Priya (so she survives) but not Billing.
-        db.merge_knowledge_delta("f2.md", &Extraction {
-            entities: vec![ent("person", "Priya N.", "Owns it.")],
-            events: vec![],
-        }, 20).unwrap();
-
-        // Re-extract f1 with an EMPTY delta (the file lost all its content).
-        db.merge_knowledge_delta("f1.md", &Extraction::default(), 30).unwrap();
-
-        let (entities, edges) = db.list_entities_with_edges().unwrap();
-        // Priya survives (grounded by f2); Billing GC'd (only f1 grounded it);
-        // the edge cascades away with Billing; the event (only f1) is gone.
-        assert_eq!(entities.len(), 1);
-        assert_eq!(entities[0].name, "Priya N.");
-        assert_eq!(entities[0].sources, vec!["f2.md".to_string()]);
-        assert!(edges.is_empty(), "orphaned edge cascaded");
-        assert!(db.list_events().unwrap().is_empty(), "f1's event removed");
-    }
-
-    #[test]
-    fn purge_file_knowledge_strips_a_removed_file() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.merge_knowledge_delta("gone.md", &Extraction {
-            entities: vec![ent("person", "Solo", "Only here.")],
-            events: vec![EventInput {
-                date: "2026-07-11".into(), category: "x".into(),
-                text: "e".into(), source: String::new(),
-            }],
-        }, 10).unwrap();
-        db.purge_file_knowledge("gone.md").unwrap();
-        let (entities, _) = db.list_entities_with_edges().unwrap();
-        assert!(entities.is_empty());
-        assert!(db.list_events().unwrap().is_empty());
-    }
-
     /// An index made before the code index gets one from its stored text, even
     /// when a scan since has mapped a file or two, and only once.
     #[test]
@@ -5403,40 +4648,6 @@ mod tests {
         assert_eq!(db.backfill_code_index().unwrap(), 1, "b.py, not the mapped one or the page");
         assert_eq!(db.code_symbols(Some("beta"), None, Some(true), 5).unwrap().len(), 1);
         assert_eq!(db.backfill_code_index().unwrap(), 0, "once");
-    }
-
-    /// A whole-project build settles the queue it read, but a file edited
-    /// while it ran (a new hash) stays waiting for the per-file worker.
-    #[test]
-    fn a_build_settles_what_it_read_and_nothing_edited_since() {
-        let mut db = Db::open_in_memory().unwrap();
-        for f in ["a.md", "b.md"] {
-            db.upsert_file(f, "md", 1, 1, "indexed", None, "text").unwrap();
-            db.enqueue_extraction_if_changed(f, "h1").unwrap();
-        }
-        let waiting = db.waiting_extractions().unwrap();
-        assert_eq!(waiting.len(), 2);
-        db.enqueue_extraction_if_changed("b.md", "h2").unwrap(); // edited mid-build
-        assert_eq!(db.settle_extractions(&waiting, 5).unwrap(), 1);
-        assert_eq!(db.next_pending_extraction().unwrap(), Some(("b.md".into(), "h2".into())));
-        assert_eq!(db.entity_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn removing_a_file_purges_its_knowledge_and_queue_row() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("gone.md", "md", 1, 1, "indexed", None, "solo content").unwrap();
-        db.enqueue_extraction_if_changed("gone.md", "h1").unwrap();
-        db.merge_knowledge_delta("gone.md", &Extraction {
-            entities: vec![ent("person", "Solo", "Only here.")],
-            events: vec![],
-        }, 10).unwrap();
-
-        db.remove_file("gone.md").unwrap();
-
-        assert!(db.list_entities_with_edges().unwrap().0.is_empty());
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 0));
-        assert!(db.next_pending_extraction().unwrap().is_none());
     }
 
     #[test]
@@ -5594,52 +4805,6 @@ mod tests {
     }
 
     #[test]
-    fn errored_then_changed_file_is_not_counted_as_analyzed() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        db.enqueue_extraction_if_changed("b.md", "h1").unwrap();
-        // Extraction fails — the file was never successfully analyzed.
-        db.mark_extraction_error("b.md", "h1", "boom", 101).unwrap();
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
-        // Content changes and re-enqueues; still never succeeded → still not
-        // counted (extracted_at must reflect last SUCCESS only, never an error).
-        assert!(db.enqueue_extraction_if_changed("b.md", "h2").unwrap());
-        assert_eq!(
-            db.extraction_coverage().unwrap(),
-            (0, 1),
-            "a file that only ever errored must not count as analyzed after re-enqueue"
-        );
-    }
-
-    #[test]
-    fn backfill_extractions_enqueues_indexed_files_without_rows() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Two indexed files with content, one metadata-only, one already queued.
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        db.upsert_file("c.png", "png", 1, 1, "metadata_only", None, "").unwrap();
-        db.upsert_file("d.md", "md", 1, 1, "indexed", None, "delta").unwrap();
-        // d already has an extraction row (a normal indexed-after-v8 file).
-        db.enqueue_extraction_if_changed("d.md", &crate::knowledge_model::content_hash("delta"))
-            .unwrap();
-        db.mark_extraction_done("d.md", &crate::knowledge_model::content_hash("delta"), 50)
-            .unwrap();
-
-        // Backfill picks up a and b only (c isn't indexed; d already has a row).
-        assert_eq!(db.backfill_extractions().unwrap(), 2);
-        let mut pending = Vec::new();
-        while let Some((rel, hash)) = db.next_pending_extraction().unwrap() {
-            db.mark_extraction_done(&rel, &hash, 100).unwrap();
-            pending.push(rel);
-        }
-        pending.sort();
-        assert_eq!(pending, vec!["a.md".to_string(), "b.md".to_string()]);
-
-        // Idempotent: a second call enqueues nothing (every file now has a row).
-        assert_eq!(db.backfill_extractions().unwrap(), 0);
-    }
-
-    #[test]
     fn refresh_stored_kinds_reclassifies_stale_binary_vtt_to_txt() {
         let mut db = Db::open_in_memory().unwrap();
         // A `.vtt` indexed before it was reclassified as text: stored "binary",
@@ -5706,235 +4871,6 @@ mod tests {
     }
 
     #[test]
-    fn requeue_errored_extractions_returns_error_rows_to_pending() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        db.upsert_file("c.md", "md", 1, 1, "indexed", None, "gamma").unwrap();
-        db.enqueue_extraction_if_changed("a.md", "ha").unwrap();
-        db.enqueue_extraction_if_changed("b.md", "hb").unwrap();
-        db.enqueue_extraction_if_changed("c.md", "hc").unwrap();
-        // a done, b errored, c still pending.
-        db.mark_extraction_done("a.md", "ha", 100).unwrap();
-        db.mark_extraction_error("b.md", "hb", "batch add failed", 101).unwrap();
-        // Only the errored row is re-queued; done and pending untouched.
-        assert_eq!(db.requeue_errored_extractions().unwrap(), 1);
-        // Drain the queue: b (re-queued, hash preserved) and c (already pending)
-        // are the only pending rows; a stayed done.
-        let mut pending = Vec::new();
-        while let Some((rel, hash)) = db.next_pending_extraction().unwrap() {
-            db.mark_extraction_done(&rel, &hash, 200).unwrap();
-            pending.push((rel, hash));
-        }
-        assert!(pending.iter().any(|(r, h)| r == "b.md" && h == "hb"),
-            "errored file b returned to pending with its hash");
-        assert!(pending.iter().any(|(r, _)| r == "c.md"));
-        assert!(!pending.iter().any(|(r, _)| r == "a.md"), "a stayed done");
-        // Re-queueing again is a no-op now that nothing is errored.
-        assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
-    }
-
-    #[test]
-    fn errored_extraction_is_requeued_up_to_cap_then_stays_error() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        db.enqueue_extraction_if_changed("b.md", "hb").unwrap();
-
-        // A deterministically failing file, driven the way the worker does: pop
-        // it, mark it error (guarding on its hash), and when the queue drains,
-        // rescue errored rows that still have retries left. It must self-heal
-        // only up to MAX_EXTRACTION_ATTEMPTS total failures, then be left
-        // `error` forever so the queue can never spin.
-        let mut requeued = 0;
-        for _ in 0..20 {
-            match db.next_pending_extraction().unwrap() {
-                Some((rel, hash)) => {
-                    db.mark_extraction_error(&rel, &hash, "boom", 100).unwrap();
-                }
-                None => {
-                    if db.requeue_errored_extractions().unwrap() == 0 {
-                        break; // exhausted the cap — no infinite loop
-                    }
-                    requeued += 1;
-                }
-            }
-        }
-        // First failure sets attempts=1; it was requeued (MAX-1) more times,
-        // failing on each, before attempts reached the cap.
-        assert_eq!(requeued, (MAX_EXTRACTION_ATTEMPTS - 1) as usize);
-        // Exhausted: stays error, never returns to pending, never re-queued.
-        assert_eq!(db.next_pending_extraction().unwrap(), None);
-        assert_eq!(db.requeue_errored_extractions().unwrap(), 0);
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
-        assert_eq!(db.extraction_failed_count().unwrap(), 1);
-
-        // An edit gives the new content the full three tries, not one.
-        db.enqueue_extraction_if_changed("b.md", "hb-edited").unwrap();
-        let attempts: i64 = db
-            .conn
-            .query_row("SELECT attempts FROM extractions WHERE rel_path = 'b.md'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(attempts, 0);
-        assert_eq!(db.extraction_failed_count().unwrap(), 0);
-        assert_eq!(db.next_pending_extraction().unwrap().map(|(p, _)| p).as_deref(), Some("b.md"));
-    }
-
-    #[test]
-    fn mark_extraction_error_does_not_clobber_a_re_enqueued_hash() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        // The worker popped "h1"; before it reports back, the scanner re-indexes
-        // and re-enqueues the file under a NEW hash "h2" (now pending).
-        db.enqueue_extraction_if_changed("a.md", "h1").unwrap();
-        db.enqueue_extraction_if_changed("a.md", "h2").unwrap();
-        // A stale failure for the OLD hash must NOT flip the fresh pending row to
-        // error — the mismatched content_hash makes it a harmless no-op.
-        db.mark_extraction_error("a.md", "h1", "stale boom", 100).unwrap();
-        assert_eq!(
-            db.next_pending_extraction().unwrap(),
-            Some(("a.md".into(), "h2".into())),
-            "the re-enqueued hash stays pending; a stale error is a no-op"
-        );
-        // The matching hash does record the error.
-        db.mark_extraction_error("a.md", "h2", "real boom", 101).unwrap();
-        assert_eq!(db.next_pending_extraction().unwrap(), None);
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
-    }
-
-    #[test]
-    fn indexed_file_without_contents_row_does_not_freeze_coverage() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Two normal indexed files (each gets a contents row via upsert_file).
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        // Simulate a legacy/corrupt state: an `indexed` file with NO contents
-        // row — counted by the raw indexed count but impossible to extract.
-        db.conn
-            .execute(
-                "INSERT INTO files (rel_path, kind, size, mtime, status, error)
-                 VALUES ('ghost.md', 'md', 1, 1, 'indexed', NULL)",
-                [],
-            )
-            .unwrap();
-
-        // Raw indexed count includes the ghost; the extractable population does
-        // not — that is the denominator the coverage line now uses.
-        assert_eq!(db.indexed_file_count().unwrap(), 3);
-        assert_eq!(db.extractable_file_count().unwrap(), 2);
-
-        // Backfill enqueues exactly the extractable files (a, b), never the
-        // ghost, and leaves nothing extractable unqueued.
-        assert_eq!(db.backfill_extractions().unwrap(), 2);
-        assert_eq!(db.unqueued_extractable_count().unwrap(), 0);
-
-        // Draining the queue reaches the full extractable denominator (2 of 2),
-        // NOT 2 of 3 — the un-extractable ghost can't strand it below 100%.
-        while let Some((rel, hash)) = db.next_pending_extraction().unwrap() {
-            db.mark_extraction_done(&rel, &hash, 100).unwrap();
-        }
-        assert_eq!(db.extraction_coverage().unwrap(), (2, 2));
-    }
-
-    #[test]
-    fn extraction_failed_count_counts_only_terminally_errored_rows() {
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        db.enqueue_extraction_if_changed("a.md", "ha").unwrap();
-        db.enqueue_extraction_if_changed("b.md", "hb").unwrap();
-
-        // a errored once — still within the retry budget, so NOT terminally
-        // failed (a self-heal requeue may yet make it succeed).
-        db.mark_extraction_error("a.md", "ha", "boom", 100).unwrap();
-        assert_eq!(
-            db.extraction_failed_count().unwrap(),
-            0,
-            "a row still within its retry budget must not count as failed"
-        );
-
-        // b errors until its retry budget is exhausted — now terminally failed.
-        for _ in 0..MAX_EXTRACTION_ATTEMPTS {
-            db.mark_extraction_error("b.md", "hb", "boom", 100).unwrap();
-        }
-        assert_eq!(
-            db.extraction_failed_count().unwrap(),
-            1,
-            "only b, which exhausted its retry budget, counts as failed"
-        );
-
-        // Boundary check: the exhausted row (b) is never re-queued, but a (still
-        // under the cap) is — so failures don't wedge the live queue.
-        assert_eq!(db.requeue_errored_extractions().unwrap(), 1);
-    }
-
-    #[test]
-    fn extraction_queue_tracks_pending_done_and_coverage() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Two indexed files, one metadata-only (must not count toward total).
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        db.upsert_file("b.md", "md", 1, 1, "indexed", None, "beta").unwrap();
-        db.upsert_file("c.png", "png", 1, 1, "metadata_only", None, "").unwrap();
-
-        // New hashes enqueue; the queue drains oldest-first.
-        assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
-        assert!(db.enqueue_extraction_if_changed("b.md", "h2").unwrap());
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 2));
-        assert_eq!(
-            db.next_pending_extraction().unwrap(),
-            Some(("a.md".into(), "h1".into()))
-        );
-
-        // Marking a.md done advances the queue and lifts coverage.
-        db.mark_extraction_done("a.md", "h1", 100).unwrap();
-        assert_eq!(db.extraction_coverage().unwrap(), (1, 2));
-        assert_eq!(
-            db.next_pending_extraction().unwrap(),
-            Some(("b.md".into(), "h2".into()))
-        );
-
-        // Re-enqueuing the same done hash is a no-op; a changed hash re-queues.
-        assert!(!db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
-        assert!(db.enqueue_extraction_if_changed("a.md", "h1b").unwrap());
-        assert_eq!(db.extraction_coverage().unwrap(), (1, 2)); // still 'done' count until re-run overwrites
-
-        // Errors stay out of the pending queue but keep the row.
-        db.mark_extraction_error("b.md", "h2", "boom", 101).unwrap();
-        db.mark_extraction_done("a.md", "h1b", 102).unwrap();
-        assert_eq!(db.next_pending_extraction().unwrap(), None);
-
-        // Removing an extraction row drops it entirely.
-        db.remove_extraction("a.md").unwrap();
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 2));
-    }
-
-    #[test]
-    fn mark_extraction_done_does_not_clobber_a_re_enqueued_hash() {
-        // The worker pops hash "h1", drops the DB lock, and generates. Meanwhile
-        // the scanner re-indexes the file and re-enqueues it under a NEW hash
-        // "h2". When the (stale) worker finally marks "h1" done, it must NOT flip
-        // the fresher "h2" row to done — the change would be lost until the next
-        // scan. The mismatch is a harmless no-op; "h2" stays pending for a re-run.
-        let mut db = Db::open_in_memory().unwrap();
-        db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
-        // Scanner re-enqueues under the new hash while the worker is generating.
-        assert!(db.enqueue_extraction_if_changed("a.md", "h2").unwrap());
-        // The stale worker marks the OLD hash done.
-        db.mark_extraction_done("a.md", "h1", 100).unwrap();
-        // No-op: the newer hash is still pending and still uncounted.
-        assert_eq!(
-            db.next_pending_extraction().unwrap(),
-            Some(("a.md".into(), "h2".into())),
-            "the re-enqueued hash must survive a stale worker's mark-done"
-        );
-        assert_eq!(db.extraction_coverage().unwrap(), (0, 1));
-        // Marking the CURRENT hash done does advance it.
-        db.mark_extraction_done("a.md", "h2", 101).unwrap();
-        assert_eq!(db.next_pending_extraction().unwrap(), None);
-        assert_eq!(db.extraction_coverage().unwrap(), (1, 1));
-    }
-
-    #[test]
     fn index_health_is_one_line_of_counts() {
         let mut db = Db::open_in_memory().unwrap();
         assert_eq!(db.index_health().unwrap(), IndexHealth::default());
@@ -5943,9 +4879,8 @@ mod tests {
         db.upsert_file("b.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
         db.upsert_file("c.png", "image", 1, 1, "metadata_only", None, "").unwrap();
         db.upsert_file("d.md", "md", 1, 1, "pending", None, "").unwrap();
-        // Neither the OCR nor the extraction backlog is counted.
+        // The OCR backlog is not counted.
         assert!(db.enqueue_ocr_if_changed("c.png", "h1").unwrap());
-        assert!(db.enqueue_extraction_if_changed("a.md", "h1").unwrap());
         db.store_control_results(r#"[{"question":"q","expect":"a.md","rank":1,"passed":true},{"question":"r","expect":"z.md","rank":null,"passed":false}]"#)
             .unwrap();
         let h = db.index_health().unwrap();
@@ -6094,27 +5029,6 @@ mod tests {
     }
 
     #[test]
-    fn indexed_file_count_excludes_non_indexed_rows() {
-        // seeded() has 2 indexed rows + 1 failed row.
-        let mut db = seeded();
-        assert_eq!(db.file_count().unwrap(), 3);
-        assert_eq!(db.indexed_file_count().unwrap(), 2);
-
-        // Image-only (metadata_only) and online-only (cloud_only) rows have
-        // no readable content and must not count toward the auto-build guard.
-        db.upsert_file("img/photo.jpg", "jpg", 1000, 1, "metadata_only", None, "")
-            .unwrap();
-        db.upsert_file("docs/remote.pdf", "pdf", 2000, 1, "cloud_only", None, "")
-            .unwrap();
-        assert_eq!(db.file_count().unwrap(), 5, "all rows still present");
-        assert_eq!(
-            db.indexed_file_count().unwrap(),
-            2,
-            "only status='indexed' rows count"
-        );
-    }
-
-    #[test]
     fn remove_file_removes_its_text_and_chunks() {
         let mut db = seeded();
         db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan owns billing cutover", "h0")], crate::kenignore::Tier::Full)
@@ -6159,8 +5073,8 @@ mod tests {
         for (path, text) in [("docs/a.md", "alpha widget"), ("docs/deep/b.md", "beta widget"), ("docs2/c.md", "gamma widget")] {
             db.upsert_chunks(path, &[chunk(0, text, path)], crate::kenignore::Tier::Full).unwrap();
         }
-        db.enqueue_extraction_if_changed("docs/a.md", "h1").unwrap();
-        db.enqueue_extraction_if_changed("docs2/c.md", "h3").unwrap();
+        crate::graph::set_topics(&db, "docs/a.md", &["billing".to_string()]).unwrap();
+        crate::graph::set_topics(&db, "docs2/c.md", &["billing".to_string()]).unwrap();
         db.enqueue_ocr_if_changed("docs/deep/b.md", "h2").unwrap();
         db.mark_ocr_done(
             "docs/deep/b.md", "h2",
@@ -6199,18 +5113,13 @@ mod tests {
         let by_folder = db.search_chunks_fts("archive alpha", 10).unwrap();
         assert_eq!(by_folder.first().map(|h| h.path.as_str()), Some("Archive/docs/a.md"), "{by_folder:?}");
 
-        // Side tables follow the rename; the sibling's queue row does not move.
+        // Side tables follow the rename, and so do the moved page's topic
+        // tags; the sibling's do not move.
         assert!(db.get_ocr_regions("Archive/docs/deep/b.md").unwrap().len() == 1);
         assert!(db.get_ocr_regions("docs/deep/b.md").unwrap().is_empty());
-        let pending: Vec<String> = db
-            .conn
-            .prepare("SELECT rel_path FROM extractions ORDER BY rel_path")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(pending, vec!["Archive/docs/a.md".to_string(), "docs2/c.md".to_string()]);
+        assert_eq!(crate::graph::topics_of(&db, "Archive/docs/a.md").unwrap(), vec!["billing".to_string()]);
+        assert!(crate::graph::topics_of(&db, "docs/a.md").unwrap().is_empty());
+        assert_eq!(crate::graph::topics_of(&db, "docs2/c.md").unwrap(), vec!["billing".to_string()]);
     }
 
     /// A single file rename goes through the same call: the row moves, and
@@ -6234,10 +5143,8 @@ mod tests {
     #[test]
     fn clear_empties_everything() {
         let mut db = seeded();
-        // Stamp a knowledge-model build so we can prove clear() resets it.
-        let (ents, evs) = sample_model();
-        db.replace_knowledge_model(&ents, &evs, 200).unwrap();
-        assert_eq!(db.knowledge_model_built_at().unwrap(), Some(200));
+        // A topic tag is a write's, not the scan's: it survives a reindex.
+        crate::graph::set_topics(&db, "knowledge/People.md", &["people".to_string()]).unwrap();
 
         // Seed the OCR queue + stored regions so clear() proves it wipes them.
         db.upsert_file("scan.png", "png", 10, 1, "metadata_only", None, "").unwrap();
@@ -6255,11 +5162,7 @@ mod tests {
         // From scratch: OCR regions and queue are gone too.
         assert!(db.get_ocr_regions("scan.png").unwrap().is_empty());
         assert!(db.next_pending_ocr().unwrap().is_none());
-        // From scratch: no entities/events and no stale build stamp.
-        let (entities, edges) = db.list_entities_with_edges().unwrap();
-        assert!(entities.is_empty() && edges.is_empty());
-        assert!(db.list_events().unwrap().is_empty());
-        assert!(db.knowledge_model_built_at().unwrap().is_none());
+        assert_eq!(crate::graph::topics_of(&db, "knowledge/People.md").unwrap(), vec!["people".to_string()]);
     }
 
     #[test]
@@ -6567,125 +5470,39 @@ mod tests {
         assert_eq!(db.file_count().unwrap(), 1);
     }
 
+    /// v26 (knowledge-core decision 21): the local reader's model goes
+    /// (entities, their edges, events, the extraction queue and the build
+    /// stamp) and the graph's edge table comes; the index itself survives.
     #[test]
-    fn v5_db_migrates_to_v6() {
+    fn v25_db_migrates_to_v26() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.db");
         {
-            // Rewind a fresh DB to v5 state.
             let mut db = Db::open_at(&path).unwrap();
             db.upsert_file("notes/a.md", "md", 10, 1, "indexed", None, "kept").unwrap();
-            db.conn.execute("DROP TABLE entity_edges", []).unwrap();
-            db.conn.execute("DROP TABLE entities", []).unwrap();
-            db.conn.execute("DROP TABLE events", []).unwrap();
             db.conn
-                .execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])
+                .execute_batch(
+                    "CREATE TABLE entities (id INTEGER PRIMARY KEY, name TEXT);
+                     CREATE TABLE events (id INTEGER PRIMARY KEY, text TEXT);
+                     CREATE TABLE extractions (rel_path TEXT PRIMARY KEY);
+                     DROP TABLE graph_edges;
+                     INSERT INTO meta(key, value) VALUES ('knowledge_model_built_at', '100');
+                     UPDATE meta SET value = '25' WHERE key = 'schema_version';",
+                )
                 .unwrap();
         }
-        let mut db = Db::open_at(&path).unwrap();
-        // v6 tables exist again and are usable; earlier data survives.
-        db.replace_knowledge_model(
-            &[EntityInput {
-                kind: "person".into(),
-                name: "Priya N.".into(),
-                summary: "Owns billing cutover.".into(),
-                sources: vec!["knowledge/People.md".into()],
-                connections: vec![],
-            }],
-            &[EventInput {
-                date: "2026-07-11".into(),
-                category: "decision".into(),
-                text: "Cutover date is firm.".into(),
-                source: "notes/standup.md".into(),
-            }],
-            100,
-        )
-        .unwrap();
-        assert_eq!(db.list_events().unwrap().len(), 1);
+        let db = Db::open_at(&path).unwrap();
+        for gone in ["entities", "entity_edges", "events", "extractions"] {
+            assert!(!table_exists(&db.conn, gone).unwrap(), "{gone} is dropped");
+        }
+        assert!(table_exists(&db.conn, "graph_edges").unwrap());
+        let stamp: Option<String> = db
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'knowledge_model_built_at'", [], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert!(stamp.is_none());
         assert_eq!(db.file_count().unwrap(), 1);
-    }
-
-    fn sample_model() -> (Vec<EntityInput>, Vec<EventInput>) {
-        let entities = vec![
-            EntityInput {
-                kind: "topic".into(),
-                name: "Billing cutover".into(),
-                summary: "The migration to the new billing system.".into(),
-                sources: vec!["notes/meeting-jul-8.md".into()],
-                connections: vec![(1, "owned by".into()), (2, "vendor".into())],
-            },
-            EntityInput {
-                kind: "person".into(),
-                name: "Priya N.".into(),
-                summary: "Owns the cutover.".into(),
-                sources: vec!["knowledge/People.md".into()],
-                connections: vec![],
-            },
-            EntityInput {
-                kind: "organization".into(),
-                name: "LangdonSoft".into(),
-                summary: "Billing vendor.".into(),
-                sources: vec![],
-                connections: vec![],
-            },
-        ];
-        let events = vec![
-            EventInput {
-                date: "2026-07-11".into(),
-                category: "decision".into(),
-                text: "Vendor sign-off confirmed.".into(),
-                source: "notes/standup.md".into(),
-            },
-            EventInput {
-                date: "2026-06-26".into(),
-                category: "people".into(),
-                text: "Retro calls for a public FAQ.".into(),
-                source: "notes/retro.md".into(),
-            },
-        ];
-        (entities, events)
-    }
-
-    #[test]
-    fn replace_knowledge_model_is_atomic_and_idempotent() {
-        let mut db = Db::open_in_memory().unwrap();
-        // Empty until built.
-        let (entities, edges) = db.list_entities_with_edges().unwrap();
-        assert!(entities.is_empty() && edges.is_empty());
-        assert!(db.list_events().unwrap().is_empty());
-        assert!(db.knowledge_model_built_at().unwrap().is_none());
-
-        let (ents, evs) = sample_model();
-        db.replace_knowledge_model(&ents, &evs, 100).unwrap();
-        db.replace_knowledge_model(&ents, &evs, 200).unwrap();
-
-        // Replacing twice leaves exactly one copy — no duplicates, no
-        // orphaned edges — and the newest timestamp.
-        let (entities, edges) = db.list_entities_with_edges().unwrap();
-        assert_eq!(entities.len(), 3);
-        assert_eq!(edges.len(), 2);
-        assert_eq!(db.knowledge_model_built_at().unwrap(), Some(200));
-        let priya = entities.iter().find(|e| e.name == "Priya N.").unwrap();
-        assert_eq!(priya.kind, "person");
-        assert_eq!(priya.sources, vec!["knowledge/People.md"]);
-        // Edge endpoints reference live entity rows with the right label.
-        let owned = edges.iter().find(|e| e.label == "owned by").unwrap();
-        let topic = entities.iter().find(|e| e.name == "Billing cutover").unwrap();
-        assert_eq!(owned.a, topic.id);
-        assert_eq!(owned.b, priya.id);
-        let orphans: i64 = db.conn.query_row(
-            "SELECT COUNT(*) FROM entity_edges
-             WHERE a NOT IN (SELECT id FROM entities)
-                OR b NOT IN (SELECT id FROM entities)",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(orphans, 0);
-
-        // Events come back newest first.
-        let events = db.list_events().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].date, "2026-07-11");
-        assert_eq!(events[1].category, "people");
     }
 
     #[test]

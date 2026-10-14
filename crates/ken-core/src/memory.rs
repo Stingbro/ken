@@ -317,9 +317,8 @@ pub fn write_memory(
 
 /// Append a `## HH:MM` entry to today's journal file, creating it (and the
 /// `journal/` folder) if absent. `today`/`time_hhmm` are caller-supplied
-/// (mirrors `engine::now_epoch`'s caller-passes-time convention, and
-/// `knowledge_model.rs`'s `today: &str` parameter already used throughout
-/// this crate) — this function never reads the wall clock, so tests can
+/// (mirrors `engine::now_epoch`'s caller-passes-time convention, and the
+/// `today: &str` parameter used throughout this crate) — this function never reads the wall clock, so tests can
 /// assert exact output.
 pub fn append_journal(
     workspace_root: &Path,
@@ -506,7 +505,7 @@ pub struct DistillCandidate {
 
 /// The distillation prompt: journal window + existing memory descriptions
 /// as a dedupe guard (D6), same compose-prompt shape as
-/// `digest.rs::compose_digest_prompt` / `knowledge_model.rs`'s prompts —
+/// `digest.rs::compose_digest_prompt` —
 /// prose contract followed by a JSON-object output shape.
 pub fn compose_distill_prompt(journal_window: &str, existing: &[(String, String)]) -> String {
     let mut p = String::from(

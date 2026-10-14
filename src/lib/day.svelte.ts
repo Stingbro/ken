@@ -108,10 +108,6 @@ class DayStore {
       this.digestError = message;
     });
     await api.onIndexUpdated(() => this.queueRefresh({ state: true, health: true }));
-    // A map build reads the files waiting for it: the count on Home drops.
-    await api.onKnowledgeModelState((ev) => {
-      if (ev.state !== "building") this.queueRefresh({ health: true });
-    });
     // A change of team (or workspace) reads everything again.
     $effect.root(() => {
       $effect(() => {

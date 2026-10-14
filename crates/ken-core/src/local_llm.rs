@@ -27,8 +27,9 @@ pub enum Priority {
 /// answers (Interactive) are a short, streamed summary, so 256 tokens covers a
 /// full answer while keeping the tail latency low.
 ///
-/// Background Map extraction emits a JSON delta of up to 40 entities / 60
-/// relations / 20 events per file (see `knowledge_model`). The budget here was
+/// Background Map extraction (since removed, knowledge-core decision 21)
+/// emitted a JSON delta of up to 40 entities / 60 relations / 20 events per
+/// file. The budget here was
 /// 512 and described as "ample"; it was not. Forty entities alone, each with a
 /// name, kind and description, is on the order of a thousand tokens, so the
 /// generation was severed mid-array and `parse_json_lenient` then threw the

@@ -1,98 +1,74 @@
 import { describe, expect, it } from "vitest";
-import { classifyDate, partitionTimeline } from "./timeline";
+import type { RaidEntry } from "./api";
+import { filterLog, groupByDate, highlightMatches, kindLabel, kindsIn } from "./timeline";
 
-const TODAY = "2026-07-13";
+function entry(date: string, kind: string, text: string, more: Partial<RaidEntry> = {}): RaidEntry {
+  return { date, at: null, kind, text, repo: null, path: null, line: null, reference: null, ...more };
+}
 
-describe("classifyDate", () => {
-  it("marks a full date after today as future", () => {
-    expect(classifyDate("2026-07-14", TODAY)).toBe("future");
-    expect(classifyDate("2027-01-01", TODAY)).toBe("future");
+// Newest first, as `raid_log` returns them.
+const log: RaidEntry[] = [
+  entry("2026-10-06", "finding", "orphan resolved: Nothing links to Design/Lonely.md.", { at: 1, path: "Design/Lonely.md" }),
+  entry("2026-10-06", "commit", "Fix SR-101", { repo: "game", reference: "1a2b3c4" }),
+  entry("2026-10-04", "ticket", "SR-101 · done: Fix saves", { path: "tickets/SR-101.md" }),
+  entry("2026-10-02", "ruling", "D-012: Regions save apart.", { path: "Decisions/DECISIONS.md", line: 3 }),
+  entry("2026-10-01", "ingest", "Standup", { path: "log.md", line: 3 }),
+  entry("2026-09-30", "rename", "a kind log.md names"),
+];
+
+describe("kindsIn", () => {
+  it("lists the kinds present, the known ones in chip order first", () => {
+    expect(kindsIn(log)).toEqual(["ingest", "ruling", "ticket", "commit", "finding", "rename"]);
+    expect(kindsIn([])).toEqual([]);
   });
 
-  it("marks a full date before today as past", () => {
-    expect(classifyDate("2026-07-12", TODAY)).toBe("past");
-    expect(classifyDate("2025-12-31", TODAY)).toBe("past");
-  });
-
-  it("marks an exact match with today as present", () => {
-    expect(classifyDate("2026-07-13", TODAY)).toBe("present");
-  });
-
-  // Partial dates can't prove "strictly after today", so a same-year or
-  // same-month partial stays visible (present) rather than being collapsed.
-  it("treats an ambiguous partial (equal known parts) as present", () => {
-    expect(classifyDate("2026", TODAY)).toBe("present");
-    expect(classifyDate("2026-07", TODAY)).toBe("present");
-  });
-
-  it("classifies a partial only when a known part proves the direction", () => {
-    expect(classifyDate("2027", TODAY)).toBe("future");
-    expect(classifyDate("2025", TODAY)).toBe("past");
-    expect(classifyDate("2026-08", TODAY)).toBe("future");
-    expect(classifyDate("2026-06", TODAY)).toBe("past");
-  });
-
-  it("treats empty or unparseable dates as undated", () => {
-    expect(classifyDate("", TODAY)).toBe("undated");
-    expect(classifyDate("someday", TODAY)).toBe("undated");
-    expect(classifyDate("n/a", TODAY)).toBe("undated");
+  it("labels the known kinds and keeps the rest", () => {
+    expect(kindLabel("ruling")).toBe("Rulings");
+    expect(kindLabel("rename")).toBe("rename");
   });
 });
 
-describe("partitionTimeline", () => {
-  const ev = (id: number, date: string) => ({ id, date });
-
-  it("splits mixed events into future, visible, and undated, preserving order", () => {
-    // Input is newest-first (date DESC), as the store delivers it.
-    const events = [
-      ev(1, "2026-09-01"), // future
-      ev(2, "2026-07-14"), // future
-      ev(3, "2026-07-13"), // today
-      ev(4, "2026-01-01"), // past
-      ev(5, ""), // undated
-    ];
-    const g = partitionTimeline(events, TODAY);
-    expect(g.future.map((e) => e.id)).toEqual([1, 2]);
-    expect(g.visible.map((e) => e.id)).toEqual([3, 4]);
-    expect(g.undated.map((e) => e.id)).toEqual([5]);
-    expect(g.hasDated).toBe(true);
+describe("filterLog", () => {
+  it("keeps one kind, and the order", () => {
+    expect(filterLog(log, "ticket", "").map((e) => e.text)).toEqual(["SR-101 · done: Fix saves"]);
+    expect(filterLog(log, null, "")).toEqual(log);
   });
 
-  it("handles all-past events with no future group", () => {
-    const events = [ev(1, "2026-01-01"), ev(2, "2025-01-01")];
-    const g = partitionTimeline(events, TODAY);
-    expect(g.future).toHaveLength(0);
-    expect(g.visible.map((e) => e.id)).toEqual([1, 2]);
-    expect(g.hasDated).toBe(true);
+  it("matches words in the text, the repo, the reference and the path", () => {
+    expect(filterLog(log, null, "sr-101").map((e) => e.kind)).toEqual(["commit", "ticket"]);
+    expect(filterLog(log, null, "GAME").map((e) => e.kind)).toEqual(["commit"]);
+    expect(filterLog(log, null, "1a2b").map((e) => e.kind)).toEqual(["commit"]);
+    expect(filterLog(log, null, "decisions.md").map((e) => e.kind)).toEqual(["ruling"]);
+    expect(filterLog(log, "ruling", "regions")).toHaveLength(1);
+    expect(filterLog(log, "ticket", "regions")).toHaveLength(0);
+  });
+});
+
+describe("groupByDate", () => {
+  it("groups by day, newest first, keeping each day's order", () => {
+    const groups = groupByDate(log);
+    expect(groups.map((g) => g.date)).toEqual(["2026-10-06", "2026-10-04", "2026-10-02", "2026-10-01", "2026-09-30"]);
+    expect(groups[0].entries.map((e) => e.kind)).toEqual(["finding", "commit"]);
+    expect(groupByDate([])).toEqual([]);
+  });
+});
+
+describe("highlightMatches", () => {
+  it("marks case-insensitive matches", () => {
+    expect(highlightMatches("The Cutover slipped", "cutover")).toBe("The <mark>Cutover</mark> slipped");
   });
 
-  it("handles all-future events with an empty visible group", () => {
-    const events = [ev(1, "2027-01-01"), ev(2, "2026-08-01")];
-    const g = partitionTimeline(events, TODAY);
-    expect(g.future.map((e) => e.id)).toEqual([1, 2]);
-    expect(g.visible).toHaveLength(0);
-    expect(g.hasDated).toBe(true);
+  it("escapes HTML and never executes it", () => {
+    expect(highlightMatches("<img src=x> & cutover", "cutover")).toBe("&lt;img src=x&gt; &amp; <mark>cutover</mark>");
+    // A query matching escaped-looking text stays escaped around the mark.
+    expect(highlightMatches("<b>bold</b>", "bold")).toBe("&lt;b&gt;<mark>bold</mark>&lt;/b&gt;");
   });
 
-  it("keeps an event exactly on today in the visible group", () => {
-    const g = partitionTimeline([ev(1, TODAY)], TODAY);
-    expect(g.visible.map((e) => e.id)).toEqual([1]);
-    expect(g.future).toHaveLength(0);
+  it("empty query just escapes", () => {
+    expect(highlightMatches("a < b", "  ")).toBe("a &lt; b");
   });
 
-  it("keeps undated events visible and never marks the set as dated when all are undated", () => {
-    const events = [ev(1, ""), ev(2, "unknown")];
-    const g = partitionTimeline(events, TODAY);
-    expect(g.undated.map((e) => e.id)).toEqual([1, 2]);
-    expect(g.future).toHaveLength(0);
-    expect(g.visible).toHaveLength(0);
-    expect(g.hasDated).toBe(false);
-  });
-
-  it("keeps ambiguous partial dates visible rather than collapsing them", () => {
-    const events = [ev(1, "2026-08"), ev(2, "2026"), ev(3, "2026-06")];
-    const g = partitionTimeline(events, TODAY);
-    expect(g.future.map((e) => e.id)).toEqual([1]); // 2026-08 is provably future
-    expect(g.visible.map((e) => e.id)).toEqual([2, 3]);
+  it("marks every occurrence", () => {
+    expect(highlightMatches("go go go", "go")).toBe("<mark>go</mark> <mark>go</mark> <mark>go</mark>");
   });
 });

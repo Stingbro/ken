@@ -9,13 +9,9 @@ use tauri::{AppHandle, Emitter, State};
 use ken_core::assistant::{self, OneshotOutcome};
 use ken_core::chat::{self, ChatEngine, ChatPty, ChatUpdate};
 use ken_core::cloud;
-use ken_core::db::{
-    db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, EdgeRow, EntityRow, EventRow,
-    FileRow,
-};
+use ken_core::db::{db_path, ChatField, ChatFlag, ChatMessage, ChatRow, Db, FileRow};
 use ken_core::digest;
 use ken_core::embedder::Embedder;
-use ken_core::knowledge_model::{self, AutoBuildTracker};
 use ken_core::model;
 use ken_core::engine;
 use ken_core::kenignore;
@@ -76,8 +72,6 @@ struct MemberRuntime {
     chat_db: Arc<Mutex<Db>>,
     sync: Arc<SyncEngine>,
     terminals: Arc<Mutex<std::collections::HashMap<String, TerminalHandle>>>,
-    /// True while a knowledge-model build thread is running.
-    knowledge_running: Arc<AtomicBool>,
     /// True while a background reindex (clear + full rescan) is running, so a
     /// second `reindex` command can't stack another rebuild on top.
     reindex_running: Arc<AtomicBool>,
@@ -86,10 +80,9 @@ struct MemberRuntime {
     /// on top. `profile_candidates` (task 2.2) has no equivalent guard: its
     /// targets aren't open members and share no state to race on.
     profiling_running: Arc<AtomicBool>,
-    /// Change/scan/build bookkeeping behind automatic Map & Timeline builds.
-    auto_knowledge: Arc<AutoBuildTracker>,
-    /// Stops the per-project extraction worker when this project closes.
-    _extraction_worker: StopOnDrop,
+    /// Stops the per-project background worker (one-line summaries and the
+    /// knowledge checks) when this project closes.
+    _background_worker: StopOnDrop,
     /// Stops the per-project OCR worker when this project closes.
     _ocr_worker: StopOnDrop,
     /// Stops the background cloud-hydration worker when this project closes.
@@ -143,19 +136,6 @@ struct AppState {
     /// The single in-progress recording, if any (app-global: one recorder at a
     /// time). Holds its own state/writers behind its mutex.
     record: Arc<Mutex<Option<RecordSession>>>,
-    /// federated-kg task 2.1: true while a `build_workspace_kg` run is in
-    /// flight. App-global (not per-member) because one build spans every
-    /// open member at once — mirrors `MemberRuntime::reindex_running`'s
-    /// single-guard discipline, just at the workspace scope instead of the
-    /// project scope.
-    workspace_kg_running: Arc<AtomicBool>,
-    /// Cancel token for the in-flight workspace-KG build, if any — mirrors
-    /// `MemberRuntime::semantic_build_cancel`'s replace-and-cancel slot.
-    workspace_kg_cancel: Arc<Mutex<Option<CancelToken>>>,
-    /// Debounce generation counter for the 30s workspace-KG auto-trigger
-    /// (mirrors `qa_gen`: "a newer request bumps it so the older one sees a
-    /// mismatch and stands down"). See `schedule_workspace_kg_debounce`.
-    workspace_kg_debounce_gen: Arc<AtomicU64>,
     /// The open workspace's bookkeeping (`workspace` change, tasks 3.1/3.2):
     /// the resolved manifest plus the resident-runtime LRU. `None` in
     /// single-project mode — the enum-free equivalent of design.md D2's
@@ -168,9 +148,8 @@ struct AppState {
     /// (task 3.1 / design D4: "ingest concurrency is capped at 2 members at a
     /// time"). Shared by every `activate` scan thread — see [`IngestGate`].
     ingest_gate: Arc<IngestGate>,
-    /// ken-memory task 2.2: true while a `distill_journal` run is in flight —
-    /// mirrors `workspace_kg_running`'s single-`AtomicBool`-guard discipline,
-    /// at the workspace-journal scope instead.
+    /// ken-memory task 2.2: true while a `distill_journal` run is in flight,
+    /// one `AtomicBool` guard at the workspace-journal scope.
     memory_distill_running: Arc<AtomicBool>,
     /// The most recent `distill_journal` run's proposed candidates, kept
     /// server-side so `resolve_distill_candidate(slug, approve)` — whose own
@@ -217,7 +196,7 @@ const WORKSPACE_DISABLED_MSG: &str =
 /// concurrently (task 3.1 / design D4). `std` has no semaphore, so this is
 /// the classic `Mutex<permits>` + `Condvar` pair — the same hand-rolled
 /// coordination discipline the rest of this file already leans on (atomics +
-/// generation counters like `qa_gen`/`workspace_kg_debounce_gen`). One
+/// generation counters like `qa_gen`). One
 /// instance lives on `AppState::ingest_gate`; each `activate` initial-scan
 /// thread `acquire`s a permit around its `scan::scan` call and releases it
 /// when the returned [`IngestPermit`] drops. With the cap at 2, a workspace
@@ -857,30 +836,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         eprintln!("warning: code index backfill failed: {e}");
     }
 
-    // One-time extraction backfill: a project indexed before the incremental
-    // Map landed has no `extractions` rows, and the scanner never re-runs
-    // index_one for unchanged files — so those files would show "0 of N
-    // analyzed" forever. Enqueue every indexed file that has no row yet,
-    // hashing its already-stored text. Cheap, idempotent, and re-index-safe.
-    match db.backfill_extractions() {
-        Ok(_) => {
-            // Sanity check: after backfill, every extractable (indexed + has
-            // content) file should have an extractions row. If any still don't,
-            // the coverage denominator and the enqueuable population disagree —
-            // the Map would stick below 100% with no queued work to close the
-            // gap (the "0 of N" wedge). Surface it instead of failing silently.
-            if let Ok(missing) = db.unqueued_extractable_count() {
-                if missing > 0 {
-                    eprintln!(
-                        "warning: extraction backfill left {missing} extractable file(s) \
-                         unqueued; Map coverage may not reach 100%"
-                    );
-                }
-            }
-        }
-        Err(e) => eprintln!("warning: extraction backfill failed: {e}"),
-    }
-
     let mut guard = state.lock().unwrap();
 
     // One-time unread baseline: snapshot the already-indexed files (this DB
@@ -1104,15 +1059,12 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         .map_err(err)?,
     );
 
-    let auto_knowledge = Arc::new(AutoBuildTracker::new());
-
     // kenignore task 2.2 needs its own `Db` handle later (see the poller
     // below), so grab a clone before `watch::start` moves `watch_db_path`.
     let kenignore_db_path = watch_db_path.clone();
 
     let emit_app = app.clone();
     let watch_sync = sync_engine.clone();
-    let watch_knowledge = auto_knowledge.clone();
     let watch_state = state.clone();
     let watch_project = project.clone();
     let watch_base = guard.base_dir.clone();
@@ -1128,9 +1080,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                     schedule_ingest_pass(&watch_state, &watch_project, &watch_base);
                 }
                 watch_sync.changed(stats.changed_paths.clone());
-                // Same signal, slower consumer: the knowledge model is
-                // rebuilt only once the changes stop coming.
-                watch_knowledge.changed();
             }
             enqueue_transcriptions(&emit_app, &watch_state, project_id, &stats.videos_needing_transcript);
             emit_member(&emit_app, project_id, "index-updated", stats.clone());
@@ -1215,11 +1164,9 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         chat_db,
         sync: sync_engine.clone(),
         terminals: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        knowledge_running: Arc::new(AtomicBool::new(false)),
         reindex_running: Arc::new(AtomicBool::new(false)),
         profiling_running: Arc::new(AtomicBool::new(false)),
-        auto_knowledge: auto_knowledge.clone(),
-        _extraction_worker: StopOnDrop(stop.clone()),
+        _background_worker: StopOnDrop(stop.clone()),
         _ocr_worker: StopOnDrop(ocr_stop.clone()),
         _bg_hydrate: StopOnDrop(bg_stop.clone()),
         _kenignore_watch: StopOnDrop(kenignore_stop.clone()),
@@ -1258,7 +1205,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
     // Initial scan in the background so opening stays instant.
     let scan_app = app.clone();
     let scan_sync = sync_engine.clone();
-    let scan_knowledge = auto_knowledge.clone();
     let scan_state = state.clone();
     let (base, scan_gate) = {
         let guard = state.lock().unwrap();
@@ -1281,7 +1227,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                 Ok(stats) => {
                     if !stats.changed_paths.is_empty() {
                         scan_sync.changed(stats.changed_paths.clone());
-                        scan_knowledge.changed();
                     }
                     enqueue_transcriptions(&scan_app, &scan_state, project_id, &stats.videos_needing_transcript);
                     emit_member(&scan_app, project_id, "index-updated", stats);
@@ -1294,32 +1239,21 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
                 }
             }
         }
-        // Whatever happened, the folder is no longer being walked — a
-        // knowledge build may now read a complete file list.
-        scan_knowledge.scan_finished();
     });
 
-    // One background extraction worker per open project: it drains the
-    // `extractions` queue at the local model's background priority, one file
-    // per generation, merging each delta into the Map/Timeline model and
-    // emitting a throttled `knowledge-updated` after each merged file. When the
-    // local model isn't ready it idles quietly (the Map shows a plain notice).
-    // Paused behind `KNOWLEDGE_EXTRACTION_ENABLED` (see its doc comment): the
-    // `stop` plumbing above stays wired either way, so nothing else changes.
-    if KNOWLEDGE_EXTRACTION_ENABLED {
-        let worker_app = app.clone();
-        let worker_state = state.clone();
-        let worker_id = project.config.id;
-        let worker_stop = stop.clone();
-        std::thread::spawn(move || {
-            extraction_worker(worker_app, worker_state, worker_id, worker_stop);
-        });
-    }
+    // One background worker per open project: one-line summaries for search
+    // and a knowledge base's checks, through Claude, on the shared pace.
+    let worker_state = state.clone();
+    let worker_id = project.config.id;
+    let worker_stop = stop.clone();
+    std::thread::spawn(move || {
+        background_worker(worker_state, worker_id, worker_stop);
+    });
 
     // One background OCR worker per open project: drains `ocr_pending`, runs
     // Vision on images/scanned PDFs, and merges the recognized text into the
     // index so it becomes searchable (and stores per-region boxes for the
-    // Cmd+F overlay). Independent of the extraction worker above.
+    // Cmd+F overlay). Independent of the background worker above.
     let ocr_app = app.clone();
     let ocr_worker_state = state.clone();
     let ocr_id = project.config.id;
@@ -1346,19 +1280,6 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
 
     Ok(info)
 }
-
-/// Master switch for the per-project knowledge extraction worker — the
-/// background pass that runs the local LLM over every indexed file and feeds
-/// the Map and Timeline screens.
-///
-/// On: the knowledge graph behind hybrid search is built from it. It was
-/// paused upstream while testing (it drove llama.cpp on the GPU once per file
-/// across a whole project); on this branch it reads only files a repo's kind
-/// and index state mark for entities (team and wiki repos by default), so a
-/// code repo costs it nothing. Switching it off leaves queue rows `pending`,
-/// so switching back on resumes where it left off; the `map` and `timeline`
-/// entries in `src/shell/NavRail.svelte` go with it.
-const KNOWLEDGE_EXTRACTION_ENABLED: bool = true;
 
 /// How often the background hydration worker wakes to look for cloud-only
 /// documents to pull down. Long on purpose: this is opportunistic work that
@@ -1402,9 +1323,9 @@ fn background_hydrate_worker(
         // Snapshot everything the tick needs, then drop the lock immediately —
         // the download and re-index below must not hold it. A different project
         // being open means this tick is stale (the drop guard will stop us).
-        let (base, project, sync, auto_knowledge) = {
+        let (base, project, sync) = {
             let guard = state.lock().unwrap();
-            // Own project by id — see `extraction_worker`. The old
+            // Own project by id. The old
             // `values().next()` plus id-mismatch check meant that with several
             // members open, every hydrate worker but one returned on its first
             // tick and their projects' cloud-only files were never pulled down.
@@ -1418,7 +1339,6 @@ fn background_hydrate_worker(
                 guard.base_dir.clone(),
                 active.project.clone(),
                 active.sync.clone(),
-                active.auto_knowledge.clone(),
             )
         };
 
@@ -1455,11 +1375,10 @@ fn background_hydrate_worker(
                         .unwrap_or(false);
                     if changed {
                         // Same downstream notifications `hydrate_file` fires, so
-                        // a just-downloaded doc reaches ingests, Map/Timeline and
-                        // sync, and the footer's cloud_only count drops.
+                        // a just-downloaded doc reaches ingests and sync, and
+                        // the footer's cloud_only count drops.
                         let paths = vec![rel.clone()];
                         sync.changed(paths.clone());
-                        auto_knowledge.changed();
                         emit_member(
                             &app,
                             project_id,
@@ -1507,15 +1426,10 @@ fn open_project(app: AppHandle, state: State<SharedState>, path: String) -> CmdR
     activate(&app, &state, project, true)
 }
 
-/// Workspaces, the workspace knowledge graph and search routed across the
-/// workspace are how Ken works, not switches (`features::BUILT_IN`): always
-/// on, whatever an older `settings.json` says. The helpers stay so their
-/// callers read as before.
+/// Workspaces and search routed across the workspace are how Ken works, not
+/// switches (`features::BUILT_IN`): always on, whatever an older
+/// `settings.json` says. The helper stays so its callers read as before.
 fn workspace_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
-    true
-}
-
-fn federated_kg_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
     true
 }
 
@@ -1536,7 +1450,7 @@ const DISMISSED_MEMORY_PREFIX: &str = "distill-dismissed:";
 /// is actually resident in `AppState::members`; callers
 /// that need residency check `guard.members.contains_key(..)`/`.get(..)`
 /// themselves. Centralizes the `memory::workspace_pseudo_member_id` call so
-/// every exclusion site (search fan-out, federation loops, profiler) derives
+/// every exclusion site (search fan-out, profiler) derives
 /// the same id the same way.
 fn memory_pseudo_member_id(state: &AppState) -> Option<uuid::Uuid> {
     state
@@ -3002,15 +2916,10 @@ async fn hydrate_file(
 
     // Snapshot everything the download, re-index, and notifications need, then
     // drop the global lock immediately — none of this may hold it.
-    let (base, project, sync, auto_knowledge) = {
+    let (base, project, sync) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
-        (
-            guard.base_dir.clone(),
-            active.project.clone(),
-            active.sync.clone(),
-            active.auto_knowledge.clone(),
-        )
+        (guard.base_dir.clone(), active.project.clone(), active.sync.clone())
     };
     let project_id = project.config.id;
 
@@ -3041,12 +2950,11 @@ async fn hydrate_file(
     .map_err(err)??;
 
     // Drive the SAME downstream notifications the watcher fires for a changed
-    // file, so a just-downloaded doc reaches ingests, Map/Timeline, and sync
-    // immediately instead of waiting for an edit or a manual reindex.
+    // file, so a just-downloaded doc reaches ingests and sync immediately
+    // instead of waiting for an edit or a manual reindex.
     if changed {
         let paths = vec![rel_path.clone()];
         sync.changed(paths.clone());
-        auto_knowledge.changed();
         emit_member(
             &app,
             project_id,
@@ -3273,16 +3181,10 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
     // rebuilt index. Progress reaches the UI via `scan-started`/`index-updated`
     // /`scan-error`, and the command returns immediately so the button never
     // hangs.
-    let (project, base, sync, knowledge, running) = {
+    let (project, base, sync, running) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
-        (
-            active.project.clone(),
-            guard.base_dir.clone(),
-            active.sync.clone(),
-            active.auto_knowledge.clone(),
-            active.reindex_running.clone(),
-        )
+        (active.project.clone(), guard.base_dir.clone(), active.sync.clone(), active.reindex_running.clone())
     };
     // Already rebuilding? Don't stack a second clear+rescan.
     if running.swap(true, Ordering::SeqCst) {
@@ -3299,12 +3201,11 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
                 match scan::reindex(&project, &mut db) {
                     Ok(stats) => {
                         // A from-scratch rebuild touches everything: push the
-                        // changed set to sync, trigger a knowledge rebuild, and
-                        // re-enqueue any videos that still need transcripts.
+                        // changed set to sync and re-enqueue any videos that
+                        // still need transcripts.
                         if !stats.changed_paths.is_empty() {
                             sync.changed(stats.changed_paths.clone());
                         }
-                        knowledge.changed();
                         enqueue_transcriptions(
                             &bg_app,
                             &bg_state,
@@ -3322,9 +3223,6 @@ fn reindex(app: AppHandle, state: State<SharedState>) -> CmdResult<ScanStats> {
                 let _ = bg_app.emit("scan-error", e.to_string());
             }
         }
-        // The folder is no longer being walked — a knowledge build may now read
-        // a complete file list.
-        knowledge.scan_finished();
         running.store(false, Ordering::SeqCst);
     });
 
@@ -4809,15 +4707,10 @@ fn import_commit(
     dest_folder_rel: String,
     create_folder: bool,
 ) -> CmdResult<String> {
-    let (root, project, sync, auto_knowledge) = {
+    let (root, project, sync) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
-        (
-            active.project.root.clone(),
-            active.project.clone(),
-            active.sync.clone(),
-            active.auto_knowledge.clone(),
-        )
+        (active.project.root.clone(), active.project.clone(), active.sync.clone())
     };
 
     let (staged_abs, file_name) = staged_file(&root, &import_id)?;
@@ -4855,7 +4748,6 @@ fn import_commit(
     if changed {
         let paths = vec![final_rel.clone()];
         sync.changed(paths.clone());
-        auto_knowledge.changed();
         emit_member(
             &app,
             project.config.id,
@@ -4966,9 +4858,10 @@ fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
         "Set up the Ken MCP server so you can search this team's knowledge base.\n\n\
 Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
 server binary, ken-mcp, runs on demand over stdio. Its tools: search (route_query \
-across the workspace, semantic_search in one project, kg_search), reading \
+across the workspace, semantic_search in one project), reading \
 (read_document, list_documents, list_projects), code navigation (find_definition, \
-find_usages, file_outline, related_files), history, the person's Your day tasks and \
+find_usages, file_outline), what a page, ruling, ticket or code file is related to \
+(related_files), history, the person's Your day tasks and \
 tickets (task_list, ticket_list). It never edits the person's files. Four tools \
 write: task_create and task_update (Your day tasks), and memory_write and \
 journal_append (Ken's memory and journal).\n\n\
@@ -6426,7 +6319,7 @@ fn llm_status() -> &'static str {
     generator_status()
 }
 
-/// What maps, answers and judges in Ken (see [`LOCAL_GENERATION`]):
+/// What answers and judges in Ken (see [`LOCAL_GENERATION`]):
 /// `ready` when it can run, `notInstalled` when Claude Code is missing.
 /// The on-device model's own state matters only to meaning search now.
 fn generator_status() -> &'static str {
@@ -6457,70 +6350,6 @@ fn warm_llm() {
     ) {
         ken_core::local_llm::warm();
     }
-}
-
-// ---------- knowledge model (Map & Timeline) ----------
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct KnowledgeModelDto {
-    entities: Vec<EntityRow>,
-    edges: Vec<EdgeRow>,
-    events: Vec<EventRow>,
-    /// Epoch seconds of the last build; null before the first one.
-    built_at: Option<i64>,
-    /// A manual Deep rebuild is running right now — the Map/Timeline screens
-    /// may open mid-build, so the state has to come back with the model, not
-    /// only as an event.
-    building: bool,
-    /// Incremental coverage: files extracted / extractable files.
-    analyzed: i64,
-    total: i64,
-    /// Files whose extraction failed permanently (retry budget exhausted).
-    /// Excluded from `analyzed`, so the Map can show "X analyzed, Y failed of N"
-    /// instead of a silent gap that looks identical to "no progress".
-    failed: i64,
-    /// `ready` | `notInstalled` | `error` — drives the Map's paused notice.
-    llm_status: String,
-    /// The model's error message when `llm_status == "error"`, else null.
-    llm_error: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct KnowledgeModelState {
-    /// `building` | `ready` | `error` | `idle`
-    ///
-    /// `idle` ends an automatic build that didn't produce a model (a CLI
-    /// that isn't logged in, say): the screens stop saying "building" and
-    /// go back to offering a manual refresh, which reports the real error.
-    /// Nobody asked for the build, so nobody gets an error banner for it.
-    state: String,
-    detail: Option<String>,
-}
-
-/// The whole stored knowledge model in one call — it's small by
-/// construction (extraction caps), so no pagination.
-#[tauri::command(async)]
-fn knowledge_model(state: State<SharedState>) -> CmdResult<KnowledgeModelDto> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let (entities, edges) = active.db.list_entities_with_edges().map_err(err)?;
-    let (analyzed, total) = active.db.extraction_coverage().map_err(err)?;
-    let failed = active.db.extraction_failed_count().map_err(err)?;
-    let (llm_status, llm_error) = (generator_status().to_string(), None::<String>);
-    Ok(KnowledgeModelDto {
-        entities,
-        edges,
-        events: active.db.list_events().map_err(err)?,
-        built_at: active.db.knowledge_model_built_at().map_err(err)?,
-        building: active.knowledge_running.load(Ordering::SeqCst),
-        analyzed,
-        total,
-        failed,
-        llm_status,
-        llm_error,
-    })
 }
 
 /// Longest one background check's Claude call may take (a drift re-read,
@@ -6573,9 +6402,10 @@ fn background_claude(
 /// rule's week, or pages waiting for a re-read), or now when `force`: the
 /// sweep, what it found acted on with re-reads through
 /// [`background_claude`], and the run's commit. Then the code citations of
-/// the workspace's other repos are checked against the decisions log
-/// (decision 30). It spawns git per cited file, so callers run it off the
-/// UI thread. Returns the run.
+/// the workspace's other repos are read against the decisions log (decision
+/// 30): the ones the log lacks are findings, the rest graph edges (decision
+/// 21). It spawns git per cited file, so callers run it off the UI thread.
+/// Returns the run.
 fn run_drift(state: &SharedState, project: &Project, db: &mut Db, force: bool, stop: &Arc<AtomicBool>) -> Option<ken_core::drift::DriftRun> {
     if !ken_core::registry::is_library(&project.root) && !force {
         return None;
@@ -6599,10 +6429,13 @@ fn run_drift(state: &SharedState, project: &Project, db: &mut Db, force: bool, s
         .into_iter()
         .filter_map(|(name, id)| Db::open_read_only(&base, id).ok().map(|db| ken_core::ingest::CodeSource { name, db }))
         .collect();
-    match ken_core::lint::unknown_rulings(db, &project.root, &code) {
+    match ken_core::lint::rulings_in_code(db, &project.root, &code) {
         Ok(found) => {
-            if let Err(e) = ken_core::findings::sync(db, &[ken_core::lint::UNKNOWN_RULING], &found, now) {
+            if let Err(e) = ken_core::findings::sync(db, &[ken_core::lint::UNKNOWN_RULING], &ken_core::lint::unknown_of(&found), now) {
                 eprintln!("warning: could not file the code citations: {e}");
+            }
+            if let Err(e) = ken_core::graph::store_code_citations(db, &found) {
+                eprintln!("warning: could not store the code citations: {e}");
             }
         }
         Err(e) => eprintln!("warning: could not read the code citations: {e}"),
@@ -6616,12 +6449,14 @@ const CHECKS_EVERY: Duration = Duration::from_secs(300);
 /// refused.
 const CHECKS_BACKOFF: Duration = Duration::from_secs(600);
 
-/// One turn of a knowledge base's checks (knowledge-core decisions 25, 28
-/// to 30), for a knowledge base only: a drift run when one is due
-/// ([`run_drift`]), then at most one background Claude call, the first of
-/// what waits: the lint after an edit, the weekly lint, the supersession
-/// pass over new decisions-log entries. The lint that needs no model and the
-/// supersession markers run with every scan (`scan::after_scan`).
+/// One turn of a knowledge base's checks (knowledge-core decisions 21, 25,
+/// 28 to 30), for a knowledge base only: a drift run when one is due
+/// ([`run_drift`]), the graph's commit edges from each repo whose branch
+/// moved, then at most one background Claude call, the first of what
+/// waits: the lint after an edit, the topic tags of pages just written, the
+/// weekly lint, the supersession pass over new decisions-log entries. The
+/// lint that needs no model, the supersession markers and the graph's own
+/// edges are made with every scan (`scan::after_scan`).
 fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
     let (base, project) = {
         let guard = lock_tolerant(state);
@@ -6640,6 +6475,15 @@ fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<Atom
     if stop.load(Ordering::SeqCst) {
         return SummaryTick::Stopped;
     }
+    // Commits citing a ticket or a ruling (decision 21): each repo read from
+    // the head read last time, one git call for a repo that has not moved.
+    let repos: Vec<(String, PathBuf)> = {
+        let guard = lock_tolerant(state);
+        workspace_repos(&guard).into_iter().map(|(name, _, root)| (name, root)).collect()
+    };
+    if let Err(e) = ken_core::graph::read_commits(&mut db, &project.root, &repos) {
+        eprintln!("graph: {e}");
+    }
     let Some(mut claude) = background_claude(state, project_id, &project.root, stop) else {
         return SummaryTick::Idle;
     };
@@ -6654,6 +6498,9 @@ fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<Atom
     };
     if let Ok(Some(p)) = ken_core::lint::after_edit_next(&db, root) {
         return done(claude(&p.prompt).and_then(|reply| ken_core::lint::after_edit_done(&mut db, &p, &reply, now)));
+    }
+    if let Ok(Some(call)) = ken_core::graph::topics_next(&db, root) {
+        return done(claude(&call.prompt).and_then(|reply| ken_core::graph::topics_done(&mut db, &call, &reply)));
     }
     if ken_core::lint::weekly_due(&db, now).unwrap_or(false) {
         if let Ok(Some(p)) = ken_core::lint::weekly_next(&db, root, now) {
@@ -6712,6 +6559,37 @@ fn code_sources(guard: &AppState, root: &Path) -> Vec<(String, uuid::Uuid)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Every repo of the open workspace as (name, id, checkout), or the open
+/// members when no workspace is open. The memory pseudo-member is not one.
+fn workspace_repos(guard: &AppState) -> Vec<(String, uuid::Uuid, PathBuf)> {
+    let pseudo = memory_pseudo_member_id(guard);
+    let all: Vec<(String, uuid::Uuid, PathBuf)> = match guard.workspace.as_ref() {
+        Some(w) => w
+            .ws
+            .members
+            .iter()
+            .filter_map(|m| match &m.status {
+                ken_core::workspace::MemberStatus::Ok(p) => Some((p.config.name.clone(), p.config.id, p.root.clone())),
+                _ => None,
+            })
+            .collect(),
+        None => guard.members.values().map(|m| (m.project.config.name.clone(), m.project.config.id, m.project.root.clone())).collect(),
+    };
+    all.into_iter().filter(|(_, id, _)| Some(*id) != pseudo).collect()
+}
+
+/// The workspace's knowledge base: the repo `prefer` names when it is one,
+/// else the first repo that is (`registry::is_library`).
+fn knowledge_base_of(repos: &[(String, uuid::Uuid, PathBuf)], prefer: Option<uuid::Uuid>) -> Option<(String, uuid::Uuid, PathBuf)> {
+    let is_kb = |r: &&(String, uuid::Uuid, PathBuf)| ken_core::registry::is_library(&r.2);
+    repos
+        .iter()
+        .filter(is_kb)
+        .find(|r| Some(r.1) == prefer)
+        .or_else(|| repos.iter().find(is_kb))
+        .cloned()
 }
 
 /// [`code_sources`], taking the lock.
@@ -8002,6 +7880,120 @@ fn page_links(state: State<SharedState>, path: String) -> CmdResult<ken_core::li
     ken_core::links::page_links(&active.db, &path).map_err(err)
 }
 
+/// One neighbour in the project graph, for Files (knowledge-core decision
+/// 21): what it is, how it joins, and where it opens.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelatedDto {
+    /// `kind:id`.
+    key: String,
+    kind: String,
+    /// What to show: a file's name, a ruling's id, a topic, a commit.
+    label: String,
+    edge: String,
+    outgoing: bool,
+    detail: String,
+    hops: u8,
+    via: Option<String>,
+    /// The member that holds it and its path there, when it opens as a file.
+    project_id: Option<String>,
+    path: Option<String>,
+}
+
+/// Most neighbours `graph_related` returns.
+const RELATED_LIMIT: usize = 40;
+
+/// A file's neighbours in the project graph (knowledge-core decision 21):
+/// `path` in the member `project_id` (default the focused one). A file of
+/// the knowledge base is a page, note or ticket; a file of another repo is
+/// a code file. The workspace's indexes are opened for reading, off the
+/// lock.
+#[tauri::command(async)]
+fn graph_related(state: State<SharedState>, path: String, project_id: Option<String>) -> CmdResult<Vec<RelatedDto>> {
+    let (base, repos, asked) = {
+        let guard = state.lock().unwrap();
+        let asked = match project_id.as_deref() {
+            Some(id) => uuid::Uuid::parse_str(id).map_err(err)?,
+            None => member(&guard, None)?.project.config.id,
+        };
+        (guard.base_dir.clone(), workspace_repos(&guard), asked)
+    };
+    let path = path.replace('\\', "/");
+    let kb = knowledge_base_of(&repos, Some(asked));
+    let node = match (&kb, repos.iter().find(|r| r.1 == asked)) {
+        (Some(k), _) if k.1 == asked => ken_core::graph::Node::of_path(&path),
+        (_, Some((name, _, _))) => ken_core::graph::Node::code(name, &path),
+        _ => return Ok(Vec::new()),
+    };
+    let kb_db = kb.as_ref().and_then(|k| Db::open_read_only(&base, k.1).ok());
+    let code: Vec<ken_core::ingest::CodeSource> = repos
+        .iter()
+        .filter(|r| kb.as_ref().map(|k| k.1) != Some(r.1))
+        .filter_map(|(name, id, _)| Db::open_read_only(&base, *id).ok().map(|db| ken_core::ingest::CodeSource { name: name.clone(), db }))
+        .collect();
+    let found = ken_core::graph::related(kb_db.as_ref(), &code, &node, RELATED_LIMIT).map_err(err)?;
+    let file_name = |p: &str| p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md").to_string();
+    Ok(found
+        .into_iter()
+        .map(|n| {
+            let (project_id, path, label) = if let Some(p) = n.node.kb_path() {
+                (kb.as_ref().map(|k| k.1.to_string()), Some(p.to_string()), file_name(p))
+            } else if let Some((repo, p, symbol)) = n.node.code_place() {
+                let id = repos.iter().find(|r| r.0 == repo).map(|r| r.1.to_string());
+                (id, Some(p.to_string()), symbol.map(str::to_string).unwrap_or_else(|| file_name(p)))
+            } else {
+                (None, None, n.node.id.clone())
+            };
+            RelatedDto {
+                key: n.node.key(),
+                kind: n.node.kind.clone(),
+                label,
+                edge: n.edge,
+                outgoing: n.outgoing,
+                detail: n.detail,
+                hops: n.hops,
+                via: n.via.map(|v| v.key()),
+                project_id,
+                path,
+            }
+        })
+        .collect())
+}
+
+/// The Timeline: the project's raid log (knowledge-core decision 37), read
+/// from the workspace's knowledge base, else the focused repo.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RaidLogDto {
+    /// The repo it was read from, so an entry's file opens there.
+    project_id: Option<String>,
+    name: Option<String>,
+    entries: Vec<ken_core::raidlog::Entry>,
+}
+
+/// Most entries the Timeline asks for by default.
+const RAID_LOG_LIMIT: usize = 1_000;
+
+/// The raid log (knowledge-core decision 37): every ingest, drift and lint
+/// run, ruling, ticket change, commit, finding and release, newest first,
+/// each linked to its source. Reads git, so it runs off the lock.
+#[tauri::command(async)]
+fn raid_log(state: State<SharedState>, limit: Option<usize>) -> CmdResult<RaidLogDto> {
+    let (base, repos, focused) = {
+        let guard = state.lock().unwrap();
+        let focused = member(&guard, None).ok().map(|m| (m.project.config.name.clone(), m.project.config.id, m.project.root.clone()));
+        (guard.base_dir.clone(), workspace_repos(&guard), focused)
+    };
+    let Some((name, id, root)) = knowledge_base_of(&repos, focused.as_ref().map(|f| f.1)).or(focused) else {
+        return Ok(RaidLogDto { project_id: None, name: None, entries: Vec::new() });
+    };
+    let db = Db::open_read_only(&base, id).map_err(err)?;
+    let others: Vec<(String, PathBuf)> = repos.into_iter().filter(|r| r.1 != id).map(|(n, _, r)| (n, r)).collect();
+    let offset = i64::from(chrono::Local::now().offset().local_minus_utc());
+    let entries = ken_core::raidlog::raid_log(&db, &root, &others, offset, limit.unwrap_or(RAID_LOG_LIMIT)).map_err(err)?;
+    Ok(RaidLogDto { project_id: Some(id.to_string()), name: Some(name), entries })
+}
+
 /// A code file's structure for the Files panel: its definitions in order
 /// (with nesting depth) and the files it imports and is imported by.
 #[derive(Serialize)]
@@ -8106,724 +8098,6 @@ async fn code_usages(state: State<'_, SharedState>, name: String) -> CmdResult<C
     .map_err(|e| e.to_string())?
 }
 
-/// Rebuild the knowledge model now, by hand. Progress arrives as
-/// `knowledge-model-state` events: building → ready | error {detail}.
-/// Unlike the automatic build this ignores every threshold — "rebuild it
-/// now" is exactly what it says.
-#[tauri::command(async)]
-fn refresh_knowledge_model(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        return Err(ken_core::runner::MISSING_CLAUDE_HELP.into());
-    };
-    let job = KnowledgeBuild {
-        base: guard.base_dir.clone(),
-        project: active.project.clone(),
-        binary,
-        running: active.knowledge_running.clone(),
-        tracker: active.auto_knowledge.clone(),
-        quiet_failure: false,
-        state: state.inner().clone(),
-    };
-    drop(guard);
-
-    if !start_knowledge_build(&app, job) {
-        return Err("Ken is already mapping this project — give it a moment.".into());
-    }
-    Ok(())
-}
-
-struct KnowledgeBuild {
-    base: PathBuf,
-    project: Project,
-    binary: PathBuf,
-    running: Arc<AtomicBool>,
-    tracker: Arc<AutoBuildTracker>,
-    /// Automatic builds report failure as `idle`, not `error`.
-    quiet_failure: bool,
-    /// federated-kg task 2.1: needed only to re-check `federatedKg`/
-    /// `workspace` after this build finishes, to decide whether to schedule
-    /// the debounced workspace-KG auto-trigger (checked fresh here rather
-    /// than cached, since either flag could change while this build ran).
-    state: SharedState,
-}
-
-/// Start one build thread, or report that one is already in flight. The
-/// `knowledge_running` flag is the single guard both entry points share,
-/// so a manual refresh and the tick can never run two Claude sessions
-/// over the same corpus.
-fn start_knowledge_build(app: &AppHandle, job: KnowledgeBuild) -> bool {
-    if job.running.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    // The changes indexed so far are this build's input; anything landing
-    // while it reads must survive into the next rebuild.
-    job.tracker.build_started(Instant::now());
-
-    let project_id = job.project.config.id;
-    emit_member(app, project_id, "knowledge-model-state", KnowledgeModelState {
-        state: "building".into(),
-        detail: None,
-    });
-    let thread_app = app.clone();
-    std::thread::spawn(move || {
-        let today = local_date_today();
-        let result = Db::open(&job.base, project_id)
-            .map_err(|e| e.to_string())
-            .and_then(|mut db| {
-                knowledge_model::build_knowledge_model(
-                    &job.binary,
-                    &job.project,
-                    &mut db,
-                    &today,
-                    &CancelToken::new(),
-                )
-                .map_err(|e| e.to_string())
-            });
-        let event = match result {
-            Ok(counts) => KnowledgeModelState {
-                state: "ready".into(),
-                detail: Some(format!(
-                    "{} entities, {} events",
-                    counts.entities, counts.events
-                )),
-            },
-            Err(_) if job.quiet_failure => KnowledgeModelState {
-                state: "idle".into(),
-                detail: None,
-            },
-            Err(detail) => KnowledgeModelState {
-                state: "error".into(),
-                detail: Some(detail),
-            },
-        };
-        // federated-kg task 2.1 / spec "member knowledge-model completion in
-        // workspace mode SHALL trigger a debounced (30s) build": snapshot
-        // BEFORE `event` moves into `emit_member` below.
-        let succeeded = event.state == "ready";
-        emit_member(&thread_app, project_id, "knowledge-model-state", event);
-        // Stamp the attempt BEFORE clearing the guard: a later manual rebuild
-        // must never see "not running" together with a stale attempt clock, or
-        // a failing build could restart immediately.
-        job.tracker.build_finished(Instant::now());
-        job.running.store(false, Ordering::SeqCst);
-        if succeeded {
-            let trigger = {
-                let guard = job.state.lock().unwrap();
-                federated_kg_enabled(&guard.app_settings)
-            };
-            if trigger {
-                schedule_workspace_kg_debounce(&thread_app, &job.state);
-            }
-        }
-    });
-    true
-}
-
-// ===========================================================================
-// federated-kg (openspec/changes/federated-kg) task 2.1-2.2: workspace-KG
-// build orchestration and read commands. `federatedKg` gating (task 2.3)
-// lives in `federated_kg_enabled` above; every entry point below checks it
-// before touching `kg.sqlite`.
-// ===========================================================================
-
-/// Production `FederationLlm` (federated-kg task 2.1): wraps
-/// `local_llm::generate_stream` at Background priority — the same call
-/// `scan_and_profile`'s refinement pass and `extraction_worker`'s `generate`
-/// closure make, just behind the trait `federation.rs` defines instead of a
-/// closure (federation's merge/adjudication/linking passes need a `&self`
-/// value they can hold across the whole build, not a one-shot closure). A
-/// thin unit struct: `complete` carries no state of its own.
-/// The workspace graph's model: summaries (one call per merged entity) on
-/// the local model; the two batched judgements, which concepts are the same
-/// and how they relate, on Claude when it is installed. The local 4B model
-/// said "same" to most near-miss pairs on a real workspace ("DMA" and "DMA
-/// Analysis", a tool and the agent that uses it).
-struct AppFederationLlm {
-    local: bool,
-    claude: Option<PathBuf>,
-    root: PathBuf,
-}
-
-impl ken_core::federation::FederationLlm for AppFederationLlm {
-    fn complete(&self, prompt: &str) -> ken_core::Result<String> {
-        if !self.local {
-            // No local model: the build falls back to the longest summary.
-            return Err(ken_core::Error::Other("no local model".into()));
-        }
-        let mut sink = |_: &str| true;
-        ken_core::local_llm::generate_stream(prompt, ken_core::local_llm::Priority::Background, &mut sink)
-    }
-
-    fn judge(&self, prompt: &str) -> ken_core::Result<String> {
-        let Some(binary) = &self.claude else {
-            return self.complete(prompt);
-        };
-        match ken_core::assistant::oneshot(binary, &self.root, prompt, Duration::from_secs(300), &CancelToken::new())? {
-            ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
-            other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
-        }
-    }
-}
-
-/// Payload for the `workspace-kg-state` event (federated-kg task 2.1),
-/// mirroring `SemanticIndexStateEvent`'s tag shape:
-/// `{"state":"building","done":0,"total":3}`, `{"state":"ready",...counts}`,
-/// `{"state":"unavailable","reason":"..."}`. Emitted with plain `app.emit`
-/// (not `emit_member`) since a workspace-KG build spans every open member
-/// at once — it has no single owning `project_id` to scope the event to.
-///
-/// Deviation (see final report): `build_workspace_kg` (ken-core) runs its
-/// per-member snapshot phase synchronously with no progress callback, so
-/// this command layer can only observe "started" and "finished" — `Building`
-/// is emitted once up front with `done: 0`, not ticked per member as the
-/// build actually progresses. `total` is still real per-member information
-/// (the member count), which is what task 2.1 asks this event to carry.
-#[derive(Clone, Serialize)]
-#[serde(tag = "state", rename_all = "camelCase")]
-enum WorkspaceKgStateEvent {
-    Building { done: usize, total: usize },
-    Ready {
-        global_entities: usize,
-        entity_links: usize,
-        imported_edges: usize,
-        cooccur_edges: usize,
-        llm_edges: usize,
-        llm_passes: bool,
-    },
-    Unavailable { reason: String },
-}
-
-/// How long a burst of member knowledge-model completions is allowed to
-/// settle before the workspace-KG auto-trigger actually fires (spec:
-/// "debounced (30 s)").
-const WORKSPACE_KG_DEBOUNCE: Duration = Duration::from_secs(30);
-
-/// Schedule the debounced workspace-KG auto-trigger (federated-kg task 2.1).
-/// Bumps `AppState::workspace_kg_debounce_gen` and spawns a timer thread that
-/// sleeps out the window before checking whether it's still the most recent
-/// request — mirrors `AppState::qa_gen`'s "a newer request invalidates the
-/// older one" pattern. A burst of member completions inside the window
-/// therefore collapses into exactly one build, fired 30s after the LAST
-/// completion (true debounce, not a fixed-interval throttle).
-fn schedule_workspace_kg_debounce(app: &AppHandle, state: &SharedState) {
-    let gen_counter = state.lock().unwrap().workspace_kg_debounce_gen.clone();
-    let my_gen = gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
-    let bg_app = app.clone();
-    let bg_state = state.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(WORKSPACE_KG_DEBOUNCE);
-        if gen_counter.load(Ordering::SeqCst) != my_gen {
-            return; // superseded by a later completion's own timer
-        }
-        start_workspace_kg_build(&bg_app, &bg_state);
-    });
-}
-
-/// Start one workspace-KG build, or report that one is already in flight
-/// (federated-kg task 2.1). Shared by `rebuild_workspace_kg` (manual) and
-/// `schedule_workspace_kg_debounce`'s timer so the two entry points can
-/// never stack two builds — mirrors `start_knowledge_build`'s single
-/// `AtomicBool` guard, and `apply_semantic_index_flag`'s replace-and-cancel
-/// `CancelToken` slot, at the workspace scope. Re-checks `federatedKg`
-/// itself (not just at the call site) so a debounce timer that fires after
-/// the flag was turned off mid-window is a no-op, per task 2.3's "no
-/// auto-trigger" when off.
-///
-/// Deviation (see final report): no `workspace.rs`/manifest exists yet to
-/// enumerate a workspace's members (proposal.md assumes one), so "members"
-/// here is simply every project currently open in `AppState::members` — a
-/// member that isn't open this session is invisible to the build until it
-/// is. Each member is read through its own fresh `Db::open_read_only`
-/// handle, the same way `ken-mcp` reads a project — never the live
-/// `MemberRuntime::db`/`search_db` handles — so a slow build never contends
-/// a member's own write connection or requires holding the global lock
-/// across it.
-/// Where the merged graph lives: beside the open workspace's manifest
-/// (`<workspace>/.ken-workspace/kg.sqlite`, design D1), so each workspace has
-/// its own graph instead of all of them rewriting one file; app data only
-/// when no workspace is open.
-fn workspace_kg_root(guard: &AppState) -> std::path::PathBuf {
-    guard
-        .workspace
-        .as_ref()
-        .map(|w| w.ws.root.clone())
-        .unwrap_or_else(|| guard.base_dir.clone())
-}
-
-/// The project ids of a team (a manifest group, set at set-up or derived
-/// from a group folder), for a team's view of the merged graph. None when
-/// no team is asked for, or the name is not a group here.
-fn team_project_ids(guard: &AppState, team: Option<&str>) -> Option<std::collections::HashSet<String>> {
-    let team = team.filter(|t| !t.is_empty())?;
-    let ws = guard.workspace.as_ref()?;
-    let names = ws.ws.config.effective_group_members(team);
-    Some(
-        ws.ws
-            .members
-            .iter()
-            .filter(|m| names.contains(&m.name))
-            .filter_map(|m| match &m.status {
-                ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id.to_string()),
-                _ => None,
-            })
-            .collect(),
-    )
-}
-
-/// The members the merged graph is built over: every member the workspace
-/// manifest lists that has an index on disk and is read for entities (a
-/// team or wiki repo, or one whose kind is not said yet), whether or not it
-/// is open this session. With no workspace, the open members.
-fn workspace_kg_members(guard: &AppState) -> Vec<uuid::Uuid> {
-    let pseudo_id = memory_pseudo_member_id(guard);
-    let listed: Vec<(uuid::Uuid, std::path::PathBuf)> = match guard.workspace.as_ref() {
-        Some(w) => w
-            .ws
-            .members
-            .iter()
-            .filter_map(|m| match &m.status {
-                ken_core::workspace::MemberStatus::Ok(p) => Some((p.config.id, p.root.clone())),
-                _ => None,
-            })
-            .collect(),
-        None => guard.members.values().map(|m| (m.project.config.id, m.project.root.clone())).collect(),
-    };
-    listed
-        .into_iter()
-        // ken-memory task 2.1 (D3): the pseudo-member's memories never join
-        // the workspace-wide KG.
-        .filter(|(id, _)| Some(*id) != pseudo_id)
-        .filter(|(id, _)| db_path(&guard.base_dir, *id).exists())
-        .filter(|(_, root)| {
-            let (kind, index) = ken_core::registry::index_of(root);
-            index.unwrap_or_else(|| ken_core::registry::IndexState::for_kind(&kind))
-                == ken_core::registry::IndexState::Entities
-        })
-        .map(|(id, _)| id)
-        .collect()
-}
-
-/// Every team's roster in the workspace: the `people/` files of each member
-/// the manifest lists, or of the open members with no workspace. The graph
-/// merges the names and addresses a roster gives one person into them.
-fn workspace_roster(guard: &AppState) -> Vec<ken_core::people::Person> {
-    let roots: Vec<std::path::PathBuf> = match guard.workspace.as_ref() {
-        Some(w) => w
-            .ws
-            .members
-            .iter()
-            .filter_map(|m| match &m.status {
-                ken_core::workspace::MemberStatus::Ok(p) => Some(p.root.clone()),
-                _ => None,
-            })
-            .collect(),
-        None => guard.members.values().map(|m| m.project.root.clone()).collect(),
-    };
-    ken_core::people::roster_of(roots.iter().map(|r| r.as_path()))
-}
-
-fn start_workspace_kg_build(app: &AppHandle, state: &SharedState) -> bool {
-    let (base_dir, kg_root, running, cancel_slot, mut member_ids, enabled, roster) = {
-        let guard = state.lock().unwrap();
-        (
-            guard.base_dir.clone(),
-            workspace_kg_root(&guard),
-            guard.workspace_kg_running.clone(),
-            guard.workspace_kg_cancel.clone(),
-            workspace_kg_members(&guard),
-            federated_kg_enabled(&guard.app_settings),
-            workspace_roster(&guard),
-        )
-    };
-    if !enabled || running.swap(true, Ordering::SeqCst) {
-        return false;
-    }
-    // Deterministic member order (design D3 / spec "delete and rebuild"
-    // determinism) — `HashMap` iteration order isn't, so sort explicitly.
-    member_ids.sort();
-
-    let token = CancelToken::new();
-    if let Some(old) = cancel_slot.lock().unwrap().replace(token.clone()) {
-        old.cancel();
-    }
-
-    let _ = app.emit(
-        "workspace-kg-state",
-        WorkspaceKgStateEvent::Building { done: 0, total: member_ids.len() },
-    );
-
-    let thread_app = app.clone();
-    std::thread::spawn(move || {
-        let now = engine::now_epoch();
-        let llm_ready = matches!(
-            ken_core::local_llm::llm_status(),
-            ken_core::local_llm::LlmStatus::Ready
-        );
-        let federation_llm = AppFederationLlm {
-            local: LOCAL_GENERATION && llm_ready,
-            claude: ken_core::runner::discover_claude(),
-            root: kg_root.clone(),
-        };
-        let llm_ready = llm_ready || federation_llm.claude.is_some();
-        let build = (|| -> ken_core::Result<ken_core::federation::BuildReport> {
-            let mut kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&kg_root)?;
-            let dbs = member_ids
-                .iter()
-                .map(|id| Db::open_read_only(&base_dir, *id).map(|db| (*id, db)))
-                .collect::<ken_core::Result<Vec<(uuid::Uuid, Db)>>>()?;
-            let members: Vec<ken_core::federation::Member> = dbs
-                .iter()
-                .map(|(id, db)| ken_core::federation::Member { project_id: *id, db })
-                .collect();
-            let llm: Option<&dyn ken_core::federation::FederationLlm> =
-                if llm_ready { Some(&federation_llm) } else { None };
-            ken_core::federation::build_workspace_kg(&mut kg, &members, &roster, llm, now, &token)
-        })();
-
-        let event = match build {
-            Ok(report) if report.cancelled => WorkspaceKgStateEvent::Unavailable {
-                reason: "workspace-KG build cancelled".into(),
-            },
-            Ok(report) => WorkspaceKgStateEvent::Ready {
-                global_entities: report.global_entities,
-                entity_links: report.entity_links,
-                imported_edges: report.imported_edges,
-                cooccur_edges: report.cooccur_edges,
-                llm_edges: report.llm_edges,
-                llm_passes: report.llm_passes,
-            },
-            Err(e) => WorkspaceKgStateEvent::Unavailable { reason: e.to_string() },
-        };
-        let _ = thread_app.emit("workspace-kg-state", event);
-        cancel_slot.lock().unwrap().take();
-        running.store(false, Ordering::SeqCst);
-    });
-    true
-}
-
-/// Manually rebuild the workspace knowledge graph now (federated-kg task
-/// 2.1). Mirrors `refresh_knowledge_model`: returns as soon as the build
-/// thread is spawned; progress and outcome arrive via `workspace-kg-state`
-/// events (`building` → `ready` | `unavailable`).
-#[tauri::command(async)]
-fn rebuild_workspace_kg(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
-    let enabled = {
-        let guard = state.lock().unwrap();
-        federated_kg_enabled(&guard.app_settings)
-    };
-    if !enabled {
-        return Err("federatedKg flag is off".into());
-    }
-    if !start_workspace_kg_build(&app, state.inner()) {
-        return Err("a workspace-KG build is already running — give it a moment.".into());
-    }
-    Ok(())
-}
-
-/// One member's staleness in `workspace_kg_overview` (federated-kg task 2.2).
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceKgMemberStatusDto {
-    project_id: String,
-    name: String,
-    /// This member's current `knowledge_model_built_at` watermark (`null` =
-    /// no knowledge model built yet).
-    current_watermark: Option<i64>,
-    /// True when the workspace-KG's cached snapshot for this member is
-    /// missing or behind `current_watermark` — i.e. the next build will
-    /// re-read it (spec: "unchanged members are skipped").
-    stale: bool,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceKgOverviewDto {
-    /// `null` before the first build ever completes.
-    built_at: Option<i64>,
-    llm_passes: bool,
-    global_entities: usize,
-    entity_links: usize,
-    edges: usize,
-    /// Only currently-open members (task 2.1/2.2 deviation — no workspace
-    /// manifest to enumerate members that aren't open; see final report).
-    members: Vec<WorkspaceKgMemberStatusDto>,
-}
-
-/// Workspace-KG summary: counts + per-member staleness (federated-kg task
-/// 2.2). Flag-gated (task 2.3) — off returns an error before `kg.sqlite` is
-/// even opened, so a read alone can never create it.
-/// With `team`, the team's graph: a view of the merged one (never a
-/// second build) keeping entities linked into the team's repos, their links
-/// into those repos, the edges between them, and the team's members.
-#[tauri::command(async)]
-fn workspace_kg_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<WorkspaceKgOverviewDto> {
-    let guard = state.lock().unwrap();
-    if !federated_kg_enabled(&guard.app_settings) {
-        return Err("federatedKg flag is off".into());
-    }
-    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
-    let built_at = kg
-        .get_meta("workspace_kg_built_at")
-        .map_err(err)?
-        .and_then(|s| s.parse::<i64>().ok());
-    let llm_passes = kg.get_meta("llm_passes").map_err(err)?.as_deref() == Some("true");
-    let team_ids = team_project_ids(&guard, team.as_deref());
-    let in_team = |p: &str| team_ids.as_ref().is_none_or(|ids| ids.contains(p));
-    let mut kept: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut entity_links = 0usize;
-    for e in kg.list_global_entities().map_err(err)? {
-        let links = kg.list_links_for_global(e.id).map_err(err)?;
-        let team_links = links.iter().filter(|l| in_team(&l.project_id)).count();
-        if team_links > 0 || (team_ids.is_none() && links.is_empty()) {
-            kept.insert(e.id);
-            entity_links += team_links;
-        }
-    }
-    let edges = kg
-        .list_all_edges()
-        .map_err(err)?
-        .iter()
-        .filter(|g| kept.contains(&g.src_global_id) && kept.contains(&g.dst_global_id))
-        .count();
-
-    let pseudo_id = memory_pseudo_member_id(&guard);
-    let mut members = Vec::with_capacity(guard.members.len());
-    for m in guard.members.values() {
-        let project_id = m.project.config.id;
-        if Some(project_id) == pseudo_id {
-            continue; // ken-memory task 2.1 (D3): never federated
-        }
-        if !in_team(&project_id.to_string()) {
-            continue;
-        }
-        let current_watermark = m.db.knowledge_model_built_at().map_err(err)?;
-        let cached = kg.get_watermark(project_id).map_err(err)?;
-        let stale = cached != Some(current_watermark);
-        members.push(WorkspaceKgMemberStatusDto {
-            project_id: project_id.to_string(),
-            name: m.project.config.name.clone(),
-            current_watermark,
-            stale,
-        });
-    }
-    members.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(WorkspaceKgOverviewDto {
-        built_at,
-        llm_passes,
-        global_entities: kept.len(),
-        entity_links,
-        edges,
-        members,
-    })
-}
-
-/// One edge in a `workspace_kg_entity` wiki page — either an out-link (this
-/// entity is `src`) or a back-link (this entity is `dst`); `other_id`/
-/// `other_name` always name the OTHER endpoint (design D4: back-links are
-/// `global_edges` queried in the reverse direction, not a separate table).
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceKgEdgeDto {
-    id: i64,
-    other_id: i64,
-    other_name: String,
-    relation: String,
-    weight: f64,
-    /// `"imported"` | `"cooccur"` | `"llm"`.
-    provenance: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceKgPointerDto {
-    project_id: String,
-    rel_path: String,
-    snippet: String,
-    /// `ken://<project-id>/<rel-path>` (design D4 addressing).
-    uri: String,
-    /// True if this pointer's file is confirmed missing on disk. Only
-    /// checkable for a currently-open member (task 2.2 deviation — no
-    /// workspace manifest to resolve a closed member's root); a pointer
-    /// into a member that isn't open is never flagged stale by this field
-    /// alone (spec: "or is marked stale if the file no longer exists —
-    /// never a crash" — never crashing is satisfied unconditionally; the
-    /// staleness *signal* is best-effort until member enumeration lands).
-    stale: bool,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceKgEntityDto {
-    id: i64,
-    kind: String,
-    name: String,
-    summary: String,
-    updated_at: i64,
-    /// `kg://<id>` (design D4 addressing).
-    uri: String,
-    out_links: Vec<WorkspaceKgEdgeDto>,
-    back_links: Vec<WorkspaceKgEdgeDto>,
-    pointers: Vec<WorkspaceKgPointerDto>,
-}
-
-/// The full wiki-page payload for one global entity in a single call
-/// (federated-kg task 2.2 / spec "Every global entity is a wiki page" +
-/// design D4: "the frontend never joins") — summary, both edge directions,
-/// and per-project doc pointers. Flag-gated (task 2.3).
-#[tauri::command(async)]
-fn workspace_kg_entity(state: State<SharedState>, id: i64) -> CmdResult<WorkspaceKgEntityDto> {
-    let guard = state.lock().unwrap();
-    if !federated_kg_enabled(&guard.app_settings) {
-        return Err("federatedKg flag is off".into());
-    }
-    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
-    let entity = kg
-        .get_global_entity(id)
-        .map_err(err)?
-        .ok_or_else(|| format!("no global entity {id}"))?;
-
-    let name_of = |kg: &ken_core::workspace_kg_db::WorkspaceKgDb, gid: i64| -> CmdResult<String> {
-        Ok(kg.get_global_entity(gid).map_err(err)?.map(|e| e.name).unwrap_or_default())
-    };
-    let out_links = kg
-        .list_edges_from(id)
-        .map_err(err)?
-        .into_iter()
-        .map(|e| {
-            Ok(WorkspaceKgEdgeDto {
-                id: e.id,
-                other_id: e.dst_global_id,
-                other_name: name_of(&kg, e.dst_global_id)?,
-                relation: e.relation,
-                weight: e.weight,
-                provenance: e.provenance,
-            })
-        })
-        .collect::<CmdResult<Vec<_>>>()?;
-    let back_links = kg
-        .list_edges_to(id)
-        .map_err(err)?
-        .into_iter()
-        .map(|e| {
-            Ok(WorkspaceKgEdgeDto {
-                id: e.id,
-                other_id: e.src_global_id,
-                other_name: name_of(&kg, e.src_global_id)?,
-                relation: e.relation,
-                weight: e.weight,
-                provenance: e.provenance,
-            })
-        })
-        .collect::<CmdResult<Vec<_>>>()?;
-
-    let pointers = kg
-        .list_pointers_for_global(id)
-        .map_err(err)?
-        .into_iter()
-        .map(|p| {
-            let stale = uuid::Uuid::parse_str(&p.project_id)
-                .ok()
-                .and_then(|pid| guard.members.get(&pid))
-                .map(|m| !m.project.root.join(&p.rel_path).exists())
-                .unwrap_or(false);
-            WorkspaceKgPointerDto {
-                uri: format!("ken://{}/{}", p.project_id, p.rel_path),
-                project_id: p.project_id,
-                rel_path: p.rel_path,
-                snippet: p.snippet,
-                stale,
-            }
-        })
-        .collect();
-
-    Ok(WorkspaceKgEntityDto {
-        uri: format!("kg://{}", entity.id),
-        id: entity.id,
-        kind: entity.kind,
-        name: entity.name,
-        summary: entity.summary,
-        updated_at: entity.updated_at,
-        out_links,
-        back_links,
-        pointers,
-    })
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WorkspaceKgSearchHitDto {
-    id: i64,
-    kind: String,
-    name: String,
-    summary: String,
-    uri: String,
-}
-
-/// Cap on returned hits. No pagination — design's own scale bound (≤~3k
-/// entities even beyond ~15 members) makes a hard cap enough.
-const WORKSPACE_KG_SEARCH_LIMIT: usize = 50;
-
-/// Search global entity names + summaries (federated-kg task 2.2).
-///
-/// Deviation (see final report): `kg.sqlite`'s schema
-/// (`workspace_kg_db.rs`, out of this task's touch scope) has no FTS table
-/// — only plain `global_entities` rows — so this is a case-insensitive
-/// substring match over `list_global_entities()` done in Rust, the honest
-/// floor the proposal's "FTS over global entity names + summaries" degrades
-/// to until a schema migration adds one. Fine at workspace scale. Flag-gated
-/// (task 2.3).
-#[tauri::command(async)]
-fn workspace_kg_search(
-    state: State<SharedState>,
-    query: String,
-    team: Option<String>,
-) -> CmdResult<Vec<WorkspaceKgSearchHitDto>> {
-    let guard = state.lock().unwrap();
-    if !federated_kg_enabled(&guard.app_settings) {
-        return Err("federatedKg flag is off".into());
-    }
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Ok(Vec::new());
-    }
-    let kg = ken_core::workspace_kg_db::WorkspaceKgDb::open(&workspace_kg_root(&guard)).map_err(err)?;
-    // A team's view: only entities with a link into one of its repos.
-    let team_ids = team_project_ids(&guard, team.as_deref());
-    let in_team = |id: i64| -> bool {
-        team_ids.as_ref().is_none_or(|ids| {
-            kg.list_links_for_global(id).map(|ls| ls.iter().any(|l| ids.contains(&l.project_id))).unwrap_or(false)
-        })
-    };
-    let mut hits: Vec<WorkspaceKgSearchHitDto> = kg
-        .list_global_entities()
-        .map_err(err)?
-        .into_iter()
-        .filter(|e| e.name.to_lowercase().contains(&q) || e.summary.to_lowercase().contains(&q))
-        .filter(|e| in_team(e.id))
-        .map(|e| WorkspaceKgSearchHitDto {
-            uri: format!("kg://{}", e.id),
-            id: e.id,
-            kind: e.kind,
-            name: e.name,
-            summary: e.summary,
-        })
-        .collect();
-    // Name matches rank above summary-only matches; stable by id within
-    // each tier for a deterministic result order.
-    hits.sort_by(|a, b| {
-        let a_name = a.name.to_lowercase().contains(&q);
-        let b_name = b.name.to_lowercase().contains(&q);
-        b_name.cmp(&a_name).then(a.id.cmp(&b.id))
-    });
-    hits.truncate(WORKSPACE_KG_SEARCH_LIMIT);
-    Ok(hits)
-}
-
-/// `route_search`'s plan: the sources searched (stringified ids), why, and
-/// the reference repos held back.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RoutePlanDto {
@@ -9528,8 +8802,7 @@ struct TeamRepo {
 }
 
 /// The repos of `team` (a manifest group, by name), or every member when
-/// no team is given. Same membership `team_overview` and `team_project_ids`
-/// use.
+/// no team is given. Same membership `team_overview` uses.
 fn team_repos(ws: &ken_core::workspace::Workspace, team: Option<&str>) -> Vec<TeamRepo> {
     let names: Option<Vec<String>> = team.filter(|t| !t.is_empty()).map(|t| ws.config.effective_group_members(t));
     ws.members
@@ -11123,33 +10396,19 @@ fn workspace_members_overview(state: State<SharedState>) -> CmdResult<Vec<Member
         .collect())
 }
 
-/// The incremental-Map worker: one per open project. Loops draining the
-/// extraction queue while the local model is ready, emitting a throttled
-/// `knowledge-updated` after each merged file. Every wait is short so a newly
-/// indexed file is picked up promptly; the model's own queue (background
-/// priority) yields to interactive quick answers upstream, and the worker also
-/// steps aside between files while a quick answer is in flight. When the local
-/// model isn't ready — no model installed, a load error — the worker idles
-/// quietly (polling with a sleep), never erroring rows and never spinning CPU.
-/// Minimum gap between two background extraction generations, counted ACROSS
-/// EVERY OPEN PROJECT rather than per worker.
+/// Minimum gap between two background Claude calls, counted ACROSS EVERY
+/// OPEN PROJECT rather than per worker.
 ///
-/// It has to be global, and that is the whole point. Local inference is a
-/// single worker thread behind a shared two-priority queue (`local_llm`), so
-/// N extraction workers never run N generations at once — they queue on the
-/// one engine. A per-worker `sleep` therefore does not bound GPU duty cycle at
-/// all: with ten projects open, ten independent gaps overlap and the queue is
-/// never empty, which is exactly the state measured on 2026-09-03 when an
-/// unpaced backlog held the A4000 at 94% / 114 W / 75 °C indefinitely. One
-/// shared "not before" instant bounds the aggregate rate no matter how many
-/// projects are open.
-///
-/// Two seconds against a background generation of roughly the same order
-/// leaves the card idle about half the time. Raise it to be gentler; the
+/// It has to be global. It was made for the local model's background reader
+/// (gone with knowledge-core decision 21), whose per-worker sleeps overlapped
+/// across ten open projects and held the graphics card at 94% on 2026-09-03.
+/// The same holds for the Claude calls that replaced it: one shared "not
+/// before" instant bounds the aggregate rate however many projects are open.
+/// The hourly cap (`summary::take_call`) bounds it again, and the
 /// `backgroundExtraction` flag turns the work off outright.
 const EXTRACT_PACING: Duration = Duration::from_secs(2);
 
-/// The shared "not before" instant every extraction worker paces against.
+/// The shared "not before" instant every background worker paces against.
 fn extraction_gate() -> &'static Mutex<Instant> {
     static GATE: OnceLock<Mutex<Instant>> = OnceLock::new();
     GATE.get_or_init(|| Mutex::new(Instant::now()))
@@ -11180,53 +10439,7 @@ fn stamp_extraction_slot() {
     *extraction_gate().lock().unwrap() = Instant::now() + EXTRACT_PACING;
 }
 
-/// How often the extraction worker asks whether a map build is due.
-const MAP_CHECK: Duration = Duration::from_secs(15);
-
-/// Build the project's map with Claude when the automatic-build policy says
-/// it is due: Claude Code installed, background extraction on, something to
-/// map, and either no map yet or changes since the last one, settled (see
-/// `knowledge_model::should_auto_build`). True while a Claude build of this
-/// project runs, started here or by hand, so the caller holds off.
-fn map_by_claude(app: &AppHandle, state: &SharedState, project_id: uuid::Uuid) -> bool {
-    let (base, project, running, tracker) = {
-        let guard = lock_tolerant(state);
-        let Some(active) = guard.members.get(&project_id) else {
-            return false;
-        };
-        if active.knowledge_running.load(Ordering::SeqCst) {
-            return true;
-        }
-        if !ken_core::features::effective_flag(&guard.app_settings, &active.project, "backgroundExtraction") {
-            return false;
-        }
-        (guard.base_dir.clone(), active.project.clone(), active.knowledge_running.clone(), active.auto_knowledge.clone())
-    };
-    // Looking for Claude reads the disk: with the lock released, since this
-    // runs every few seconds for every repo.
-    let Some(binary) = ken_core::runner::discover_claude() else {
-        return false;
-    };
-    let job = KnowledgeBuild { base, project, binary, running, tracker, quiet_failure: true, state: state.clone() };
-    let Ok(db) = Db::open_read_only(&job.base, project_id) else {
-        return false;
-    };
-    let never_built = db.knowledge_model_built_at().ok().flatten().is_none();
-    let (_, total) = db.extraction_coverage().unwrap_or((0, 0));
-    drop(db);
-    let ctx = knowledge_model::AutoBuildContext {
-        claude_available: true,
-        in_flight: false,
-        indexed_files: usize::try_from(total).unwrap_or(0),
-        never_built,
-    };
-    if !job.tracker.should_build(ctx, Instant::now()) {
-        return false;
-    }
-    start_knowledge_build(app, job)
-}
-
-/// How often the extraction worker asks whether chunks wait for a summary.
+/// How often the background worker asks whether chunks wait for a summary.
 const SUMMARY_CHECK: Duration = Duration::from_secs(30);
 /// How long the worker leaves summaries alone after a Claude call failed.
 const SUMMARY_BACKOFF: Duration = Duration::from_secs(600);
@@ -11306,24 +10519,15 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
     }
 }
 
-fn extraction_worker(
-    app: AppHandle,
-    state: SharedState,
-    project_id: uuid::Uuid,
-    stop: Arc<AtomicBool>,
-) {
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
-    let mut pending_emit = false;
-    // The worker's own connection, opened once and reused for its whole life
-    // (opening runs pragmas + a migration probe — needless work per file).
-    // Dropped with the function when the project switches/closes.
-    let mut db: Option<Db> = None;
-    // Tracks the model's not-ready → ready edge so we retry files that errored
-    // while the model was faulty (e.g. a bad load, or the batch-overflow bug)
-    // exactly once per recovery — no content edit required.
-    let mut was_ready = false;
-    let mut requeue_on_next_open = false;
-    let mut last_map_check = Instant::now() - MAP_CHECK;
+/// The background worker: one per open project. It takes the project's
+/// background Claude turns in order: one batch of one-line summaries for
+/// search (knowledge-core decision 16), then a knowledge base's checks
+/// (drift, lint, the supersession pass, topic tags and the graph's commits,
+/// decisions 21 and 25 to 30). Every call is on the shared pace
+/// (`EXTRACT_PACING`), the hourly cap and the `backgroundExtraction` switch.
+/// The local model is never used: its background reader is gone (decision
+/// 21).
+fn background_worker(state: SharedState, project_id: uuid::Uuid, stop: Arc<AtomicBool>) {
     let mut last_summary_check = Instant::now() - SUMMARY_CHECK;
     let mut summaries_after = Instant::now();
     // The first look at the checks a minute after the project opens, once
@@ -11332,17 +10536,6 @@ fn extraction_worker(
     let mut last_checks = soon(Duration::from_secs(60));
     let mut checks_after = Instant::now();
     while !stop.load(Ordering::SeqCst) {
-        // The map comes from Claude: one read of the whole project for the
-        // first map, and again once changes have settled (the automatic-build
-        // policy: a quiet window, at most two builds an hour). Minutes, where
-        // the local model took hours file by file and failed half of them.
-        if last_map_check.elapsed() >= MAP_CHECK {
-            last_map_check = Instant::now();
-            if map_by_claude(&app, &state, project_id) {
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-        }
         // One-line summaries of the knowledge base's pages, for search
         // (knowledge-core decision 16): one batch per turn, while any wait.
         if last_summary_check.elapsed() >= SUMMARY_CHECK && Instant::now() >= summaries_after {
@@ -11355,9 +10548,9 @@ fn extraction_worker(
                 SummaryTick::Stopped => return,
             }
         }
-        // A knowledge base's drift and lint (knowledge-core decisions 25, 28
-        // to 30): a drift run when one is due, then at most one background
-        // Claude call per turn while any check waits.
+        // A knowledge base's drift, lint and graph (knowledge-core decisions
+        // 21, 25, 28 to 30): a drift run when one is due, then at most one
+        // background Claude call per turn while any check waits.
         if last_checks.elapsed() >= CHECKS_EVERY && Instant::now() >= checks_after {
             last_checks = Instant::now();
             match knowledge_checks(&state, project_id, &stop) {
@@ -11367,144 +10560,7 @@ fn extraction_worker(
                 SummaryTick::Stopped => return,
             }
         }
-        // The local, per-file path: off by policy (LOCAL_GENERATION), kept
-        // for a build that turns it back on. Pause quietly unless it is on
-        // and the local model is ready.
-        let ready = LOCAL_GENERATION
-            && matches!(ken_core::local_llm::llm_status(), ken_core::local_llm::LlmStatus::Ready);
-        if ready && !was_ready {
-            // Just became ready (model installed / selection changed / error
-            // acknowledged): return any errored rows to pending on the next
-            // time we hold the DB connection.
-            requeue_on_next_open = true;
-        }
-        was_ready = ready;
-        if !ready {
-            std::thread::sleep(Duration::from_secs(2));
-            continue;
-        }
-        // Yield to interactive quick answers: while one is queued or running,
-        // step aside briefly rather than occupying the single inference worker
-        // with a background generation.
-        if ken_core::local_llm::interactive_pending() {
-            std::thread::sleep(Duration::from_millis(200));
-            continue;
-        }
-        // Resolve base + project root/profiler-flag under the lock, then drop
-        // it before the (slow) generation so IPC stays responsive.
-        // Look up THIS worker's own project by id.
-        //
-        // This used to read `members.values().next()` — an arbitrary entry of
-        // a HashMap — and `return` unless that entry happened to be this
-        // worker's project. With more than one member open it killed every
-        // worker but the lucky one, and HashMap order is arbitrary (randomized
-        // per process), so which project survived was chance rather than
-        // design. Measured 2026-09-08: nine of ten projects had never
-        // extracted a single file, 25,859 rows stuck at `pending`, while the
-        // tenth held 77 done / 355 error. A worker that knows its own id must
-        // ask for its own id.
-        // The roster comes along so a teammate whose name reads like a bot's
-        // is never dropped from the map.
-        let (base, profiler_enabled, project_root, extraction_on, roster) = {
-            let guard = state.lock().unwrap();
-            let Some(active) = guard.members.get(&project_id) else {
-                return; // project closed — this worker is done
-            };
-            (
-                guard.base_dir.clone(),
-                ken_core::features::effective_flag(&guard.app_settings, &active.project, "profiler"),
-                active.project.root.clone(),
-                ken_core::features::effective_flag(
-                    &guard.app_settings,
-                    &active.project,
-                    "backgroundExtraction",
-                ),
-                workspace_roster(&guard),
-            )
-        };
-        // Switched off: idle but stay alive, so turning it back on resumes
-        // without having to reopen the project.
-        if !extraction_on {
-            std::thread::sleep(Duration::from_secs(2));
-            continue;
-        }
-        if db.is_none() {
-            match Db::open(&base, project_id) {
-                Ok(d) => db = Some(d),
-                Err(_) => {
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue;
-                }
-            }
-        }
-        let db = db.as_mut().expect("opened above");
-        // First tick after the model became ready: rescue errored rows so the
-        // Map recovers files that failed under a transient model fault.
-        if requeue_on_next_open {
-            let _ = db.requeue_errored_extractions();
-            requeue_on_next_open = false;
-        }
-        let today = local_date_today();
-        let at = engine::now_epoch();
-        let generate = |prompt: &str| {
-            ken_core::local_llm::generate_json(prompt, ken_core::local_llm::Priority::Background)
-        };
-        // project-profiler task 2.3: append the stored profile's
-        // summary/focus-hints addendum to the extraction prompt when the
-        // `profiler` flag is on and a profile exists. Empty string when off
-        // or absent, which reproduces `process_next_pending`'s plain prompt
-        // exactly (ken-core task 1.5's flag-off inertness guarantee) — a
-        // fresh, cheap read per file rather than caching, since a profile
-        // can be regenerated ("Re-analyze") while this worker is running.
-        let addendum = if profiler_enabled {
-            ken_core::profiler::profile_prompt_addendum(&ken_core::profiler::ProjectProfile::load(&project_root))
-        } else {
-            String::new()
-        };
-        // Take the shared pace before spending a generation on the one engine.
-        if !wait_for_extraction_slot(&stop) {
-            return;
-        }
-        match knowledge_model::process_next_pending_for(db, &today, at, &generate, &addendum, &roster) {
-            Ok(Some(_)) => {
-                // A generation actually ran: close the slot behind us.
-                stamp_extraction_slot();
-                pending_emit = true;
-                // Throttle: coalesce a burst into at most one event / 750ms.
-                if last_emit.elapsed() >= Duration::from_millis(750) {
-                    let _ = app.emit("knowledge-updated", ());
-                    last_emit = Instant::now();
-                    pending_emit = false;
-                }
-                // Immediately loop for the next pending file.
-            }
-            Ok(None) => {
-                // Queue empty: flush any trailing throttled emit, then idle.
-                if pending_emit {
-                    let _ = app.emit("knowledge-updated", ());
-                    last_emit = Instant::now();
-                    pending_emit = false;
-                }
-                // Self-heal: return errored rows that still have retries left to
-                // `pending` before sleeping, so a file that failed under a
-                // transient fault is retried on the next tick without needing a
-                // model restart. Rows that have exhausted the attempt cap stay
-                // `error` and are NOT re-queued, so this can't spin forever.
-                let _ = db.requeue_errored_extractions();
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            Err(_) => {
-                // A generation failed (already recorded on the row, which is now
-                // `error` and won't be re-popped). Continue the loop past it —
-                // a brief backoff so a bad model state doesn't spin. A failed
-                // generation still burned GPU, so it takes the shared pace too:
-                // the per-worker sleep below only bounds ONE worker, and a
-                // whole workspace erroring in lockstep is exactly the burst
-                // the global gate exists to stop.
-                stamp_extraction_slot();
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -11513,9 +10569,8 @@ fn extraction_worker(
 /// cap bounds the cost of a pathological 500-page scan.
 const MAX_OCR_PAGES: usize = 50;
 
-/// One background OCR worker per open project, mirroring `extraction_worker` but
-/// independent of the local LLM and the knowledge-model coverage accounting. It
-/// drains `ocr_pending`: reads each queued file's bytes, runs the OS's OCR
+/// One background OCR worker per open project, beside the background worker
+/// and independent of it. It drains `ocr_pending`: reads each queued file's bytes, runs the OS's OCR
 /// (`ken_core::ocr`: Vision on macOS, Windows.Media.Ocr on Windows), stores
 /// the recognized regions, merges the text into
 /// `contents` (→ FTS, so search picks it up), and emits a coalesced
@@ -11536,9 +10591,9 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
     while !stop.load(Ordering::SeqCst) {
         // Resolve base + root under the lock, then drop it before the (slow)
         // Vision pass so IPC stays responsive.
-        // Own project by id, not an arbitrary map entry — same defect, and the
-        // same fix, as `extraction_worker` above: picking `values().next()`
-        // and bailing unless it matched meant only one project's OCR ever ran.
+        // Own project by id, not an arbitrary map entry: picking
+        // `values().next()` and bailing unless it matched meant only one
+        // project's OCR ever ran.
         let (base, root) = {
             let guard = state.lock().unwrap();
             let Some(active) = guard.members.get(&project_id) else {
@@ -12499,9 +11554,6 @@ pub fn run() {
         model_downloads: Arc::new(Mutex::new(std::collections::HashSet::new())),
         qa_gen: Arc::new(AtomicU64::new(0)),
         record: Arc::new(Mutex::new(None)),
-        workspace_kg_running: Arc::new(AtomicBool::new(false)),
-        workspace_kg_cancel: Arc::new(Mutex::new(None)),
-        workspace_kg_debounce_gen: Arc::new(AtomicU64::new(0)),
         workspace: None,
         ingest_gate: Arc::new(IngestGate::new(WORKSPACE_INGEST_CONCURRENCY)),
         memory_distill_running: Arc::new(AtomicBool::new(false)),
@@ -12667,6 +11719,8 @@ pub fn run() {
             set_project_index,
             index_health,
             page_links,
+            graph_related,
+            raid_log,
             code_file,
             code_usages,
             run_drift_now,
@@ -12709,12 +11763,6 @@ pub fn run() {
             quick_answer,
             look_for,
             warm_llm,
-            knowledge_model,
-            refresh_knowledge_model,
-            rebuild_workspace_kg,
-            workspace_kg_overview,
-            workspace_kg_entity,
-            workspace_kg_search,
             route_search,
             list_chats,
             chat_transcript,
