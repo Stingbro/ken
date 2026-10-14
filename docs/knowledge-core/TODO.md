@@ -317,6 +317,28 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
     - **The templates link** points at the `knowledge-core` branch; repoint it when the branch merges.
   - Checked: tag balance on every changed page, every relative link and anchor they hold (and every link into the five changed Knowledge pages from elsewhere in `docs/` and `design/`), and both JSON templates parse. Not done: a cold read against `research/PAGE-COLD-READ-RUBRIC.md`, and the artifacts were not republished.
 
+- **Slice 15a: Chris's answers, the ken-core half** (`4ca0b20`, `62e3954`, `951c59f`, `6f85432`, `63c00a3`, `cd9c52c`). Decisions 2, 5, 7, 21, 28, 29, 34, with Chris's answers of 2026-10-14.
+  - `superseded_by`, the seventh key (`4ca0b20`; 5, 7):
+    - `PageMeta.superseded_by` and `HitPage.superseded_by` (`api.ts` `supersededBy`) replace `replaced_by`; an older page's `replaced_by` reads as the same field. The index keeps it in v22's `replaced_by` column, so nothing migrates.
+    - A hit on a retired page names its successor: `doc · superseded · 2026-07-21 · superseded by Design/new.md` (`authority::label_of`, `pagemeta::successor_name` reads a path or a `[[link]]`).
+    - Ken writes it: the ingest plan has `retire` (`Retire`: a page the note makes untrue as a whole, and `by`); `pagemeta::retire` sets `status: superseded` and `superseded_by:` (an older `replaced_by` dropped), and the page is written at once, held for a Rules page or a person's uncommitted work, skipped when the run already edited it or a successor path is not there. A new draft drops the key (`finish_page`).
+    - The template README and the wiki brief say seven keys; the brief's banner is the key now.
+  - The age rule files findings (`62e3954`; 28): a page past `AGE_DAYS` whose code did not really move is an `aged` finding (`drift::file_aged`), never a re-read. Filed once for each `checked:` date, open or done (`findings::ever`), so the weekly run does not file it again; resolved once the page is checked again, re-read or retired. Claude re-reads only pages with a Judgment change; the age branch of `reread_prompt` and the as-it-is-now evidence are gone. The Inbox calls it "Not checked"; the settings screen lists it after drift.
+  - Drift reads `base` (`951c59f`; 28): `drift::branch_for` measures a repo against `repos.<repo>.base` (`knowledge_settings::base`, by the citation's repo name, else the folder's), `origin/<base>` where it was fetched, else the local branch; no base, or one git does not know (said in the run's branch notes), falls back to `default_branch`. `PinCache.branches` keeps the branch measured, so `branch_moved` reads the same one; `head_for` stamps that branch's head. The template's repos note says so.
+  - Topic tags in the writing call (`6f85432`; 21): the ingest plan's JSON gives `topics` for the note (`"page": "note"`, `NOTE_TOPICS`) and each page it updates, creates or retires; the note and the pages written are tagged as they land (`graph::tag_written`), a held page not. The drift re-read ends with a line `{"topics": [...]}` (`drift::split_topics`), stored for the page it stamped or fixed. Both offer the topics in use (`graph::topics_ask`). Removed: `topics_next`, `topics_done`, `TopicCall`, `queue_topics`, `topics_queued`, the `graph_topic_queue` state and the checks worker's tagging turn, so it no longer takes a call from the throttle's hour.
+  - Lint writes `log.md` lines (`63c00a3`; 2, 29): `lint::log_pass` writes `## [date] lint | scan: 2 filed, 1 resolved` (`after an edit`, `weekly`) for a pass that filed something new or resolved something, and commits the log alone through `git::commit_paths`, left out when the log holds a person's work. `on_scan`, `after_edit_done` and `weekly_done` take the root and the date and return what was new. Slice 13's gap ("lint writes no `log.md` line") is closed.
+  - The older ignore files move once (`cd9c52c`; 34): at a source's first scan, `knowledge_settings::move_legacy_ignores` copies its lines of the workspace `.kenignore`, its own `.kenignore` and `project.json`'s `excluded` (as `/folder` lines, last) into its `repos` entry, before the lines already there, marks the entry `ignoreMoved: true`, and makes one commit in the knowledge base naming `.ken/knowledge.json` and listing the lines. Nothing moves for a source with no settings file, or whose file is a code repo's own. The older files are never changed or deleted. After the move they are not read: `Project::index_rules` leaves the `.kenignore` files out, the scan stops applying `excluded` (`Project::legacy_excluded`), and the repo drawer's folder list reads and writes the entry's `/folder` lines (`Project::excluded_folders`, `set_excluded_folders`); the settings screen shows the workspace `.kenignore` only while a source still reads it.
+  - Tests: the seventh key read, written and labelled (`pagemeta`, `authority`, `ingest`'s plan and `a_retired_page_names_its_successor`); `an_aged_page_is_a_finding_filed_once`; `drift_measures_against_the_base_when_set`; topics from the plan and the re-read (`ingest`, `drift`, `graph`, `a_reread_reply_ends_with_its_topics`); the lint lines and their commit (`a_lint_line_is_committed_with_the_log_alone`); `the_older_ignore_files_move_in_once`.
+  - Choices:
+    - A retirement is written at once like a plain fact update (decision 11), not held by the size rule: it changes two frontmatter lines (see Open for Chris).
+    - A page whose code really moved is re-read and gets no `aged` finding; one filed before is resolved by that run.
+    - The scan lint's `log.md` line carries the UTC date: a scan has no local clock in ken-core. The two Claude passes carry the app's local date.
+    - A held ingest edit is not tagged when a person applies it later; its next re-read tags it.
+    - Moved lines go into the source's `repos` entry, so the file's top-level `ignore` lines now come before them, where the older files came before every settings line. Only a top-level line and an older line about the same path in opposite ways would read differently.
+    - A source no knowledge base lists (the workspace memory, a repo outside any workspace) keeps reading its older files: there is nowhere to move them.
+  - The compile check is clean apart from the known warnings. Tests: ken-core 856 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 15 passed; vitest 793 passed in 65 files; `npm run check` 0 errors, the 6 known warnings.
+  - Not run: the app. The first scan of each source with older ignore lines and a knowledge base that lists it makes one commit in the knowledge base. The first weekly drift run files an `aged` finding for each page not checked in 30 days, where before it asked Claude to re-read them.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
@@ -381,15 +403,19 @@ The test suite has been run (2026-10-14) and passes; the app has not been starte
 
 One lane at a time, a compile check, a commit and a push each, as before; the tests touched are re-run at the end.
 
-- [ ] `superseded_by`: the seventh key (decisions 5, 7), written when a page is retired, shown on the hit's label; `replaced_by` still read on older pages.
+- [x] `superseded_by`: the seventh key (decisions 5, 7), written when a page is retired, shown on the hit's label; `replaced_by` still read on older pages.
 - [ ] Repo analysis proposals: an Inbox card holds the proposed role rules and controls; Accept writes them to `.ken/knowledge.json` (one commit), Dismiss drops them.
-- [ ] Age rule: aged pages become findings; only pages whose `sources:` moved are re-read.
+- [x] Age rule: aged pages become findings; only pages whose `sources:` moved are re-read.
 - [ ] Throttle: a person's own ingest skips the hourly budget (still paced between calls).
 - [ ] Inbox: a card closes by itself once nothing waits from it.
-- [ ] Lint: a `log.md` line per pass that filed or resolved something (decision 2).
-- [ ] Drift: `base` read when set, the remote default otherwise.
-- [ ] Topic tags inside the ingest plan and the drift re-read; the tags call removed.
-- [ ] Old ignore files: moved into `.ken/knowledge.json` once, then no longer read.
+- [x] Lint: a `log.md` line per pass that filed or resolved something (decision 2).
+- [x] Drift: `base` read when set, the remote default otherwise.
+- [x] Topic tags inside the ingest plan and the drift re-read; the tags call removed.
+- [x] Old ignore files: moved into `.ken/knowledge.json` once, then no longer read.
 - [ ] Sync: "commit my other changes", listing each file before it commits.
 - [ ] ken-mcp signals a running app after `propose_decision` and `add_source`.
 - [ ] Re-run the tests the slice touched; update DECISIONS.md where an answer changes a decision's wording (2, 5, 7, 12).
+
+### Open for Chris
+
+- **Retiring a page is written at once.** The ingest plan's `retire` writes `status: superseded` and `superseded_by:` without asking, unless the page is a Rules page or holds a person's work (slice 15a). Should every retirement wait for a person instead?
