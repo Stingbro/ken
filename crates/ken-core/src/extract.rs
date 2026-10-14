@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn xlsx_rows_and_sheets() {
-        let out = extract(&fixture("vendor/quotes.xlsx")).unwrap();
+        let out = extract(&fixture("suppliers/quotes.xlsx")).unwrap();
         assert!(out.text.contains("Quotes"), "sheet name: {}", out.text);
         assert!(out.text.contains("LangdonSoft"));
         assert!(out.text.contains("12500"));
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn pdf_text() {
-        let out = extract(&fixture("vendor/contract.pdf")).unwrap();
+        let out = extract(&fixture("suppliers/contract.pdf")).unwrap();
         assert!(
             out.text.contains("Contract renewal terms"),
             "got: {}",
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn corrupt_pdf_is_error_not_panic() {
-        let err = extract(&fixture("vendor/corrupt.pdf")).unwrap_err();
+        let err = extract(&fixture("suppliers/corrupt.pdf")).unwrap_err();
         assert!(matches!(err, Error::Extraction(_)));
     }
 

@@ -881,6 +881,16 @@ mod tests {
         (dir, project)
     }
 
+    /// The fixture's corrupt PDF at its last try, as three scans leave it
+    /// (decision 34), so a rescan passes it by like any unchanged file.
+    fn corrupt_pdf_tried_out(db: &mut Db) {
+        let rel = "suppliers/corrupt.pdf";
+        let row = db.get_file(rel).unwrap().unwrap();
+        while db.read_attempts().unwrap().get(rel).copied().unwrap_or(0) < crate::db::MAX_READ_ATTEMPTS {
+            db.upsert_file(rel, &row.kind, row.size, row.mtime, STATUS_FAILED, row.error.as_deref(), "").unwrap();
+        }
+    }
+
     fn copy_dir(src: &Path, dst: &Path) {
         for entry in fs::read_dir(src).unwrap().flatten() {
             let to = dst.join(entry.file_name());
@@ -902,6 +912,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         fs::write(project.root.join("PartyMemberChip.ui"), "Group #NameCell { Anchor: (Width: 168); }\n").unwrap();
         scan(&project, &mut db).unwrap();
+        corrupt_pdf_tried_out(&mut db);
         let row = db.get_file("PartyMemberChip.ui").unwrap().unwrap();
         // As an older Ken left it.
         db.upsert_file("PartyMemberChip.ui", "binary", row.size, row.mtime, STATUS_METADATA_ONLY, None, "").unwrap();
@@ -945,12 +956,12 @@ mod tests {
         // scanned/image case the heuristic catches — so it IS queued for OCR.
         // (A genuine multi-paragraph text PDF clears the threshold; that path is
         // covered directly by `pdf_low_text_heuristic`.)
-        let pdf = project.root.join("vendor/contract.pdf");
+        let pdf = project.root.join("suppliers/contract.pdf");
         let pm = pdf.metadata().unwrap();
-        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false).unwrap();
+        index_one(&project, &mut db, "suppliers/contract.pdf", pm.len() as i64, 5, false).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
-            Some("vendor/contract.pdf".to_string()),
+            Some("suppliers/contract.pdf".to_string()),
             "a sparse (scanned-style) PDF should be queued for OCR"
         );
         drop(dir);
@@ -1028,7 +1039,7 @@ mod tests {
         }
 
         // Failed and binary files are listed, with no text to search.
-        assert_eq!(db.get_file("vendor/corrupt.pdf").unwrap().unwrap().status, STATUS_FAILED);
+        assert_eq!(db.get_file("suppliers/corrupt.pdf").unwrap().unwrap().status, STATUS_FAILED);
         assert!(db.get_file("images/team-photo.png").unwrap().is_some());
     }
 
@@ -1060,6 +1071,7 @@ mod tests {
         let (_dir, project) = temp_project();
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
+        corrupt_pdf_tried_out(&mut db);
 
         // The file was skipped as cloud-only on an earlier scan. Its bytes are
         // on disk now (fixture files are ordinary local files).
@@ -1114,6 +1126,7 @@ mod tests {
         let (dir, project) = temp_project();
         let mut db = Db::open_in_memory().unwrap();
         scan(&project, &mut db).unwrap();
+        corrupt_pdf_tried_out(&mut db);
 
         // Touch nothing: everything unchanged.
         let stats = scan(&project, &mut db).unwrap();
