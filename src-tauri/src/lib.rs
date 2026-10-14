@@ -6408,37 +6408,79 @@ struct QuickAnswerDelta {
     delta: String,
 }
 
-/// Build the local-model quick-answer prompt: the same grounding as the Claude
-/// path (paragraph excerpts, one `rel_path: text` line per source), wrapped in
-/// Qwen3 ChatML, ending with the `SOURCES:` convention `digest::parse_digest`
-/// already understands.
-fn local_quick_answer_prompt(query: &str, sources: &[(String, String)]) -> String {
-    let mut material = String::new();
-    for (rel_path, text) in sources {
-        material.push_str(&format!("- {rel_path}: {text}\n"));
-    }
-    let system = "You answer questions using only the provided project material. \
-Answer in one or two sentences. If the material doesn't answer it, say you don't \
-know. End with a final line `SOURCES: path1, path2` listing the project-relative \
-paths you used (omit the line if none).";
-    let user = format!("Question: {query}\n\nMaterial:\n\n{material}");
-    ken_core::local_llm::chatml_prompt(system, &user)
+/// One hit a quick answer is grounded on: how the answer cites it
+/// (`source:path`), where it opens (`ken://<project-id>/<path>`), its label
+/// (`kind · tier or role · date`) and a paragraph of its text.
+#[derive(Clone, Debug)]
+struct QaSource {
+    cite: String,
+    address: String,
+    label: Option<String>,
+    text: String,
 }
 
-fn quick_answer_prompt(query: &str, sources: &[(String, String)]) -> String {
-    let mut p = format!(
-        "Question: {query}\n\nMaterial from the project's search index:\n\n"
-    );
-    for (rel_path, text) in sources {
-        p.push_str(&format!("- {rel_path}: {text}\n"));
+/// The material lines of a quick answer: `- cite (label): text`.
+fn qa_material(sources: &[QaSource]) -> String {
+    let mut material = String::new();
+    for s in sources {
+        match &s.label {
+            Some(label) => material.push_str(&format!("- {} ({label}): {}\n", s.cite, s.text)),
+            None => material.push_str(&format!("- {}: {}\n", s.cite, s.text)),
+        }
     }
-    p.push_str(
-        "\nAnswer the question in one or two sentences using ONLY this \
-material; name the source paths you used; if the material doesn't answer \
-it, say you don't know. End with a final line `SOURCES: path1, path2` \
-listing the project-relative paths you used (omit the line if none).\n",
+    material
+}
+
+/// How a quick answer weighs what it was given: the chat guide's rule
+/// (`chat.rs`, rule 4), so the quick answer and the chat agree. A binding
+/// ruling wins; where the code differs from one, both are named.
+const QA_WEIGHING: &str = "Each item carries its label (kind · tier or role · date). Weigh them by it: a binding \
+ruling or rule over a current page, a current page over a record (a ticket, note or draft), a later ruling over an \
+earlier one. A binding ruling is settled, so state what it says as how things are decided. Where the code or a page \
+differs from a ruling, say so and cite both.";
+
+/// How a quick answer ends: a `SOURCES:` line `digest::parse_digest` reads,
+/// each source cited as the material names it.
+const QA_SOURCES: &str = "End with a final line `SOURCES: a, b` listing the items you used, each written exactly as the \
+material names it before its label (such as `Game:src/world.py`); omit the line if none.";
+
+/// Build the local-model quick-answer prompt: the same grounding as the Claude
+/// path, wrapped in Qwen3 ChatML.
+fn local_quick_answer_prompt(query: &str, sources: &[QaSource]) -> String {
+    let system = format!(
+        "You answer questions using only the provided project material. Answer in one or two sentences. {QA_WEIGHING} \
+If the material doesn't answer it, say you don't know. {QA_SOURCES}"
     );
-    p
+    let user = format!("Question: {query}\n\nMaterial:\n\n{}", qa_material(sources));
+    ken_core::local_llm::chatml_prompt(&system, &user)
+}
+
+fn quick_answer_prompt(query: &str, sources: &[QaSource]) -> String {
+    format!(
+        "Question: {query}\n\nMaterial from the workspace's search index, each item its source and path, its label and \
+a paragraph of it:\n\n{}\n\
+Answer the question in one or two sentences using ONLY this material. {QA_WEIGHING} If the material doesn't answer \
+it, say you don't know. {QA_SOURCES}\n",
+        qa_material(sources)
+    )
+}
+
+/// The `SOURCES:` a quick answer gave, as addresses that open: each cited
+/// item's `ken://` address (by its `source:path`, or its path alone), and
+/// what matches no item as it was written.
+fn qa_cited(cited: Vec<String>, sources: &[QaSource]) -> Vec<String> {
+    cited
+        .into_iter()
+        .map(|c| {
+            let c = c.trim().trim_matches('`').to_string();
+            sources
+                .iter()
+                .find(|s| s.cite.eq_ignore_ascii_case(&c))
+                .or_else(|| sources.iter().find(|s| s.cite.split_once(':').is_some_and(|(_, path)| path.eq_ignore_ascii_case(&c))))
+                .map(|s| s.address.clone())
+                .unwrap_or(c)
+        })
+        .collect()
 }
 
 /// What a look found: the answer and the `ken://` sources it cites.
@@ -6512,11 +6554,28 @@ async fn quick_answer(
     // supersede counter (microseconds), then release it so the search and the
     // per-source excerpt reads run on the dedicated read-only handle off the lock,
     // never freezing the UI event loop.
-    let (search_db, root, project_id, qa_gen, claude) = {
+    let (members, base_dir, root, project_id, qa_gen, claude) = {
         let guard = state.lock().unwrap();
         let active = member(&guard, None)?;
+        // Every source of the workspace, as the overlay's matches are (decision
+        // 20): a ruling in the knowledge base answers a question asked with a
+        // code repo focused. Single-project mode searches the open projects.
+        let members: Vec<(uuid::Uuid, String, Option<Arc<Mutex<Db>>>)> = match guard.workspace.as_ref() {
+            Some(ws) => ws
+                .ws
+                .members
+                .iter()
+                .filter_map(|m| match &m.status {
+                    ken_core::workspace::MemberStatus::Ok(p) => Some(p),
+                    _ => None,
+                })
+                .map(|p| (p.config.id, p.config.name.clone(), guard.members.get(&p.config.id).map(|m| m.search_db.clone())))
+                .collect(),
+            None => guard.members.values().map(|m| (m.project.config.id, m.project.config.name.clone(), Some(m.search_db.clone()))).collect(),
+        };
         (
-            active.search_db.clone(),
+            members,
+            guard.base_dir.clone(),
             active.project.root.clone(),
             active.project.config.id,
             guard.qa_gen.clone(),
@@ -6531,23 +6590,38 @@ async fn quick_answer(
     let tokens = ken_core::db::significant_tokens(&query);
 
     // Search through the one pipeline (knowledge-core decision 15), by
-    // keyword, and build a ~350-char paragraph excerpt per hit on the blocking
-    // pool (richer grounding than the hit's chunk alone); fall back to the
-    // chunk's text when a source has no stored content to excerpt.
+    // keyword, in every source, best first, and build a ~350-char paragraph
+    // excerpt per hit on the blocking pool (richer grounding than the hit's
+    // chunk alone); fall back to the chunk's text when a source has no stored
+    // content to excerpt. Each hit keeps its label, so the answer can weigh
+    // a binding ruling over the code it rules on.
     let query_for_search = query.clone();
-    let sources: Vec<(String, String)> = tauri::async_runtime::spawn_blocking(
-        move || -> CmdResult<Vec<(String, String)>> {
-            let db = search_db.lock().unwrap();
-            let hits = routing::search_member(&db, &query_for_search, None, 8).map_err(err)?;
-            Ok(hits
-                .into_iter()
-                .map(|hit| {
-                    let text = db.excerpt(&hit.path, &tokens, 350).unwrap_or(hit.snippet);
-                    (hit.path, text)
-                })
-                .collect())
-        },
-    )
+    let sources: Vec<QaSource> = tauri::async_runtime::spawn_blocking(move || -> CmdResult<Vec<QaSource>> {
+        let mut scored: Vec<(f64, QaSource)> = Vec::new();
+        for (id, name, handle) in members {
+            let handle = match handle {
+                Some(h) => h,
+                None => match Db::open_read_only(&base_dir, id) {
+                    Ok(db) => Arc::new(Mutex::new(db)),
+                    Err(_) => continue,
+                },
+            };
+            let db = lock_tolerant(&handle);
+            let Ok(hits) = routing::search_member(&db, &query_for_search, None, 8) else { continue };
+            for hit in hits {
+                let text = db.excerpt(&hit.path, &tokens, 350).unwrap_or(hit.snippet);
+                let source = QaSource {
+                    cite: format!("{name}:{}", hit.path),
+                    address: format!("ken://{id}/{}", hit.path),
+                    label: hit.label,
+                    text,
+                };
+                scored.push((hit.score, source));
+            }
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter().take(8).map(|(_, s)| s).collect())
+    })
     .await
     .map_err(|e| e.to_string())??;
 
@@ -6585,7 +6659,7 @@ async fn quick_answer(
                         &app,
                         project_id,
                         "quick-answer",
-                        QuickAnswerEvent { query, body: parsed.body, sources: parsed.sources },
+                        QuickAnswerEvent { query, body: parsed.body, sources: qa_cited(parsed.sources, &sources) },
                     );
                 }
                 Ok(_) => {} // superseded — a newer generation owns the card
@@ -6617,7 +6691,7 @@ fn run_claude_quick_answer(
     root: std::path::PathBuf,
     claude: Option<std::path::PathBuf>,
     query: String,
-    sources: Vec<(String, String)>,
+    sources: Vec<QaSource>,
     qa_gen: Arc<AtomicU64>,
     my_gen: u64,
 ) {
@@ -6638,7 +6712,7 @@ fn run_claude_quick_answer(
             &app,
             project_id,
             "quick-answer",
-            QuickAnswerEvent { query, body: parsed.body, sources: parsed.sources },
+            QuickAnswerEvent { query, body: parsed.body, sources: qa_cited(parsed.sources, &sources) },
         );
     }
 }
@@ -12586,15 +12660,48 @@ mod tests {
 
     #[test]
     fn local_quick_answer_prompt_grounds_and_uses_chatml() {
-        // The caller now hands each source in as `(rel_path, excerpt_text)` with
-        // marks already stripped (the excerpt/snippet fallback does that upstream),
-        // so the fixture supplies clean text directly.
-        let sources = vec![("People.md".to_string(), "Priya owns billing".to_string())];
+        // The caller hands each source in with marks already stripped (the
+        // excerpt/snippet fallback does that upstream), so the fixture
+        // supplies clean text directly.
+        let sources = vec![QaSource {
+            cite: "Wiki:People.md".into(),
+            address: "ken://x/People.md".into(),
+            label: None,
+            text: "Priya owns billing".into(),
+        }];
         let p = local_quick_answer_prompt("who owns billing?", &sources);
         assert!(p.contains("<|im_start|>system"));
         assert!(p.contains("who owns billing?"));
-        assert!(p.contains("People.md: Priya owns billing"));
+        assert!(p.contains("Wiki:People.md: Priya owns billing"));
         assert!(p.contains("<|im_start|>assistant"));
+    }
+
+    /// A quick answer is told each hit's label and that a binding ruling
+    /// wins over the code it rules on (end-to-end finding 15), and its
+    /// sources open in the repo they came from.
+    #[test]
+    fn a_quick_answer_weighs_each_hit_by_its_label() {
+        let sources = vec![
+            QaSource {
+                cite: "tiny-game:src/world.py".into(),
+                address: "ken://g/src/world.py".into(),
+                label: Some("code · reference · 2026-10-14".into()),
+                text: "def save_region(region): writes one file per region".into(),
+            },
+            QaSource {
+                cite: "Wiki:Decisions/DECISIONS.md".into(),
+                address: "ken://w/Decisions/DECISIONS.md".into(),
+                label: Some("decision D-001 · binding · 2026-10-14".into()),
+                text: "The whole world saves to a single file.".into(),
+            },
+        ];
+        for p in [quick_answer_prompt("how is the world saved", &sources), local_quick_answer_prompt("how is the world saved", &sources)] {
+            assert!(p.contains("- Wiki:Decisions/DECISIONS.md (decision D-001 · binding · 2026-10-14): The whole world"), "{p}");
+            assert!(p.contains("- tiny-game:src/world.py (code · reference · 2026-10-14):"), "{p}");
+            assert!(p.contains("A binding ruling is settled") && p.contains("say so and cite both"), "{p}");
+        }
+        let cited = qa_cited(vec!["Wiki:Decisions/DECISIONS.md".into(), "src/world.py".into(), "elsewhere.md".into()], &sources);
+        assert_eq!(cited, vec!["ken://w/Decisions/DECISIONS.md", "ken://g/src/world.py", "elsewhere.md"]);
     }
 
     /// The trash call plus `deindex_removed` (the two halves of `delete_file`)

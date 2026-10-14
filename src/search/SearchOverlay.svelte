@@ -21,7 +21,8 @@
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
   import { claudeInstallHelp, shortcut } from "../lib/platform";
-  import { errorText } from "../lib/toast.svelte";
+  import { errorText, toast } from "../lib/toast.svelte";
+  import { openKenAddress } from "../lib/kenAddress";
 
   let query = $state("");
   let selected = $state(0);
@@ -216,6 +217,17 @@
     if (!cached && aiAvailable && isQuestionQuery(q)) {
       aiTimer = setTimeout(() => void ask(q), 250);
     }
+  }
+
+  /** A quick answer's source: a `ken://` address opens in the repo it came
+   *  from (the answer reads every source), a bare path in the focused one. */
+  async function openSource(source: string) {
+    if (!source.startsWith("ken://")) {
+      app.openInFiles(source);
+      return;
+    }
+    const opened = await openKenAddress(source);
+    if (!opened.ok) toast.error(opened.reason);
   }
 
   async function ask(q: string) {
@@ -429,7 +441,7 @@
           <button
             class="qa-chip mono"
             title={source}
-            onclick={() => app.openInFiles(source)}
+            onclick={() => void openSource(source)}
           >
             {source.split("/").pop() || source}
           </button>
