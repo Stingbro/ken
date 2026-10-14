@@ -216,6 +216,125 @@ pub fn create(dir: &Path, team: &str, repos: &[Covered], today: &str) -> Result<
     git_commit_all(dir, &format!("Start the {team} knowledge base from Ken's template"))
 }
 
+/// Overlay Ken's structure on an existing wiki at `dir` (decision 32, step
+/// 2): every template file it lacks is laid down with what Ken knows filled
+/// in, and nothing it has is written, moved or deleted. The folder becomes a
+/// git repo when it is not one, and the files Ken added are committed by
+/// name, never anything of the person's (decision 36). Returns the files
+/// added. The pages it already has are mapped into the sections afterwards,
+/// after a dry run (`wikimap`).
+pub fn overlay(dir: &Path, name: &str, repos: &[Covered], today: &str) -> Result<Vec<String>> {
+    if !dir.is_dir() {
+        return Err(Error::Other(format!("{} is not a folder", dir.display())));
+    }
+    let wiki = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "wiki".into());
+    let mut added = Vec::new();
+    for (path, text) in TEMPLATE {
+        let dest = dir.join(path);
+        if dest.exists() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        let text = text.replace("\r\n", "\n");
+        fs::write(&dest, fill(path, &text, name, &wiki, repos, today)).map_err(|e| Error::io(&dest, e))?;
+        added.push(path.to_string());
+    }
+    if !dir.join(".git").exists() {
+        git(dir, &["init", "-q"])?;
+    }
+    if !added.is_empty() {
+        if let Err(e) = crate::git::commit_paths(dir, &added, &format!("Lay Ken's structure over the {name} knowledge base")) {
+            eprintln!("warning: the files Ken added to {} are not committed: {e}", dir.display());
+        }
+    }
+    Ok(added)
+}
+
+/// A template file a knowledge base lacks, or one Ken owns whose text is
+/// not the bundled template's any more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateGap {
+    pub path: String,
+    /// `missing` or `out-of-date`.
+    pub state: String,
+    /// For an out-of-date file, the lines that differ: `- ` the file's,
+    /// `+ ` the template's.
+    pub diff: Vec<String>,
+}
+
+/// Files whose text is Ken's to keep current: the blanks in `Templates/`
+/// and the brief. Every other page is a person's once laid down, so only
+/// its absence is reported.
+fn ken_owned(path: &str) -> bool {
+    is_copy_template(path) || path == "CLAUDE.md"
+}
+
+/// Running set-up again on a knowledge base (decision 4): the template files
+/// it lacks, and the ones Ken owns that differ from the bundled template, as
+/// a diff. Reads only; nothing is overwritten. `name` fills the brief as
+/// set-up would.
+pub fn template_gaps(dir: &Path, name: &str, today: &str) -> Vec<TemplateGap> {
+    let wiki = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "wiki".into());
+    let mut out = Vec::new();
+    for (path, text) in TEMPLATE {
+        if path.ends_with(".gitkeep") {
+            continue;
+        }
+        let dest = dir.join(path);
+        let Ok(have) = fs::read_to_string(&dest) else {
+            out.push(TemplateGap { path: path.to_string(), state: "missing".into(), diff: Vec::new() });
+            continue;
+        };
+        if !ken_owned(path) {
+            continue;
+        }
+        let want = fill(path, &text.replace("\r\n", "\n"), name, &wiki, &[], today);
+        let have = have.replace("\r\n", "\n");
+        if have.trim_end() != want.trim_end() {
+            out.push(TemplateGap { path: path.to_string(), state: "out-of-date".into(), diff: line_diff(&have, &want) });
+        }
+    }
+    out
+}
+
+/// The lines only one side has, in order: `- ` lines of `have`, `+ ` lines
+/// of `want`. At most 40 lines.
+fn line_diff(have: &str, want: &str) -> Vec<String> {
+    let mine: std::collections::HashSet<&str> = have.lines().collect();
+    let theirs: std::collections::HashSet<&str> = want.lines().collect();
+    have.lines()
+        .filter(|l| !theirs.contains(l))
+        .map(|l| format!("- {l}"))
+        .chain(want.lines().filter(|l| !mine.contains(l)).map(|l| format!("+ {l}")))
+        .take(40)
+        .collect()
+}
+
+/// Lay down the template files `dir` lacks from the gaps a person chose,
+/// never overwriting; commit them by name. Returns the files written.
+pub fn add_missing(dir: &Path, name: &str, paths: &[String], today: &str) -> Result<Vec<String>> {
+    let wiki = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "wiki".into());
+    let mut added = Vec::new();
+    for (path, text) in TEMPLATE.iter().filter(|(p, _)| paths.iter().any(|x| x == p)) {
+        let dest = dir.join(path);
+        if dest.exists() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+        }
+        fs::write(&dest, fill(path, &text.replace("\r\n", "\n"), name, &wiki, &[], today)).map_err(|e| Error::io(&dest, e))?;
+        added.push(path.to_string());
+    }
+    if !added.is_empty() {
+        crate::git::commit_paths(dir, &added, "Add the template files the knowledge base lacked").map_err(Error::Other)?;
+    }
+    Ok(added)
+}
+
 /// `git init` in `dir` and one commit of everything in it. The person's own
 /// git identity when they have one; Ken's otherwise, so a machine with no
 /// identity set can still make the first commit.
@@ -318,5 +437,28 @@ pub(crate) mod tests {
         assert!(dir.join(".git").exists());
         assert!(fs::read_to_string(dir.join("CLAUDE.md")).unwrap().starts_with("# Realms-Wiki"));
         assert!(create(&dir, "Realms", &repos(), "2026-09-25").is_err(), "never writes over a folder with files");
+    }
+
+    #[test]
+    fn running_set_up_again_reports_gaps_and_never_overwrites() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("Realms-Wiki");
+        create(&dir, "Realms", &[], "2026-09-25").unwrap();
+        assert!(template_gaps(&dir, "Realms", "2026-09-25").is_empty(), "fresh from the template");
+
+        fs::remove_file(dir.join("Templates/Rule.md")).unwrap();
+        fs::write(dir.join("Templates/How-to.md"), "# An older blank\n").unwrap();
+        fs::write(dir.join("START-HERE.md"), "# Ours now\n").unwrap();
+        let gaps = template_gaps(&dir, "Realms", "2026-09-25");
+        let state = |p: &str| gaps.iter().find(|g| g.path == p).map(|g| g.state.clone());
+        assert_eq!(state("Templates/Rule.md").as_deref(), Some("missing"));
+        assert_eq!(state("Templates/How-to.md").as_deref(), Some("out-of-date"));
+        assert_eq!(state("START-HERE.md"), None, "a page a person owns is theirs to change");
+        let howto = gaps.iter().find(|g| g.path == "Templates/How-to.md").unwrap();
+        assert!(howto.diff.contains(&"- # An older blank".to_string()), "{:?}", howto.diff);
+
+        let added = add_missing(&dir, "Realms", &["Templates/Rule.md".into(), "Templates/How-to.md".into()], "2026-09-25").unwrap();
+        assert_eq!(added, vec!["Templates/Rule.md"], "an out-of-date file is reported, never overwritten");
+        assert_eq!(fs::read_to_string(dir.join("Templates/How-to.md")).unwrap(), "# An older blank\n");
     }
 }

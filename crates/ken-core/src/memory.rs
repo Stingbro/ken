@@ -625,31 +625,20 @@ pub fn workspace_pseudo_member_id(workspace_id: Uuid) -> Uuid {
     Uuid::from_bytes(out)
 }
 
-/// Built-in tier rules for classifying the workspace pseudo-member's own
-/// files (D3): `memory/` full, `journal/` (current + `archive/`, covered
-/// by one directory-prefix rule) and `tasks/` search-only, `workspace.json`
-/// and `kg.sqlite` ignored.
+/// The index rules for the workspace pseudo-member's own files: its
+/// memory, journal and tasks are indexed (decision 34 has two states), and
+/// `workspace.json` and `kg.sqlite` are not.
 ///
-/// Deliberately **not** wired into `kenignore::built_in_rule_sets()`:
-/// that function is parameterless and folded into *every* project's
-/// classify call (`scan.rs` lines ~121/292, unconditionally, for every
-/// member), so filling it with these patterns would apply workspace-only
-/// semantics (e.g. ignoring any regular project's own root-level
-/// `workspace.json`/`kg.sqlite`, or demoting any project's own `journal/`
-/// or `tasks/` folder to search-only) to every ordinary member project —
-/// contradicting D3, which scopes these rules to the pseudo-member only.
-/// This function is the seam instead: whichever call classifies the
-/// pseudo-member's own files (src-tauri task 2.1, spinning up its engine
-/// instance) folds `workspace_builtin_rules()` into that classify call's
-/// `rule_sets` specifically, the same way `Project::kenignore_rules()`
-/// supplies the user tier for an ordinary project.
+/// Not in `kenignore::built_in_rule_sets()`, which every source reads: an
+/// ordinary repo's own root `workspace.json` must stay indexed. Only the
+/// call that classifies the pseudo-member's files folds these in.
 pub fn workspace_builtin_rules() -> Vec<Rule> {
     vec![
-        Rule { tier: Tier::Full, pattern: "/memory/".to_string() },
-        Rule { tier: Tier::SearchOnly, pattern: "/journal/".to_string() },
-        Rule { tier: Tier::SearchOnly, pattern: "/tasks/".to_string() },
-        Rule { tier: Tier::Ignore, pattern: "/workspace.json".to_string() },
-        Rule { tier: Tier::Ignore, pattern: "/kg.sqlite".to_string() },
+        Rule { tier: Tier::Indexed, pattern: "/memory/".to_string() },
+        Rule { tier: Tier::Indexed, pattern: "/journal/".to_string() },
+        Rule { tier: Tier::Indexed, pattern: "/tasks/".to_string() },
+        Rule { tier: Tier::Ignored, pattern: "/workspace.json".to_string() },
+        Rule { tier: Tier::Ignored, pattern: "/kg.sqlite".to_string() },
     ]
 }
 
@@ -940,16 +929,16 @@ mod tests {
     fn workspace_builtin_rules_classify_as_designed() {
         let rules = workspace_builtin_rules();
         let rs: &[&[Rule]] = &[&rules];
-        assert_eq!(crate::kenignore::classify("memory/style.md", false, rs), Tier::Full);
-        assert_eq!(crate::kenignore::classify("journal/2026-07-01.md", false, rs), Tier::SearchOnly);
+        assert_eq!(crate::kenignore::classify("memory/style.md", false, rs), Tier::Indexed);
+        assert_eq!(crate::kenignore::classify("journal/2026-07-01.md", false, rs), Tier::Indexed);
         assert_eq!(
             crate::kenignore::classify("journal/archive/2026-01-01.md", false, rs),
-            Tier::SearchOnly
+            Tier::Indexed
         );
-        assert_eq!(crate::kenignore::classify("tasks/todo.md", false, rs), Tier::SearchOnly);
-        assert_eq!(crate::kenignore::classify("workspace.json", false, rs), Tier::Ignore);
-        assert_eq!(crate::kenignore::classify("kg.sqlite", false, rs), Tier::Ignore);
+        assert_eq!(crate::kenignore::classify("tasks/todo.md", false, rs), Tier::Indexed);
+        assert_eq!(crate::kenignore::classify("workspace.json", false, rs), Tier::Ignored);
+        assert_eq!(crate::kenignore::classify("kg.sqlite", false, rs), Tier::Ignored);
         // Unrelated paths default to Full, unaffected.
-        assert_eq!(crate::kenignore::classify("tasks_notes.md", false, rs), Tier::Full);
+        assert_eq!(crate::kenignore::classify("tasks_notes.md", false, rs), Tier::Indexed);
     }
 }

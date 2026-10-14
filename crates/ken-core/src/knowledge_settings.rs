@@ -61,6 +61,21 @@ impl Settings {
             .collect()
     }
 
+    /// The source's index rules (knowledge-core decision 34): the file's
+    /// top-level `ignore` lines, which hold for every source, then its
+    /// `repos.<name>.ignore` lines. Gitignore-style, one pattern a line: a
+    /// bare line is not indexed, a `!` line brings a path back.
+    pub fn index_rules(&self) -> Vec<String> {
+        let lines = |v: Option<&Value>| -> Vec<String> {
+            v.and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|l| l.as_str()).map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+                .unwrap_or_default()
+        };
+        let mut out = lines(self.value.get("ignore"));
+        out.extend(lines(self.repo_entry().and_then(|e| e.get("ignore"))));
+        out
+    }
+
     /// The controls for this source: the ones that name it, and in the
     /// file's own repo also the ones that name no source.
     pub fn controls(&self) -> Vec<Control> {
@@ -174,6 +189,35 @@ pub fn save_proposals(root: &Path, roles: &[(String, String)], controls: &[Contr
     Ok(true)
 }
 
+/// The knowledge base's own top-level `ignore` lines, the rules every source
+/// reads (decision 34). Empty when the file has none or is missing.
+pub fn ignore_lines(kb_root: &Path) -> Vec<String> {
+    read(kb_root)
+        .map(|value| Settings { kb_root: kb_root.to_path_buf(), name: String::new(), own: true, value })
+        .map(|s| {
+            s.value
+                .get("ignore")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|l| l.as_str()).map(str::to_string).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// Write the knowledge base's top-level `ignore` lines, blank lines dropped,
+/// keeping every other key as it was. The file must exist: a knowledge base
+/// has one from its template.
+pub fn set_ignore_lines(kb_root: &Path, lines: &[String]) -> Result<()> {
+    let path = kb_root.join(KNOWLEDGE_FILE);
+    let mut value = read(kb_root).ok_or_else(|| Error::Other(format!("{} has no readable {KNOWLEDGE_FILE}", kb_root.display())))?;
+    let kept: Vec<Value> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).map(|l| Value::String(l.to_string())).collect();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("ignore".into(), Value::Array(kept));
+    }
+    let text = serde_json::to_string_pretty(&value).map_err(|e| Error::Other(e.to_string()))?;
+    std::fs::write(&path, text + "\n").map_err(|e| Error::io(&path, e))
+}
+
 /// [`save_proposals`]'s change to the settings, None when nothing changes.
 pub fn with_proposals(settings: &Settings, roles: &[(String, String)], controls: &[Control]) -> Option<Value> {
     let mut value = settings.value.clone();
@@ -232,6 +276,20 @@ mod tests {
         assert_eq!(s.controls().len(), 1, "only its own; one with no source is the knowledge base's");
         assert!(s.analyzed());
         assert!(among(&other, "Elsewhere", &[wiki.clone()]).is_none(), "not listed");
+    }
+
+    #[test]
+    fn index_rules_are_the_files_lines_then_the_sources() {
+        let d = tempfile::tempdir().unwrap();
+        let (wiki, game) = (d.path().join("Wiki"), d.path().join("Game"));
+        kb(&wiki, r#"{ "ignore": ["*.log", " "], "repos": { "Game": { "kind": "code", "ignore": ["assets/raw/", "!tests/"] } } }"#);
+        let s = among(&game, "Game", &[wiki.clone()]).unwrap();
+        assert_eq!(s.index_rules(), vec!["*.log", "assets/raw/", "!tests/"]);
+        assert_eq!(ignore_lines(&wiki), vec!["*.log", " "]);
+        set_ignore_lines(&wiki, &["build-cache/".into(), "".into()]).unwrap();
+        assert_eq!(ignore_lines(&wiki), vec!["build-cache/"]);
+        assert_eq!(read(&wiki).unwrap()["repos"]["Game"]["kind"], "code", "the rest of the file stays");
+        assert!(set_ignore_lines(&d.path().join("None"), &[]).is_err());
     }
 
     #[test]

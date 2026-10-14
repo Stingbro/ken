@@ -206,7 +206,11 @@ pub const STATUS_CLOUD_ONLY: &str = "cloud_only";
 /// a file we skipped (or that timed out mid-download) would stay contentless
 /// forever. Deliberately narrow: a file still in the cloud has nothing new to
 /// read, and a genuinely corrupt file must not be retried on every scan.
-fn needs_retry(status: &str, error: Option<&str>, dataless_now: bool) -> bool {
+///
+/// A file that failed for any other reason is tried again by the next scans
+/// until it has failed [`crate::db::MAX_READ_ATTEMPTS`] times, and is then
+/// counted as failed and left alone (knowledge-core decision 34).
+fn needs_retry(status: &str, error: Option<&str>, dataless_now: bool, attempts: i64) -> bool {
     match status {
         // We skipped its bytes; they've since arrived (the user opened it, or
         // the provider synced it down). Extract the content now.
@@ -216,7 +220,7 @@ fn needs_retry(status: &str, error: Option<&str>, dataless_now: bool) -> bool {
         // next scan sees cloud_only + dataless and leaves it alone. A file
         // that failed for any other reason is left alone, so a corrupt one
         // isn't re-extracted on every scan.
-        STATUS_FAILED => dataless_now && error.is_some_and(is_transient_error),
+        STATUS_FAILED => (dataless_now && error.is_some_and(is_transient_error)) || attempts < crate::db::MAX_READ_ATTEMPTS,
         _ => false,
     }
 }
@@ -238,19 +242,15 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         return Ok(stats);
     }
 
-    // kenignore (D2): built-ins first, user `.kenignore` appended last so a
-    // `!` line can override them. Loaded once per scan, not per file —
-    // `classify` is pure and re-parsing per path would be wasted work. The
-    // repo's kind sits between them: it sets the whole repo's state. The
-    // built-ins leave tests out (knowledge-core decision 17), so a test file
-    // indexed before is removed below like any other newly ignored path.
-    let built_in_rules = crate::kenignore::built_in_rule_sets();
-    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
-    let user_rules = project.kenignore_rules();
-    let rule_sets: [&[crate::kenignore::Rule]; 3] = [&built_in_rules, &kind_rules, &user_rules];
+    // The index rules (knowledge-core decision 34), loaded once per scan:
+    // the fixed built-ins, the repo switched off, the older `.kenignore`
+    // files, then `.ken/knowledge.json`. The built-ins leave tests out
+    // (decision 17), so a file indexed before and ignored now is removed
+    // below like any other.
+    let rules = project.index_rules();
 
-    // What's on disk (rel_path -> size, mtime, cloud placeholder?, tier)
-    let mut on_disk: HashMap<String, (i64, i64, bool, crate::kenignore::Tier)> = HashMap::new();
+    // What's on disk (rel_path -> size, mtime, cloud placeholder?)
+    let mut on_disk: HashMap<String, (i64, i64, bool)> = HashMap::new();
     // A git repo's own `.gitignore` is the best statement anyone has of
     // "this is generated, not authored" — build output, caches, server
     // world data. Honouring it in a repo is why a Gradle project indexes
@@ -317,11 +317,9 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         if project.is_excluded(&rel_str) {
             continue;
         }
-        // kenignore D3: "Ignore-tier paths simply never produce rows —
-        // identical to today's exclusion path." Skip exactly like `excluded`
-        // above so an ignored file leaves no file/FTS row either.
-        let tier = crate::kenignore::classify(&rel_str, false, &rule_sets);
-        if tier == crate::kenignore::Tier::Ignore {
+        // A path that is not indexed never produces a row, exactly like
+        // `excluded` above.
+        if crate::kenignore::classify(&rel_str, false, &[&rules]) == crate::kenignore::Tier::Ignored {
             continue;
         }
         if let Some(meta) = listed.or_else(|| path.metadata().ok()) {
@@ -331,15 +329,19 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            on_disk.insert(rel_str, (meta.len() as i64, mtime, cloud::is_dataless(&meta), tier));
+            on_disk.insert(rel_str, (meta.len() as i64, mtime, cloud::is_dataless(&meta)));
         }
     }
 
-    // What's in the index
-    let indexed: HashMap<String, (i64, i64, String, Option<String>)> = db
+    // What's in the index, with how often each failed file was tried.
+    let attempts = db.read_attempts()?;
+    let indexed: Indexed = db
         .list_files()?
         .into_iter()
-        .map(|f| (f.rel_path, (f.size, f.mtime, f.status, f.error)))
+        .map(|f| {
+            let tries = attempts.get(&f.rel_path).copied().unwrap_or(0);
+            (f.rel_path, (f.size, f.mtime, f.status, f.error, tries))
+        })
         .collect();
 
     // Writes go in batches of BATCH_FILES, one commit each, not several
@@ -354,11 +356,6 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
         }
     }
 
-    // Re-tier. An unchanged file skipped `index_one` above, so a change of
-    // the repo's kind or a new `~` line reaches it only here.
-    let tiers: Vec<(String, crate::kenignore::Tier)> =
-        on_disk.iter().map(|(rel, (_, _, _, tier))| (rel.clone(), *tier)).collect();
-    db.set_file_tiers(&tiers)?;
     // Each file's authority in search, from the index's frontmatter and the
     // team file, for every file: a team file's new override reaches them all.
     crate::authority::refresh(db, &project.root, None)?;
@@ -406,8 +403,9 @@ fn after_scan(project: &Project, db: &mut Db) -> Result<()> {
 /// Files written per transaction during a scan.
 const BATCH_FILES: usize = 500;
 
-type OnDisk = HashMap<String, (i64, i64, bool, crate::kenignore::Tier)>;
-type Indexed = HashMap<String, (i64, i64, String, Option<String>)>;
+type OnDisk = HashMap<String, (i64, i64, bool)>;
+/// rel_path -> size, mtime, status, error, failed tries.
+type Indexed = HashMap<String, (i64, i64, String, Option<String>, i64)>;
 
 /// A scan's removals, adds and updates, committed every [`BATCH_FILES`]
 /// files inside the batch the caller opened.
@@ -434,19 +432,19 @@ fn write_changes(project: &Project, db: &mut Db, indexed: &Indexed, on_disk: &On
     }
 
     // Adds/updates
-    for (rel, (size, mtime, dataless, tier)) in on_disk {
+    for (rel, (size, mtime, dataless)) in on_disk {
         match indexed.get(rel) {
-            Some((s, m, status, error)) if s == size
+            Some((s, m, status, error, tries)) if s == size
                 && m == mtime
-                && !needs_retry(status, error.as_deref(), *dataless) =>
+                && !needs_retry(status, error.as_deref(), *dataless, *tries) =>
             {
                 stats.unchanged += 1;
                 continue;
             }
-            Some((s, _, status, error))
+            Some((s, _, status, error, tries))
                 if s == size
                     && !*dataless
-                    && !needs_retry(status, error.as_deref(), *dataless)
+                    && !needs_retry(status, error.as_deref(), *dataless, *tries)
                     && only_mtime_moved(db, rel, &project.root.join(rel), *size, *mtime)? =>
             {
                 stats.unchanged += 1;
@@ -455,7 +453,7 @@ fn write_changes(project: &Project, db: &mut Db, indexed: &Indexed, on_disk: &On
             Some(_) => stats.updated += 1,
             None => stats.added += 1,
         }
-        let status = index_one(project, db, rel, *size, *mtime, *dataless, *tier)?;
+        let status = index_one(project, db, rel, *size, *mtime, *dataless)?;
         if status == STATUS_FAILED {
             stats.failed += 1;
         }
@@ -495,7 +493,6 @@ fn index_one(
     size: i64,
     mtime: i64,
     dataless: bool,
-    tier: crate::kenignore::Tier,
 ) -> Result<&'static str> {
     let abs = project.root.join(rel);
     let kind = FileKind::from_path(&abs);
@@ -504,7 +501,7 @@ fn index_one(
     // and leave the content to `cloud::hydrate` when the user opens it.
     if dataless {
         db.upsert_file(rel, kind.as_str(), size, mtime, STATUS_CLOUD_ONLY, None, "")?;
-        db.store_chunked(rel, &name_only(rel), tier)?;
+        db.store_chunked(rel, &name_only(rel))?;
         return Ok(STATUS_CLOUD_ONLY);
     }
     let (status, error, text) = match extract::extract(&abs) {
@@ -548,7 +545,7 @@ fn index_one(
     } else {
         name_only(rel)
     };
-    db.store_chunked(rel, &chunked, tier)?;
+    db.store_chunked(rel, &chunked)?;
     // What a page says about itself (title, aliases, status, checked),
     // read from its frontmatter for search to rank and show.
     if kind == FileKind::Md {
@@ -595,17 +592,9 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
         || is_hidden_rel(rel)
         || rel.rsplit('/').next().is_some_and(|n| is_office_lock_name(n) || is_backup_name(n))
         || inside_linked_checkout(&project.root, rel);
-    // kenignore D3: an Ignore-tier path is treated exactly like `excluded` —
-    // no row at all. This is a basic per-event check, not D4's fuller
-    // old-tier -> new-tier transition diffing (deleting stale KM
-    // contributions on Full->SearchOnly, etc.) — that belongs to task 1.6 and
-    // the src-tauri watcher work, out of scope here.
-    let built_in_rules = crate::kenignore::built_in_rule_sets();
-    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
-    let user_rules = project.kenignore_rules();
-    let rule_sets: [&[crate::kenignore::Rule]; 3] = [&built_in_rules, &kind_rules, &user_rules];
-    let tier = crate::kenignore::classify(rel, false, &rule_sets);
-    let excluded = excluded || tier == crate::kenignore::Tier::Ignore;
+    // A path that is not indexed is treated exactly like `excluded`: no row.
+    let rules = project.index_rules();
+    let excluded = excluded || crate::kenignore::classify(rel, false, &[&rules]) == crate::kenignore::Tier::Ignored;
     if !excluded && abs.is_file() {
         let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
         let mtime = meta
@@ -616,11 +605,9 @@ pub fn refresh_path(project: &Project, db: &mut Db, rel: &str) -> Result<bool> {
             .unwrap_or(0);
         let dataless = cloud::is_dataless(&meta);
         if !dataless && only_mtime_moved(db, rel, &abs, meta.len() as i64, mtime)? {
-            db.set_file_tiers(&[(rel.to_string(), tier)])?;
             return Ok(false);
         }
-        index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
-        db.set_file_tiers(&[(rel.to_string(), tier)])?;
+        index_one(project, db, rel, meta.len() as i64, mtime, dataless)?;
         crate::authority::refresh(db, &project.root, Some(&[rel.to_string()]))?;
         let role = crate::coderole::RoleRules::for_repo(&project.root).role_of(rel);
         db.set_file_roles(&[(rel.to_string(), role)])?;
@@ -708,7 +695,7 @@ fn refresh_one(
     project: &Project,
     db: &mut Db,
     rel: &str,
-    rule_sets: &[&[crate::kenignore::Rule]; 3],
+    rules: &[crate::kenignore::Rule],
     git: &mut GitIgnores,
 ) -> Result<Refreshed> {
     let abs = project.root.join(rel);
@@ -717,8 +704,7 @@ fn refresh_one(
         || rel.rsplit('/').next().is_some_and(|n| is_office_lock_name(n) || is_backup_name(n))
         || inside_linked_checkout(&project.root, rel)
         || git.ignored(rel);
-    let tier = crate::kenignore::classify(rel, false, rule_sets);
-    let excluded = excluded || tier == crate::kenignore::Tier::Ignore;
+    let excluded = excluded || crate::kenignore::classify(rel, false, &[rules]) == crate::kenignore::Tier::Ignored;
     if !excluded && abs.is_file() {
         let meta = abs.metadata().map_err(|e| crate::Error::io(&abs, e))?;
         let mtime = meta
@@ -730,17 +716,19 @@ fn refresh_one(
         let dataless = cloud::is_dataless(&meta);
         let before = db.get_file(rel)?;
         if let Some(f) = &before {
-            if f.size == meta.len() as i64 && f.mtime == mtime && !needs_retry(&f.status, f.error.as_deref(), dataless) {
-                db.set_file_tiers(&[(rel.to_string(), tier)])?;
+            // A watcher event on an unchanged file is no reason to try a
+            // failed read again; the next full scan counts the tries.
+            if f.size == meta.len() as i64
+                && f.mtime == mtime
+                && !needs_retry(&f.status, f.error.as_deref(), dataless, crate::db::MAX_READ_ATTEMPTS)
+            {
                 return Ok(Refreshed::Unchanged);
             }
         }
         if !dataless && only_mtime_moved(db, rel, &abs, meta.len() as i64, mtime)? {
-            db.set_file_tiers(&[(rel.to_string(), tier)])?;
             return Ok(Refreshed::Unchanged);
         }
-        let status = index_one(project, db, rel, meta.len() as i64, mtime, dataless, tier)?;
-        db.set_file_tiers(&[(rel.to_string(), tier)])?;
+        let status = index_one(project, db, rel, meta.len() as i64, mtime, dataless)?;
         Ok(Refreshed::Indexed { added: before.is_none(), status })
     } else if db.get_file(rel)?.is_some() {
         db.remove_file(rel)?;
@@ -766,10 +754,7 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
     if rels.len() > SCOPED_MAX || rels.iter().any(|r| project.root.join(r).is_dir()) {
         return Ok(None);
     }
-    let built_in_rules = crate::kenignore::built_in_rule_sets();
-    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
-    let user_rules = project.kenignore_rules();
-    let rule_sets: [&[crate::kenignore::Rule]; 3] = [&built_in_rules, &kind_rules, &user_rules];
+    let rules = project.index_rules();
     let mut git = GitIgnores::of(project);
     let mut stats = ScanStats::default();
 
@@ -784,7 +769,7 @@ pub fn scan_paths(project: &Project, db: &mut Db, rels: &[String]) -> Result<Opt
                 gone_folders.push(rel);
                 continue;
             }
-            match refresh_one(project, db, rel, &rule_sets, &mut git)? {
+            match refresh_one(project, db, rel, &rules, &mut git)? {
                 Refreshed::Unchanged => stats.unchanged += 1,
                 Refreshed::Removed => {
                     stats.removed += 1;
@@ -940,7 +925,7 @@ mod tests {
         // An image (no EXIF text): enqueued for OCR.
         fs::write(project.root.join("photo.png"), b"not really a png").unwrap();
         let meta = project.root.join("photo.png").metadata().unwrap();
-        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("photo.png".to_string()),
@@ -953,7 +938,7 @@ mod tests {
         // An SVG is vector-only — the OCR bridge can't rasterize it — so skip.
         fs::write(project.root.join("logo.svg"), b"<svg></svg>").unwrap();
         let m = project.root.join("logo.svg").metadata().unwrap();
-        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "logo.svg", m.len() as i64, 5, false).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none(), "SVG must not enqueue OCR");
 
         // The fixture PDF has only a one-line text layer (sparse) — exactly the
@@ -962,7 +947,7 @@ mod tests {
         // covered directly by `pdf_low_text_heuristic`.)
         let pdf = project.root.join("vendor/contract.pdf");
         let pm = pdf.metadata().unwrap();
-        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "vendor/contract.pdf", pm.len() as i64, 5, false).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("vendor/contract.pdf".to_string()),
@@ -978,7 +963,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         fs::write(project.root.join("photo.png"), b"not really a png").unwrap();
         let meta = project.root.join("photo.png").metadata().unwrap();
-        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "photo.png", meta.len() as i64, 5, false).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none());
         drop(dir);
     }
@@ -991,16 +976,16 @@ mod tests {
         let meta = project.root.join("photo.png").metadata().unwrap();
         let (size, mtime) = (meta.len() as i64, 5);
 
-        index_one(&project, &mut db, "photo.png", size, mtime, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
         let (rel, hash) = db.next_pending_ocr().unwrap().unwrap();
         db.mark_ocr_done(&rel, &hash, &[]).unwrap();
 
         // Same (size, mtime): re-indexing does NOT re-OCR.
-        index_one(&project, &mut db, "photo.png", size, mtime, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime, false).unwrap();
         assert!(db.next_pending_ocr().unwrap().is_none(), "unchanged image must not re-OCR");
 
         // A changed mtime (new version) re-queues it.
-        index_one(&project, &mut db, "photo.png", size, mtime + 1, false, crate::kenignore::Tier::Full).unwrap();
+        index_one(&project, &mut db, "photo.png", size, mtime + 1, false).unwrap();
         assert_eq!(
             db.next_pending_ocr().unwrap().map(|(r, _)| r),
             Some("photo.png".to_string())
@@ -1055,7 +1040,7 @@ mod tests {
         let (_dir, project) = temp_project();
         let mut db = Db::open_in_memory().unwrap();
 
-        let status = index_one(&project, &mut db, "notes/meeting.md", 120, 7, true, crate::kenignore::Tier::Full).unwrap();
+        let status = index_one(&project, &mut db, "notes/meeting.md", 120, 7, true).unwrap();
 
         assert_eq!(status, STATUS_CLOUD_ONLY);
         let row = db.get_file("notes/meeting.md").unwrap().unwrap();
@@ -1101,22 +1086,27 @@ mod tests {
     fn retry_rule_covers_only_rows_whose_content_could_have_changed() {
         let timeout = Some("extraction failed: Operation timed out (os error 60)");
 
+        let tried_out = crate::db::MAX_READ_ATTEMPTS;
         // Still in the cloud: nothing new to read, so don't touch it.
-        assert!(!needs_retry(STATUS_CLOUD_ONLY, None, true));
+        assert!(!needs_retry(STATUS_CLOUD_ONLY, None, true, 0));
         // Bytes have landed: extract the content.
-        assert!(needs_retry(STATUS_CLOUD_ONLY, None, false));
+        assert!(needs_retry(STATUS_CLOUD_ONLY, None, false, 0));
 
         // A timed-out read of a file that's still a placeholder — a row left
         // by the old behaviour. Re-index it (cheaply) as cloud_only.
-        assert!(needs_retry(STATUS_FAILED, timeout, true));
+        assert!(needs_retry(STATUS_FAILED, timeout, true, tried_out));
         // …and once it is cloud_only, the scan above leaves it alone: converges.
 
-        // A genuinely corrupt local file must not be re-extracted every scan.
-        assert!(!needs_retry(STATUS_FAILED, Some("PDF error: invalid xref"), false));
+        // A corrupt local file is tried again until its third failure
+        // (decision 34), then left alone and counted as failed.
+        let corrupt = Some("PDF error: invalid xref");
+        assert!(needs_retry(STATUS_FAILED, corrupt, false, 1));
+        assert!(needs_retry(STATUS_FAILED, corrupt, false, tried_out - 1));
+        assert!(!needs_retry(STATUS_FAILED, corrupt, false, tried_out));
 
         // Healthy rows are never redundant work.
-        assert!(!needs_retry(STATUS_INDEXED, None, false));
-        assert!(!needs_retry(STATUS_METADATA_ONLY, None, false));
+        assert!(!needs_retry(STATUS_INDEXED, None, false, 0));
+        assert!(!needs_retry(STATUS_METADATA_ONLY, None, false, 0));
     }
 
     #[test]
@@ -1696,7 +1686,7 @@ mod tests {
         db.upsert_file("ghost.md", "md", 1, 1, "indexed", None, "ghost content")
             .unwrap();
         let chunks = crate::chunker::chunk_file("ghost.md", "ghost content", &crate::chunker::IndexProfile::default_for("ghost.md"));
-        db.upsert_chunks("ghost.md", &chunks, crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("ghost.md", &chunks).unwrap();
         // Seed a stale generated-transcript cache; reindex must purge it so
         // regenerated transcripts never reuse it.
         let cache = crate::transcript::cache_dir(&project.root);

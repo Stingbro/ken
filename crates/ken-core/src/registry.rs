@@ -12,11 +12,10 @@ use crate::project::Project;
 use crate::workspace::Workspace;
 use crate::{Error, Result};
 
-/// What a repo is for, which decides what Ken does there: sync, and how
-/// deep to read. Team and wiki repos hold people, rulings and dates, so they
-/// sync and are read for entities; code and reference repos are only made
-/// searchable, and Ken never commits into them. A repo can be more than one
-/// kind (a wiki that also carries code).
+/// What a repo is for, which decides what Ken does there: team and wiki
+/// repos sync and are where Ken writes; code and reference repos Ken never
+/// commits into. Every kind is indexed the same way (decision 34). A repo
+/// can be more than one kind (a wiki that also carries code).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RepoKind {
@@ -29,14 +28,6 @@ pub enum RepoKind {
 impl RepoKind {
     /// Kinds whose repos Ken keeps in step with the team by default.
     pub fn syncs(self) -> bool {
-        matches!(self, RepoKind::Team | RepoKind::Wiki)
-    }
-
-    /// Kinds whose files are read for entities. Code and reference repos
-    /// are only made searchable: entities read out of code are functions
-    /// and variables that clutter the graph, and each one costs a local
-    /// model generation.
-    pub fn reads_entities(self) -> bool {
         matches!(self, RepoKind::Team | RepoKind::Wiki)
     }
 }
@@ -54,9 +45,9 @@ pub struct RegistryEntry {
     /// The team this repo belongs to, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<String>,
-    /// How deep Ken reads the repo when a person chose other than what the
-    /// kind implies (a code repo whose docs are read for entities, say).
-    /// None means follow the kind.
+    /// `Some(Off)` when a person switched the whole repo off; None means it
+    /// is indexed. An older registry's `search` or `entities` reads as
+    /// indexed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<IndexState>,
     /// What the repo is and how to use it, in a person's words (set at
@@ -66,25 +57,17 @@ pub struct RegistryEntry {
     pub description: Option<String>,
 }
 
-/// A repo's index state, set once for the whole repo: the three kenignore
-/// tiers. `Off` repos are not members at all, so only these two are stored.
+/// A repo's index state, set once for the whole repo: the two states of
+/// knowledge-core decision 34. Paths inside it follow the index rules in
+/// `.ken/knowledge.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexState {
     Off,
-    Search,
-    Entities,
-}
-
-impl IndexState {
-    /// The state a repo of these kinds gets unless a person says otherwise.
-    pub fn for_kind(kind: &[RepoKind]) -> IndexState {
-        if kind.is_empty() || kind.iter().any(|k| k.reads_entities()) {
-            IndexState::Entities
-        } else {
-            IndexState::Search
-        }
-    }
+    /// `search` and `entities` were the two indexed states before; both
+    /// read as indexed.
+    #[serde(alias = "search", alias = "entities")]
+    Indexed,
 }
 
 /// A recently opened workspace (recent-projects' sibling list — see
@@ -319,12 +302,13 @@ impl Registry {
         true
     }
 
-    /// Set how deep Ken reads a project, or None to follow its kind.
+    /// Switch a project's index on or off as a whole. Indexed is the
+    /// default, so only Off is stored.
     pub fn set_index(&mut self, id: Uuid, index: Option<IndexState>) -> bool {
         let Some(entry) = self.projects.iter_mut().find(|e| e.id == id) else {
             return false;
         };
-        entry.index = index.filter(|i| *i != IndexState::for_kind(&entry.kind));
+        entry.index = index.filter(|i| *i == IndexState::Off);
         true
     }
 

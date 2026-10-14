@@ -201,7 +201,7 @@ mod tests {
         for (p, kind) in [("src/PayService.java", "code"), ("README.md", "md")] {
             db.upsert_file(p, kind, 1, 1, "indexed", None, "x").unwrap();
             let chunks = crate::chunker::chunk_file(p, "x", &crate::chunker::IndexProfile::default_for(p));
-            db.upsert_chunks(p, &chunks, crate::kenignore::Tier::Full).unwrap();
+            db.upsert_chunks(p, &chunks).unwrap();
         }
         assert_eq!(refresh_with(&db, &RoleRules::default()).unwrap(), vec!["src/PayService.java".to_string()]);
         assert_eq!(db.file_role("src/PayService.java").unwrap().as_deref(), Some("service"));

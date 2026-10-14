@@ -1,10 +1,12 @@
 <script lang="ts">
   // Team (the Wright white box, frame 9): the chosen team's repos as set-up
-  // wrote them, one row each (kind, how deep Ken reads it, branch, commit,
-  // how far behind its upstream), the workspace's ignore lines, what a scan
-  // found and what a repo lacks for its kind, the wiki's weekly sweep and what
-  // its checks found, and the team's rules and templates. It is Settings ›
-  // Team library in the Briefing design.
+  // wrote them, one row each (kind, indexed or off, branch, commit, how far
+  // behind its upstream), the index rules in the knowledge base's
+  // `.ken/knowledge.json`, what a scan found and what a repo lacks for its
+  // kind, the template files the knowledge base lacks, the pages outside its
+  // sections, the wiki's weekly sweep and what its checks found, and the
+  // team's rules and templates. It is Settings › Team library in the
+  // Briefing design.
   // Each row opens that repo's own settings in a drawer. Add a repo (9b) and
   // Scan again sit at the top.
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -16,6 +18,7 @@
     type SetupMoved,
     type TeamOverview,
     type TeamRepo,
+    type WikiMapPlan,
   } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
@@ -94,10 +97,41 @@
     void run(`k${r.id}`, "Could not set the kind", () => api.setProjectKind(r.id, kind, team));
   }
 
+  // Two states (knowledge-core decision 34): a repo is indexed or it is off.
   function setIndex(r: TeamRepo, value: string) {
-    void run(`i${r.id}`, "Could not change how Ken reads it", () =>
-      api.setProjectIndex(r.id, value === "kind" ? null : (value as IndexState)),
+    void run(`i${r.id}`, "Could not change whether Ken indexes it", () =>
+      api.setProjectIndex(r.id, value === "off" ? ("off" as IndexState) : null),
     );
+  }
+
+  // Template files the knowledge base lacks: added on request, never over a
+  // file it has. An out-of-date one is shown as a diff and left alone.
+  function addMissing() {
+    const paths = (overview?.templateGaps ?? []).filter((g) => g.state === "missing").map((g) => g.path);
+    if (paths.length === 0) return;
+    void run("templates", "Could not add the template files", () => api.teamAddTemplateFiles(paths));
+  }
+
+  // The wiki's pages outside the sections, placed after a dry run.
+  let mapPlan = $state<WikiMapPlan | null>(null);
+  async function checkLayout() {
+    const path = overview?.wiki?.path;
+    if (!path) return;
+    await run("map", "Could not read the wiki's layout", async () => {
+      mapPlan = await api.wikiMapPlan(path);
+    });
+  }
+  function applyMap() {
+    const path = overview?.wiki?.path;
+    const moves = mapPlan?.moves ?? [];
+    if (!path || moves.length === 0) return;
+    void run("map", "Could not move the pages", async () => {
+      const done = await api.wikiMapApply(path, moves);
+      mapPlan = null;
+      toast.show(
+        `${done.moved.length} pages moved${done.unresolved.length ? `; ${done.unresolved.length} links left as they were` : ""}${done.commit ? ` · commit ${done.commit}` : ""}`,
+      );
+    });
   }
 
   function takeOut(e: MouseEvent, r: TeamRepo) {
@@ -122,7 +156,7 @@
     const name = overview.workspace;
     await run("add", "Could not add the repo", async () => {
       const proposal = await api.setupProposeRepos(paths);
-      const rows = proposal.rows.map((r) => ({ ...r, include: true, team: team ?? r.team }));
+      const rows = proposal.rows.map((r) => ({ ...r, include: true }));
       await app.confirmSetupRepos(name, rows, true);
       app.openTeam();
       await scope.refreshGroups();
@@ -283,14 +317,12 @@
                 <td>
                   <span class="sel">
                     <select
-                      value={r.index ?? "kind"}
+                      value={r.effectiveIndex}
                       disabled={busy !== null}
                       onchange={(e) => setIndex(r, e.currentTarget.value)}
-                      title="How deeply Ken reads it"
+                      title="Whether Ken indexes it"
                     >
-                      <option value="kind">{r.effectiveIndex} (its kind)</option>
-                      <option value="entities">entities</option>
-                      <option value="search">search</option>
+                      <option value="indexed">indexed</option>
                       <option value="off">off</option>
                     </select>
                     <ChevronDown size={12} strokeWidth={1.75} />
@@ -345,25 +377,78 @@
           </tbody>
         </table>
 
-        <div class="divider">ignore list · .kenignore beside the repos · {overview.ignores.length} {overview.ignores.length === 1 ? "line" : "lines"}</div>
+        <div class="divider">index rules · .ken/knowledge.json · {overview.ignores.length} {overview.ignores.length === 1 ? "line" : "lines"}</div>
         {#if editingIgnores}
           <textarea class="mono" rows="8" bind:value={ignoresDraft}></textarea>
-          <p class="note">One path or pattern a line; <span class="mono">~path/</span> keeps it in search but out of the graph. The next scan reads it.</p>
+          <p class="note">
+            One path or pattern a line: a path is indexed or it isn't. A bare line leaves it out, a
+            <span class="mono">!path/</span> line brings it back. Saved in the knowledge base; every repo is scanned again.
+          </p>
           <div class="actions">
             <button class="btn btn-ghost" onclick={() => (editingIgnores = false)}>Cancel</button>
             <button class="btn btn-primary" disabled={busy !== null} onclick={saveIgnores}>Save</button>
           </div>
         {:else}
           <div class="ignores">
-            <span class="mono">{overview.ignores.length > 0 ? overview.ignores.join(" · ") : "worktrees, dependencies, build outputs and secrets are left out already"}</span>
+            <span class="mono">{overview.ignores.length > 0 ? overview.ignores.join(" · ") : "VCS, dependencies, build output, secrets, tests, minified and generated files and binaries are left out already"}</span>
             <button
               class="btn btn-ghost"
               onclick={() => {
                 ignoresDraft = (overview?.ignores ?? []).join("\n");
                 editingIgnores = true;
-              }}>Edit</button
+              }}
+              disabled={!overview.wiki}>Edit</button
             >
           </div>
+          {#if overview.legacyIgnores.length > 0}
+            <p class="note">
+              Still read from the older <span class="mono">.kenignore</span> beside the repos:
+              <span class="mono">{overview.legacyIgnores.join(" · ")}</span>
+            </p>
+          {/if}
+        {/if}
+
+        {#if overview.wiki}
+          <div class="divider">knowledge base files · against Ken's template · {overview.templateGaps.length}</div>
+          {#each overview.templateGaps as g (g.path)}
+            <div class="entry">
+              <span>
+                <span class="mono">{g.path}</span>
+                {g.state === "missing" ? "is missing." : "differs from Ken's template:"}
+                {#if g.diff.length > 0}<pre class="diff mono">{g.diff.join("\n")}</pre>{/if}
+              </span>
+            </div>
+          {:else}
+            <p class="note">Every template file is there and current.</p>
+          {/each}
+          {#if overview.templateGaps.some((g) => g.state === "missing")}
+            <div class="actions">
+              <button class="btn btn-ghost" disabled={busy !== null} onclick={addMissing}>Add the missing files</button>
+            </div>
+          {/if}
+
+          <div class="divider">pages outside the sections</div>
+          {#if mapPlan}
+            {#each mapPlan.moves as m (m.from)}
+              <div class="entry"><span><span class="mono">{m.from}</span> → <span class="mono">{m.to}</span> <span class="sub">({m.why})</span></span></div>
+            {:else}
+              <p class="note">Every page is in a section.</p>
+            {/each}
+            {#each mapPlan.left as [page, why] (page)}
+              <div class="entry"><span><span class="mono">{page}</span> stays: {why}</span></div>
+            {/each}
+            <div class="actions">
+              <button class="btn btn-ghost" onclick={() => (mapPlan = null)}>Cancel</button>
+              {#if mapPlan.moves.length > 0}
+                <button class="btn btn-primary" disabled={busy !== null} onclick={applyMap}>Move {mapPlan.moves.length} pages</button>
+              {/if}
+            </div>
+            <p class="note">Nothing is deleted. Links are rewritten where Ken is sure of the target; the rest are listed. One commit.</p>
+          {:else}
+            <div class="actions">
+              <button class="btn btn-ghost" disabled={busy !== null} onclick={() => void checkLayout()}>Check the layout (dry run)</button>
+            </div>
+          {/if}
         {/if}
       </div>
 
@@ -677,6 +762,14 @@
   }
   .bad {
     color: var(--needs-input);
+  }
+  .diff {
+    margin: 4px 0 0;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: var(--sunken-2);
+    font-size: 11.5px;
+    white-space: pre-wrap;
   }
   .ignores {
     display: flex;

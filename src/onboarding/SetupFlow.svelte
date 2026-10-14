@@ -1,125 +1,76 @@
 <script lang="ts">
-  // Set-up for Ken on its own: Repos, Team, Index (step 4 of the
-  // knowledge-layer plan). A person picks the repos, one or many at a time,
-  // wherever they are; the workspace lives in Ken's app data, so nothing is
-  // written into a shared parent. Each row is proposed from what is in the
-  // repo and every cell can change; nothing is written until Confirm.
+  // Set-up for Ken on its own, in three steps (knowledge-core decision 32):
+  // 1, the workspace's name; 2, where its knowledge base is saved, a new repo
+  // from Ken's template or an existing wiki to overlay (its pages mapped into
+  // the sections after a dry run); 3, its sources, repos and folders picked
+  // wherever they are, each with its kind. The workspace lives in Ken's app
+  // data, so nothing is written into a shared parent. Nothing is written
+  // until Confirm, which lays the knowledge base down and indexes every
+  // source, so search and the code index work from day one.
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { api, type IndexState, type RepoKind, type SetupRepoRow } from "../lib/api";
+  import { api, type RepoKind, type SetupRepoRow, type WikiMapPlan } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { toast } from "../lib/toast.svelte";
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import {
     commonParent,
     coveredRepos,
-    defaultTeamName,
-    defaultWikiChoice,
-    indexSummary,
+    defaultKb,
+    kbReady,
     KINDS,
     mergeRows,
     newWikiPath,
-    onOneTeam,
-    renamedWikiChoice,
-    suggestedTeams,
-    teamWikis,
+    renamedKb,
+    sourceSummary,
+    STEPS,
     toggleKind,
-    wikiChoicesReady,
-    type WikiChoice,
+    withKnowledgeBase,
+    type KbChoice,
+    type Step,
   } from "./setupFlow";
 
   let { onclose }: { onclose: () => void } = $props();
 
-  type Step = "repos" | "team" | "index";
-  let step = $state<Step>("repos");
+  let step = $state<Step>("name");
+  let name = $state("");
   let picked = $state<string[]>([]);
   // Repos taken out, so a folder of repos picked again does not bring them back.
   let removed = $state<string[]>([]);
   let rows = $state<SetupRepoRow[]>([]);
-  let name = $state("Code");
   let busy = $state(false);
   let error = $state<string | null>(null);
 
-  const summary = $derived(indexSummary(rows));
-  const teams = $derived(suggestedTeams(rows));
+  const summary = $derived(sourceSummary(rows));
 
-  // A workspace is usually one team: every repo goes on it under one name.
-  // A person splits the repos across teams only when they belong to more.
-  let teamName = $state("");
-  let split = $state(false);
-  let teamProposed = false;
-  let nameTouched = false;
-
-  function goTeam() {
-    if (!teamProposed) {
-      teamProposed = true;
-      const proposed = suggestedTeams(rows);
-      split = proposed.length > 1;
-      teamName = proposed[0] ?? defaultTeamName(rows);
-    }
-    if (!split) rows = onOneTeam(rows, teamName);
-    step = "team";
+  // Step 2: the knowledge base. A new one follows the workspace's name until
+  // a person names it.
+  let kb = $state<KbChoice>(defaultKb(""));
+  let namedFor = "";
+  function setName(value: string) {
+    kb = renamedKb(kb, namedFor, value);
+    namedFor = value;
+    name = value;
   }
 
-  function setTeamName(value: string) {
-    teamName = value;
-    rows = onOneTeam(rows, value);
+  async function chooseParent() {
+    const c = kb;
+    if (c.mode !== "new") return;
+    const folder = await openDialog({ directory: true, title: "Where the knowledge base goes", defaultPath: c.parent ?? undefined });
+    if (typeof folder === "string") kb = { ...c, parent: folder };
   }
 
-  function toggleSplit() {
-    split = !split;
-    if (!split) rows = onOneTeam(rows, teamName);
-  }
-
-  function goIndex() {
-    if (!nameTouched) name = teamName.trim() || teams[0] || name;
-    step = "index";
-  }
-
-  // The wiki is the team's: each team uses a wiki repo it picked, creates a
-  // new one from the method's template, or has none for now.
-  let wikiChoices = $state<Record<string, WikiChoice>>({});
-  // Wikis already created this session, by team, so a retry after a failed
-  // Confirm does not try to create the folder again.
-  let created = $state<Record<string, SetupRepoRow>>({});
-  const choicesReady = $derived(wikiChoicesReady(wikiChoices));
-  $effect(() => {
-    const parent = lastParent ?? commonParent(rows);
-    const before = Object.keys(wikiChoices);
-    const next: Record<string, WikiChoice> = {};
-    for (const t of teams) {
-      // Typing the one team's name keeps its wiki choice.
-      const was =
-        wikiChoices[t] ??
-        (teams.length === 1 && before.length === 1 ? renamedWikiChoice(wikiChoices[before[0]], before[0], t) : undefined);
-      const stillValid = was && (was.mode !== "existing" || teamWikis(rows, t).some((w) => w.member === was.member));
-      next[t] = stillValid ? was : defaultWikiChoice(rows, t, parent);
-    }
-    if (JSON.stringify(next) !== JSON.stringify(wikiChoices)) wikiChoices = next;
-  });
-
-  // The folder last chosen for a new wiki, offered again when one is ticked.
-  let lastParent = $state<string | null>(null);
-
-  function chooseWiki(team: string, member: string) {
-    wikiChoices[team] = { mode: "existing", member };
-  }
-
-  function toggleNewWiki(team: string, on: boolean) {
-    wikiChoices[team] = on
-      ? { mode: "new", parent: lastParent ?? commonParent(rows), name: `${team}-Wiki` }
-      : { mode: "none" };
-  }
-
-  async function chooseWikiParent(team: string) {
-    const c = wikiChoices[team];
-    const folder = await openDialog({
-      directory: true,
-      title: `Where the ${team} wiki goes`,
-      defaultPath: c?.mode === "new" && c.parent ? c.parent : undefined,
-    });
-    if (typeof folder === "string" && c?.mode === "new") {
-      lastParent = folder;
-      wikiChoices[team] = { ...c, parent: folder };
+  // An existing wiki: picked, then its dry run read so the moves are seen
+  // before anything moves.
+  let mapPlan = $state<WikiMapPlan | null>(null);
+  async function chooseExisting() {
+    const folder = await openDialog({ directory: true, title: "The wiki to lay Ken's structure over" });
+    if (typeof folder !== "string") return;
+    kb = { mode: "existing", path: folder, map: true };
+    mapPlan = null;
+    try {
+      mapPlan = await api.wikiMapPlan(folder);
+    } catch (e) {
+      error = String(e);
     }
   }
 
@@ -128,7 +79,7 @@
    *  already here are kept. */
   async function addRepos() {
     error = null;
-    const chosen = await openDialog({ directory: true, multiple: true, title: "Pick the repos Ken should know" });
+    const chosen = await openDialog({ directory: true, multiple: true, title: "Pick the sources Ken should know" });
     const list = Array.isArray(chosen) ? chosen : typeof chosen === "string" ? [chosen] : [];
     if (list.length === 0) return;
     busy = true;
@@ -151,24 +102,32 @@
     if (row.path) removed = [...removed, row.path];
   }
 
+  // The knowledge base made this session, so a retry after a failed Confirm
+  // does not lay it down twice.
+  let made = $state<SetupRepoRow | null>(null);
+
   async function confirm() {
     if (busy) return;
     busy = true;
     error = null;
+    const workspace = name.trim() || "Workspace";
     try {
-      let all = [...rows];
-      // New knowledge bases: each is laid down from the template and joins
-      // the set-up as its team's wiki, holding the tickets and decisions too.
-      for (const t of teams) {
-        const c = wikiChoices[t];
-        if (c?.mode !== "new" || !c.parent) continue;
-        const row =
-          created[t] ??
-          (await api.setupCreateWiki(newWikiPath(c.parent, c.name), t, coveredRepos(all, t), all.map((r) => r.member)));
-        created[t] = row;
-        all = [...all.filter((r) => r.path !== row.path), row];
+      const taken = rows.map((r) => r.member);
+      let kbRow = made;
+      if (!kbRow && kb.mode === "new" && kb.parent) {
+        kbRow = await api.setupCreateWiki(newWikiPath(kb.parent, kb.name), workspace, coveredRepos(rows), taken);
+      } else if (!kbRow && kb.mode === "existing" && kb.path) {
+        kbRow = (await api.setupOverlayWiki(kb.path, workspace, coveredRepos(rows, kb.path), taken)).row;
       }
-      await app.confirmSetupRepos(name.trim() || "Code", all);
+      if (!kbRow) throw new Error("Choose where the knowledge base is saved.");
+      made = kbRow;
+      await app.confirmSetupRepos(workspace, withKnowledgeBase(rows, kbRow));
+      // An existing wiki's pages go into the sections once the person saw
+      // the dry run and left it ticked.
+      if (kb.mode === "existing" && kb.path && kb.map && mapPlan && mapPlan.moves.length > 0) {
+        const done = await api.wikiMapApply(kb.path, mapPlan.moves);
+        toast.show(`${done.moved.length} pages moved into the sections${done.unresolved.length ? `; ${done.unresolved.length} links left as they were` : ""}.`);
+      }
       onclose();
     } catch (e) {
       error = String(e);
@@ -176,42 +135,135 @@
       busy = false;
     }
   }
-
-  const STATES: { value: IndexState; label: string }[] = [
-    { value: "entities", label: "read in full" },
-    { value: "search", label: "search only" },
-    { value: "off", label: "left out" },
-  ];
 </script>
 
 <div class="setup">
   <ol class="steps" aria-label="Set-up steps">
-    {#each [["repos", "Repos"], ["team", "Team"], ["index", "Read"]] as [s, label], i}
-      <li class:current={step === s}>{i + 1} · {label}</li>
+    {#each STEPS as s, i (s.step)}
+      <li class:current={step === s.step}>{i + 1} · {s.label}</li>
     {/each}
   </ol>
 
-  {#if step === "repos"}
-    <h2>Which repos should Ken know?</h2>
+  {#if step === "name"}
+    <h2>Name the workspace</h2>
     <p class="note">
-      Pick each repo, wherever it lives; pick a folder of repos to add every repo in it. Ken reads
-      what is in each one to propose what it is, and reads nothing until you confirm. Say in a line
-      what each repo is for: it helps Ken use it well, and the first-wiki draft reads it.
+      A workspace is the sources Ken knows and the knowledge base it keeps beside them. Its name is how Ken and the
+      knowledge base call it.
+    </p>
+    <label class="field">
+      <span class="field-label">Workspace name</span>
+      <input
+        class="input"
+        value={name}
+        placeholder="The team's or the product's name"
+        oninput={(e) => setName((e.currentTarget as HTMLInputElement).value)}
+      />
+    </label>
+    <div class="actions">
+      <button
+        class="btn btn-primary"
+        disabled={!name.trim()}
+        onclick={() => {
+          if (kb.mode === "new" && !kb.parent) kb = { ...kb, parent: commonParent(rows) };
+          step = "base";
+        }}>Next</button
+      >
+      <button class="btn btn-ghost" onclick={onclose}>Cancel</button>
+    </div>
+  {:else if step === "base"}
+    <h2>Where the knowledge base is saved</h2>
+    <p class="note">
+      The knowledge base is one repo: the library, the decisions log, the tickets and its settings. Ken writes and
+      commits only there, never in a source.
+    </p>
+    <div class="choice">
+      <label class="check-row">
+        <input type="radio" name="kb" checked={kb.mode === "new"} onchange={() => (kb = defaultKb(name, commonParent(rows)))} />
+        <span>A new repo, from Ken's template</span>
+      </label>
+      {#if kb.mode === "new"}
+        {@const c = kb}
+        <div class="where-row">
+          <input
+            class="input"
+            value={c.name}
+            aria-label="Folder name of the knowledge base"
+            oninput={(e) => (kb = { ...c, name: (e.currentTarget as HTMLInputElement).value })}
+          />
+          <span class="in">in</span>
+          <button class="btn where" title={c.parent ?? ""} onclick={() => void chooseParent()}>
+            <FolderOpen size={14} strokeWidth={1.75} aria-hidden="true" />
+            <span class="where-path">{c.parent ?? "Choose a folder…"}</span>
+          </button>
+        </div>
+        {#if c.parent}
+          <p class="note indent">
+            Ken makes <span class="mono">{newWikiPath(c.parent, c.name || `${name}-Wiki`)}</span> from the template, with one
+            git commit. It stays on this computer; adding a remote and pushing is yours to do.
+          </p>
+        {/if}
+      {/if}
+      <label class="check-row">
+        <input type="radio" name="kb" checked={kb.mode === "existing"} onchange={() => void chooseExisting()} />
+        <span>An existing wiki, with Ken's structure laid over it</span>
+      </label>
+      {#if kb.mode === "existing"}
+        {@const c = kb}
+        <div class="where-row">
+          <button class="btn where" title={c.path ?? ""} onclick={() => void chooseExisting()}>
+            <FolderOpen size={14} strokeWidth={1.75} aria-hidden="true" />
+            <span class="where-path">{c.path ?? "Choose the wiki's folder…"}</span>
+          </button>
+        </div>
+        {#if c.path}
+          <p class="note indent">Ken adds only the files it lacks (the sections' indexes, the decisions log, the templates, its settings). Nothing there is changed or deleted.</p>
+          {#if mapPlan}
+            {#if mapPlan.moves.length > 0}
+              <label class="check-row indent">
+                <input type="checkbox" checked={c.map} onchange={(e) => (kb = { ...c, map: e.currentTarget.checked })} />
+                <span>Move {mapPlan.moves.length} pages into the sections on Confirm (a dry run, below)</span>
+              </label>
+              <div class="moves indent">
+                {#each mapPlan.moves as m (m.from)}
+                  <div class="move"><span class="mono">{m.from}</span> → <span class="mono">{m.to}</span> <span class="evidence">{m.why}</span></div>
+                {/each}
+                {#each mapPlan.left as [page, why] (page)}
+                  <div class="move"><span class="mono">{page}</span> <span class="evidence">stays: {why}</span></div>
+                {/each}
+              </div>
+              <p class="note indent">Links are rewritten where Ken is sure of the target; the rest are listed. One commit and a log line.</p>
+            {:else}
+              <p class="note indent">Every page is already in a section.</p>
+            {/if}
+          {/if}
+        {/if}
+      {/if}
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" disabled={!kbReady(kb)} onclick={() => (step = "sources")}>Next</button>
+      <button class="btn btn-ghost" onclick={() => (step = "name")}>Back</button>
+    </div>
+  {:else}
+    <h2>Sources</h2>
+    <p class="note">
+      Pick each repo or folder, wherever it lives; pick a folder of repos to add every repo in it. Ken reads what is in
+      each to propose its kind, and reads nothing until you confirm. Say in a line what each is for: the knowledge
+      base lists it. Connectors come later.
     </p>
     <div class="actions">
       <button class="btn btn-primary" disabled={busy} onclick={addRepos}>
-        {busy ? "Reading…" : rows.length === 0 ? "Pick repos…" : "Add more repos…"}
+        {busy ? "Reading…" : rows.length === 0 ? "Pick sources…" : "Add more…"}
       </button>
     </div>
 
     {#if rows.length > 0}
       <div class="table" role="table">
         <div class="tr head" role="row">
-          <span>Include</span><span>Repo</span><span>Kind</span><span>Index</span><span></span>
+          <span>Index</span><span>Source</span><span>Kind</span><span></span>
         </div>
         {#each rows as row (row.path ?? row.member)}
           <div class="tr" role="row" class:dim={!row.include}>
-            <span><input type="checkbox" bind:checked={row.include} aria-label="Include {row.member}" /></span>
+            <span><input type="checkbox" bind:checked={row.include} aria-label="Index {row.member}" /></span>
             <span class="repo">
               <span class="mono">{row.member}</span>
               <span class="evidence mono" title={row.path ?? ""}>{row.path}</span>
@@ -219,13 +271,13 @@
               <textarea
                 class="textarea description"
                 rows="2"
-                placeholder="What is this repo for, and how is it used?"
+                placeholder="What is this source for, and how is it used?"
                 bind:value={row.description}
                 aria-label="What {row.member} is for"
               ></textarea>
             </span>
             <span class="kinds">
-              {#each KINDS as k}
+              {#each KINDS as k (k)}
                 <button
                   class="chip"
                   class:on={row.kind.includes(k)}
@@ -235,153 +287,29 @@
               {/each}
             </span>
             <span>
-              <select bind:value={row.index} aria-label="Index state for {row.member}">
-                {#each STATES as s}<option value={s.value}>{s.label}</option>{/each}
-              </select>
-            </span>
-            <span>
               <button class="remove" title="Take it out" aria-label="Remove {row.member}" onclick={() => remove(row)}>✕</button>
             </span>
           </div>
         {/each}
       </div>
       <p class="note">
-        Team and wiki repos are read in full: Ken maps the people, decisions and tickets in them. Code
-        and reference repos are search only: found by search and read by Claude when asked, and Ken never
-        commits into them. Secrets (<span class="mono">.env</span>, keys,
-        <span class="mono">credentials.json</span>) are never read.
+        A source is indexed or left out: searched, in the code index and read by Claude when asked. Ken never commits
+        into a source. Dependencies, build output, tests, generated files, binaries and secrets are never indexed; more
+        rules go in the knowledge base's settings.
       </p>
     {/if}
+    <p class="counts"><strong>{summary.indexed}</strong> indexed · <strong>{summary.left}</strong> left out</p>
     <div class="actions">
-      <button class="btn btn-primary" disabled={rows.every((r) => !r.include)} onclick={goTeam}>Next</button>
-      <button class="btn btn-ghost" onclick={onclose}>Cancel</button>
-    </div>
-  {:else if step === "team"}
-    <h2>Your team</h2>
-    {#if !split}
-      <p class="note">
-        The repos you picked are one team. It keeps one wiki, and Home, search and chat cover its repos.
-      </p>
-      <label class="field">
-        <span class="field-label">Team name</span>
-        <input
-          class="input"
-          value={teamName}
-          placeholder="The team's name"
-          oninput={(e) => setTeamName((e.currentTarget as HTMLInputElement).value)}
-        />
-      </label>
-      <p class="note">
-        {#each rows.filter((r) => r.include) as row, i (row.path ?? row.member)}{i > 0 ? " · " : ""}<span class="mono">{row.member}</span>{/each}
-      </p>
-      {#if teams.length === 1}
-        <h3>Wiki</h3>
-        {@render wikiRow(teams[0])}
-      {/if}
-    {:else}
-      <p class="note">Repos with the same team name are one team, and each team keeps one wiki.</p>
-      <div class="table" role="table">
-        <div class="tr head teams" role="row"><span>Repo</span><span>Team</span></div>
-        {#each rows.filter((r) => r.include) as row (row.path ?? row.member)}
-          <div class="tr teams" role="row">
-            <span class="mono">{row.member}</span>
-            <input
-              class="input team"
-              placeholder="No team"
-              value={row.team ?? ""}
-              oninput={(e) => (row.team = (e.currentTarget as HTMLInputElement).value.trim() || null)}
-              aria-label="Team for {row.member}"
-            />
-          </div>
-        {/each}
-      </div>
-      {#each teams as t (t)}
-        <h3>{t}'s wiki</h3>
-        {@render wikiRow(t)}
-      {/each}
-    {/if}
-    <div>
-      <button class="btn btn-link" onclick={toggleSplit}>
-        {split ? "Put them all on one team" : "These repos belong to more than one team"}
+      <button class="btn btn-primary" disabled={busy || !kbReady(kb)} onclick={confirm}>
+        {busy ? "Setting up…" : "Confirm and start indexing"}
       </button>
+      <button class="btn btn-ghost" onclick={() => (step = "base")}>Back</button>
     </div>
-    <div class="actions">
-      <button class="btn btn-primary" disabled={!choicesReady} onclick={goIndex}>Next</button>
-      <button class="btn btn-ghost" onclick={() => (step = "repos")}>Back</button>
-    </div>
-  {:else}
-    <h2>Ready to read</h2>
     <p class="note">
-      Confirm saves the workspace on this computer and starts reading the repos in the background; you
-      can use Ken while it runs. A wiki or team repo made in step 2 is created first.
+      Confirm lays the knowledge base down and indexes every source in the background, so search and the code index
+      work at once. Building the library from the sources is its own step, in Settings, at the pace you set there.
     </p>
-    <p class="counts">
-      <strong>{summary.entities}</strong> read in full · <strong>{summary.search}</strong>
-      search only · <strong>{summary.off}</strong> left out
-    </p>
-    <label class="field">
-      <span class="field-label">Workspace name</span>
-      <input class="input" bind:value={name} oninput={() => (nameTouched = true)} />
-    </label>
-    <div class="actions">
-      <button class="btn btn-primary" disabled={busy || summary.entities + summary.search === 0} onclick={confirm}>
-        {busy ? "Setting up…" : "Confirm and start reading"}
-      </button>
-      <button class="btn btn-ghost" onclick={() => (step = "team")}>Back</button>
-    </div>
   {/if}
-
-  {#snippet wikiRow(t: string)}
-    {@const c = wikiChoices[t] ?? { mode: "none" }}
-    {@const existing = teamWikis(rows, t)}
-    <div class="wiki">
-      {#if existing.length > 0}
-        <span class="note">
-          {#if existing.length === 1}
-            Uses <span class="mono">{existing[0].member}</span>, the wiki repo you picked.
-          {:else}
-            Uses
-            <select
-              aria-label="Wiki for {t}"
-              value={c.mode === "existing" ? c.member : existing[0].member}
-              onchange={(e) => chooseWiki(t, (e.currentTarget as HTMLSelectElement).value)}
-            >
-              {#each existing as w (w.member)}<option value={w.member}>{w.member}</option>{/each}
-            </select>
-          {/if}
-        </span>
-      {:else}
-        <label class="check-row">
-          <input type="checkbox" checked={c.mode === "new"} onchange={(e) => toggleNewWiki(t, e.currentTarget.checked)} />
-          <span>Create a wiki for {t} from the Ways of Working template</span>
-        </label>
-        {#if c.mode === "new"}
-          <div class="wiki-where">
-            <input
-              class="input"
-              value={c.name}
-              aria-label="Folder name of the {t} wiki"
-              oninput={(e) => (wikiChoices[t] = { ...c, name: (e.currentTarget as HTMLInputElement).value })}
-            />
-            <span class="in">in</span>
-            <button class="btn where" title={c.parent ?? ""} onclick={() => chooseWikiParent(t)}>
-              <FolderOpen size={14} strokeWidth={1.75} aria-hidden="true" />
-              <span class="where-path">{c.parent ?? "Choose a folder…"}</span>
-            </button>
-          </div>
-          <p class="note">
-            {#if c.parent}
-              Ken makes <span class="mono">{newWikiPath(c.parent, c.name || `${t}-Wiki`)}</span> from the template,
-              with one git commit. Its pages are written as sources are ingested. It stays on this computer;
-              adding a remote and pushing is yours to do.
-            {:else}
-              Choose where the wiki folder goes, or untick it to go without one for now.
-            {/if}
-          </p>
-        {/if}
-      {/if}
-    </div>
-  {/snippet}
 
   {#if error}<div class="error">{error}</div>{/if}
 </div>
@@ -416,6 +344,9 @@
     line-height: 1.5;
     color: var(--ink-secondary);
   }
+  .indent {
+    padding-left: 26px;
+  }
   .counts {
     margin: 0;
     font-size: 13px;
@@ -425,27 +356,6 @@
     display: flex;
     gap: 8px;
     margin-top: 4px;
-  }
-  .table {
-    display: flex;
-    flex-direction: column;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: auto;
-    max-height: 46vh;
-  }
-  .tr {
-    display: grid;
-    grid-template-columns: 56px minmax(220px, 2.4fr) minmax(170px, 1.2fr) 140px 28px;
-    gap: 8px;
-    align-items: start;
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--border);
-    font-size: 12.5px;
-  }
-  .tr.teams {
-    grid-template-columns: minmax(160px, 1fr) minmax(160px, 1fr);
-    align-items: center;
   }
   .field {
     display: flex;
@@ -458,7 +368,7 @@
     font-weight: 600;
     color: var(--ink-2);
   }
-  .wiki {
+  .choice {
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -475,19 +385,16 @@
     color: var(--ink);
     cursor: pointer;
   }
-  .wiki-where {
+  .where-row {
     display: flex;
     align-items: center;
     gap: 8px;
     min-width: 0;
     padding-left: 26px;
   }
-  .wiki-where .input {
+  .where-row .input {
     width: 160px;
     flex: none;
-  }
-  .wiki-where + .note {
-    padding-left: 26px;
   }
   .in {
     font-size: 13px;
@@ -503,9 +410,33 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  h3 {
-    margin: 6px 0 0;
-    font-size: 14px;
+  .moves {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 30vh;
+    overflow: auto;
+    font-size: 12.5px;
+  }
+  .move {
+    overflow-wrap: anywhere;
+  }
+  .table {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: auto;
+    max-height: 46vh;
+  }
+  .tr {
+    display: grid;
+    grid-template-columns: 56px minmax(220px, 2.4fr) minmax(170px, 1.2fr) 28px;
+    gap: 8px;
+    align-items: start;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
   }
   .description {
     width: 100%;
@@ -546,9 +477,6 @@
   .evidence {
     font-size: 11.5px;
     color: var(--ink-tertiary);
-  }
-  .team {
-    width: 100%;
   }
   .kinds {
     display: flex;

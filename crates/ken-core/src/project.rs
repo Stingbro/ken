@@ -215,17 +215,28 @@ impl Project {
         })
     }
 
-    /// Load and parse this project's `.kenignore` (project root, not
-    /// `.ken/`) into rules per kenignore design D6/D1. Missing file reads as
-    /// empty rules, not an error — most projects won't have one. This is the
-    /// "user rule set" tier in D2's precedence order; callers combine it with
-    /// any built-in rule sets (task 1.3) via `kenignore::classify`'s
-    /// `rule_sets` slice, user rules last so they can override built-ins.
-    ///
-    /// A workspace member also takes the lines of its workspace's own
-    /// `.kenignore` (the one setup writes, beside `.ken-workspace/`) that
-    /// reach inside it: `member/path` lines, and patterns with no folder in
-    /// them (`*.log`). They come first, so the member's own file overrides.
+    /// Every index rule this source reads, in the order `kenignore::classify`
+    /// folds them (knowledge-core decision 34): the fixed built-ins, the repo
+    /// switched off as a whole, the older `.kenignore` files (read only, as
+    /// legacy: Ken writes none now), then the rules in the knowledge base's
+    /// `.ken/knowledge.json`, the one place a person writes them, which win.
+    pub fn index_rules(&self) -> Vec<crate::kenignore::Rule> {
+        let mut rules = crate::kenignore::built_in_rule_sets();
+        rules.extend(crate::kenignore::repo_rules_for(&self.root));
+        rules.extend(self.kenignore_rules());
+        if let Some(settings) = crate::knowledge_settings::for_repo(&self.root) {
+            rules.extend(crate::kenignore::parse_lines(&settings.index_rules()));
+        }
+        rules
+    }
+
+    /// The older `.kenignore` rules, read as legacy: this project's own file
+    /// (project root, not `.ken/`) and the lines of its workspace's
+    /// `.kenignore` (the one an older set-up wrote, beside
+    /// `.ken-workspace/`) that reach inside it: `member/path` lines, and
+    /// patterns with no folder in them (`*.log`). The workspace's lines come
+    /// first, so the member's own file overrides. Missing files read as no
+    /// rules.
     pub fn kenignore_rules(&self) -> Vec<crate::kenignore::Rule> {
         let path = self.root.join(".kenignore");
         let text = fs::read_to_string(&path).unwrap_or_default();

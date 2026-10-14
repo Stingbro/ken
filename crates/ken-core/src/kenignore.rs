@@ -1,74 +1,52 @@
-//! `.kenignore` parsing and tier classification (kenignore tasks 1.1-1.3).
+//! Index rules: which paths are indexed (knowledge-core decision 34).
 //!
-//! Pure module, no filesystem IO (per design D6): `parse` turns `.kenignore`
-//! file text into an ordered list of [`Rule`]s, and `classify` folds one or
-//! more rule sets (built-ins first, user file last, per D2) against a path
-//! to decide its [`Tier`]. Rule sets are plain data — callers (scan.rs's
-//! walk, engine.rs's index rebuild) own reading `.kenignore` off disk and
-//! composing the built-in/user rule sets; this module never touches a file
-//! handle.
+//! Two states: a path is indexed or it isn't. Pure module, no filesystem IO:
+//! `parse` turns rule text into an ordered list of [`Rule`]s, and `classify`
+//! folds rule sets (the fixed built-ins first, a person's rules last) against
+//! a path to decide its [`Tier`]. `Project::index_rules` gathers every rule a
+//! source reads: the built-ins, the repo switched off as a whole, the older
+//! `.kenignore` files (read, never written), and the rules in the knowledge
+//! base's `.ken/knowledge.json`, which is where a person writes them now.
 //!
-//! ## Syntax (D1)
+//! ## Syntax
 //!
-//! - A bare pattern (`build/`) ⇒ [`Tier::Ignore`] (today's default: not
-//!   indexed at all).
-//! - A `~`-prefixed pattern (`~.ken/tasks/`) ⇒ [`Tier::SearchOnly`].
-//! - A `!`-prefixed pattern (`!README.md`) ⇒ [`Tier::Full`] (i.e. this is
-//!   *kenignore's own* negation, not gitignore's — it always means "index
-//!   this fully", overriding an earlier broader rule via last-match-wins).
+//! - A bare pattern (`build/`) is not indexed.
+//! - A `!`-prefixed pattern (`!README.md`) is indexed, overriding an earlier
+//!   broader rule via last-match-wins.
+//! - A `~`-prefixed pattern, from the time a path could be searchable but not
+//!   read for the graph, reads as indexed: it was searchable.
 //! - `#` starts a comment; blank lines are skipped.
-//! - `\~` / `\!` escape a literal leading `~`/`!` in the glob itself (so a
-//!   file *named* `~foo` or `!foo` can still be matched), and always
-//!   classify as [`Tier::Ignore`] (no tier prefix was consumed).
-//! - After the tier prefix is stripped, the remainder is a gitignore-style
-//!   glob: `dir/` is directory-only, a leading `/` anchors to the rule
-//!   set's root, `**` matches across path segments, etc. — delegated
-//!   entirely to the `ignore` crate's `GitignoreBuilder`/`Gitignore`
-//!   (D6's "candidate base").
-//! - Malformed lines (a bare `~`/`!` with no pattern, or a glob the
-//!   underlying matcher rejects) are skipped tolerantly, like every other
-//!   parser in this plan (D4) — never a hard error.
-//! - Last-match-wins across the whole effective rule list (built-ins then
-//!   user file, in file order): a later rule overrides an earlier one for
-//!   any path both match, including a user `!pattern` overriding a
-//!   built-in `~pattern` or bare pattern.
+//! - `\~` / `\!` escape a literal leading `~`/`!` in the glob itself, and
+//!   always classify as not indexed.
+//! - After the prefix is stripped, the remainder is a gitignore-style glob
+//!   (`dir/` is directory-only, a leading `/` anchors, `**` crosses folders),
+//!   delegated to the `ignore` crate's matcher.
+//! - Malformed lines (a bare `~`/`!`) are skipped, never a hard error.
 //!
-//! ## Precedence (D2)
+//! ## Precedence
 //!
-//! [`classify`] only implements steps 2-4: fold the given rule sets in
-//! order, default to [`Tier::Full`] if nothing matches. Step 1 (hard
-//! ignores: `project.json`'s `excluded` list, plus a small built-in skip
-//! list of directories that are never indexed at any tier) is split
-//! between this module's own always-on directory check and the caller —
-//! `project.json` exclusion is a `Project`-level concern this pure module
-//! has no access to, so callers must additionally check that themselves
-//! (e.g. `project.is_excluded(path) || classify(..) == Tier::Ignore`)
-//! before treating a path as indexable. `!` can never resurrect a
-//! hard-ignored path; that's why the hard-ignore check short-circuits
-//! before any rule folding happens.
+//! [`classify`] folds the given rule sets in order and defaults to
+//! [`Tier::Indexed`]. Hard ignores come first and nothing brings them back:
+//! VCS and dependency folders and secrets. `project.json`'s `excluded` list
+//! is checked by the caller.
 
 use std::path::Path;
 
-/// How deeply a path is indexed. Numeric values match the `chunks.tier`
-/// column (`0` = full, `1` = search-only) added in the same schema bump as
-/// semantic-index; `Ignore` never produces a `chunks` (or `files`) row at
-/// all, so it has no on-disk representation.
+/// Whether a path is indexed: the two states of decision 34. An ignored
+/// path never produces a `files` or `chunks` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
-    /// Indexed for both keyword/semantic search AND fed to consumers like
-    /// knowledge-model extraction and profiler doc sampling.
-    Full = 0,
-    /// Indexed for keyword/semantic search only; excluded from knowledge
-    /// model extraction and profiler doc sampling (kenignore task 1.5).
-    SearchOnly = 1,
-    /// Not indexed at all — identical to today's exclusion behavior.
-    Ignore = 2,
+    /// Indexed: searchable by keyword and meaning, in the code index and the
+    /// graph.
+    Indexed,
+    /// Not indexed at all.
+    Ignored,
 }
 
 /// One parsed line from a `.kenignore` file (or a built-in rule set).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
-    /// The tier this rule assigns when it's the last matching rule.
+    /// The state this rule assigns when it's the last matching rule.
     pub tier: Tier,
     /// The gitignore-style glob, with the tier prefix (`~`/`!`) already
     /// stripped and any `\~`/`\!` escape already resolved to a literal
@@ -78,26 +56,14 @@ pub struct Rule {
     pub pattern: String,
 }
 
-/// Directories that are never indexed at any tier, regardless of any
-/// `.kenignore` rule — `!` cannot resurrect these (D2, step 1). This is
-/// deliberately a small, fixed list; `project.json`'s `excluded` list is
-/// the other half of "hard ignores" and is checked by the caller, not
-/// here (this module has no `Project` access — see the module doc).
+/// Folders that are never indexed, whatever a rule says: no `!` line brings
+/// them back. VCS and the biggest dependency folder. `project.json`'s
+/// `excluded` list is checked by the caller.
 ///
-/// Deliberately does NOT include `.ken` as a blanket path component. D2's
-/// hard-ignore text is "`.git/`, `node_modules/`, the project's own `.ken/`
-/// DB internals, etc." — that `.ken/` clause describes scan.rs's existing
-/// walker filter (`WalkBuilder::filter_entry`, `name != ".ken"`), which
-/// already keeps the real on-disk `.ken/` directory out of every scan
-/// before any path ever reaches `classify`. It is not this module's job to
-/// re-block it. Blocking the whole `.ken` component here would also make
-/// D2 step 2's own worked example unreachable: `~.ken/tasks/` (ken-tasks
-/// D6) is a built-in tier rule specifically meant to route
-/// non-DB-internal `.ken/tasks/...` paths (e.g. synthetic chunk paths a
-/// future ken-tasks feature indexes directly, bypassing the file walk) to
-/// `SearchOnly`/`Full`, overridable by the user file. A user `!` line
-/// could never resurrect that if this list swallowed all of `.ken` first.
-const HARD_IGNORE_DIRS: &[&str] = &[".git", "node_modules"];
+/// `.ken` is not listed: the scan's walker keeps the real `.ken/` folder out
+/// before any path reaches `classify`, and walks only its allowlisted
+/// folders (`.ken/memory/`, `.ken/tasks/`) on purpose.
+const HARD_IGNORE_DIRS: &[&str] = &[".git", ".hg", ".svn", "node_modules"];
 
 /// Parse `.kenignore`-style text into an ordered list of rules. Pure: no
 /// filesystem access, no validation beyond what's needed to skip a
@@ -112,15 +78,15 @@ pub fn parse(text: &str) -> Vec<Rule> {
         }
 
         let (tier, pattern) = if let Some(rest) = line.strip_prefix("\\~") {
-            (Tier::Ignore, format!("~{rest}"))
+            (Tier::Ignored, format!("~{rest}"))
         } else if let Some(rest) = line.strip_prefix("\\!") {
-            (Tier::Ignore, format!("!{rest}"))
-        } else if let Some(rest) = line.strip_prefix('~') {
-            (Tier::SearchOnly, rest.to_string())
-        } else if let Some(rest) = line.strip_prefix('!') {
-            (Tier::Full, rest.to_string())
+            (Tier::Ignored, format!("!{rest}"))
+        } else if let Some(rest) = line.strip_prefix('~').or_else(|| line.strip_prefix('!')) {
+            // `~` was search-only, which was indexed for search: with two
+            // states it reads as indexed.
+            (Tier::Indexed, rest.to_string())
         } else {
-            (Tier::Ignore, line.to_string())
+            (Tier::Ignored, line.to_string())
         };
 
         if pattern.is_empty() {
@@ -198,26 +164,22 @@ pub fn malformed_lines(text: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Classify `path` against one or more rule sets, folded in the given
-/// order (built-ins first, user `.kenignore` last, per D2) using
-/// gitignore's last-match-wins semantics: the last rule (across *all*
-/// rule sets, in order) that matches `path` decides the tier. If nothing
-/// matches, the default is [`Tier::Full`] (D2 step 4) — with no
-/// `.kenignore` at all, every non-hard-ignored path is `Full`, identical
-/// to today's behavior (the design's stated migration: none).
+/// Classify `path` against one or more rule sets, folded in the given order
+/// (built-ins first, a person's rules last) with gitignore's last-match-wins:
+/// the last rule, across every set, that matches `path` decides. With no
+/// rule matching, a path is indexed.
 ///
-/// `path` should be project-relative, forward-slash-separated, without a
-/// leading `/` (matching `rel_path` conventions used elsewhere in this
-/// crate). `is_dir` tells the matcher whether `path` names a directory,
-/// which matters for directory-only patterns (`dir/`).
+/// `path` is project-relative, forward-slash-separated, without a leading
+/// `/`. `is_dir` tells the matcher whether `path` names a folder, which
+/// matters for folder-only patterns (`dir/`).
 pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
     let norm = path.trim_start_matches('/');
 
     if is_hard_ignored(norm) {
-        return Tier::Ignore;
+        return Tier::Ignored;
     }
 
-    let mut result = Tier::Full;
+    let mut result = Tier::Indexed;
     for rules in rule_sets {
         for rule in rules.iter() {
             if rule_matches(rule, norm, is_dir) {
@@ -228,49 +190,36 @@ pub fn classify(path: &str, is_dir: bool, rule_sets: &[&[Rule]]) -> Tier {
     result
 }
 
-/// Built-in rule sets that ship with Ken itself, ahead of any user
-/// `.kenignore` (D2 step 2 — built-ins first, user rules appended after so a
-/// `!` line can override them). Per design.md D2/1.3, this is meant to hold
-/// per-member pseudo-tier rules from ken-memory and the `~.ken/tasks/`
-/// search-only rule from ken-tasks. It stays an empty rule set, on purpose:
-/// every built-in rule those features actually needed turned out to be
-/// **scoped to one member**, and this function is parameterless and folded
-/// into *every* project's classify call (`scan::scan`,
-/// `scan::refresh_path`), so putting them here would apply one member's
-/// semantics to all of them.
+/// The fixed built-ins every source reads first (knowledge-core decision
+/// 34): dependencies, build output, tests, minified and generated files,
+/// binaries and archives, and a knowledge base's page templates. VCS folders
+/// and secrets are hard ignores ([`HARD_IGNORE_DIRS`], [`is_secret_name`]),
+/// so no line brings them back; a `!` line in `.ken/knowledge.json` brings
+/// back any of these. Media is not listed: Ken transcribes video.
 ///
-/// The per-member rule sets live next to the feature that owns them, and
-/// whoever ingests that member folds them into that classify call's
-/// `rule_sets` — the same seam `Project::kenignore_rules()` uses for the
-/// user tier:
-///
-/// - `memory::workspace_builtin_rules()` — the workspace pseudo-member
-///   (ken-memory 1.6).
-///
-/// What does belong here is a rule global to every project: archives,
-/// what a tool writes, page templates and tests. An archive or disk image
-/// answers no question by its name and Ken cannot read inside it, so it is
-/// not indexed; a user `!*.zip` line brings the names back. Media is not
-/// listed: Ken transcribes video. Secrets are not a rule at all but a hard
-/// ignore ([`is_secret_name`]), so no `!` line can bring them back.
+/// The workspace's own memory folder has rules of its own
+/// (`memory::workspace_builtin_rules`), folded only for it.
 pub fn built_in_rule_sets() -> Vec<Rule> {
-    ARCHIVE_PATTERNS
+    DEPENDENCY_PATTERNS
         .iter()
+        .chain(BUILD_PATTERNS)
+        .chain(ARCHIVE_PATTERNS)
+        .chain(BINARY_PATTERNS)
         .chain(GENERATED_PATTERNS)
         .chain(TEMPLATE_PATTERNS)
         .chain(TEST_PATTERNS)
-        .map(|p| Rule { tier: Tier::Ignore, pattern: (*p).into() })
+        .map(|p| Rule { tier: Tier::Ignored, pattern: (*p).into() })
         .collect()
 }
 
 /// Tests are not indexed by default (knowledge-core decision 17): a test
 /// restates the code it checks in a hundred near-copies, and outranked the
 /// code it tests. Test folders, and test files named the way each language
-/// names them (the ones `contenttype` calls a test). A team brings them
-/// back with a `!` line in `.kenignore` (`!tests/`, `!*.test.ts`), which
-/// the user's rules, folded last, win with. A file already indexed leaves
-/// the index on the next scan, like any other newly ignored path.
-const TEST_PATTERNS: &[&str] = &[
+/// names them (the ones `contenttype` calls a test). A team brings them back
+/// with a `!` line in `.ken/knowledge.json` (`"!tests/"`, `"!*.test.ts"`),
+/// which, folded last, wins. A file already indexed leaves the index on the
+/// next scan, like any other newly ignored path.
+pub const TEST_PATTERNS: &[&str] = &[
     "test/",
     "tests/",
     "__tests__/",
@@ -292,9 +241,19 @@ const TEST_PATTERNS: &[&str] = &[
     "*Test.cs",
 ];
 
+/// Folders a package manager fills. `node_modules` is a hard ignore.
+const DEPENDENCY_PATTERNS: &[&str] = &["vendor/", "bower_components/", "Pods/", "venv/", "__pycache__/", "site-packages/"];
+
+/// Folders a build writes. The scan's walker skips the common ones before
+/// they are read (`scan::JUNK_DIRS`); these say so for every caller.
+const BUILD_PATTERNS: &[&str] = &["target/", "dist/", "build/", "out/", "obj/", ".next/", ".gradle/"];
+
+/// Compiled files: nothing in them a person reads.
+const BINARY_PATTERNS: &[&str] =
+    &["*.exe", "*.dll", "*.so", "*.dylib", "*.o", "*.obj", "*.a", "*.lib", "*.class", "*.pyc", "*.wasm", "*.pdb"];
+
 /// Files a tool writes and no one reads for meaning: minified bundles,
 /// source maps, lockfiles. They match many searches a little and answer none.
-/// A `!` line brings one back.
 const GENERATED_PATTERNS: &[&str] = &[
     "*.min.js", "*.min.css", "*.map", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock",
     "uv.lock", "Gemfile.lock", "composer.lock",
@@ -305,12 +264,14 @@ const GENERATED_PATTERNS: &[&str] = &[
 /// answers none.
 const TEMPLATE_PATTERNS: &[&str] = &["Templates/"];
 
+/// An archive or disk image answers no question by its name and Ken cannot
+/// read inside it.
 const ARCHIVE_PATTERNS: &[&str] = &["*.zip", "*.7z", "*.rar", "*.tar", "*.gz", "*.tgz", "*.iso", "*.jar"];
 
-/// File names that hold secrets, never indexed at any tier: search results,
-/// chunks and entity prompts would all carry their contents. Dotfiles are
-/// already hidden by the walker; this also covers the plain-named ones.
-/// `*.key` includes Keynote decks, which Ken cannot read anyway.
+/// File names that hold secrets, never indexed: search results and chunks
+/// would carry their contents. Dotfiles are already hidden by the walker;
+/// this also covers the plain-named ones. `*.key` includes Keynote decks,
+/// which Ken cannot read anyway.
 pub fn is_secret_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == ".env"
@@ -326,30 +287,20 @@ pub fn is_secret_name(name: &str) -> bool {
         || n == "credentials.json"
 }
 
-/// The rule a repo's kind contributes: its index state, set once for the
-/// whole repo. A code or reference repo is searchable only; a repo that is
-/// also team or wiki, or has no kind yet, adds nothing, so it reads as today.
-/// Callers fold this after the built-ins and before the user's
-/// `.kenignore`, so a `!docs/` line there still reads a code repo's docs
-/// for entities. Held in the registry, not written into the repo.
-pub fn kind_rules(kind: &[crate::registry::RepoKind]) -> Vec<Rule> {
-    if kind.is_empty() || kind.iter().any(|k| k.reads_entities()) {
-        return Vec::new();
+/// The repo switched off as a whole: a person's choice in the registry,
+/// never written into the repo. Folded after the built-ins.
+pub fn repo_rules_for(root: &Path) -> Vec<Rule> {
+    if crate::registry::index_of(root).1 == Some(crate::registry::IndexState::Off) {
+        vec![Rule { tier: Tier::Ignored, pattern: "*".into() }]
+    } else {
+        Vec::new()
     }
-    vec![Rule { tier: Tier::SearchOnly, pattern: "*".into() }]
 }
 
-/// The repo's rule from the default registry: a person's index choice when
-/// they made one, else what its kind implies ([`kind_rules`]).
-pub fn kind_rules_for(root: &Path) -> Vec<Rule> {
-    use crate::registry::IndexState;
-    let (kind, index) = crate::registry::index_of(root);
-    match index {
-        Some(IndexState::Search) => vec![Rule { tier: Tier::SearchOnly, pattern: "*".into() }],
-        Some(IndexState::Entities) => Vec::new(),
-        Some(IndexState::Off) => vec![Rule { tier: Tier::Ignore, pattern: "*".into() }],
-        None => kind_rules(&kind),
-    }
+/// Rule lines as `.ken/knowledge.json` holds them (`"build/"`,
+/// `"!tests/"`), parsed like any rule text.
+pub fn parse_lines(lines: &[String]) -> Vec<Rule> {
+    parse(&lines.join("\n"))
 }
 
 fn is_hard_ignored(path: &str) -> bool {
@@ -430,28 +381,25 @@ mod tests {
     #[test]
     fn parse_bare_pattern_is_ignore_tier() {
         let rules = parse("build/\n");
-        assert_eq!(rules, vec![Rule { tier: Tier::Ignore, pattern: "build/".into() }]);
+        assert_eq!(rules, vec![Rule { tier: Tier::Ignored, pattern: "build/".into() }]);
     }
 
     #[test]
-    fn parse_tilde_prefix_is_search_only_tier() {
+    fn an_older_tilde_line_reads_as_indexed() {
         let rules = parse("~.ken/tasks/\n");
-        assert_eq!(
-            rules,
-            vec![Rule { tier: Tier::SearchOnly, pattern: ".ken/tasks/".into() }]
-        );
+        assert_eq!(rules, vec![Rule { tier: Tier::Indexed, pattern: ".ken/tasks/".into() }]);
     }
 
     #[test]
-    fn parse_bang_prefix_is_full_tier() {
+    fn parse_bang_prefix_is_indexed() {
         let rules = parse("!README.md\n");
-        assert_eq!(rules, vec![Rule { tier: Tier::Full, pattern: "README.md".into() }]);
+        assert_eq!(rules, vec![Rule { tier: Tier::Indexed, pattern: "README.md".into() }]);
     }
 
     #[test]
     fn parse_skips_comments_and_blank_lines() {
         let rules = parse("# a comment\n\nbuild/\n   \n# another\n");
-        assert_eq!(rules, vec![Rule { tier: Tier::Ignore, pattern: "build/".into() }]);
+        assert_eq!(rules, vec![Rule { tier: Tier::Ignored, pattern: "build/".into() }]);
     }
 
     #[test]
@@ -459,7 +407,7 @@ mod tests {
         let rules = parse("\\~weird-dir/\n");
         assert_eq!(
             rules,
-            vec![Rule { tier: Tier::Ignore, pattern: "~weird-dir/".into() }]
+            vec![Rule { tier: Tier::Ignored, pattern: "~weird-dir/".into() }]
         );
     }
 
@@ -468,14 +416,14 @@ mod tests {
         let rules = parse("\\!important.txt\n");
         assert_eq!(
             rules,
-            vec![Rule { tier: Tier::Ignore, pattern: "!important.txt".into() }]
+            vec![Rule { tier: Tier::Ignored, pattern: "!important.txt".into() }]
         );
     }
 
     #[test]
     fn parse_bare_prefix_with_no_pattern_is_malformed_and_skipped() {
         let rules = parse("~\n!\nbuild/\n");
-        assert_eq!(rules, vec![Rule { tier: Tier::Ignore, pattern: "build/".into() }]);
+        assert_eq!(rules, vec![Rule { tier: Tier::Ignored, pattern: "build/".into() }]);
     }
 
     #[test]
@@ -484,9 +432,9 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                Rule { tier: Tier::Ignore, pattern: "a".into() },
-                Rule { tier: Tier::SearchOnly, pattern: "b".into() },
-                Rule { tier: Tier::Full, pattern: "c".into() },
+                Rule { tier: Tier::Ignored, pattern: "a".into() },
+                Rule { tier: Tier::Indexed, pattern: "b".into() },
+                Rule { tier: Tier::Indexed, pattern: "c".into() },
             ]
         );
     }
@@ -494,62 +442,52 @@ mod tests {
     // ---- classify ----
 
     #[test]
-    fn classify_defaults_to_full_with_no_rules() {
-        assert_eq!(classify("src/main.rs", false, &[]), Tier::Full);
+    fn classify_defaults_to_indexed_with_no_rules() {
+        assert_eq!(classify("src/main.rs", false, &[]), Tier::Indexed);
     }
 
     #[test]
-    fn classify_no_kenignore_file_is_byte_identical_to_full_everywhere() {
+    fn no_rules_index_everything() {
         // The stated migration (design.md): no `.kenignore` at all means
-        // every non-hard-ignored path classifies as Full.
+        // every non-hard-ignored path is indexed.
         let rules = parse(""); // empty file
-        assert_eq!(classify("anything/at/all.rs", false, &[&rules]), Tier::Full);
+        assert_eq!(classify("anything/at/all.rs", false, &[&rules]), Tier::Indexed);
     }
 
     #[test]
     fn classify_bare_pattern_ignores_matching_path() {
         let rules = parse("build/\n");
-        assert_eq!(classify("build", true, &[&rules]), Tier::Ignore);
-        assert_eq!(classify("build/output.txt", false, &[&rules]), Tier::Ignore);
+        assert_eq!(classify("build", true, &[&rules]), Tier::Ignored);
+        assert_eq!(classify("build/output.txt", false, &[&rules]), Tier::Ignored);
     }
 
     #[test]
-    fn classify_tilde_pattern_is_search_only() {
-        let rules = parse("~docs/drafts/\n");
-        assert_eq!(
-            classify("docs/drafts/note.md", false, &[&rules]),
-            Tier::SearchOnly
-        );
+    fn a_tilde_line_after_a_bare_one_brings_the_path_back() {
+        let rules = parse("docs/\n~docs/drafts/\n");
+        assert_eq!(classify("docs/drafts/note.md", false, &[&rules]), Tier::Indexed);
+        assert_eq!(classify("docs/other.md", false, &[&rules]), Tier::Ignored);
     }
 
     #[test]
-    fn classify_non_matching_path_defaults_full() {
+    fn classify_non_matching_path_is_indexed() {
         let rules = parse("build/\n");
-        assert_eq!(classify("src/lib.rs", false, &[&rules]), Tier::Full);
+        assert_eq!(classify("src/lib.rs", false, &[&rules]), Tier::Indexed);
     }
 
     #[test]
     fn classify_last_match_wins_within_one_rule_set() {
-        // A later broad ignore, then a narrower full-tier carve-out.
+        // A later broad ignore, then a narrower carve-out.
         let rules = parse("docs/\n!docs/README.md\n");
-        assert_eq!(classify("docs/README.md", false, &[&rules]), Tier::Full);
-        assert_eq!(classify("docs/other.md", false, &[&rules]), Tier::Ignore);
+        assert_eq!(classify("docs/README.md", false, &[&rules]), Tier::Indexed);
+        assert_eq!(classify("docs/other.md", false, &[&rules]), Tier::Ignored);
     }
 
     #[test]
     fn classify_user_rules_override_builtin_rules_last_match_wins() {
-        // Built-in prelude marks .ken/tasks/ SearchOnly; user file
-        // overrides a specific file back to Full.
-        let builtins = parse("~.ken/tasks/\n");
+        let builtins = parse(".ken/tasks/\n");
         let user = parse("!.ken/tasks/important.md\n");
-        assert_eq!(
-            classify(".ken/tasks/important.md", false, &[&builtins, &user]),
-            Tier::Full
-        );
-        assert_eq!(
-            classify(".ken/tasks/other.md", false, &[&builtins, &user]),
-            Tier::SearchOnly
-        );
+        assert_eq!(classify(".ken/tasks/important.md", false, &[&builtins, &user]), Tier::Indexed);
+        assert_eq!(classify(".ken/tasks/other.md", false, &[&builtins, &user]), Tier::Ignored);
     }
 
     #[test]
@@ -557,77 +495,46 @@ mod tests {
         let user = parse("!node_modules/keep-me.js\n");
         assert_eq!(
             classify("node_modules/keep-me.js", false, &[&user]),
-            Tier::Ignore
+            Tier::Ignored
         );
-        assert_eq!(classify(".git/config", false, &[&user]), Tier::Ignore);
-    }
-
-    #[test]
-    fn classify_does_not_blanket_hard_ignore_dot_ken() {
-        // `.ken/` DB internals (the real on-disk SQLite file etc.) never
-        // reach `classify` at all in practice: scan.rs's walker filters the
-        // whole `.ken` directory out unconditionally before rel paths are
-        // ever computed (see `HARD_IGNORE_DIRS`'s doc comment). This module
-        // must NOT re-implement that as a blanket `.ken` path-component
-        // hard-ignore, because D2 step 2 names `~.ken/tasks/` as a built-in
-        // tier rule that has to stay reachable and user-overridable — a
-        // blanket `.ken` hard-ignore would swallow it and make `!` unable
-        // to resurrect it, contradicting D2's own worked example.
-        let builtins = parse("~.ken/tasks/\n");
-        assert_eq!(
-            classify(".ken/tasks/notes.md", false, &[&builtins]),
-            Tier::SearchOnly
-        );
+        assert_eq!(classify(".git/config", false, &[&user]), Tier::Ignored);
     }
 
     #[test]
     fn classify_root_anchored_pattern_only_matches_at_root() {
         let rules = parse("/only-root.txt\n");
-        assert_eq!(classify("only-root.txt", false, &[&rules]), Tier::Ignore);
+        assert_eq!(classify("only-root.txt", false, &[&rules]), Tier::Ignored);
         assert_eq!(
             classify("nested/only-root.txt", false, &[&rules]),
-            Tier::Full
+            Tier::Indexed
         );
     }
 
     #[test]
     fn classify_double_star_glob_matches_across_segments() {
-        let rules = parse("~**/*.generated.ts\n");
-        assert_eq!(
-            classify("a/b/c/x.generated.ts", false, &[&rules]),
-            Tier::SearchOnly
-        );
+        let rules = parse("**/*.generated.ts\n");
+        assert_eq!(classify("a/b/c/x.generated.ts", false, &[&rules]), Tier::Ignored);
     }
 
     #[test]
-    fn kind_sets_the_repo_index_state_and_the_users_file_still_wins() {
-        use crate::registry::RepoKind;
-        let code = kind_rules(&[RepoKind::Code]);
-        assert_eq!(classify("src/main.rs", false, &[&code]), Tier::SearchOnly);
-        assert_eq!(classify("README.md", false, &[&code]), Tier::SearchOnly);
-        assert_eq!(classify("a/b/c/deep.md", false, &[&code]), Tier::SearchOnly);
-        assert_eq!(
-            classify("x.md", false, &[&kind_rules(&[RepoKind::Reference])]),
-            Tier::SearchOnly
-        );
-
-        // Team, wiki, a wiki that holds code, and not-yet-said read in full.
-        for kind in [vec![RepoKind::Team], vec![RepoKind::Wiki], vec![RepoKind::Wiki, RepoKind::Code], vec![]] {
-            assert!(kind_rules(&kind).is_empty(), "{kind:?}");
+    fn the_fixed_built_ins_cover_dependencies_build_output_and_binaries() {
+        let built = built_in_rule_sets();
+        for path in ["vendor/lib/x.go", "app/build/out.txt", "target/release/ken.exe", "bin/tool.dll", "Main.class", ".hg/store", "a/.svn/x"] {
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignored, "{path}");
         }
-
-        // A user line after the kind rule reads a code repo's docs in full,
-        // and a bare line still takes a path out.
-        let user = parse("!docs/\nsecret/\n");
-        assert_eq!(classify("docs/arch.md", false, &[&code, &user]), Tier::Full);
-        assert_eq!(classify("secret/x.md", false, &[&code, &user]), Tier::Ignore);
-        assert_eq!(classify("src/lib.rs", false, &[&code, &user]), Tier::SearchOnly);
+        for path in ["src/build.rs", "docs/building.md", "scripts/run.sh"] {
+            assert_eq!(classify(path, false, &[&built]), Tier::Indexed, "{path}");
+        }
+        // Rules as `.ken/knowledge.json` holds them, folded last.
+        let user = parse_lines(&["assets/raw/".to_string(), "!vendor/ours/".to_string()]);
+        assert_eq!(classify("assets/raw/a.png", false, &[&built, &user]), Tier::Ignored);
+        assert_eq!(classify("vendor/ours/x.go", false, &[&built, &user]), Tier::Indexed, "a ! line brings a built-in back");
     }
 
     #[test]
     fn classify_escaped_literal_bang_filename_matches_as_ignore() {
         let rules = parse("\\!important.txt\n");
-        assert_eq!(classify("!important.txt", false, &[&rules]), Tier::Ignore);
+        assert_eq!(classify("!important.txt", false, &[&rules]), Tier::Ignored);
     }
 
     #[test]
@@ -635,30 +542,30 @@ mod tests {
         let a = parse("x\n");
         let b = parse("!x\n");
         // b comes after a: last-match-wins across sets, not just within.
-        assert_eq!(classify("x", false, &[&a, &b]), Tier::Full);
-        assert_eq!(classify("x", false, &[&b, &a]), Tier::Ignore);
+        assert_eq!(classify("x", false, &[&a, &b]), Tier::Indexed);
+        assert_eq!(classify("x", false, &[&b, &a]), Tier::Ignored);
     }
 
     #[test]
     fn built_ins_skip_archives_and_a_user_line_brings_them_back() {
         let built = built_in_rule_sets();
         for path in ["backups/world.zip", "a.7z", "dist/app.jar", "disk.iso", "x.tar.gz"] {
-            assert_eq!(classify(path, false, &[&built]), Tier::Ignore, "{path}");
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignored, "{path}");
         }
-        assert_eq!(classify("notes.md", false, &[&built]), Tier::Full);
-        assert_eq!(classify("clip.mp4", false, &[&built]), Tier::Full, "media stays: Ken transcribes it");
+        assert_eq!(classify("notes.md", false, &[&built]), Tier::Indexed);
+        assert_eq!(classify("clip.mp4", false, &[&built]), Tier::Indexed, "media stays: Ken transcribes it");
         let user = parse("!*.zip\n");
-        assert_eq!(classify("backups/world.zip", false, &[&built, &user]), Tier::Full);
+        assert_eq!(classify("backups/world.zip", false, &[&built, &user]), Tier::Indexed);
         // What a tool writes: bundles, maps, lockfiles.
         for path in ["dist/app.min.js", "web/site.min.css", "dist/app.js.map", "package-lock.json", "api/uv.lock", "Cargo.lock"] {
-            assert_eq!(classify(path, false, &[&built]), Tier::Ignore, "{path}");
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignored, "{path}");
         }
-        assert_eq!(classify("src/app.js", false, &[&built]), Tier::Full);
-        assert_eq!(classify("package.json", false, &[&built]), Tier::Full);
+        assert_eq!(classify("src/app.js", false, &[&built]), Tier::Indexed);
+        assert_eq!(classify("package.json", false, &[&built]), Tier::Indexed);
         // The knowledge base's page templates.
-        assert_eq!(classify("Templates/Rule.md", false, &[&built]), Tier::Ignore);
-        assert_eq!(classify("Templates", true, &[&built]), Tier::Ignore);
-        assert_eq!(classify("Rules/Templates and forms.md", false, &[&built]), Tier::Full);
+        assert_eq!(classify("Templates/Rule.md", false, &[&built]), Tier::Ignored);
+        assert_eq!(classify("Templates", true, &[&built]), Tier::Ignored);
+        assert_eq!(classify("Rules/Templates and forms.md", false, &[&built]), Tier::Indexed);
     }
 
     #[test]
@@ -675,15 +582,15 @@ mod tests {
             "src/test/java/WorldTest.java",
             "Game.Tests/SaveTests.cs",
         ] {
-            assert_eq!(classify(path, false, &[&built]), Tier::Ignore, "{path}");
+            assert_eq!(classify(path, false, &[&built]), Tier::Ignored, "{path}");
         }
         for path in ["src/lib/citation.ts", "src/contest.rs", "docs/testing-strategy.md", "openspec/specs/mcp/spec.md", "src/Latest.java"] {
-            assert_eq!(classify(path, false, &[&built]), Tier::Full, "{path}");
+            assert_eq!(classify(path, false, &[&built]), Tier::Indexed, "{path}");
         }
         let user = parse("!tests/\n!*.test.ts\n");
-        assert_eq!(classify("crates/ken-core/tests/qa_probe.rs", false, &[&built, &user]), Tier::Full);
-        assert_eq!(classify("src/lib/citation.test.ts", false, &[&built, &user]), Tier::Full);
-        assert_eq!(classify("pkg/store/store_test.go", false, &[&built, &user]), Tier::Ignore, "only what the line names");
+        assert_eq!(classify("crates/ken-core/tests/qa_probe.rs", false, &[&built, &user]), Tier::Indexed);
+        assert_eq!(classify("src/lib/citation.test.ts", false, &[&built, &user]), Tier::Indexed);
+        assert_eq!(classify("pkg/store/store_test.go", false, &[&built, &user]), Tier::Ignored, "only what the line names");
     }
 
     #[test]
@@ -700,10 +607,10 @@ mod tests {
             "deploy/secrets.yaml",
             "Secrets.JSON",
         ] {
-            assert_eq!(classify(path, false, &[&user]), Tier::Ignore, "{path}");
+            assert_eq!(classify(path, false, &[&user]), Tier::Ignored, "{path}");
         }
         for path in ["docs/secrets-policy.md", "keys.md", "src/credentials.rs", "monkey.txt"] {
-            assert_eq!(classify(path, false, &[&user]), Tier::Full, "{path}");
+            assert_eq!(classify(path, false, &[&user]), Tier::Indexed, "{path}");
         }
     }
 }

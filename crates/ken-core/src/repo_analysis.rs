@@ -57,7 +57,7 @@ pub fn file_list(root: &Path) -> Vec<String> {
         .take(WALK_LIMIT)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
         .filter_map(|e| e.path().strip_prefix(root).ok().map(|p| p.to_string_lossy().replace('\\', "/")))
-        .filter(|rel| crate::kenignore::classify(rel, false, &[&built_in]) != crate::kenignore::Tier::Ignore)
+        .filter(|rel| crate::kenignore::classify(rel, false, &[&built_in]) != crate::kenignore::Tier::Ignored)
         .filter(|rel| crate::chunker::is_markdown(rel) || crate::contenttype::of(rel) == crate::contenttype::ContentType::Code)
         .collect();
     files.sort();

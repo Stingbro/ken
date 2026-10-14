@@ -235,9 +235,13 @@ fn summarize_tool(block: &Value) -> String {
 pub const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
 
 /// What every chat session is told about working inside Ken, appended to
-/// Claude Code's own system prompt. Only the app's rules (knowledge-core
-/// decision 1): how to search, weigh and cite the knowledge base is the
-/// knowledge server's own `instructions`, which every Claude session gets.
+/// Claude Code's own system prompt. The app's rules (knowledge-core decision
+/// 1), plus three of the knowledge server's `instructions` said again in
+/// short (rule 4): how to weigh a hit's label, that the wiki settles what the
+/// team decided and a ruling is settled, and that a difference from the code
+/// is said with both cited. The chat's answers were measured with those in
+/// the guide; they stay until a measurement shows the instructions alone
+/// carry them.
 pub const KEN_GUIDE: &str = "You are working inside Ken, a desktop app where a person reads and edits their team's \
 wiki, docs and code. Rules for this app:\n\
 1. Edits are reviewed. Every Edit, MultiEdit or Write you make is shown to the person as a diff, and they accept or \
@@ -259,16 +263,21 @@ cover every question about the files; do not run shell commands to look at them.
 answers, look yourself with Grep, Glob and Read in this project and the workspace's other repos (you may read them \
 all; Glob and Grep search only the folder you start in unless given one, so pass each repo's folder as the path) \
 before saying something isn't there, and say where you looked.\n\
-4. The knowledge base changes through a person. A ruling the person states goes in with \
+4. Weigh each hit by its label (kind · tier or role · date): a binding ruling or rule over a current page, a current \
+page over a record (a ticket, note or draft), a later ruling over an earlier one. The wiki settles what the team \
+decided, and a ruling is settled: do not reopen it. When the code differs from the wiki or a ruling, say so and cite \
+both.\n\
+5. The knowledge base changes through a person. A ruling the person states goes in with \
 mcp__ken__propose_decision and a source they want kept with mcp__ken__add_source: both wait in Ken's Inbox (the \
-ruling for one click into the decisions log, the source for the next ingest), so say that it waits. Edit a page of \
-the knowledge base only when they ask, as a reviewed edit.\n\
-5. The person's list is Ken's, not yours. Their tasks are read with mcp__ken-personal__task_list; add or change a \
+ruling for one click into the decisions log, the source for the next ingest), so say that it waits. An answer worth \
+keeping is filed back the same way: offer to add it with mcp__ken__add_source, and ingest makes it pages. Edit a page \
+of the knowledge base only when they ask, as a reviewed edit.\n\
+6. The person's list is Ken's, not yours. Their tasks are read with mcp__ken-personal__task_list; add or change a \
 task with mcp__ken-personal__task_create and mcp__ken-personal__task_update when they ask, and say what you added. \
 Your own task or todo tools are not their list. A ## Memories block at the top of a turn holds the team's standing \
 notes: follow them, add one with mcp__ken-personal__memory_write only when the person asks you to remember \
 something, and keep a finding they want kept with mcp__ken-personal__journal_append.\n\
-6. mcp__ken-personal__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or \
+7. mcp__ken-personal__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or \
 show something.";
 
 /// The server name Ken's chat gives its knowledge server, `ken-mcp`
@@ -1330,15 +1339,19 @@ mod tests {
         assert!(KEN_GUIDE.contains("%20") && KEN_GUIDE.contains("never a project-relative path"));
     }
 
-    /// The guide keeps the app's rules only (decision 1): how to weigh a
-    /// hit's label is in the knowledge server's instructions now.
+    /// The guide keeps the app's rules (decision 1), and says again the three
+    /// knowledge rules the chat was measured with, until a measurement shows
+    /// the server's instructions alone carry them.
     #[test]
-    fn the_guide_keeps_the_apps_rules_only() {
+    fn the_guide_keeps_the_apps_rules_and_the_three_measured_ones() {
         let guide = KEN_GUIDE.replace('\n', " ");
         for word in ["shown to the person as a diff", "Cite your sources", "wait in Ken's Inbox", "The person's list is Ken's"] {
             assert!(guide.contains(word), "{word}");
         }
-        assert!(!guide.contains("carries one label"), "the label is the server's instructions");
+        for rule in ["Weigh each hit by its label", "The wiki settles what the team decided", "a ruling is settled", "say so and cite both"] {
+            assert!(guide.contains(rule), "{rule}");
+        }
+        assert!(guide.contains("An answer worth keeping"), "answers are filed back through add_source (decision 33)");
     }
 
     #[test]

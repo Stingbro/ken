@@ -4,6 +4,7 @@
 
 pub mod assistant;
 pub mod authority;
+pub mod buildqueue;
 pub mod bg_hydrate;
 pub mod chat;
 pub mod chunker;
@@ -60,11 +61,13 @@ pub mod supersede;
 pub mod setup;
 pub mod sync;
 pub mod tasks;
+pub mod throttle;
 pub mod transcript;
 pub mod user_state;
 pub mod vocab;
 pub mod watch;
 pub mod wikinew;
+pub mod wikimap;
 pub mod workspace;
 
 pub use error::{Error, Result};

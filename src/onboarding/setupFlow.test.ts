@@ -3,25 +3,21 @@ import type { SetupRepoRow } from "../lib/api";
 import {
   commonParent,
   coveredRepos,
-  defaultTeamName,
-  defaultWikiChoice,
-  indexSummary,
+  defaultKb,
+  kbReady,
   mergeRows,
   newWikiPath,
-  onOneTeam,
-  renamedWikiChoice,
-  suggestedTeams,
-  teamWikis,
+  renamedKb,
+  sourceSummary,
+  STEPS,
   toggleKind,
-  wikiChoicesReady,
+  withKnowledgeBase,
 } from "./setupFlow";
 
 const row = (member: string, over: Partial<SetupRepoRow> = {}): SetupRepoRow => ({
   member,
   include: true,
   kind: [],
-  team: "Realms",
-  index: "entities",
   evidence: [],
   remote: null,
   existing: false,
@@ -32,15 +28,18 @@ const row = (member: string, over: Partial<SetupRepoRow> = {}): SetupRepoRow => 
 });
 
 describe("setup flow", () => {
+  it("is three steps: the name, the knowledge base, the sources", () => {
+    expect(STEPS.map((s) => s.step)).toEqual(["name", "base", "sources"]);
+  });
+
   it("keeps a person's edits when the picked set is proposed again", () => {
-    const old = [row("docs", { description: "Our wiki", team: "Mine", include: false })];
+    const old = [row("docs", { description: "Our wiki", include: false, kind: ["wiki"] })];
     const fresh = [row("docs", { description: "From the README" }), row("game")];
     const merged = mergeRows(old, fresh);
-    expect(merged.map((r) => [r.member, r.description, r.team, r.include])).toEqual([
-      ["docs", "Our wiki", "Mine", false],
-      ["game", "", "Realms", true],
+    expect(merged.map((r) => [r.member, r.description, r.include, r.kind])).toEqual([
+      ["docs", "Our wiki", false, ["wiki"]],
+      ["game", "", true, []],
     ]);
-    expect(suggestedTeams(merged)).toEqual(["Realms"]);
   });
 
   it("toggles a kind and keeps the fixed order", () => {
@@ -48,54 +47,37 @@ describe("setup flow", () => {
     expect(toggleKind(["wiki", "code"], "wiki")).toEqual(["code"]);
   });
 
-  it("puts every included repo on the one team", () => {
-    const rows = [row("a", { team: null }), row("b", { team: "Old" }), row("c", { team: null, include: false })];
-    expect(onOneTeam(rows, " AUR ").map((r) => r.team)).toEqual(["AUR", "AUR", null]);
-    expect(onOneTeam(rows, "  ").map((r) => r.team)).toEqual([null, null, null]);
+  it("counts a source as indexed or left out, nothing between", () => {
+    expect(sourceSummary([row("a"), row("b", { include: false }), row("c")])).toEqual({ indexed: 2, left: 1 });
   });
 
-  it("names the team from a team or wiki repo, else the folder the repos share", () => {
-    const aur = [
-      row("agentic-ui-reviewer", { path: "C:\\ken-eval\\AUR\\agentic-ui-reviewer" }),
-      row("AUR-Team", { path: "C:\\ken-eval\\AUR\\AUR-Team" }),
-    ];
-    expect(defaultTeamName(aur)).toBe("AUR");
-    expect(commonParent(aur)).toBe("C:\\ken-eval\\AUR");
-    const code = [row("game", { path: "/home/me/realms/game" }), row("docs", { path: "/home/me/realms/docs" })];
-    expect(defaultTeamName(code)).toBe("realms");
-    expect(defaultTeamName([row("steam", { path: "C:\\steam" })])).toBe("");
-    expect(commonParent([row("a", { path: "C:\\x\\a" }), row("b", { path: "D:\\y\\b" })])).toBeNull();
+  it("names a new knowledge base after the workspace and follows a rename", () => {
+    const kb = defaultKb("Realms", "C:/Code");
+    expect(kb).toEqual({ mode: "new", parent: "C:/Code", name: "Realms-Wiki" });
+    expect(renamedKb(kb, "Realms", "AUR")).toEqual({ mode: "new", parent: "C:/Code", name: "AUR-Wiki" });
+    expect(renamedKb({ mode: "new", parent: null, name: "Docs" }, "Realms", "AUR")).toEqual({ mode: "new", parent: null, name: "Docs" });
+    expect(renamedKb({ mode: "existing", path: "C:/w", map: true }, "Realms", "AUR")).toEqual({ mode: "existing", path: "C:/w", map: true });
   });
 
-  it("counts excluded and off rows as not indexed", () => {
-    const rows = [
-      row("docs"),
-      row("game", { index: "search" }),
-      row("tools", { index: "search", include: false }),
-      row("empty", { index: "off", include: false }),
-    ];
-    expect(indexSummary(rows)).toEqual({ entities: 1, search: 1, off: 2 });
-  });
-
-  it("a team uses its wiki repo, or a new one is ticked", () => {
-    const rows = [row("docs", { kind: ["wiki"] }), row("game", { kind: ["code"], description: "The client" }), row("ops", { team: "Ops" })];
-    expect(teamWikis(rows, "Realms").map((r) => r.member)).toEqual(["docs"]);
-    expect(defaultWikiChoice(rows, "Realms")).toEqual({ mode: "existing", member: "docs" });
-    expect(defaultWikiChoice(rows, "Ops")).toEqual({ mode: "new", parent: null, name: "Ops-Wiki" });
-    expect(defaultWikiChoice(rows, "Ops", "C:/Code")).toEqual({ mode: "new", parent: "C:/Code", name: "Ops-Wiki" });
-    expect(coveredRepos(rows, "Realms")).toEqual([{ name: "game", description: "The client", kind: ["code"], path: "C:/Code/game" }]);
-  });
-
-  it("a new wiki needs a folder and a name", () => {
+  it("step 2 is ready with a folder for a new repo, or an existing wiki picked", () => {
+    expect(kbReady({ mode: "new", parent: null, name: "W" })).toBe(false);
+    expect(kbReady({ mode: "new", parent: "C:/x", name: " " })).toBe(false);
+    expect(kbReady({ mode: "new", parent: "C:/x", name: "W" })).toBe(true);
+    expect(kbReady({ mode: "existing", path: null, map: true })).toBe(false);
+    expect(kbReady({ mode: "existing", path: "C:/Docs", map: false })).toBe(true);
     expect(newWikiPath("C:\\Code\\", "Realms-Wiki")).toBe("C:\\Code\\Realms-Wiki");
     expect(newWikiPath("/home/me/code", " Realms-Wiki ")).toBe("/home/me/code/Realms-Wiki");
-    expect(wikiChoicesReady({ A: { mode: "new", parent: null, name: "W" } })).toBe(false);
-    expect(wikiChoicesReady({ A: { mode: "new", parent: "C:/x", name: "W" }, B: { mode: "none" } })).toBe(true);
   });
 
-  it("renaming the team renames a new wiki still named after it", () => {
-    expect(renamedWikiChoice({ mode: "new", parent: "C:/x", name: "AU-Wiki" }, "AU", "AUR")).toEqual({ mode: "new", parent: "C:/x", name: "AUR-Wiki" });
-    expect(renamedWikiChoice({ mode: "new", parent: null, name: "Docs" }, "AU", "AUR")).toEqual({ mode: "new", parent: null, name: "Docs" });
-    expect(renamedWikiChoice({ mode: "existing", member: "docs" }, "AU", "AUR")).toEqual({ mode: "existing", member: "docs" });
+  it("lists the sources on the knowledge base and lets its own row replace a source", () => {
+    const rows = [row("docs"), row("game", { kind: ["code"], description: "The client" }), row("old", { include: false })];
+    expect(coveredRepos(rows, "C:/Code/docs")).toEqual([{ name: "game", description: "The client", kind: ["code"], path: "C:/Code/game" }]);
+    const kb = row("docs", { kind: ["team", "wiki"] });
+    expect(withKnowledgeBase(rows, kb).map((r) => [r.member, r.kind])).toEqual([
+      ["game", ["code"]],
+      ["old", []],
+      ["docs", ["team", "wiki"]],
+    ]);
+    expect(commonParent(rows)).toBe("C:/Code");
   });
 });

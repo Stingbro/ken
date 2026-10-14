@@ -26,10 +26,23 @@ const EMBED_BATCH: usize = 128;
 /// Embed `ids`/`texts` and store the vectors. One chunk the model can't take
 /// must not stop the index: the batch is retried one by one and only what
 /// fails is left out (it stays keyword-searchable, and is retried next build).
-fn embed_pending(db: &mut Db, embedder: &mut dyn Embedder, ids: &mut Vec<i64>, texts: &mut Vec<String>) -> Result<()> {
+///
+/// Embedding runs on the graphics card or the processor, so it obeys the one
+/// background throttle (knowledge-core decision 34): it waits while paused,
+/// and after each batch rests by the pace. A build cancelled while it waits
+/// leaves the batch for the next build, which embeds every chunk with no
+/// vector.
+fn embed_pending(db: &mut Db, embedder: &mut dyn Embedder, ids: &mut Vec<i64>, texts: &mut Vec<String>, token: &CancelToken) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
+    let stop = || token.is_cancelled();
+    if !crate::throttle::wait_unpaused(&stop) {
+        ids.clear();
+        texts.clear();
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
     match embedder.embed(texts) {
         Ok(vecs) => db.store_embeddings(ids, &vecs)?,
         Err(batch_err) => {
@@ -43,6 +56,7 @@ fn embed_pending(db: &mut Db, embedder: &mut dyn Embedder, ids: &mut Vec<i64>, t
     }
     ids.clear();
     texts.clear();
+    crate::throttle::rest_after(started.elapsed(), &stop);
     Ok(())
 }
 
@@ -105,13 +119,8 @@ pub fn rebuild_semantic_index_with_profile(
     }
     db.ensure_vec_chunks(embedder.dim())?;
 
-    // kenignore (D2/D3): tier is classified once per file here, against the
-    // same rule sets scan.rs uses: the built-ins (archives, generated files,
-    // templates, tests), the repo's kind, then the user's `.kenignore`.
-    let built_in_rules = crate::kenignore::built_in_rule_sets();
-    let kind_rules = crate::kenignore::kind_rules_for(&project.root);
-    let user_rules = project.kenignore_rules();
-    let rule_sets: &[&[crate::kenignore::Rule]] = &[&built_in_rules, &kind_rules, &user_rules];
+    // The same index rules the scan reads (decision 34), once per file.
+    let rules = project.index_rules();
 
     // Chunks still to embed, gathered across files.
     let mut pending_ids: Vec<i64> = Vec::new();
@@ -122,8 +131,7 @@ pub fn rebuild_semantic_index_with_profile(
             return Ok(false);
         }
 
-        let tier = crate::kenignore::classify(&file.rel_path, false, rule_sets);
-        if tier == crate::kenignore::Tier::Ignore {
+        if crate::kenignore::classify(&file.rel_path, false, &[&rules]) == crate::kenignore::Tier::Ignored {
             // Defensive: scan.rs should already keep Ignore-tier paths out of
             // `files`, but if one slips through (e.g. a `.kenignore` edit
             // landed after the last scan), don't chunk/embed it, and drop any
@@ -163,7 +171,7 @@ pub fn rebuild_semantic_index_with_profile(
                 };
                 chunker::chunk_with(&file.rel_path, &text, &idx_profile, &defs)
             };
-            db.store_chunked(&file.rel_path, &chunked, tier)?;
+            db.store_chunked(&file.rel_path, &chunked)?;
         }
 
         // Embed every chunk with no vector yet, not only the ones this call
@@ -175,13 +183,13 @@ pub fn rebuild_semantic_index_with_profile(
             pending_ids.push(id);
             pending_texts.push(text);
             if pending_ids.len() >= EMBED_BATCH {
-                embed_pending(db, embedder, &mut pending_ids, &mut pending_texts)?;
+                embed_pending(db, embedder, &mut pending_ids, &mut pending_texts, token)?;
             }
         }
 
         on_progress(done + 1, total);
     }
-    embed_pending(db, embedder, &mut pending_ids, &mut pending_texts)?;
+    embed_pending(db, embedder, &mut pending_ids, &mut pending_texts, token)?;
 
     db.set_embed_model(&embedder.model_id())?;
     db.set_embed_dim(embedder.dim())?;

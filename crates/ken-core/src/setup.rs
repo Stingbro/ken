@@ -1,22 +1,24 @@
-//! Set-up for Ken on its own: Folder, Team, Repos, Index. The scan reads a
-//! code folder and proposes one row per repo (kind, team, index state, with
-//! the evidence for each), and the ignore entries it would add; nothing is
-//! written until a person confirms, and Ken reads nothing until then. Scan
+//! Set-up for Ken on its own, in three steps (knowledge-core decision 32):
+//! the workspace's name; where its knowledge base is saved, a new repo from
+//! Ken's template or an existing wiki to overlay; and the sources, repos and
+//! folders, each with its kind. Each source is proposed from what is in it,
+//! with the evidence; nothing is written until a person confirms, and Ken
+//! reads nothing until then. Confirm lays the knowledge base down and every
+//! source is scanned, so search and the code index work from day one. Scan
 //! again reports what moved instead of overwriting.
 //!
 //! What the scan reads, cheaply and without a model: folder grouping, `.git`
 //! and its `origin` URL (read from `.git/config`, no process), repo markers,
 //! the signs of a library (a decisions log, a vault, the method's sections),
-//! the signs of a team repo (tickets, decisions, ideas), a README that names
-//! a sibling, and `git worktree list` for second checkouts.
+//! the signs of a knowledge base (its settings file), and `git worktree
+//! list` for second checkouts.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{IndexState, Registry, RepoKind};
+use crate::registry::{Registry, RepoKind};
 use crate::workspace::{self, Workspace};
 use crate::Result;
 
@@ -26,10 +28,10 @@ use crate::Result;
 pub struct RepoRow {
     /// Folder relative to the code folder (`Game` or `SR/Game`).
     pub member: String,
+    /// Whether it is a source of the workspace: two states (decision 34), a
+    /// repo is indexed or it is left out.
     pub include: bool,
     pub kind: Vec<RepoKind>,
-    pub team: Option<String>,
-    pub index: IndexState,
     /// Why the scan proposed what it did, one fact per entry.
     pub evidence: Vec<String>,
     pub remote: Option<String>,
@@ -40,19 +42,18 @@ pub struct RepoRow {
     #[serde(default)]
     pub path: Option<PathBuf>,
     /// What the repo is and how to use it, first proposed from its README;
-    /// a person edits it. Kept in the registry and read by the first-wiki
-    /// draft.
+    /// a person edits it. Kept in the registry and listed on the knowledge
+    /// base's Start Here page.
     #[serde(default)]
     pub description: String,
 }
 
-/// One ignore line the scan would add to the code folder's `.kenignore`.
+/// One ignore line the scan would add to the code folder's `.kenignore`:
+/// a path left out of the index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IgnoreRow {
     pub pattern: String,
-    /// `off` (a bare line) or `search` (a `~` line).
-    pub state: IndexState,
     pub reason: String,
     pub evidence: String,
     pub ticked: bool,
@@ -67,7 +68,6 @@ pub struct Proposal {
     pub repos: usize,
     pub without_git: usize,
     pub rows: Vec<RepoRow>,
-    pub teams: Vec<String>,
     pub ignores: Vec<IgnoreRow>,
     /// The folder already has a Ken workspace: Confirm updates it.
     pub existing_workspace: bool,
@@ -244,36 +244,6 @@ pub fn remote_owner(url: &str) -> Option<String> {
     (!owner.is_empty()).then(|| owner.to_string())
 }
 
-fn readme_text(dir: &Path) -> String {
-    ["README.md", "START-HERE.md", "CLAUDE.md", "readme.md"]
-        .iter()
-        .filter_map(|f| fs::read_to_string(dir.join(f)).ok())
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase()
-}
-
-fn names_word(haystack: &str, word: &str) -> bool {
-    let w = word.to_lowercase();
-    w.len() >= 4
-        && haystack.match_indices(&w).any(|(i, _)| {
-            let before = haystack[..i].chars().next_back();
-            let after = haystack[i + w.len()..].chars().next();
-            !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_alphanumeric())
-        })
-}
-
-/// A team name from a docs repo's folder name: `Realms-Docs` → `Realms`.
-fn team_from_docs(leaf: &str) -> String {
-    let lower = leaf.to_lowercase();
-    for suffix in ["-docs", "_docs", " docs", "-wiki", "_wiki", "-knowledge"] {
-        if lower.ends_with(suffix) {
-            return leaf[..leaf.len() - suffix.len()].to_string();
-        }
-    }
-    leaf.to_string()
-}
-
 /// Second checkouts of the repos found: every `git worktree list` path under
 /// the folder other than the repo itself, as a folder relative to it.
 fn worktrees(parent: &Path, repo: &Path) -> Vec<(String, String)> {
@@ -324,18 +294,15 @@ pub fn propose(parent: &Path) -> Result<Proposal> {
         if let Some(r) = &remote {
             evidence.push(format!("remote {r}"));
         }
-        let index = if !has_git && kind.is_empty() && c.file_count == 0 && c.markers.is_empty() {
-            IndexState::Off
-        } else {
-            IndexState::for_kind(&kind)
-        };
+        // A folder with nothing in it to index is not offered at all.
+        if !has_git && kind.is_empty() && c.file_count == 0 && c.markers.is_empty() {
+            continue;
+        }
         let member_of_ws = existing_ws.as_ref().is_some_and(|w| w.config.members.contains(&c.name));
         rows.push(RepoRow {
-            include: !declined.members.contains(&c.name) && (member_of_ws || existing_ws.is_none()) && index != IndexState::Off,
-            team: workspace::member_group(&c.name).map(str::to_string),
+            include: !declined.members.contains(&c.name) && (member_of_ws || existing_ws.is_none()),
             member: c.name,
             kind,
-            index,
             evidence,
             remote,
             existing: c.existing,
@@ -344,8 +311,6 @@ pub fn propose(parent: &Path) -> Result<Proposal> {
             path: Some(dir),
         });
     }
-
-    suggest_teams(&mut rows, |r| parent.join(&r.member));
     let rows = rows;
 
     // Ignore entries: second checkouts, and the secrets that are built in.
@@ -360,7 +325,6 @@ pub fn propose(parent: &Path) -> Result<Proposal> {
             ignores.push(IgnoreRow {
                 ticked: !declined.ignores.iter().any(|d| d.trim_start_matches('/') == pattern.trim_start_matches('/')),
                 pattern,
-                state: IndexState::Off,
                 reason: "Git worktree".into(),
                 evidence,
                 fixed: false,
@@ -369,15 +333,11 @@ pub fn propose(parent: &Path) -> Result<Proposal> {
     }
     ignores.push(secrets_row());
 
-    let mut teams: Vec<String> = rows.iter().filter_map(|r| r.team.clone()).collect();
-    teams.sort();
-    teams.dedup();
     Ok(Proposal {
         folder: parent.to_path_buf(),
         repos: rows.iter().filter(|r| r.has_git).count(),
         without_git: rows.iter().filter(|r| !r.has_git).count(),
         rows,
-        teams,
         ignores,
         existing_workspace: existing_ws.is_some(),
     })
@@ -416,7 +376,6 @@ fn first_paragraph(text: &str) -> String {
 fn secrets_row() -> IgnoreRow {
     IgnoreRow {
         pattern: ".env* *.pem *.key id_rsa* secrets.* credentials.json".into(),
-        state: IndexState::Off,
         reason: "Secrets".into(),
         evidence: "built in: never read, and no line brings them back".into(),
         ticked: true,
@@ -424,35 +383,6 @@ fn secrets_row() -> IgnoreRow {
     }
 }
 
-/// A docs repo whose README names another row proposes them as one team.
-fn suggest_teams(rows: &mut [RepoRow], dir_of: impl Fn(&RepoRow) -> PathBuf) {
-    let texts: Vec<String> = rows.iter().map(|r| readme_text(&dir_of(r))).collect();
-    for i in 0..rows.len() {
-        if !rows[i].kind.contains(&RepoKind::Wiki) {
-            continue;
-        }
-        let team = rows[i].team.clone().unwrap_or_else(|| team_from_docs(workspace::member_leaf(&rows[i].member)));
-        let named: Vec<usize> = (0..rows.len())
-            .filter(|j| *j != i && names_word(&texts[i], workspace::member_leaf(&rows[*j].member)))
-            .collect();
-        if named.is_empty() {
-            continue;
-        }
-        rows[i].team.get_or_insert(team.clone());
-        for j in named {
-            if rows[j].team.is_none() {
-                rows[j].team = Some(team.clone());
-                let by = workspace::member_leaf(&rows[i].member).to_string();
-                rows[j].evidence.push(format!("{by}'s README names it"));
-            }
-        }
-    }
-}
-
-/// Write the confirmed set-up: the workspace manifest (members, teams as
-/// groups), each repo's kind, team and index state in the registry at
-/// `base`, the ticked ignore lines under a dated comment, and what was
-/// declined. The only step that writes.
 /// A repo Ken leaves untouched: code or reference, and not also team or
 /// wiki. It gains no file from Ken; its project config lives in app data.
 pub fn leaves_untouched(kind: &[RepoKind]) -> bool {
@@ -471,8 +401,12 @@ fn place_untouched(rows: &[&RepoRow], folder: impl Fn(&RepoRow) -> Option<PathBu
     Ok(())
 }
 
+/// Write the confirmed set-up of a code folder: the workspace manifest, each
+/// repo's kind and description in the registry at `base`, the ticked ignore
+/// lines under a dated comment, and what was declined. The only step that
+/// writes.
 pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores: &[IgnoreRow], today: &str) -> Result<Workspace> {
-    let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include && r.index != IndexState::Off).collect();
+    let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include).collect();
     let members: Vec<String> = chosen.iter().map(|r| r.member.clone()).collect();
     place_untouched(&chosen, |r| Some(parent.join(&r.member)))?;
 
@@ -495,13 +429,12 @@ pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores
         for i in fresh {
             // gitignore syntax: `#` starts a comment only at the start of a
             // line, so the reason goes on its own line above the pattern.
-            let line = if i.state == IndexState::Search { format!("~{}", i.pattern) } else { i.pattern.clone() };
-            text.push_str(&format!("# {}: {}\n{line}\n", i.reason, i.evidence));
+            text.push_str(&format!("# {}: {}\n{}\n", i.reason, i.evidence, i.pattern));
         }
         fs::write(&path, text).map_err(|e| crate::Error::io(&path, e))?;
     }
 
-    let mut ws = match Workspace::open(parent) {
+    let ws = match Workspace::open(parent) {
         Ok(mut ws) => {
             for m in &members {
                 if !ws.config.members.contains(m) {
@@ -513,37 +446,12 @@ pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores
         }
         Err(_) => Workspace::create(parent, name, &members)?,
     };
-
-    // Teams become groups, except where the team is already a group folder.
-    let derived: Vec<String> = ws.config.derived_groups().into_iter().map(|g| g.name).collect();
-    let mut teams: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for r in &chosen {
-        if let Some(t) = &r.team {
-            teams.entry(t.clone()).or_default().push(r.member.clone());
-        }
-    }
-    for (team, ms) in teams {
-        if !derived.iter().any(|d| d.eq_ignore_ascii_case(&team)) {
-            ws.config.set_group(&team, &ms)?;
-        }
-    }
-    ws.save()?;
-
-    let mut reg = Registry::load(base)?;
-    for m in &ws.members {
-        let workspace::MemberStatus::Ok(p) = &m.status else { continue };
-        let Some(row) = chosen.iter().find(|r| r.member == m.name) else { continue };
-        reg.add(p);
-        reg.set_kind(p.config.id, row.kind.clone(), row.team.clone());
-        reg.set_index(p.config.id, Some(row.index));
-        reg.set_description(p.config.id, &row.description);
-    }
-    reg.save(base)?;
+    register(base, &ws, &chosen)?;
 
     let mut d = declined(parent);
     // Only what a person took out; a folder with nothing to index was never
     // offered, so it is not a refusal.
-    for r in rows.iter().filter(|r| !r.include && r.index != IndexState::Off) {
+    for r in rows.iter().filter(|r| !r.include) {
         if !d.members.contains(&r.member) {
             d.members.push(r.member.clone());
         }
@@ -563,8 +471,24 @@ pub fn confirm(base: &Path, parent: &Path, name: &str, rows: &[RepoRow], ignores
     Workspace::open(parent)
 }
 
+/// Each chosen source in the registry at `base`: its kind and description,
+/// indexed. A kind is the repo's own; the team a row once carried is gone
+/// with decision 35.
+fn register(base: &Path, ws: &Workspace, chosen: &[&RepoRow]) -> Result<()> {
+    let mut reg = Registry::load(base)?;
+    for m in &ws.members {
+        let workspace::MemberStatus::Ok(p) = &m.status else { continue };
+        let Some(row) = chosen.iter().find(|r| r.member == m.name) else { continue };
+        reg.add(p);
+        reg.set_kind(p.config.id, row.kind.clone(), None);
+        reg.set_index(p.config.id, None);
+        reg.set_description(p.config.id, &row.description);
+    }
+    reg.save(base)
+}
+
 /// A row for one folder a person picked. A linked worktree comes back
-/// unticked and off, named as a second checkout.
+/// unticked, named as a second checkout.
 fn row_for(dir: &Path, member: String) -> RepoRow {
     let has_git = dir.join(".git").is_dir();
     let (kind, mut evidence) = detect(dir);
@@ -579,13 +503,10 @@ fn row_for(dir: &Path, member: String) -> RepoRow {
     if worktree {
         evidence.insert(0, "a second checkout (git worktree) of another repo".into());
     }
-    let index = if worktree { IndexState::Off } else { IndexState::for_kind(&kind) };
     RepoRow {
         include: !worktree,
-        team: None,
         member,
         kind,
-        index,
         evidence,
         remote,
         existing: crate::project::existing_config(dir).is_some(),
@@ -658,27 +579,42 @@ pub fn propose_repos(picked: &[PathBuf], taken: &[String]) -> Result<Proposal> {
         used.push(name.clone());
         rows.push(row_for(d, name));
     }
-    suggest_teams(&mut rows, |r| r.path.clone().unwrap_or_default());
-    let mut teams: Vec<String> = rows.iter().filter_map(|r| r.team.clone()).collect();
-    teams.sort();
-    teams.dedup();
     Ok(Proposal {
         folder: PathBuf::new(),
         repos: rows.iter().filter(|r| r.has_git).count(),
         without_git: rows.iter().filter(|r| !r.has_git).count(),
         rows,
-        teams,
         ignores: vec![secrets_row()],
         existing_workspace: false,
     })
 }
 
-/// Create a team's knowledge base at `dir` from the bundled template (see
-/// [`crate::wikinew`]), covering `repos`, and return its set-up row: one repo
-/// that is the library and holds the tickets and the decisions log, on `team`.
-/// `taken` are names already in use.
-pub fn create_wiki(dir: &Path, team: &str, repos: &[crate::wikinew::Covered], taken: &[String], today: &str) -> Result<RepoRow> {
-    crate::wikinew::create(dir, team, repos, today)?;
+/// Create the workspace's knowledge base at `dir` from the bundled template
+/// (see [`crate::wikinew`]), covering `repos`, and return its set-up row: one
+/// repo that is the library and holds the tickets and the decisions log.
+/// `name` is the workspace's; `taken` are names already in use.
+pub fn create_wiki(dir: &Path, name: &str, repos: &[crate::wikinew::Covered], taken: &[String], today: &str) -> Result<RepoRow> {
+    crate::wikinew::create(dir, name, repos, today)?;
+    let mut row = knowledge_base_row(dir, name, taken)?;
+    row.evidence.insert(0, "created at set-up from Ken's template".into());
+    Ok(row)
+}
+
+/// Overlay Ken's structure on an existing wiki at `dir` (decision 32, step
+/// 2): the template's files it lacks are laid down and committed, nothing it
+/// has is changed or deleted. Returns its set-up row and what was added. Its
+/// pages are mapped into the sections afterwards, after a dry run
+/// ([`crate::wikimap`]).
+pub fn overlay_wiki(dir: &Path, name: &str, repos: &[crate::wikinew::Covered], taken: &[String], today: &str) -> Result<(RepoRow, Vec<String>)> {
+    let added = crate::wikinew::overlay(dir, name, repos, today)?;
+    let mut row = knowledge_base_row(dir, name, taken)?;
+    row.evidence.insert(0, format!("an existing wiki; {} of Ken's files added at set-up", added.len()));
+    Ok((row, added))
+}
+
+/// The set-up row of the knowledge base at `dir`: a team and wiki repo,
+/// included.
+fn knowledge_base_row(dir: &Path, name: &str, taken: &[String]) -> Result<RepoRow> {
     let mut row = propose_repos(&[dir.to_path_buf()], taken)?
         .rows
         .into_iter()
@@ -686,10 +622,7 @@ pub fn create_wiki(dir: &Path, team: &str, repos: &[crate::wikinew::Covered], ta
         .ok_or_else(|| crate::Error::Other(format!("{} could not be read back", dir.display())))?;
     row.include = true;
     row.kind = vec![RepoKind::Team, RepoKind::Wiki];
-    row.team = Some(team.to_string());
-    row.index = IndexState::Entities;
-    row.description = format!("The {team} knowledge base: what was decided and why, what is true now, and the tickets.");
-    row.evidence.insert(0, "created at set-up from Ken's template".into());
+    row.description = format!("The {name} knowledge base: what was decided and why, what is true now, and the tickets.");
     Ok(row)
 }
 
@@ -700,44 +633,16 @@ pub fn workspaces_dir(base: &Path) -> PathBuf {
 
 /// Write the confirmed set-up of picked repos into the workspace at `root`
 /// (new under [`workspaces_dir`], or the open one when adding): the manifest
-/// with each member's folder and the teams as groups, and each repo's kind,
-/// team, index state and description in the registry at `base`. Nothing is
-/// written into a shared parent folder. The only step that writes.
+/// with each member's folder, and each repo's kind and description in the
+/// registry at `base`. Nothing is written into a shared parent folder. The
+/// only step that writes.
 pub fn confirm_repos(base: &Path, root: &Path, name: &str, rows: &[RepoRow]) -> Result<Workspace> {
-    let chosen: Vec<&RepoRow> =
-        rows.iter().filter(|r| r.include && r.index != IndexState::Off && r.path.is_some()).collect();
+    let chosen: Vec<&RepoRow> = rows.iter().filter(|r| r.include && r.path.is_some()).collect();
     let members: Vec<(String, PathBuf)> =
         chosen.iter().filter_map(|r| r.path.clone().map(|p| (r.member.clone(), p))).collect();
     place_untouched(&chosen, |r| r.path.clone())?;
-    let mut ws = Workspace::create_at(root, name, &members)?;
-
-    let mut teams: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for r in &chosen {
-        if let Some(t) = &r.team {
-            teams.entry(t.clone()).or_default().push(r.member.clone());
-        }
-    }
-    for (team, ms) in teams {
-        let mut all = ws.config.group(&team).map(|g| g.members.clone()).unwrap_or_default();
-        for m in ms {
-            if !all.contains(&m) {
-                all.push(m);
-            }
-        }
-        ws.config.set_group(&team, &all)?;
-    }
-    ws.save()?;
-
-    let mut reg = Registry::load(base)?;
-    for m in &ws.members {
-        let workspace::MemberStatus::Ok(p) = &m.status else { continue };
-        let Some(row) = chosen.iter().find(|r| r.member == m.name) else { continue };
-        reg.add(p);
-        reg.set_kind(p.config.id, row.kind.clone(), row.team.clone());
-        reg.set_index(p.config.id, Some(row.index));
-        reg.set_description(p.config.id, &row.description);
-    }
-    reg.save(base)?;
+    let ws = Workspace::create_at(root, name, &members)?;
+    register(base, &ws, &chosen)?;
     Workspace::open(root)
 }
 
@@ -750,7 +655,7 @@ pub fn rescan(parent: &Path) -> Result<Vec<Moved>> {
     let declined = declined(parent);
     let mut out = Vec::new();
     for r in &proposal.rows {
-        if !ws.config.members.contains(&r.member) && !declined.members.contains(&r.member) && r.index != IndexState::Off {
+        if !ws.config.members.contains(&r.member) && !declined.members.contains(&r.member) {
             out.push(Moved::NewFolder { member: r.member.clone(), evidence: r.evidence.clone() });
         }
     }
@@ -845,33 +750,30 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_proposes_kinds_teams_states_and_worktrees_with_evidence() {
+    fn the_scan_proposes_kinds_and_worktrees_with_evidence() {
         let d = code_folder();
         let p = propose(d.path()).unwrap();
         let row = |m: &str| p.rows.iter().find(|r| r.member == m).unwrap_or_else(|| panic!("{m}: {:?}", p.rows));
 
         let docs = row("Realms-Docs");
         assert_eq!(docs.kind, vec![RepoKind::Wiki]);
-        assert_eq!(docs.index, IndexState::Entities);
-        assert_eq!(docs.team.as_deref(), Some("Realms"));
+        assert!(docs.include);
         assert!(docs.evidence.iter().any(|e| e.contains("DECISIONS")), "{:?}", docs.evidence);
 
         let game = row("Realms-Game");
-        assert_eq!((game.kind.clone(), game.index), (vec![RepoKind::Code], IndexState::Search));
-        assert_eq!(game.team.as_deref(), Some("Realms"), "named by the docs README");
+        assert_eq!(game.kind, vec![RepoKind::Code]);
         assert_eq!(game.remote.as_deref(), Some("git@github.com:Stingbro/Realms-Game.git"));
 
-        assert_eq!(row("SR/tools").team.as_deref(), Some("SR"), "the group folder is the team");
+        assert!(row("SR/tools").include);
         let personal = row("Personal");
-        assert!(personal.kind.is_empty() && personal.index == IndexState::Entities && !personal.has_git);
+        assert!(personal.kind.is_empty() && personal.include && !personal.has_git);
         assert!(!p.rows.iter().any(|r| r.member == "Realms-Game-u7"), "a worktree is never a row");
-        assert_eq!(row("Empty").index, IndexState::Off);
+        assert!(!p.rows.iter().any(|r| r.member == "Empty"), "a folder with nothing to index is not offered");
 
         let wt = p.ignores.iter().find(|i| i.reason == "Git worktree").expect("worktree proposed");
         assert_eq!(wt.pattern, "/Realms-Game-u7/", "anchored: that folder, not any of the name");
         assert!(wt.ticked && !wt.fixed);
         assert!(p.ignores.iter().any(|i| i.reason == "Secrets" && i.fixed));
-        assert_eq!(p.teams, vec!["Realms", "SR"]);
         assert!(!d.path().join(".kenignore").exists(), "propose writes nothing");
         assert!(!d.path().join(".ken-workspace").exists());
     }
@@ -881,24 +783,20 @@ mod tests {
         let d = code_folder();
         let base = tempfile::tempdir().unwrap();
         let mut p = propose(d.path()).unwrap();
-        // A person takes Personal out and reads the game's docs for entities.
+        // A person takes Personal out.
         p.rows.iter_mut().find(|r| r.member == "Personal").unwrap().include = false;
-        p.rows.iter_mut().find(|r| r.member == "Realms-Game").unwrap().index = IndexState::Entities;
         let ws = confirm(base.path(), d.path(), "Code", &p.rows, &p.ignores, "2026-09-24").unwrap();
 
         let mut members = ws.config.members.clone();
         members.sort();
         assert_eq!(members, vec!["Realms-Docs", "Realms-Game", "SR/tools"]);
-        assert_eq!(ws.config.group("Realms").map(|g| g.members.len()), Some(2));
-        assert!(ws.config.group("SR").is_none(), "SR is already a group folder");
+        assert!(ws.config.group("Realms").is_none(), "no team becomes a group (decision 35)");
 
         let reg = Registry::load(base.path()).unwrap();
         let game = reg.entry_at(&d.path().join("Realms-Game")).unwrap();
         assert_eq!(game.kind, vec![RepoKind::Code]);
-        assert_eq!(game.team.as_deref(), Some("Realms"));
-        assert_eq!(game.index, Some(IndexState::Entities), "a choice other than the kind's is kept");
-        let docs = reg.entry_at(&d.path().join("Realms-Docs")).unwrap();
-        assert_eq!(docs.index, None, "the kind's own state is not stored twice");
+        assert_eq!(game.team, None);
+        assert_eq!(game.index, None, "indexed: the default is not stored");
 
         let ignore = fs::read_to_string(d.path().join(".kenignore")).unwrap();
         assert!(ignore.contains("# Ken proposed these at set-up on 2026-09-24"));
@@ -917,9 +815,9 @@ mod tests {
     }
 
     /// Repos picked one by one from anywhere: a group folder stands for the
-    /// repos in it, a worktree comes back off, names stay unique, the docs
-    /// README still proposes the team, and Confirm writes the workspace in
-    /// app data with each member's own folder and nothing in a parent.
+    /// repos in it, a worktree comes back left out, names stay unique, and
+    /// Confirm writes the workspace in app data with each member's own folder
+    /// and nothing in a parent.
     #[test]
     fn repos_picked_one_by_one_make_a_workspace_in_app_data() {
         let d = code_folder();
@@ -938,10 +836,9 @@ mod tests {
         let row = |m: &str| {
             prop.rows.iter().find(|r| r.member == m).unwrap_or_else(|| panic!("{m}: {:?}", prop.rows))
         };
-        assert_eq!(row("Realms-Game").team.as_deref(), Some("Realms"), "named by the docs README");
         assert_eq!(row("Realms-Docs").description, "Docs for Realms-Game and its tools.");
         let wt = row("Realms-Game-u7");
-        assert!(!wt.include && wt.index == IndexState::Off, "a worktree is off");
+        assert!(!wt.include, "a worktree is left out");
         assert!(prop.rows.iter().any(|r| r.member == "tools-2"), "SR expanded, name kept unique");
 
         let base = tempfile::tempdir().unwrap();
@@ -962,7 +859,6 @@ mod tests {
         assert_eq!(ws.member_root("Personal"), canon(elsewhere.path().join("Personal")));
         assert!(ws.members.iter().all(|m| matches!(m.status, workspace::MemberStatus::Ok(_))));
         assert!(!ws.config.members.contains(&"Realms-Game-u7".to_string()));
-        assert_eq!(ws.config.group("Realms").map(|g| g.members.len()), Some(2));
         let reg = Registry::load(base.path()).unwrap();
         let game = reg.entry_at(&p.join("Realms-Game")).unwrap();
         assert_eq!(game.description.as_deref(), Some("The game: Rust, saves by region."));
@@ -995,25 +891,39 @@ mod tests {
     }
 
     #[test]
-    fn remote_owners_and_docs_team_names() {
+    fn remote_owners() {
         assert_eq!(remote_owner("git@github.com:Stingbro/ken.git").as_deref(), Some("Stingbro"));
         assert_eq!(remote_owner("https://github.com/smo-key/ken.git").as_deref(), Some("smo-key"));
-        assert_eq!(team_from_docs("Shattered-Realms-Docs"), "Shattered-Realms");
-        assert_eq!(team_from_docs("sr-docs"), "sr");
-        assert!(names_word("docs for realms-game and", "Realms-Game"));
-        assert!(!names_word("gamers", "game"), "short and partial words do not count");
     }
+
     #[test]
-    fn a_new_wiki_joins_set_up_as_the_teams_wiki() {
+    fn a_new_wiki_joins_set_up_as_the_knowledge_base() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("Realms-Wiki");
         let covered = vec![crate::wikinew::Covered { name: "Game".into(), description: "The client.".into(), ..Default::default() }];
         let row = create_wiki(&dir, "Realms", &covered, &["Game".into()], "2026-09-25").unwrap();
         assert_eq!(row.member, "Realms-Wiki");
         assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
-        assert_eq!(row.team.as_deref(), Some("Realms"));
-        assert_eq!(row.index, IndexState::Entities);
         assert!(row.include && row.has_git);
         assert!(fs::read_to_string(dir.join("START-HERE.md")).unwrap().contains("| `Game` | The client. |"));
+    }
+
+    /// Step 2's other choice: an existing wiki gets the files it lacks and
+    /// keeps every page it has.
+    #[test]
+    fn an_existing_wiki_is_overlaid_and_keeps_its_pages() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("Docs");
+        fs::create_dir_all(dir.join("design")).unwrap();
+        git(d.path(), &["init", "-q", "Docs"]);
+        fs::write(dir.join("START-HERE.md"), "# Our own start page\n").unwrap();
+        fs::write(dir.join("design/payments.md"), "# Payments\n").unwrap();
+        let (row, added) = overlay_wiki(&dir, "Realms", &[], &[], "2026-10-13").unwrap();
+        assert_eq!(row.kind, vec![RepoKind::Team, RepoKind::Wiki]);
+        assert!(added.contains(&"Decisions/DECISIONS.md".to_string()), "{added:?}");
+        assert!(!added.contains(&"START-HERE.md".to_string()), "a file it has is never written");
+        assert_eq!(fs::read_to_string(dir.join("START-HERE.md")).unwrap(), "# Our own start page\n");
+        assert!(dir.join("design/payments.md").is_file());
+        assert!(dir.join(".ken/knowledge.json").is_file());
     }
 }

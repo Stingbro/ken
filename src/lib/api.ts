@@ -32,16 +32,16 @@ export interface IndexHealth {
   modelMissing: boolean;
 }
 
-/** A repo's index state: not indexed, searchable only, read for entities. */
-export type IndexState = "off" | "search" | "entities";
+/** A repo's index state, the two of knowledge-core decision 34: switched
+ *  off as a whole, or indexed (its paths follow the index rules). */
+export type IndexState = "off" | "indexed";
 
-/** Mirrors `setup::RepoRow`: one repo the set-up scan found. */
+/** Mirrors `setup::RepoRow`: one source the set-up scan found. `include`
+ *  is its index state: a source or left out. */
 export interface SetupRepoRow {
   member: string;
   include: boolean;
   kind: RepoKind[];
-  team: string | null;
-  index: IndexState;
   evidence: string[];
   remote: string | null;
   existing: boolean;
@@ -63,7 +63,6 @@ export interface CoveredRepo {
 /** Mirrors `setup::IgnoreRow`: one ignore line the scan would add. */
 export interface SetupIgnoreRow {
   pattern: string;
-  state: IndexState;
   reason: string;
   evidence: string;
   ticked: boolean;
@@ -76,7 +75,6 @@ export interface SetupProposal {
   repos: number;
   withoutGit: number;
   rows: SetupRepoRow[];
-  teams: string[];
   ignores: SetupIgnoreRow[];
   existingWorkspace: boolean;
 }
@@ -131,6 +129,79 @@ export interface TeamFinding {
 }
 
 /** The Team screen: the chosen team's repos and configuration. */
+/** Mirrors `wikinew::TemplateGap`: a template file the knowledge base lacks,
+ *  or one Ken owns that differs from its template (`diff`: `- ` its lines,
+ *  `+ ` the template's). */
+export interface TemplateGap {
+  path: string;
+  state: "missing" | "out-of-date";
+  diff: string[];
+}
+
+/** Mirrors `wikimap::Move`: one page of an existing wiki and the section
+ *  it goes to. */
+export interface WikiMove {
+  from: string;
+  to: string;
+  section: string;
+  why: string;
+}
+
+/** Mirrors `wikimap::Plan`: the dry run. `left`: [page, why]. */
+export interface WikiMapPlan {
+  moves: WikiMove[];
+  left: [string, string][];
+}
+
+export interface WikiMapApplied {
+  moved: WikiMove[];
+  rewritten: string[];
+  unresolved: string[];
+  commit: string | null;
+  commitError: string | null;
+}
+
+/** The one background throttle (knowledge-core decision 34). */
+export type Pace = "gentle" | "normal" | "fast";
+
+export interface BackgroundJob {
+  kind: string;
+  label: string;
+  done: number;
+  total: number;
+}
+
+export interface BackgroundFailure {
+  kind: string;
+  label: string;
+  reason: string;
+  at: number;
+}
+
+/** Mirrors `buildqueue::Progress`: the library's build queue in numbers. */
+export interface BuildProgress {
+  total: number;
+  done: number;
+  queued: number;
+  reading: string[];
+  failed: [string, string][];
+  atOnce: number;
+}
+
+/** The one status panel: running, queued, progress, failed with reasons. */
+export interface BackgroundStatus {
+  throttle: {
+    setting: { pace: Pace; paused: boolean };
+    callsLastHour: number;
+    callsPerHour: number;
+    calling: boolean;
+  };
+  running: BackgroundJob[];
+  queued: { kind: string; label: string; count: number }[];
+  failed: BackgroundFailure[];
+  build: BuildProgress | null;
+}
+
 export interface TeamOverview {
   team: string | null;
   workspace: string;
@@ -138,7 +209,11 @@ export interface TeamOverview {
   repos: TeamRepo[];
   wiki: TeamRepo | null;
   gaps: TeamGap[];
+  /** The index rules in the knowledge base's `.ken/knowledge.json`. */
   ignores: string[];
+  /** Older workspace `.kenignore` lines, still read, never written. */
+  legacyIgnores: string[];
+  templateGaps: TemplateGap[];
   sweep: DriftRun | null;
   rules: TeamPage[];
   templates: TeamPage[];
@@ -1192,10 +1267,29 @@ export const api = {
   listProjects: () => invoke<RegistryEntryStatus[]>("list_projects"),
   /** The page a [[link]] names, by file name or frontmatter alias. */
   resolvePageLink: (from: string, target: string) => invoke<string | null>("resolve_page_link", { from, target }),
-  /** A knowledge base from the bundled template, in a new or empty folder;
-   *  it holds the tickets and the decisions log too. */
-  setupCreateWiki: (dir: string, team: string, repos: CoveredRepo[], taken: string[]) =>
-    invoke<SetupRepoRow>("setup_create_wiki", { dir, team, repos, taken }),
+  /** A knowledge base from the bundled template, in a new or empty folder,
+   *  named for the workspace; it holds the tickets and the decisions log. */
+  setupCreateWiki: (dir: string, name: string, repos: CoveredRepo[], taken: string[]) =>
+    invoke<SetupRepoRow>("setup_create_wiki", { dir, name, repos, taken }),
+  /** Ken's structure laid over an existing wiki: only the files it lacks are
+   *  written. Returns its row and the files added. */
+  setupOverlayWiki: (dir: string, name: string, repos: CoveredRepo[], taken: string[]) =>
+    invoke<{ row: SetupRepoRow; added: string[] }>("setup_overlay_wiki", { dir, name, repos, taken }),
+  /** The dry run of mapping an existing wiki's pages into the sections. */
+  wikiMapPlan: (dir: string) => invoke<WikiMapPlan>("wiki_map_plan", { dir }),
+  /** Apply the confirmed moves: links rewritten where certain, a log line,
+   *  one commit. Nothing is deleted. */
+  wikiMapApply: (dir: string, moves: WikiMove[]) => invoke<WikiMapApplied>("wiki_map_apply", { dir, moves }),
+  /** Lay down template files the knowledge base lacks; never overwrites. */
+  teamAddTemplateFiles: (paths: string[]) => invoke<string[]>("team_add_template_files", { paths }),
+  /** Start building the library from the workspace's sources. */
+  buildStart: (atOnce: number | null = null) => invoke<BuildProgress>("build_start", { atOnce }),
+  buildStop: () => invoke<void>("build_stop"),
+  buildSetAtOnce: (atOnce: number) => invoke<void>("build_set_at_once", { atOnce }),
+  /** The one status panel. */
+  backgroundStatus: () => invoke<BackgroundStatus>("background_status"),
+  /** Set the one throttle: the pace and Pause. */
+  backgroundSet: (pace: Pace, paused: boolean) => invoke<void>("background_set", { pace, paused }),
   /** Apply a proposed page change; returns the page written. */
   applyPageProposal: (itemId: number, projectId: string | null = null) =>
     invoke<string>("apply_page_proposal", { itemId, projectId }),

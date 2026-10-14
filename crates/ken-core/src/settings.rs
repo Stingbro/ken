@@ -16,6 +16,10 @@ pub struct AppSettings {
     /// Global feature-flag defaults; bool values keyed by flag name.
     #[serde(default)]
     pub features: Map<String, Value>,
+    /// The one background throttle (knowledge-core decision 34): its pace
+    /// and whether background work is paused. None until a person sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<crate::throttle::Setting>,
     /// Forward-compat passthrough for keys this build doesn't know about.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -26,6 +30,15 @@ pub fn settings_path(base_dir: &Path) -> PathBuf {
 }
 
 impl AppSettings {
+    /// The throttle setting: what a person set, else Normal, paused when an
+    /// older `backgroundExtraction: false` switched background work off.
+    pub fn throttle(&self) -> crate::throttle::Setting {
+        self.background.unwrap_or_else(|| crate::throttle::Setting {
+            paused: self.features.get("backgroundExtraction").and_then(Value::as_bool) == Some(false),
+            ..Default::default()
+        })
+    }
+
     pub fn load(base_dir: &Path) -> AppSettings {
         match std::fs::read_to_string(settings_path(base_dir)) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
@@ -100,6 +113,19 @@ mod tests {
             reloaded.features.get("semanticIndex").and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn the_throttle_setting_round_trips_and_an_old_switch_reads_as_pause() {
+        use crate::throttle::{Pace, Setting};
+        let dir = tempdir().unwrap();
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.throttle(), Setting::default());
+        settings.features.insert("backgroundExtraction".into(), false.into());
+        assert!(settings.throttle().paused, "background reading switched off is a pause");
+        settings.background = Some(Setting { pace: Pace::Gentle, paused: false });
+        settings.save(dir.path()).unwrap();
+        assert_eq!(AppSettings::load(dir.path()).throttle(), Setting { pace: Pace::Gentle, paused: false }, "a set throttle wins");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 <script lang="ts">
   import TeamScreen from "./TeamScreen.svelte";
+  import BackgroundPanel from "../team/BackgroundPanel.svelte";
   import type { SettingsSection } from "../lib/app.svelte";
   // Settings: what is yours (You), what is this computer's (This machine),
   // Ken's features, the connector for agents, and About. Each repo's own
@@ -59,9 +60,9 @@
 
   const transcriptionModels = $derived(modelsFor(models, "transcription"));
   const embeddingModels = $derived(modelsFor(models, "embedding"));
-  // Background reading is this machine's; the rest are Ken's features.
-  const backgroundReading = $derived(features.find((f) => f.name === "backgroundExtraction") ?? null);
-  const kenFeatures = $derived(features.filter((f) => f.name !== "backgroundExtraction"));
+  // Background work is paced and paused by the one throttle (the panel
+  // below), not a feature switch.
+  const kenFeatures = $derived(features);
 
   onMount(() => {
     void api.mcpInfo().then((m) => (mcp = m)).catch(() => (mcp = null));
@@ -426,21 +427,9 @@
         {/if}
       </div>
 
-      {#if backgroundReading}
-        <div class="card">
-          <div class="card-title">{backgroundReading.label}</div>
-          <label class="radio">
-            <input
-              type="checkbox"
-              checked={backgroundReading.global}
-              disabled={featuresBusy === backgroundReading.name}
-              onchange={(e) => backgroundReading && void setGlobalDefault(backgroundReading, e.currentTarget.checked)}
-            />
-            Read new files in the background
-          </label>
-          <p class="note">{backgroundReading.description}</p>
-        </div>
-      {/if}
+      <div class="card">
+        <BackgroundPanel />
+      </div>
       <div class="card">
         <div class="card-title">Memory: journal distillation</div>
         <p class="note">

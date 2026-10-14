@@ -634,7 +634,7 @@ pub fn ignore_rules(parent: &Path) -> Vec<crate::kenignore::Rule> {
 /// `~search-only` rule is about how much of a file's content gets
 /// indexed, which has no meaning for "is this a project".
 pub fn is_ignored_folder(rules: &[crate::kenignore::Rule], name: &str) -> bool {
-    crate::kenignore::classify(name, true, &[rules]) == crate::kenignore::Tier::Ignore
+    crate::kenignore::classify(name, true, &[rules]) == crate::kenignore::Tier::Ignored
 }
 
 /// Append a folder rule to the workspace-root `.kenignore`, creating the

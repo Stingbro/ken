@@ -17,7 +17,7 @@
 //!   in each entry's head, the named things they share, one citing the
 //!   other, how close their meaning is), and Claude is asked about a cluster
 //!   only when it holds an entry the pass has not read. The app asks in the
-//!   background, behind the shared pace and the hourly cap.
+//!   background, each call a turn of the one background throttle.
 //! - **Each pair it finds is a finding**, never written by itself. When a
 //!   person confirms one ([`confirm`]), Ken writes `supersedes:` on the later
 //!   entry and `[SUPERSEDED BY D-nnn]` on the earlier ([`mark_in_log`]) as
@@ -854,7 +854,7 @@ mod tests {
     fn index(db: &mut Db, log: &str, text: &str) {
         db.upsert_file(log, "md", 1, 1, "indexed", None, text).unwrap();
         let chunks = crate::chunker::chunk_file(log, text, &crate::chunker::IndexProfile::default_for(log));
-        db.upsert_chunks(log, &chunks, crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks(log, &chunks).unwrap();
     }
 
     #[test]

@@ -831,7 +831,7 @@ pub fn file_run(db: &mut Db, run: &DriftRun) -> Result<()> {
 }
 
 /// One Claude call for a re-read: a prompt in, the answer's text out. An
-/// error (no Claude, the switch off, the hourly cap reached) leaves the page
+/// error (no Claude, or asked to stop while the throttle held it) leaves the page
 /// waiting for a later run.
 pub type Reread<'a> = dyn FnMut(&str) -> Result<String> + 'a;
 

@@ -15,9 +15,9 @@
 //! - **Rulings cited in code** ([`unknown_rulings`]): a code comment citing a
 //!   ruling id the decisions log does not have.
 //!
-//! Claude is asked by the app, in the background, behind the shared pace,
-//! the hourly cap (`summary::take_call`) and the `backgroundExtraction`
-//! switch; this module only says what to ask and files what comes back.
+//! Claude is asked by the app, in the background, each call a turn of the
+//! one background throttle (`throttle::claude_turn`); this module only says
+//! what to ask and files what comes back.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;

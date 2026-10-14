@@ -58,18 +58,6 @@ pub const FLAGS: &[FlagDef] = &[
                       optional local-LLM refinement) to tune semantic-index \
                       chunking, exclusions, and knowledge extraction.",
     },
-    FlagDef {
-        name: "backgroundExtraction",
-        label: "Background reading",
-        applies: "this machine",
-        scope: FlagScope::Global,
-        default: true,
-        description: "Let Ken ask Claude in the background, a few calls an \
-                      hour: one-line summaries of the knowledge base's pages \
-                      for search, drift re-reads, the lint, and topic tags \
-                      for pages it writes. On by default. Turn it off and that \
-                      work waits until it goes back on.",
-    },
 ];
 
 /// What were flags and are now how Ken works: a workspace of several repos,
@@ -77,7 +65,10 @@ pub const FLAGS: &[FlagDef] = &[
 /// `settings.json` still holds for one is ignored, and none is shown.
 /// `federatedKg` named the merged workspace graph, gone with knowledge-core
 /// decision 21; it stays listed so an old value is still ignored.
-pub const BUILT_IN: &[&str] = &["workspace", "federatedKg", "kgRouting", "kenMemory"];
+/// `backgroundExtraction` switched background work off; the one throttle's
+/// Pause is that switch now (decision 34, `throttle`), and an old `false`
+/// is read once into it (`settings::AppSettings::background`).
+pub const BUILT_IN: &[&str] = &["workspace", "federatedKg", "kgRouting", "kenMemory", "backgroundExtraction"];
 
 /// Is `name` one of the [`BUILT_IN`] features, always on?
 pub fn built_in(name: &str) -> bool {
@@ -141,22 +132,18 @@ mod tests {
     }
 
     fn settings_with(features: Map<String, Value>) -> AppSettings {
-        AppSettings { features, extra: Map::new() }
+        AppSettings { features, ..Default::default() }
     }
 
     #[test]
-    fn registry_has_semantic_index_workspace_and_profiler() {
-        assert_eq!(FLAGS.len(), 3);
+    fn registry_has_semantic_index_and_profiler() {
+        assert_eq!(FLAGS.len(), 2);
         assert!(flag("semanticIndex").is_some());
         for name in BUILT_IN {
             assert!(flag(name).is_none(), "{name} is how Ken works, not a switch");
         }
-        // The only flag in the registry that defaults ON: background
-        // extraction is the behaviour Ken shipped with, and the switch exists
-        // to stop it rather than to start it.
-        let bg_extraction = flag("backgroundExtraction").expect("backgroundExtraction registered");
-        assert_eq!(bg_extraction.scope, FlagScope::Global);
-        assert!(bg_extraction.default);
+        // Background work is paused and paced by the throttle, not a flag.
+        assert!(flag("backgroundExtraction").is_none());
         let profiler = flag("profiler").expect("profiler flag registered");
         assert_eq!(profiler.scope, FlagScope::Project);
         assert!(!profiler.default);

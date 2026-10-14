@@ -14,7 +14,11 @@ use uuid::Uuid;
 use crate::search::FtsHit;
 use crate::{Error, Result};
 
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
+
+/// How many times a scan tries a file that fails to read before it is
+/// counted as failed (knowledge-core decision 34).
+pub const MAX_READ_ATTEMPTS: i64 = 3;
 
 /// Meta key: the code index was filled from stored text for this index. The
 /// stored key keeps its old name, so an index filled before the rename is not
@@ -934,6 +938,19 @@ impl Db {
                 "#,
             )?;
         }
+        if version < 27 {
+            // knowledge-core decision 34: a file that fails to read is tried
+            // again by the next scans and counted as failed after its third
+            // try (`MAX_READ_ATTEMPTS`). A file that failed before this
+            // counts one try. Nothing is read again now.
+            let has: bool = self.conn.prepare("SELECT 1 FROM pragma_table_info('files') WHERE name = 'attempts'")?.exists([])?;
+            if !has {
+                self.conn.execute_batch(
+                    "ALTER TABLE files ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+                     UPDATE files SET attempts = 1 WHERE status = 'failed';",
+                )?;
+            }
+        }
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION.to_string()],
@@ -1163,11 +1180,13 @@ impl Db {
         &mut self,
         path: &str,
         chunks: &[crate::chunker::Chunk],
-        tier: crate::kenignore::Tier,
     ) -> Result<Vec<(i64, String)>> {
         let tx = self.conn.savepoint()?;
         let vec_exists = table_exists(&tx, "vec_chunks")?;
-        let tier = tier as i64;
+        // The `tier` column is from when a path could be searchable but not
+        // read for the graph; with two states (decision 34) every chunk
+        // written is indexed, 0.
+        let tier = 0i64;
 
         let mut existing: std::collections::HashMap<i64, (i64, String)> = {
             let mut stmt = tx.prepare("SELECT seq, id, content_hash FROM chunks WHERE path = ?1")?;
@@ -1271,9 +1290,8 @@ impl Db {
         &mut self,
         path: &str,
         chunked: &crate::chunker::Chunked,
-        tier: crate::kenignore::Tier,
     ) -> Result<Vec<(i64, String)>> {
-        let changed = self.upsert_chunks(path, &chunked.chunks, tier)?;
+        let changed = self.upsert_chunks(path, &chunked.chunks)?;
         self.conn.execute(
             "UPDATE files SET chunk_capped = ?2 WHERE rel_path = ?1",
             params![path, chunked.capped as i64],
@@ -1518,10 +1536,13 @@ impl Db {
     ) -> Result<()> {
         let tx = self.conn.savepoint()?;
         tx.execute(
-            r#"INSERT INTO files (rel_path, kind, size, mtime, status, error)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            // A failed read counts one more try; any other status starts the
+            // count again (decision 34: failed after the third try).
+            r#"INSERT INTO files (rel_path, kind, size, mtime, status, error, attempts)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?5 = 'failed' THEN 1 ELSE 0 END)
                ON CONFLICT(rel_path) DO UPDATE SET
-                 kind = ?2, size = ?3, mtime = ?4, status = ?5, error = ?6"#,
+                 kind = ?2, size = ?3, mtime = ?4, status = ?5, error = ?6,
+                 attempts = CASE WHEN ?5 = 'failed' THEN attempts + 1 ELSE 0 END"#,
             params![rel_path, kind, size, mtime, status, error],
         )?;
         let file_id: i64 = tx.query_row(
@@ -2011,15 +2032,17 @@ impl Db {
     /// numbers are how anyone can tell. `model_missing` is left false for
     /// the caller to set.
     pub fn index_health(&self) -> Result<IndexHealth> {
+        // A file that failed fewer than `MAX_READ_ATTEMPTS` times waits for
+        // the next scan's try: queued, not failed.
         let (files, indexed, failed, skipped, queued, capped): (i64, i64, i64, i64, i64, i64) = self.conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(status = 'indexed'), 0),
-                    COALESCE(SUM(status = 'failed'), 0),
+                    COALESCE(SUM(status = 'failed' AND attempts >= ?1), 0),
                     COALESCE(SUM(status IN ('metadata_only', 'cloud_only')), 0),
-                    COALESCE(SUM(status = 'pending'), 0),
+                    COALESCE(SUM(status = 'pending' OR (status = 'failed' AND attempts < ?1)), 0),
                     COALESCE(SUM(chunk_capped <> 0), 0)
                FROM files",
-            [],
+            params![MAX_READ_ATTEMPTS],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
         let controls = crate::controls::stored(self);
@@ -3219,6 +3242,13 @@ impl Db {
             .flatten())
     }
 
+    /// How many times each failed file has been tried, by path.
+    pub fn read_attempts(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare("SELECT rel_path, attempts FROM files WHERE status = 'failed'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Record a file's byte hash, and its modified time when only that moved.
     pub fn set_file_byte_hash(&mut self, rel_path: &str, hash: &str, mtime: i64) -> Result<()> {
         self.conn.execute(
@@ -3226,22 +3256,6 @@ impl Db {
             params![rel_path, hash, mtime],
         )?;
         Ok(())
-    }
-
-    /// Store each file's current kenignore tier. This is how a change of a
-    /// repo's kind, or a new `~` line, reaches files already indexed: the scan
-    /// skips an unchanged file, but not this. Returns how many were re-tiered.
-    pub fn set_file_tiers(&mut self, tiers: &[(String, crate::kenignore::Tier)]) -> Result<usize> {
-        let tx = self.conn.savepoint()?;
-        let mut retiered = 0;
-        {
-            let mut stmt = tx.prepare("UPDATE files SET tier = ?2 WHERE rel_path = ?1 AND tier <> ?2")?;
-            for (rel, tier) in tiers {
-                retiered += stmt.execute(params![rel, *tier as i64])?;
-            }
-        }
-        tx.commit()?;
-        Ok(retiered)
     }
 
     /// Sentinel `mtime` stamped on a row that must be re-indexed by the next
@@ -3403,16 +3417,12 @@ impl Db {
             .map(|r| r.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let mut merged_text: Option<(String, i64)> = None;
+        let mut merged_text: Option<String> = None;
         if !ocr_text.trim().is_empty() {
-            let file: Option<(i64, i64)> = tx
-                .query_row(
-                    "SELECT id, tier FROM files WHERE rel_path = ?1",
-                    params![rel_path],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+            let file: Option<i64> = tx
+                .query_row("SELECT id FROM files WHERE rel_path = ?1", params![rel_path], |r| r.get(0))
                 .ok();
-            if let Some((id, tier)) = file {
+            if let Some(id) = file {
                 let existing: Option<String> = tx
                     .query_row("SELECT text FROM contents WHERE file_id = ?1", params![id], |r| r.get(0))
                     .ok();
@@ -3425,7 +3435,7 @@ impl Db {
                      ON CONFLICT(file_id) DO UPDATE SET text = ?2",
                     params![id, merged],
                 )?;
-                merged_text = Some((merged, tier));
+                merged_text = Some(merged);
             }
         }
         tx.execute(
@@ -3436,14 +3446,9 @@ impl Db {
         tx.commit()?;
         // The chunk index is the only search index (knowledge-core decision
         // 15), so the recognized words are chunked like any file's text.
-        if let Some((text, tier)) = merged_text {
-            let tier = if tier == crate::kenignore::Tier::SearchOnly as i64 {
-                crate::kenignore::Tier::SearchOnly
-            } else {
-                crate::kenignore::Tier::Full
-            };
+        if let Some(text) = merged_text {
             let chunked = crate::chunker::chunk_with(rel_path, &text, &crate::chunker::IndexProfile::default_for(rel_path), &[]);
-            self.store_chunked(rel_path, &chunked, tier)?;
+            self.store_chunked(rel_path, &chunked)?;
         }
         Ok(())
     }
@@ -4111,7 +4116,7 @@ mod tests {
     #[test]
     fn a_chunk_keeps_its_line_and_it_moves_when_text_is_added_above() {
         let mut db = Db::open_in_memory().unwrap();
-        db.upsert_chunks("a.md", &[chunk(0, "one", "h0"), chunk(1, "two", "h1")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("a.md", &[chunk(0, "one", "h0"), chunk(1, "two", "h1")])
             .unwrap();
         let id: i64 = db
             .conn
@@ -4121,7 +4126,7 @@ mod tests {
         let mut moved = chunk(1, "two", "h1");
         moved.line = 40;
         let changed = db
-            .upsert_chunks("a.md", &[chunk(0, "one", "h0"), moved], crate::kenignore::Tier::Full)
+            .upsert_chunks("a.md", &[chunk(0, "one", "h0"), moved])
             .unwrap();
         assert!(changed.is_empty(), "same text: nothing to re-embed");
         assert_eq!(db.chunk_line(id).unwrap(), Some(40));
@@ -4134,7 +4139,7 @@ mod tests {
         let chunks = vec![chunk(0, "hello world", "h0"), chunk(1, "second chunk", "h1")];
 
         let changed = db
-            .upsert_chunks("a.md", &chunks, crate::kenignore::Tier::Full)
+            .upsert_chunks("a.md", &chunks)
             .unwrap();
         assert_eq!(changed.len(), 2, "both new chunks reported as changed");
 
@@ -4199,9 +4204,9 @@ mod tests {
     #[test]
     fn split_names_and_stems_find_a_data_file_by_its_words() {
         let mut db = Db::open_in_memory().unwrap();
-        db.upsert_chunks("data/equipment/WeaponBases.json", &[chunk(0, "{ \"Bases\": { \"Sword_T1\": { \"MinLow\": 4 } } }", "h0")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("data/equipment/WeaponBases.json", &[chunk(0, "{ \"Bases\": { \"Sword_T1\": { \"MinLow\": 4 } } }", "h0")])
             .unwrap();
-        db.upsert_chunks("docs/notes.md", &[chunk(0, "Nothing about arms here.", "h1")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("docs/notes.md", &[chunk(0, "Nothing about arms here.", "h1")])
             .unwrap();
         for q in ["weapon bases", "base weapon", "WeaponBases", "weapon base damage ranges"] {
             let hits = db.search_chunks_fts(q, 5).unwrap();
@@ -4233,12 +4238,11 @@ mod tests {
     #[test]
     fn the_title_field_is_searched_and_weighted_above_the_body() {
         let mut db = Db::open_in_memory().unwrap();
-        db.upsert_chunks("Design/Payments.md", &[titled(0, "Payments › Retries › Backoff", None, "Each wait doubles, to a minute at most.")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("Design/Payments.md", &[titled(0, "Payments › Retries › Backoff", None, "Each wait doubles, to a minute at most.")])
             .unwrap();
         db.upsert_chunks(
             "Research/Notes.md",
             &[titled(0, "", None, "Notes from the call: queues, workers, dashboards, alerts, and a word on backoff among many other things discussed.")],
-            crate::kenignore::Tier::Full,
         )
         .unwrap();
         let hits = db.search_chunks_fts("backoff", 5).unwrap();
@@ -4250,7 +4254,7 @@ mod tests {
     #[test]
     fn a_code_chunks_symbol_is_in_its_names() {
         let mut db = Db::open_in_memory().unwrap();
-        db.upsert_chunks("src/books.rs", &[titled(0, "Settles the month.", Some("Ledger.reconcile"), "fn x() {}")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("src/books.rs", &[titled(0, "Settles the month.", Some("Ledger.reconcile"), "fn x() {}")])
             .unwrap();
         assert_eq!(db.search_chunks_fts("reconcile ledger", 5).unwrap().len(), 1);
         assert_eq!(db.search_chunks_fts("settles the month", 5).unwrap().len(), 1, "the doc comment is the title");
@@ -4266,9 +4270,9 @@ mod tests {
             db.upsert_file(path, "md", 1, 1, "indexed", None, "x").unwrap();
         }
         let page = titled(0, "Payments › Retries", None, "Each wait doubles.");
-        db.upsert_chunks("Design/Payments.md", std::slice::from_ref(&page), crate::kenignore::Tier::Full).unwrap();
-        db.upsert_chunks("src/pay.rs", &[titled(0, "", Some("pay"), "fn pay() {}")], crate::kenignore::Tier::Full).unwrap();
-        db.upsert_chunks("Inbox/raw.md", &[titled(0, "Raw", None, "A transcript.")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("Design/Payments.md", std::slice::from_ref(&page)).unwrap();
+        db.upsert_chunks("src/pay.rs", &[titled(0, "", Some("pay"), "fn pay() {}")]).unwrap();
+        db.upsert_chunks("Inbox/raw.md", &[titled(0, "Raw", None, "A transcript.")]).unwrap();
         let wanted = db.chunks_wanting_summaries(10).unwrap();
         assert_eq!(wanted.len(), 1, "pages only, not code or raw sources: {wanted:?}");
         assert_eq!(wanted[0].0, page.content_hash);
@@ -4282,7 +4286,7 @@ mod tests {
 
         // The same text written again finds its summary in the cache.
         db.delete_chunks("Design/Payments.md").unwrap();
-        db.upsert_chunks("Design/Payments.md", &[page], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("Design/Payments.md", &[page]).unwrap();
         assert_eq!(db.search_chunks_fts("exponentially", 5).unwrap().len(), 1);
     }
 
@@ -4293,7 +4297,7 @@ mod tests {
             db.upsert_file(path, "code", 1, 5, "indexed", None, "x").unwrap();
             db.set_file_byte_hash(path, "abc", 5).unwrap();
         }
-        db.upsert_chunks("notes.md", &[chunk(0, "plain words", "h0")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("notes.md", &[chunk(0, "plain words", "h0")]).unwrap();
         db.conn
             .execute_batch(
                 "DROP TABLE chunks_fts; CREATE VIRTUAL TABLE chunks_fts USING fts5(text, names);
@@ -4309,7 +4313,7 @@ mod tests {
             assert_eq!(db.get_file(path).unwrap().unwrap().mtime == -1, again, "{path}");
         }
         let chunked = crate::chunker::Chunked { chunks: vec![chunk(0, "plain words", "h0")], capped: true };
-        db.store_chunked("notes.md", &chunked, crate::kenignore::Tier::Full).unwrap();
+        db.store_chunked("notes.md", &chunked).unwrap();
         assert_eq!(db.index_health().unwrap().capped, 1, "a file cut at the cap is counted");
     }
 
@@ -4320,7 +4324,7 @@ mod tests {
             db.upsert_file(path, "code", 1, 5, status, None, "x").unwrap();
             db.set_file_byte_hash(path, "abc", 5).unwrap();
         }
-        db.upsert_chunks("a/WeaponBases.json", &[chunk(0, "{ \"MinLow\": 4 }", "h0")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("a/WeaponBases.json", &[chunk(0, "{ \"MinLow\": 4 }", "h0")])
             .unwrap();
         // An index from before: the old one-column table, filled the old way.
         db.conn
@@ -4355,8 +4359,8 @@ mod tests {
     fn keyword_search_returns_files_not_sections_of_one_file() {
         let mut db = Db::open_in_memory().unwrap();
         let sections: Vec<_> = (0..6).map(|i| chunk(i, &format!("the crossbow keeps its bolts loaded, case {i}"), &format!("t{i}"))).collect();
-        db.upsert_chunks("src/test/AmmoKeepDecisionTest.java", &sections, crate::kenignore::Tier::Full).unwrap();
-        db.upsert_chunks("src/main/AmmoKeep.java", &[chunk(0, "bolts stay loaded when the crossbow is put away", "a0")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("src/test/AmmoKeepDecisionTest.java", &sections).unwrap();
+        db.upsert_chunks("src/main/AmmoKeep.java", &[chunk(0, "bolts stay loaded when the crossbow is put away", "a0")])
             .unwrap();
         let hits = db.search_chunks_fts("crossbow bolts loaded", 2).unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -4368,16 +4372,15 @@ mod tests {
     fn a_plain_words_question_weighs_names_less_than_the_text() {
         let mut db = Db::open_in_memory().unwrap();
         // Names that hold three of the words; a text that holds five.
-        db.upsert_chunks("src/chest/LootedWorldChest.java", &[chunk(0, "class LootedWorldChest { int x; }", "n0")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("src/chest/LootedWorldChest.java", &[chunk(0, "class LootedWorldChest { int x; }", "n0")])
             .unwrap();
         db.upsert_chunks(
             "src/chest/PoolRespawn.java",
             &[chunk(0, "a chest emptied this tick comes back on a later tick, never the next one", "t0")],
-            crate::kenignore::Tier::Full,
         )
         .unwrap();
         for i in 0..20 {
-            db.upsert_chunks(&format!("src/other/Filler{i}.java"), &[chunk(0, &format!("unrelated code number {i}"), "f")], crate::kenignore::Tier::Full)
+            db.upsert_chunks(&format!("src/other/Filler{i}.java"), &[chunk(0, &format!("unrelated code number {i}"), "f")])
                 .unwrap();
         }
         // No chunk has every word, so the any-word search ranks them.
@@ -4429,7 +4432,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         let text = decisions_log(12);
         let chunks = crate::chunker::chunk_file("decisions/DECISIONS.md", &text, &crate::chunker::IndexProfile::default_for("x.md"));
-        db.upsert_chunks("decisions/DECISIONS.md", &chunks, crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("decisions/DECISIONS.md", &chunks).unwrap();
         let names: String = db.conn.query_row("SELECT names FROM chunks_fts WHERE text LIKE '%**D-007**%'", [], |r| r.get(0)).unwrap();
         for want in ["D007", "007", "RULING", "WIDGET"] {
             assert!(names.split(' ').any(|w| w == want), "{want} in {names}");
@@ -4446,7 +4449,7 @@ mod tests {
             "this passage never spells out the module by name",
             "h0",
         )];
-        db.upsert_chunks("src/local_llm.rs", &chunks, crate::kenignore::Tier::Full)
+        db.upsert_chunks("src/local_llm.rs", &chunks)
             .unwrap();
 
         let hits = db.search_chunks_fts("local_llm", 10).unwrap();
@@ -4461,7 +4464,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         let plain = "fn frobnicate() { /* body */ }";
         let chunks = vec![chunk(0, plain, "h0")];
-        db.upsert_chunks("src/util.rs", &chunks, crate::kenignore::Tier::Full)
+        db.upsert_chunks("src/util.rs", &chunks)
             .unwrap();
 
         let stored: String = db
@@ -4479,7 +4482,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         let first = vec![chunk(0, "hello world", "h0"), chunk(1, "second chunk", "h1")];
         let ids1 = db
-            .upsert_chunks("a.md", &first, crate::kenignore::Tier::Full)
+            .upsert_chunks("a.md", &first)
             .unwrap();
         assert_eq!(ids1.len(), 2);
         let id_seq0 = ids1[0].0;
@@ -4487,7 +4490,7 @@ mod tests {
         // Re-upsert with seq 0 unchanged (same hash) and seq 1 changed (new hash).
         let second = vec![chunk(0, "hello world", "h0"), chunk(1, "second chunk EDITED", "h1-new")];
         let changed = db
-            .upsert_chunks("a.md", &second, crate::kenignore::Tier::Full)
+            .upsert_chunks("a.md", &second)
             .unwrap();
         assert_eq!(changed.len(), 1, "only the changed chunk should be reported");
 
@@ -4517,13 +4520,13 @@ mod tests {
     fn upsert_chunks_removes_stale_seqs() {
         let mut db = Db::open_in_memory().unwrap();
         let first = vec![chunk(0, "a", "h0"), chunk(1, "b", "h1"), chunk(2, "c", "h2")];
-        db.upsert_chunks("a.md", &first, crate::kenignore::Tier::Full)
+        db.upsert_chunks("a.md", &first)
             .unwrap();
 
         // Re-chunk down to a single chunk: seq 1 and 2 must disappear from
         // `chunks` and their `chunks_fts` mirror rows.
         let second = vec![chunk(0, "a", "h0")];
-        db.upsert_chunks("a.md", &second, crate::kenignore::Tier::Full)
+        db.upsert_chunks("a.md", &second)
             .unwrap();
 
         let count: i64 = db
@@ -4544,7 +4547,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         let chunks = vec![chunk(0, "a", "h0"), chunk(1, "b", "h1")];
         let ids = db
-            .upsert_chunks("a.md", &chunks, crate::kenignore::Tier::Full)
+            .upsert_chunks("a.md", &chunks)
             .unwrap();
         if db.vec_available() {
             db.ensure_vec_chunks(8).unwrap();
@@ -4581,7 +4584,7 @@ mod tests {
             // No usable vec0 in this build: store_embeddings/semantic_search
             // must degrade to graceful no-ops rather than erroring.
             let changed = db
-                .upsert_chunks("a.md", &[chunk(0, "hello", "h0")], crate::kenignore::Tier::Full)
+                .upsert_chunks("a.md", &[chunk(0, "hello", "h0")])
                 .unwrap();
             let ids: Vec<i64> = changed.iter().map(|(id, _)| *id).collect();
             db.store_embeddings(&ids, &[vec![0.1f32; 8]]).unwrap();
@@ -4595,7 +4598,7 @@ mod tests {
             chunk(1, "a totally different sentence", "h1"),
         ];
         let changed = db
-            .upsert_chunks("a.md", &chunks, crate::kenignore::Tier::Full)
+            .upsert_chunks("a.md", &chunks)
             .unwrap();
         let ids: Vec<i64> = changed.iter().map(|(id, _)| *id).collect();
 
@@ -4875,7 +4878,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         assert_eq!(db.index_health().unwrap(), IndexHealth::default());
         db.upsert_file("a.md", "md", 1, 1, "indexed", None, "alpha").unwrap();
-        db.upsert_chunks("a.md", &[chunk(0, "alpha", "h0"), chunk(1, "beta", "h1")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("a.md", &[chunk(0, "alpha", "h0"), chunk(1, "beta", "h1")]).unwrap();
         db.upsert_file("b.pdf", "pdf", 1, 1, "failed", Some("bad pdf"), "").unwrap();
         db.upsert_file("c.png", "image", 1, 1, "metadata_only", None, "").unwrap();
         db.upsert_file("d.md", "md", 1, 1, "pending", None, "").unwrap();
@@ -4916,7 +4919,7 @@ mod tests {
     fn a_pages_title_and_aliases_and_a_files_role_are_in_its_names() {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_file("Reference/Regions.md", "md", 1, 1, "indexed", None, "x").unwrap();
-        db.upsert_chunks("Reference/Regions.md", &[chunk(0, "How the map is cut up.", "h0")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("Reference/Regions.md", &[chunk(0, "How the map is cut up.", "h0")]).unwrap();
         let meta = crate::pagemeta::PageMeta { title: Some("World regions".into()), aliases: vec!["shard layout".into()], ..Default::default() };
         db.set_page_meta("Reference/Regions.md", Some(&meta)).unwrap();
         let names = db.chunk_names("Reference/Regions.md").unwrap().join(" ");
@@ -4924,7 +4927,7 @@ mod tests {
         assert_eq!(db.search_chunks_fts("shard layout", 5).unwrap().len(), 1, "an alias finds its page through the names field");
 
         db.upsert_file("src/Pay.java", "code", 1, 1, "indexed", None, "class Pay {}").unwrap();
-        db.upsert_chunks("src/Pay.java", &[chunk(0, "class Pay {}", "h1")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("src/Pay.java", &[chunk(0, "class Pay {}", "h1")]).unwrap();
         assert_eq!(db.set_file_roles(&[("src/Pay.java".into(), Some("billing".into()))]).unwrap(), vec!["src/Pay.java".to_string()]);
         assert!(db.chunk_names("src/Pay.java").unwrap()[0].contains("billing"));
         assert!(db.chunks_missing_vectors("src/Pay.java").unwrap()[0].1.starts_with("src/Pay.java (billing)"), "the role is in the embedded header");
@@ -5031,7 +5034,7 @@ mod tests {
     #[test]
     fn remove_file_removes_its_text_and_chunks() {
         let mut db = seeded();
-        db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan owns billing cutover", "h0")], crate::kenignore::Tier::Full)
+        db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan owns billing cutover", "h0")])
             .unwrap();
         assert!(!db.search_chunks_fts("Natarajan", 10).unwrap().is_empty());
         db.remove_file("knowledge/People.md").unwrap();
@@ -5045,8 +5048,8 @@ mod tests {
     #[test]
     fn orphan_chunks_are_dropped() {
         let mut db = seeded();
-        db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan", "h0")], crate::kenignore::Tier::Full).unwrap();
-        db.upsert_chunks("ghost.md", &[chunk(0, "ghost content", "h1")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("knowledge/People.md", &[chunk(0, "Priya Natarajan", "h0")]).unwrap();
+        db.upsert_chunks("ghost.md", &[chunk(0, "ghost content", "h1")]).unwrap();
         assert_eq!(db.drop_orphan_chunks().unwrap(), 1);
         assert!(db.search_chunks_fts("ghost", 5).unwrap().is_empty());
         assert!(!db.search_chunks_fts("Natarajan", 5).unwrap().is_empty());
@@ -5071,7 +5074,7 @@ mod tests {
         db.upsert_file("docs/deep/b.md", "md", 20, 2, "indexed", None, "beta widget").unwrap();
         db.upsert_file("docs2/c.md", "md", 30, 3, "indexed", None, "gamma widget").unwrap();
         for (path, text) in [("docs/a.md", "alpha widget"), ("docs/deep/b.md", "beta widget"), ("docs2/c.md", "gamma widget")] {
-            db.upsert_chunks(path, &[chunk(0, text, path)], crate::kenignore::Tier::Full).unwrap();
+            db.upsert_chunks(path, &[chunk(0, text, path)]).unwrap();
         }
         crate::graph::set_topics(&db, "docs/a.md", &["billing".to_string()]).unwrap();
         crate::graph::set_topics(&db, "docs2/c.md", &["billing".to_string()]).unwrap();
@@ -5128,7 +5131,7 @@ mod tests {
     fn rename_prefix_renames_a_single_file_and_its_chunks() {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_file("notes/kickoff.md", "md", 10, 1, "indexed", None, "body text").unwrap();
-        db.upsert_chunks("notes/kickoff.md", &[chunk(0, "body text", "h0")], crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks("notes/kickoff.md", &[chunk(0, "body text", "h0")]).unwrap();
 
         assert_eq!(db.rename_prefix("notes/kickoff.md", "notes/launch-plan.md").unwrap(), 1);
         assert!(db.get_file("notes/kickoff.md").unwrap().is_none());
@@ -5229,7 +5232,7 @@ mod tests {
         writer
             .upsert_file("notes/b.md", "md", 20, 2, "indexed", None, "quarterly forecast")
             .unwrap();
-        writer.upsert_chunks("notes/b.md", &[chunk(0, "quarterly forecast", "h0")], crate::kenignore::Tier::Full).unwrap();
+        writer.upsert_chunks("notes/b.md", &[chunk(0, "quarterly forecast", "h0")]).unwrap();
         let via_reader = reader.search_chunks_fts("forecast", 5).unwrap();
         let via_writer = writer.search_chunks_fts("forecast", 5).unwrap();
         assert_eq!(via_reader.len(), 1);

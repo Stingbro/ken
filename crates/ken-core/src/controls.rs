@@ -97,7 +97,7 @@ mod tests {
     fn indexed(db: &mut Db, path: &str, text: &str) {
         db.upsert_file(path, "md", 1, 1, "indexed", None, text).unwrap();
         let chunks = crate::chunker::chunk_file(path, text, &crate::chunker::IndexProfile::default_for(path));
-        db.upsert_chunks(path, &chunks, crate::kenignore::Tier::Full).unwrap();
+        db.upsert_chunks(path, &chunks).unwrap();
     }
 
     #[test]

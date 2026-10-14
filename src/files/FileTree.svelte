@@ -12,6 +12,7 @@
   import { memberLeaf } from "../lib/api";
   import { imports } from "../lib/imports.svelte";
   import { isMarkAllEnabled, showUnreadFilter } from "./filesHeader";
+  import { repoFor, sideOf, splitRepos, type FilesSide } from "./filesSplit";
   import { buildTree } from "../lib/tree";
   import {
     openContextMenu,
@@ -27,9 +28,11 @@
 
   let { width }: { width: number } = $props();
 
-  // Files opens on the team's wiki; the menu above the tree shows any of
-  // the team's repos. A file opened from another repo (a search hit, a
-  // citation) shows that repo here. Choosing one stays on Files.
+  // Files splits into Wiki and Sources (knowledge-core decision 32): the
+  // knowledge base under Wiki, the workspace's other repos under Sources,
+  // with a menu when there are several. Files opens on the wiki. A file
+  // opened from another repo (a search hit, a citation) shows that repo here.
+  // Choosing one stays on Files.
   const teamRepos = $derived.by(() => {
     const ids = scope.groups.find((g) => g.name === scope.team)?.projectIds ?? null;
     return app.members
@@ -38,8 +41,19 @@
       .sort((a, b) => (a.id === scope.wikiId ? -1 : b.id === scope.wikiId ? 1 : a.name.localeCompare(b.name)));
   });
 
-  function showRepo(id: string) {
+  function showRepo(id: string | null) {
     if (id && id !== app.focused) void app.focusMember(id, { stay: true });
+  }
+
+  const split = $derived(splitRepos(teamRepos, scope.wikiId));
+  const side = $derived(sideOf(app.focused, scope.wikiId));
+  // The source last shown, so Sources opens where a person left it.
+  let lastSource = $state<string | null>(null);
+  $effect(() => {
+    if (side === "sources" && app.focused) lastSource = app.focused;
+  });
+  function showSide(to: FilesSide) {
+    showRepo(repoFor(to, split, lastSource));
   }
 
   const unreadOnly = $derived(app.filesFilter === "unread");
@@ -152,17 +166,32 @@
 
 <div class="tree" style:width="{width}px">
   {#if app.workspace && teamRepos.length > 1}
-    <div class="repo-pick">
-      <select
-        aria-label="Repo shown in Files"
-        value={app.focused ?? ""}
-        onchange={(e) => showRepo((e.currentTarget as HTMLSelectElement).value)}
+    <div class="split" role="tablist" aria-label="Wiki or sources">
+      <button class="side" class:on={side === "wiki"} role="tab" aria-selected={side === "wiki"} disabled={!split.wiki} onclick={() => showSide("wiki")}
+        >Wiki</button
       >
-        {#each teamRepos as m (m.id)}
-          <option value={m.id}>{memberLeaf(m.name)}{m.id === scope.wikiId ? " · wiki" : ""}</option>
-        {/each}
-      </select>
+      <button
+        class="side"
+        class:on={side === "sources"}
+        role="tab"
+        aria-selected={side === "sources"}
+        disabled={split.sources.length === 0}
+        onclick={() => showSide("sources")}>Sources</button
+      >
     </div>
+    {#if side === "sources" && split.sources.length > 1}
+      <div class="repo-pick">
+        <select
+          aria-label="Source shown in Files"
+          value={app.focused ?? ""}
+          onchange={(e) => showRepo((e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#each split.sources as m (m.id)}
+            <option value={m.id}>{memberLeaf(m.name)}</option>
+          {/each}
+        </select>
+      </div>
+    {/if}
   {/if}
   {#if app.favorites.length > 0}
     <div class="tree-head">Favorites</div>
@@ -474,6 +503,29 @@
   }
   .repo-pick {
     margin: 0 8px 8px;
+  }
+  .split {
+    display: flex;
+    gap: 2px;
+    margin: 0 8px 8px;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+  }
+  .side {
+    flex: 1;
+    padding: 3px 8px;
+    border: none;
+    border-radius: var(--radius-control);
+    background: transparent;
+    color: var(--ink-secondary);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .side.on {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent-deep);
+    font-weight: 600;
   }
   .repo-pick select {
     width: 100%;

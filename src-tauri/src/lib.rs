@@ -1229,13 +1229,15 @@ fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others
         }
     });
 
-    // One background worker per open project: one-line summaries for search
-    // and a knowledge base's checks, through Claude, on the shared pace.
+    // One background worker per open project: one-line summaries for search,
+    // a knowledge base's checks and its build queue, through Claude, on the
+    // one background throttle.
+    let worker_app = app.clone();
     let worker_state = state.clone();
     let worker_id = project.config.id;
     let worker_stop = stop.clone();
     std::thread::spawn(move || {
-        background_worker(worker_state, worker_id, worker_stop);
+        background_worker(worker_app, worker_state, worker_id, worker_stop);
     });
 
     // One background OCR worker per open project: drains `ocr_pending`, runs
@@ -1279,10 +1281,6 @@ const BG_HYDRATE_TICK: Duration = Duration::from_secs(20);
 /// slow file is abandoned quickly (its provider keeps downloading) and retried
 /// on a later tick instead of pinning the single worker to one file.
 const BG_HYDRATE_DEADLINE: Duration = Duration::from_secs(45);
-
-/// Quiet gap between two background downloads so a large backlog trickles in
-/// rather than saturating disk and bandwidth in a burst.
-const BG_HYDRATE_PACING: Duration = Duration::from_secs(3);
 
 /// Minimum wait before retrying a file that failed to materialize. A provider
 /// that's offline (or a file that keeps timing out) must not be hammered every
@@ -1351,6 +1349,14 @@ fn background_hydrate_worker(
             let Ok(abs) = project.resolve(&rel) else {
                 continue;
             };
+            // Each download is a step of the one background throttle
+            // (knowledge-core decision 34): it waits while paused and paces
+            // the backlog so it trickles rather than bursts.
+            let halt = || stop.load(Ordering::SeqCst);
+            if !ken_core::throttle::step_turn(&halt) {
+                return;
+            }
+            let _running = ken_core::throttle::begin("cloud", &rel);
 
             match hydrate_emitting(&app, project_id, &rel, &abs, BG_HYDRATE_DEADLINE) {
                 Ok(()) => {
@@ -1377,8 +1383,6 @@ fn background_hydrate_worker(
                             },
                         );
                     }
-                    // Pace the backlog so it trickles rather than bursts.
-                    std::thread::sleep(BG_HYDRATE_PACING);
                 }
                 // Provider offline, or the file is still downloading past the
                 // short deadline: leave the row cloud_only and try later. Never
@@ -1716,8 +1720,8 @@ fn focus_member_inner(app: &AppHandle, state: &SharedState, id: uuid::Uuid) -> C
 }
 
 /// Reverse of `kenignore::parse` (ken-memory task 2.1): render `Rule`s back
-/// to `.kenignore`-syntax lines (`Tier::Full` -> `!pattern`,
-/// `Tier::SearchOnly` -> `~pattern`, `Tier::Ignore` -> bare `pattern`). Lets
+/// to `.kenignore`-syntax lines (`Tier::Indexed` -> `!pattern`,
+/// `Tier::Ignored` -> bare `pattern`). Lets
 /// `activate_memory_pseudo_member` hand `memory::workspace_builtin_rules()`
 /// to the existing `Project::kenignore_rules()`/`scan::scan` disk-read path
 /// completely unchanged — see that function's doc comment for why this file-
@@ -1731,9 +1735,8 @@ fn render_builtin_kenignore(rules: &[kenignore::Rule]) -> String {
     );
     for r in rules {
         let prefix = match r.tier {
-            kenignore::Tier::Full => "!",
-            kenignore::Tier::SearchOnly => "~",
-            kenignore::Tier::Ignore => "",
+            kenignore::Tier::Indexed => "!",
+            kenignore::Tier::Ignored => "",
         };
         out.push_str(prefix);
         out.push_str(&r.pattern);
@@ -1793,16 +1796,12 @@ fn activate_memory_pseudo_member(
         project
     };
 
-    // D3's built-in tier rules (memory/ full, journal/+tasks/ search-only,
-    // workspace.json+kg.sqlite ignored), regenerated on every activation.
-    // `scan::scan`'s `rule_sets` is hardcoded to
-    // `[built_in_rule_sets(), user_rules]` with no third, per-member slot,
-    // and both `scan.rs`/`kenignore.rs` are outside this task's touch-
-    // boundary — so this writes the built-ins through the same
-    // `Project::kenignore_rules()` disk-read channel `scan::scan` already
-    // calls unmodified, via `render_builtin_kenignore` above. Best-effort:
-    // a write failure degrades this activation to "everything Full tier"
-    // (today's plain no-`.kenignore` default) rather than blocking the open.
+    // The pseudo-member's own index rules (memory/, journal/ and tasks/
+    // indexed, workspace.json and kg.sqlite not), regenerated on every
+    // activation. They reach `scan::scan` through the `.kenignore` that
+    // `Project::index_rules` reads as legacy, written here by
+    // `render_builtin_kenignore`. Best-effort: a write failure leaves every
+    // file of it indexed rather than blocking the open.
     let kenignore_path = pseudo_root.join(".kenignore");
     let rules = memory::workspace_builtin_rules();
     let text = render_builtin_kenignore(&rules);
@@ -2188,7 +2187,10 @@ fn analyze_new_sources(app: &AppHandle, state: &SharedState) {
                 continue;
             }
             let root = project.root.clone();
+            // Background work: a turn of the one throttle (decision 34).
             let mut generate = |prompt: &str| -> ken_core::Result<String> {
+                let _turn = ken_core::throttle::claude_turn(&|| false);
+                let _running = ken_core::throttle::begin("analysis", &project.config.name);
                 match ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, ANALYSIS_TIMEOUT, &CancelToken::new())? {
                     ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
                     other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
@@ -2301,8 +2303,8 @@ fn set_project_kind(
 }
 
 /// Scan an open repo again in the background, after what it is changed: a
-/// repo given its kind is read for the first time, and one whose index state
-/// changed has its files re-tiered.
+/// repo given its kind is read for the first time, and one switched off or
+/// on loses or gains its files.
 fn rescan_member(app: &AppHandle, base: &Path, project: &Project) {
     let (app, base, project) = (app.clone(), base.to_path_buf(), project.clone());
     std::thread::spawn(move || {
@@ -2314,8 +2316,9 @@ fn rescan_member(app: &AppHandle, base: &Path, project: &Project) {
     });
 }
 
-/// Set how deep Ken reads a repo (off / search / entities), or clear the
-/// choice so it follows the kind. The next scan re-tiers its files.
+/// Switch a repo's index off, or back on with None or `indexed` (the two
+/// states of knowledge-core decision 34). The next scan drops or reads its
+/// files.
 #[tauri::command]
 fn set_project_index(
     app: AppHandle,
@@ -6367,38 +6370,25 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A background Claude call for the knowledge checks (knowledge-core
 /// decisions 25, 28 and 29): through the Claude CLI with no tools, never the
-/// local model. Each call is made only while `backgroundExtraction` is on
-/// for the project, waits for the shared pace (`EXTRACT_PACING`), and takes
-/// one of the hourly calls summaries share (`summary::take_call`). A call
-/// refused (switched off, the hour full, asked to stop) is an error, which
-/// leaves its work waiting. None when Claude Code is not installed.
+/// local model. Each call is a turn of the one background throttle
+/// (`throttle::claude_turn`, decision 34): it waits while paused, for the
+/// pace's gap and for one of the hour's calls. A call asked to stop while it
+/// waits is an error, which leaves its work waiting. None when Claude Code
+/// is not installed.
 fn background_claude(
-    state: &SharedState,
-    project_id: uuid::Uuid,
+    _state: &SharedState,
+    _project_id: uuid::Uuid,
     root: &Path,
     stop: &Arc<AtomicBool>,
 ) -> Option<impl FnMut(&str) -> ken_core::Result<String>> {
     let binary = ken_core::runner::discover_claude()?;
-    let (state, root, stop) = (state.clone(), root.to_path_buf(), stop.clone());
+    let (root, stop) = (root.to_path_buf(), stop.clone());
     Some(move |prompt: &str| -> ken_core::Result<String> {
-        let on = {
-            let guard = lock_tolerant(&state);
-            guard
-                .members
-                .get(&project_id)
-                .is_some_and(|a| ken_core::features::effective_flag(&guard.app_settings, &a.project, "backgroundExtraction"))
-        };
-        if !on {
-            return Err(ken_core::Error::Other("background reading is switched off".into()));
-        }
-        if !wait_for_extraction_slot(&stop) {
+        let halt = || stop.load(Ordering::SeqCst);
+        let Some(_turn) = ken_core::throttle::claude_turn(&halt) else {
             return Err(ken_core::Error::Other("stopped".into()));
-        }
-        if !ken_core::summary::take_call() {
-            return Err(ken_core::Error::Other("the hour's background calls are used".into()));
-        }
+        };
         let out = ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, CHECK_TIMEOUT, &CancelToken::new());
-        stamp_extraction_slot();
         match out? {
             ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
             other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
@@ -6452,10 +6442,8 @@ fn run_drift(state: &SharedState, project: &Project, db: &mut Db, force: bool, s
     Some(run)
 }
 
-/// How often the background worker looks at a knowledge base's checks.
-const CHECKS_EVERY: Duration = Duration::from_secs(300);
-/// How long the checks are left alone after a Claude call failed or was
-/// refused.
+/// How long the checks are left alone after a Claude call failed. How often
+/// they are looked at is the throttle's pace (`Limits::checks_every`).
 const CHECKS_BACKOFF: Duration = Duration::from_secs(600);
 
 /// One turn of a knowledge base's checks (knowledge-core decisions 21, 25,
@@ -6498,10 +6486,16 @@ fn knowledge_checks(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<Atom
     };
     let root = project.root.as_path();
     let now = engine::now_epoch();
+    let label = project.config.name.clone();
+    let _running = ken_core::throttle::begin("checks", &label);
     let done = |r: ken_core::Result<usize>| match r {
-        Ok(_) => SummaryTick::Ran,
+        Ok(_) => {
+            ken_core::throttle::clear_failure("checks", &label);
+            SummaryTick::Ran
+        }
         Err(e) => {
             eprintln!("checks: {e}");
+            ken_core::throttle::fail("checks", &label, &e.to_string());
             SummaryTick::Failed
         }
     };
@@ -6653,6 +6647,7 @@ fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::
         return false;
     }
     let id = project.config.id;
+    let project_name = format!("{}: reading the inbox", project.config.name);
     let Some(binary) = ken_core::runner::discover_claude() else {
         INGEST_STOPPED.lock().unwrap().insert(id, ken_core::runner::MISSING_CLAUDE_HELP.to_string());
         return false;
@@ -6684,7 +6679,11 @@ fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::
                     let on_phase: Arc<dyn Fn(&str, ken_core::ingest::PassPhase) + Send + Sync> = Arc::new(move |raw, phase| {
                         INGEST_READING.lock().unwrap().insert(id, (raw.to_string(), phase));
                     });
+                    // Each ingest call is a turn of the one background throttle
+                    // (knowledge-core decision 34): paused with everything else,
+                    // paced, and counted against the hour's calls.
                     let call = |prompt: &str| {
+                        let _turn = ken_core::throttle::claude_turn(&|| false);
                         ken_core::ingest::call_result(ken_core::assistant::oneshot(
                             &binary,
                             &root,
@@ -6693,6 +6692,7 @@ fn start_ingest_pass(project: &Project, base: &Path, others: Vec<(String, uuid::
                             &CancelToken::new(),
                         ))
                     };
+                    let _running = ken_core::throttle::begin("ingest", &project_name);
                     let today = local_date_today();
                     match ken_core::ingest::run_pass(&root, &mut db, &code, &today, engine::now_epoch, transcriber, call, &on_phase) {
                         Ok(report) => {
@@ -6773,15 +6773,63 @@ fn claude_generate(
 #[tauri::command]
 async fn setup_create_wiki(
     dir: String,
-    team: String,
+    name: String,
     repos: Vec<ken_core::wikinew::Covered>,
     taken: Vec<String>,
 ) -> CmdResult<ken_core::setup::RepoRow> {
     tauri::async_runtime::spawn_blocking(move || {
-        ken_core::setup::create_wiki(Path::new(&dir), &team, &repos, &taken, &local_date_today()).map_err(err)
+        ken_core::setup::create_wiki(Path::new(&dir), &name, &repos, &taken, &local_date_today()).map_err(err)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// What overlaying an existing wiki did: its set-up row and the template
+/// files laid down.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayDto {
+    row: ken_core::setup::RepoRow,
+    added: Vec<String>,
+}
+
+/// Set-up's second step, the other choice (knowledge-core decision 32): lay
+/// Ken's structure over an existing wiki at `dir`. Only files it lacks are
+/// written; nothing it has is changed or deleted. Its pages are mapped into
+/// the sections after a dry run ([`wiki_map_plan`]).
+#[tauri::command]
+async fn setup_overlay_wiki(
+    dir: String,
+    name: String,
+    repos: Vec<ken_core::wikinew::Covered>,
+    taken: Vec<String>,
+) -> CmdResult<OverlayDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (row, added) = ken_core::setup::overlay_wiki(Path::new(&dir), &name, &repos, &taken, &local_date_today()).map_err(err)?;
+        Ok(OverlayDto { row, added })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The dry run of mapping an existing wiki at `dir` into the sections
+/// (knowledge-core decision 33): every move with why, and what stays where
+/// it is. Moves nothing.
+#[tauri::command(async)]
+fn wiki_map_plan(dir: String) -> CmdResult<ken_core::wikimap::Plan> {
+    let dir = PathBuf::from(dir);
+    if !dir.is_dir() {
+        return Err(format!("{} is not a folder", dir.display()));
+    }
+    Ok(ken_core::wikimap::plan(&dir))
+}
+
+/// Apply the moves a person confirmed from [`wiki_map_plan`]: pages moved,
+/// links rewritten where certain and the rest reported, a `log.md` line and
+/// one commit. Nothing is deleted.
+#[tauri::command(async)]
+fn wiki_map_apply(dir: String, moves: Vec<ken_core::wikimap::Move>) -> CmdResult<ken_core::wikimap::Applied> {
+    ken_core::wikimap::apply(Path::new(&dir), &moves, &local_date_today()).map_err(err)
 }
 
 /// Apply a proposed change to a page a person keeps, only while the page
@@ -7502,9 +7550,9 @@ struct TeamRepoDto {
     name: String,
     path: String,
     kind: Vec<ken_core::registry::RepoKind>,
-    /// Set only when a person chose other than the kind implies.
+    /// `off` when a person switched the whole repo off, else None.
     index: Option<ken_core::registry::IndexState>,
-    /// What Ken reads it as now: the choice, else the kind's default.
+    /// Indexed or off (knowledge-core decision 34).
     effective_index: ken_core::registry::IndexState,
     description: String,
     available: bool,
@@ -7545,8 +7593,14 @@ struct TeamOverviewDto {
     /// The team's wiki, when it has one.
     wiki: Option<TeamRepoDto>,
     gaps: Vec<TeamGapDto>,
-    /// The workspace's own ignore lines (`.kenignore` beside the repos).
+    /// The index rules every source reads, from the knowledge base's
+    /// `.ken/knowledge.json` (knowledge-core decision 34).
     ignores: Vec<String>,
+    /// The older workspace `.kenignore` lines, still read, never written.
+    legacy_ignores: Vec<String>,
+    /// Running set-up again: the template files the knowledge base lacks,
+    /// and the ones Ken owns that differ from its template, as a diff.
+    template_gaps: Vec<ken_core::wikinew::TemplateGap>,
     /// The wiki's last drift run.
     sweep: Option<ken_core::drift::DriftRun>,
     /// What waits on a person in the wiki: the one findings list (drift,
@@ -7662,7 +7716,7 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
             id: p.config.id.to_string(),
             name: m.name.clone(),
             path: p.root.display().to_string(),
-            effective_index: index.unwrap_or_else(|| ken_core::registry::IndexState::for_kind(&kind)),
+            effective_index: index.unwrap_or(ken_core::registry::IndexState::Indexed),
             kind,
             index,
             description: entry.and_then(|e| e.description.clone()).unwrap_or_default(),
@@ -7680,7 +7734,11 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
 
     let mut gaps: Vec<TeamGapDto> = Vec::new();
     if wiki_index.is_none() {
-        gaps.push(TeamGapDto { repo: None, text: "This team has no wiki. Set-up can make one from the Ways of Working template.".into(), open: None });
+        gaps.push(TeamGapDto {
+            repo: None,
+            text: "This workspace has no knowledge base. Set-up makes one from Ken's template, or lays it over an existing wiki.".into(),
+            open: None,
+        });
     }
     for r in &repos {
         let root = std::path::Path::new(&r.path);
@@ -7719,8 +7777,13 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         }
         templates = pages_in(root, "Templates");
     }
-    let ignores = std::fs::read_to_string(ws.root.join(".kenignore"))
-        .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty()).collect())
+    let ignores = wiki.as_ref().map(|w| ken_core::knowledge_settings::ignore_lines(Path::new(&w.path))).unwrap_or_default();
+    let legacy_ignores = std::fs::read_to_string(ws.root.join(".kenignore"))
+        .map(|t| t.lines().map(str::to_string).filter(|l| !l.trim().is_empty() && !l.starts_with('#')).collect())
+        .unwrap_or_default();
+    let template_gaps = wiki
+        .as_ref()
+        .map(|w| ken_core::wikinew::template_gaps(Path::new(&w.path), &ws.config.name, &local_date_today()))
         .unwrap_or_default();
     let workspace = ws.config.name.clone();
     let ws_root = ws.root.display().to_string();
@@ -7759,6 +7822,8 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
         wiki,
         gaps,
         ignores,
+        legacy_ignores,
+        template_gaps,
         sweep,
         findings,
         rules,
@@ -7766,14 +7831,37 @@ fn team_overview(state: State<SharedState>, team: Option<String>) -> CmdResult<T
     })
 }
 
-/// Write the workspace's ignore lines (`.kenignore` beside its repos). The
-/// next scan of each repo reads them.
+/// Write the index rules every source reads: the top-level `ignore` lines of
+/// the knowledge base's `.ken/knowledge.json`, the one place they live
+/// (knowledge-core decision 34). Every open repo is scanned again, so a path
+/// newly left out leaves the index and one brought back is read.
 #[tauri::command(async)]
-fn team_save_ignores(state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-    let text: String = lines.iter().map(|l| format!("{}\n", l.trim_end())).collect();
-    std::fs::write(ws.ws.root.join(".kenignore"), text).map_err(err)
+fn team_save_ignores(app: AppHandle, state: State<SharedState>, lines: Vec<String>) -> CmdResult<()> {
+    let (kb, base, open) = {
+        let guard = state.lock().unwrap();
+        let kb = knowledge_base_of(&workspace_repos(&guard), None).ok_or("this workspace has no knowledge base to keep the rules in")?;
+        let open: Vec<Project> = guard.members.values().map(|m| m.project.clone()).collect();
+        (kb, guard.base_dir.clone(), open)
+    };
+    ken_core::knowledge_settings::set_ignore_lines(&kb.2, &lines).map_err(err)?;
+    for p in &open {
+        rescan_member(&app, &base, p);
+    }
+    Ok(())
+}
+
+/// Lay down the template files the knowledge base lacks that a person
+/// chose (running set-up again, decision 4): never over a file it has, and
+/// committed by name. Returns the files written.
+#[tauri::command(async)]
+fn team_add_template_files(state: State<SharedState>, paths: Vec<String>) -> CmdResult<Vec<String>> {
+    let (kb, name) = {
+        let guard = state.lock().unwrap();
+        let kb = knowledge_base_of(&workspace_repos(&guard), None).ok_or("this workspace has no knowledge base")?;
+        let name = guard.workspace.as_ref().map(|w| w.ws.config.name.clone()).unwrap_or_else(|| kb.0.clone());
+        (kb, name)
+    };
+    ken_core::wikinew::add_missing(&kb.2, &name, &paths, &local_date_today()).map_err(err)
 }
 
 /// A new rule in the knowledge base's Rules/, from its own
@@ -10381,49 +10469,6 @@ fn workspace_members_overview(state: State<SharedState>) -> CmdResult<Vec<Member
         .collect())
 }
 
-/// Minimum gap between two background Claude calls, counted ACROSS EVERY
-/// OPEN PROJECT rather than per worker.
-///
-/// It has to be global. It was made for the local model's background reader
-/// (gone with knowledge-core decision 21), whose per-worker sleeps overlapped
-/// across ten open projects and held the graphics card at 94% on 2026-09-03.
-/// The same holds for the Claude calls that replaced it: one shared "not
-/// before" instant bounds the aggregate rate however many projects are open.
-/// The hourly cap (`summary::take_call`) bounds it again, and the
-/// `backgroundExtraction` flag turns the work off outright.
-const EXTRACT_PACING: Duration = Duration::from_secs(2);
-
-/// The shared "not before" instant every background worker paces against.
-fn extraction_gate() -> &'static Mutex<Instant> {
-    static GATE: OnceLock<Mutex<Instant>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(Instant::now()))
-}
-
-/// Block until the shared extraction slot opens. `false` means the worker was
-/// asked to stop while waiting and should exit rather than generate.
-fn wait_for_extraction_slot(stop: &Arc<AtomicBool>) -> bool {
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return false;
-        }
-        let now = Instant::now();
-        let until = *extraction_gate().lock().unwrap();
-        if until <= now {
-            return true;
-        }
-        // Sleep in short chunks so closing a project or quitting the app is
-        // still responsive while a long pace is being served.
-        std::thread::sleep((until - now).min(Duration::from_millis(250)));
-    }
-}
-
-/// Close the shared slot for `EXTRACT_PACING`. Called only after a generation
-/// actually happened: an idle worker finding an empty queue must not consume
-/// the pace, or nine idle projects would starve the one with work to do.
-fn stamp_extraction_slot() {
-    *extraction_gate().lock().unwrap() = Instant::now() + EXTRACT_PACING;
-}
-
 /// How often the background worker asks whether chunks wait for a summary.
 const SUMMARY_CHECK: Duration = Duration::from_secs(30);
 /// How long the worker leaves summaries alone after a Claude call failed.
@@ -10433,6 +10478,7 @@ const SUMMARY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What one turn of a background Claude job did ([`summarize_by_claude`],
 /// [`knowledge_checks`]).
+#[derive(PartialEq, Eq)]
 enum SummaryTick {
     /// Nothing to do, or not allowed to.
     Idle,
@@ -10446,24 +10492,17 @@ enum SummaryTick {
 
 /// Summarize one batch of this project's knowledge-base chunks with Claude
 /// (`summary`, knowledge-core decision 16). Only for a knowledge-base repo
-/// (kind team or wiki), only while background extraction is on, and only
-/// on the shared background pace (`EXTRACT_PACING`). Claude reads the
-/// prompt and answers, with no tools. The local model never writes them.
+/// (kind team or wiki), each call a turn of the one background throttle
+/// (decision 34). Claude reads the prompt and answers, with no tools. The
+/// local model never writes them.
 fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
-    let (base, root, on) = {
+    let (base, root, name) = {
         let guard = lock_tolerant(state);
         let Some(active) = guard.members.get(&project_id) else {
             return SummaryTick::Stopped;
         };
-        (
-            guard.base_dir.clone(),
-            active.project.root.clone(),
-            ken_core::features::effective_flag(&guard.app_settings, &active.project, "backgroundExtraction"),
-        )
+        (guard.base_dir.clone(), active.project.root.clone(), active.project.config.name.clone())
     };
-    if !on {
-        return SummaryTick::Idle;
-    }
     let (kinds, _) = ken_core::registry::index_of(&root);
     if !kinds.iter().any(|k| matches!(k, ken_core::registry::RepoKind::Team | ken_core::registry::RepoKind::Wiki)) {
         return SummaryTick::Idle;
@@ -10478,14 +10517,11 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
     let Some(binary) = ken_core::runner::discover_claude() else {
         return SummaryTick::Idle;
     };
-    if !wait_for_extraction_slot(stop) {
+    let halt = || stop.load(Ordering::SeqCst);
+    let Some(turn) = ken_core::throttle::claude_turn(&halt) else {
         return SummaryTick::Stopped;
-    }
-    // At most twenty summary calls in any hour across the app, until slice
-    // 11's throttle replaces the cap. A full hour is quiet, not a failure.
-    if !ken_core::summary::take_call() {
-        return SummaryTick::Idle;
-    }
+    };
+    let _running = ken_core::throttle::begin("summaries", &name);
     let mut generate = |prompt: &str| -> ken_core::Result<String> {
         match ken_core::assistant::oneshot_answer(&binary, &root, prompt, None, SUMMARY_TIMEOUT, &CancelToken::new())? {
             ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
@@ -10493,34 +10529,46 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
         }
     };
     let result = ken_core::summary::summarize_next(&mut db, &mut generate, engine::now_epoch());
-    stamp_extraction_slot();
+    drop(turn);
     match result {
-        Ok(Some(_)) => SummaryTick::Ran,
+        Ok(Some(_)) => {
+            ken_core::throttle::clear_failure("summaries", &name);
+            SummaryTick::Ran
+        }
         Ok(None) => SummaryTick::Idle,
         Err(e) => {
             eprintln!("summaries: {e}");
+            ken_core::throttle::fail("summaries", &name, &e.to_string());
             SummaryTick::Failed
         }
     }
 }
 
 /// The background worker: one per open project. It takes the project's
-/// background Claude turns in order: one batch of one-line summaries for
-/// search (knowledge-core decision 16), then a knowledge base's checks
-/// (drift, lint, the supersession pass, topic tags and the graph's commits,
-/// decisions 21 and 25 to 30). Every call is on the shared pace
-/// (`EXTRACT_PACING`), the hourly cap and the `backgroundExtraction` switch.
-/// The local model is never used: its background reader is gone (decision
-/// 21).
-fn background_worker(state: SharedState, project_id: uuid::Uuid, stop: Arc<AtomicBool>) {
+/// background turns in order: one batch of one-line summaries for search
+/// (knowledge-core decision 16), a knowledge base's checks (drift, lint, the
+/// supersession pass, topic tags and the graph's commits, decisions 21 and
+/// 25 to 30), and a knowledge base's build queue (decision 33). Every Claude
+/// call and every step is a turn of the one background throttle (decision
+/// 34), whose pace also sets how often the checks are looked at. The local
+/// model is never used: its background reader is gone (decision 21).
+fn background_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: Arc<AtomicBool>) {
     let mut last_summary_check = Instant::now() - SUMMARY_CHECK;
     let mut summaries_after = Instant::now();
     // The first look at the checks a minute after the project opens, once
     // its first scan has had time to land.
-    let soon = |wait: Duration| Instant::now().checked_sub(CHECKS_EVERY.saturating_sub(wait)).unwrap_or_else(Instant::now);
+    let soon = |wait: Duration| {
+        let every = ken_core::throttle::limits().checks_every;
+        Instant::now().checked_sub(every.saturating_sub(wait)).unwrap_or_else(Instant::now)
+    };
     let mut last_checks = soon(Duration::from_secs(60));
     let mut checks_after = Instant::now();
+    let mut last_build = Instant::now();
     while !stop.load(Ordering::SeqCst) {
+        if ken_core::throttle::paused() {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
         // One-line summaries of the knowledge base's pages, for search
         // (knowledge-core decision 16): one batch per turn, while any wait.
         if last_summary_check.elapsed() >= SUMMARY_CHECK && Instant::now() >= summaries_after {
@@ -10536,7 +10584,7 @@ fn background_worker(state: SharedState, project_id: uuid::Uuid, stop: Arc<Atomi
         // A knowledge base's drift, lint and graph (knowledge-core decisions
         // 21, 25, 28 to 30): a drift run when one is due, then at most one
         // background Claude call per turn while any check waits.
-        if last_checks.elapsed() >= CHECKS_EVERY && Instant::now() >= checks_after {
+        if last_checks.elapsed() >= ken_core::throttle::limits().checks_every && Instant::now() >= checks_after {
             last_checks = Instant::now();
             match knowledge_checks(&state, project_id, &stop) {
                 SummaryTick::Ran => last_checks = soon(SUMMARY_CHECK),
@@ -10545,8 +10593,274 @@ fn background_worker(state: SharedState, project_id: uuid::Uuid, stop: Arc<Atomi
                 SummaryTick::Stopped => return,
             }
         }
+        // The build queue (decision 33): its next item into the inbox when
+        // there is room, every few seconds.
+        if last_build.elapsed() >= BUILD_EVERY {
+            last_build = Instant::now();
+            if build_turn(&app, &state, project_id, &stop) == SummaryTick::Stopped {
+                return;
+            }
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// How often the background worker looks at the build queue.
+const BUILD_EVERY: Duration = Duration::from_secs(10);
+
+/// One turn of a knowledge base's build queue (knowledge-core decision 33):
+/// the queue is brought up to date with the inbox (an item read is done, one
+/// that failed carries ingest's reason), then the next items go into Raw
+/// while there is room, each a step of the one background throttle
+/// (decision 34), and an ingest pass is started for them. The overview of a
+/// source is made from its own index, read only; a file is copied as it is.
+fn build_turn(_app: &AppHandle, state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
+    let (base, project, sources) = {
+        let guard = lock_tolerant(state);
+        let Some(active) = guard.members.get(&project_id) else {
+            return SummaryTick::Stopped;
+        };
+        let sources: Vec<(String, uuid::Uuid, PathBuf)> =
+            workspace_repos(&guard).into_iter().filter(|(_, id, _)| *id != project_id).collect();
+        (guard.base_dir.clone(), active.project.clone(), sources)
+    };
+    if !ken_core::registry::is_library(&project.root) {
+        return SummaryTick::Idle;
+    }
+    let Ok(db) = Db::open(&base, project_id) else {
+        return SummaryTick::Idle;
+    };
+    let Ok(Some(mut queue)) = ken_core::buildqueue::load(&db) else {
+        return SummaryTick::Idle;
+    };
+    let failures = ken_core::ingest::failures(&db).unwrap_or_default();
+    let mut changed = ken_core::buildqueue::refresh(&mut queue, &project.root, &failures);
+    let mut placed = false;
+    let halt = || stop.load(Ordering::SeqCst);
+    while let Some(i) = ken_core::buildqueue::next(&queue) {
+        if !ken_core::throttle::step_turn(&halt) {
+            break;
+        }
+        let item = queue.items[i].clone();
+        let _running = ken_core::throttle::begin("build", &item.label());
+        let root = project.root.clone();
+        let place = || -> Result<PathBuf, String> {
+            let (_, source_id, source_root) =
+                sources.iter().find(|(n, _, _)| *n == item.source).ok_or("the source is not in the workspace any more")?;
+            match item.pass {
+                ken_core::buildqueue::Pass::Overview => {
+                    let sdb = Db::open_read_only(&base, *source_id).map_err(err)?;
+                    let (name, text) =
+                        ken_core::buildqueue::overview_of(&item.source, source_root, &sdb, &local_source_stamp()).map_err(err)?;
+                    let target = ken_core::ingest::raw_target(&root, &name).map_err(err)?;
+                    std::fs::write(&target, text).map_err(err)?;
+                    Ok(target)
+                }
+                ken_core::buildqueue::Pass::File => {
+                    let path = item.path.as_deref().ok_or("no file named")?;
+                    let target = ken_core::ingest::raw_target(&root, &ken_core::buildqueue::raw_name(&item.source, path)).map_err(err)?;
+                    std::fs::copy(source_root.join(path), &target).map_err(|e| format!("could not copy {path}: {e}"))?;
+                    Ok(target)
+                }
+            }
+        };
+        let it = &mut queue.items[i];
+        match place() {
+            Ok(target) => {
+                let rel = target.strip_prefix(&project.root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+                it.state = ken_core::buildqueue::ItemState::InRaw;
+                it.raw = Some(rel);
+                placed = true;
+            }
+            Err(e) => {
+                it.state = ken_core::buildqueue::ItemState::Failed;
+                it.reason = Some(e);
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        if let Err(e) = ken_core::buildqueue::save(&db, &queue) {
+            eprintln!("build queue: {e}");
+        }
+    }
+    if placed {
+        start_ingest_pass(&project, &base, code_sources_of(state, &project.root), false);
+        SummaryTick::Ran
+    } else if halt() {
+        SummaryTick::Stopped
+    } else {
+        SummaryTick::Idle
+    }
+}
+
+/// The workspace's knowledge base and the other repos, its sources.
+fn kb_and_sources(state: &SharedState) -> CmdResult<((String, uuid::Uuid, PathBuf), Vec<(String, uuid::Uuid, PathBuf)>, PathBuf)> {
+    let guard = state.lock().unwrap();
+    let repos = workspace_repos(&guard);
+    let kb = knowledge_base_of(&repos, None).ok_or("this workspace has no knowledge base to build")?;
+    let sources = repos.into_iter().filter(|r| r.1 != kb.1).collect();
+    Ok((kb, sources, guard.base_dir.clone()))
+}
+
+/// Start building the library (knowledge-core decision 33): a queue of the
+/// workspace's sources, the heavy hitters first, an overview of each, then
+/// their files broad to fine, kept in the knowledge base's index. The
+/// background worker then works through it under the one throttle; Pause
+/// stops it, and starting again plans the queue anew.
+#[tauri::command(async)]
+fn build_start(state: State<SharedState>, at_once: Option<usize>) -> CmdResult<ken_core::buildqueue::Progress> {
+    let (kb, sources, base) = kb_and_sources(&state)?;
+    let mut planned = Vec::new();
+    for (name, id, _) in &sources {
+        if let Ok(db) = Db::open_read_only(&base, *id) {
+            planned.push(ken_core::buildqueue::source_of(name, &db).map_err(err)?);
+        }
+    }
+    if planned.is_empty() {
+        return Err("no source of the workspace has an index yet: wait for its first scan".into());
+    }
+    let db = Db::open(&base, kb.1).map_err(err)?;
+    let at_once = at_once.or_else(|| ken_core::buildqueue::load(&db).ok().flatten().map(|q| q.at_once)).unwrap_or(1);
+    let queue = ken_core::buildqueue::plan(&planned, at_once);
+    ken_core::buildqueue::save(&db, &queue).map_err(err)?;
+    Ok(ken_core::buildqueue::progress(&queue))
+}
+
+/// Stop building: what has not gone into the inbox is dropped; what waits
+/// there is read like any source.
+#[tauri::command(async)]
+fn build_stop(state: State<SharedState>) -> CmdResult<()> {
+    let (kb, _, base) = kb_and_sources(&state)?;
+    let db = Db::open(&base, kb.1).map_err(err)?;
+    if let Some(mut queue) = ken_core::buildqueue::load(&db).map_err(err)? {
+        ken_core::buildqueue::stop(&mut queue);
+        ken_core::buildqueue::save(&db, &queue).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// How many build items may wait in the inbox at once: one to start, a few
+/// once the results are trusted (1 to 5).
+#[tauri::command(async)]
+fn build_set_at_once(state: State<SharedState>, at_once: usize) -> CmdResult<()> {
+    let (kb, _, base) = kb_and_sources(&state)?;
+    let db = Db::open(&base, kb.1).map_err(err)?;
+    if let Some(mut queue) = ken_core::buildqueue::load(&db).map_err(err)? {
+        queue.at_once = at_once.clamp(1, 5);
+        ken_core::buildqueue::save(&db, &queue).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// One line of the status panel: something queued, with how many.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedDto {
+    kind: String,
+    label: String,
+    count: usize,
+}
+
+/// The one status panel (knowledge-core decision 34): the throttle (pace,
+/// pause, the hour's calls), what is running with its progress, what is
+/// queued, and what failed with its reason.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundStatusDto {
+    throttle: ken_core::throttle::Snapshot,
+    running: Vec<ken_core::throttle::Job>,
+    queued: Vec<QueuedDto>,
+    failed: Vec<ken_core::throttle::Failure>,
+    /// The library's build queue, when one was started.
+    build: Option<ken_core::buildqueue::Progress>,
+}
+
+#[tauri::command(async)]
+fn background_status(state: State<SharedState>) -> CmdResult<BackgroundStatusDto> {
+    let snapshot = ken_core::throttle::snapshot();
+    let mut running = snapshot.running.clone();
+    let mut failed = snapshot.failed.clone();
+    let (members, base, kb) = {
+        let guard = lock_tolerant(&state);
+        let members: Vec<(uuid::Uuid, String, PathBuf)> =
+            guard.members.values().map(|m| (m.project.config.id, m.project.config.name.clone(), m.project.root.clone())).collect();
+        let kb = knowledge_base_of(&workspace_repos(&guard), None);
+        (members, guard.base_dir.clone(), kb)
+    };
+    // Meaning search being built, per repo.
+    {
+        let builds = semantic_builds().lock().unwrap_or_else(|p| p.into_inner());
+        for (id, (done, total)) in builds.iter() {
+            let name = members.iter().find(|m| m.0 == *id).map(|m| m.1.clone()).unwrap_or_default();
+            running.push(ken_core::throttle::Job { id: 0, kind: "meaning".into(), label: name, done: *done as u64, total: *total as u64 });
+        }
+    }
+    // The source each inbox is reading now.
+    for (id, (raw, phase)) in INGEST_READING.lock().unwrap().iter() {
+        let name = members.iter().find(|m| m.0 == *id).map(|m| m.1.clone()).unwrap_or_default();
+        let what = match phase {
+            ken_core::ingest::PassPhase::Transcribing(pct) => format!("transcribing {pct}%"),
+            ken_core::ingest::PassPhase::Reading => "reading".into(),
+            ken_core::ingest::PassPhase::Writing => "writing pages".into(),
+        };
+        let file = raw.rsplit('/').next().unwrap_or(raw);
+        running.push(ken_core::throttle::Job { id: 0, kind: "ingest".into(), label: format!("{name}: {file}, {what}"), done: 0, total: 0 });
+    }
+    let mut queued = Vec::new();
+    for (id, name, root) in &members {
+        let Ok(db) = Db::open_read_only(&base, *id) else { continue };
+        if let Ok(h) = db.index_health() {
+            if h.queued > 0 {
+                queued.push(QueuedDto { kind: "index".into(), label: format!("{name}: files to read"), count: h.queued as usize });
+            }
+            if h.chunks > h.embedded && !h.model_missing && semantic_builds().lock().unwrap_or_else(|p| p.into_inner()).contains_key(id) {
+                queued.push(QueuedDto { kind: "meaning".into(), label: format!("{name}: passages to read for meaning"), count: (h.chunks - h.embedded) as usize });
+            }
+        }
+        if ken_core::ingest::has_inbox(root) {
+            let waiting = ken_core::ingest::waiting_new(root, &db).map(|w| w.len()).unwrap_or(0);
+            if waiting > 0 {
+                queued.push(QueuedDto { kind: "ingest".into(), label: format!("{name}: sources in the inbox"), count: waiting });
+            }
+            for (raw, why) in ken_core::ingest::failures(&db).unwrap_or_default() {
+                failed.push(ken_core::throttle::Failure {
+                    kind: "ingest".into(),
+                    label: raw.rsplit('/').next().unwrap_or(&raw).to_string(),
+                    reason: why,
+                    at: 0,
+                });
+            }
+        }
+    }
+    let build = kb.and_then(|kb| Db::open_read_only(&base, kb.1).ok()).and_then(|db| ken_core::buildqueue::load(&db).ok().flatten());
+    let build = build.map(|q| ken_core::buildqueue::progress(&q));
+    if let Some(b) = &build {
+        if b.queued > 0 {
+            queued.push(QueuedDto { kind: "build".into(), label: "building the library".into(), count: b.queued });
+        }
+        for (label, why) in &b.failed {
+            failed.push(ken_core::throttle::Failure { kind: "build".into(), label: label.clone(), reason: why.clone(), at: 0 });
+        }
+    }
+    Ok(BackgroundStatusDto { throttle: snapshot, running, queued, failed, build })
+}
+
+/// Set the one background throttle (knowledge-core decision 34): the pace,
+/// Gentle, Normal or Fast, and Pause. Saved in `settings.json` and in force
+/// at once for every background job.
+#[tauri::command(async)]
+fn background_set(state: State<SharedState>, pace: ken_core::throttle::Pace, paused: bool) -> CmdResult<()> {
+    let setting = ken_core::throttle::Setting { pace, paused };
+    let (base_dir, mut settings) = {
+        let guard = state.lock().unwrap();
+        (guard.base_dir.clone(), guard.app_settings.clone())
+    };
+    settings.background = Some(setting);
+    settings.save(&base_dir).map_err(err)?;
+    state.lock().unwrap().app_settings = settings;
+    ken_core::throttle::set(setting);
+    Ok(())
 }
 
 /// Cap on how many pages of a scanned PDF are OCR'd. Rasterizing + recognizing
@@ -10636,11 +10950,23 @@ fn ocr_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: 
             let _ = db.mark_ocr_error(&rel, &hash, "image too large for OCR");
             continue;
         }
-        let result = if is_pdf(&rel) {
-            ken_core::ocr::ocr_pdf_bytes(&bytes, MAX_OCR_PAGES)
-        } else {
-            ken_core::ocr::ocr_image_bytes(&bytes)
+        // OCR runs on this computer, so it obeys the one background throttle
+        // (knowledge-core decision 34): it waits while paused and rests by
+        // the pace after each file.
+        let halt = || stop.load(Ordering::SeqCst);
+        if !ken_core::throttle::wait_unpaused(&halt) {
+            return;
+        }
+        let started = Instant::now();
+        let result = {
+            let _running = ken_core::throttle::begin("ocr", &rel);
+            if is_pdf(&rel) {
+                ken_core::ocr::ocr_pdf_bytes(&bytes, MAX_OCR_PAGES)
+            } else {
+                ken_core::ocr::ocr_image_bytes(&bytes)
+            }
         };
+        ken_core::throttle::rest_after(started.elapsed(), &halt);
         match result {
             Ok(regions) => {
                 let rows: Vec<ken_core::db::OcrRegionRow> = regions
@@ -11528,6 +11854,8 @@ pub fn run() {
     // installed model; this is the only wiring that activates the local path.
     ken_core::local_llm::init(base_dir.clone());
     let app_settings = ken_core::settings::AppSettings::load(&base_dir);
+    // The one background throttle, before any background work starts.
+    ken_core::throttle::set(app_settings.throttle());
     // The graphics card setting, before any model loads.
     ken_core::compute::set_use_gpu(use_gpu_setting(&app_settings));
     let state: SharedState = Arc::new(Mutex::new(AppState {
@@ -11731,6 +12059,15 @@ pub fn run() {
             files_banner,
             team_overview,
             team_save_ignores,
+            team_add_template_files,
+            build_start,
+            build_stop,
+            build_set_at_once,
+            background_status,
+            background_set,
+            setup_overlay_wiki,
+            wiki_map_plan,
+            wiki_map_apply,
             team_add_rule,
             ingest_now,
             ingest_seen,
