@@ -181,10 +181,8 @@
         {:else if sel.source.type === "finding"}
           <p class="body">{sel.source.finding.detail}</p>
         {:else if sel.source.type === "analysis"}
-          <p class="body">
-            Ken read {sel.source.analysis.source}'s files and proposes these for search. Accept writes them into
-            .ken/knowledge.json as one commit; Dismiss drops them. Nothing applies until you accept.
-          </p>
+          <!-- One source line: .body keeps line breaks (pre-wrap), so a break here showed as a wide gap. -->
+          <p class="body">Ken read {sel.source.analysis.source}'s files and proposes these for search. Accept writes them into <code>.ken/knowledge.json</code> as one commit; Dismiss drops them. Nothing applies until you accept.</p>
           {#if sel.source.analysis.roles.length > 0}
             <div class="t-label">Role rules</div>
             <ul class="plist">
@@ -204,10 +202,7 @@
         {:else if sel.source.type === "conflict"}
           <ConflictDetail item={sel.source.conflict} />
         {:else if sel.source.type === "failed"}
-          <p class="body">
-            Ken couldn't read {sel.source.relPath.split("/").pop()}{sel.source.error ? `: ${sel.source.error}` : ""}. It may be a scan
-            with no text, or a protected file. It is still found by name.
-          </p>
+          <p class="body">Ken couldn't read {sel.source.relPath.split("/").pop()}{sel.source.error ? `: ${sel.source.error}` : ""}. It may be a scan with no text, or a protected file. It is still found by name.</p>
         {:else if sel.source.type === "chat"}
           <p class="body">Ken stopped in “{sel.source.title || "a chat"}” to ask you something. Answer it in Ask Ken and it carries on.</p>
         {/if}
