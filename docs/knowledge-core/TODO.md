@@ -351,12 +351,24 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - Choices:
     - Only a source the build queue placed counts against the hour; when the queue cannot be read, the call is counted.
     - A card closes only after a person settles its last waiting item; a card that never had anything waiting stays until Seen.
-    - A source proposed once (waiting, accepted or dismissed) is not analysed again (see Open for Chris). A code repo that keeps its own settings file gets no proposal: Ken writes nothing there.
+    - A source proposed once (waiting, accepted or dismissed) is not analysed again by itself; slice 15c lets a person ask (Decided by Chris). A code repo that keeps its own settings file gets no proposal: Ken writes nothing there.
     - Accept writes only where the file has no rules or controls for the source yet, so an edit made in Settings › Workspace while the card waited stays; the commit is left out when the file holds a person's uncommitted work.
     - "Commit my other changes" commits the list the person was shown, each file only if it still has changes.
     - The app is found through a file in its app data, not an environment variable, so a ken-mcp registered with Claude Code reaches it too; only a loopback address is asked.
   - The compile check is clean apart from the known warnings. Tests: ken-core 861 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 15 passed; vitest 793 passed in 65 files; `npm run check` 0 errors, the 6 known warnings. The sidecar was re-staged.
   - Not run: the app. The first set-up or kind change after this files an analysis card for each source with no rules or controls yet and none proposed before; nothing is written until a person accepts.
+
+- **Slice 15c: "Analyse again"** (`9c24895`). Decisions 17, 19, 36, with Chris's answer of 2026-10-14.
+  - Settings › Workspace lists each source the repo analysis can propose for under "repo analysis", with Analyse again. Asking clears the source's mark at once (`repo_analysis::forget`: its done cards, accepted or dismissed, leave the knowledge base's index) and queues one Claude call in the background (`analyze_source_again`), a `claude_turn` counted against the hour like any analysis. The proposal arrives as a new Inbox card (`repo_analysis::analyze_again`) with the usual Accept and Dismiss, replacing a card still waiting for the source.
+  - The row shows "Analysing…" while the call is queued or running (`ANALYSING`, `SourceDto.analyzing`) and is read again on `review-changed`; it says when a card waits and when the file already holds the source's rules or controls (`analysisNote`).
+  - Not offered for a code repo that keeps its own settings file (decision 36) or a source whose kind is not said; `repo_analysis::writable` is the rule, shared with `due_of`, and the command refuses them too.
+  - Tests: `a_person_can_ask_for_the_analysis_again` (the mark cleared, one call, the waiting card replaced, an empty reply leaving it, emptied roles filled on Accept, a code repo's own file never asked); vitest for `analysisNote`.
+  - Choices:
+    - Analyse again runs whatever the file holds, and Accept stays the usual one: it writes only what the file has none of for the source. Role rules a person emptied count as none (`with_proposals`), so emptying them first is how to take fresh ones; the row says so.
+    - The mark is cleared when the person asks, not when the card lands: if the call fails, the source counts as never proposed, and the next set-up or kind change may analyse it by itself.
+    - A fresh analysis that proposes nothing leaves a waiting card where it is. A failed call is shown in the status panel's failures.
+  - The compile check is clean apart from the known warnings. Tests: ken-core 862 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-app 15 passed; vitest 795 passed in 65 files; `npm run check` 0 errors, the 6 known warnings.
+  - Not run: the app.
 
 ## Decided by Chris, 2026-10-14
 
@@ -387,6 +399,7 @@ Chris answered the open questions. Slice 15 builds the ones that change code; th
   - The older ignore files move into `.ken/knowledge.json` once (a commit in the knowledge base) and are no longer read.
   - Sync offers "commit my other changes", naming each file first.
   - ken-mcp tells a running app when `propose_decision` or `add_source` files something.
+- **Asked again (after slice 15b), built in slice 15c:** a dismissed repo analysis is not proposed again by itself, but Settings › Workspace offers "Analyse again" on each source: one Claude call through the queue and the throttle (the background budget), its result a new Inbox card with the usual Accept and Dismiss, replacing one still waiting. Not for a code repo that keeps its own settings file (decision 36).
 - **Ways-of-Working:** Wright's pages are brought in line with the new templates in a later WoW slice; Wright keeps its pages.
 
 ## Next: slice 14, verify
@@ -437,7 +450,8 @@ One lane at a time, a compile check, a commit and a push each, as before; the te
 - [x] Sync: "commit my other changes", listing each file before it commits.
 - [x] ken-mcp signals a running app after `propose_decision` and `add_source`.
 - [x] Re-run the tests the slice touched; update DECISIONS.md where an answer changes a decision's wording (2, 5, 7, 12).
+- [x] Repo analysis: "Analyse again" in Settings › Workspace (slice 15c).
 
 ### Open for Chris
 
-- **A dismissed repo analysis is not proposed again.** Slice 15b asks Claude once per source: a card that was dismissed, like one accepted, keeps the source from being analysed again, so a person's no stays and no call is made unasked. The roles and controls can still be written by hand in Settings › Workspace. Should there be a way to ask for a fresh analysis?
+Nothing open.
