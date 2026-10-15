@@ -45,13 +45,13 @@
   let gpu = $state<GpuInfo | null>(null);
   let embedding = $state<EmbeddingState | null>(null);
 
-  const sections: { key: SettingsSection; label: string; sub: string }[] = [
-    { key: "general", label: "General", sub: "Appearance, files, updates" },
-    { key: "workspace", label: "Workspace", sub: "Sources, index rules, tiers, controls" },
-    { key: "sync", label: "Sync", sub: "The knowledge base's Git remote" },
-    { key: "ai", label: "AI", sub: "Claude Code and models" },
-    { key: "agents", label: "Agents", sub: "The connector for your tools" },
-    { key: "rules", label: "Ingest rules", sub: "What Ken may write" },
+  const sections: { key: SettingsSection; label: string }[] = [
+    { key: "general", label: "General" },
+    { key: "workspace", label: "Workspace" },
+    { key: "sync", label: "Sync" },
+    { key: "ai", label: "AI" },
+    { key: "agents", label: "Agents" },
+    { key: "rules", label: "Ingest rules" },
   ];
 
   const themeOptions: { value: ThemeMode; title: string }[] = [
@@ -220,7 +220,6 @@
     {#each sections as s (s.key)}
       <button class:on={app.settingsSection === s.key} onclick={() => (app.settingsSection = s.key)}>
         <span class="slabel">{s.label}</span>
-        <span class="ssub">{s.sub}</span>
       </button>
     {/each}
   </nav>
@@ -302,16 +301,11 @@
           <input type="checkbox" checked={app.followOpen} onchange={(e) => app.setFollowOpen(e.currentTarget.checked)} />
           Highlight the open file in the files list
         </label>
-        <p class="note">The folder tree follows and opens to whichever file is open.</p>
       </div>
 
       {#if app.ignored.length > 0}
         <div class="card">
           <div class="card-title">Ignored files</div>
-          <p class="note">
-            Ken no longer flags these when it cannot read them. For you only, never shared. They stay indexed and
-            searchable.
-          </p>
           <div class="list">
             {#each app.ignored as path (path)}
               <div class="list-row">
@@ -332,7 +326,6 @@
 
       <div class="card">
         <div class="card-title">Offline models</div>
-        <p class="note">These run on this computer; nothing you say or store leaves it.</p>
         {#if modelsLoading}
           <p class="note">Checking for models…</p>
         {:else}
@@ -419,9 +412,8 @@
             <span class="ok-dot"></span>Found{#if doctor.version}, version {doctor.version}{/if}
             {#if doctor.path}<span class="mono small path">{doctor.path}</span>{/if}
           </p>
-          <p class="note">Ken writes, reads sources in, judges and answers with it.</p>
         {:else if doctor}
-          <p class="note warn">Not found. Ingest, the digest, answers and the background checks need it.</p>
+          <p class="note warn">Not found</p>
           <p class="note">{doctor.help || claudeInstallHelp()}</p>
         {:else}
           <p class="note">Checking…</p>
@@ -433,10 +425,6 @@
       </div>
       <div class="card">
         <div class="card-title">Memory: journal distillation</div>
-        <p class="note">
-          Ken reads the workspace journal and drafts long-term memories from what keeps coming back. Nothing is
-          written to <span class="mono small">memory/</span> until you approve a draft below.
-        </p>
         {#if memory.phase === "planning" || memory.phase === "distilling"}
           <div class="row">
             <span class="mini-spinner" aria-hidden="true"></span>
@@ -460,7 +448,6 @@
       {#each memory.candidates as c (c.slug)}
         <div class="card">
           <div class="card-title">{c.slug}</div>
-          <div class="row"><span class="chip mono">.ken-workspace/memory/{c.slug}.md</span></div>
           {#if c.description}<p class="note">{c.description}</p>{/if}
           <pre class="memory-body">{bodyPreview(c.body)}</pre>
           {#if c.sources.length > 0}
@@ -491,7 +478,7 @@
             <div class="card-title">{flag.label}</div>
             <p class="note">
               {flag.description}
-              <span class="flag-meta">{flag.applies} · <span class="mono">{flag.name}</span></span>
+              <span class="flag-meta">{flag.applies}</span>
             </p>
             <label class="radio">
               <input
@@ -511,10 +498,8 @@
                   onchange={(e) => void setRepoOverride(flag, e.currentTarget.checked)}
                 />
                 On for {app.project?.name ?? "this repo"}
+                {#if flag.projectOverride !== null}<span class="chip">custom</span>{/if}
               </label>
-              <p class="note">
-                {flag.projectOverride === null ? "This repo follows the default above." : "This repo has its own setting."}
-              </p>
             {/if}
             {#if flag.name === "semanticIndex" && flag.effective && app.semanticIndexState}
               {#if app.semanticIndexState.state === "building"}
@@ -535,20 +520,9 @@
     {#if app.settingsSection === "agents"}
     <section class="group">
       <div class="card">
-        <div class="mcp-head">
-          <span class="card-title">Connect an agent</span>
-          {#if mcp?.binaryPath}
-            <span class="mcp-status"><span class="ok-dot"></span>Ready; an agent starts it when it needs it</span>
-          {/if}
-        </div>
-        <p class="note">
-          Ken's connector lets Claude Code, Cursor and other agents search the workspace's repos and read their files.
-          It proposes rulings and adds sources for a person to accept, and Ken's own chat also writes Your day tasks,
-          memories and the journal; never your files.
-        </p>
+        <div class="card-title">Connect an agent</div>
         {#if mcp?.binaryPath}
           <div class="mcp-block">
-            <div class="mcp-comment"># add Ken to an agent, scoped to this repo</div>
             <div class="mcp-cmd-row">
               <code class="mcp-cmd">{mcp.addCommand}</code>
               <button class="mcp-copy" onclick={() => mcp && copy(mcp.addCommand, "command")}>
@@ -584,7 +558,6 @@
           <span class="about-version">Ken v{whatsNew.version}</span>
           <button class="whats-new" onclick={() => whatsNew.show()}>What's new in this version</button>
         </div>
-        <p class="note">Each folder's own settings (reindex, watched folders, cloud files, sync) open from its row under Workspace.</p>
       </div>
     </section>
     {/if}
@@ -636,10 +609,6 @@
   .slabel {
     font-size: 13.5px;
     font-weight: 600;
-  }
-  .ssub {
-    font-size: 12px;
-    color: var(--ink-3);
   }
   .rules {
     margin: 0;
@@ -885,21 +854,6 @@
       transform: rotate(360deg);
     }
   }
-  .mcp-head {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-  }
-  .mcp-head .card-title {
-    flex: 1;
-  }
-  .mcp-status {
-    display: inline-flex;
-    align-items: center;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--healthy-text);
-  }
   .mcp-block {
     background: var(--terminal-bg);
     border-radius: 10px;
@@ -907,9 +861,6 @@
     font-family: var(--font-mono);
     font-size: 12px;
     line-height: 1.7;
-  }
-  .mcp-comment {
-    color: var(--ink-tertiary);
   }
   .mcp-cmd-row {
     display: flex;

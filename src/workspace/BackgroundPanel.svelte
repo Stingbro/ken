@@ -129,10 +129,6 @@
       {/if}
     </div>
   {:else}
-    <p class="note">
-      Ken builds the knowledge base from its sources through ordinary ingest: an overview of each source, the largest
-      first, then its files from broad to fine, one at a time, at the pace above.
-    </p>
     <div class="actions">
       <button class="btn btn-small btn-primary" disabled={busy} onclick={() => void act("Could not start building", () => api.buildStart())}>
         Build the library
