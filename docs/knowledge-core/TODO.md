@@ -443,6 +443,17 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check and svelte-check report no warnings. Tests: ken-core 845 passed, 0 failed, 38 ignored (five new; the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 818 passed in 66 files.
   - Not run: the app.
 
+- **Chris's answers, 2026-10-15** (`d0eb503`, `1bebaf4`, `9e9f62f`, `bf25fd0`, `922354c`, `eda78e3`).
+  1. Code repos stay editable, with no commits (`d0eb503`, a test only). Checked: the Files viewer's save (`finish_save`) tells sync it wrote the file, and sync keeps Ken's writes for a commit only in the knowledge base (`sync_active`, `sync_auto`); a chat's accepted edit is written by Claude Code and reaches sync only as a watcher change, never committed; the chat has no shell; every other commit is made in the knowledge base's root, and `commit_others` refuses any other. Nothing commits in a code repo, so nothing changed. Test: `engine_never_commits_in_a_code_repo`.
+  2. The Home digest drops the Inbox line (`1bebaf4`): `DigestSources` loses `waiting`, the tickets-and-tasks list left `DigestJob`, and the prompt summarises what changed and says never to mention the Inbox, what waits, or tasks and tickets, nor count them. Test: `the_digest_summarises_what_changed_and_never_what_waits`.
+  3. Journal distillation on Claude (`9e9f62f`): `memory::distill` is one call; the app's is a turn of the background throttle (`claude_turn`, counted against the hour) through `oneshot_answer` with no tools, shown as "Memory · journal" in the status panel. Candidates, Approve and Dismiss, and the `memory-state` events are unchanged; `claude_text` went. Test: `distill_is_one_call_and_drops_what_was_dismissed`.
+  4. Agents registers the whole workspace (`bf25fd0`): ken-mcp takes `--workspace <dir>` (search, repos, tickets, related and the knowledge base are that workspace's, whatever Ken opens later; a bare path is read in its knowledge base). Without it the server follows the workspace Ken last had open. The connect command, its JSON and its instructions use it; the card reads "Scope: workspace". Test: `a_workspace_server_serves_its_whole_workspace`.
+  5. One word, "source" (`922354c`): "+ Add a source", "2 sources indexed", the switcher's count, search's "This source", the feature switches, the status panel's "Source analysis", and the app's messages. "repo" stays for a git repository, "folder" for the folder on disk.
+  6. Small UI (`eda78e3`): set-up step 1 keeps its heading, the field's placeholder is its label (with an aria-label); Ingest's empty right pane is the EmptyState "No source selected"; the Files code viewer colours code with Lezer and CodeMirror's language list (already in the app; now direct dependencies at the installed versions), `--syntax-*` tokens for light and dark, plain past 100,000 characters.
+  - Docs: DECISIONS.md decision 22 (an agent's scope) and 37 (distillation on Claude); the design tokens list the syntax colours.
+  - The compile check and svelte-check report no warnings. Tests: ken-core 849 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 46 passed (43 unit, 3 stdio); ken-app 17 passed; vitest 821 passed in 67 files. The sidecar was re-staged.
+  - Not run: the app. A Claude Code session registered with the old command (`--project <repo>`) keeps it until it is added again.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
