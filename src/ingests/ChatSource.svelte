@@ -91,7 +91,6 @@
         <EmptyState />
       {/each}
     </div>
-    <p class="note">Shift-click takes every message from the last one clicked.</p>
     <div class="actions">
       <button class="btn btn-small" disabled={busy || messages.length === 0} onclick={() => void add(true)}>Add the whole chat</button>
       <button class="btn btn-small btn-primary" disabled={busy || count === 0} onclick={() => void add(false)}>
@@ -182,11 +181,6 @@
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
-  }
-  .note {
-    margin: 0;
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
   }
   .warn {
     margin: 0;

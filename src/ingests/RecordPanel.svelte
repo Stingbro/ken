@@ -80,7 +80,7 @@
 
     {#if record.modelStatus && !record.modelStatus.installed && !record.recording}
       <div class="model-gate">
-        <p class="note">Recording needs a transcription model. It runs on this computer.</p>
+        <p class="note">Recording needs a transcription model.</p>
         <ModelDownloadDialog status={record.modelStatus} compact onInstalled={() => void record.refreshModelStatus()} />
       </div>
     {/if}

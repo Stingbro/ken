@@ -30,7 +30,6 @@
   import { renderMarkdown, renderTitle } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
   import { errorText } from "../lib/toast.svelte";
-  import { claudeInstallHelp } from "../lib/platform";
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import {
     canReadNow,
@@ -488,7 +487,7 @@
     {#if loadError}<p class="warn">{loadError}</p>{/if}
     {#if overview?.stopped}<p class="warn">The last read stopped: {overview.stopped}</p>{/if}
     {#if overview && !overview.claudeFound}
-      <p class="warn">Reading needs Claude Code. {claudeInstallHelp()}</p>
+      <p class="warn">Claude Code not found</p>
     {/if}
 
     {#if !overview && !error}
