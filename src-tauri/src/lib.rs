@@ -25,7 +25,6 @@ use ken_core::registry::{Registry, RegistryEntryStatus};
 use ken_core::pty_registry;
 use ken_core::routing;
 use ken_core::scan::{self, ScanStats};
-use ken_core::search as hybrid_search_mod;
 use ken_core::sync::{self, SyncEngine, SyncNotice};
 use ken_core::record::{self, CaptureSource, LinearResampler, RecorderState, Source};
 use ken_core::transcript;
@@ -2084,8 +2083,7 @@ async fn setup_propose_repos(state: State<'_, SharedState>, paths: Vec<String>) 
 }
 
 /// Confirm picked repos. With `add` false, a new workspace in Ken's app
-/// data (`workspaces/<id>`), switching the workspace feature on; with `add`
-/// true, into the open workspace. Then opens it so indexing starts.
+/// data (`workspaces/<id>`); with `add` true, into the open workspace. Then opens it so indexing starts.
 #[tauri::command(async)]
 fn setup_confirm_repos(
     app: AppHandle,
@@ -7942,8 +7940,6 @@ async fn run_drift_now(state: State<'_, SharedState>, project_id: Option<String>
     .map_err(|e| e.to_string())?
 }
 
-/// A page's links both ways, resolved now: the pages it reaches and the
-/// pages that reach it (the Map's page neighbours).
 /// The page a `[[link]]` in `from` names, by file name or by an alias in a
 /// page's frontmatter; the one in `from`'s folder when two pages claim it.
 #[tauri::command(async)]
@@ -8246,9 +8242,9 @@ struct RoutedHitDto {
 impl From<routing::RoutedHit> for RoutedHitDto {
     fn from(h: routing::RoutedHit) -> Self {
         let source = match h.source {
-            hybrid_search_mod::Source::Keyword => "keyword",
-            hybrid_search_mod::Source::Semantic => "semantic",
-            hybrid_search_mod::Source::Both => "both",
+            ken_core::search::Source::Keyword => "keyword",
+            ken_core::search::Source::Semantic => "semantic",
+            ken_core::search::Source::Both => "both",
         };
         RoutedHitDto {
             content_type: ken_core::contenttype::of(&h.path).as_str(),
@@ -8755,8 +8751,8 @@ fn journal_window_text(ws_root: &Path) -> String {
 /// Run a distillation pass over the current journal window (ken-memory task
 /// 2.2 / design D6): compose the prompt (journal window + existing workspace
 /// memory descriptions + previously-dismissed slugs, all as the dedupe
-/// guard), generate at Background priority on the local LLM — same call
-/// shape as `AppFederationLlm` — parse tolerantly, cap 5, and emit
+/// guard), generate at Background priority on the local LLM, parse
+/// tolerantly, cap 5, and emit
 /// `memory-state` (`planning` → `distilling` → `ready`/`error`). Candidates
 /// are cached server-side (`AppState::memory_distill_candidates`) so
 /// `resolve_distill_candidate(slug, approve)` can look one up by slug alone,

@@ -76,6 +76,11 @@ else. `::selection` is `#E8DCCB`.
   `rgba(138,90,68,0.06–0.1)`.
 
 ## App layout (Prototype v2)
+
+The prototype as drawn. Since `knowledge-core` there is no Map, and the
+Timeline is the Log, the project's RAID register
+(`docs/knowledge-core/DECISIONS.md`, decision 37).
+
 - Title bar h52 on `sunken`: traffic lights, project switcher pill (with
   sync dot), centered global search (⌘K, "Search — Ken answers questions
   inline…"), Chats toggle button (clay-tinted, unread dot).

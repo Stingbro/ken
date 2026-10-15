@@ -795,14 +795,16 @@ impl Db {
             }
         }
         if version < 22 {
-            // knowledge-core decision 5: a page's frontmatter is six keys,
-            // `title`, `aliases`, `status`, `updated`, `sources` and
-            // `checked` (a date and a commit, in its written form), plus an
-            // optional `reviewed_by`. `replaced_by` and `generated` are still
-            // read from older pages. `verified` and `audience` are gone.
-            // The table is made again and filled from the stored text, no
-            // file read, and each file's tier with it (the default tiers;
-            // the next scan applies the team file's overrides).
+            // knowledge-core decision 5: a page's frontmatter is seven keys,
+            // `title`, `aliases`, `status`, `superseded_by`, `updated`,
+            // `sources` and `checked` (a date and a commit, in its written
+            // form), plus an optional `reviewed_by`. `superseded_by` (and an
+            // older page's `replaced_by`) is kept in the `replaced_by` column;
+            // `generated` is still read from older pages. `verified` and
+            // `audience` are gone. The table is made again and filled from
+            // the stored text, no file read, and each file's tier with it (the
+            // default tiers; the next scan applies `.ken/knowledge.json`'s
+            // overrides).
             self.conn.execute_batch(
                 r#"
                 DROP TABLE IF EXISTS page_meta;
@@ -3281,7 +3283,7 @@ impl Db {
     /// can't extract here (no byte read), but we CAN reset the row's stored
     /// `mtime` to [`Self::REINDEX_SENTINEL_MTIME`] so the next incremental
     /// `scan::scan` sees it as changed and re-runs `index_one` (re-extracting
-    /// content + enqueuing extraction). Only those transitioned rows are
+    /// its content). Only those transitioned rows are
     /// re-index-flagged, to avoid needless work for a mere glyph change.
     pub fn refresh_stored_kinds(&mut self) -> Result<usize> {
         let mut stmt = self.conn.prepare("SELECT rel_path, kind FROM files")?;

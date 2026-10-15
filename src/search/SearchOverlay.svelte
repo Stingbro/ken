@@ -337,8 +337,7 @@
     if (!hit) return;
     // A hit from an unfocused member: switch focus first (workspace task
     // 4.4 / kg-routing spec: "selection resolves ... switching member focus
-    // as needed"), then open — same order `federated-kg`'s wiki pointers
-    // already use.
+    // as needed"), then open.
     if (hit.projectId && hit.projectId !== app.focused) {
       await app.focusMember(hit.projectId);
     }

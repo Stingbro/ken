@@ -149,7 +149,7 @@ fn contains_normalized(haystack: &str, needle: &str) -> bool {
 
 /// How a hit is cited so a reader can go straight to it: `repo:path:line`,
 /// with `repo@sha` when the repo is git, and led by `[[Note Name]]` for a
-/// page in a team or wiki repo. `line` is None for a chunk stored before
+/// page in a knowledge base. `line` is None for a chunk stored before
 /// lines were recorded, which drops the `:line`.
 pub fn locator(repo: &str, rel_path: &str, line: Option<i64>, sha: Option<&str>, wiki_page: bool) -> String {
     let path = rel_path.replace('\\', "/");

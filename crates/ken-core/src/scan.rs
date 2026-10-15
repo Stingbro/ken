@@ -276,9 +276,8 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     // pull back something `.gitignore` already excluded — the walker
     // never hands it over to be reclassified. To index a gitignored path
     // deliberately, un-ignore it in `.gitignore` (a `!` line there), or
-    // move it out from under the pattern. `.kenignore` remains able to
-    // exclude further, and to demote to search-only, which is what it is
-    // overwhelmingly used for.
+    // move it out from under the pattern. The index rules remain able to
+    // exclude further, which is what they are overwhelmingly used for.
     let is_repo = project.root.join(".git").exists();
     let walker = ignore::WalkBuilder::new(&project.root)
         .hidden(true) // skip dotfiles: .git, .ken, .DS_Store…
@@ -364,7 +363,8 @@ pub fn scan(project: &Project, db: &mut Db) -> Result<ScanStats> {
     }
 
     // Each file's authority in search, from the index's frontmatter and the
-    // team file, for every file: a team file's new override reaches them all.
+    // knowledge base's `.ken/knowledge.json`, for every file: a new tier
+    // override there reaches them all.
     crate::authority::refresh(db, &project.root, None)?;
     // Each code file's role, from the repo's role rules and the built-in
     // core, for every file: a new rule reaches them all (decision 17).
@@ -546,8 +546,8 @@ fn index_one(
         }
     }
     // The code index: definitions, references and imports, for "find usages"
-    // and "go to definition". Every tier: a code repo is search-only and
-    // this is exactly what it is searched for. Made before the chunks, which
+    // and "go to definition", for every indexed file: it is what a code
+    // repo is searched for. Made before the chunks, which
     // cut code at its definitions.
     let map = crate::codeindex::Lang::of(rel).map(|_| {
         if status == STATUS_INDEXED { crate::codeindex::map_file(rel, &text).unwrap_or_default() } else { Default::default() }

@@ -48,9 +48,9 @@ pub const WHISPER_SMALL_EN_BYTES: u64 = 190_085_487;
 pub const WHISPER_LARGE_TURBO_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
 pub const WHISPER_LARGE_TURBO_BYTES: u64 = 574_041_195;
 
-// ---------- Language models (spec §1 / §10 "Answers & Map") ----------
+// ---------- Language models (spec §1 / §10 "Answers") ----------
 
-/// Recommended answers/Map model: Qwen3-4B-Instruct-2507, Q4_K_M GGUF (~2.5 GB).
+/// Recommended answers model: Qwen3-4B-Instruct-2507, Q4_K_M GGUF (~2.5 GB).
 /// The official `Qwen/...GGUF` repo is gated (needs auth), so we serve the
 /// public `unsloth` mirror of the identical quant — Ken downloads without
 /// credentials.
@@ -58,7 +58,7 @@ pub const LANG_4B_FILE: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 pub const LANG_4B_URL: &str = "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 pub const LANG_4B_BYTES: u64 = 2_497_281_120;
 
-/// Advanced answers/Map model: Qwen3-8B, Q4_K_M GGUF (~5 GB), official repo.
+/// Advanced answers model: Qwen3-8B, Q4_K_M GGUF (~5 GB), official repo.
 pub const LANG_8B_FILE: &str = "Qwen3-8B-Q4_K_M.gguf";
 pub const LANG_8B_URL: &str = "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf";
 pub const LANG_8B_BYTES: u64 = 5_027_783_488;
@@ -215,7 +215,7 @@ fn transcription_catalog() -> Vec<CatalogEntry> {
 }
 
 /// The on-device language models, kept for the local engine behind
-/// `LOCAL_GENERATION` (off): Claude writes, extracts and answers, so these
+/// `LOCAL_GENERATION` (off): Claude reads, writes and answers, so these
 /// are not offered in Settings ([`catalog`] leaves them out). A file already
 /// downloaded is still found by [`selected_model_path`] and can be removed.
 pub fn language_catalog() -> Vec<CatalogEntry> {
@@ -223,14 +223,14 @@ pub fn language_catalog() -> Vec<CatalogEntry> {
         CatalogEntry {
             category: ModelCategory::Language,
             tier: ModelTier::Recommended,
-            blurb: "Not used: Claude builds the map.",
+            blurb: "Not used: Claude reads and writes for Ken.",
             languages: "",
             spec: lang_recommended_spec(),
         },
         CatalogEntry {
             category: ModelCategory::Language,
             tier: ModelTier::Advanced,
-            blurb: "Not used: Claude builds the map.",
+            blurb: "Not used: Claude reads and writes for Ken.",
             languages: "",
             spec: lang_advanced_spec(),
         },
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn language_models_are_known_but_not_offered() {
-        assert!(catalog().iter().all(|e| e.category != ModelCategory::Language), "Claude builds the map");
+        assert!(catalog().iter().all(|e| e.category != ModelCategory::Language), "Claude reads and writes for Ken");
         let lang = language_catalog();
         assert_eq!(lang.len(), 2);
         let rec = lang.iter().find(|e| e.tier == ModelTier::Recommended).unwrap();

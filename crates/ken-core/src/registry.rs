@@ -171,7 +171,7 @@ pub fn index_of(root: &Path) -> (Vec<RepoKind>, Option<IndexState>) {
 
 /// A repo nobody has said the kind of yet: registered and a git repo. Ken
 /// reads none of it until a person sets its kind, so a repo is never indexed
-/// on a guess (a code repo with no kind is read for entities in full). Ken's
+/// on a guess (a code repo with no kind would be read in full). Ken's
 /// own folders (the workspace memory) are not git repos and are read as
 /// before.
 pub fn awaits_kind(root: &Path) -> bool {

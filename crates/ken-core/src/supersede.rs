@@ -24,8 +24,8 @@
 //!   one commit; the next scan stores it as a marker.
 //!
 //! Generic: any log whose entries carry an id and a date (`**D-410** ·
-//! 2026-10-06 · topics — **TITLE**`), named by the team file (`decisions`) or
-//! called `DECISIONS.md`.
+//! 2026-10-06 · topics — **TITLE**`), named by the settings file
+//! (`decisions`) or called `DECISIONS.md`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,7 +84,7 @@ impl Supersession {
     }
 }
 
-/// The logs a pass reads in a repo: the decisions log the team file names,
+/// The logs a pass reads in a repo: the decisions log the settings file names,
 /// else every indexed page called `DECISIONS.md`.
 pub fn log_paths(db: &Db, roles: &Roles) -> Result<Vec<String>> {
     Ok(db.authority_candidates(false)?.into_iter().filter(|p| roles.is_decisions_log(p)).collect())

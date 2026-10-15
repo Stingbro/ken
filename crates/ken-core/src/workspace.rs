@@ -47,9 +47,9 @@ pub struct WorkspaceConfig {
     /// they are separate repos (e.g. a game and its tools).
     ///
     /// Unlike [`WorkspaceConfig::links`] — which is read out of `extra` on
-    /// demand precisely because nothing in-tree writes it — groups ARE
-    /// written by Ken (the user manages them in Settings), so they get a
-    /// typed field. `skip_serializing_if` keeps a manifest that has no
+    /// demand precisely because nothing in-tree writes it — groups were
+    /// written by Ken's settings once and still sort the repos, so they get
+    /// a typed field. `skip_serializing_if` keeps a manifest that has no
     /// groups byte-identical to one written before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ProjectGroup>,
@@ -620,9 +620,8 @@ pub fn ignore_rules(parent: &Path) -> Vec<crate::kenignore::Rule> {
 }
 
 /// Whether a sibling folder is excluded by the workspace-root
-/// `.kenignore`. Only the `Ignore` tier hides a folder outright: a
-/// `~search-only` rule is about how much of a file's content gets
-/// indexed, which has no meaning for "is this a project".
+/// `.kenignore`. Only an ignore line hides a folder: a legacy `~` line
+/// reads as indexed (decision 34), so it hides nothing.
 pub fn is_ignored_folder(rules: &[crate::kenignore::Rule], name: &str) -> bool {
     crate::kenignore::classify(name, true, &[rules]) == crate::kenignore::Tier::Ignored
 }
@@ -927,8 +926,8 @@ mod tests {
         assert_eq!(names, ["ken"], "a glob must hide every match");
     }
 
-    /// A search-only rule says how much of a file to index; it has no
-    /// meaning for "is this folder a project", so it must not hide one.
+    /// A legacy `~` (search-only) line reads as indexed, so it must not
+    /// hide a folder.
     #[test]
     fn search_only_rule_does_not_hide_a_candidate() {
         let dir = tempdir().unwrap();

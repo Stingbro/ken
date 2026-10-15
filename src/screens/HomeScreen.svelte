@@ -82,8 +82,7 @@
     if (c.projectId) void openInRepo(c.projectId, c.path, where);
     else void openMemberPath(c.path, where);
   }
-  // Files still being indexed. `queued` is the files the knowledge map has
-  // not read yet: Claude's map build reads them, so they are not indexing.
+  // Files still being indexed.
   const indexing = $derived(app.scanning);
 
   // ── Your list ─────────────────────────────────────────────────────

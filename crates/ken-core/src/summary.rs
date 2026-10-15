@@ -8,7 +8,7 @@
 //!
 //! Claude writes them, never the local model, in batches of many chunks per
 //! call. The app runs [`summarize_next`] in the background for a
-//! knowledge-base repo (kind team or wiki), each call a turn of the one
+//! knowledge-base repo (kind wiki), each call a turn of the one
 //! background throttle (`throttle::claude_turn`, decision 34): paused with
 //! everything else, paced and counted against the pace's hourly calls.
 

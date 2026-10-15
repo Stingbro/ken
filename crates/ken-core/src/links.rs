@@ -371,7 +371,7 @@ pub fn report(db: &Db) -> Result<LinkReport> {
 }
 
 /// A page's links both ways: the pages it reaches and the pages that reach
-/// it, for the Map's neighbours.
+/// it, for the Related row under a page in Files.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageLinks {

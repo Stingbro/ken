@@ -1,12 +1,14 @@
-//! Embedded, on-device language model — instant ⌘K quick answers (spec §5) and
-//! Map entity extraction (sibling plan), running entirely on the user's Mac.
+//! Embedded, on-device language model — instant ⌘K quick answers (spec §5),
+//! the model's warm-up and the memory distillation, running entirely on the
+//! user's machine.
 //!
 //! One model is loaded per app process, lazily, on first use, and driven by a
 //! single worker thread behind a two-priority inference queue: `Interactive`
-//! work (quick answers) is always served before `Background` work (Map
-//! extraction). A running Background generation is *preempted* the moment an
-//! Interactive job arrives — it is aborted mid-decode and re-queued to run again
-//! from scratch (extraction jobs are idempotent) — so an interactive request
+//! work (quick answers) is always served before `Background` work (the
+//! warm-up, the memory distillation). A running Background generation is
+//! *preempted* the moment an Interactive job arrives — it is aborted mid-decode
+//! and re-queued to run again from scratch (background jobs are idempotent) —
+//! so an interactive request
 //! waits at most one token, not a whole background generation. The real
 //! llama.cpp engine lives behind the [`Engine`] trait seam
 //! (like `model.rs`'s `ByteSource`) so every scheduling / cancel / JSON-retry
@@ -16,7 +18,7 @@
 use crate::{Error, Result};
 
 /// Where a job sits in the inference queue. `Interactive` (quick answers) is
-/// always served before `Background` (Map extraction).
+/// always served before `Background` (the warm-up, the memory distillation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
     Interactive,
@@ -147,8 +149,8 @@ impl Utf8Streamer {
 
 /// Parse JSON out of a model completion that may be wrapped in prose or code
 /// fences: take the substring from the first `{` or `[` to the matching last
-/// `}` or `]`. Good enough for the greedy, schema-hinted generations Map
-/// extraction and any JSON caller produce.
+/// `}` or `]`. Good enough for the greedy, schema-hinted generations any JSON
+/// caller produces, and for Claude's replies to the background checks.
 pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
     let Some(start) = text.find(['{', '[']) else {
         return Err(Error::Other("no JSON object found in the model output".into()));
@@ -207,8 +209,9 @@ pub fn parse_json_lenient(text: &str) -> Result<serde_json::Value> {
 /// inside a string, between an object's key and value, halfway through an
 /// array. What it produced up to that point is usually most of a useful answer,
 /// and discarding all of it turns a partial result into a total loss. That is
-/// what was happening to Map extraction: the cap severed the JSON and every
-/// affected file was recorded as an error and retried twice more.
+/// what was happening to the Map's extraction (since removed, knowledge-core
+/// decision 21): the cap severed the JSON and every affected file was recorded
+/// as an error and retried twice more.
 ///
 /// Deliberately conservative. It only ever DROPS a trailing incomplete value
 /// and appends the closers for containers that were still open, so the result
@@ -413,7 +416,7 @@ impl LlmService {
     }
 
     /// True while any Interactive job is queued or running — the "yield flag" a
-    /// Background caller (Map extraction) checks between its per-file jobs.
+    /// Background caller checks between its jobs.
     pub fn interactive_pending(&self) -> bool {
         self.interactive_pending.load(Ordering::SeqCst)
     }
@@ -518,11 +521,10 @@ impl LlmService {
     /// non-JSON output, so the second attempt must perturb the input to have a
     /// chance at succeeding.
     ///
-    /// The retry is scoped to `Interactive` work. `Background` (Map extraction)
-    /// runs hundreds of files serially, so the doubled generation a retry costs
-    /// on every not-quite-JSON first answer dominates indexing time; the
-    /// pipeline already tolerates a failed delta (the file is marked `error`,
-    /// never re-queued into a storm), so background jobs take the single attempt.
+    /// The retry is scoped to `Interactive` work. `Background` work runs
+    /// unattended and tolerates a failed answer, so the doubled generation a
+    /// retry costs is not worth it there: background jobs take the single
+    /// attempt.
     pub fn generate_json_via(
         &self,
         prompt: &str,
@@ -1052,7 +1054,7 @@ mod tests {
     #[test]
     fn generation_budget_is_bounded_per_priority() {
         // Quick answers get a short, streamed budget (256) to keep tail latency
-        // low; background Map extraction keeps its own bounded budget. Guards the
+        // low; background work keeps its own bounded budget. Guards the
         // two constants against accidental change.
         assert_eq!(max_tokens_for(Priority::Interactive), 256);
         assert_eq!(max_tokens_for(Priority::Background), 2048);
@@ -1355,10 +1357,10 @@ mod tests {
 
     #[test]
     fn background_json_does_not_retry() {
-        // Background (Map extraction) takes a single attempt: hundreds of serial
-        // files make the retry's doubled generation too costly, and the pipeline
-        // tolerates a failed delta. A bad first answer errors without a second
-        // generation, so the good script is never reached.
+        // Background work takes a single attempt: it runs unattended, and the
+        // retry's doubled generation is not worth it there. A bad first answer
+        // errors without a second generation, so the good script is never
+        // reached.
         let order = Arc::new(Mutex::new(Vec::<String>::new()));
         let svc = {
             let order = order.clone();
