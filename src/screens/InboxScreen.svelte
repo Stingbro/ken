@@ -206,8 +206,6 @@
         {:else if sel.source.type === "finding"}
           <p class="body">{sel.source.finding.detail}</p>
         {:else if sel.source.type === "analysis"}
-          <!-- One source line: .body keeps line breaks (pre-wrap), so a break here showed as a wide gap. -->
-          <p class="body">Ken read {sel.source.analysis.source}'s files and proposes these for search. Accept writes them into <code>.ken/knowledge.json</code> as one commit; Dismiss drops them. Nothing applies until you accept.</p>
           {#if sel.source.analysis.roles.length > 0}
             <div class="t-label">Role rules</div>
             <ul class="plist">
@@ -217,7 +215,7 @@
             </ul>
           {/if}
           {#if sel.source.analysis.controls.length > 0}
-            <div class="t-label">Controls: a question, and the file that must come back near the top</div>
+            <div class="t-label">Controls</div>
             <ul class="plist">
               {#each sel.source.analysis.controls as c, i (i)}
                 <li>“{c.question}” → <code>{c.expect}</code></li>
@@ -227,9 +225,7 @@
         {:else if sel.source.type === "conflict"}
           <ConflictDetail item={sel.source.conflict} />
         {:else if sel.source.type === "failed"}
-          <p class="body">Ken couldn't read {sel.source.relPath.split("/").pop()}{sel.source.error ? `: ${sel.source.error}` : ""}. It may be a scan with no text, or a protected file. It is still found by name.</p>
-        {:else if sel.source.type === "chat"}
-          <p class="body">Ken stopped in “{sel.source.title || "a chat"}” to ask you something. Answer it in Ask Ken and it carries on.</p>
+          {#if sel.source.error}<p class="body">{sel.source.error}</p>{/if}
         {/if}
 
         {#if isDone}
@@ -244,7 +240,7 @@
             {/each}
             <span class="grow"></span>
             {#if sel.source.type === "failed"}
-              <button class="btn btn-ghost" title="Stop showing this file's problems (only for you)" disabled={busy} onclick={() => sel && void ignoreFile(sel)}>
+              <button class="btn btn-ghost" disabled={busy} onclick={() => sel && void ignoreFile(sel)}>
                 <BellOff size={14} strokeWidth={1.75} aria-hidden="true" /> Ignore this file
               </button>
             {/if}

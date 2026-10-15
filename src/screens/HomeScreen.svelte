@@ -84,8 +84,6 @@
     if (c.projectId) void openInRepo(c.projectId, c.path, where);
     else void openMemberPath(c.path, where);
   }
-  // Files still being indexed.
-  const indexing = $derived(app.scanning);
 
   // ── Your list ─────────────────────────────────────────────────────
 
@@ -189,7 +187,7 @@
         {#snippet actions()}
           {#if day.digest}
             <span class="meta">Digest at {digestTime(day.digest.generatedAt)}{day.digest.sources.length ? ` · ${day.digest.sources.length} ${day.digest.sources.length === 1 ? "source" : "sources"}` : ""}</span>
-            <button class="btn btn-small" onclick={share} title="Copy the digest as markdown">
+            <button class="btn btn-small" onclick={share}>
               {#if copied}<Check size={13} strokeWidth={2} /> Copied{:else}<Copy size={13} strokeWidth={1.75} /> Share{/if}
             </button>
           {/if}
@@ -208,11 +206,11 @@
       {:else if day.generating}
         <p class="digest quiet">Ken is writing today's digest.</p>
       {:else if !day.claudeFound}
-        <p class="digest quiet">The digest needs Claude Code. Settings › AI says how to install it.</p>
+        <p class="t-small err">Claude Code not found</p>
       {:else}
         <EmptyState title="No digest yet">
           {#snippet action()}
-            <button class="btn btn-small" title={indexing ? "Ken is still indexing; the digest may miss what it has not read." : undefined} onclick={() => void day.writeDigest()}>Write it now</button>
+            <button class="btn btn-small" onclick={() => void day.writeDigest()}>Write it now</button>
           {/snippet}
         </EmptyState>
       {/if}
@@ -280,7 +278,7 @@
     {#if recents.length > 0}
       <section class="recent">
         <div class="lhead">
-          <h2 class="t-heading">Picked up where you left off</h2>
+          <h2 class="t-heading">Recent</h2>
           <span class="grow"></span>
           <button class="btn btn-link btn-small" onclick={() => (app.screen = "files")}>All files</button>
         </div>
@@ -329,7 +327,6 @@
       {#if meaningModel}
         <div class="k-action meaning">
           <div class="kind accent">Search by meaning is off</div>
-          <div class="short">Search finds exact words only until a model that reads for meaning is on this computer. It runs here; nothing leaves it.</div>
           <ModelDownloadDialog status={meaningModel} compact onInstalled={() => void checkMeaning()} />
         </div>
       {/if}
