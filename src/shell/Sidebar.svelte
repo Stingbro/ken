@@ -81,7 +81,7 @@
     <div class="traffic" data-tauri-drag-region></div>
   {/if}
 
-  <button class="team" onclick={() => (switcherOpen = !switcherOpen)} title="Switch workspace">
+  <button class="workspace" onclick={() => (switcherOpen = !switcherOpen)} title="Switch workspace">
     <span class="k">K</span>
     {#if !collapsed}
       <span class="tinfo">
@@ -155,7 +155,7 @@
     height: 22px;
     flex: none;
   }
-  .team {
+  .workspace {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -168,10 +168,10 @@
     color: var(--ink);
     min-width: 0;
   }
-  .team:hover {
+  .workspace:hover {
     border-color: var(--line-strong);
   }
-  .team :global(svg) {
+  .workspace :global(svg) {
     color: var(--ink-3);
     flex: none;
   }

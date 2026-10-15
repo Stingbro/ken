@@ -56,7 +56,7 @@
 
   function applyLabel(kind: IngestProposal["kind"]): string {
     if (kind === "page" || kind === "new page") return "Apply";
-    if (kind === "ruling") return "Add to the log";
+    if (kind === "ruling") return "Add to the decisions log";
     if (kind === "risk" || kind === "issue") return "Add to the register";
     return "Accept";
   }

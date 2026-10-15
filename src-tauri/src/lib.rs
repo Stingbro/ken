@@ -7887,7 +7887,7 @@ fn workspace_add_template_files(state: State<SharedState>, paths: Vec<String>) -
 fn workspace_add_rule(state: State<SharedState>, wiki_id: String, rule: String) -> CmdResult<String> {
     let guard = state.lock().unwrap();
     let id: uuid::Uuid = wiki_id.parse().map_err(err)?;
-    let root = guard.members.get(&id).map(|m| m.project.root.clone()).ok_or("the wiki is not open")?;
+    let root = guard.members.get(&id).map(|m| m.project.root.clone()).ok_or("the knowledge base is not open")?;
     let rule = rule.trim();
     if rule.is_empty() {
         return Err("say the rule as a sentence".into());

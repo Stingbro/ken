@@ -131,7 +131,7 @@
   async function checkLayout() {
     const path = overview?.wiki?.path;
     if (!path) return;
-    await run("map", "Could not read the wiki's layout", async () => {
+    await run("map", "Could not read the knowledge base's layout", async () => {
       mapPlan = await api.wikiMapPlan(path);
     });
   }
@@ -310,7 +310,7 @@
   const controlsPassing = $derived((overview?.controls ?? []).filter((c) => c.passed).length);
 </script>
 
-<div class="team">
+<div class="workspace">
   <div class="head">
     <strong class="tname">{overview?.workspace ?? app.workspace?.name ?? ""}</strong>
     <span class="spacer"></span>
@@ -695,7 +695,7 @@
 {/if}
 
 <style>
-  .team {
+  .workspace {
     display: flex;
     flex-direction: column;
     gap: 10px;

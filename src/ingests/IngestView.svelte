@@ -609,7 +609,7 @@
                 <div class="ddetail">Ready for the decisions log; adding it gives it the next number.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
-                  <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the decisions log" onclick={() => apply(p)}>Add to the log</button>
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the decisions log" onclick={() => apply(p)}>Add to the decisions log</button>
                   <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
                   <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
                 </div>
