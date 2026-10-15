@@ -245,7 +245,7 @@ On top of that base:
     - **Your day and tasks stay.**
     - **Families and the team bus go.**
     - **The Team screen** becomes the workspace settings screen (sources, kinds, index rules, tiers, roles, controls, health).
-    - **Memory stays,** personal and local, never pushed.
+    - **Memory stays,** personal and local, never pushed. Distilling the journal into proposed memories is one Claude call, a turn of the background throttle counted against the hour like the summaries; the local model only embeds (Chris, 2026-10-15).
     - **Explore and the Map go.** The Timeline becomes the Log: the project's RAID register (risks, actions, issues, decisions) and milestones, not a feed of every update (Chris, 2026-10-14).
       - Risks and issues live in `Current/RAID.md`, one entry each (`## R-001 · date · title`, then `status:`, `owner:`, `sources:`); ingest proposes them, and an open question can be raised as an issue.
       - Actions are the open tickets with an assignee; decisions are the decisions log's rulings, a superseded or refined one folded; milestones are the tickets marked `type: milestone`, the roadmap's rows and releases (tags).

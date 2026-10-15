@@ -589,6 +589,30 @@ pub fn parse_distill_candidates(raw: &str) -> Vec<DistillCandidate> {
     out
 }
 
+/// One distillation run over `journal_window`: the prompt, with the
+/// memories already kept (`existing`, slug and description) and the slugs
+/// the person dismissed before (`dismissed`) as its dedupe guard; one call
+/// to `generate`; and the candidates it proposes, less any dismissed slug.
+/// An empty window proposes nothing and makes no call. The caller owns the
+/// call: in the app it is Claude, as a turn of the background throttle
+/// (Chris, 2026-10-15), never the local model.
+pub fn distill(
+    journal_window: &str,
+    existing: &[(String, String)],
+    dismissed: &[String],
+    generate: &mut dyn FnMut(&str) -> Result<String>,
+) -> Result<Vec<DistillCandidate>> {
+    if journal_window.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut known = existing.to_vec();
+    known.extend(dismissed.iter().map(|slug| (slug.clone(), "previously suggested and dismissed by the user".to_string())));
+    let raw = generate(&compose_distill_prompt(journal_window, &known))?;
+    let mut candidates = parse_distill_candidates(&raw);
+    candidates.retain(|c| !dismissed.contains(&c.slug));
+    Ok(candidates)
+}
+
 // ---------------------------------------------------------------------
 // 1.6 Workspace pseudo-member
 // ---------------------------------------------------------------------
@@ -905,6 +929,36 @@ mod tests {
         assert!(prompt.contains("style: How we name things"));
         assert!(prompt.contains("Shipped X."));
         assert!(prompt.contains("\"candidates\""));
+    }
+
+    /// A run is one call, with what is kept and what was dismissed in its
+    /// prompt; a dismissed slug proposed again is dropped; an empty journal
+    /// makes no call; a failed call is the run's error.
+    #[test]
+    fn distill_is_one_call_and_drops_what_was_dismissed() {
+        let existing = vec![("style".to_string(), "How we name things".to_string())];
+        let dismissed = vec!["standups".to_string()];
+        let mut prompts: Vec<String> = Vec::new();
+        let mut generate = |prompt: &str| -> Result<String> {
+            prompts.push(prompt.to_string());
+            Ok(r#"{"candidates": [
+                {"slug": "standups", "description": "again", "body": "Daily at nine."},
+                {"slug": "review-cadence", "description": "How we review", "body": "Two reviewers."}
+            ]}"#
+                .to_string())
+        };
+        let out = distill("## 2026-10-14.md\nTwo reviewers again.\n", &existing, &dismissed, &mut generate).unwrap();
+        assert_eq!(out.iter().map(|c| c.slug.as_str()).collect::<Vec<_>>(), vec!["review-cadence"]);
+        assert_eq!(prompts.len(), 1, "one call");
+        assert!(prompts[0].contains("style: How we name things"), "{}", prompts[0]);
+        assert!(prompts[0].contains("standups: previously suggested and dismissed"), "{}", prompts[0]);
+        assert!(prompts[0].contains("Two reviewers again."), "{}", prompts[0]);
+
+        let mut never = |_: &str| -> Result<String> { panic!("an empty journal makes no call") };
+        assert!(distill("  \n", &existing, &dismissed, &mut never).unwrap().is_empty());
+
+        let mut failing = |_: &str| -> Result<String> { Err(Error::Other("stopped".into())) };
+        assert!(distill("## 2026-10-14.md\nx\n", &[], &[], &mut failing).is_err());
     }
 
     // ---- 1.6 workspace pseudo-member ----

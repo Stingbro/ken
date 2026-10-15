@@ -6592,33 +6592,12 @@ fn start_ingest_passes(state: &SharedState) {
     }
 }
 
-/// One model call through the Claude CLI, run in the wiki's folder.
 /// Ken's generation policy: the on-device model embeds (meaning search) and
 /// nothing else. Everything that writes, extracts, judges or answers runs
 /// through Claude, in-agent Ken; the local 4B model, measured on a real
 /// knowledge base, left half its extractions unparseable at ~42 s each and
 /// merged near-miss names it should not have.
 const LOCAL_GENERATION: bool = false;
-
-/// One prompt through Claude, from `root`; the error is for a person.
-fn claude_text(root: &Path, prompt: &str) -> Result<String, String> {
-    let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
-    claude_generate(binary, root.to_path_buf(), Vec::new())(prompt).map_err(|e| e.to_string())
-}
-
-/// Claude from `root`, also reading `dirs` (the workspace's repos a draft reads).
-fn claude_generate(
-    binary: std::path::PathBuf,
-    root: std::path::PathBuf,
-    dirs: Vec<std::path::PathBuf>,
-) -> impl FnMut(&str) -> ken_core::Result<String> {
-    move |prompt: &str| match ken_core::assistant::oneshot_in(&binary, &root, &dirs, prompt, Duration::from_secs(600), &CancelToken::new())? {
-        ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
-        ken_core::assistant::OneshotOutcome::Failed(d) => Err(ken_core::Error::Other(d)),
-        ken_core::assistant::OneshotOutcome::TimedOut => Err(ken_core::Error::Other("timed out".into())),
-        ken_core::assistant::OneshotOutcome::Cancelled => Err(ken_core::Error::Other("cancelled".into())),
-    }
-}
 
 /// Create a knowledge base from the bundled template at `dir` (a new or
 /// empty folder) and return its set-up row. It holds the tickets and the
@@ -8643,13 +8622,20 @@ fn journal_window_text(ws_root: &Path) -> String {
     out
 }
 
+/// How long one distillation call may take.
+const DISTILL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Run a distillation pass over the current journal window (ken-memory task
-/// 2.2 / design D6): compose the prompt (journal window + existing workspace
-/// memory descriptions + previously-dismissed slugs, all as the dedupe
-/// guard), generate at Background priority on the local LLM, parse
-/// tolerantly, cap 5, and emit
-/// `memory-state` (`planning` → `distilling` → `ready`/`error`). Candidates
-/// are cached server-side (`AppState::memory_distill_candidates`) so
+/// 2.2 / design D6) through `memory::distill`: the journal window, with the
+/// existing workspace memories and the previously dismissed slugs as the
+/// dedupe guard, in one Claude call with no tools. The call is a turn of the
+/// background throttle (`throttle::claude_turn`, decision 34), as the
+/// summaries' are: it waits while paused and for the pace, counts against
+/// the hour, and shows in the status panel ("memory"), with a failure
+/// listed there too (Chris, 2026-10-15: distillation runs on Claude, not
+/// the local model). It emits `memory-state` (`planning` → `distilling` →
+/// `ready`/`error`). Candidates are cached server-side
+/// (`AppState::memory_distill_candidates`) so
 /// `resolve_distill_candidate(slug, approve)` can look one up by slug alone,
 /// matching that command's own two-argument contract.
 #[tauri::command(async)]
@@ -8673,30 +8659,39 @@ fn distill_journal(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let bg_app = app.clone();
     std::thread::spawn(move || {
         let outcome = (|| -> Result<Vec<memory::DistillCandidate>, String> {
+            let binary = ken_core::runner::discover_claude().ok_or_else(|| ken_core::runner::MISSING_CLAUDE_HELP.to_string())?;
             let window = journal_window_text(&ws_root);
-            let dismissed = UserState::load(&base_dir, pseudo_id).ignored;
+            let dismissed: Vec<String> = UserState::load(&base_dir, pseudo_id)
+                .ignored
+                .iter()
+                .filter_map(|tagged| tagged.strip_prefix(DISMISSED_MEMORY_PREFIX).map(str::to_string))
+                .collect();
+            let existing: Vec<(String, String)> = memory::list_memories(&memory::workspace_memory_dir(&ws_root))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.slug, m.description))
+                .collect();
 
-            let mut existing: Vec<(String, String)> =
-                memory::list_memories(&memory::workspace_memory_dir(&ws_root))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|m| (m.slug, m.description))
-                    .collect();
-            for tagged in &dismissed {
-                if let Some(slug) = tagged.strip_prefix(DISMISSED_MEMORY_PREFIX) {
-                    existing.push((slug.to_string(), "previously suggested and dismissed by the user".to_string()));
+            let _ = bg_app.emit("memory-state", MemoryStateEvent::Distilling);
+            // Background work: a turn of the one throttle (decision 34).
+            let mut generate = |prompt: &str| -> ken_core::Result<String> {
+                let _turn = ken_core::throttle::claude_turn(&|| false);
+                let _running = ken_core::throttle::begin("memory", "journal");
+                match ken_core::assistant::oneshot_answer(&binary, &ws_root, prompt, None, DISTILL_TIMEOUT, &CancelToken::new())? {
+                    ken_core::assistant::OneshotOutcome::Completed(text) => Ok(text),
+                    other => Err(ken_core::Error::Other(format!("claude: {other:?}"))),
+                }
+            };
+            match memory::distill(&window, &existing, &dismissed, &mut generate) {
+                Ok(candidates) => {
+                    ken_core::throttle::clear_failure("memory", "journal");
+                    Ok(candidates)
+                }
+                Err(e) => {
+                    ken_core::throttle::fail("memory", "journal", &e.to_string());
+                    Err(e.to_string())
                 }
             }
-
-            let prompt = memory::compose_distill_prompt(&window, &existing);
-            let _ = bg_app.emit("memory-state", MemoryStateEvent::Distilling);
-            let raw = claude_text(&ws_root, &prompt)?;
-
-            let mut candidates = memory::parse_distill_candidates(&raw);
-            candidates.retain(|c| {
-                !dismissed.contains(&format!("{DISMISSED_MEMORY_PREFIX}{}", c.slug))
-            });
-            Ok(candidates)
         })();
 
         match outcome {

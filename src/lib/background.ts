@@ -37,6 +37,7 @@ const KINDS: Record<string, string> = {
   cloud: "Cloud files",
   index: "Index",
   analysis: "Repo analysis",
+  memory: "Memory",
 };
 
 /** A kind of work in a person's words. */
