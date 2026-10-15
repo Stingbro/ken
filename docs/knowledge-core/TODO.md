@@ -391,7 +391,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - Stale text (`2e23385`): the Map and its extraction in the local model's docs and the model catalog's row, six keys in the v22 note, "the team file", the team kind, entities and the search-only tier in comments, the chat guide's Memories block (the person's, not the team's), the README (ingest as it is now, what Ken writes where), and the prototype layout in the design tokens.
   - Names (`b6ad2b5`): "Add to the decisions log", not "the log", now that the Log is a screen; "the knowledge base" for "the wiki" in two messages; the `team` class names are `workspace`.
   - Left for Chris, not removed:
-    - Commands with no caller that belong to kept features: `memory_write`, `journal_append`, `read_journal` (memory stays, decision 37) and `rename_chat`.
+    - Commands with no caller that belong to kept features: `rename_chat`. The app's own `memory_write`, `journal_append` and `read_journal` went after (Chris): memory and the journal are written through ken-mcp's personal set, and distillation writes through ken-core.
     - `setup::confirm` stays as the rescan test's fixture; `setup_rescan` still serves a workspace the folder form made.
     - Functions only tests call, from before the rebuild: the run log (`Db::insert_run` and the rest), the digests table (`upsert_digest`, `get_digest`, `latest_digest`), `runner::run_ingest_session`, `workspace::linked_projects`, `groups_for_member`, `WorkspaceConfig::set_group`.
     - Design-system classes nothing uses: `.k-pill`, `.btn-large`, and `.k-segmented` (Explore's).

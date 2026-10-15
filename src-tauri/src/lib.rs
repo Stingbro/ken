@@ -5770,13 +5770,6 @@ fn local_date_today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// `HH:MM`, local time — ken-memory task 2.2's `journal_append` caller-
-/// supplies-time param (`memory::append_journal`'s `time_hhmm`), same
-/// caller-passes-a-formatted-string discipline as `local_date_today` above.
-fn local_time_hhmm() -> String {
-    chrono::Local::now().format("%H:%M").to_string()
-}
-
 fn local_hour() -> u32 {
     use chrono::Timelike;
     chrono::Local::now().hour()
@@ -8601,124 +8594,6 @@ enum MemoryStateEvent {
     Distilling,
     Ready { candidates: Vec<memory::DistillCandidate> },
     Error { reason: String },
-}
-
-/// One day's journal content, as returned by `read_journal`.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct JournalDayDto {
-    /// `YYYY-MM-DD`.
-    date: String,
-    content: String,
-}
-
-/// Create or replace a memory (ken-memory task 2.2 / design D5). `scope` is
-/// `"workspace"` (`.ken-workspace/memory/`) or `"project"` (the currently
-/// FOCUSED member's `.ken/memory/` — judgment call: the command takes no
-/// explicit `project_id`, matching how D4's context injection already scopes
-/// "project memories" to whichever member is focused, and keeping the tool
-/// surface small; a future multi-target `memory_write` could add an explicit
-/// id without breaking this contract, since "project" today unambiguously
-/// means "the focused one"). `mode` is `"create"` (slug must not exist) or
-/// `"replace"` (slug must exist) — `memory::WriteMode`'s two explicit
-/// intents, spelled out as strings at the command boundary.
-///
-/// Known gap (project scope only): `<project>/.ken/memory/` lives inside
-/// `.ken/`, which `scan.rs`'s `WalkBuilder` (`.hidden(true)`) and
-/// `watch.rs`'s `relevant_path` both hard-exclude (any path component
-/// starting with `.`) — outside this task's touch-boundary to fix. A
-/// project-scoped memory is written and immediately reflected by
-/// `list_memories`/chat injection (both read the filesystem directly, not
-/// the index), but never reaches that project's own FTS/semantic index or
-/// `ken://` search-resolved address. Only the workspace-scope tier is
-/// actually indexed (via the pseudo-member's own engine, rooted at
-/// `.ken-workspace` itself, which isn't nested under anything excluded).
-#[tauri::command(async)]
-fn memory_write(
-    state: State<SharedState>,
-    scope: String,
-    slug: String,
-    content: String,
-    mode: String,
-) -> CmdResult<memory::Memory> {
-    let guard = state.lock().unwrap();
-    let write_mode = match mode.as_str() {
-        "create" => memory::WriteMode::Create,
-        "replace" => memory::WriteMode::Replace,
-        _ => return Err(format!("unknown memory write mode '{mode}' — use \"create\" or \"replace\"")),
-    };
-    let today = local_date_today();
-    let path = match scope.as_str() {
-        "workspace" => {
-            let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
-            let mscope = memory::MemoryScope::Workspace { workspace_root: &ws_root };
-            memory::write_memory(mscope, &slug, &content, write_mode, &today).map_err(err)?
-        }
-        "project" => {
-            let active = member(&guard, None)?;
-            let mscope = memory::MemoryScope::Project { project_root: &active.project.root };
-            memory::write_memory(mscope, &slug, &content, write_mode, &today).map_err(err)?
-        }
-        _ => return Err(format!("unknown memory scope '{scope}' — use \"workspace\" or \"project\"")),
-    };
-    let raw = std::fs::read_to_string(&path).map_err(err)?;
-    Ok(memory::parse_memory(&slug, &raw))
-}
-
-/// Append a timestamped entry to today's journal file, creating it if absent
-/// (ken-memory task 2.2 / design D5) — the write MCP's `journal_append`
-/// delegates to the same `memory::append_journal` core once ken-mcp task 3.1
-/// lands (parallel session; not this file).
-#[tauri::command(async)]
-fn journal_append(
-    state: State<SharedState>,
-    text: String,
-    project: Option<String>,
-    tags: Option<Vec<String>>,
-) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let ws_root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
-    memory::append_journal(
-        &ws_root,
-        &text,
-        project.as_deref(),
-        &tags.unwrap_or_default(),
-        &local_date_today(),
-        &local_time_hhmm(),
-    )
-    .map_err(err)?;
-    Ok(())
-}
-
-/// Recent journal content on demand (ken-memory task 2.2 / design D4: "the
-/// journal is NOT injected... a `read_journal(days_back?)` tool returns
-/// recent days on demand"). Walks back `days_back` calendar days (default 1
-/// = today only) from local today, checking `journal/` then
-/// `journal/archive/` for each date (spec: "archived journal stays
-/// findable") — a day with no file on either side is skipped, not an error.
-/// Most-recent-first.
-#[tauri::command(async)]
-fn read_journal(state: State<SharedState>, days_back: Option<u32>) -> CmdResult<Vec<JournalDayDto>> {
-    let ws_root = {
-        let guard = state.lock().unwrap();
-        guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
-    };
-
-    let days_back = days_back.unwrap_or(1).max(1) as i64;
-    let today = chrono::Local::now().date_naive();
-    let dir = memory::journal_dir(&ws_root);
-    let archive_dir = memory::journal_archive_dir(&ws_root);
-    let mut out = Vec::new();
-    for i in 0..days_back {
-        let date = today - chrono::Duration::days(i);
-        let name = date.format("%Y-%m-%d").to_string();
-        let in_current = dir.join(format!("{name}.md"));
-        let path = if in_current.is_file() { in_current } else { archive_dir.join(format!("{name}.md")) };
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            out.push(JournalDayDto { date: name, content });
-        }
-    }
-    Ok(out)
 }
 
 /// Concatenate every current (non-archived) journal file, oldest first, each
@@ -11812,9 +11687,6 @@ pub fn run() {
             record_resume,
             record_stop,
             record_cancel,
-            memory_write,
-            journal_append,
-            read_journal,
             distill_journal,
             resolve_distill_candidate,
             day_state,
