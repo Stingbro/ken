@@ -21,6 +21,9 @@
     mergeRows,
     newWikiPath,
     renamedKb,
+    confirmBlocked,
+    rowEvidence,
+    rowTip,
     sourceSummary,
     STEPS,
     toggleKind,
@@ -41,6 +44,7 @@
   let error = $state<string | null>(null);
 
   const summary = $derived(sourceSummary(rows));
+  const blocked = $derived(confirmBlocked(rows));
 
   // Step 2: the knowledge base. A new one follows the workspace's name until
   // a person names it.
@@ -231,7 +235,7 @@
   {:else}
     <h2 class="t-heading">Sources</h2>
     <div class="actions">
-      <button class="btn btn-primary" disabled={busy} onclick={addRepos}>
+      <button class="btn" disabled={busy} onclick={addRepos}>
         {busy ? "Reading…" : rows.length === 0 ? "Pick sources…" : "Add more…"}
       </button>
     </div>
@@ -245,9 +249,8 @@
           <div class="tr" role="row" class:dim={!row.include}>
             <span><input type="checkbox" bind:checked={row.include} aria-label="Index {row.member}" /></span>
             <span class="repo">
-              <span class="mono">{row.member}</span>
-              <span class="evidence mono path" title={row.path ?? ""}>{row.path}</span>
-              {#if row.evidence.length > 0}<span class="evidence">{row.evidence.join(" · ")}</span>{/if}
+              <span class="mono" title={rowTip(row) || undefined}>{row.member}</span>
+              {#if rowEvidence(row)}<span class="evidence">{rowEvidence(row)}</span>{/if}
               <textarea
                 class="textarea description"
                 rows="2"
@@ -275,7 +278,7 @@
     {/if}
     <p class="counts"><strong>{summary.indexed}</strong> indexed · <strong>{summary.left}</strong> left out</p>
     <div class="actions">
-      <button class="btn btn-primary" disabled={busy || !kbReady(kb)} onclick={confirm}>
+      <button class="btn btn-primary" disabled={busy || !kbReady(kb) || !!blocked} title={blocked ?? undefined} onclick={confirm}>
         {busy ? "Setting up…" : "Confirm and start indexing"}
       </button>
       <button class="btn btn-ghost" onclick={() => (step = "base")}>Back</button>
@@ -384,8 +387,8 @@
   /* The table fits its card and scrolls down only (finding 10). The set-up
      panel is 460px wide at any window size; the old column minimums alone
      came to more than that, so a long path pushed it sideways. The source
-     and kind columns now shrink to the card, a path wraps anywhere, and the
-     kind chips wrap onto a second line. */
+     and kind columns now shrink to the card, the paths are the name's
+     tooltip, and the kind chips wrap onto a second line. */
   .table {
     display: flex;
     flex-direction: column;
@@ -441,12 +444,6 @@
   .evidence {
     font-size: 11.5px;
     color: var(--ink-3);
-  }
-  /* A path has few break points, so it may break between any two letters;
-     the full path is also its tooltip. */
-  .path {
-    overflow-wrap: anywhere;
-    word-break: break-all;
   }
   .kinds {
     display: flex;

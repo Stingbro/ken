@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import type { SetupRepoRow } from "../lib/api";
 import {
   commonParent,
+  confirmBlocked,
   coveredRepos,
   defaultKb,
   kbReady,
   mergeRows,
   newWikiPath,
   renamedKb,
+  rowEvidence,
+  rowTip,
   sourceSummary,
   STEPS,
   toggleKind,
@@ -79,5 +82,19 @@ describe("setup flow", () => {
       ["docs", ["wiki"]],
     ]);
     expect(commonParent(rows)).toBe("C:/Code");
+  });
+});
+
+describe("a source's row", () => {
+  it("shows the kind evidence and keeps the paths for the name's tooltip", () => {
+    const r = row("tiny-game", { path: "C:/Code/tiny-game", evidence: ["mostly source: 2 of 3 tracked files (.py)", "remote C:/remotes/tiny-game.git"] });
+    expect(rowEvidence(r)).toBe("mostly source: 2 of 3 tracked files (.py)");
+    expect(rowTip(r)).toBe("C:/Code/tiny-game\nremote C:/remotes/tiny-game.git");
+  });
+
+  it("waits for a source to index before Confirm", () => {
+    expect(confirmBlocked([])).toBe("No source to index");
+    expect(confirmBlocked([row("a", { include: false })])).toBe("No source to index");
+    expect(confirmBlocked([row("a")])).toBeNull();
   });
 });

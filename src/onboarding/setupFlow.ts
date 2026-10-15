@@ -25,6 +25,24 @@ export function sourceSummary(rows: SetupRepoRow[]): { indexed: number; left: nu
   return { indexed, left: rows.length - indexed };
 }
 
+/** What a source's row shows under its name: the kind evidence ("mostly
+ *  source: 2 of 3 tracked files (.py)"), without the remote, which is a
+ *  path and goes in the name's tooltip. */
+export function rowEvidence(row: Pick<SetupRepoRow, "evidence">): string {
+  return row.evidence.filter((e) => !e.startsWith("remote ")).join(" · ");
+}
+
+/** The name's tooltip: the folder, and the remote when there is one. */
+export function rowTip(row: Pick<SetupRepoRow, "path" | "evidence">): string {
+  return [row.path ?? "", ...row.evidence.filter((e) => e.startsWith("remote "))].filter((l) => l).join("\n");
+}
+
+/** Why Confirm waits, or null when it can go: there must be a source to
+ *  index. */
+export function confirmBlocked(rows: SetupRepoRow[]): string | null {
+  return sourceSummary(rows).indexed === 0 ? "No source to index" : null;
+}
+
 /** Rows for a fresh proposal, keeping what a person already changed on a
  *  repo they had picked before (matched by folder). */
 export function mergeRows(old: SetupRepoRow[], fresh: SetupRepoRow[]): SetupRepoRow[] {
