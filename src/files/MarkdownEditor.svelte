@@ -508,7 +508,7 @@
   // Frontmatter is not Markdown the editor knows: it showed as a rule and a
   // heading and saved back mangled, losing a page's aliases. It is set aside
   // here and put back on every save.
-  const front = initial.match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/)?.[0] ?? "";
+  const front = untrack(() => initial).match(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(\r?\n|$)/)?.[0] ?? "";
   // The serializer escapes `[` in text, which turns every [[wiki link]] into
   // \[\[text]]: put them back.
   const unescapeWikiLinks = (md: string) => md.replace(/\\\[\\\[([^\n]+?)\\?\]\\?\]/g, "[[$1]]");

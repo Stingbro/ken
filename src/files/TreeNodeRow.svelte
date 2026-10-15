@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import Star from "@lucide/svelte/icons/star";
@@ -32,7 +33,8 @@
     depth,
     expandAll = false,
   }: { node: TreeNode; depth: number; expandAll?: boolean } = $props();
-  let open = $state(depth < 1 || expandAll);
+  // Where a row starts; it opens and closes on its own after that.
+  let open = $state(untrack(() => depth < 1 || expandAll));
 
   const isFolder = $derived(node.file === undefined);
   const isDropTarget = $derived(drag.over === node.relPath);

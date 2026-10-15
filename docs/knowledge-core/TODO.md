@@ -9,10 +9,7 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
 - **Build check (compile only):**
   - Rust: `scripts\win-build.cmd cargo check --release --workspace --all-targets --message-format short`, run from the checkout root.
   - Frontend: `npm run check`, with its output redirected to a file. Piping it through PowerShell exits with code 144.
-- **Known warnings:**
-  - `hooks.rs`: an unreachable pattern.
-  - `ocr`: an unused attribute.
-  - `svelte-check`: 6 warnings (since slice 9; the old Timeline screen's two unused-style warnings went with it). One is the unused `h2` style, in `WorkspaceSettingsScreen.svelte` since slice 12.
+- **Known warnings:** none. The clean pass cleared the last ones: `hooks.rs`'s unreachable pattern, `ocr`'s unused attribute, and svelte-check's six (five props read once on purpose, now through `untrack`, and the unused `h2` style). A new warning is a regression.
 - **A fresh checkout:** run `scripts\win-build.cmd sidecar` once before the Rust check, or the app's build script stops on the missing `ken-mcp` binary.
 - **Tests:** don't run test binaries or anything that spawns shells without asking first. Endpoint security on the dev machine flags it.
 

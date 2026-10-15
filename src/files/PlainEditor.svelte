@@ -28,7 +28,8 @@
     });
   });
 
-  let value = $state(initial);
+  // The text the editor opened with; edits live here from then on.
+  let value = $state(untrack(() => initial));
 
   let ta = $state<HTMLTextAreaElement | null>(null);
   let layer = $state<HTMLDivElement | null>(null);

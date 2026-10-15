@@ -44,10 +44,13 @@ impl HookListener {
     pub fn start() -> Result<HookListener> {
         let server = tiny_http::Server::http("127.0.0.1:0")
             .map_err(|e| Error::Other(format!("hook listener: {e}")))?;
-        let port = match server.server_addr() {
-            tiny_http::ListenAddr::IP(addr) => addr.port(),
-            _ => return Err(Error::Other("hook listener: no tcp port".into())),
-        };
+        // Bound to a TCP address, so `to_ip` is always there; a Unix socket
+        // (the other arm, on Unix builds only) would have no port.
+        let port = server
+            .server_addr()
+            .to_ip()
+            .map(|addr| addr.port())
+            .ok_or_else(|| Error::Other("hook listener: no tcp port".into()))?;
         let server = Arc::new(server);
         let subscribers: Subscribers = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));

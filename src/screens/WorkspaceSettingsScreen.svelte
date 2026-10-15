@@ -707,10 +707,6 @@
     gap: 10px;
     flex-wrap: wrap;
   }
-  h2 {
-    margin: 0;
-    font-size: 18px;
-  }
   .tname {
     font-size: 15px;
   }

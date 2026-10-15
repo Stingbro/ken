@@ -206,8 +206,7 @@ pub(crate) mod tests {
     ///
     /// `cargo test -p ken-core --ignored ocr_smoke` (with the fixture wired in).
     #[test]
-    #[ignore = "needs a text-bearing image fixture; see doc comment to run manually"]
-    #[cfg_attr(not(target_os = "macos"), ignore = "Vision is macOS-only")]
+    #[ignore = "needs a text-bearing image fixture (and Vision, macOS only); see doc comment to run manually"]
     fn ocr_smoke() {
         // Intentionally empty: enable and point at a fixture to validate a real
         // end-to-end Vision recognition run.
