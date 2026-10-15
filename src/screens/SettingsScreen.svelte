@@ -346,16 +346,15 @@
             </div>
           {:else}
             <div class="mopt-actions">
-              <ModelDownloadDialog status={m} compact onInstalled={refreshModels} />
+              <ModelDownloadDialog status={m} compact named={false} onInstalled={refreshModels} />
             </div>
           {/if}
         </div>
       {/snippet}
 
       {#snippet modelText(m: ModelStatus)}
-        <span class="mopt-main">
+        <span class="mopt-main" title={[m.blurb, m.languages].filter((t) => t).join(" · ") || undefined}>
           <span class="mname">{m.name} <span class="mtier">{tierLabel(m.tier)}</span></span>
-          <span class="mblurb">{m.blurb}{#if m.languages} · {m.languages}{/if}</span>
         </span>
       {/snippet}
 
@@ -428,19 +427,16 @@
         <div class="group-head">Features</div>
         {#each kenFeatures as flag (flag.name)}
           <div class="card">
-            <div class="card-title">{flag.label}</div>
-            <p class="note">
-              {flag.description}
-              <span class="flag-meta">{flag.applies}</span>
-            </p>
-            <label class="radio">
+            <!-- A feature is a switch with its name; what it does, and that it
+                 is on by default for every repo, is the tooltip. -->
+            <label class="radio feature" title="{flag.description} On by default for every repo.">
               <input
                 type="checkbox"
                 checked={flag.global}
                 disabled={featuresBusy === flag.name}
                 onchange={(e) => void setGlobalDefault(flag, e.currentTarget.checked)}
               />
-              On by default for every repo
+              {flag.label}
             </label>
             {#if flag.scope === "project"}
               <label class="radio">
@@ -627,10 +623,10 @@
     color: var(--needs-input-text);
   }
   /* Where a feature applies, and its code name for anyone editing JSON. */
-  .flag-meta {
-    display: block;
-    font-size: 11.5px;
-    opacity: 0.85;
+  .radio.feature {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--ink);
   }
   .list {
     display: flex;
@@ -737,10 +733,6 @@
     font-size: 11px;
     font-weight: 400;
     color: var(--accent);
-  }
-  .mblurb {
-    font-size: 12px;
-    color: var(--ink-tertiary);
   }
   .mopt-actions {
     display: flex;

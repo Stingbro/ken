@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { buildLine, jobLine, jobPct, kindLabel, PACES, waitLine } from "./background";
+import { buildLine, jobLine, jobPct, kindLabel, paceLine, PACES, waitLine } from "./background";
 
 describe("background status panel", () => {
   it("offers the three paces in order", () => {
     expect(PACES.map((p) => p.value)).toEqual(["gentle", "normal", "fast"]);
+  });
+
+  it("shows the pace as data, with the rest in its tooltip", () => {
+    const gentle = paceLine({ setting: { pace: "gentle", paused: false }, callsLastHour: 8, callsPerHour: 20 });
+    expect(gentle.text).toBe("20/h · 8 used");
+    expect(gentle.tip).toContain("The default: a call every 10 seconds");
+    expect(gentle.tip).toContain("not counted");
+    const paused = paceLine({ setting: { pace: "gentle", paused: true }, callsLastHour: 8, callsPerHour: 20 });
+    expect(paused.text).toBe("paused · 8 used");
+    expect(paused.tip).toContain("all wait");
   });
 
   it("reads a job with and without progress", () => {

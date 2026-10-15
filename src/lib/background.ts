@@ -8,6 +8,25 @@ export const PACES: { value: Pace; label: string; note: string }[] = [
   { value: "fast", label: "Fast", note: "calls back to back, 240 an hour; local work without rests" },
 ];
 
+/** The pace as data ("20/h · 8 used", "paused · 8 used"), and the rest
+ *  for its tooltip: what the pace means, what a pause holds, and that a
+ *  source a person adds is not counted. */
+export function paceLine(throttle: { setting: { pace: Pace; paused: boolean }; callsLastHour: number; callsPerHour: number }): { text: string; tip: string } {
+  const used = `${throttle.callsLastHour} used`;
+  const own = "A source you add yourself is read at the pace but not counted.";
+  if (throttle.setting.paused) {
+    return {
+      text: `paused · ${used}`,
+      tip: `Summaries, checks, ingest, building, meaning search, text in images and cloud downloads all wait. ${own}`,
+    };
+  }
+  const note = PACES.find((p) => p.value === throttle.setting.pace)?.note ?? "";
+  return {
+    text: `${throttle.callsPerHour}/h · ${used}`,
+    tip: `${note.charAt(0).toUpperCase()}${note.slice(1)}. Claude calls this hour: ${throttle.callsLastHour} of ${throttle.callsPerHour}. ${own}`,
+  };
+}
+
 const KINDS: Record<string, string> = {
   summaries: "Summaries",
   checks: "Checks",

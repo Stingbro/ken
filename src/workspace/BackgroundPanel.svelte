@@ -6,7 +6,7 @@
   // is started, stopped and widened here too.
   import { onMount } from "svelte";
   import { api, type BackgroundStatus, type Pace } from "../lib/api";
-  import { buildLine, jobLine, jobPct, kindLabel, PACES, waitLine } from "../lib/background";
+  import { buildLine, jobLine, jobPct, kindLabel, paceLine, PACES, waitLine } from "../lib/background";
   import { toast } from "../lib/toast.svelte";
   import ProgressBar from "../lib/ProgressBar.svelte";
   import EmptyState from "../lib/ui/EmptyState.svelte";
@@ -75,17 +75,10 @@
       >
     {/each}
   </div>
-  <p class="note">
-    {#if setting.paused}
-      Paused: summaries, checks, ingest, building, meaning search, text in images and cloud downloads all wait.
-    {:else}
-      {PACES.find((p) => p.value === setting.pace)?.note}.
-    {/if}
-    {#if status}
-      {status.throttle.callsLastHour} of {status.throttle.callsPerHour} Claude calls used this hour. A source you add yourself
-      is read at the pace but not counted.
-    {/if}
-  </p>
+  {#if status}
+    {@const pace = paceLine(status.throttle)}
+    <p class="note" title={pace.tip}>{pace.text}</p>
+  {/if}
 
   <div class="section">Running</div>
   {#each working as job, i (i)}
