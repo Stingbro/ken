@@ -7,10 +7,10 @@
   import { inbox, type InboxGroup, type InboxItem } from "../lib/inbox.svelte";
   import { conflicts } from "../lib/conflicts.svelte";
   import { chats } from "../lib/chats.svelte";
-  import { openInRepo } from "../lib/day.svelte";
+  import { openInRepo, openPageLink } from "../lib/day.svelte";
   import { toast } from "../lib/toast.svelte";
   import { timeAgo } from "../lib/format";
-  import { renderTitle } from "../lib/markdown";
+  import { pageLinkTarget, renderBody, renderTitle } from "../lib/markdown";
   import { raidDetail } from "../lib/ingestCard";
   import ProposalDetail from "../ingests/ProposalDetail.svelte";
   import ConflictDetail from "../files/ConflictDetail.svelte";
@@ -142,6 +142,19 @@
     inbox.select(id);
   }
 
+  /** A link in a finding's body: a `[[page]]` opens the page, found from
+   *  the finding's note; a web link opens in the browser. */
+  function followLink(e: MouseEvent, item: InboxItem) {
+    const a = (e.target as HTMLElement).closest("a");
+    if (!a || item.source.type !== "finding") return;
+    e.preventDefault();
+    const f = item.source.finding;
+    const href = a.getAttribute("href");
+    const page = pageLinkTarget(href);
+    if (page && f.projectId) void openPageLink(f.projectId, f.path ?? "", page);
+    else if (href && /^https?:/i.test(href)) void api.openWebUrl(href).catch((err) => toast.error("Could not open the link", err));
+  }
+
   const emptyHead = $derived(filter === "all" ? "Nothing waiting on you" : "Nothing here");
 </script>
 
@@ -162,7 +175,7 @@
         <button class="row" class:sel={sel?.id === it.id} onclick={() => selectItem(it.id)}>
           <InboxKindIcon item={it} />
           <span class="rtext">
-            <span class="rtitle">{@html renderTitle(it.title)}</span>
+            <span class="rtitle" title={it.tip ?? undefined}>{@html renderTitle(it.title)}</span>
             <span class="rmeta">{it.kind} · {it.from}{when(it) ? ` · ${when(it)}` : ""}</span>
           </span>
         </button>
@@ -188,23 +201,27 @@
     {#if sel}
       <div class="dinner">
         <div class="dkind {sel.tone}"><InboxKindIcon item={sel} bare />{sel.kind}</div>
-        <h2>{@html renderTitle(sel.title)}</h2>
-        <div class="t-small">
-          From {sel.from}{when(sel) ? ` · ${when(sel)}` : ""}{sel.where ? ` · ${sel.where.split("/").pop()}` : ""}
+        <h2 title={sel.tip ?? undefined}>{@html renderTitle(sel.title)}</h2>
+        <div class="t-small" title={sel.where ?? undefined}>
+          From {sel.from}{sel.source.type === "proposal" && sel.source.proposal.who ? ` · ${sel.source.proposal.who}` : ""}{when(sel) ? ` · ${when(sel)}` : ""}
         </div>
 
         {#if sel.source.type === "proposal"}
-          {#if sel.source.proposal.body.trim()}
-            <p class="body">{sel.source.proposal.body}</p>
-          {/if}
-          {#if (sel.source.proposal.kind === "risk" || sel.source.proposal.kind === "issue") && raidDetail(sel.source.proposal.payload)}
-            <p class="quote">{raidDetail(sel.source.proposal.payload)}</p>
-          {/if}
-          {#if sel.source.proposal.payload && (sel.source.proposal.kind === "page" || sel.source.proposal.kind === "new page")}
+          <!-- The title says what it is; the detail is what it writes: the
+               line ingest wrote for a risk or issue, else the change. -->
+          {#if sel.source.proposal.kind === "risk" || sel.source.proposal.kind === "issue"}
+            {#if raidDetail(sel.source.proposal.payload)}
+              <p class="quote">{@html renderTitle(raidDetail(sel.source.proposal.payload))}</p>
+            {/if}
+          {:else if sel.source.proposal.payload}
             <ProposalDetail payload={sel.source.proposal.payload} />
           {/if}
         {:else if sel.source.type === "finding"}
-          <p class="body">{sel.source.finding.detail}</p>
+          {#if sel.source.finding.detail.trim()}
+            {@const item = sel}
+            <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+            <div class="body md" onclick={(e) => followLink(e, item)}>{@html renderBody(sel.source.finding.detail)}</div>
+          {/if}
         {:else if sel.source.type === "analysis"}
           {#if sel.source.analysis.roles.length > 0}
             <div class="t-label">Role rules</div>
@@ -306,10 +323,17 @@
     flex-direction: column;
     gap: 2px;
   }
+  /* Two lines at most, cut where a line wraps (between words), with an
+     ellipsis; the detail shows the whole title. */
   .rtitle {
     font-size: 13.5px;
     font-weight: 600;
     line-height: 1.35;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
   }
   .rmeta {
     font-size: 12px;
@@ -336,9 +360,11 @@
   }
   .done span {
     flex: 1;
-    white-space: nowrap;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+    line-clamp: 1;
     overflow: hidden;
-    text-overflow: ellipsis;
   }
   .detail {
     flex: 1;
@@ -386,6 +412,33 @@
     line-height: 1.65;
     color: var(--ink-2);
     white-space: pre-wrap;
+  }
+  /* A finding's body is Markdown: the text the title did not hold, the
+     source's words as a quote, a link to the note. */
+  .body.md {
+    white-space: normal;
+  }
+  .body.md :global(p) {
+    margin: 0 0 10px;
+  }
+  .body.md :global(p:last-child) {
+    margin-bottom: 0;
+  }
+  .body.md :global(blockquote) {
+    margin: 0 0 10px;
+    padding-left: 12px;
+    border-left: 2px solid var(--line);
+    color: var(--ink-2);
+  }
+  .body.md :global(code) {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+  }
+  .body.md :global(a) {
+    color: var(--accent-ink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
   }
   /* What ingest wrote for a risk or issue, as a ruling's card quotes it. */
   .quote {

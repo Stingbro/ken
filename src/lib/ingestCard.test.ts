@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { canReadNow, ingestBusy, pageName, raidDetail, rawActions, rawStatus } from "./ingestCard";
+import { canReadNow, heldTitle, ingestBusy, pageName, proposalShort, raidDetail, rawActions, rawStatus } from "./ingestCard";
 import type { RawSource } from "./api";
 
 describe("pageName", () => {
@@ -7,6 +7,21 @@ describe("pageName", () => {
     expect(pageName("Current/Project.md")).toBe("Current › Project");
     expect(pageName("tickets/SR-031.md")).toBe("tickets › SR-031");
     expect(pageName("Vocabulary.md")).toBe("Vocabulary");
+  });
+});
+
+describe("an Inbox card", () => {
+  it("names a held edit by its page, never its path", () => {
+    expect(heldTitle({ title: "Current › Project", page: "Current/Project.md" })).toBe("Current › Project");
+    expect(heldTitle({ title: "Held: Current/Project.md from 2026-10-15-meeting", page: "Current/Project.md" })).toBe("Current › Project");
+    expect(heldTitle({ title: "Held: retire Design/Old.md from 2026-10-15-meeting", page: "Design/Old.md" })).toBe("Retire Design › Old");
+  });
+
+  it("shows a line that is not the title: who, or what ingest wrote", () => {
+    const raid = JSON.stringify({ raid: { text: "A crash mid-write loses `saves/world.json`." } });
+    expect(proposalShort({ kind: "risk", payload: raid, who: "Ana" })).toBe("A crash mid-write loses `saves/world.json`.");
+    expect(proposalShort({ kind: "ruling", payload: null, who: "Ana and Ben" })).toBe("Ana and Ben");
+    expect(proposalShort({ kind: "page", payload: null, who: null })).toBe("");
   });
 });
 

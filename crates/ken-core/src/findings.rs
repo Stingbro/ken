@@ -87,30 +87,67 @@ impl Finding {
         (self.kind.clone(), page.clone(), target.to_string())
     }
 
-    fn title(&self) -> String {
-        let short: String = self.text.chars().take(80).collect();
+    /// The text split for the title and the body: its first sentence when
+    /// that fits, else the text cut at a word ([`crate::ingest::cut_at_word`]).
+    /// The body carries on from where the title stopped, so the two never
+    /// say the same thing.
+    fn split(&self) -> (String, String) {
+        let text = self.text.trim();
+        let end = sentence_end(text);
+        let first = text[..end].trim();
+        if first.chars().count() <= TITLE_CHARS {
+            return (first.trim_end_matches('.').to_string(), text[end..].trim().to_string());
+        }
+        crate::ingest::cut_at_word(text, TITLE_CHARS)
+    }
+
+    /// What the Inbox shows as the finding's title: its kind's words and the
+    /// start of its text, never cut mid-word.
+    pub fn title(&self) -> String {
+        let (short, _) = self.split();
         match self.kind.as_str() {
             "question" => format!("Open question: {short}"),
             "contradiction" if self.against.is_empty() => format!("Contradiction: {short}"),
+            "contradiction" if self.against_kind == "source" => format!("Contradicts itself: {short}"),
             "contradiction" => format!("Contradicts {}: {short}", self.against),
             _ => short,
         }
     }
 
-    fn body(&self) -> String {
-        let mut s = self.text.clone();
+    /// The rest of the finding, as Markdown: the text the title did not
+    /// hold, the source's words as a quote, and a link to the note.
+    pub fn body(&self) -> String {
+        let (_, rest) = self.split();
+        let mut parts = Vec::new();
+        if !rest.is_empty() {
+            parts.push(rest);
+        }
         if !self.quote.is_empty() {
-            s.push_str(&format!("\n\n> {}", self.quote));
+            parts.push(format!("> {}", self.quote));
         }
         if crate::chunker::is_markdown(&self.source) {
             let stem = self.source.rsplit('/').next().unwrap_or(&self.source).trim_end_matches(".md");
-            s.push_str(&format!("\n\nFrom [[{stem}]]."));
+            parts.push(format!("From [[{stem}]]."));
         }
-        if self.binds() {
-            s.push_str(" A contradiction with a ruling or the code waits for a person: Ken changed nothing for it.");
-        }
-        s
+        parts.join("\n\n")
     }
+}
+
+/// Most characters of a finding's text in its title.
+const TITLE_CHARS: usize = 100;
+
+/// Where the first sentence of `text` ends: after a `.`, `?` or `!` that a
+/// space and a capital, a quote or a code span follow; the whole text when
+/// there is one sentence.
+fn sentence_end(text: &str) -> usize {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for w in chars.windows(3) {
+        let [(i, c), (_, space), (_, next)] = [w[0], w[1], w[2]];
+        if matches!(c, '.' | '?' | '!') && space == ' ' && (next.is_uppercase() || matches!(next, '`' | '"' | '\u{201c}')) {
+            return i + c.len_utf8();
+        }
+    }
+    text.len()
 }
 
 /// File one finding, unless an open one has the same kind, page and target
@@ -205,10 +242,37 @@ mod tests {
         assert_eq!(open[0].1, f);
         assert!(open[0].0.title.starts_with("Contradicts D-012: "));
         assert!(open[0].0.body.contains("> we save it all in one file") && open[0].0.body.contains("[[2026-10-13-standup]]"));
-        assert!(open[0].0.body.contains("waits for a person"), "a ruling binds");
+        assert!(!open[0].0.body.contains(&f.text), "the body does not repeat the title");
         let q = Finding { kind: "question".into(), source: f.source.clone(), text: "Who owns saves?".into(), ..Default::default() };
         assert!(!q.binds() && q.title() == "Open question: Who owns saves?");
         assert_eq!(f.page(), f.source, "a ruling is no page: the note opens");
+    }
+
+    #[test]
+    fn a_title_is_never_cut_mid_word_and_the_body_never_repeats_it() {
+        let text = "the decision gives \"an atomic save\" as a reason for the single file, but Ana's risk says a crash \
+                    could interrupt that same write. The minutes say";
+        let f = Finding {
+            kind: "contradiction".into(),
+            against: "source".into(),
+            against_kind: "source".into(),
+            text: text.into(),
+            quote: "a single save file could lose the whole world".into(),
+            source: "Research/Ingested/2026-10-14-meeting.md".into(),
+            ..Default::default()
+        };
+        let title = f.title();
+        assert!(title.starts_with("Contradicts itself: the decision gives") && title.ends_with('…'), "{title}");
+        let shown = title.trim_start_matches("Contradicts itself: ").trim_end_matches('…');
+        assert!(text.starts_with(shown) && text[shown.len()..].starts_with(' '), "cut at a word: {title}");
+        let body = f.body();
+        assert!(body.starts_with('…') && !body.contains(shown), "the body carries on where the title stopped: {body}");
+        assert!(body.contains("The minutes say") && body.contains("> a single save file") && body.ends_with("From [[2026-10-14-meeting]]."));
+
+        let two = Finding { kind: "question".into(), text: "Who owns saves? Ana thinks Ben.".into(), ..Default::default() };
+        assert_eq!((two.title().as_str(), two.body().as_str()), ("Open question: Who owns saves?", "Ana thinks Ben."));
+        let lint = Finding { kind: "orphan".into(), source: "lint".into(), text: "Nothing links to Design/A.md.".into(), ..Default::default() };
+        assert_eq!((lint.title().as_str(), lint.body().as_str()), ("Nothing links to Design/A.md", ""));
     }
 
     #[test]

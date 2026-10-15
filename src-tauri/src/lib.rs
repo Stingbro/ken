@@ -7526,15 +7526,17 @@ struct FindingDto {
 /// The knowledge base's one findings list (`ken_core::findings`), newest
 /// first, each marked done once seen to. Drift, the lint and the
 /// supersession pass file theirs as they run; nothing is worked out here.
+/// The title and the detail are read from the finding, not the stored
+/// row, so one filed before titles were cut at a word reads the same.
 fn kb_findings(wiki_id: &str, db: &Db) -> Vec<FindingDto> {
     ken_core::findings::open(db)
         .unwrap_or_default()
         .into_iter()
         .map(|(it, f)| FindingDto {
             path: f.page(),
+            title: f.title(),
+            detail: f.body(),
             kind: f.kind,
-            title: it.title,
-            detail: it.body,
             project_id: wiki_id.to_string(),
             item_id: Some(it.id),
         })

@@ -949,13 +949,39 @@ const CARD_TITLE_CHARS: usize = 90;
 /// else cut at the last word that fits, with an ellipsis, never mid-word
 /// ("…to write one file, by").
 pub fn card_title(text: &str) -> String {
+    cut_at_word(text, CARD_TITLE_CHARS).0
+}
+
+/// `text` cut for a title of at most `max` characters: whole when it fits,
+/// else at the last word that fits, never mid-word and never inside a
+/// `code` span, with an ellipsis. The second part is what the cut left,
+/// starting with an ellipsis, so a body can carry on where the title
+/// stopped; it is empty when nothing was cut.
+pub fn cut_at_word(text: &str, max: usize) -> (String, String) {
     let text = text.trim();
-    if text.chars().count() <= CARD_TITLE_CHARS {
-        return text.to_string();
+    if text.chars().count() <= max {
+        return (text.to_string(), String::new());
     }
-    let cut: String = text.chars().take(CARD_TITLE_CHARS).collect();
-    let at_word = cut.rfind(char::is_whitespace).map_or(cut.as_str(), |i| &cut[..i]);
-    format!("{}…", at_word.trim_end_matches([',', ';', ':', ' ']))
+    let end = text.char_indices().nth(max).map_or(text.len(), |(i, _)| i);
+    let mut at = text[..end].rfind(char::is_whitespace).unwrap_or(end);
+    // An odd number of backticks before the cut leaves a code span open:
+    // the cut moves to before the span, unless that leaves nothing.
+    if text[..at].matches('`').count() % 2 == 1 {
+        if let Some(tick) = text[..at].rfind('`') {
+            let before = text[..tick].trim_end().len();
+            if before > 0 {
+                at = before;
+            }
+        }
+    }
+    let head = text[..at].trim_end_matches([',', ';', ':', ' ']);
+    let rest = text[at..].trim_start();
+    (format!("{head}…"), format!("…{rest}"))
+}
+
+/// A page as a title names it: `Current/Project.md` → "Current › Project".
+pub fn page_name(path: &str) -> String {
+    path.trim_end_matches(".md").split('/').filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" › ")
 }
 
 /// A name made safe for a file: no path separators or characters Windows
@@ -2217,7 +2243,7 @@ pub fn follow_ups(
                      still reads as it does now.",
                     why.reason()
                 );
-                file_page_proposal(db, &p, &format!("Held: {page} from {stem}"), &body, now)?;
+                file_page_proposal(db, &p, &page_name(page), &body, now)?;
                 out.held.push(page.clone());
             }
         }
@@ -2248,7 +2274,7 @@ pub fn follow_ups(
             Some(why) => {
                 let p = Proposal { from: from.clone(), ..Proposal::new(new.path.clone(), made.unwrap_or_default(), proposed) };
                 let body = format!("Held from {stem}: {}. Read the page and apply it, or discard it.", why.reason());
-                file_page_proposal(db, &p, &format!("Held: {} from {stem}", new.path), &body, now)?;
+                file_page_proposal(db, &p, &page_name(&new.path), &body, now)?;
                 out.held.push(new.path.clone());
             }
         }
@@ -2284,7 +2310,7 @@ pub fn follow_ups(
             Some(why) => {
                 let p = Proposal { from: from.clone(), ..Proposal::new(page.clone(), base, proposed) };
                 let body = format!("Held from {stem}: {}. It retires the page, {label}. Apply it, or discard it.", why.reason());
-                file_page_proposal(db, &p, &format!("Held: retire {page} from {stem}"), &body, now)?;
+                file_page_proposal(db, &p, &format!("Retire {}", page_name(page)), &body, now)?;
                 out.held.push(page.clone());
             }
         }
@@ -2600,6 +2626,16 @@ mod tests {
         assert!(long.starts_with(t.trim_end_matches('…')), "{t}");
         let rest = &long[t.trim_end_matches('…').len()..];
         assert!(rest.starts_with(' ') || rest.starts_with(", "), "cut at a word: {t}");
+    }
+
+    #[test]
+    fn a_cut_carries_on_where_the_title_stopped_and_never_opens_a_code_span() {
+        let (head, rest) = cut_at_word("one two three four", 9);
+        assert_eq!((head.as_str(), rest.as_str()), ("one two…", "…three four"));
+        assert_eq!(cut_at_word("short", 9), ("short".to_string(), String::new()));
+        let (head, rest) = cut_at_word("call `save world now` today", 18);
+        assert_eq!(head, "call…", "the cut is before the code span, not inside it");
+        assert_eq!(rest, "…`save world now` today");
     }
 
     #[test]

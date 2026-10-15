@@ -1,6 +1,6 @@
 // Pure helpers for the Ingest screen (the library inbox, white box 8b): page
 // names as a row says them, a risk's text, and what a Raw/ row says and offers.
-import type { IngestOverview, RawSource, RawState } from "./api";
+import type { IngestOverview, IngestProposal, RawSource, RawState } from "./api";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -22,6 +22,24 @@ export function pageName(path: string): string {
     .split("/")
     .filter((p) => p.length > 0)
     .join(" › ");
+}
+
+/** A held page edit's title: the page it changes ("Current › Project"),
+ *  "Retire …" when it retires the page. Read from the page, so an edit held
+ *  before titles named the page ("Held: Current/Project.md from …") reads
+ *  the same. */
+export function heldTitle(p: Pick<IngestProposal, "title" | "page">): string {
+  const name = pageName(p.page);
+  return /^(held: )?retire /i.test(p.title) ? `Retire ${name}` : name;
+}
+
+/** The one line a proposal's card shows under its title: who made a ruling
+ *  or an action, what ingest wrote for a risk or issue; nothing for a held
+ *  edit, whose title is its page. */
+export function proposalShort(p: Pick<IngestProposal, "kind" | "payload" | "who">): string {
+  if (p.kind === "risk" || p.kind === "issue") return raidDetail(p.payload) || (p.who ?? "");
+  if (p.kind === "ruling" || p.kind === "ticket") return p.who ?? "";
+  return "";
 }
 
 /** How a source in Raw/ reads in its row: "Queued", "Transcribing 40%". */

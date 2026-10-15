@@ -19,6 +19,7 @@ import { conflicts } from "./conflicts.svelte";
 import { chats } from "./chats.svelte";
 import { coalesce, singleFlight } from "./refresh";
 import { uniqueIds } from "./uniqueIds";
+import { heldTitle, proposalShort } from "./ingestCard";
 
 export type InboxGroup = "ken" | "sync";
 /** The colour a kind is drawn in: amber for decisions, red for failures. */
@@ -42,7 +43,9 @@ export interface InboxItem {
   /** Who it is from: "Ken", "Sync". */
   from: string;
   title: string;
-  /** One line of context. */
+  /** Detail behind the title, as its tooltip (a held edit's path). */
+  tip?: string | null;
+  /** One line of context, never the title again; often empty. */
   short: string;
   /** Seconds since the epoch, when known. */
   when: number | null;
@@ -73,14 +76,16 @@ const PROPOSAL_KINDS: Record<IngestProposal["kind"], string> = {
  *  from; empty for one no card holds, then `origin` says where it came from. */
 export function proposalItem(p: IngestProposal, cardId: number, note: string, projectId: string, origin: "chat" | "drift" | null = null): InboxItem {
   const kind = PROPOSAL_KINDS[p.kind] ?? "Page edit";
+  const held = p.kind === "page" || p.kind === "new page";
   return {
     id: `proposal:${p.id}`,
     group: "ken",
     kind,
     tone: "attn",
     from: origin === "chat" ? "Ken, in a chat" : origin === "drift" ? "Ken, checking drift" : "Ken",
-    title: p.title,
-    short: p.kind === "page" || p.kind === "new page" ? `${leaf(p.page)} · held back for you to read` : p.body.split("\n")[0] ?? "",
+    title: held ? heldTitle(p) : p.title,
+    tip: held ? p.page : null,
+    short: proposalShort(p),
     when: null,
     where: note || p.page || null,
     source: { type: "proposal", proposal: p, cardId, note, projectId },
@@ -112,7 +117,9 @@ export function findingItem(f: Finding, i: number): InboxItem {
     tone: "attn",
     from: "Ken",
     title: f.title,
-    short: f.detail,
+    // The title says what it is; the rest (the text the title did not
+    // hold, the source's words, the note) is the detail's.
+    short: "",
     when: null,
     where: f.path,
     source: { type: "finding", finding: f },
@@ -133,7 +140,7 @@ export function analysisItem(a: AnalysisProposal): InboxItem {
     tone: "attn",
     from: "Ken",
     title: `Search settings for ${a.source}`,
-    short: `${parts.join(" and ")} · nothing applies until you accept`,
+    short: parts.join(" · "),
     when: a.createdAt || null,
     where: ".ken/knowledge.json",
     source: { type: "analysis", analysis: a },
@@ -163,7 +170,7 @@ export function failedItem(relPath: string, error: string | null): InboxItem {
     tone: "danger",
     from: "Ken",
     title: `Ken couldn't read ${leaf(relPath)}`,
-    short: error ? `${error}. It is still found by name.` : "It is still found by name.",
+    short: error ?? "",
     when: null,
     where: relPath,
     source: { type: "failed", relPath, error },
@@ -205,7 +212,7 @@ class InboxStore {
           tone: "attn",
           from: "Ken, in a chat",
           title: r.title || "Ken asked you something",
-          short: "Ken is waiting for your answer before it goes on.",
+          short: "",
           when: null,
           where: null,
           source: { type: "chat", chatId: r.id, title: r.title },

@@ -1248,7 +1248,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
                      discard it. It applies only while the page still reads as it does now.",
                     why.reason()
                 );
-                crate::proposal::file_page_proposal(db, &p, &format!("Held: {page} from drift"), &body, now)?;
+                crate::proposal::file_page_proposal(db, &p, &crate::ingest::page_name(&page), &body, now)?;
                 run.held.push(page.clone());
             }
         }

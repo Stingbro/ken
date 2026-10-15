@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderSearchSnippet, renderTitle } from "./markdown";
+import { pageLinkTarget, renderBody, renderSearchSnippet, renderTitle } from "./markdown";
 
 describe("renderSearchSnippet", () => {
   it("escapes plain text with no markup", () => {
@@ -44,5 +44,23 @@ describe("renderTitle", () => {
 
   it("passes each plain run through the given mark", () => {
     expect(renderTitle("x `y` z", (s) => `[${s}]`)).toBe('[x ]<code class="title-code">[y]</code>[ z]');
+  });
+});
+
+describe("renderBody", () => {
+  it("renders a quote, inline code and a [[page]] link", () => {
+    const html = renderBody("It says `save()`.\n\n> one file\n\nFrom [[2026-10-14-meeting]].");
+    expect(html).toContain("<code>save()</code>");
+    expect(html).toContain("<blockquote>");
+    expect(html).toContain('<a href="#ken-page:2026-10-14-meeting">2026-10-14-meeting</a>');
+    expect(html).not.toContain("[[");
+  });
+
+  it("shows a link's label and keeps its page for the click", () => {
+    const html = renderBody("See [[Current/Project|the project]].");
+    expect(html).toContain(">the project</a>");
+    const href = /href="([^"]+)"/.exec(html)?.[1] ?? null;
+    expect(pageLinkTarget(href)).toBe("Current/Project");
+    expect(pageLinkTarget("https://example.com")).toBeNull();
   });
 });

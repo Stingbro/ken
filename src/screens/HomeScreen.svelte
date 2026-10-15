@@ -317,8 +317,8 @@
       {#each needs as n (n.id)}
         <div class="k-action">
           <div class="kind {n.tone}"><InboxKindIcon item={n} bare />{n.kind} · {n.from}</div>
-          <button class="title plain" onclick={() => openInbox(n)}>{@html renderTitle(n.title)}</button>
-          {#if n.short}<div class="short">{n.short}</div>{/if}
+          <button class="title plain" title={n.tip ?? undefined} onclick={() => openInbox(n)}>{@html renderTitle(n.title)}</button>
+          {#if n.short}<div class="short">{@html renderTitle(n.short)}</div>{/if}
           <div class="acts">
             <button class="btn btn-primary btn-small" onclick={() => openInbox(n)}>Open</button>
           </div>
@@ -584,8 +584,17 @@
   .kind.ink {
     color: var(--ink-2);
   }
-  .title.plain {
+  /* A card's title and its line are two lines at most, cut where a line
+     wraps (between words), with an ellipsis; the Inbox shows them whole. */
+  .title.plain,
+  .k-action .short {
     text-wrap: pretty;
+    text-align: left;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
   }
   .reading {
     display: flex;

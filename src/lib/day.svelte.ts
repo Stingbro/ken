@@ -348,6 +348,15 @@ export async function openInRepo(projectId: string, relPath: string, where: Wher
   else app.openInFiles(relPath);
 }
 
+/** Follow a `[[page]]` link in a body (a finding's): focus the repo it is
+ *  in, find the page the name means from `from`, and open it in Files. */
+export async function openPageLink(projectId: string, from: string, target: string) {
+  if (projectId !== app.focused) await app.focusMember(projectId);
+  const page = await api.resolvePageLink(from, target).catch(() => null);
+  if (page) app.openInFiles(page);
+  else toast.show(`No page named "${target}"`);
+}
+
 /** Open a member-relative path (`repo/path/to/file.md`), as the digest
  *  cites them. The longest member name (full or leaf) that prefixes the
  *  path wins; with none, the path opens in the focused repo. */

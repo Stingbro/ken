@@ -43,3 +43,23 @@ export function renderTitle(text: string, mark: (s: string) => string = escapeHt
     .map((part, i) => (i % 2 === 1 ? `<code class="title-code">${mark(part)}</code>` : mark(part)))
     .join("");
 }
+
+/** The href a `[[page]]` link gets in `renderBody`, before the page's name. */
+const PAGE_HREF = "#ken-page:";
+
+/** A body (a finding's, a card's) as sanitized HTML: Markdown, with each
+ *  `[[page]]` or `[[page|label]]` a link. The caller follows a click on
+ *  one through `pageLinkTarget`. */
+export function renderBody(md: string): string {
+  const linked = md.replace(/\[\[([^\]\n|]+)(?:\|([^\]\n]+))?\]\]/g, (_, target: string, label: string | undefined) => {
+    const text = (label ?? target).trim().replace(/[[\]]/g, "");
+    return `[${text}](${PAGE_HREF}${encodeURIComponent(target.trim())})`;
+  });
+  return renderMarkdown(linked);
+}
+
+/** The page a link `renderBody` made names; null for any other link. */
+export function pageLinkTarget(href: string | null): string | null {
+  if (!href?.startsWith(PAGE_HREF)) return null;
+  return decodeURIComponent(href.slice(PAGE_HREF.length)) || null;
+}
