@@ -623,6 +623,9 @@ export interface SyncStatus {
   active: boolean;
   remote: string | null;
   branch: string | null;
+  /** When it last pulled and last pushed, Unix seconds; null for never. */
+  lastPull: number | null;
+  lastPush: number | null;
   /** The knowledge base's files changed outside Ken: sync never commits
    *  them by itself; "commit my other changes" does, once shown. */
   others: string[];
@@ -1577,13 +1580,15 @@ export const api = {
     invoke<void>("mark_seen_under", { relPath }),
   /// Mark every currently-unread file seen.
   markAllSeen: () => invoke<void>("mark_all_seen"),
-  syncStatus: () => invoke<SyncStatus>("sync_status"),
+  /** `projectId` names the member; none is the focused one. */
+  syncStatus: (projectId: string | null = null) => invoke<SyncStatus>("sync_status", { projectId }),
   setSyncAuto: (auto: boolean) =>
     invoke<SyncStatus>("set_sync_auto", { auto }),
   syncNow: () => invoke<void>("sync_now"),
   /** Commit exactly these files changed outside Ken in the knowledge base,
    *  named in the message, then sync. Returns the commit, when one was made. */
-  syncCommitOthers: (paths: string[]) => invoke<string | null>("sync_commit_others", { paths }),
+  syncCommitOthers: (paths: string[], projectId: string | null = null) =>
+    invoke<string | null>("sync_commit_others", { paths, projectId }),
   resolveConflict: (
     itemId: number,
     resolution: ConflictResolution,

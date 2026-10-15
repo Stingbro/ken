@@ -5352,6 +5352,9 @@ struct SyncStatus {
     active: bool,
     remote: Option<String>,
     branch: Option<String>,
+    /// When it last pulled and last pushed, Unix seconds (`sync::last_pull_push`).
+    last_pull: Option<i64>,
+    last_push: Option<i64>,
     /// The knowledge base's changes not written through Ken
     /// (`sync::other_changes`): a cycle never commits them, and "commit my
     /// other changes" commits them only when a person asks. Empty in a code
@@ -5368,6 +5371,11 @@ fn sync_status_of(project: &Project, pending: &[String]) -> SyncStatus {
     } else {
         (None, None)
     };
+    let (last_pull, last_push) = if remote.is_some() {
+        sync::last_pull_push(&project.root)
+    } else {
+        (None, None)
+    };
     let auto = sync::sync_auto(project, &ken_core::registry::kind_of(&project.root));
     let others = if is_git && ken_core::registry::is_library(&project.root) {
         sync::other_changes(&project.root, pending)
@@ -5380,16 +5388,21 @@ fn sync_status_of(project: &Project, pending: &[String]) -> SyncStatus {
         active: is_git && auto && remote.is_some(),
         remote,
         branch,
+        last_pull,
+        last_push,
         others,
     }
 }
 
+/// `project_id` names the member (Workspace shows the knowledge base's
+/// beside its row); none is the focused one.
 #[tauri::command(async)]
-fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
+fn sync_status(state: State<SharedState>, project_id: Option<String>) -> CmdResult<SyncStatus> {
+    let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     // git runs a few times: with the lock released.
     let (project, pending) = {
         let guard = lock_tolerant(&state);
-        let active = member(&guard, None)?;
+        let active = member(&guard, id)?;
         (active.project.clone(), active.sync.pending())
     };
     Ok(sync_status_of(&project, &pending))
@@ -5402,15 +5415,20 @@ fn sync_status(state: State<SharedState>) -> CmdResult<SyncStatus> {
 /// none, the commit stays on this computer. Refused in a code or reference
 /// repo (decision 36). Returns the commit, when one was made.
 #[tauri::command(async)]
-fn sync_commit_others(state: State<SharedState>, paths: Vec<String>) -> CmdResult<Option<String>> {
+fn sync_commit_others(
+    state: State<SharedState>,
+    paths: Vec<String>,
+    project_id: Option<String>,
+) -> CmdResult<Option<String>> {
+    let id = project_id.as_deref().map(|p| p.parse::<uuid::Uuid>()).transpose().map_err(err)?;
     let root = {
         let guard = lock_tolerant(&state);
-        member(&guard, None)?.project.root.clone()
+        member(&guard, id)?.project.root.clone()
     };
     let commit = sync::commit_others(&root, &paths).map_err(err)?;
     if commit.is_some() {
         let guard = lock_tolerant(&state);
-        if let Ok(active) = member(&guard, None) {
+        if let Ok(active) = member(&guard, id) {
             if active.project.root == root {
                 active.sync.sync_now();
             }

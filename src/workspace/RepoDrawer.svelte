@@ -21,7 +21,8 @@
     repo,
     close,
     changed,
-  }: { repo: SourceRow; close: () => void; changed?: () => void } = $props();
+    knowledgeBase = false,
+  }: { repo: SourceRow; close: () => void; changed?: () => void; knowledgeBase?: boolean } = $props();
 
   // What the repo is for, in a person's words: Ken reads it when it decides
   // where something belongs.
@@ -93,6 +94,7 @@
     if (!sync) return;
     try {
       sync = await api.setSyncAuto(!sync.auto);
+      changed?.();
     } catch (e) {
       toast.error("Could not change sync", e);
     }
@@ -107,26 +109,6 @@
     } finally {
       // Live progress shows on the title-bar dot.
       setTimeout(() => (syncingNow = false), 1200);
-    }
-  }
-
-  // "Commit my other changes": the files changed outside Ken are listed
-  // first, one by one, and only those are committed once the person says so.
-  let showingOthers = $state(false);
-  let committingOthers = $state(false);
-
-  async function commitOthers() {
-    if (!sync || sync.others.length === 0) return;
-    committingOthers = true;
-    try {
-      const commit = await api.syncCommitOthers(sync.others);
-      toast.show(commit ?`Committed ${sync.others.length === 1 ? "1 file" : `${sync.others.length} files`} (${commit}).` : "Nothing was left to commit.");
-      showingOthers = false;
-      sync = await api.syncStatus();
-    } catch (e) {
-      toast.error("Could not commit those changes", e);
-    } finally {
-      committingOthers = false;
     }
   }
 
@@ -251,70 +233,20 @@
       <p class="note">Speech to text on this computer, so what is said in a video is searchable. Off by default: it is slow. One video can be transcribed from its player.</p>
     </div>
 
-    <div class="card">
-      <div class="card-title">Sync</div>
-      {#if sync?.mode === "git" && !repo.kind.includes("wiki") && !sync.auto}
-        <p class="note">
-          Only the knowledge base syncs. Ken never commits or pushes in a code or reference repo, so its branch is
-          yours to pull and push.
-        </p>
-      {:else if sync?.mode === "git"}
-        {#if sync.remote}
-          <div class="row">
-            <span class="chip mono">git</span>
-            <span class="mono small">{sync.remote} {sync.branch ?? ""}</span>
-          </div>
-          <div class="row">
-            <label class="check">
-              <input type="checkbox" checked={sync.auto} onchange={() => void toggleSyncAuto()} />
-              Keep this repo in sync
-            </label>
-            <button class="btn btn-small push" onclick={() => void syncNow()} disabled={!sync.active || syncingNow}>
-              {syncingNow ? "Syncing…" : "Sync now"}
-            </button>
-          </div>
-          <p class="note">
-            Ken fetches others' changes when you come back to it, and commits and pushes only what it wrote here
-            soon after. When two people change one file, the banner at the top of Files opens both versions.
-          </p>
-        {:else}
-          <p class="note">No remote, so Ken keeps everything on this computer.</p>
-        {/if}
-        <!-- Offered with or without a remote (finding 17): a knowledge base
-             kept on this computer has a person's own changes too. The list
-             is empty in a code or reference repo, where Ken never commits. -->
-        {#if sync.others.length > 0}
-          <div class="row">
-            <span class="small">
-              {sync.others.length === 1 ? "1 file" : `${sync.others.length} files`} changed outside Ken. Ken leaves
-              them to you.
-            </span>
-            {#if !showingOthers}
-              <button class="btn btn-small push" onclick={() => (showingOthers = true)}>Commit my other changes…</button>
-            {/if}
-          </div>
-          {#if showingOthers}
-            <ul class="others mono small">
-              {#each sync.others as path (path)}
-                <li>{path}</li>
-              {/each}
-            </ul>
-            <div class="row">
-              <span class="note">
-                One commit of exactly these files, its message naming each.{sync.remote ? " Sync then pushes it." : ""}
-              </span>
-              <button class="btn btn-small" onclick={() => (showingOthers = false)} disabled={committingOthers}>Cancel</button>
-              <button class="btn btn-small btn-primary" onclick={() => void commitOthers()} disabled={committingOthers}>
-                {committingOthers ? "Committing…" : `Commit ${sync.others.length === 1 ? "this file" : `these ${sync.others.length}`}`}
-              </button>
-            </div>
-          {/if}
-        {/if}
-      {:else}
-        <div class="row"><span class="chip mono">shared drive</span></div>
-        <p class="note">The drive syncs this folder. Ken looks out for conflicted copies; the banner at the top of Files lists them.</p>
-      {/if}
-    </div>
+    {#if knowledgeBase && sync?.mode === "git" && sync.remote}
+      <div class="card">
+        <div class="card-title">Sync</div>
+        <div class="row">
+          <label class="check">
+            <input type="checkbox" checked={sync.auto} onchange={() => void toggleSyncAuto()} />
+            Keep this repo in sync
+          </label>
+          <button class="btn btn-small push" onclick={() => void syncNow()} disabled={!sync.active || syncingNow}>
+            {syncingNow ? "Syncing…" : "Sync now"}
+          </button>
+        </div>
+      </div>
+    {/if}
   {/if}
 </aside>
 
@@ -412,25 +344,6 @@
     font-size: 12px;
     line-height: 1.55;
     color: var(--ink-tertiary);
-  }
-  .small {
-    font-size: 11.5px;
-  }
-  .others {
-    margin: 0;
-    padding-left: 18px;
-    max-height: 180px;
-    overflow-y: auto;
-    line-height: 1.6;
-    word-break: break-all;
-  }
-  .chip {
-    font-size: 11.5px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 2px 8px;
-    background: var(--sunken);
-    flex: none;
   }
   textarea {
     font: inherit;

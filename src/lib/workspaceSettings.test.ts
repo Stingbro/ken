@@ -9,6 +9,8 @@ import {
   orderFindings,
   parseControls,
   proposedKinds,
+  syncParts,
+  syncProblem,
 } from "./workspaceSettings";
 import type { Finding, RepoKind } from "./api";
 
@@ -115,5 +117,32 @@ describe("analysisNote", () => {
     // A control with no source is the knowledge base's own.
     expect(analysisNote(row, [{ source: null }], "Wiki")).toMatch(/^Nothing for it/);
     expect(analysisNote({ ...row, settingsName: "Wiki" }, [{ source: null }], "Wiki")).toMatch(/Accept adds only/);
+  });
+});
+
+describe("syncParts", () => {
+  const ago = (s: number) => `${s}s`;
+  const base = { mode: "git" as const, auto: true, remote: "origin", branch: "main", lastPull: 10, lastPush: 20 };
+  it("names the remote and branch, then the last pull and push", () => {
+    expect(syncParts(base, ago)).toEqual(["origin/main", "pulled 10s", "pushed 20s"]);
+    expect(syncParts({ ...base, branch: null, lastPull: null, lastPush: null }, ago)).toEqual([
+      "origin",
+      "never pulled",
+      "never pushed",
+    ]);
+  });
+  it("says when sync is off, there is no remote, or a drive syncs it", () => {
+    expect(syncParts({ ...base, auto: false }, ago)).toContain("sync off");
+    expect(syncParts({ ...base, remote: null }, ago)).toEqual(["No remote"]);
+    expect(syncParts({ ...base, mode: "drive" }, ago)).toEqual(["shared drive"]);
+  });
+});
+
+describe("syncProblem", () => {
+  it("is the reason only while sync needs attention", () => {
+    expect(syncProblem(undefined)).toBeNull();
+    expect(syncProblem({ state: "synced", detail: null })).toBeNull();
+    expect(syncProblem({ state: "attention", detail: "sync failed: offline" })).toBe("sync failed: offline");
+    expect(syncProblem({ state: "attention", detail: null })).toBe("needs attention");
   });
 });

@@ -19,6 +19,7 @@
     type RepoKind,
     type SetupMoved,
     type SourceRow,
+    type SyncStatus,
     type WikiMapPlan,
     type WorkspaceSettings,
   } from "../lib/api";
@@ -39,6 +40,8 @@
     orderFindings,
     parseControls,
     proposedKinds,
+    syncParts,
+    syncProblem,
   } from "../lib/workspaceSettings";
   import RepoDrawer from "../workspace/RepoDrawer.svelte";
   import Loading from "../lib/ui/Loading.svelte";
@@ -269,6 +272,49 @@
     app.openInFiles(f.path);
   }
 
+  // ── The knowledge base's sync, beside its row ───────────────────────
+  // Its remote, branch, last pull and push, and what blocks it. Read again
+  // whenever its sync settles.
+  const kbId = $derived(overview?.wiki?.id ?? null);
+  let kbSync = $state<SyncStatus | null>(null);
+  async function loadSync(id: string | null) {
+    kbSync = id ? await api.syncStatus(id).catch(() => null) : null;
+  }
+  $effect(() => {
+    void loadSync(kbId);
+  });
+  $effect(() => {
+    let off: (() => void) | undefined;
+    void api
+      .onSyncState((ev) => {
+        if (ev.project_id && ev.project_id === kbId && ev.state !== "syncing") void loadSync(kbId);
+      })
+      .then((fn) => (off = fn));
+    return () => off?.();
+  });
+
+  // "Commit my other changes": the files changed outside Ken are listed
+  // first, one by one, and only those are committed once the person says so.
+  let showingOthers = $state(false);
+  let committingOthers = $state(false);
+  async function commitOthers() {
+    const others = kbSync?.others ?? [];
+    if (!kbId || others.length === 0) return;
+    committingOthers = true;
+    try {
+      const commit = await api.syncCommitOthers(others, kbId);
+      toast.show(
+        commit ? `Committed ${others.length === 1 ? "1 file" : `${others.length} files`} (${commit}).` : "Nothing was left to commit.",
+      );
+      showingOthers = false;
+      await loadSync(kbId);
+    } catch (e) {
+      toast.error("Could not commit those changes", e);
+    } finally {
+      committingOthers = false;
+    }
+  }
+
   // ── A repo's own settings, in a drawer from its row ─────────────────
   let drawer = $state<SourceRow | null>(null);
   async function openDrawer(r: SourceRow) {
@@ -435,6 +481,36 @@
                   {/if}
                 </td>
               </tr>
+              {#if r.id === kbId && kbSync}
+                {@const problem = syncProblem(app.syncStates[r.id])}
+                <tr class="kb-sync">
+                  <td></td>
+                  <td colspan="6">
+                    <div class="sync-line">
+                      <span class="sync-label">sync</span>
+                      <span class="mono">{syncParts(kbSync, timeAgo).join(" · ")}</span>
+                      {#if problem}<span class="bad">{problem}</span>{/if}
+                      {#if kbSync.others.length > 0}
+                        <span>{kbSync.others.length} changed outside Ken</span>
+                        {#if !showingOthers}
+                          <button class="btn btn-ghost btn-small" onclick={() => (showingOthers = true)}>Commit my other changes…</button>
+                        {/if}
+                      {/if}
+                    </div>
+                    {#if showingOthers && kbSync.others.length > 0}
+                      <ul class="others mono">
+                        {#each kbSync.others as path (path)}<li>{path}</li>{/each}
+                      </ul>
+                      <div class="actions">
+                        <button class="btn btn-ghost btn-small" disabled={committingOthers} onclick={() => (showingOthers = false)}>Cancel</button>
+                        <button class="btn btn-primary btn-small" disabled={committingOthers} onclick={() => void commitOthers()}>
+                          {committingOthers ? "Committing…" : `Commit ${kbSync.others.length === 1 ? "this file" : `these ${kbSync.others.length}`}`}
+                        </button>
+                      </div>
+                    {/if}
+                  </td>
+                </tr>
+              {/if}
             {/each}
           </tbody>
         </table>
@@ -690,7 +766,15 @@
 
 {#if drawer}
   {#key drawer.id}
-    <RepoDrawer repo={drawer} close={() => (drawer = null)} changed={() => void refresh()} />
+    <RepoDrawer
+      repo={drawer}
+      knowledgeBase={drawer.id === kbId}
+      close={() => (drawer = null)}
+      changed={() => {
+        void refresh();
+        void loadSync(kbId);
+      }}
+    />
   {/key}
 {/if}
 
@@ -792,6 +876,32 @@
   }
   .row-actions {
     white-space: nowrap;
+  }
+  tr.kb-sync td {
+    padding-top: 2px;
+  }
+  .sync-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+    font-size: 12px;
+    color: var(--ink-tertiary);
+  }
+  .sync-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .others {
+    margin: 6px 0;
+    padding-left: 18px;
+    max-height: 180px;
+    overflow-y: auto;
+    font-size: 11.5px;
+    line-height: 1.6;
+    word-break: break-all;
   }
   .kinds {
     display: flex;

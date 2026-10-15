@@ -2,8 +2,8 @@
 // how a finding of the knowledge base's checks is labelled, the sources no one
 // has said the kind of and the kinds set-up would give them, and how the
 // editors read and show the tiers, roles and controls of `.ken/knowledge.json`,
-// and what the repo analysis row says of a source.
-import type { ControlRow, Finding, RepoKind, SetupRepoRow, SourceRow } from "./api";
+// what a source's analysis stands at, and the knowledge base's sync line.
+import type { ControlRow, Finding, RepoKind, SetupRepoRow, SourceRow, SyncStateName, SyncStatus } from "./api";
 
 /** The tag a finding row carries. */
 export function findingLabel(kind: string): string {
@@ -131,4 +131,27 @@ export function analysisNote(
     return "Its rules or controls are in .ken/knowledge.json. Accept adds only what it has none of yet: empty them here first to take fresh ones.";
   }
   return "Nothing for it waits in the Inbox or is in .ken/knowledge.json.";
+}
+
+/** The knowledge base's sync as the short line beside its row: the remote
+ *  and branch, and when it last pulled and pushed. `ago` turns Unix seconds
+ *  into "5 min ago". */
+export function syncParts(
+  s: Pick<SyncStatus, "mode" | "auto" | "remote" | "branch" | "lastPull" | "lastPush">,
+  ago: (secs: number) => string,
+): string[] {
+  if (s.mode === "drive") return ["shared drive"];
+  if (!s.remote) return ["No remote"];
+  const parts = [s.branch ? `${s.remote}/${s.branch}` : s.remote];
+  if (!s.auto) parts.push("sync off");
+  parts.push(s.lastPull ? `pulled ${ago(s.lastPull)}` : "never pulled");
+  parts.push(s.lastPush ? `pushed ${ago(s.lastPush)}` : "never pushed");
+  return parts;
+}
+
+/** What blocks the knowledge base's sync, from its last state: the reason
+ *  while it needs attention, else nothing. */
+export function syncProblem(live: { state: SyncStateName; detail: string | null } | undefined): string | null {
+  if (live?.state !== "attention") return null;
+  return live.detail ?? "needs attention";
 }

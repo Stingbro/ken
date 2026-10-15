@@ -114,6 +114,42 @@ pub fn remote_and_branch(root: &Path) -> (Option<String>, Option<String>) {
     (remote, branch)
 }
 
+/// When the repository last pulled and last pushed, as Unix seconds: its
+/// `FETCH_HEAD` is written by every fetch and pull, and the newest "update
+/// by push" in its upstream's reflog is the last push that moved it. None
+/// for either it has not done (or has no upstream for).
+pub fn last_pull_push(root: &Path) -> (Option<i64>, Option<i64>) {
+    let pulled = run_git(root, &["rev-parse", "--git-path", "FETCH_HEAD"])
+        .ok()
+        .filter(|o| o.ok)
+        .map(|o| {
+            let p = PathBuf::from(o.stdout.trim());
+            if p.is_absolute() { p } else { root.join(p) }
+        })
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    let pushed = run_git(root, &["rev-parse", "--symbolic-full-name", "@{upstream}"])
+        .ok()
+        .filter(|o| o.ok)
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|upstream| run_git(root, &["reflog", "show", "--date=unix", "--format=%gd%x09%gs", &upstream]).ok())
+        .filter(|o| o.ok)
+        .and_then(|o| {
+            o.stdout.lines().find_map(|l| {
+                let (selector, subject) = l.split_once('\t')?;
+                if !subject.starts_with("update by push") {
+                    return None;
+                }
+                let at = selector.rsplit_once("@{")?.1.trim_end_matches('}');
+                at.parse::<i64>().ok()
+            })
+        });
+    (pulled, pushed)
+}
+
 /// Whether sync runs for a repo: only for the knowledge base (said to be a
 /// wiki, or holding the inbox), and there on unless a person switched it off
 /// (`project.json` extra `"sync": {"auto": false}`). A code or reference repo
@@ -809,15 +845,13 @@ fn cycle(
         emit_state(
             notify,
             SyncState::Attention,
-            Some(format!(
-                "Ken couldn't sync this project just now — it will keep trying. ({detail})"
-            )),
+            Some(format!("sync failed: {detail}")),
         );
     } else if has_open_conflicts(db) {
         emit_state(
             notify,
             SyncState::Attention,
-            Some("Some documents have two versions — open Review to choose what stays.".into()),
+            Some("two versions wait in the Inbox".into()),
         );
     } else {
         emit_state(notify, SyncState::Synced, None);
@@ -939,7 +973,7 @@ fn detect_conflicted_copies(
         emit_state(
             notify,
             SyncState::Attention,
-            Some("A conflicting copy needs review — open Review to choose.".into()),
+            Some("a conflicting copy waits in the Inbox".into()),
         );
     }
 }
@@ -1066,6 +1100,20 @@ mod tests {
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "-m", "edit"]);
         git(repo, &["push"]);
+    }
+
+    #[test]
+    fn last_pull_and_push_come_from_git() {
+        let (_d, _bare, a, b) = fixture();
+        // `a` pushed main when it was seeded; `b` has only cloned.
+        let (_, a_pushed) = last_pull_push(&a);
+        assert!(a_pushed.is_some_and(|t| t > 0));
+        assert_eq!(last_pull_push(&b), (None, None));
+        commit_push(&a, "fresh.md", "from teammate\n");
+        assert_eq!(pull(&b, |_| false).unwrap(), PullOutcome::Clean);
+        let (b_pulled, b_pushed) = last_pull_push(&b);
+        assert!(b_pulled.is_some_and(|t| t > 0));
+        assert_eq!(b_pushed, None);
     }
 
     #[test]

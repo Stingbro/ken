@@ -182,6 +182,9 @@ class AppStore {
   /** Sync state for the title-bar dot ("off" = not a synced project). */
   syncState = $state<SyncStateName>("off");
   syncDetail = $state<string | null>(null);
+  /** Each member's last sync state, by id: Workspace shows the knowledge
+   *  base's beside its row whichever member is focused. */
+  syncStates = $state<Record<string, { state: SyncStateName; detail: string | null }>>({});
 
   /** Whether cloud-offline documents are indexed in the background (on by
    *  default). Shared so Settings and the Home footer agree instantly. */
@@ -311,6 +314,7 @@ class AppStore {
       );
     });
     await api.onSyncState((ev) => {
+      if (ev.project_id) this.syncStates[ev.project_id] = { state: ev.state, detail: ev.detail };
       if (!forFocused(ev.project_id)) return;
       this.syncState = ev.state;
       this.syncDetail = ev.detail;
