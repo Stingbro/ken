@@ -535,7 +535,7 @@
 
       {#if decisionsTotal > 0}
         <section class="decisions">
-          <div class="shead"><span class="adot"></span><span class="t-label">needs your decision · {decisionsTotal}</span></div>
+          <div class="shead"><span class="adot"></span><span class="t-label">to review · {decisionsTotal}</span></div>
           <div class="dgrid">
             {#each rulings as p (p.id)}
               <div class="dcard">
