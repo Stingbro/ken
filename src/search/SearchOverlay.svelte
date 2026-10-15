@@ -130,7 +130,7 @@
     }
     const held = res.plan.reserve.filter((id) => !res.memberStatus.some((s) => s.projectId === id));
     if (held.length) {
-      notes.push(`${held.length} reference repo${held.length === 1 ? "" : "s"} held back`);
+      notes.push(`${held.length} reference source${held.length === 1 ? "" : "s"} held back`);
     }
     return notes;
   }
@@ -378,7 +378,7 @@
       bind:value={query}
       oninput={onInput}
       onkeydown={onKeydown}
-      placeholder={scope === "all" ? `Search ${workspaceName}…` : "Search this repo…"}
+      placeholder={scope === "all" ? `Search ${workspaceName}…` : "Search this source…"}
       spellcheck="false"
     />
   </div>
@@ -390,7 +390,7 @@
         class:active={scope === "project"}
         onclick={() => setScope("project")}
       >
-        This repo
+        This source
       </button>
       <button class="scope-btn" class:active={scope === "all"} onclick={() => setScope("all")}>
         {workspaceName}
@@ -402,8 +402,8 @@
           class="member-pin"
           value={pinnedMember ?? ""}
           onchange={(e) => setPinnedMember(e.currentTarget.value || null)}
-          aria-label="Project"
-          title="Narrow to one project"
+          aria-label="Source"
+          title="Narrow to one source"
         >
           <option value="">Everywhere</option>
           <!-- Dormant members are pinnable: routing opens their index by
@@ -520,7 +520,7 @@
     <div class="qa">
       <div class="qa-head">Ken looked</div>
       {#if look.state === "looking"}
-        <div class="qa-body qa-thinking">Looking through the folders itself…</div>
+        <div class="qa-body qa-thinking">Looking through the sources itself…</div>
       {:else}
         <div class="qa-body">{@html renderMarkdown(look.body)}</div>
         {#if look.sources.length}

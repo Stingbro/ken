@@ -8,8 +8,8 @@
   // and what a source lacks for its kind, the template files the knowledge
   // base lacks, the pages outside its sections, its drift runs and what its
   // checks found, and its rules and templates. The whole row opens that
-  // repo's detail, which carries its actions. Add a repo and Scan again sit
-  // at the top.
+  // source's detail, which carries its actions. Add a source and Scan again
+  // sit at the top.
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     api,
@@ -91,7 +91,7 @@
   async function scanAgain() {
     if (!overview) return;
     const root = overview.root;
-    await run("scan", "Could not scan the folders", async () => {
+    await run("scan", "Could not scan the sources", async () => {
       moved = await api.setupRescan(root);
       scanned = Math.floor(Date.now() / 1000);
     });
@@ -129,11 +129,11 @@
 
   async function addRepos() {
     if (!overview) return;
-    const picked = await openDialog({ directory: true, multiple: true, title: "Add a repo to the workspace" });
+    const picked = await openDialog({ directory: true, multiple: true, title: "Add a source to the workspace" });
     const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
     if (paths.length === 0) return;
     const name = overview.workspace;
-    await run("add", "Could not add the repo", async () => {
+    await run("add", "Could not add the source", async () => {
       const proposal = await api.setupProposeRepos(paths);
       const rows = proposal.rows.map((r) => ({ ...r, include: true }));
       await app.confirmSetupRepos(name, rows, true);
@@ -143,7 +143,7 @@
   }
 
   function addFolder(member: string) {
-    void run(`m${member}`, "Could not add the folder", async () => {
+    void run(`m${member}`, "Could not add the source", async () => {
       await api.workspaceAddMember(member);
       moved = moved.filter((m) => !("member" in m) || m.member !== member);
       await app.refreshWorkspaceOverview();
@@ -330,18 +330,18 @@
       <span class="chip" class:warn={overview.gaps.length > 0}>gaps · {overview.gaps.length}</span>
       <span class="chip" class:warn={findings.length > 0}>findings · {findings.length}</span>
     {/if}
-    <button class="btn btn-ghost" disabled={busy !== null} onclick={addRepos}>+ Add a repo</button>
+    <button class="btn btn-ghost" disabled={busy !== null} onclick={addRepos}>+ Add a source</button>
     <button class="btn btn-primary" disabled={busy !== null} onclick={scanAgain}>{busy === "scan" ? "Scanning…" : "Scan again"}</button>
   </div>
   {#if error}<p class="warn-text">{error}</p>{/if}
   {#if !overview && !error}
-    <Loading label="Reading the workspace's folders…" lines={4} />
+    <Loading label="Reading the workspace's sources…" lines={4} />
   {/if}
 
   {#if overview && kindless.length > 0}
     <div class="kinds">
       <div class="kinds-head">
-        <span>{kindless.length} {kindless.length === 1 ? "repo" : "repos"} without a kind</span>
+        <span>{kindless.length} {kindless.length === 1 ? "source" : "sources"} without a kind</span>
         {#if !kindsOpen}
           <button class="btn btn-small btn-primary" onclick={() => void openKinds()}>Set kinds</button>
         {/if}

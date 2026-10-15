@@ -36,7 +36,7 @@ const KINDS: Record<string, string> = {
   ocr: "Text in images",
   cloud: "Cloud files",
   index: "Index",
-  analysis: "Repo analysis",
+  analysis: "Source analysis",
   memory: "Memory",
 };
 

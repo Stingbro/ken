@@ -163,7 +163,7 @@
     // The one health line (knowledge-core decision 19).
     const h = day.health;
     if (!h) return "";
-    const repos = h.reposIndexed >= h.repos ? `All ${h.repos} ${h.repos === 1 ? "folder" : "folders"} indexed` : `${h.reposIndexed} of ${h.repos} folders indexed`;
+    const repos = h.reposIndexed >= h.repos ? `${h.repos} ${h.repos === 1 ? "source" : "sources"} indexed` : `${h.reposIndexed} of ${h.repos} sources indexed`;
     const files = [`${h.indexed} ${h.indexed === 1 ? "file" : "files"}`];
     if (h.failed > 0) files.push(`${h.failed} failed`);
     if (h.skipped > 0) files.push(`${h.skipped} by name only`);

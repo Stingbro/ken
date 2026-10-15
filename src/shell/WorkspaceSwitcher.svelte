@@ -44,7 +44,7 @@
       <span class="badge">{app.workspace.name.charAt(0).toUpperCase()}</span>
       <span class="info">
         <span class="name">{app.workspace.name}</span>
-        <span class="sub">{n} {n === 1 ? "repo" : "repos"}</span>
+        <span class="sub">{n} {n === 1 ? "source" : "sources"}</span>
       </span>
     </button>
   {/if}

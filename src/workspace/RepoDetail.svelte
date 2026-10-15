@@ -101,7 +101,7 @@
       body: "Ken stops indexing it. The folder and its files stay on disk.",
       confirmLabel: "Remove",
       onConfirm: () =>
-        void run("remove", "Could not remove the repo", async () => {
+        void run("remove", "Could not remove the source", async () => {
           await api.workspaceRemoveMember(repo.name);
           await app.refreshWorkspaceOverview();
           close();
@@ -129,7 +129,7 @@
   const dirty = $derived(description.trim() !== repo.description.trim());
   function saveDescription() {
     if (!dirty) return;
-    void run("description", "Could not save what the repo is for", () =>
+    void run("description", "Could not save what the source is for", () =>
       api.setProjectDescription(repo.id, description.trim()),
     );
   }

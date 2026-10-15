@@ -268,7 +268,7 @@
       <input
         class="link-input"
         bind:value={linkDraft}
-        placeholder="ATT-014, a file path or a repo"
+        placeholder="ATT-014, a file path or a source"
         aria-label="Link"
         autofocus
         onkeydown={(e) => {

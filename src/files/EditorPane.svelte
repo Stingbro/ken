@@ -299,7 +299,7 @@
     const page = resolveRelativeHref(href, relPath);
     if (!page) return false;
     if (app.files.some((f) => f.relPath === page)) app.openTab(page, true);
-    else toast.show(`No file at ${page} in this repo.`);
+    else toast.show(`No file at ${page} in this source.`);
     return true;
   }
 
@@ -310,7 +310,7 @@
       (await api.resolvePageLink(relPath, target).catch(() => null)) ??
       resolveWikiLink(target, relPath, app.files.map((f) => f.relPath));
     if (page) app.openTab(page, true);
-    else toast.show(`No page named "${target.split("|")[0]}" in this repo.`);
+    else toast.show(`No page named "${target.split("|")[0]}" in this source.`);
   }
 
   async function doSave() {

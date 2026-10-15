@@ -428,8 +428,8 @@
         {#each kenFeatures as flag (flag.name)}
           <div class="card">
             <!-- A feature is a switch with its name; what it does, and that it
-                 is on by default for every repo, is the tooltip. -->
-            <label class="radio feature" title="{flag.description} On by default for every repo.">
+                 is on by default for every source, is the tooltip. -->
+            <label class="radio feature" title="{flag.description} On by default for every source.">
               <input
                 type="checkbox"
                 checked={flag.global}
@@ -446,7 +446,7 @@
                   disabled={featuresBusy === flag.name}
                   onchange={(e) => void setRepoOverride(flag, e.currentTarget.checked)}
                 />
-                On for {app.project?.name ?? "this repo"}
+                On for {app.project?.name ?? "this source"}
                 {#if flag.projectOverride !== null}<span class="chip">custom</span>{/if}
               </label>
             {/if}

@@ -6695,7 +6695,7 @@ fn apply_page_proposal(state: State<SharedState>, item_id: i64, project_id: Opti
         Ok(()) => {}
         Err(ken_core::proposal::ApplyError::Changed) => {
             return Err(format!(
-                "{} changed after Ken proposed this, so applying it would undo that edit. Discard it; the next repo added proposes again.",
+                "{} changed after Ken proposed this, so applying it would undo that edit. Discard it; the next source added proposes again.",
                 proposal.page
             ))
         }
@@ -6760,7 +6760,7 @@ fn knowledge_base_id(state: State<SharedState>) -> CmdResult<Option<String>> {
 fn inbox_member(app: &AppHandle, state: &SharedState) -> CmdResult<uuid::Uuid> {
     let (project, open, focused) = {
         let guard = state.lock().unwrap();
-        let project = inbox_project(&guard).ok_or("No repo of this workspace has an inbox (Research/Ingestion/Raw/). A knowledge base made by set-up has one.")?;
+        let project = inbox_project(&guard).ok_or("No source of this workspace has an inbox (Research/Ingestion/Raw/). A knowledge base made by set-up has one.")?;
         let open = guard.members.contains_key(&project.config.id);
         (project, open, guard.focused)
     };
@@ -9032,7 +9032,7 @@ fn member_root(state: &SharedState, project_id: &str) -> CmdResult<PathBuf> {
                 _ => None,
             })
         })
-        .ok_or_else(|| "that repo is not open".to_string())
+        .ok_or_else(|| "that source is not open".to_string())
 }
 
 /// Move one of my tickets to `status` (todo, in-progress, blocked,
