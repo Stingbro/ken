@@ -1,17 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { canReadNow, ingestBusy, pageName, raidDetail, rawActions, rawStateLabel, writtenLine } from "./ingestCard";
+import { canReadNow, ingestBusy, pageName, raidDetail, rawActions, rawStatus } from "./ingestCard";
 import type { RawSource } from "./api";
-
-describe("writtenLine", () => {
-  it("counts the pages, then what waits", () => {
-    expect(writtenLine(2, 3)).toBe("2 pages written · 3 wait");
-    expect(writtenLine(1, 1)).toBe("1 page written · 1 waits");
-  });
-  it("says when nothing was written", () => {
-    expect(writtenLine(0, 0)).toBe("nothing written");
-    expect(writtenLine(0, 4)).toBe("nothing written · 4 wait");
-  });
-});
 
 describe("pageName", () => {
   it("reads a path as sections", () => {
@@ -23,10 +12,11 @@ describe("pageName", () => {
 
 describe("Raw rows", () => {
   it("say where each source is", () => {
-    expect(rawStateLabel("queued")).toBe("in the queue");
-    expect(rawStateLabel("transcribing")).toBe("transcribing");
-    expect(rawStateLabel("waiting")).toBe("waiting for a transcript");
-    expect(rawStateLabel("failed")).toBe("could not read");
+    expect(rawStatus({ state: "queued", detail: null })).toBe("Queued");
+    expect(rawStatus({ state: "transcribing", detail: "transcribing 40%" })).toBe("Transcribing 40%");
+    expect(rawStatus({ state: "transcribing", detail: null })).toBe("Transcribing");
+    expect(rawStatus({ state: "waiting", detail: "no whisper model" })).toBe("Waits for a transcript");
+    expect(rawStatus({ state: "failed", detail: "bad file" })).toBe("Couldn't read");
   });
   it("offer Try again and Remove only where they make sense", () => {
     expect(rawActions("failed")).toEqual(["retry", "remove"]);

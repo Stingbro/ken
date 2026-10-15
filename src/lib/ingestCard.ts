@@ -1,17 +1,8 @@
-// Pure helpers for the Ingest screen (the library inbox, white box 8b): the
-// one-line count of the pages a source wrote and what waits, page names as a
-// row says them, and what a Raw/ row says and offers.
-import type { IngestOverview, RawState } from "./api";
+// Pure helpers for the Ingest screen (the library inbox, white box 8b): page
+// names as a row says them, a risk's text, and what a Raw/ row says and offers.
+import type { IngestOverview, RawSource, RawState } from "./api";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
-
-/** "2 pages written · 3 wait": the pages written from a source and what
- *  waits, in one line. */
-export function writtenLine(pages: number, waiting: number): string {
-  let line = pages > 0 ? `${plural(pages, "page")} written` : "nothing written";
-  if (waiting > 0) line += ` · ${waiting} ${waiting === 1 ? "waits" : "wait"}`;
-  return line;
-}
 
 /** The line or two ingest wrote for a waiting risk or issue (its entry's
  *  text), read from the proposal; empty for anything else. */
@@ -33,21 +24,23 @@ export function pageName(path: string): string {
     .join(" › ");
 }
 
-/** How a source in Raw/ reads in its row. */
-export function rawStateLabel(state: RawState): string {
-  switch (state) {
+/** How a source in Raw/ reads in its row: "Queued", "Transcribing 40%". */
+export function rawStatus(r: Pick<RawSource, "state" | "detail">): string {
+  switch (r.state) {
     case "queued":
-      return "in the queue";
-    case "transcribing":
-      return "transcribing";
-    case "waiting":
-      return "waiting for a transcript";
+      return "Queued";
+    case "transcribing": {
+      const m = r.detail?.match(/(\d+)%/);
+      return m ? `Transcribing ${m[1]}%` : "Transcribing";
+    }
     case "reading":
-      return "reading";
-    case "read":
-      return "read";
+      return "Reading";
+    case "waiting":
+      return "Waits for a transcript";
     case "failed":
-      return "could not read";
+      return "Couldn't read";
+    case "read":
+      return "Read";
   }
 }
 

@@ -37,8 +37,7 @@
     pageName,
     raidDetail,
     rawActions,
-    rawStateLabel,
-    writtenLine,
+    rawStatus,
   } from "../lib/ingestCard";
   import ProposalDetail from "./ProposalDetail.svelte";
   import RecordPanel from "./RecordPanel.svelte";
@@ -51,7 +50,6 @@
   let error = $state<string | null>(null);
   /** Why the list could not be read; kept apart from an action's error. */
   let loadError = $state<string | null>(null);
-  let notice = $state<string | null>(null);
   let selected = $state<number | null>(null);
   let card = $state<IngestCard | null>(null);
   let busy = $state<string | null>(null);
@@ -124,31 +122,6 @@
       await api.revealInFolder(path, overview.projectId);
     } catch (e) {
       error = errorText(e);
-    }
-  }
-  function rawPct(r: IngestOverview["raw"][number]): number {
-    const m = r.detail?.match(/(\d+)%/);
-    if (r.state === "read" || r.state === "failed" || r.state === "waiting") return 100;
-    if (r.state === "transcribing") return m ? Math.round(Number(m[1]) * 0.6) : 10;
-    if (r.state === "reading") return m ? 60 + Math.round(Number(m[1]) * 0.4) : 70;
-    return 4;
-  }
-  function rawStatus(r: IngestOverview["raw"][number]): string {
-    switch (r.state) {
-      case "queued":
-        return "Queued";
-      case "transcribing": {
-        const m = r.detail?.match(/(\d+)%/);
-        return m ? `Transcribing ${m[1]}%` : "Transcribing";
-      }
-      case "reading":
-        return "Reading";
-      case "waiting":
-        return "Waits for a transcript";
-      case "failed":
-        return "Couldn't read";
-      default:
-        return "Read";
     }
   }
   let noteTitle = $state("");
@@ -280,7 +253,6 @@
       await api.ingestAddText(noteTitle.trim() || null, text);
       noteTitle = "";
       noteText = "";
-      notice = "The note is in Raw. Ken reads it now.";
       error = null;
     } catch (e) {
       error = errorText(e);
@@ -291,7 +263,6 @@
   }
 
   async function chatAdded() {
-    notice = "The chat is in Raw. Ken reads it now.";
     error = null;
     await refresh();
   }
@@ -299,8 +270,7 @@
   async function readNow() {
     busy = "now";
     try {
-      const started = await api.ingestNow();
-      notice = started ? "Reading what is queued." : "A read is already running; the queue is next.";
+      await api.ingestNow();
     } catch (e) {
       error = errorText(e);
     } finally {
@@ -312,8 +282,7 @@
   async function retry(r: IngestOverview["raw"][number]) {
     busy = `r${r.path}`;
     try {
-      const started = await api.ingestRetry(r.path);
-      notice = started ? `Reading ${r.name} again.` : `${r.name} is read on the next pass.`;
+      await api.ingestRetry(r.path);
       error = null;
     } catch (e) {
       error = errorText(e);
@@ -337,7 +306,6 @@
     busy = `x${r.path}`;
     try {
       await api.ingestRemove(r.path);
-      notice = `${r.name} is in the trash.`;
       error = null;
     } catch (e) {
       error = errorText(e);
@@ -423,12 +391,6 @@
   const contradictions = $derived((card?.takeaways.contradictions ?? []).filter((c) => !saysNothing(c)));
   const questions = $derived((card?.takeaways.openQuestions ?? []).filter((q) => !saysNothing(q)));
   const decisionsTotal = $derived(rulings.length + raid.length + tickets.length + held.length);
-
-  function rawSub(r: IngestOverview["raw"][number]): string {
-    const bits = [r.kind, r.length, r.present.length > 0 ? `${r.present.length} present` : "", rawStateLabel(r.state)];
-    if (r.state === "read") bits.push(writtenLine(r.pages, r.waiting));
-    return bits.filter((b) => b).join(" · ");
-  }
 </script>
 
 <div class="ingest">
@@ -481,7 +443,6 @@
     {/if}
     {#if adding > 0}<p class="note">Adding {adding} {adding === 1 ? "file" : "files"}…</p>{/if}
     {#if error}<p class="warn">{error}</p>{/if}
-    {#if notice}<p class="note">{notice}</p>{/if}
     {#if loadError}<p class="warn">{loadError}</p>{/if}
     {#if overview?.stopped}<p class="warn">The last read stopped: {overview.stopped}</p>{/if}
     {#if overview && !overview.claudeFound}
@@ -500,53 +461,33 @@
         {/if}
       </div>
       {#each inProgress as r (r.path)}
-        {@const actions = rawActions(r.state)}
-        {@const pct = rawPct(r)}
-        <div class="qitem" class:sel={selectedRaw === r.path}>
-          <button class="qrow" title={r.path} onclick={() => selectRaw(r)}>
-            <span class="qline">
-              <span class="qdot {r.state}"></span>
-              <span class="qname">{r.name}</span>
-              <span class="qstat">{rawStatus(r)}</span>
-            </span>
-            <span class="k-progress thin"><span style="width: {pct}%" class:bad={r.state === "failed"} class:wait={r.state === "waiting"}></span></span>
-          </button>
-          {#if (r.state === "failed" || r.state === "waiting") && r.detail}
-            <p class="reason" class:bad={r.state === "failed"}>{r.detail}</p>
-          {/if}
-          {#if actions.length > 0}
-            <div class="raw-actions">
-              {#if actions.includes("retry")}
-                <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => retry(r)}>Try again</button>
-              {/if}
-              {#if actions.includes("remove")}
-                <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={(e) => askRemove(e, r)}>Remove</button>
-              {/if}
-            </div>
-          {/if}
-        </div>
+        <button class="qrow" class:sel={selectedRaw === r.path} onclick={() => selectRaw(r)}>
+          <span class="qdot {r.state}"></span>
+          <span class="qname">{r.name}</span>
+          <span class="qstat">{rawStatus(r)}</span>
+        </button>
       {:else}
         <EmptyState />
       {/each}
 
       {@const readRaw = overview.raw.filter((r) => r.state === "read" && r.cardId !== null)}
-      <div class="t-label lhead"><span>Ingested</span></div>
+      <div class="t-label lhead"><span>Ingested · {readRaw.length + ingested.length}</span></div>
       {#each readRaw as r (r.path)}
         <button class="srow" class:sel={r.cardId === selected} onclick={() => r.cardId !== null && selectCard(r.cardId)}>
           <span class="sicon"><FileText size={15} strokeWidth={1.75} aria-hidden="true" /></span>
           <span class="stext">
             <span class="stitle">{r.name}</span>
-            <span class="sline">{rawSub(r)}</span>
+            <span class="sline">{r.kind || "source"}</span>
           </span>
           {#if r.waiting > 0}<span class="count">{r.waiting}</span>{/if}
         </button>
       {/each}
       {#each ingested as s (s.id)}
-        <button class="srow" class:sel={s.id === selected} onclick={() => selectCard(s.id)}>
+        <button class="srow" class:sel={s.id === selected} class:seen={!s.open} onclick={() => selectCard(s.id)}>
           <span class="sicon"><FileText size={15} strokeWidth={1.75} aria-hidden="true" /></span>
           <span class="stext">
             <span class="stitle">{@html renderTitle(s.title)}</span>
-            <span class="sline">{s.kind || "source"} · {timeAgo(s.at)}{#if !s.open} · seen{/if}</span>
+            <span class="sline">{s.kind || "source"} · {timeAgo(s.at)}</span>
           </span>
           {#if s.waiting > 0}<span class="count">{s.waiting}</span>{/if}
         </button>
@@ -872,17 +813,10 @@
     justify-content: space-between;
     padding: 12px 6px 2px;
   }
-  .qitem {
-    border-radius: 9px;
-    padding: 2px 0;
-  }
-  .qitem.sel {
-    background: var(--accent-soft);
-  }
   .qrow {
     display: flex;
-    flex-direction: column;
-    gap: 6px;
+    align-items: center;
+    gap: 8px;
     padding: 8px 10px;
     border-radius: 9px;
     border: none;
@@ -894,11 +828,8 @@
   .qrow:hover {
     background: var(--line-soft);
   }
-  .qline {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
+  .qrow.sel {
+    background: var(--accent-soft);
   }
   .qdot {
     width: 8px;
@@ -931,29 +862,14 @@
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
-  .k-progress.thin {
-    height: 3px;
-    width: 100%;
-  }
-  .k-progress :global(span.bad) {
-    background: var(--danger);
-  }
-  .k-progress :global(span.wait) {
-    background: var(--attn);
-  }
   .reason {
-    margin: 0 10px 4px;
+    margin: 0;
     font-size: 12px;
     color: var(--attn-ink);
     line-height: 1.45;
   }
   .reason.bad {
     color: var(--danger);
-  }
-  .raw-actions {
-    display: flex;
-    gap: 4px;
-    padding: 0 6px 4px;
   }
   .srow {
     display: flex;
@@ -971,6 +887,9 @@
   }
   .srow.sel {
     background: var(--accent-soft);
+  }
+  .srow.seen .stitle {
+    color: var(--ink-3);
   }
   .sicon {
     color: var(--ink-2);
