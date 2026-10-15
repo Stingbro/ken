@@ -1,4 +1,5 @@
 // Display helpers: file glyph labels/tints, sizes, relative times.
+import { clock } from "./clock.svelte";
 
 export interface GlyphStyle {
   label: string;
@@ -116,10 +117,11 @@ export function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function timeAgo(epochSeconds: number, nowMs = Date.now()): string {
+/** How long ago `epochSeconds` was, in a person's words. With no `nowMs`
+ *  it reads the ticking clock, so a template showing it stays current. */
+export function timeAgo(epochSeconds: number, nowMs = clock.now): string {
   const s = Math.max(0, Math.floor(nowMs / 1000) - epochSeconds);
-  if (s < 10) return "just now";
-  if (s < 60) return `${s} sec ago`;
+  if (s < 60) return "just now";
   const m = Math.floor(s / 60);
   if (m < 60) return `${m} min ago`;
   const h = Math.floor(m / 60);
