@@ -205,12 +205,15 @@
         {/if}
       {:else if day.generating}
         <p class="digest quiet">Ken is writing today's digest.</p>
-      {:else if !day.claudeFound}
-        <p class="t-small err">Claude Code not found</p>
       {:else}
         <EmptyState title="No digest yet">
           {#snippet action()}
-            <button class="btn btn-small" onclick={() => void day.writeDigest()}>Write it now</button>
+            <button
+              class="btn btn-small"
+              disabled={!day.claudeFound}
+              title={day.claudeFound ? undefined : "Claude Code not found"}
+              onclick={() => void day.writeDigest()}>Write it now</button
+            >
           {/snippet}
         </EmptyState>
       {/if}
