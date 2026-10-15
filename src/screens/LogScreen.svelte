@@ -13,6 +13,7 @@
   import { counts, highlightMatches, statusTone, viewOf } from "../lib/log";
   import { renderTitle } from "../lib/markdown";
   import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
   import Search from "@lucide/svelte/icons/search";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
 
@@ -89,14 +90,13 @@
 
 <div class="screen">
   <div class="inner">
-    <div class="head">
-      <h1>Log</h1>
-      {#if log?.name}<span class="name">{log.name}</span>{/if}
-      <button class="refresh" title="Read again" aria-label="Read again" disabled={loading} onclick={() => void load()}>
-        <RefreshCw size={14} strokeWidth={1.75} aria-hidden="true" />
-      </button>
-    </div>
-    <p class="lede">The project's risks, actions, issues and decisions, and its milestones. Closed items fold away.</p>
+    <ScreenHeader title="Log" sub={log?.name} count={log && count.total > 0 ? count : null}>
+      {#snippet actions()}
+        <button class="refresh" title="Read again" aria-label="Read again" disabled={loading} onclick={() => void load()}>
+          <RefreshCw size={14} strokeWidth={1.75} aria-hidden="true" />
+        </button>
+      {/snippet}
+    </ScreenHeader>
 
     {#if error}
       <div class="error">The log could not be read: {error}</div>
@@ -108,7 +108,6 @@
       <div class="search">
         <Search class="lens" size={14} strokeWidth={1.75} aria-hidden="true" />
         <input bind:value={query} placeholder="Search the log…" spellcheck="false" />
-        <span class="count">{count.shown} of {count.total}</span>
       </div>
 
       {#each groups as g (g.key)}
@@ -151,29 +150,7 @@
     flex-direction: column;
     gap: 16px;
   }
-  .head {
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
-  }
-  h1 {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 30px;
-    font-weight: 500;
-  }
-  .name {
-    font-size: 12.5px;
-    color: var(--ink-tertiary);
-  }
-  .lede {
-    margin: -8px 0 0;
-    font-size: 13px;
-    color: var(--ink-secondary);
-  }
   .refresh {
-    margin-left: auto;
-    align-self: center;
     display: inline-flex;
     padding: 5px;
     border-radius: 6px;
@@ -215,12 +192,6 @@
     font-size: 13px;
     color: var(--ink);
   }
-  .count {
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
-    white-space: nowrap;
-  }
-
   .group {
     display: flex;
     flex-direction: column;

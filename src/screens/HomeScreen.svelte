@@ -21,6 +21,7 @@
   import InboxKindIcon from "./InboxKindIcon.svelte";
   import Loading from "../lib/ui/Loading.svelte";
   import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import { api, type ModelStatus } from "../lib/api";
   import Check from "@lucide/svelte/icons/check";
@@ -184,20 +185,16 @@
 <div class="home">
   <main>
     <section class="brief">
-      <h1 class="t-display">{greeting}</h1>
-      <div class="meta">
-        <span>{todayLong}</span>
-        {#if day.digest}
-          <span>·</span>
-          <span>Digest at {digestTime(day.digest.generatedAt)}{day.digest.sources.length ? ` · ${day.digest.sources.length} ${day.digest.sources.length === 1 ? "source" : "sources"}` : ""}</span>
-        {/if}
-        <span class="grow"></span>
-        {#if day.digest}
-          <button class="btn btn-small" onclick={share} title="Copy the digest as markdown">
-            {#if copied}<Check size={13} strokeWidth={2} /> Copied{:else}<Copy size={13} strokeWidth={1.75} /> Share{/if}
-          </button>
-        {/if}
-      </div>
+      <ScreenHeader title={greeting} sub={todayLong}>
+        {#snippet actions()}
+          {#if day.digest}
+            <span class="meta">Digest at {digestTime(day.digest.generatedAt)}{day.digest.sources.length ? ` · ${day.digest.sources.length} ${day.digest.sources.length === 1 ? "source" : "sources"}` : ""}</span>
+            <button class="btn btn-small" onclick={share} title="Copy the digest as markdown">
+              {#if copied}<Check size={13} strokeWidth={2} /> Copied{:else}<Copy size={13} strokeWidth={1.75} /> Share{/if}
+            </button>
+          {/if}
+        {/snippet}
+      </ScreenHeader>
       {#if day.digest}
         <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
         <div class="digest" onclick={onDigestClick}>{@html renderMarkdown(day.digest.body)}</div>
@@ -374,13 +371,7 @@
   .brief {
     gap: 12px;
   }
-  h1 {
-    margin: 0;
-  }
   .meta {
-    display: flex;
-    align-items: center;
-    gap: 8px;
     font-size: 13px;
     color: var(--ink-3);
     white-space: nowrap;

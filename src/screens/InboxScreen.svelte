@@ -17,6 +17,7 @@
   import InboxKindIcon from "./InboxKindIcon.svelte";
   import Loading from "../lib/ui/Loading.svelte";
   import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
   import CircleCheck from "@lucide/svelte/icons/circle-check";
   import BellOff from "@lucide/svelte/icons/bell-off";
 
@@ -147,10 +148,7 @@
 <div class="inbox">
   <div class="listcol">
     <div class="lhead">
-      <div class="titlerow">
-        <h1>Inbox</h1>
-        <span class="t-small">{inbox.count} waiting</span>
-      </div>
+      <ScreenHeader title="Inbox" sub="{inbox.count} waiting" />
       <div class="k-tabs" role="tablist">
         {#each filters as f (f.key)}
           <button class:on={filter === f.key} role="tab" aria-selected={filter === f.key} onclick={() => (filter = f.key)}>
@@ -279,17 +277,6 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
-  }
-  .titlerow {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-  }
-  h1 {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 28px;
-    font-weight: 500;
   }
   .rows {
     flex: 1;

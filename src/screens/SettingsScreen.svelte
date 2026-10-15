@@ -27,6 +27,7 @@
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import ProgressBar from "../lib/ProgressBar.svelte";
   import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
   import { whatsNew } from "../whats-new/whatsNew.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
@@ -215,7 +216,7 @@
 
 <div class="settings">
   <nav class="snav" aria-label="Settings">
-    <h1>Settings</h1>
+    <div class="title"><ScreenHeader title="Settings" /></div>
     {#each sections as s (s.key)}
       <button class:on={app.settingsSection === s.key} onclick={() => (app.settingsSection = s.key)}>
         <span class="slabel">{s.label}</span>
@@ -225,8 +226,6 @@
   </nav>
   <div class="wrap">
   <div class="inner">
-    <h2 class="stitle">{sections.find((s) => s.key === app.settingsSection)?.label}</h2>
-
     {#if app.settingsSection === "workspace"}
       <WorkspaceSettingsScreen />
     {/if}
@@ -611,12 +610,9 @@
     box-sizing: border-box;
     overflow-y: auto;
   }
-  .snav h1 {
+  .title {
     margin: 0 0 14px;
     padding: 0 10px;
-    font-family: var(--font-serif);
-    font-size: 28px;
-    font-weight: 500;
   }
   .snav button {
     display: flex;
@@ -644,12 +640,6 @@
   .ssub {
     font-size: 12px;
     color: var(--ink-3);
-  }
-  .stitle {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 24px;
-    font-weight: 500;
   }
   .rules {
     margin: 0;

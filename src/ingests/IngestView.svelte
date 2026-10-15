@@ -47,6 +47,7 @@
   import RecordPanel from "./RecordPanel.svelte";
   import ChatSource from "./ChatSource.svelte";
   import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
   import { singleFlight } from "../lib/refresh";
 
   let overview = $state<IngestOverview | null>(null);
@@ -446,7 +447,7 @@
     ondragleave={() => (dropping = false)}
     ondrop={onDrop}
   >
-    <h1>Ingest</h1>
+    <div class="title"><ScreenHeader title="Ingest" /></div>
 
     <div class="adds">
       <button class="add drop" onclick={chooseFiles}>
@@ -791,12 +792,9 @@
   .left.dropping {
     background: var(--accent-soft);
   }
-  h1 {
+  .title {
     margin: 0 0 4px;
     padding: 0 4px;
-    font-family: var(--font-serif);
-    font-size: 28px;
-    font-weight: 500;
   }
   .adds {
     display: flex;

@@ -26,6 +26,7 @@
   import InlineNameRow from "./InlineNameRow.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
   import EmptyState from "../lib/ui/EmptyState.svelte";
+  import ScreenHeader from "../lib/ui/ScreenHeader.svelte";
 
   let { width }: { width: number } = $props();
 
@@ -164,6 +165,60 @@
 </script>
 
 <div class="tree" style:width="{width}px">
+  <div class="files-head">
+    <ScreenHeader title="Files">
+      {#snippet actions()}
+        {#if showUnreadFilter(app.unread.length, app.filesFilter)}
+          <div class="filter" role="tablist" aria-label="Filter files">
+            <button
+              class="seg"
+              class:on={app.filesFilter === "all"}
+              role="tab"
+              aria-selected={app.filesFilter === "all"}
+              onclick={() => (app.filesFilter = "all")}
+            >All</button>
+            <button
+              class="seg"
+              class:on={app.filesFilter === "unread"}
+              role="tab"
+              aria-selected={app.filesFilter === "unread"}
+              onclick={() => (app.filesFilter = "unread")}
+            >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
+          </div>
+        {/if}
+        <!-- Always shown; disabled (not hidden) when there is nothing to mark.
+             Uses aria-disabled + a data-disabled styling hook rather than the
+             native `disabled` attribute: a natively disabled button swallows
+             pointer/hover events, so its :hover::after tooltip would never fire.
+             Keeping the element hoverable lets the "why" tooltip appear, and the
+             onclick guards against acting while disabled. -->
+        <button
+          class="icon-btn"
+          class:is-disabled={!markAllEnabled}
+          data-disabled={!markAllEnabled}
+          data-tooltip={markAllEnabled
+            ? "Mark every changed file as viewed"
+            : "No unread files"}
+          aria-label="Mark all as viewed"
+          aria-disabled={!markAllEnabled}
+          onclick={() => {
+            if (markAllEnabled) void app.markAllSeen();
+          }}
+        >
+          <CheckCheck size={15} strokeWidth={1.75} />
+        </button>
+        <button
+          class="icon-btn"
+          data-tooltip="Import file"
+          aria-label="Import file"
+          disabled={imports.importing}
+          onclick={() => void imports.startImport()}
+        >
+          <Upload size={15} strokeWidth={1.75} />
+        </button>
+      {/snippet}
+    </ScreenHeader>
+  </div>
   {#if app.workspace && repos.length > 1}
     <div class="split" role="tablist" aria-label="Wiki or sources">
       <button class="side" class:on={side === "wiki"} role="tab" aria-selected={side === "wiki"} disabled={!split.wiki} onclick={() => showSide("wiki")}
@@ -208,60 +263,6 @@
       {/each}
     </div>
   {/if}
-
-  <div class="tree-head files-head">
-    <span class="ttl">Files</span>
-    <div class="head-actions">
-      {#if showUnreadFilter(app.unread.length, app.filesFilter)}
-        <div class="filter" role="tablist" aria-label="Filter files">
-          <button
-            class="seg"
-            class:on={app.filesFilter === "all"}
-            role="tab"
-            aria-selected={app.filesFilter === "all"}
-            onclick={() => (app.filesFilter = "all")}
-          >All</button>
-          <button
-            class="seg"
-            class:on={app.filesFilter === "unread"}
-            role="tab"
-            aria-selected={app.filesFilter === "unread"}
-            onclick={() => (app.filesFilter = "unread")}
-          >Unread{#if app.unread.length > 0}&nbsp;·&nbsp;{app.unread.length}{/if}</button>
-        </div>
-      {/if}
-      <!-- Always shown; disabled (not hidden) when there is nothing to mark.
-           Uses aria-disabled + a data-disabled styling hook rather than the
-           native `disabled` attribute: a natively disabled button swallows
-           pointer/hover events, so its :hover::after tooltip would never fire.
-           Keeping the element hoverable lets the "why" tooltip appear, and the
-           onclick guards against acting while disabled. -->
-      <button
-        class="icon-btn"
-        class:is-disabled={!markAllEnabled}
-        data-disabled={!markAllEnabled}
-        data-tooltip={markAllEnabled
-          ? "Mark every changed file as viewed"
-          : "No unread files"}
-        aria-label="Mark all as viewed"
-        aria-disabled={!markAllEnabled}
-        onclick={() => {
-          if (markAllEnabled) void app.markAllSeen();
-        }}
-      >
-        <CheckCheck size={15} strokeWidth={1.75} />
-      </button>
-      <button
-        class="icon-btn"
-        data-tooltip="Import file"
-        aria-label="Import file"
-        disabled={imports.importing}
-        onclick={() => void imports.startImport()}
-      >
-        <Upload size={15} strokeWidth={1.75} />
-      </button>
-    </div>
-  </div>
 
   {#if drag.error}
     <div class="move-error">
@@ -329,7 +330,7 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
-  /* The Files header stays visually pinned: sticky flush to the top of the
+  /* The screen's header stays pinned: sticky flush to the top of the
      scrolling .tree column (which carries no top padding, so there is nowhere
      for rows to show above it) so it never scrolls away with Favorites and the
      tree. A solid ground covers content sliding under it. */
@@ -337,24 +338,10 @@
     position: sticky;
     top: 0;
     z-index: 5;
-    background: var(--paper);
-    justify-content: space-between;
+    background: var(--rail);
     /* extend the ground to the column edges under the sticky row */
-    margin: 0 -8px;
-    padding-left: 18px;
-    padding-right: 12px;
-  }
-  .files-head .ttl {
-    flex: none;
-  }
-  .head-actions {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    /* header uppercases its text; keep control labels normal-case */
-    text-transform: none;
-    letter-spacing: 0;
-    font-weight: 500;
+    margin: 0 -8px 4px;
+    padding: 12px 12px 8px 18px;
   }
   .filter {
     display: inline-flex;
