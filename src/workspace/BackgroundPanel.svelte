@@ -70,6 +70,7 @@
         role="radio"
         aria-checked={setting.pace === p.value}
         disabled={busy}
+        title={p.note}
         onclick={() => setPace(p.value)}>{p.label}</button
       >
     {/each}

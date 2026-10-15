@@ -407,7 +407,7 @@
             <div class="list">
               {#each c.sources as src}
                 {@const reason = unopenableReason(toWorkspaceAddress(src))}
-                <span class="mono small" class:disabled-link={!!reason} title={reason ?? undefined}>{src}</span>
+                <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>{src}</span>
               {/each}
             </div>
           {/if}

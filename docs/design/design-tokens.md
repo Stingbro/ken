@@ -14,9 +14,9 @@ whitespace.
 
 A screen shows names, values and verbs. Taken from the SR page how-to
 (Shattered-Realms-Docs, `Engine/How-tos/UI/Building an SR page.md` §3).
+The rule is about visible text. Tooltips are where detail goes (rule 7).
 
-1. **No how-to text.** No sentence that explains how to use a screen, no
-   instructions in tooltips.
+1. **No how-to text.** No sentence on a screen that explains how to use it.
 2. **A subtitle holds a count or an id.** Nothing else: never a sentence,
    never a path.
 3. **No file paths.** A line that says what an action writes may stay.
@@ -25,8 +25,12 @@ A screen shows names, values and verbs. Taken from the SR page how-to
    `EmptyState` (`src/lib/ui/EmptyState.svelte`).
 5. **Labels, not sentences.** "Controls", "Recent", "no changes".
 6. **A control shows its state itself.** A checkbox, a radio or a badge
-   says it; a sentence does not repeat it. A tooltip only says why a
-   control is disabled.
+   says it; a sentence does not repeat it.
+7. **Tooltips may carry detail.** A path, a shortcut, what a count means,
+   why a control is disabled, what a hint or icon does. A tooltip never
+   repeats the visible label it sits on: "Add it to the decisions log" on
+   a button reading "Add to the decisions log" goes. (Chris, 2026-10-15:
+   "Tool tips are fine, just content everywhere is not the move.")
 
 Every screen has one title, in `ScreenHeader` (`src/lib/ui/ScreenHeader.svelte`):
 the title, an optional count or id, and on the right the screen's actions and

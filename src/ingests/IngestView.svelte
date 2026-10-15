@@ -461,7 +461,7 @@
         {/if}
       </div>
       {#each inProgress as r (r.path)}
-        <button class="qrow" class:sel={selectedRaw === r.path} onclick={() => selectRaw(r)}>
+        <button class="qrow" class:sel={selectedRaw === r.path} title={r.path} onclick={() => selectRaw(r)}>
           <span class="qdot {r.state}"></span>
           <span class="qname">{r.name}</span>
           <span class="qstat">{rawStatus(r)}</span>
@@ -513,7 +513,7 @@
           <h2>{@html renderTitle(card.takeaways.title || (card.note.split("/").pop() ?? ""))}</h2>
         </div>
         <div class="cacts">
-          <button class="btn btn-ghost" onclick={() => card && openSource(card.source)}>Open source</button>
+          <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => card && openSource(card.source)}>Open source</button>
           <button class="btn" onclick={() => card && inLibrary(card.note)}>Open the note</button>
           {#if card.open}
             <button class="btn btn-primary" disabled={busy !== null || cardWriting} onclick={seen}>Mark as seen</button>
@@ -660,7 +660,7 @@
           <h2>{rawSelected.name}</h2>
         </div>
         <div class="cacts">
-          <button class="btn btn-ghost" onclick={() => rawSelected && openSource(rawSelected.path)}>Open source</button>
+          <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => rawSelected && openSource(rawSelected.path)}>Open source</button>
           {#if acts.includes("remove")}
             <button class="btn" disabled={busy !== null} onclick={(e) => rawSelected && askRemove(e, rawSelected)}>Remove</button>
           {/if}

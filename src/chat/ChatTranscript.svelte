@@ -86,7 +86,7 @@
     <button
       class="pick"
       class:on={pick.selected.has(id)}
-      title="Pick for Ingest"
+      title={pick.selected.has(id) ? "Picked for Ingest (shift-click for a range)" : "Pick for Ingest (shift-click for a range)"}
       aria-label="Pick for Ingest"
       aria-pressed={pick.selected.has(id)}
       onclick={(e) => togglePick(e, id)}

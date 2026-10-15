@@ -62,7 +62,7 @@
       {#if decided === "accepted"}Accepted{:else if decided === "declined"}Declined{:else if decided === "partial"}Partly accepted{:else}Claude proposes{/if}
       {isNew ? "a new file" : `${hunks.length} ${hunks.length === 1 ? "change" : "changes"}`} to
       {#if proposal.relPath && showOpen}
-        <button class="file mono" onclick={open}>{file}</button>
+        <button class="file mono" onclick={open} title="Open {file}">{file}</button>
       {:else}
         <span class="file mono">{file}</span>
       {/if}

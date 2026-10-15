@@ -37,7 +37,7 @@
       {#each hits as hit, i (i)}
         <li class="mono">
           <span class="place">{hit.place}</span>
-          {#if hit.symbol}<span class="symbol">{hit.symbol}</span>{/if}
+          {#if hit.symbol}<span class="symbol" title="The definition this hit holds">{hit.symbol}</span>{/if}
         </li>
       {/each}
     </ul>

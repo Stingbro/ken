@@ -403,6 +403,7 @@
           value={pinnedMember ?? ""}
           onchange={(e) => setPinnedMember(e.currentTarget.value || null)}
           aria-label="Project"
+          title="Narrow to one project"
         >
           <option value="">Everywhere</option>
           <!-- Dormant members are pinnable: routing opens their index by
