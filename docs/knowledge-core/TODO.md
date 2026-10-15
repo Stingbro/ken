@@ -380,6 +380,26 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check is clean apart from the known warnings. Tests: ken-core 876 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 797 passed in 65 files; `npm run check` 0 errors, the 6 known warnings.
   - Not run: the app. Nothing migrates: a knowledge base without the page reports it as a template gap, and its first risk or issue added makes it.
 
+- **Clean pass** (`c18c300`, `b6d8342`, `ee35c6e`, `b8a875d`, `2e23385`, `b6ad2b5`). Tidying before review; no new features.
+  - Polish (`c18c300`), the two items the re-check left: `markdown::renderTitle` shows a title's `code` spans as code (the Log, the Inbox, the Ingest card's rulings, risks and tickets, Your day, the findings in Settings); a risk or issue card shows the line or two ingest wrote (`ingestCard::raidDetail`, read from the proposal, so older cards show it too).
+  - Dead code (`b6d8342`, `ee35c6e`), each proven unreached by a caller search:
+    - 16 Tauri commands no screen called: set-up's folder form (`setup_confirm`), `setup_propose`, `discover_workspace_candidates`, the workspace candidate list and its `.kenignore` writers (`workspace_candidates`, `workspace_ignored`, `workspace_ignore_candidate`, `workspace_unignore_candidate`), `open_member`, `close_member`, `last_project_id`, `ingest_status`, the merged tree (`get_tree_all`), project rename and forget, group editing (`workspace_set_group`, `workspace_remove_group`).
+    - The built-in `workspace` flag's twelve `workspace_enabled` gates, always true.
+    - 17 ken-core items with no caller: `chat_oneshot_traced` and the stream-json one-shot path with it, `Db::code_indexed_files`, `first_chunk`, `remove_ocr`, `reopen_review_item`, `merge_and_rerank_with`, `Running::relabel`, `registry::description_of`, `digest::QUIET_DIGEST`, `findings::open_from`, `Project::is_excluded`, `Project::set_name`, `workspace::ignore_folder`, `unignore_folder`, `WorkspaceConfig::remove_group`.
+    - Frontend: `Placeholder.svelte` and `ProjectSwitcher.svelte` (never mounted), six store methods and the merged-tree state, six `api.ts` wrappers and `memberGroup`, four helpers.
+  - Warnings (`b8a875d`): none left (see "How to pick it up").
+  - Stale text (`2e23385`): the Map and its extraction in the local model's docs and the model catalog's row, six keys in the v22 note, "the team file", the team kind, entities and the search-only tier in comments, the chat guide's Memories block (the person's, not the team's), the README (ingest as it is now, what Ken writes where), and the prototype layout in the design tokens.
+  - Names (`b6ad2b5`): "Add to the decisions log", not "the log", now that the Log is a screen; "the knowledge base" for "the wiki" in two messages; the `team` class names are `workspace`.
+  - Left for Chris, not removed:
+    - Commands with no caller that belong to kept features: `memory_write`, `journal_append`, `read_journal` (memory stays, decision 37) and `rename_chat`.
+    - `setup::confirm` stays as the rescan test's fixture; `setup_rescan` still serves a workspace the folder form made.
+    - Functions only tests call, from before the rebuild: the run log (`Db::insert_run` and the rest), the digests table (`upsert_digest`, `get_digest`, `latest_digest`), `runner::run_ingest_session`, `workspace::linked_projects`, `groups_for_member`, `WorkspaceConfig::set_group`.
+    - Design-system classes nothing uses: `.k-pill`, `.btn-large`, and `.k-segmented` (Explore's).
+    - Names: "source" is both a workspace repo and a source for ingest; Settings › Workspace calls its rows repos and sources, and Your day's health line says folders. The chat guide says "wiki" where the rest says "knowledge base"; it stays as measured (slice 11's carry-over).
+    - `docs/superpowers/` holds dated specs and plans, left as written.
+  - The compile check and svelte-check report no warnings. Tests: ken-core 840 passed, 0 failed, 38 ignored (five tests went with the code they tested; the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 803 passed in 65 files.
+  - Not run: the app.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
@@ -455,7 +475,7 @@ The test suite has been run (2026-10-14) and passes, the end-to-end run is done,
     - `c6ddd7d` (finding 10): the set-up sources table fits its card. The set-up panel is 460px wide at any window size and the old column minimums came to more than that; the source and kind columns now shrink, a path breaks anywhere (the full path is its tooltip), the kind chips wrap and the table scrolls down only.
     - The compile check is clean apart from the known warnings (one fewer). Tests: ken-core 845 passed, 0 failed, 38 ignored (the profiler's tests went with it; the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 797 passed in 65 files; `npm run check` 0 errors, the 6 known warnings. The sidecar was not re-staged.
   - The compile check is clean apart from the known warnings. Tests: ken-core 870 passed, 0 failed, 38 ignored (and the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 796 passed in 65 files; `npm run check` 0 errors, the 6 known warnings.
-- [x] **Re-check the fixed items in the app** (a release build, with Chris): the meaning index finishing after a change and the controls running after Accept, the ingest's findings in the Inbox, no template findings and one lint commit at most on a fresh install, no `.ken/project.json`, `code` proposed for a manifest-less repo, the quick answer citing D-001, the six UI items, and drift starting within a minute of a push. Done 2026-10-14 at `b303280` on a fresh workspace: all held, and the Log showed R-001, ETW-001, I-001 and D-001 from one meeting note. Drift fixed a page 73 seconds after a push, with no click. Left for polish: inline code in titles shows raw backticks (the Log, the ticket card's heading), and the risk and issue cards show only the title, not the line ingest wrote.
+- [x] **Re-check the fixed items in the app** (a release build, with Chris): the meaning index finishing after a change and the controls running after Accept, the ingest's findings in the Inbox, no template findings and one lint commit at most on a fresh install, no `.ken/project.json`, `code` proposed for a manifest-less repo, the quick answer citing D-001, the six UI items, and drift starting within a minute of a push. Done 2026-10-14 at `b303280` on a fresh workspace: all held, and the Log showed R-001, ETW-001, I-001 and D-001 from one meeting note. Drift fixed a page 73 seconds after a push, with no click. Left for polish: inline code in titles shows raw backticks (the Log, the ticket card's heading), and the risk and issue cards show only the title, not the line ingest wrote. Both done in the clean pass.
 - [ ] Ask Chris before merging anything.
 
 ## Next: slice 15, Chris's answers
