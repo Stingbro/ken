@@ -5,6 +5,7 @@ import {
   controlResult,
   editorLines,
   findingLabel,
+  kindValue,
   kindlessRepos,
   orderFindings,
   parseControls,
@@ -107,16 +108,24 @@ describe("controls", () => {
 describe("analysisNote", () => {
   const row = { analyzing: false, analysisWaiting: false, roles: [] as string[], settingsName: "Game" };
   it("says busy first, then a waiting card", () => {
-    expect(analysisNote({ ...row, analyzing: true, analysisWaiting: true }, [], "Wiki")).toMatch(/^Queued or running/);
-    expect(analysisNote({ ...row, analysisWaiting: true }, [], "Wiki")).toMatch(/replaces it/);
+    expect(analysisNote({ ...row, analyzing: true, analysisWaiting: true }, [], "Wiki")).toBe("analysing");
+    expect(analysisNote({ ...row, analysisWaiting: true }, [], "Wiki")).toBe("proposal in the Inbox");
   });
   it("says when the file holds its rules or controls already", () => {
-    expect(analysisNote(row, [], "Wiki")).toMatch(/^Nothing for it/);
-    expect(analysisNote({ ...row, roles: ["src/net/** = protocol"] }, [], "Wiki")).toMatch(/Accept adds only/);
-    expect(analysisNote(row, [{ source: "game" }], "Wiki")).toMatch(/Accept adds only/);
+    expect(analysisNote(row, [], "Wiki")).toBeNull();
+    expect(analysisNote({ ...row, roles: ["src/net/** = protocol"] }, [], "Wiki")).toBe("has rules or controls");
+    expect(analysisNote(row, [{ source: "game" }], "Wiki")).toBe("has rules or controls");
     // A control with no source is the knowledge base's own.
-    expect(analysisNote(row, [{ source: null }], "Wiki")).toMatch(/^Nothing for it/);
-    expect(analysisNote({ ...row, settingsName: "Wiki" }, [{ source: null }], "Wiki")).toMatch(/Accept adds only/);
+    expect(analysisNote(row, [{ source: null }], "Wiki")).toBeNull();
+    expect(analysisNote({ ...row, settingsName: "Wiki" }, [{ source: null }], "Wiki")).toBe("has rules or controls");
+  });
+});
+
+describe("kindValue", () => {
+  it("joins two kinds and leaves none empty", () => {
+    expect(kindValue({ kind: ["wiki", "code"] })).toBe("wiki+code");
+    expect(kindValue({ kind: ["code"] })).toBe("code");
+    expect(kindValue({ kind: [] })).toBe("");
   });
 });
 
