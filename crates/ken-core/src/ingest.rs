@@ -280,17 +280,28 @@ fn slug(name: &str) -> String {
     if s.is_empty() { "source".into() } else { s }
 }
 
+/// Whether a name holds a date (`2026-10-14`) anywhere.
+fn has_date(name: &str) -> bool {
+    name.as_bytes()
+        .windows(10)
+        .any(|w| w.iter().enumerate().all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() }))
+}
+
 /// Where a source of `kind` goes on `date` (`YYYY-MM-DD`): its kind's
-/// folder, then the month, not colliding with an earlier one.
+/// folder, then the month, not colliding with an earlier one. The note is
+/// named for the day it was read, unless the source's name has a date of
+/// its own (`meeting-2026-10-14`): then that name is enough, so a name
+/// never carries two dates.
 pub fn place(root: &Path, raw: &str, date: &str, kind: SourceKind) -> Placement {
     let file = raw.rsplit('/').next().unwrap_or(raw).to_string();
     let stem = file.rsplit_once('.').map_or(file.as_str(), |(s, _)| s);
     let month = date.get(..7).unwrap_or(date);
     let dir = format!("{INGESTED}/{}/{month}", kind.folder());
-    let mut base = format!("{date}-{}", slug(stem));
+    let name = if has_date(&slug(stem)) { slug(stem) } else { format!("{date}-{}", slug(stem)) };
+    let mut base = name.clone();
     let mut n = 2;
     while root.join(&dir).join(format!("{base}.md")).exists() || root.join(&dir).join(&base).exists() {
-        base = format!("{date}-{}-{n}", slug(stem));
+        base = format!("{name}-{n}");
         n += 1;
     }
     Placement {
@@ -1210,6 +1221,39 @@ pub struct RaidItem {
     pub owner: String,
 }
 
+/// Who a risk or issue belongs to when the plan left its owner empty: the
+/// one person present (the note's `Present:` line) named in the note's
+/// sentence that says most of what the item says. None when no sentence
+/// shares two of its words, or that sentence names no one or several.
+fn owner_from_note(note: &str, item: &RaidItem) -> Option<String> {
+    let people = present_of(note);
+    if people.is_empty() {
+        return None;
+    }
+    let mut words: Vec<String> = format!("{} {}", item.title, item.detail)
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 4)
+        .map(str::to_string)
+        .collect();
+    words.sort();
+    words.dedup();
+    let sentences = note
+        .lines()
+        .filter(|l| !l.trim_start().to_lowercase().starts_with("present"))
+        .flat_map(|l| l.split(". "));
+    let (shared, best) = sentences
+        .map(|s| (words.iter().filter(|w| s.to_lowercase().contains(w.as_str())).count(), s))
+        .max_by_key(|(n, _)| *n)?;
+    if shared < 2 {
+        return None;
+    }
+    let tokens: Vec<&str> = best.split(|c: char| !c.is_alphanumeric()).collect();
+    let named: Vec<&String> =
+        people.iter().filter(|p| p.split_whitespace().next().is_some_and(|first| tokens.contains(&first))).collect();
+    (named.len() == 1).then(|| named[0].clone())
+}
+
 /// A list the model may write as one comma-separated string.
 fn list_or_string<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
@@ -1275,9 +1319,11 @@ pub fn plan_prompt(pages: &[(String, String)], note: &str, context: &str, topics
            made it when the note says, a few aliases (other words anyone might search for it by), and the ids of the \
            rulings it replaces, from the passages below.\n\
          - risks: what the note says might go wrong and has not yet, each with a title of a few words, what would \
-           show it in one line, and who watches it when the note says. Most notes raise none.\n\
-         - issues: problems the note says exist now that no ruling or action settles, each the same way. A question \
-           the note leaves open is not an issue.\n\
+           show it in one line, and its owner: the person the note says raised it, watches it or will deal with it \
+           (\"Ana worried that…\" makes Ana its owner). Leave the owner empty only when the note names no one. Most \
+           notes raise none.\n\
+         - issues: problems the note says exist now that no ruling or action settles, each the same way, its owner \
+           too. A question the note leaves open is not an issue.\n\
          - renames: each thing the note says now goes by another name, old and new, for the Vocabulary page.\n\
          - topics: for the note (page \"note\") and each page you update, create or retire, ",
     );
@@ -2382,7 +2428,7 @@ pub fn follow_ups(
     let register = fs::read_to_string(root.join(crate::raid::RAID_PAGE)).unwrap_or_default();
     for (kind, items) in [(crate::raid::Kind::Risk, &plan.risks), (crate::raid::Kind::Issue, &plan.issues)] {
         for item in items {
-            let owner = Some(item.owner.trim().to_string()).filter(|o| !o.is_empty());
+            let owner = Some(item.owner.trim().to_string()).filter(|o| !o.is_empty()).or_else(|| owner_from_note(note, item));
             let draft = crate::raid::Draft {
                 kind,
                 title: item.title.trim().to_string(),
@@ -2615,6 +2661,40 @@ pub fn card_of(payload: Option<&str>) -> Option<Card> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_risk_or_issue_left_without_an_owner_takes_who_the_note_names() {
+        let note = "---\ntitle: Save format sync\n---\n# Save format sync\n\nPresent: Ana, Ben\n\n## Risks and problems\n\n\
+                    Ana worried that a single save file could lose the whole world if the game crashes halfway through a \
+                    write. Ben said saving already takes about four seconds on the biggest test world.\n";
+        let risk = RaidItem {
+            title: "Crash mid-write loses world".into(),
+            detail: "A crash partway through writing leaves the whole world corrupt".into(),
+            owner: String::new(),
+        };
+        assert_eq!(owner_from_note(note, &risk).as_deref(), Some("Ana"));
+        let issue = RaidItem { title: "Saving already takes four seconds".into(), ..Default::default() };
+        assert_eq!(owner_from_note(note, &issue).as_deref(), Some("Ben"));
+        let nobody = RaidItem { title: "The build server is slow".into(), ..Default::default() };
+        assert_eq!(owner_from_note(note, &nobody), None, "no sentence says it");
+        assert_eq!(owner_from_note("# A note\n\nThe world may be lost in a crash.\n", &risk), None, "no one present");
+        assert!(plan_prompt(&[], note, "", &[]).contains("makes Ana its owner"), "the plan is asked for the owner");
+    }
+
+    #[test]
+    fn a_note_named_for_a_dated_source_carries_one_date() {
+        let d = tempfile::tempdir().unwrap();
+        let p = place(d.path(), &format!("{RAW}/meeting-2026-10-14.md"), "2026-10-15", SourceKind::Meeting);
+        assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-10/meeting-2026-10-14.md"));
+        let p = place(d.path(), &format!("{RAW}/2026-10-14 standup.txt"), "2026-10-15", SourceKind::Meeting);
+        assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-10/2026-10-14-standup.md"));
+        fs::create_dir_all(d.path().join(format!("{INGESTED}/Meetings/2026-10"))).unwrap();
+        fs::write(d.path().join(&p.note), "x").unwrap();
+        let again = place(d.path(), &format!("{RAW}/2026-10-14 standup.txt"), "2026-10-15", SourceKind::Meeting);
+        assert_eq!(again.note, format!("{INGESTED}/Meetings/2026-10/2026-10-14-standup-2.md"));
+        let undated = place(d.path(), &format!("{RAW}/Standup notes.txt"), "2026-10-15", SourceKind::Meeting);
+        assert_eq!(undated.note, format!("{INGESTED}/Meetings/2026-10/2026-10-15-standup-notes.md"));
+    }
 
     #[test]
     fn a_card_title_is_whole_or_cut_at_a_word() {
