@@ -74,7 +74,7 @@ export type Screen =
 /** Settings' sections (the Briefing design's sub-nav). Workspace holds the
  *  workspace settings (knowledge-core decision 37): sources, kinds, index
  *  rules, tiers, roles, controls and health. */
-export type SettingsSection = "general" | "workspace" | "sync" | "ai" | "agents" | "rules";
+export type SettingsSection = "general" | "workspace" | "ai" | "agents";
 
 /** One entry in `app.members` (workspace task 4.3). In Single mode (no
  *  workspace open) this is just the one open project, `status: "active"`

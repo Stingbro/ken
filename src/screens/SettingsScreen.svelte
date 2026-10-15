@@ -2,9 +2,9 @@
   import WorkspaceSettingsScreen from "./WorkspaceSettingsScreen.svelte";
   import BackgroundPanel from "../workspace/BackgroundPanel.svelte";
   import type { SettingsSection } from "../lib/app.svelte";
-  // Settings: what is yours (You), what is this computer's (This machine),
-  // Ken's features, the connector for agents, and About. Each repo's own
-  // settings open from its row under Workspace.
+  // Settings, four sections: General, Workspace (each repo's own settings
+  // open from its row, and the knowledge base's sync shows beside it), AI
+  // and Agents.
   import { onMount, untrack } from "svelte";
   import { app } from "../lib/app.svelte";
   import { memory } from "../lib/memory.svelte";
@@ -48,10 +48,8 @@
   const sections: { key: SettingsSection; label: string }[] = [
     { key: "general", label: "General" },
     { key: "workspace", label: "Workspace" },
-    { key: "sync", label: "Sync" },
     { key: "ai", label: "AI" },
     { key: "agents", label: "Agents" },
-    { key: "rules", label: "Ingest rules" },
   ];
 
   const themeOptions: { value: ThemeMode; title: string }[] = [
@@ -227,50 +225,6 @@
   <div class="inner">
     {#if app.settingsSection === "workspace"}
       <WorkspaceSettingsScreen />
-    {/if}
-
-    {#if app.settingsSection === "sync"}
-      <section class="group">
-        <div class="card">
-          <div class="card-title">How the knowledge base syncs</div>
-          <p class="note">
-            Only the knowledge base syncs, through its own Git remote: Ken commits what it wrote there, never anything
-            else in the folder, and never commits in a code repo. Memory stays on this computer. A file two people
-            changed at once shows in the Inbox under Sync &amp; files, with both versions side by side.
-          </p>
-        </div>
-      </section>
-    {/if}
-
-    {#if app.settingsSection === "rules"}
-      <section class="group">
-        <div class="card">
-          <div class="card-title">What Ken writes on its own</div>
-          <p class="note">
-            When a source is added, Ken writes the note and the pages it changes at once, each citing the note: one
-            section of a page at a time, and new pages in their section's index. Each ingest is one commit in the
-            knowledge base, so git takes it back.
-          </p>
-        </div>
-        <div class="card">
-          <div class="card-title">What waits for you</div>
-          <ul class="rules">
-            <li>A ruling, as a ready entry for the decisions log. One click adds it.</li>
-            <li>An edit to a page in Rules, or one that goes against a ruling or the code.</li>
-            <li>An edit that rewrites more than a fifth of a page, or lands on a page someone changed while Ken was reading.</li>
-            <li>An action. It becomes a ticket once accepted.</li>
-          </ul>
-          <p class="note">
-            These wait in the Inbox under Ken, with what the source contradicts and the questions it leaves open. Human
-            edits always win.
-          </p>
-        </div>
-        <div class="card">
-          <div class="card-title">The project's own rules</div>
-          <p class="note">The rules reviewers check work against are pages in the knowledge base. Add one under Workspace.</p>
-          <div class="row"><button class="btn btn-small" onclick={() => (app.settingsSection = "workspace")}>Open Workspace</button></div>
-        </div>
-      </section>
     {/if}
 
     <!-- ── General ─────────────────────────────────────────────────── -->
@@ -609,13 +563,6 @@
   .slabel {
     font-size: 13.5px;
     font-weight: 600;
-  }
-  .rules {
-    margin: 0;
-    padding-left: 18px;
-    font-size: 13.5px;
-    line-height: 1.6;
-    color: var(--ink-2);
   }
   .wrap {
     flex: 1;
