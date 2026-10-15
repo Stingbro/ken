@@ -177,12 +177,6 @@ const WORKSPACE_RESIDENT_CAP: usize = 12;
 /// Max member initial-scans allowed to run at once (design D4 / task 3.1).
 const WORKSPACE_INGEST_CONCURRENCY: usize = 2;
 
-/// Friendly error returned by every workspace command when the global
-/// `workspace` flag is off (task 3.4). Mirrors `open_member`/`close_member`'s
-/// flag gate, just with launcher-ready wording.
-const WORKSPACE_DISABLED_MSG: &str =
-    "The workspace feature is off — turn it on in Settings → Features to open a workspace.";
-
 /// A counting semaphore capping how many member initial-scans run
 /// concurrently (task 3.1 / design D4). `std` has no semaphore, so this is
 /// the classic `Mutex<permits>` + `Condvar` pair — the same hand-rolled
@@ -848,8 +842,8 @@ fn start_semantic_build(
 /// `clear_others` controls whether pre-existing entries in `state.members`
 /// are dropped first: `true` (single-project mode — `create_project` /
 /// `open_project`) keeps the map at <=1 entry, matching the pre-workspace
-/// behavior exactly; `false` (`open_member`, workspace flag on) leaves other
-/// open members running so the map can hold more than one.
+/// behavior exactly; `false` (a workspace's members) leaves other open
+/// members running so the map can hold more than one.
 fn activate(app: &AppHandle, state: &SharedState, project: Project, clear_others: bool) -> CmdResult<ProjectInfo> {
     // Captured up front (Uuid is Copy) so every per-project event closure
     // below can move its own copy in without borrowing `project` itself.
@@ -1492,13 +1486,6 @@ fn open_project(app: AppHandle, state: State<SharedState>, path: String) -> CmdR
     activate(&app, &state, project, true)
 }
 
-/// Workspaces and search routed across the workspace are how Ken works, not
-/// switches (`features::BUILT_IN`): always on, whatever an older
-/// `settings.json` says. The helper stays so its callers read as before.
-fn workspace_enabled(_app_settings: &ken_core::settings::AppSettings) -> bool {
-    true
-}
-
 /// Display label given to the workspace pseudo-member's `Project::name`
 /// (ken-memory task 2.1) — shows up wherever a member's name flows through
 /// unchanged (route_search's `MemberInfo::name`, say).
@@ -1523,45 +1510,6 @@ fn memory_pseudo_member_id(state: &AppState) -> Option<uuid::Uuid> {
         .workspace
         .as_ref()
         .map(|ws| memory::workspace_pseudo_member_id(ws.ws.config.id))
-}
-
-/// Open an additional project alongside whatever is already open, without
-/// disturbing it (S9 step 6 / `workspace` change). Gated on the global
-/// `workspace` flag — off, this is a no-op error so a stray call can't grow
-/// `state.members` past one entry outside workspace mode. The asset-protocol
-/// scope grant for the member's root happens inside `activate`, same as
-/// `open_project` — nothing to duplicate here.
-#[tauri::command(async)]
-fn open_member(app: AppHandle, state: State<SharedState>, path: String) -> CmdResult<ProjectInfo> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err("workspace disabled".into());
-        }
-    }
-    let project = Project::open(std::path::Path::new(&path)).map_err(err)?;
-    activate(&app, &state, project, false)
-}
-
-/// Close one member of an open workspace, leaving the others running. Gated
-/// on the global `workspace` flag like `open_member`. If the closed member
-/// was focused, focus falls to an arbitrary remaining member (or `None` if
-/// it was the last one) — `MemberRuntime`'s `Drop`/`StopOnDrop` fields stop
-/// its watcher and background workers.
-#[tauri::command(async)]
-fn close_member(state: State<SharedState>, project_id: String) -> CmdResult<()> {
-    let mut guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err("workspace disabled".into());
-    }
-    let uuid: uuid::Uuid = project_id.parse().map_err(err)?;
-    if guard.members.remove(&uuid).is_none() {
-        return Err("project not open".into());
-    }
-    if guard.focused == Some(uuid) {
-        guard.focused = guard.members.keys().next().copied();
-    }
-    Ok(())
 }
 
 // ── Workspace mode ─────────────────────────────────────────────────────────
@@ -1735,9 +1683,8 @@ fn record_workspace_recent(state: &SharedState) {
 
 /// Focus a workspace member, activating it if dormant and evicting the LRU
 /// front when that pushes residents past `WORKSPACE_RESIDENT_CAP` (task 3.2).
-/// Eviction is a plain `members.remove`, which drops the `MemberRuntime` —
-/// the exact same teardown `close_member` performs (its `StopOnDrop`/`Drop`
-/// fields stop the watcher and background workers). Shared by `focus_project`
+/// Eviction is a plain `members.remove`, which drops the `MemberRuntime`:
+/// its `StopOnDrop`/`Drop` fields stop the watcher and background workers. Shared by `focus_project`
 /// and the open/reopen focus-restore path. Never holds the global guard while
 /// calling `activate` (which locks internally).
 fn focus_member_inner(app: &AppHandle, state: &SharedState, id: uuid::Uuid) -> CmdResult<()> {
@@ -2081,25 +2028,19 @@ fn open_workspace_inner(
 }
 
 /// Open an existing workspace (`<parent>/.ken-workspace/workspace.json`) and
-/// bring its members online (task 3.1). Flag-gated (task 3.4).
+/// bring its members online (task 3.1).
 #[tauri::command(async)]
 fn open_workspace(
     app: AppHandle,
     state: State<SharedState>,
     parent: String,
 ) -> CmdResult<WorkspaceOverviewDto> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-    }
     let ws = ken_core::workspace::Workspace::open(Path::new(&parent)).map_err(err)?;
     open_workspace_inner(&app, state.inner(), ws)
 }
 
 /// Create a new workspace over `parent` from the selected member folder names,
-/// then open it (task 3.1). Flag-gated (task 3.4).
+/// then open it (task 3.1).
 #[tauri::command(async)]
 fn create_workspace(
     app: AppHandle,
@@ -2108,74 +2049,23 @@ fn create_workspace(
     name: String,
     members: Vec<String>,
 ) -> CmdResult<WorkspaceOverviewDto> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-    }
     let ws = ken_core::workspace::Workspace::create(Path::new(&parent), &name, &members)
         .map_err(err)?;
     open_workspace_inner(&app, state.inner(), ws)
 }
 
 /// Members + per-member status + counts for the open workspace (task 3.2).
-/// Flag-gated (task 3.4).
 #[tauri::command(async)]
 fn workspace_overview(state: State<SharedState>) -> CmdResult<WorkspaceOverviewDto> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-    }
     build_workspace_overview(state.inner())
 }
 
 /// Focus a member, activating a dormant one and LRU-evicting past the cap
-/// (task 3.2). Flag-gated (task 3.4).
+/// (task 3.2).
 #[tauri::command(async)]
 fn focus_project(app: AppHandle, state: State<SharedState>, id: String) -> CmdResult<()> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-    }
     let uuid: uuid::Uuid = id.parse().map_err(err)?;
     focus_member_inner(&app, state.inner(), uuid)
-}
-
-/// Set-up, step one to three: scan a code folder and propose a row per repo
-/// (kind, evidence) and the ignore entries. Reads only.
-#[tauri::command]
-async fn setup_propose(parent: String) -> CmdResult<ken_core::setup::Proposal> {
-    // Not flag-gated: set-up is how a fresh install opts into several repos
-    // (Confirm turns the workspace flag on). `git worktree list` per repo:
-    // off the UI thread.
-    tauri::async_runtime::spawn_blocking(move || ken_core::setup::propose(Path::new(&parent)).map_err(err))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Set-up, Confirm: write the manifest, the registry's kinds and the ticked
-/// ignore lines, then open the workspace so
-/// indexing starts. The only set-up step that writes.
-#[tauri::command(async)]
-fn setup_confirm(
-    app: AppHandle,
-    state: State<SharedState>,
-    parent: String,
-    name: String,
-    rows: Vec<ken_core::setup::RepoRow>,
-    ignores: Vec<ken_core::setup::IgnoreRow>,
-) -> CmdResult<WorkspaceOverviewDto> {
-    let base = state.lock().unwrap().base_dir.clone();
-    let ws = ken_core::setup::confirm(&base, Path::new(&parent), &name, &rows, &ignores, &local_date_today())
-        .map_err(err)?;
-    let overview = open_workspace_inner(&app, state.inner(), ws)?;
-    analyze_new_sources(&app, state.inner());
-    Ok(overview)
 }
 
 /// Set-up from repos picked one by one, wherever they are: a row per repo
@@ -2471,32 +2361,12 @@ async fn setup_rescan(parent: String) -> CmdResult<Vec<ken_core::setup::Moved>> 
         .map_err(|e| e.to_string())?
 }
 
-/// Immediate subfolder candidates for the workspace-creation UI (task 3.2) —
-/// a thin flag-gated wrapper over `ken_core::workspace::discover_candidates`.
-#[tauri::command(async)]
-fn discover_workspace_candidates(
-    state: State<SharedState>,
-    parent: String,
-) -> CmdResult<Vec<ken_core::workspace::Candidate>> {
-    {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-    }
-    ken_core::workspace::discover_candidates(Path::new(&parent)).map_err(err)
-}
-
 /// Close the open workspace, tearing down every member handle (task 3.2).
 /// `members.clear()` drops all runtimes; recents get the last focus + now.
-/// Flag-gated (task 3.4).
 #[tauri::command(async)]
 fn close_workspace(app: AppHandle, state: State<SharedState>) -> CmdResult<()> {
     let (base, ws_core, focused, closed) = {
         let mut guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
         let ws = guard.workspace.take().ok_or("no workspace open")?;
         let focused = guard.focused.take();
         // Every runtime goes (full teardown); they drop below, with the lock
@@ -2582,18 +2452,6 @@ fn set_project_index(
     Ok(registry.statuses())
 }
 
-#[tauri::command(async)]
-fn forget_project(state: State<SharedState>, id: String) -> CmdResult<()> {
-    let guard = state.lock().unwrap();
-    let uuid: uuid::Uuid = id.parse().map_err(err)?;
-    let mut registry = Registry::load(&guard.base_dir).map_err(err)?;
-    registry.remove(uuid);
-    if registry.last_project == Some(uuid) {
-        registry.last_project = None;
-    }
-    registry.save(&guard.base_dir).map_err(err)
-}
-
 /// The workspaces opened recently, newest first, each with whether its folder
 /// is still there: the start screen's "Recent workspaces".
 #[tauri::command(async)]
@@ -2615,55 +2473,6 @@ fn forget_workspace(state: State<SharedState>, id: String) -> CmdResult<()> {
         registry.last_workspace = None;
     }
     registry.save(&guard.base_dir).map_err(err)
-}
-
-/// Rename a project. The name lives in two stores that must stay in step: the
-/// project's own `.ken/project.json` (source of truth, travels with the folder)
-/// and the user-level registry (drives the switcher/recents). When the renamed
-/// project is the open one, the in-memory copy is updated too so the title bar
-/// and switcher reflect it without a reopen.
-#[tauri::command]
-fn rename_project(
-    state: State<SharedState>,
-    id: String,
-    name: String,
-) -> CmdResult<ProjectInfo> {
-    let uuid: uuid::Uuid = id.parse().map_err(err)?;
-    let mut guard = state.lock().unwrap();
-    let base_dir = guard.base_dir.clone();
-
-    let mut registry = Registry::load(&base_dir).map_err(err)?;
-    let entry_path = registry
-        .projects
-        .iter()
-        .find(|e| e.id == uuid)
-        .map(|e| e.path.clone())
-        .ok_or("unknown project")?;
-
-    // Rewrite `.ken/project.json`, validating first — an invalid name aborts
-    // here before either store is touched.
-    let info = if let Some(active) = guard.members.get_mut(&uuid) {
-        active.project.set_name(&name).map_err(err)?;
-        ProjectInfo::of(&active.project)
-    } else {
-        let mut project = Project::open(&entry_path).map_err(err)?;
-        project.set_name(&name).map_err(err)?;
-        ProjectInfo::of(&project)
-    };
-
-    if let Some(entry) = registry.projects.iter_mut().find(|e| e.id == uuid) {
-        entry.name = info.name.clone();
-    }
-    registry.save(&base_dir).map_err(err)?;
-    Ok(info)
-}
-
-/// The id of the most recently opened project, for launch-to-last-project.
-#[tauri::command]
-fn last_project_id(state: State<SharedState>) -> CmdResult<Option<String>> {
-    let guard = state.lock().unwrap();
-    let registry = Registry::load(&guard.base_dir).map_err(err)?;
-    Ok(registry.last_project.map(|id| id.to_string()))
 }
 
 #[tauri::command]
@@ -2739,107 +2548,6 @@ fn get_tree(state: State<SharedState>) -> CmdResult<TreeData> {
         .into_iter()
         .map(|row| FileRowDto::new(row, &excluded))
         .collect();
-    Ok(TreeData { files, folders })
-}
-
-/// The whole workspace as ONE tree: every resolvable member's files and
-/// folders, each path prefixed with the member's folder name so the top
-/// level of the tree is the projects themselves.
-///
-/// Deliberately the same `TreeData` shape as [`get_tree`], so `FileTree`
-/// renders it with no changes — a prefixed path is just a path with one
-/// more leading segment. The prefix is also what makes a selection
-/// resolvable: `app.openTab` splits it back off, focuses that member, and
-/// opens the remainder (see its comment), which is why the prefix is the
-/// MANIFEST folder name rather than the display name — folder names are
-/// unique within a parent, display names need not be.
-///
-/// Dormant members are read the same way `route_search` reads them: their
-/// index opens by project id without activating anything.
-#[tauri::command(async)]
-fn get_tree_all(state: State<SharedState>) -> CmdResult<TreeData> {
-    let (base_dir, members) = {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-        let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-        let members: Vec<(String, ken_core::project::Project, Option<Arc<Mutex<Db>>>)> = ws
-            .ws
-            .members
-            .iter()
-            .filter_map(|m| match &m.status {
-                ken_core::workspace::MemberStatus::Ok(p) => Some((
-                    m.name.clone(),
-                    p.clone(),
-                    guard.members.get(&p.config.id).map(|r| r.search_db.clone()),
-                )),
-                _ => None,
-            })
-            .collect();
-        (guard.base_dir.clone(), members)
-    };
-
-    let mut files: Vec<FileRowDto> = Vec::new();
-    let mut folders: Vec<FolderInfo> = Vec::new();
-
-    for (folder_name, project, live) in members {
-        let excluded = project.excluded_folders();
-        // Each member is a folder in the merged tree — and a nested member
-        // ("SR/ShatteredRealms") needs its group folder ("SR") emitted
-        // too, or the tree has a node whose parent doesn't exist. Emitted
-        // per member and de-duplicated by the sort+dedup below, so two SR
-        // members yield one SR node.
-        if let Some(group) = ken_core::workspace::member_group(&folder_name) {
-            folders.push(FolderInfo {
-                excluded: false,
-                rel_path: group.to_string(),
-            });
-        }
-        folders.push(FolderInfo {
-            excluded: false,
-            rel_path: folder_name.clone(),
-        });
-
-        let rows = match live {
-            Some(db) => db.lock().unwrap().list_files().unwrap_or_default(),
-            None => Db::open(&base_dir, project.config.id)
-                .ok()
-                .and_then(|db| db.list_files().ok())
-                .unwrap_or_default(),
-        };
-        for mut row in rows {
-            row.rel_path = format!("{folder_name}/{}", row.rel_path);
-            files.push(FileRowDto::new(row, &excluded));
-        }
-
-        // Folders from disk, same as `get_tree`, so an excluded or empty
-        // one still appears under its project.
-        let walker = ignore::WalkBuilder::new(&project.root)
-            .hidden(true)
-            .git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                name != ".ken" && !(e.path().is_dir() && ken_core::scan::is_junk_dir_name(&name))
-            })
-            .build();
-        for entry in walker.flatten() {
-            if entry.path().is_dir() && entry.path() != project.root {
-                if let Ok(rel) = entry.path().strip_prefix(&project.root) {
-                    let rel = rel.to_string_lossy().replace('\\', "/");
-                    folders.push(FolderInfo {
-                        excluded: ken_core::project::in_folders(&excluded, &rel),
-                        rel_path: format!("{folder_name}/{rel}"),
-                    });
-                }
-            }
-        }
-    }
-
-    folders.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    folders.dedup_by(|a, b| a.rel_path == b.rel_path);
     Ok(TreeData { files, folders })
 }
 
@@ -3003,8 +2711,7 @@ fn list_features(
     };
 
     // A requested project that isn't the open one is loaded from disk via the
-    // registry (mirrors `rename_project`), so overrides read true even when it
-    // isn't active.
+    // registry, so overrides read true even when it isn't active.
     let project = match (&project_id, active_project) {
         (Some(_), Some(p)) => Some(p),
         (Some(id), None) => {
@@ -7647,34 +7354,6 @@ async fn ingest_remove(app: AppHandle, state: State<'_, SharedState>, path: Stri
     Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestStatusDto {
-    has_inbox: bool,
-    /// New sources in Raw, not yet processed.
-    waiting: Vec<String>,
-    /// Sources in Raw an older card holds, waiting for Seen to file them.
-    in_review: Vec<String>,
-    running: bool,
-    claude_found: bool,
-}
-
-/// What waits in the focused project's library inbox.
-#[tauri::command(async)]
-fn ingest_status(app: AppHandle, state: State<SharedState>) -> CmdResult<IngestStatusDto> {
-    let id = inbox_member(&app, &state)?;
-    let guard = state.lock().unwrap();
-    let active = member(&guard, Some(id))?;
-    let root = &active.project.root;
-    Ok(IngestStatusDto {
-        has_inbox: ken_core::ingest::has_inbox(root),
-        waiting: ken_core::ingest::waiting_new(root, &active.db).map_err(err)?,
-        in_review: ken_core::ingest::in_review(root, &active.db).map_err(err)?,
-        running: INGEST_RUNNING.lock().unwrap().contains(&active.project.config.id),
-        claude_found: ken_core::runner::discover_claude().is_some(),
-    })
-}
-
 /// Read what waits in Raw/ now, whatever the repo's kind.
 #[tauri::command(async)]
 fn ingest_now(app: AppHandle, state: State<SharedState>) -> CmdResult<bool> {
@@ -10189,149 +9868,6 @@ fn spawn_task_board_watch(app: AppHandle, state: SharedState) -> StopOnDrop {
 // the members overview the add/remove commands return.
 // ---------------------------------------------------------------------
 
-/// Sibling folders under the workspace root that are NOT yet members —
-/// the "add this repo too" list. Mirrors `discover_candidates`' filtering
-/// (no dot-folders, no junk dirs) minus everything already joined.
-#[tauri::command(async)]
-fn workspace_candidates(state: State<SharedState>) -> CmdResult<Vec<CandidateDto>> {
-    let guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err(WORKSPACE_DISABLED_MSG.into());
-    }
-    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
-    let existing: Vec<String> = ws.ws.config.members.clone();
-    let root = ws.ws.root.clone();
-    drop(guard);
-
-    // `discover_candidates` already applies the workspace-root
-    // `.kenignore`, so nothing extra is filtered here.
-    let found = ken_core::workspace::discover_candidates(&root).map_err(err)?;
-    Ok(found
-        .into_iter()
-        // Not already a member, and not a group folder that CONTAINS
-        // members — adding "SR" itself while "SR/ShatteredRealms" is a
-        // member would nest one project's tree inside another's.
-        .filter(|c| {
-            !existing
-                .iter()
-                .any(|m| m == &c.name || m.starts_with(&format!("{}/", c.name)))
-        })
-        .map(|c| CandidateDto {
-            name: c.name,
-            existing: c.existing,
-            file_count: c.file_count,
-            markers: c.markers,
-        })
-        .collect())
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CandidateDto {
-    name: String,
-    /// Already has `.ken/project.json` — it will be adopted, not created.
-    existing: bool,
-    file_count: usize,
-    markers: Vec<String>,
-}
-
-/// Folder names currently excluded by the workspace-root `.kenignore`,
-/// for the UI's "not projects" list. Derived by testing each sibling
-/// folder against the rules rather than by parsing lines back out, so a
-/// hand-written glob (`sr-universe-*/`) reports every folder it hides.
-#[tauri::command(async)]
-fn workspace_ignored(state: State<SharedState>) -> CmdResult<Vec<String>> {
-    let guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err(WORKSPACE_DISABLED_MSG.into());
-    }
-    let root = guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone();
-    drop(guard);
-
-    let rules = ken_core::workspace::ignore_rules(&root);
-    if rules.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Two levels, matching membership's D6 shape: a rule can hide a direct
-    // child ("worlds/") or something inside a group folder
-    // ("SR/scratch/"). Rows are parent-relative paths; an ignored
-    // top-level folder reports alone — descending into it would list every
-    // child as redundantly ignored via parent matching.
-    let mut out: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&root).map_err(err)?.filter_map(|e| e.ok()) {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        if ken_core::workspace::is_ignored_folder(&rules, &name) {
-            out.push(name);
-            continue;
-        }
-        for child in std::fs::read_dir(entry.path())
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-        {
-            if !child.path().is_dir() {
-                continue;
-            }
-            let Some(child_name) = child.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if child_name.starts_with('.') {
-                continue;
-            }
-            let rel = format!("{name}/{child_name}");
-            if ken_core::workspace::is_ignored_folder(&rules, &rel) {
-                out.push(rel);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// Exclude a sibling folder by appending a rule to the workspace-root
-/// `.kenignore` — the same file, syntax, and matcher a project's own
-/// `.kenignore` uses, just governing the parent folder. Hand-editing it
-/// works exactly as well as this command.
-#[tauri::command]
-fn workspace_ignore_candidate(state: State<SharedState>, folder: String) -> CmdResult<Vec<String>> {
-    let root = {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-        guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
-    };
-    ken_core::workspace::ignore_folder(&root, &folder).map_err(err)?;
-    workspace_ignored(state)
-}
-
-#[tauri::command]
-fn workspace_unignore_candidate(state: State<SharedState>, folder: String) -> CmdResult<Vec<String>> {
-    let root = {
-        let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
-        guard.workspace.as_ref().ok_or("no workspace open")?.ws.root.clone()
-    };
-    // False here means the folder is hidden by a hand-written glob rather
-    // than a line we wrote — say so instead of silently doing nothing.
-    if !ken_core::workspace::unignore_folder(&root, &folder).map_err(err)? {
-        return Err(format!(
-            "\"{folder}\" is excluded by a pattern in .kenignore — edit that file to change it"
-        ));
-    }
-    workspace_ignored(state)
-}
-
 /// Join an existing sibling folder to the open workspace.
 ///
 /// Until now the only way to add a member was the creation picker, which
@@ -10351,9 +9887,6 @@ fn workspace_add_member(state: State<SharedState>, folder: String) -> CmdResult<
     // escape the workspace root.
     let folder = ken_core::workspace::validate_member_name(&folder).map_err(err)?;
     let mut guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err(WORKSPACE_DISABLED_MSG.into());
-    }
     let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
     if ws.ws.config.members.iter().any(|m| m == &folder) {
         return Err(format!("\"{folder}\" is already in this workspace"));
@@ -10392,9 +9925,6 @@ struct RemovedMemberDto {
 fn workspace_remove_member(state: State<SharedState>, name: String) -> CmdResult<RemovedMemberDto> {
     {
         let mut guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
         let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
         let id = ws.ws.members.iter().find(|m| m.name == name).and_then(|m| match &m.status {
             ken_core::workspace::MemberStatus::Ok(p) => Some(p.config.id),
@@ -10431,9 +9961,6 @@ struct ProjectGroupDto {
 #[tauri::command(async)]
 fn workspace_groups(state: State<SharedState>) -> CmdResult<Vec<ProjectGroupDto>> {
     let guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err(WORKSPACE_DISABLED_MSG.into());
-    }
     let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
     Ok(group_dtos(&ws.ws))
 }
@@ -10469,36 +9996,6 @@ fn group_dtos(ws: &ken_core::workspace::Workspace) -> Vec<ProjectGroupDto> {
             }
         })
         .collect()
-}
-
-/// Create or replace a group, then persist the manifest.
-#[tauri::command(async)]
-fn workspace_set_group(
-    state: State<SharedState>,
-    name: String,
-    members: Vec<String>,
-) -> CmdResult<Vec<ProjectGroupDto>> {
-    let mut guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err(WORKSPACE_DISABLED_MSG.into());
-    }
-    let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
-    ws.ws.config.set_group(&name, &members).map_err(err)?;
-    ws.ws.save().map_err(err)?;
-    Ok(group_dtos(&ws.ws))
-}
-
-#[tauri::command(async)]
-fn workspace_remove_group(state: State<SharedState>, name: String) -> CmdResult<Vec<ProjectGroupDto>> {
-    let mut guard = state.lock().unwrap();
-    if !workspace_enabled(&guard.app_settings) {
-        return Err(WORKSPACE_DISABLED_MSG.into());
-    }
-    let ws = guard.workspace.as_mut().ok_or("no workspace open")?;
-    if ws.ws.config.remove_group(&name) {
-        ws.ws.save().map_err(err)?;
-    }
-    Ok(group_dtos(&ws.ws))
 }
 
 #[derive(Serialize)]
@@ -10543,9 +10040,6 @@ fn workspace_members_overview(state: State<SharedState>) -> CmdResult<Vec<Member
 
     let (base_dir, entries) = {
         let guard = state.lock().unwrap();
-        if !workspace_enabled(&guard.app_settings) {
-            return Err(WORKSPACE_DISABLED_MSG.into());
-        }
         let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
         let entries: Vec<Entry> = ws
             .ws
@@ -12172,23 +11666,16 @@ pub fn run() {
             list_projects,
             create_project,
             open_project,
-            open_member,
-            close_member,
             open_workspace,
             create_workspace,
             workspace_overview,
             focus_project,
-            discover_workspace_candidates,
             close_workspace,
-            forget_project,
             list_recent_workspaces,
             forget_workspace,
-            rename_project,
-            last_project_id,
             current_project,
             set_folder_selection,
             get_tree,
-            get_tree_all,
             set_project_feature,
             set_global_feature,
             list_features,
@@ -12250,13 +11737,10 @@ pub fn run() {
             code_file,
             code_usages,
             run_drift_now,
-            setup_propose,
-            setup_confirm,
             setup_rescan,
             setup_propose_repos,
             setup_confirm_repos,
             set_project_description,
-            ingest_status,
             ingest_overview,
             knowledge_base_id,
             embedding_state,
@@ -12348,14 +11832,8 @@ pub fn run() {
             resolve_page_link,
             ticket_set_status,
             workspace_groups,
-            workspace_set_group,
-            workspace_remove_group,
-            workspace_candidates,
             workspace_add_member,
             workspace_remove_member,
-            workspace_ignored,
-            workspace_ignore_candidate,
-            workspace_unignore_candidate,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Ken")

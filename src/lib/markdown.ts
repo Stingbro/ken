@@ -43,8 +43,3 @@ export function renderTitle(text: string, mark: (s: string) => string = escapeHt
     .map((part, i) => (i % 2 === 1 ? `<code class="title-code">${mark(part)}</code>` : mark(part)))
     .join("");
 }
-
-/** A href that points inside the project (relative, no scheme). */
-export function isProjectLink(href: string): boolean {
-  return !/^[a-z][a-z0-9+.-]*:/i.test(href) && !href.startsWith("//");
-}

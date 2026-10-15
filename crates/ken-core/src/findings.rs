@@ -178,11 +178,6 @@ pub fn ever(db: &Db, kind: &str) -> Result<Vec<Finding>> {
         .collect())
 }
 
-/// How many open findings came from `source`.
-pub fn open_from(db: &Db, source: &str) -> Result<usize> {
-    Ok(open(db)?.into_iter().filter(|(_, f)| f.source == source).count())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,7 +206,6 @@ mod tests {
         assert!(open[0].0.title.starts_with("Contradicts D-012: "));
         assert!(open[0].0.body.contains("> we save it all in one file") && open[0].0.body.contains("[[2026-10-13-standup]]"));
         assert!(open[0].0.body.contains("waits for a person"), "a ruling binds");
-        assert_eq!(open_from(&db, &f.source).unwrap(), 1);
         let q = Finding { kind: "question".into(), source: f.source.clone(), text: "Who owns saves?".into(), ..Default::default() };
         assert!(!q.binds() && q.title() == "Open question: Who owns saves?");
         assert_eq!(f.page(), f.source, "a ruling is no page: the note opens");

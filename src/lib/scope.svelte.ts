@@ -91,16 +91,6 @@ class ScopeStore {
     this.kind = kind;
     this.value = value;
   }
-
-  async saveGroup(name: string, members: string[]) {
-    this.groups = await api.workspaceSetGroup(name, members);
-  }
-
-  async deleteGroup(name: string) {
-    this.groups = await api.workspaceRemoveGroup(name);
-    if (this.kind === "group" && this.value === name) this.set("all", null);
-    await this.refreshGroups();
-  }
 }
 
 export const scope = new ScopeStore();

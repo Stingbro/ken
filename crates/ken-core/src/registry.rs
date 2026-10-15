@@ -185,14 +185,6 @@ pub fn awaits_kind(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// What a person said the repo at `root` is for, from the default registry.
-pub fn description_of(root: &Path) -> Option<String> {
-    default_base_dir()
-        .and_then(|base| Registry::load(&base))
-        .ok()
-        .and_then(|reg| reg.entry_at(root).and_then(|e| e.description.clone()))
-}
-
 /// [`Registry::kind_of`] against the registry in the default app-data
 /// directory. Empty when it cannot be read.
 pub fn kind_of(root: &Path) -> Vec<RepoKind> {

@@ -64,13 +64,6 @@ export function shortTarget(target: string | null | undefined, today: string = l
   });
 }
 
-/** The long form, for the task panel: "Wed, Oct 1". */
-export function longTarget(target: string | null | undefined): string {
-  const d = parseIsoDate(target);
-  if (!d) return "";
-  return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
-}
-
 /** True when the target is before today and the task is still open. */
 export function isOverdue(task: Pick<DayTask, "state" | "target">, today: string = localToday()): boolean {
   return task.state === "open" && !!task.target && task.target < today;

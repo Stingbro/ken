@@ -2256,15 +2256,6 @@ impl Db {
         Ok(())
     }
 
-    /// Open a resolved review item again.
-    pub fn reopen_review_item(&mut self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE review_items SET status = 'open', resolved_at = NULL WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
     pub fn resolve_review_item(&mut self, id: i64, at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE review_items SET status = 'resolved', resolved_at = ?2
@@ -3006,15 +2997,6 @@ impl Db {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// How many files are in the code index: none on an index made before it.
-    pub fn code_indexed_files(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT path FROM code_symbols UNION SELECT DISTINCT path FROM code_imports)",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-
     /// Map every indexed code file from its stored text, for an index made
     /// before the code index. Returns how many files were mapped.
     pub fn backfill_code_index(&mut self) -> Result<usize> {
@@ -3067,16 +3049,6 @@ impl Db {
                 params![path, line],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?)
-    }
-
-    /// A file's first chunk (id, text): what a linked page shows as a hit.
-    pub fn first_chunk(&self, rel_path: &str) -> Result<Option<(i64, String)>> {
-        Ok(self
-            .conn
-            .query_row("SELECT id, text FROM chunks WHERE path = ?1 ORDER BY id LIMIT 1", params![rel_path], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
             .optional()?)
     }
 
@@ -3549,17 +3521,6 @@ impl Db {
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
-
-    /// Drop a file's OCR bookkeeping (regions + queue row). Used by callers that
-    /// invalidate a file's OCR without going through `remove_file`.
-    pub fn remove_ocr(&mut self, rel_path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM ocr_regions WHERE rel_path = ?1", params![rel_path])?;
-        self.conn
-            .execute("DELETE FROM ocr_pending WHERE rel_path = ?1", params![rel_path])?;
-        Ok(())
-    }
-
 }
 
 #[derive(Debug, Clone, Copy)]

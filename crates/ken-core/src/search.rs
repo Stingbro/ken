@@ -155,19 +155,6 @@ pub fn merge_and_rerank(fts_hits: &[FtsHit], vec_hits: &[VecHit], query: &str) -
     rerank(query, merge_hits(fts_hits, vec_hits), vec_hits)
 }
 
-/// [`merge_and_rerank`] with meaning distances for keyword hits the KNN list
-/// missed (see [`rerank_with`]) and each file's authority (see
-/// [`rerank_weighted`]).
-pub fn merge_and_rerank_with(
-    fts_hits: &[FtsHit],
-    vec_hits: &[VecHit],
-    query: &str,
-    extra: &HashMap<String, f64>,
-    authority: &HashMap<String, f64>,
-) -> Vec<HybridHit> {
-    rerank_weighted(query, merge_hits(fts_hits, vec_hits), vec_hits, extra, authority)
-}
-
 // --- Reranking (semantic-index S7b Condition C) -----------------------------
 //
 // B4 owns recall and a validated *default* order (FTS precision first, KNN

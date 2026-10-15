@@ -29,9 +29,6 @@ impl DigestSources {
     }
 }
 
-/// Stored verbatim as the digest on days with nothing to report.
-pub const QUIET_DIGEST: &str = "A quiet day — nothing new since yesterday.";
-
 /// How many changed paths the prompt lists at most.
 const MAX_PROMPT_FILES: usize = 20;
 

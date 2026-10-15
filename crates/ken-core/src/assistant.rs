@@ -305,25 +305,6 @@ pub fn chat_oneshot_with(
     run_oneshot(binary, project_root, prompt, timeout, cancel, &args)
 }
 
-/// [`chat_oneshot_with`] over `--output-format stream-json --verbose`, so
-/// every event comes back with the outcome: each tool call Claude made and
-/// what it returned, in order, for measuring how an answer was found. On a
-/// timeout the events are those printed before it.
-#[allow(clippy::too_many_arguments)]
-pub fn chat_oneshot_traced(
-    binary: &Path,
-    project_root: &Path,
-    dirs: &[std::path::PathBuf],
-    mcp_config: &Path,
-    prompt: &str,
-    timeout: Duration,
-    cancel: &CancelToken,
-    look: bool,
-) -> Result<(OneshotOutcome, Vec<serde_json::Value>)> {
-    let args = chat_args(project_root, dirs, mcp_config, look);
-    run_oneshot_events(binary, project_root, prompt, timeout, cancel, &args, true)
-}
-
 /// The access a headless chat turn gets: its guide, Ken's MCP server and the
 /// tools it may use without asking, and with `look` the read-only file tools
 /// over `dirs`.

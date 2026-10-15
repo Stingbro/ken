@@ -384,13 +384,6 @@ impl Running {
             j.total = total;
         }
     }
-
-    /// What it is working on now.
-    pub fn relabel(&self, label: &str) {
-        if let Some(j) = state().jobs.iter_mut().find(|j| j.id == self.0) {
-            j.label = label.to_string();
-        }
-    }
 }
 
 impl Drop for Running {

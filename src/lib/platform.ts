@@ -38,8 +38,3 @@ export function claudeInstallHelp(mac: boolean = isMac): string {
 export function systemAudioLabel(mac: boolean = isMac): string {
   return mac ? "system audio (Screen Recording)" : "system audio";
 }
-
-/** Where a file manager opens a file's folder. */
-export function fileManagerName(mac: boolean = isMac): string {
-  return mac ? "Finder" : "File Explorer";
-}

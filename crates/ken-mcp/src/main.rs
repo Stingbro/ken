@@ -2940,10 +2940,7 @@ mod tests {
         registry.add(&project_b);
         registry.save(base.path()).unwrap();
 
-        let mut settings = AppSettings::default();
-        settings.features.insert("workspace".into(), true.into());
-        settings.features.insert("kgRouting".into(), true.into());
-        settings.save(base.path()).unwrap();
+        AppSettings::default().save(base.path()).unwrap();
 
         let server = Server {
             base_dir: base.path().to_path_buf(),

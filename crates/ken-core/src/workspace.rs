@@ -314,15 +314,6 @@ impl WorkspaceConfig {
         self.members.len() != before
     }
 
-    /// Remove a group. Returns whether one was actually removed, so a
-    /// caller can tell "deleted" from "already gone" without a prior read.
-    pub fn remove_group(&mut self, name: &str) -> bool {
-        let before = self.groups.len();
-        self.groups
-            .retain(|g| !g.name.trim().eq_ignore_ascii_case(name.trim()));
-        self.groups.len() != before
-    }
-
     /// Parsed `links` array (design D12). Deliberately **not** a typed
     /// `WorkspaceConfig` field: the manifest already round-trips unknown
     /// keys through `extra` (see `unknown_fields_survive_roundtrip`), and a
@@ -636,67 +627,10 @@ pub fn is_ignored_folder(rules: &[crate::kenignore::Rule], name: &str) -> bool {
     crate::kenignore::classify(name, true, &[rules]) == crate::kenignore::Tier::Ignored
 }
 
-/// Append a folder rule to the workspace-root `.kenignore`, creating the
-/// file with a short header if absent. Idempotent — a folder already
-/// excluded by ANY existing rule (a glob, not just its own literal line)
-/// is left alone rather than adding a redundant duplicate.
-pub fn ignore_folder(parent: &Path, folder: &str) -> Result<bool> {
-    let folder = folder.trim().trim_end_matches('/');
-    // Same shape rule as membership (D6): a bare folder or one inside a
-    // single group folder. `validate_member_name` also rejects `..`/drive
-    // prefixes, which matters more here — this string is written to disk.
-    let folder = &validate_member_name(folder).map_err(|_| {
-        Error::Other(
-            "only a folder in the workspace (or inside one of its group \
-             folders) can be ignored"
-                .into(),
-        )
-    })?;
-    if is_ignored_folder(&ignore_rules(parent), folder) {
-        return Ok(false);
-    }
-    let path = ignore_path(parent);
-    let mut text = fs::read_to_string(&path).unwrap_or_default();
-    if text.is_empty() {
-        text.push_str(
-            "# Ken ignores these, using .gitignore syntax.\n\
-             # `~pattern` indexes a path for search only; `!pattern` forces it back in.\n",
-        );
-    }
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&format!("{}\n", folder_line(folder)));
-    fs::write(&path, text).map_err(|e| Error::io(&path, e))?;
-    Ok(true)
-}
-
 /// The line that ignores one workspace folder: anchored (`/Game/`), so it
 /// means that folder and not any folder of that name anywhere below.
 pub fn folder_line(folder: &str) -> String {
     format!("/{}/", folder.trim().trim_matches('/'))
-}
-
-/// Remove the `/folder/` line this module writes (or the unanchored
-/// `folder/` it wrote before). Returns false when
-/// no such literal line exists — a folder excluded by a hand-written glob
-/// (`sr-universe-*/`) is deliberately NOT rewritten here, because editing
-/// someone's glob to carve out one folder is a guess about intent.
-pub fn unignore_folder(parent: &Path, folder: &str) -> Result<bool> {
-    let folder = folder.trim().trim_end_matches('/');
-    let path = ignore_path(parent);
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Ok(false);
-    };
-    let forms = [folder_line(folder), format!("{folder}/"), folder.to_string(), format!("/{folder}")];
-    let kept: Vec<&str> = text.lines().filter(|line| !forms.iter().any(|f| line.trim() == f)).collect();
-    if kept.len() == text.lines().count() {
-        return Ok(false);
-    }
-    let mut out = kept.join("\n");
-    out.push('\n');
-    fs::write(&path, out).map_err(|e| Error::io(&path, e))?;
-    Ok(true)
 }
 
 /// A linked git worktree: its `.git` is a file pointing into another repo's
@@ -956,9 +890,6 @@ mod tests {
         ws.config.set_group("g", &["a".into(), "b".into()]).unwrap();
         assert_eq!(ws.config.groups.len(), 1);
         assert_eq!(ws.config.group_members("G"), ["a", "b"]);
-
-        assert!(ws.config.remove_group("G"));
-        assert!(!ws.config.remove_group("G"), "second remove is a no-op");
     }
 
     #[test]
@@ -971,16 +902,11 @@ mod tests {
         let before = discover_candidates(dir.path()).unwrap();
         assert_eq!(before.len(), 3);
 
-        assert!(ignore_folder(dir.path(), "worlds").unwrap());
-        assert!(!ignore_folder(dir.path(), "worlds").unwrap(), "idempotent");
+        fs::write(ignore_path(dir.path()), format!("{}\n", folder_line("worlds"))).unwrap();
 
         let after = discover_candidates(dir.path()).unwrap();
         let names: Vec<&str> = after.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["ken", "shared-source"]);
-
-        assert!(unignore_folder(dir.path(), "worlds").unwrap());
-        assert_eq!(discover_candidates(dir.path()).unwrap().len(), 3);
-        assert!(!unignore_folder(dir.path(), "worlds").unwrap(), "no-op twice");
     }
 
     /// The whole point of using `.kenignore` rather than a list: a
@@ -999,12 +925,6 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, ["ken"], "a glob must hide every match");
-
-        // And a glob is left alone rather than rewritten to carve one out.
-        assert!(
-            !unignore_folder(dir.path(), "sr-universe-current").unwrap(),
-            "un-ignoring must not edit someone's glob"
-        );
     }
 
     /// A search-only rule says how much of a file to index; it has no
@@ -1015,18 +935,6 @@ mod tests {
         fs::create_dir_all(dir.path().join("notes")).unwrap();
         fs::write(ignore_path(dir.path()), "~notes/\n").unwrap();
         assert_eq!(discover_candidates(dir.path()).unwrap().len(), 1);
-    }
-
-    /// D6 relaxed the old flat-only rule: ONE level of nesting (a folder
-    /// inside a group folder) is now a valid ignore target, the same shape
-    /// membership allows. Deeper paths and traversal stay rejected.
-    #[test]
-    fn ignore_folder_rejects_paths() {
-        let dir = tempdir().unwrap();
-        assert!(ignore_folder(dir.path(), "a/b").is_ok());
-        assert!(ignore_folder(dir.path(), "a/b/c").is_err());
-        assert!(ignore_folder(dir.path(), "../escape").is_err());
-        assert!(ignore_folder(dir.path(), "  ").is_err());
     }
 
     #[test]
@@ -1364,12 +1272,11 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert!(names.is_empty(), "SR/ rule should hide the whole group: {names:?}");
-        // And a nested entry can itself be ignored/unignored.
+        // And a nested entry can itself be ignored.
         let dir2 = tempdir().unwrap();
         fs::create_dir_all(dir2.path().join("SR/scratch")).unwrap();
-        assert!(ignore_folder(dir2.path(), "SR/scratch").unwrap());
+        fs::write(ignore_path(dir2.path()), format!("{}\n", folder_line("SR/scratch"))).unwrap();
         assert!(is_ignored_folder(&ignore_rules(dir2.path()), "SR/scratch"));
-        assert!(unignore_folder(dir2.path(), "SR/scratch").unwrap());
-        assert!(!is_ignored_folder(&ignore_rules(dir2.path()), "SR/scratch"));
+        assert!(!is_ignored_folder(&ignore_rules(dir2.path()), "SR/other"));
     }
 }

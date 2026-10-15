@@ -1050,13 +1050,6 @@ export function memberLeaf(name: string): string {
   return slash === -1 ? name : name.slice(slash + 1);
 }
 
-/** The group folder a nested member lives in (`SR/ShatteredRealms` →
- *  `SR`), or null for a direct child of the workspace root. */
-export function memberGroup(name: string): string | null {
-  const slash = name.lastIndexOf("/");
-  return slash === -1 ? null : name.slice(0, slash);
-}
-
 /** Mirrors `WorkspaceOverviewDto` — the open workspace's manifest header
  *  plus the full member roster, as returned by `open_workspace`,
  *  `create_workspace`, and `workspace_overview`. */
@@ -1392,8 +1385,6 @@ export const api = {
     invoke<WorkspaceOverview>("create_workspace", { parent, name, members }),
   /** Set-up Confirm: writes the manifest, kinds and the ticked
    *  ignore lines, then opens the workspace. */
-  setupConfirm: (parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) =>
-    invoke<WorkspaceOverview>("setup_confirm", { parent, name, rows, ignores }),
   /** Set-up from repos picked one by one (a folder of repos stands for
    *  each inside it). Reads only. */
   setupProposeRepos: (paths: string[]) => invoke<SetupProposal>("setup_propose_repos", { paths }),
@@ -1414,20 +1405,13 @@ export const api = {
   focusProject: (id: string) => invoke<void>("focus_project", { id }),
   /** Close the open workspace, tearing down every member's runtime. */
   closeWorkspace: () => invoke<void>("close_workspace"),
-  forgetProject: (id: string) => invoke<void>("forget_project", { id }),
   /** Workspaces opened recently, newest first. */
   listRecentWorkspaces: () => invoke<RecentWorkspace[]>("list_recent_workspaces"),
   forgetWorkspace: (id: string) => invoke<void>("forget_workspace", { id }),
-  renameProject: (id: string, name: string) =>
-    invoke<ProjectInfo>("rename_project", { id, name }),
   currentProject: () => invoke<ProjectInfo | null>("current_project"),
   setFolderSelection: (excluded: string[]) =>
     invoke<ProjectInfo>("set_folder_selection", { excluded }),
   getTree: () => invoke<TreeData>("get_tree"),
-  /** The whole workspace as one tree: every member's files and folders,
-   *  each path prefixed with the member's folder name. Same shape as
-   *  getTree, so FileTree renders it unchanged. */
-  getTreeAll: () => invoke<TreeData>("get_tree_all"),
   /** Search the workspace's sources, merged once by relevance (knowledge-core
    *  decisions 15 and 20): every source, or only one the query names; a
    *  reference repo only for a platform question, when named, or when nothing
@@ -1449,10 +1433,6 @@ export const api = {
     }),
   /** Named groups of members, stored in the workspace manifest. */
   workspaceGroups: () => invoke<ProjectGroup[]>("workspace_groups"),
-  workspaceSetGroup: (name: string, members: string[]) =>
-    invoke<ProjectGroup[]>("workspace_set_group", { name, members }),
-  workspaceRemoveGroup: (name: string) =>
-    invoke<ProjectGroup[]>("workspace_remove_group", { name }),
   /** Take a repo out of the workspace (its folder and files stay). Its
    *  knowledge base's link report names the pages that still cite it. */
   workspaceRemoveMember: (name: string) =>

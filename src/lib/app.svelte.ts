@@ -7,7 +7,6 @@ import {
   type RegistryEntryStatus,
   type ScanStats,
   type SemanticIndexState,
-  type SetupIgnoreRow,
   type SetupRepoRow,
   type SyncStateName,
   type WorkspaceOverview,
@@ -353,33 +352,14 @@ class AppStore {
     this.registry = await api.listProjects();
   }
 
-  /** Files shows the whole workspace as one tree, projects at the top
-   *  level, rather than only the focused member. Off in single-project
-   *  mode, where there is nothing to merge. */
-  treeShowsAllProjects = $state(false);
-
   /** One tree read at a time (see `singleFlight`). */
   readonly refreshTree = singleFlight(async () => {
     if (!this.project) return;
-    const merged = this.treeShowsAllProjects && !!this.workspace;
-    // A failed merged read must not blank the tree — fall back to the
-    // focused member rather than showing nothing.
-    const tree = merged
-      ? await api.getTreeAll().catch(() => null)
-      : await api.getTree();
-    const resolved = tree ?? (await api.getTree());
-    this.files = resolved.files;
-    this.folders = resolved.folders;
+    const tree = await api.getTree();
+    this.files = tree.files;
+    this.folders = tree.folders;
     this.pruneFavorites();
   });
-
-  /** Switch Files between the merged workspace tree and the focused
-   *  member's own. */
-  async setTreeShowsAllProjects(all: boolean) {
-    if (this.treeShowsAllProjects === all) return;
-    this.treeShowsAllProjects = all;
-    await this.refreshTree();
-  }
 
   private pruneFavorites() {
     if (!this.project) return;
@@ -510,31 +490,6 @@ class AppStore {
   // ── Tabs ──────────────────────────────────────────────────────────────
   /** Open a file in a preview tab (single-click) or persistent tab. */
   openTab(path: string, persistent = false) {
-    // In the merged workspace tree every path is `<member folder>/<rest>`,
-    // but reads, tabs and recents are all project-relative. So a merged
-    // path is resolved HERE, at the one funnel every open goes through:
-    // focus the member it names, then open the remainder against it.
-    //
-    // Opening a file this way leaves you in that project with its own
-    // tree — picking a file out of the merged view is how you travel to
-    // a project, which is more predictable than staying merged and having
-    // tabs from several projects that look alike.
-    if (this.treeShowsAllProjects && this.workspace) {
-      // Longest-prefix match, not first-segment split: a nested member's
-      // key is itself two segments ("SR/ShatteredRealms"), so the member
-      // is whichever key the path starts with at a segment boundary.
-      const member = this.workspace.members
-        .filter((m) => path === m.name || path.startsWith(m.name + "/"))
-        .sort((a, b) => b.name.length - a.name.length)[0];
-      if (member?.projectId) {
-        const rest = path === member.name ? "" : path.slice(member.name.length + 1);
-        void this.focusMember(member.projectId).then(() => {
-          this.treeShowsAllProjects = false;
-          if (rest) this.openTab(rest, persistent);
-        });
-        return;
-      }
-    }
     this.applyTabState(reduceOpenTab({ tabs: this.fileTabs, active: this.activeTab }, path, persistent));
     this.recents = recordRecent(this.recents, path);
     if (this.project) saveRecents(this.project.id, this.recents);
@@ -659,13 +614,6 @@ class AppStore {
     await this.loadFocusedMemberState(overview);
   }
 
-  /** Set-up's Confirm: write what the person chose and open the workspace. */
-  async confirmSetup(parent: string, name: string, rows: SetupRepoRow[], ignores: SetupIgnoreRow[]) {
-    const overview = await api.setupConfirm(parent, name, rows, ignores);
-    this.workspace = overview;
-    await this.loadFocusedMemberState(overview);
-  }
-
   /** Switch focus to member `id` — the nav-rail switcher's click/`Ctrl+P`
    *  cycle target. `focus_project` also fires `workspace-state`'s `focus`
    *  event (handled in `init()`, routes back through
@@ -717,13 +665,6 @@ class AppStore {
    *  from `workspace-state`'s `open`/`focus` events and `member-status`
    *  events (workspace task 4.3: "screens reload their stores on the focus
    *  workspace-state event"). */
-  /** Public re-read of the workspace roster, for callers that changed
-   *  membership themselves (adding a project) and can't wait for the
-   *  `workspace-state` event that normally drives this. */
-  async refreshWorkspace() {
-    await this.refreshWorkspaceOverview();
-  }
-
   async refreshWorkspaceOverview() {
     const overview = await api.workspaceOverview().catch(() => null);
     if (!overview) return;
@@ -817,13 +758,6 @@ class AppStore {
   /** The workspace settings (was the Team screen). */
   openWorkspaceSettings() {
     this.openSettings("workspace");
-  }
-
-  /** The Log: the project's RAID register and milestones (knowledge-core
-   *  decision 37). */
-  openLog() {
-    this.screen = "log";
-    this.searchOpen = false;
   }
 
   /** Move a file or folder: update open tabs, favorites, and the selection.

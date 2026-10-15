@@ -215,12 +215,6 @@ impl Project {
         write_config(&config_path(&self.root), &self.config)
     }
 
-    /// Is a project-relative path inside a folder of `project.json`'s
-    /// `excluded`?
-    pub fn is_excluded(&self, rel_path: &str) -> bool {
-        in_folders(&self.config.excluded, rel_path)
-    }
-
     /// Whether this source's older ignore files have moved into the
     /// knowledge base's `.ken/knowledge.json`
     /// (`knowledge_settings::move_legacy_ignores`): from then on its
@@ -328,16 +322,6 @@ impl Project {
         let Some((ws, member)) = self.workspace_of() else { return Vec::new() };
         let Ok(text) = fs::read_to_string(ws.join(".kenignore")) else { return Vec::new() };
         crate::kenignore::parse(&crate::kenignore::lines_for_member(&text, &member))
-    }
-
-    /// Rename the project, rewriting `.ken/project.json`. The invalid-name
-    /// check runs before any write, so a rejected name leaves the config
-    /// untouched. The user-level registry is a separate store the caller
-    /// updates alongside this.
-    pub fn set_name(&mut self, name: &str) -> Result<()> {
-        let name = normalize_name(name)?;
-        self.config.name = name;
-        self.save()
     }
 
     pub fn set_excluded(&mut self, excluded: Vec<String>) -> Result<()> {
@@ -457,13 +441,11 @@ mod tests {
 
     #[test]
     fn exclusion_matches_folders_not_prefixes() {
-        let dir = tempdir().unwrap();
-        let mut p = Project::create(dir.path(), "X").unwrap();
-        p.config.excluded = vec!["archive".into()];
-        assert!(p.is_excluded("archive/old.md"));
-        assert!(p.is_excluded("archive"));
-        assert!(!p.is_excluded("archive-2/notes.md"));
-        assert!(!p.is_excluded("notes/archive.md"));
+        let excluded = vec!["archive".to_string()];
+        assert!(in_folders(&excluded, "archive/old.md"));
+        assert!(in_folders(&excluded, "archive"));
+        assert!(!in_folders(&excluded, "archive-2/notes.md"));
+        assert!(!in_folders(&excluded, "notes/archive.md"));
     }
 
     #[test]
@@ -506,25 +488,5 @@ mod tests {
         let long = "x".repeat(NAME_MAX_LEN + 1);
         assert!(normalize_name(&long).is_err());
         assert!(normalize_name(&"x".repeat(NAME_MAX_LEN)).is_ok());
-    }
-
-    #[test]
-    fn set_name_rewrites_config() {
-        let dir = tempdir().unwrap();
-        Project::create(dir.path(), "Original").unwrap();
-        let mut p = Project::open(dir.path()).unwrap();
-        p.set_name("  Renamed  ").unwrap();
-        // Trimmed on write, and durable across a reopen.
-        assert_eq!(p.config.name, "Renamed");
-        assert_eq!(Project::open(dir.path()).unwrap().config.name, "Renamed");
-    }
-
-    #[test]
-    fn set_name_rejects_invalid_and_leaves_config() {
-        let dir = tempdir().unwrap();
-        let mut p = Project::create(dir.path(), "Keep").unwrap();
-        assert!(p.set_name("   ").is_err());
-        assert_eq!(p.config.name, "Keep");
-        assert_eq!(Project::open(dir.path()).unwrap().config.name, "Keep");
     }
 }
