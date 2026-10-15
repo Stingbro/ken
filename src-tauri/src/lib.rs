@@ -9272,12 +9272,12 @@ fn maybe_generate_digest(app: &AppHandle, state: &SharedState) {
 
 /// The digest's inputs, read off the lock: each repo's last day (resident
 /// repos through their read connection, dormant ones through a read-only
-/// open of their index), and my day's tickets and tasks.
+/// open of their index). What waits on the person is not among them: Home
+/// shows it live, and the digest is written once a day (Chris, 2026-10-15).
 struct DigestJob {
     repos: Vec<(String, ken_core::digest::DigestSources)>,
     /// The repos' folders, for Claude to read.
     roots: Vec<PathBuf>,
-    mine: Vec<String>,
 }
 
 fn digest_job(state: &SharedState) -> CmdResult<DigestJob> {
@@ -9296,35 +9296,8 @@ fn digest_job(state: &SharedState) -> CmdResult<DigestJob> {
         let sources = with_index(&live, &base_dir, r.id, |db| ken_core::digest::gather(db, since).ok()).flatten();
         out.push((r.name.clone(), sources.unwrap_or_default()));
     }
-
-    let today = local_date_today();
-    let all = DayHomes::new(&ws).scan(&today);
-    let me = cached_git_me();
-    let (tickets, _) = my_tickets(&repos, &me, &all);
-    let mut mine: Vec<String> = Vec::new();
-    for t in tickets.iter().take(8) {
-        mine.push(format!(
-            "ticket {} \"{}\" in {}{}{}",
-            t.id,
-            t.title,
-            t.repo,
-            if t.state.is_empty() { String::new() } else { format!(", {}", t.state) },
-            t.target.as_deref().map(|d| format!(", target {d}")).unwrap_or_default()
-        ));
-    }
-    for t in ken_core::day::today_list(all, &today)
-        .iter()
-        .filter(|t| t.state == ken_core::day::DayTaskState::Open)
-        .take(8)
-    {
-        mine.push(format!(
-            "task \"{}\"{}",
-            t.title,
-            t.target.as_deref().map(|d| format!(", target {d}")).unwrap_or_default()
-        ));
-    }
     let roots = repos.iter().map(|r| r.root.clone()).collect();
-    Ok(DigestJob { repos: out, roots, mine })
+    Ok(DigestJob { repos: out, roots })
 }
 
 /// The workspaces whose digest is being written or waits its turn. The
@@ -9449,14 +9422,14 @@ fn write_digest(
             Err(e) => fail(e),
         }
     };
-    if ken_core::digest::workspace_is_quiet(&job.repos, &job.mine) {
+    if ken_core::digest::workspace_is_quiet(&job.repos) {
         store(ken_core::digest::QUIET_WORKSPACE_DIGEST.to_string(), Vec::new());
         return;
     }
     let Some(binary) = binary else {
         return; // the schedule without Claude Code: nothing to write with
     };
-    let prompt = ken_core::digest::compose_workspace_digest_prompt(ws_name, &job.repos, &job.mine);
+    let prompt = ken_core::digest::compose_workspace_digest_prompt(ws_name, &job.repos);
     // From the folder that holds the repos, when they share one, so a repo's
     // name is its folder; each repo is readable either way.
     let cwd = shared_parent(&job.roots).unwrap_or_else(|| ws_root.to_path_buf());
