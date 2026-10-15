@@ -10,6 +10,31 @@ and is the authoritative visual reference.
 reads like a well-set document. One accent, warm neutrals, generous
 whitespace.
 
+## Copy rule
+
+A screen shows names, values and verbs. Taken from the SR page how-to
+(Shattered-Realms-Docs, `Engine/How-tos/UI/Building an SR page.md` §3).
+
+1. **No how-to text.** No sentence that explains how to use a screen, no
+   instructions in tooltips.
+2. **A subtitle holds a count or an id.** Nothing else: never a sentence,
+   never a path.
+3. **No file paths.** A line that says what an action writes may stay.
+4. **An empty list reads "none".** An empty screen gets a short title
+   ("No file open"), at most one clause of fact, never a how-to. Use
+   `EmptyState` (`src/lib/ui/EmptyState.svelte`).
+5. **Labels, not sentences.** "Controls", "Recent", "no changes".
+6. **A control shows its state itself.** A checkbox, a radio or a badge
+   says it; a sentence does not repeat it. A tooltip only says why a
+   control is disabled.
+
+Every screen has one title, in `ScreenHeader` (`src/lib/ui/ScreenHeader.svelte`):
+the title, an optional count or id, and on the right the screen's actions and
+its count ("4 of 4"). No lede under it.
+
+Background work stays out of sight: one short status line, and only where it
+blocks.
+
 ## Color
 
 ### Neutrals — paper
