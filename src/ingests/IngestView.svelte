@@ -504,8 +504,9 @@
       <div class="chead">
         <div class="ctitle">
           <div class="chips">
-            {#if card.takeaways.kind}<span class="chip">{card.takeaways.kind}</span>{/if}
-            {#if card.takeaways.length}<span class="chip">{card.takeaways.length}</span>{/if}
+            <!-- The kind is the chip; the source's shape ("short minutes, one
+                 page, four sections: …") is its tooltip. -->
+            {#if card.takeaways.kind || card.takeaways.length}<span class="chip" title={card.takeaways.length || undefined}>{card.takeaways.kind || "source"}</span>{/if}
             {#if card.takeaways.present.length > 0}<span class="chip">{card.takeaways.present.join(" · ")}</span>{/if}
             {#if !card.open}<span class="chip">seen</span>{/if}
             {#if card.commit}<span class="chip mono">{card.commit}</span>{/if}
@@ -555,7 +556,7 @@
                   {#if p.kind === "risk"}<TriangleAlert size={14} strokeWidth={1.75} aria-hidden="true" />Risk{:else}<CircleAlert size={14} strokeWidth={1.75} aria-hidden="true" />Issue{/if}{p.who ? ` · ${p.who}` : ""}
                 </div>
                 <div class="dshort">{@html renderTitle(raidOf(p))}</div>
-                {#if raidDetail(p.payload)}<div class="dquote">{raidDetail(p.payload)}</div>{/if}
+                {#if raidDetail(p.payload)}<div class="dquote">{@html renderTitle(raidDetail(p.payload))}</div>{/if}
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
                   <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Add to the register</button>
@@ -634,7 +635,7 @@
                 <span class="wtag">{w.new ? "new page" : "page"}</span>
                 <span class="wtext">
                   <span class="wtarget">{pageName(w.path)}</span>
-                  <span class="t-small">{w.label}</span>
+                  <span class="t-small">{@html renderTitle(w.label)}</span>
                 </span>
                 <span class="wacts">
                   <button class="btn btn-small" onclick={() => inLibrary(w.path)}>Open</button>
@@ -654,8 +655,7 @@
       <div class="chead">
         <div class="ctitle">
           <div class="chips">
-            {#if rawSelected.kind}<span class="chip">{rawSelected.kind}</span>{/if}
-            {#if rawSelected.length}<span class="chip">{rawSelected.length}</span>{/if}
+            {#if rawSelected.kind || rawSelected.length}<span class="chip" title={rawSelected.length || undefined}>{rawSelected.kind || "source"}</span>{/if}
           </div>
           <h2>{rawSelected.name}</h2>
         </div>
