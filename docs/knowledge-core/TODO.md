@@ -425,6 +425,23 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - Chris, 2026-10-15 ("Tool tips are fine"): the 24 tooltips these commits removed or shortened came back (paths, shortcuts, counts, hints; the rail's labels still show only while it is collapsed, and Ask Ken's only while open), except the two that repeated their button ("Add it to the decisions log", "Add it to the RAID register"); the copy rule's rule 7 now says tooltips may carry detail.
   - `npm run check` 0 errors, 0 warnings; vitest 803 passed in 65 files (four helper tests went with their helpers). Not run: the app.
 
+- **UI walkthrough fixes** (`3a9f0fa`, `09b4954`, `623d27c`, `f6aab1e`, `8445521`, `0efc154`, `42d2a25`, `877ccb5`, `07b0e07`, `a254d72`, `36f66bc`). Chris's walkthrough of the release app at `f89bec0` (`claude-scratch/ken-e2e/walkthrough.md`), each item it left to fix:
+  1. Findings (`3a9f0fa`): a finding's title is its text's first sentence, or the text cut at a word (`ingest::cut_at_word`, never inside a code span), and its body carries on where the title stopped, then the quote and the note's link, so it never repeats the title. The app reads both from the finding, so older ones read the same. The Inbox renders the body as Markdown (`renderBody`): quotes, inline code, and `[[page]]` links that open the page. A held edit's title is its page ("Current › Project"), the path its tooltip. List rows and Home's cards clamp to two lines at a word; a card's line is who, what ingest wrote, or nothing.
+  2. Ingest detail (`09b4954`): the source's shape is the kind chip's tooltip; a risk card's line and a page's label show their code.
+  3. Set-up sources (`623d27c`): the folder and the remote are the name's tooltip; Confirm is disabled with no source to index ("No source to index"); "Pick sources…" / "Add more…" is secondary.
+  4. Settings › AI (`f6aab1e`): a model row is its name and badge once, its size and its action, the description its tooltip; the pace reads "20/h · 8 used" with the rest in its tooltip; a feature card is a switch with its name.
+  5. Confirmations (`8445521`): "Accepted", "Added", "Raised as I-002" and the like, in the Inbox and the toasts; the repo detail says only "analysing" or "proposal in the Inbox" beside Analyse again.
+  6. Search (`0efc154`): no routing badge ("Matches · 5" carries the plan as its tooltip), a small dot with a tooltip for a hit found by meaning, and plain-text snippets for anything but code (`plainSnippet`).
+  7. Naming (`42d2a25`): the Files tab reads "Knowledge base"; the chat guide says "knowledge base" throughout (the clean pass had left it as measured) and its rule 8 says never to name a tool to the person.
+  8. Data (`877ccb5`): the plan asks for a risk's or issue's owner as whoever the note says raised it; when it is still empty, `owner_from_note` takes the one person present named in the note's matching sentence. A source whose name has a date keeps its name, with no read date in front.
+  9. Empty states (`07b0e07`): the title is the body face, regular, in the muted ink; the copy rule's rule 4 says so.
+  10. Relative times (`a254d72`): `timeAgo` reads a clock that ticks every 30 seconds, so every relative time in the app stays current; under a minute reads "just now".
+  11. The walkthrough's "Works" list: nothing it names was changed in behaviour; the Inbox's Mark as done and Raise as an issue, the quick answer and the Workspace detail keep their paths.
+  12. Formatted diff (`36f66bc`, Chris after the walkthrough): a held edit's change is drawn as Markdown block by block (`blockDiff`), an added block green, a removed one red and struck, unchanged runs folded; "Raw lines" shows the line diff.
+  - Chosen differently: a finding's body lost "A contradiction with a ruling or the code waits for a person: Ken changed nothing for it." (a sentence, by the copy rule). The Inbox detail of a ruling, ticket or held edit shows its change (the diff) in place of the stored how-to sentence. A contradiction of the source with itself reads "Contradicts itself".
+  - The compile check and svelte-check report no warnings. Tests: ken-core 845 passed, 0 failed, 38 ignored (five new; the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 818 passed in 66 files.
+  - Not run: the app.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
