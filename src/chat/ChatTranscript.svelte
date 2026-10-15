@@ -71,7 +71,7 @@
     sending = true;
     try {
       await api.ingestAddChat(projectId, chatId, picked);
-      toast.show(`${picked.length} ${picked.length === 1 ? "message is" : "messages are"} in Ingest. Ken reads them now.`);
+      toast.show(`${picked.length} ${picked.length === 1 ? "message is" : "messages are"} in Ingest`);
       pick = { selected: new Set(), anchor: null };
     } catch (e) {
       toast.error("Could not send the messages to Ingest", e);

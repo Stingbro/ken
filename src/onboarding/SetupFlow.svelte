@@ -130,7 +130,7 @@
       // the dry run and left it ticked.
       if (kb.mode === "existing" && kb.path && kb.map && mapPlan && mapPlan.moves.length > 0) {
         const done = await api.wikiMapApply(kb.path, mapPlan.moves);
-        toast.show(`${done.moved.length} pages moved into the sections${done.unresolved.length ? `; ${done.unresolved.length} links left as they were` : ""}.`);
+        toast.show(`${done.moved.length} pages moved${done.unresolved.length ? ` · ${done.unresolved.length} links left as they were` : ""}`);
       }
       onclose();
     } catch (e) {

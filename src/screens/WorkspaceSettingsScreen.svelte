@@ -122,7 +122,7 @@
       const done = await api.wikiMapApply(path, moves);
       mapPlan = null;
       toast.show(
-        `${done.moved.length} pages moved${done.unresolved.length ? `; ${done.unresolved.length} links left as they were` : ""}${done.commit ? ` · commit ${done.commit}` : ""}`,
+        `${done.moved.length} pages moved${done.unresolved.length ? ` · ${done.unresolved.length} links left as they were` : ""}${done.commit ? ` · ${done.commit}` : ""}`,
       );
     });
   }
@@ -259,7 +259,7 @@
     try {
       const commit = await api.syncCommitOthers(others, kbId);
       toast.show(
-        commit ? `Committed ${others.length === 1 ? "1 file" : `${others.length} files`} (${commit}).` : "Nothing was left to commit.",
+        commit ? `Committed ${others.length === 1 ? "1 file" : `${others.length} files`} · ${commit}` : "Nothing to commit",
       );
       showingOthers = false;
       await loadSync(kbId);
@@ -313,7 +313,7 @@
         repo={detailRow}
         workspace={overview.workspace}
         knowledgeBase={detailRow.id === kbId}
-        analysis={analysisNote(detailRow, overview.controls, overview.wiki?.settingsName ?? null)}
+        analysis={analysisNote(detailRow)}
         close={() => (detailId = null)}
         changed={() => {
           void refresh();

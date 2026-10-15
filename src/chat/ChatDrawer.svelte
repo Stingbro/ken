@@ -61,7 +61,7 @@
     if (!projectId) return;
     try {
       await api.ingestAddChat(projectId, row.id, null);
-      toast.show(`"${row.title}" is in Ingest. Ken reads it now.`);
+      toast.show(`"${row.title}" is in Ingest`);
     } catch (err) {
       toast.error("Could not send the chat to Ingest", err);
     }

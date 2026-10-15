@@ -115,20 +115,12 @@ export function controlResult(c: Pick<ControlRow, "ran" | "rank" | "passed">): s
 }
 
 /** Where a source's analysis stands, beside "Analyse again" in its detail
- *  (Chris, 2026-10-14): running, a proposal waiting in the Inbox, or rules
- *  or controls it has already (Accept adds only what it has none of). A
- *  control with no source is the knowledge base's own (`kbName`). Null when
- *  none of these. */
-export function analysisNote(
-  r: Pick<SourceRow, "analyzing" | "analysisWaiting" | "roles" | "settingsName">,
-  controls: readonly Pick<ControlRow, "source">[],
-  kbName: string | null,
-): string | null {
+ *  (Chris, 2026-10-14): running, or a proposal waiting in the Inbox. Null
+ *  otherwise: the rules and controls a source has already show in its
+ *  health line and its form, so the header says nothing of them. */
+export function analysisNote(r: Pick<SourceRow, "analyzing" | "analysisWaiting">): string | null {
   if (r.analyzing) return "analysing";
   if (r.analysisWaiting) return "proposal in the Inbox";
-  const name = r.settingsName.toLowerCase();
-  const hasControls = controls.some((c) => (c.source ?? kbName)?.toLowerCase() === name);
-  if (r.roles.length > 0 || hasControls) return "has rules or controls";
   return null;
 }
 

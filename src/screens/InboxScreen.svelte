@@ -64,10 +64,9 @@
   }
 
   function appliedNote(kind: IngestProposal["kind"]): string {
-    if (kind === "ruling") return "Added. It is in the decisions log.";
-    if (kind === "risk" || kind === "issue") return "Added. It is in the RAID register with the next number.";
-    if (kind === "ticket") return "Accepted. The ticket is written.";
-    return "Applied. The page cites the note.";
+    if (kind === "ruling" || kind === "risk" || kind === "issue") return "Added";
+    if (kind === "ticket") return "Accepted";
+    return "Applied";
   }
 
   /** The actions an item offers: the first is primary, at most three. */
@@ -77,7 +76,7 @@
       case "proposal": {
         const p = s.proposal;
         const apply = { label: applyLabel(p.kind), primary: true, run: () => void act(item, () => api.applyPageProposal(p.id, s.projectId), appliedNote(p.kind)) };
-        const discard = { label: "Discard", run: () => void act(item, () => api.resolveReviewItem(p.id, s.projectId), "Discarded.") };
+        const discard = { label: "Discard", run: () => void act(item, () => api.resolveReviewItem(p.id, s.projectId), "Discarded") };
         // A ruling proposed in chat or an edit drift held comes from no note.
         if (!s.note) return [apply, discard];
         const note = { label: "Open the note", run: () => void openInRepo(s.projectId, s.note) };
@@ -90,19 +89,19 @@
         // dismissed; any other finding is marked done once seen to.
         const confirms = f.kind === "supersession";
         if (confirms && f.itemId && f.projectId) {
-          out.push({ label: "Confirm", primary: true, run: () => void act(item, () => api.confirmFinding(f.itemId as number, f.projectId), "Confirmed. The decisions log says so now.") });
+          out.push({ label: "Confirm", primary: true, run: () => void act(item, () => api.confirmFinding(f.itemId as number, f.projectId), "Confirmed") });
         }
         // An open question left unsettled can go into the RAID register as
         // an issue: one click, one commit, and the finding is done.
         if (f.kind === "question" && f.itemId && f.projectId) {
           const fid = f.itemId;
           const pid = f.projectId;
-          out.push({ label: "Raise as an issue", primary: true, run: () => void act(item, () => api.raiseIssue(fid, pid), (id) => `Raised as ${id}. It is in the RAID register.`) });
+          out.push({ label: "Raise as an issue", primary: true, run: () => void act(item, () => api.raiseIssue(fid, pid), (id) => `Raised as ${id}`) });
         }
         if (f.path && f.projectId) out.push({ label: "Open the page", primary: out.length === 0, run: () => void openInRepo(f.projectId as string, f.path as string) });
         if (f.itemId && f.projectId) {
           const label = confirms ? "Dismiss" : "Mark as done";
-          out.push({ label, run: () => void act(item, () => api.resolveReviewItem(f.itemId as number, f.projectId), confirms ? "Dismissed." : "Marked as done.") });
+          out.push({ label, run: () => void act(item, () => api.resolveReviewItem(f.itemId as number, f.projectId), confirms ? "Dismissed" : "Marked as done") });
         }
         return out;
       }
@@ -110,8 +109,8 @@
         // Nothing applies until accepted; Settings › Workspace edits what is.
         const a = s.analysis;
         return [
-          { label: "Accept", primary: true, run: () => void act(item, () => api.acceptAnalysis(a.itemId, a.projectId), "Accepted. They are in .ken/knowledge.json, and the source is read again.") },
-          { label: "Dismiss", run: () => void act(item, () => api.resolveReviewItem(a.itemId, a.projectId), "Dismissed. Nothing was written.") },
+          { label: "Accept", primary: true, run: () => void act(item, () => api.acceptAnalysis(a.itemId, a.projectId), "Accepted") },
+          { label: "Dismiss", run: () => void act(item, () => api.resolveReviewItem(a.itemId, a.projectId), "Dismissed") },
         ];
       }
       case "conflict":
@@ -135,7 +134,7 @@
   async function ignoreFile(item: InboxItem) {
     if (item.source.type !== "failed") return;
     const rel = item.source.relPath;
-    await act(item, () => app.ignoreFile(rel), "Ignored, for you only.");
+    await act(item, () => app.ignoreFile(rel), "Ignored");
   }
 
   function selectItem(id: string) {
@@ -248,7 +247,7 @@
         {#if isDone}
           <div class="donebar">
             <CircleCheck size={15} strokeWidth={1.75} aria-hidden="true" />
-            {doneNote[sel.id] ?? "Done."}
+            {doneNote[sel.id] ?? "Done"}
           </div>
         {:else}
           <div class="acts">

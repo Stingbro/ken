@@ -106,18 +106,13 @@ describe("controls", () => {
 });
 
 describe("analysisNote", () => {
-  const row = { analyzing: false, analysisWaiting: false, roles: [] as string[], settingsName: "Game" };
+  const row = { analyzing: false, analysisWaiting: false };
   it("says busy first, then a waiting card", () => {
-    expect(analysisNote({ ...row, analyzing: true, analysisWaiting: true }, [], "Wiki")).toBe("analysing");
-    expect(analysisNote({ ...row, analysisWaiting: true }, [], "Wiki")).toBe("proposal in the Inbox");
+    expect(analysisNote({ ...row, analyzing: true, analysisWaiting: true })).toBe("analysing");
+    expect(analysisNote({ ...row, analysisWaiting: true })).toBe("proposal in the Inbox");
   });
-  it("says when the file holds its rules or controls already", () => {
-    expect(analysisNote(row, [], "Wiki")).toBeNull();
-    expect(analysisNote({ ...row, roles: ["src/net/** = protocol"] }, [], "Wiki")).toBe("has rules or controls");
-    expect(analysisNote(row, [{ source: "game" }], "Wiki")).toBe("has rules or controls");
-    // A control with no source is the knowledge base's own.
-    expect(analysisNote(row, [{ source: null }], "Wiki")).toBeNull();
-    expect(analysisNote({ ...row, settingsName: "Wiki" }, [{ source: null }], "Wiki")).toBe("has rules or controls");
+  it("says nothing of the rules or controls a source has: its health line does", () => {
+    expect(analysisNote(row)).toBeNull();
   });
 });
 
