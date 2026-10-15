@@ -102,7 +102,6 @@
 <div class="scroll" bind:this={scroller} onclick={onClick} role="log">
   {#if chats.transcript.length === 0}
     <div class="starters">
-      <div class="hint">Ask anything about this project's knowledge.</div>
       {#each SUGGESTED_PROMPTS as p (p)}
         <button class="starter" onclick={() => chats.send(p)}>{p}</button>
       {/each}
@@ -178,11 +177,6 @@
     flex-direction: column;
     gap: 8px;
     margin-top: 12px;
-  }
-  .hint {
-    font-size: 12.5px;
-    color: var(--ink-tertiary);
-    margin-bottom: 4px;
   }
   .starter {
     text-align: left;

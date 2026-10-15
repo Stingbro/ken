@@ -242,10 +242,6 @@
     </button>
   </div>
 
-  {#if isNew}
-    <p class="hint">Enter in the title adds it.</p>
-  {/if}
-
   <div class="field">
     <span class="label">Target</span>
     <DatePicker value={target ?? ""} label="Target date" onchange={(v) => setTarget(v)} />
@@ -367,11 +363,6 @@
   .close:hover {
     background: var(--sunken);
     color: var(--ink);
-  }
-  .hint {
-    margin: -6px 0 0 28px;
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
   }
   .cb {
     flex: none;

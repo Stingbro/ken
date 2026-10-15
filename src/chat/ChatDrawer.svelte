@@ -315,13 +315,7 @@
             <button class="mini" onclick={cancelResearch}>Cancel research</button>
           {/if}
         </div>
-        <span class="foot-note">You're in the real Claude terminal.</span>
       {:else if chats.active?.kind === "ingest" || chats.active?.kind === "research"}
-        <span class="foot-note">
-          {chats.active.kind === "research"
-            ? "Research session — opens in the terminal; you can answer its questions there."
-            : "Ingest session — opens in the terminal."}
-        </span>
         {#if researchLive}
           <div class="chat-actions">
             <button class="mini" onclick={cancelResearch}>Cancel research</button>
@@ -333,7 +327,7 @@
             bind:this={replyEl}
             bind:value={draft}
             onkeydown={onKeydown}
-            placeholder="Reply to Ken…  (Enter to send, Shift+Enter for a new line)"
+            placeholder="Reply"
             rows="3"
           ></textarea>
           <!-- Composer controls sit in their own row so a model-selector
@@ -694,9 +688,5 @@
   }
   .mini:hover {
     color: var(--accent);
-  }
-  .foot-note {
-    font-size: 11.5px;
-    color: var(--ink-tertiary);
   }
 </style>
