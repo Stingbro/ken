@@ -135,7 +135,7 @@
     <EmptyState />
   {/if}
 
-  <div class="head second"><span class="overline">Wiki pages that cite it</span></div>
+  <div class="head second"><span class="overline">Pages that cite it</span></div>
   {#if pages.length > 0}
     <div class="list">
       {#each pages as p (p.projectId + ":" + p.path)}

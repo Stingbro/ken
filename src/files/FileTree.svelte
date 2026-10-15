@@ -30,8 +30,8 @@
 
   let { width }: { width: number } = $props();
 
-  // Files splits into Wiki and Sources (knowledge-core decision 32): the
-  // knowledge base under Wiki, the workspace's other repos under Sources,
+  // Files splits into Knowledge base and Sources (knowledge-core decision
+  // 32): the knowledge base under the first, the other repos under Sources,
   // with a menu when there are several. Files opens on the wiki. A file
   // opened from another repo (a search hit, a citation) shows that repo here.
   // Choosing one stays on Files.
@@ -220,9 +220,9 @@
     </ScreenHeader>
   </div>
   {#if app.workspace && repos.length > 1}
-    <div class="split" role="tablist" aria-label="Wiki or sources">
+    <div class="split" role="tablist" aria-label="Knowledge base or sources">
       <button class="side" class:on={side === "wiki"} role="tab" aria-selected={side === "wiki"} disabled={!split.wiki} onclick={() => showSide("wiki")}
-        >Wiki</button
+        >Knowledge base</button
       >
       <button
         class="side"

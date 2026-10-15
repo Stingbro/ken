@@ -237,13 +237,14 @@ pub const EDIT_TOOLS: [&str; 3] = ["Edit", "MultiEdit", "Write"];
 /// What every chat session is told about working inside Ken, appended to
 /// Claude Code's own system prompt. The app's rules (knowledge-core decision
 /// 1), plus three of the knowledge server's `instructions` said again in
-/// short (rule 4): how to weigh a hit's label, that the wiki settles what the
-/// team decided and a ruling is settled, and that a difference from the code
-/// is said with both cited. The chat's answers were measured with those in
-/// the guide; they stay until a measurement shows the instructions alone
-/// carry them.
+/// short (rule 4): how to weigh a hit's label, that the knowledge base
+/// settles what the team decided and a ruling is settled, and that a
+/// difference from the code is said with both cited. The chat's answers were
+/// measured with those in the guide; they stay until a measurement shows the
+/// instructions alone carry them. Rule 8 keeps the tools' names out of what
+/// the person reads.
 pub const KEN_GUIDE: &str = "You are working inside Ken, a desktop app where a person reads and edits their team's \
-wiki, docs and code. Rules for this app:\n\
+knowledge base, docs and code. Rules for this app:\n\
 1. Edits are reviewed. Every Edit, MultiEdit or Write you make is shown to the person as a diff, and they accept or \
 decline each change. If they decline some, the tool result says which; read the file again before editing it further, \
 and do not retry a declined change unless they ask.\n\
@@ -264,9 +265,9 @@ answers, look yourself with Grep, Glob and Read in this project and the workspac
 all; Glob and Grep search only the folder you start in unless given one, so pass each repo's folder as the path) \
 before saying something isn't there, and say where you looked.\n\
 4. Weigh each hit by its label (kind · tier or role · date): a binding ruling or rule over a current page, a current \
-page over a record (a ticket, note or draft), a later ruling over an earlier one. The wiki settles what the team \
-decided, and a ruling is settled: do not reopen it. When the code differs from the wiki or a ruling, say so and cite \
-both.\n\
+page over a record (a ticket, note or draft), a later ruling over an earlier one. The knowledge base settles what the \
+team decided, and a ruling is settled: do not reopen it. When the code differs from the knowledge base or a ruling, say \
+so and cite both.\n\
 5. The knowledge base changes through a person. A ruling the person states goes in with \
 mcp__ken__propose_decision and a source they want kept with mcp__ken__add_source: both wait in Ken's Inbox (the \
 ruling for one click into the decisions log, the source for the next ingest), so say that it waits. An answer worth \
@@ -278,7 +279,9 @@ Your own task or todo tools are not their list. A ## Memories block at the top o
 notes: follow them, add one with mcp__ken-personal__memory_write only when the person asks you to remember \
 something, and keep a finding they want kept with mcp__ken-personal__journal_append.\n\
 7. mcp__ken-personal__open_in_ken opens a file for the person: use it only when they explicitly ask you to open or \
-show something.";
+show something.\n\
+8. Tell the person what you did, never which tool did it: \"I searched the knowledge base\", \"it waits in the \
+Inbox\". Never name a tool, yours or Ken's, to them, and call the team's pages the knowledge base, not the wiki.";
 
 /// The server name Ken's chat gives its knowledge server, `ken-mcp`
 /// (`mcp__ken__search`): the same name Claude Code is told to register.
@@ -1348,10 +1351,12 @@ mod tests {
         for word in ["shown to the person as a diff", "Cite your sources", "wait in Ken's Inbox", "The person's list is Ken's"] {
             assert!(guide.contains(word), "{word}");
         }
-        for rule in ["Weigh each hit by its label", "The wiki settles what the team decided", "a ruling is settled", "say so and cite both"] {
+        for rule in ["Weigh each hit by its label", "The knowledge base settles what the team decided", "a ruling is settled", "say so and cite both"] {
             assert!(guide.contains(rule), "{rule}");
         }
         assert!(guide.contains("An answer worth keeping"), "answers are filed back through add_source (decision 33)");
+        assert!(guide.contains("Never name a tool"), "the person hears what was done, not a tool's name");
+        assert!(!guide.contains("wiki,") && !guide.contains("The wiki"), "the knowledge base, not the wiki");
     }
 
     #[test]
