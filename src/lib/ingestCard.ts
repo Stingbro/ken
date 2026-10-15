@@ -1,6 +1,6 @@
 // Pure helpers for the Ingest screen (the library inbox, white box 8b): the
 // one-line count of the pages a source wrote and what waits, page names as a
-// row says them, the hold line, and what a Raw/ row says and offers.
+// row says them, and what a Raw/ row says and offers.
 import type { IngestOverview, RawState } from "./api";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -31,18 +31,6 @@ export function pageName(path: string): string {
     .split("/")
     .filter((p) => p.length > 0)
     .join(" › ");
-}
-
-/** The line under the pages: none was held for a person, or how many. */
-export function stagingLine(held: number): string {
-  return held === 0 ? "No page edit was held for you." : `${held} held for you, above.`;
-}
-
-/** Where the ingest's commit is, so git takes it back. */
-export function commitLine(commit: string | null, error: string | null): string {
-  if (commit) return `One commit, ${commit}, in the knowledge base. git revert ${commit} takes it all back.`;
-  if (error) return `Not committed: ${error}`;
-  return "Not committed: the knowledge base is not a git repo, or nothing changed.";
 }
 
 /** How a source in Raw/ reads in its row. */

@@ -33,13 +33,11 @@
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import {
     canReadNow,
-    commitLine,
     ingestBusy,
     pageName,
     raidDetail,
     rawActions,
     rawStateLabel,
-    stagingLine,
     writtenLine,
   } from "../lib/ingestCard";
   import ProposalDetail from "./ProposalDetail.svelte";
@@ -569,12 +567,12 @@
             {#if card.takeaways.length}<span class="chip">{card.takeaways.length}</span>{/if}
             {#if card.takeaways.present.length > 0}<span class="chip">{card.takeaways.present.join(" · ")}</span>{/if}
             {#if !card.open}<span class="chip">seen</span>{/if}
+            {#if card.commit}<span class="chip mono">{card.commit}</span>{/if}
           </div>
           <h2>{@html renderTitle(card.takeaways.title || (card.note.split("/").pop() ?? ""))}</h2>
-          <div class="t-small">{card.note}</div>
         </div>
         <div class="cacts">
-          <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => card && openSource(card.source)}>Open source</button>
+          <button class="btn btn-ghost" onclick={() => card && openSource(card.source)}>Open source</button>
           <button class="btn" onclick={() => card && inLibrary(card.note)}>Open the note</button>
           {#if card.open}
             <button class="btn btn-primary" disabled={busy !== null || cardWriting} onclick={seen}>Mark as seen</button>
@@ -582,35 +580,29 @@
         </div>
       </div>
 
-      <div class="progress-card">
-        {#if cardWriting}
-          <div class="pline"><b>Writing the pages</b><span class="grow"></span><span class="t-small">The note is written; Claude is updating the pages it changes</span></div>
-          <div class="k-progress fat"><span style="width: 80%"></span></div>
-        {:else}
-          <div class="pline"><b>Read and filed</b><span class="grow"></span><span class="t-small">Done</span></div>
-          <div class="k-progress fat"><span style="width: 100%" class="okbar"></span></div>
-        {/if}
+      {#if cardWriting}
+        {@const steps = isRecording(card.source, card.takeaways.kind) ? RECORDING_STEPS : DOCUMENT_STEPS}
+        {@const at = steps.indexOf("Pages written")}
         <div class="steps">
-          {#each isRecording(card.source, card.takeaways.kind) ? RECORDING_STEPS : DOCUMENT_STEPS as s (s)}<span class="step done"><CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{s}</span>{/each}
+          {#each steps as s, i (s)}
+            <span class="step" class:done={i < at} class:now={i === at}>
+              {#if i < at}<CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{:else}<Circle size={14} strokeWidth={1.75} aria-hidden="true" />{/if}{s}
+            </span>
+          {/each}
         </div>
-      </div>
+      {/if}
 
       {#if decisionsTotal > 0}
         <section class="decisions">
-          <div class="shead">
-            <span class="adot"></span>
-            <h3>Needs your decision</h3>
-            <span class="t-small">{decisionsTotal} left · also in your Inbox</span>
-          </div>
+          <div class="shead"><span class="adot"></span><span class="t-label">needs your decision · {decisionsTotal}</span></div>
           <div class="dgrid">
             {#each rulings as p (p.id)}
               <div class="dcard">
                 <div class="dkind"><Gavel size={14} strokeWidth={1.75} aria-hidden="true" />Ruling{p.who ? ` · ${p.who}` : ""}</div>
                 <div class="dshort">“{@html renderTitle(rulingOf(p))}”</div>
-                <div class="ddetail">Ready for the decisions log; adding it gives it the next number.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
-                  <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the decisions log" onclick={() => apply(p)}>Add to the decisions log</button>
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Add to the decisions log</button>
                   <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
                   <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
                 </div>
@@ -623,10 +615,9 @@
                 </div>
                 <div class="dshort">{@html renderTitle(raidOf(p))}</div>
                 {#if raidDetail(p.payload)}<div class="dquote">{raidDetail(p.payload)}</div>{/if}
-                <div class="ddetail">For the RAID register; adding it gives it the next number.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
-                  <button class="btn btn-small btn-primary" disabled={busy !== null} title="Add it to the RAID register" onclick={() => apply(p)}>Add to the register</button>
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Add to the register</button>
                   <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
                   <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
                 </div>
@@ -636,10 +627,9 @@
               <div class="dcard">
                 <div class="dkind"><Ticket size={14} strokeWidth={1.75} aria-hidden="true" />Ticket</div>
                 <div class="dshort">{@html renderTitle(p.title)}</div>
-                <div class="ddetail">Accepting writes the ticket in the knowledge base's tickets folder.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
-                  <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Accept</button>
+                  <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Add to tickets</button>
                   <button class="btn btn-small" onclick={() => (openDiff = openDiff === p.id ? null : p.id)}>{openDiff === p.id ? "Close" : "Read it"}</button>
                   <button class="btn btn-small btn-ghost" disabled={busy !== null} onclick={() => discard(p)}>Discard</button>
                 </div>
@@ -649,7 +639,6 @@
               <div class="dcard wide">
                 <div class="dkind"><FilePen size={14} strokeWidth={1.75} aria-hidden="true" />Held page edit</div>
                 <div class="dshort">{pageName(p.page)}</div>
-                <div class="ddetail">{p.body}</div>
                 <ProposalDetail payload={p.payload} />
                 <div class="dacts">
                   <button class="btn btn-small btn-primary" disabled={busy !== null} onclick={() => apply(p)}>Apply</button>
@@ -663,7 +652,7 @@
 
       <div class="cols">
         <section class="summary">
-          <h3>Summary</h3>
+          <span class="t-label">summary</span>
           {#if card.takeaways.summary}
             <div class="lead">{@html renderMarkdown(card.takeaways.summary)}</div>
           {/if}
@@ -674,13 +663,13 @@
           {/if}
           {#if !saysNothing(card.takeaways.overturns)}
             <div class="well">
-              <span class="t-label">What it overturns</span>
+              <span class="t-label">overturns</span>
               <div class="md">{@html renderMarkdown(card.takeaways.overturns)}</div>
             </div>
           {/if}
           {#if contradictions.length > 0}
             <div class="well danger">
-              <span class="t-label">Contradictions · findings in your Inbox</span>
+              <span class="t-label">contradictions · {contradictions.length}</span>
               <ul>
                 {#each contradictions as c}<li>{@html renderMarkdown(c)}</li>{/each}
               </ul>
@@ -688,7 +677,7 @@
           {/if}
           {#if questions.length > 0}
             <div class="well">
-              <span class="t-label">Open questions · findings in your Inbox</span>
+              <span class="t-label">open questions · {questions.length}</span>
               <ul>
                 {#each questions as q}<li>{@html renderMarkdown(q)}</li>{/each}
               </ul>
@@ -698,7 +687,7 @@
 
         <div class="side">
           <section>
-            <div class="shead"><h3>Pages Ken updated</h3><span class="t-small">{pages.length} · each cites the note</span></div>
+            <div class="shead"><span class="t-label">pages updated · {pages.length}</span></div>
             {#each pages as w (w.path)}
               <div class="wrow">
                 <span class="wtag">{w.new ? "new page" : "page"}</span>
@@ -711,20 +700,15 @@
                 </span>
               </div>
             {:else}
-              <p class="note">No page was written from this source.</p>
+              <EmptyState />
             {/each}
-            {#if pages.length > 0 || held.length > 0}
-              <p class="note">{stagingLine(held.length)}</p>
-            {/if}
           </section>
         </div>
       </div>
 
-      <div class="foot">
-        <span class="t-small grow">{commitLine(card.commit, card.commitError)}</span>
-      </div>
+      {#if card.commitError}<p class="warn">not committed: {card.commitError}</p>{/if}
     {:else if rawSelected}
-      {@const pct = rawPct(rawSelected)}
+      {@const pct = rawSelected.detail?.match(/(\d+)%/)?.[1]}
       {@const acts = rawActions(rawSelected.state)}
       <div class="chead">
         <div class="ctitle">
@@ -733,10 +717,9 @@
             {#if rawSelected.length}<span class="chip">{rawSelected.length}</span>{/if}
           </div>
           <h2>{rawSelected.name}</h2>
-          <div class="t-small">{rawSelected.path}</div>
         </div>
         <div class="cacts">
-          <button class="btn btn-ghost" title="Show the source file in your file manager" onclick={() => rawSelected && openSource(rawSelected.path)}>Open source</button>
+          <button class="btn btn-ghost" onclick={() => rawSelected && openSource(rawSelected.path)}>Open source</button>
           {#if acts.includes("remove")}
             <button class="btn" disabled={busy !== null} onclick={(e) => rawSelected && askRemove(e, rawSelected)}>Remove</button>
           {/if}
@@ -745,22 +728,18 @@
           {/if}
         </div>
       </div>
-      <div class="progress-card">
-        <div class="pline"><b>{rawStatus(rawSelected)}</b><span class="grow"></span>{#if pct > 0 && pct < 100}<span class="t-small">{pct}%</span>{/if}</div>
-        <div class="k-progress fat"><span style="width: {pct}%" class:bad={rawSelected.state === "failed"}></span></div>
-        <div class="steps">
-          {#each stepsFor(rawSelected) as s, i (s)}
-            {@const at = stepAt(rawSelected)}
-            {@const failed = rawSelected.state === "failed" && i === at}
-            <span class="step" class:done={i < at} class:now={i === at && !failed} class:failed>
-              {#if i < at}<CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{:else if failed}<CircleX size={14} strokeWidth={1.75} aria-hidden="true" />{:else}<Circle size={14} strokeWidth={1.75} aria-hidden="true" />{/if}{s}
-            </span>
-          {/each}
-        </div>
+      <div class="steps">
+        {#each stepsFor(rawSelected) as s, i (s)}
+          {@const at = stepAt(rawSelected)}
+          {@const failed = rawSelected.state === "failed" && i === at}
+          <span class="step" class:done={i < at} class:now={i === at && !failed} class:failed>
+            {#if i < at}<CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />{:else if failed}<CircleX size={14} strokeWidth={1.75} aria-hidden="true" />{:else}<Circle size={14} strokeWidth={1.75} aria-hidden="true" />{/if}{s}{#if i === at && pct && !failed}<span class="pct">{pct}%</span>{/if}
+          </span>
+        {/each}
       </div>
-      <div class="soft">
-        <EmptyState title={rawSelected.state === "failed" ? "Ken couldn't read this" : rawSelected.state === "waiting" ? "This waits for a transcript" : "Ken is still reading"} />
-      </div>
+      {#if (rawSelected.state === "failed" || rawSelected.state === "waiting") && rawSelected.detail}
+        <p class="reason" class:bad={rawSelected.state === "failed"}>{rawSelected.detail}</p>
+      {/if}
     {:else}
       <div class="soft">
         <EmptyState title="Add a source" />
@@ -956,18 +935,11 @@
     height: 3px;
     width: 100%;
   }
-  .k-progress.fat {
-    height: 6px;
-    border-radius: 3px;
-  }
   .k-progress :global(span.bad) {
     background: var(--danger);
   }
   .k-progress :global(span.wait) {
     background: var(--attn);
-  }
-  .k-progress :global(span.okbar) {
-    background: var(--ok);
   }
   .reason {
     margin: 0 10px 4px;
@@ -1070,27 +1042,6 @@
     gap: 8px;
     flex: none;
   }
-  .progress-card {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding: 16px 18px;
-    border-radius: var(--radius-card);
-    background: var(--surface);
-    border: 1px solid var(--line);
-  }
-  .pline {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 13.5px;
-  }
-  .pline b {
-    font-weight: 600;
-  }
-  .grow {
-    flex: 1;
-  }
   .steps {
     display: flex;
     flex-wrap: wrap;
@@ -1111,13 +1062,12 @@
     color: var(--accent-ink);
     font-weight: 600;
   }
+  .pct {
+    margin-left: 4px;
+    font-variant-numeric: tabular-nums;
+  }
   .step.failed {
     color: var(--danger);
-    font-weight: 600;
-  }
-  h3 {
-    margin: 0;
-    font-size: 16px;
     font-weight: 600;
   }
   .shead {
@@ -1176,17 +1126,12 @@
     color: var(--ink-2);
     line-height: 1.5;
   }
-  .ddetail {
-    font-size: 13px;
-    color: var(--ink-2);
-    line-height: 1.5;
-    flex: 1;
-  }
   .dacts {
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
-    margin-top: 4px;
+    margin-top: auto;
+    padding-top: 4px;
   }
   .cols {
     display: grid;
@@ -1275,13 +1220,6 @@
     display: flex;
     gap: 4px;
     flex: none;
-  }
-  .foot {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding-top: 16px;
-    border-top: 1px solid var(--line-soft);
   }
   .soft {
     background: var(--rail);

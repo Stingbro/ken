@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { canReadNow, commitLine, ingestBusy, pageName, raidDetail, rawActions, rawStateLabel, stagingLine, writtenLine } from "./ingestCard";
+import { canReadNow, ingestBusy, pageName, raidDetail, rawActions, rawStateLabel, writtenLine } from "./ingestCard";
 import type { RawSource } from "./api";
 
 describe("writtenLine", () => {
@@ -18,21 +18,6 @@ describe("pageName", () => {
     expect(pageName("Current/Project.md")).toBe("Current › Project");
     expect(pageName("tickets/SR-031.md")).toBe("tickets › SR-031");
     expect(pageName("Vocabulary.md")).toBe("Vocabulary");
-  });
-});
-
-describe("stagingLine", () => {
-  it("says none or how many were held", () => {
-    expect(stagingLine(0)).toBe("No page edit was held for you.");
-    expect(stagingLine(2)).toBe("2 held for you, above.");
-  });
-});
-
-describe("commitLine", () => {
-  it("names the commit git takes back, or why there is none", () => {
-    expect(commitLine("abc1234", null)).toBe("One commit, abc1234, in the knowledge base. git revert abc1234 takes it all back.");
-    expect(commitLine(null, "git commit failed: no identity")).toBe("Not committed: git commit failed: no identity");
-    expect(commitLine(null, null)).toContain("not a git repo");
   });
 });
 
