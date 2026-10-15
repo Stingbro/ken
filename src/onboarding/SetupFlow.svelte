@@ -150,15 +150,16 @@
 
   {#if step === "name"}
     <h2 class="t-heading">Name the workspace</h2>
-    <label class="field">
-      <span class="t-label">Workspace name</span>
+    <!-- The heading names the step; the field's placeholder is its label. -->
+    <div class="field">
       <input
         class="input"
         value={name}
-        placeholder="The team's or the product's name"
+        placeholder="Workspace name"
+        aria-label="Workspace name"
         oninput={(e) => setName((e.currentTarget as HTMLInputElement).value)}
       />
-    </label>
+    </div>
     <div class="actions">
       <button
         class="btn btn-primary"

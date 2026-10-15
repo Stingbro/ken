@@ -112,6 +112,14 @@
   --healthy: var(--ok);
   --healthy-text: var(--ok);
   --match-highlight: color-mix(in oklch, var(--attn) 28%, transparent);
+  /* Syntax colours in the code viewer, from the palette, so the dark theme
+     brings its own. */
+  --syntax-keyword: var(--accent-ink);
+  --syntax-string: var(--ok);
+  --syntax-number: var(--attn-ink);
+  --syntax-comment: var(--ink-3);
+  --syntax-type: var(--info);
+  --syntax-meta: var(--ink-2);
   --rule-line: color-mix(in oklch, var(--ink) 5%, transparent);
   --selection-bg: var(--accent-soft);
   --file-doc: var(--info);

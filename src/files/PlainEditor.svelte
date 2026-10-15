@@ -3,12 +3,20 @@
   import { MATCH_CAP, findTextMatches } from "../lib/find";
   import { find, type FindAdapter } from "../lib/find.svelte";
   import type { Reveal } from "../lib/app.svelte";
+  import { highlightHtml, parserFor, type Parser } from "../lib/syntax";
 
   let {
     initial,
     onchange,
     reveal = null,
-  }: { initial: string; onchange: (text: string) => void; reveal?: Reveal | null } = $props();
+    path = null,
+  }: {
+    initial: string;
+    onchange: (text: string) => void;
+    reveal?: Reveal | null;
+    /** The file's path: its name picks the language it is coloured as. */
+    path?: string | null;
+  } = $props();
 
   // A clicked citation: put the caret on its line and scroll it into view.
   $effect(() => {
@@ -33,6 +41,31 @@
 
   let ta = $state<HTMLTextAreaElement | null>(null);
   let layer = $state<HTMLDivElement | null>(null);
+  let syntaxLayer = $state<HTMLDivElement | null>(null);
+
+  // Syntax colours sit on a second mirror, above the find marks and below
+  // the textarea, whose own text turns transparent while they show. The
+  // grammar loads once per file; a file of no known language, or one past
+  // the size cap (`HIGHLIGHT_MAX`), stays plain text.
+  let parser = $state<Parser | null>(null);
+  $effect(() => {
+    const p = path;
+    parser = null;
+    if (!p) return;
+    let live = true;
+    void parserFor(p).then((found) => {
+      if (live) parser = found;
+    });
+    return () => {
+      live = false;
+    };
+  });
+  const syntax = $derived(parser ? highlightHtml(value, parser) : null);
+  // A mirror that appears, or is painted again, takes the textarea's scroll.
+  $effect(() => {
+    void syntax;
+    if (syntaxLayer) syncScroll();
+  });
   let starts = $state<number[]>([]);
   let hitLength = $state(0);
   let current = $state(0);
@@ -64,9 +97,12 @@
   });
 
   function syncScroll() {
-    if (!ta || !layer) return;
-    layer.scrollTop = ta.scrollTop;
-    layer.scrollLeft = ta.scrollLeft;
+    if (!ta) return;
+    for (const l of [layer, syntaxLayer]) {
+      if (!l) continue;
+      l.scrollTop = ta.scrollTop;
+      l.scrollLeft = ta.scrollLeft;
+    }
   }
 
   // scroll=false comes from an edit-driven refresh: re-accent the current match
@@ -132,8 +168,14 @@
          Every box property it shares with the textarea must stay identical or
          the marks drift away from the words they belong to. -->
     <div class="layer" bind:this={layer} aria-hidden="true">{#each segments as seg, i (i)}{#if seg.hit >= 0}<mark class="ken-find" class:ken-find-current={seg.hit === current}>{seg.text}</mark>{:else}{seg.text}{/if}{/each}</div>
+    {#if syntax !== null}
+      <!-- The text again, coloured by its grammar: the same box as the
+           textarea, so every token sits under its own characters. -->
+      <div class="layer syntax" bind:this={syntaxLayer} aria-hidden="true">{@html syntax}</div>
+    {/if}
     <textarea
       bind:this={ta}
+      class:coloured={syntax !== null}
       bind:value
       oninput={() => {
         onchange(value);
@@ -187,5 +229,53 @@
     resize: none;
     background: transparent;
     color: var(--ink);
+  }
+  /* The coloured mirror shows the text; the textarea keeps the caret and the
+     selection, whose text is drawn plainly over its own background. */
+  textarea.coloured {
+    color: transparent;
+    caret-color: var(--ink);
+  }
+  textarea.coloured::selection {
+    color: var(--ink);
+  }
+  .layer.syntax {
+    color: var(--ink);
+  }
+  /* Colour only: a weight or a slant could change a glyph's width and move
+     the text off the caret. */
+  .syntax :global(.tok-keyword),
+  .syntax :global(.tok-heading) {
+    color: var(--syntax-keyword);
+  }
+  .syntax :global(.tok-string),
+  .syntax :global(.tok-string2),
+  .syntax :global(.tok-inserted) {
+    color: var(--syntax-string);
+  }
+  .syntax :global(.tok-number),
+  .syntax :global(.tok-bool),
+  .syntax :global(.tok-atom),
+  .syntax :global(.tok-literal) {
+    color: var(--syntax-number);
+  }
+  .syntax :global(.tok-comment) {
+    color: var(--syntax-comment);
+  }
+  .syntax :global(.tok-typeName),
+  .syntax :global(.tok-className),
+  .syntax :global(.tok-namespace),
+  .syntax :global(.tok-url),
+  .syntax :global(.tok-link) {
+    color: var(--syntax-type);
+  }
+  .syntax :global(.tok-meta),
+  .syntax :global(.tok-macroName),
+  .syntax :global(.tok-labelName) {
+    color: var(--syntax-meta);
+  }
+  .syntax :global(.tok-invalid),
+  .syntax :global(.tok-deleted) {
+    color: var(--danger);
   }
 </style>

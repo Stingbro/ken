@@ -682,9 +682,7 @@
         <p class="reason" class:bad={rawSelected.state === "failed"}>{rawSelected.detail}</p>
       {/if}
     {:else}
-      <div class="soft">
-        <EmptyState title="Add a source" />
-      </div>
+      <EmptyState title="No source selected" />
     {/if}
     </div>
   </main>
@@ -1139,9 +1137,5 @@
     display: flex;
     gap: 4px;
     flex: none;
-  }
-  .soft {
-    background: var(--rail);
-    padding: 20px;
   }
 </style>

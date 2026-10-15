@@ -521,7 +521,7 @@
           isRepo={(name) => !!repoNamed(name)}
         />
       {:else}
-        <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} />
+        <PlainEditor initial={content} onchange={onEdit} reveal={revealHere} path={relPath} />
       {/if}
     {/key}
   {:else if meta}

@@ -74,6 +74,13 @@ Status colors: 10–14% opacity for fills, full strength for text and dots.
 Clay marks the active nav item, primary buttons, links, selection — nothing
 else. `::selection` is `#E8DCCB`.
 
+### Syntax (the Files code viewer)
+`--syntax-keyword` (accent ink), `--syntax-string` (ok), `--syntax-number`
+(attention ink), `--syntax-comment` (ink 3), `--syntax-type` (info),
+`--syntax-meta` (ink 2), and the danger colour for invalid code. Each is a
+token above, so the dark theme brings its own. Colour only: no weight or
+slant, which could move the text off the caret.
+
 ## Typography
 - **Source Serif 4** (400/500/600): document titles and page headers.
   display 32/500, title 22–24/500, page h1 28–30/500, letter-spacing -0.01em.
