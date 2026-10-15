@@ -22,7 +22,8 @@ The rule is about visible text. Tooltips are where detail goes (rule 7).
 3. **No file paths.** A line that says what an action writes may stay.
 4. **An empty list reads "none".** An empty screen gets a short title
    ("No file open"), at most one clause of fact, never a how-to. Use
-   `EmptyState` (`src/lib/ui/EmptyState.svelte`).
+   `EmptyState` (`src/lib/ui/EmptyState.svelte`); its title is quiet, the
+   body face in the muted ink, never louder than the content.
 5. **Labels, not sentences.** "Controls", "Recent", "no changes".
 6. **A control shows its state itself.** A checkbox, a radio or a badge
    says it; a sentence does not repeat it.

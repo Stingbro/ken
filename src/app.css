@@ -624,10 +624,13 @@ option {
   padding: 16px;
   border-radius: var(--radius-card);
 }
+/* An empty state's title is quieter than the content around it: the body
+   face, regular, in the muted ink. */
 .k-empty .head {
-  font-family: var(--font-serif);
-  font-size: 17px;
-  font-weight: 500;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--ink-3);
 }
 /* A notice in the flow of a page: what went wrong, said plainly, with at most
    one action after it. A toast is for what happens out of view. */
