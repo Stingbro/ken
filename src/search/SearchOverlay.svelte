@@ -20,9 +20,10 @@
   import { inMember, parseCitation } from "../lib/citation";
   import FileGlyph from "../files/FileGlyph.svelte";
   import Search from "@lucide/svelte/icons/search";
-  import { claudeInstallHelp, shortcut } from "../lib/platform";
+  import { shortcut } from "../lib/platform";
   import { errorText, toast } from "../lib/toast.svelte";
   import { openKenAddress } from "../lib/kenAddress";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   let query = $state("");
   let selected = $state(0);
@@ -129,9 +130,7 @@
     }
     const held = res.plan.reserve.filter((id) => !res.memberStatus.some((s) => s.projectId === id));
     if (held.length) {
-      notes.push(
-        `${held.length} reference repo${held.length === 1 ? "" : "s"} held back: searched for platform questions, when named, or when nothing else answers`,
-      );
+      notes.push(`${held.length} reference repo${held.length === 1 ? "" : "s"} held back`);
     }
     return notes;
   }
@@ -462,9 +461,7 @@
     </div>
   {:else if !modelInstalled && isQuestionQuery(query.trim())}
     <div class="qa qa-hint">
-      <div class="qa-body">
-        Answers come from Claude Code. {claudeInstallHelp()}
-      </div>
+      <div class="qa-body">Claude Code not found</div>
     </div>
   {/if}
 
@@ -500,16 +497,16 @@
               <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
               <span class="path mono" title={hit.path}>{hit.path.split("/").pop() || hit.path}</span>
               {#if hit.symbol}
-                <span class="symbol mono" title="The definition this passage holds">{hit.symbol}</span>
+                <span class="symbol mono">{hit.symbol}</span>
               {/if}
               {#if hit.label || hit.contentType}
-                <span class="tag tag-kind" title="What this file is, how much it counts and when it last changed">{hit.label ?? hit.contentType}</span>
+                <span class="tag tag-kind">{hit.label ?? hit.contentType}</span>
               {/if}
               {#if hit.memberName}
                 <span class="tag tag-member" title={hit.path}>{hit.memberName}</span>
               {/if}
               {#if hit.source === "semantic" || hit.source === "both"}
-                <span class="tag tag-semantic" title="Matched by meaning, not just keywords">semantic</span>
+                <span class="tag tag-semantic">semantic</span>
               {/if}
             </span>
           </span>
@@ -541,7 +538,6 @@
     </div>
   {:else if searched && !searchError && results.length < 3 && query.trim().length >= 3}
     <div class="look-row">
-      <span>Not much in the index for this.</span>
       <button class="qa-dig" onclick={askKenToLook}>Ask Ken to look</button>
     </div>
   {/if}
@@ -549,17 +545,7 @@
   {#if searchError}
     <div class="empty error">Search failed: {searchError}</div>
   {:else if results.length === 0 && searched}
-    <div class="empty">
-      {#if scope === "all"}
-        Nothing in {workspaceName} matches “{query}”.
-      {:else if app.scanning}
-        Nothing matches “{query}” <em>yet</em> — Ken is still reading your folder.
-        Search lights up as files are indexed.
-      {:else}
-        Nothing in this repo matches “{query}”. Ken searches file contents and
-        names — try fewer or different words.
-      {/if}
-    </div>
+    <div class="empty"><EmptyState title="No matches" /></div>
   {/if}
 
   <div class="foot">
