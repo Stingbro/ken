@@ -175,8 +175,10 @@ pub struct Placement {
     pub raw: String,
     /// The note (`…/Ingested/Meetings/2026-09/2026-09-24-standup.md`).
     pub note: String,
-    /// Where the source goes as its note is written, beside the note
-    /// (`…/Ingested/Meetings/2026-09/2026-09-24-standup/standup.txt`).
+    /// Where the source goes as its note is written, beside the note and
+    /// named for it (`…/2026-09/2026-09-24-standup/2026-09-24-standup.source.txt`).
+    /// A card from before keeps the source's own name
+    /// (`…/2026-09-24-standup/standup.txt`).
     pub source: String,
 }
 
@@ -291,10 +293,15 @@ fn has_date(name: &str) -> bool {
 /// folder, then the month, not colliding with an earlier one. The note is
 /// named for the day it was read, unless the source's name has a date of
 /// its own (`meeting-2026-10-14`): then that name is enough, so a name
-/// never carries two dates.
+/// never carries two dates. The source moves into a folder of the note's
+/// name as `<note>.source.<ext>`: never the note's link name, even when the
+/// source kept its own name for the note (`meeting-2026-10-14.md` beside
+/// `meeting-2026-10-14.md` made `[[meeting-2026-10-14]]` two pages), nor
+/// another source's of the same name. A card from before keeps the path it
+/// recorded, so its source is found where it was moved.
 pub fn place(root: &Path, raw: &str, date: &str, kind: SourceKind) -> Placement {
     let file = raw.rsplit('/').next().unwrap_or(raw).to_string();
-    let stem = file.rsplit_once('.').map_or(file.as_str(), |(s, _)| s);
+    let (stem, ext) = file.rsplit_once('.').map_or((file.as_str(), None), |(s, e)| (s, Some(e)));
     let month = date.get(..7).unwrap_or(date);
     let dir = format!("{INGESTED}/{}/{month}", kind.folder());
     let name = if has_date(&slug(stem)) { slug(stem) } else { format!("{date}-{}", slug(stem)) };
@@ -307,7 +314,10 @@ pub fn place(root: &Path, raw: &str, date: &str, kind: SourceKind) -> Placement 
     Placement {
         raw: raw.to_string(),
         note: format!("{dir}/{base}.md"),
-        source: format!("{dir}/{base}/{file}"),
+        source: match ext {
+            Some(ext) => format!("{dir}/{base}/{base}.source.{ext}"),
+            None => format!("{dir}/{base}/{base}.source"),
+        },
     }
 }
 
@@ -2686,14 +2696,66 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = place(d.path(), &format!("{RAW}/meeting-2026-10-14.md"), "2026-10-15", SourceKind::Meeting);
         assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-10/meeting-2026-10-14.md"));
+        assert_eq!(p.source, format!("{INGESTED}/Meetings/2026-10/meeting-2026-10-14/meeting-2026-10-14.source.md"), "never the note's name");
         let p = place(d.path(), &format!("{RAW}/2026-10-14 standup.txt"), "2026-10-15", SourceKind::Meeting);
         assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-10/2026-10-14-standup.md"));
         fs::create_dir_all(d.path().join(format!("{INGESTED}/Meetings/2026-10"))).unwrap();
         fs::write(d.path().join(&p.note), "x").unwrap();
         let again = place(d.path(), &format!("{RAW}/2026-10-14 standup.txt"), "2026-10-15", SourceKind::Meeting);
         assert_eq!(again.note, format!("{INGESTED}/Meetings/2026-10/2026-10-14-standup-2.md"));
+        assert_eq!(again.source, format!("{INGESTED}/Meetings/2026-10/2026-10-14-standup-2/2026-10-14-standup-2.source.txt"));
         let undated = place(d.path(), &format!("{RAW}/Standup notes.txt"), "2026-10-15", SourceKind::Meeting);
         assert_eq!(undated.note, format!("{INGESTED}/Meetings/2026-10/2026-10-15-standup-notes.md"));
+        let bare = place(d.path(), &format!("{RAW}/README"), "2026-10-15", SourceKind::Document);
+        assert_eq!(bare.source, format!("{INGESTED}/Documents/2026-10/2026-10-15-readme/2026-10-15-readme.source"));
+    }
+
+    /// The walkthrough's `meeting-2026-10-14.md`: its note keeps the name,
+    /// the source moved beside it does not take it too, so lint files no
+    /// "two pages claim the name" and every link the ingest wrote reaches
+    /// one page.
+    #[test]
+    fn a_dated_source_and_its_note_never_share_a_link_name() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        fs::create_dir_all(root.join(RAW)).unwrap();
+        fs::create_dir_all(root.join(INGESTED)).unwrap();
+        fs::create_dir_all(root.join("Current")).unwrap();
+        fs::write(root.join("Current/Project.md"), SHORT_PROJECT).unwrap();
+        fs::write(root.join(RAW).join("meeting-2026-10-14.md"), "# Meeting
+
+Ana: \"we ship on Friday\". Ben will fix the save bug.
+").unwrap();
+        let project = crate::project::Project::create(root, "Wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let model = |p: &str| -> std::result::Result<String, CallError> {
+            if writing(p, "Current/Project.md") {
+                return Ok(SHORT_PROJECT.replace("We ship on Monday.", "We ship on Friday ([[meeting-2026-10-14]])."));
+            }
+            pass_model(p)
+        };
+        let report = run_pass(root, &mut db, &[], "2026-10-15", || 5, Transcriber::default(), model, &quiet()).unwrap();
+        assert_eq!(report.read.len(), 1, "{report:?}");
+        let p = &report.read[0];
+        assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-10/meeting-2026-10-14.md"), "one date");
+        assert_eq!(p.source, format!("{INGESTED}/Meetings/2026-10/meeting-2026-10-14/meeting-2026-10-14.source.md"));
+        assert!(root.join(&p.source).is_file());
+        let note = fs::read_to_string(root.join(&p.note)).unwrap();
+        assert!(note.contains(&format!("sources:
+  - \"[[{}]]\"
+", p.source)), "{note}");
+        assert!(fs::read_to_string(root.join("Current/Project.md")).unwrap().contains("[[meeting-2026-10-14]]"), "the ingest cited its note");
+
+        crate::scan::scan(&project, &mut db).unwrap();
+        let links = crate::links::report(&db).unwrap();
+        assert!(links.duplicate_names.is_empty() && links.missing_names.is_empty() && links.broken_paths.is_empty(), "{links:?}");
+        let resolver = crate::links::Resolver::from_db(&db).unwrap();
+        let name = |t: &str| crate::links::Link { kind: crate::links::LinkKind::Name, target: t.into() };
+        assert_eq!(resolver.resolve(&name("meeting-2026-10-14")), vec![p.note.clone()]);
+        assert_eq!(resolver.resolve(&name(&p.source)), vec![p.source.clone()], "the note's sources: link");
+        let found = crate::lint::scan_findings(&db).unwrap();
+        assert!(!found.iter().any(|f| f.kind == "ambiguous-name" || f.text.contains("meeting-2026-10-14")), "{found:#?}");
     }
 
     #[test]
@@ -2854,7 +2916,7 @@ mod tests {
         let p = read.placement;
 
         assert_eq!(p.note, format!("{INGESTED}/Meetings/2026-09/2026-09-24-standup-notes.md"), "people present: a meeting");
-        assert_eq!(p.source, format!("{INGESTED}/Meetings/2026-09/2026-09-24-standup-notes/Standup notes.txt"));
+        assert_eq!(p.source, format!("{INGESTED}/Meetings/2026-09/2026-09-24-standup-notes/2026-09-24-standup-notes.source.txt"));
         assert!(seen_prompt.contains("we ship on Friday"));
         assert!(!root.join(&raw).exists() && root.join(&p.source).exists(), "claimed as the note is written");
         let note = fs::read_to_string(root.join(&p.note)).unwrap();
