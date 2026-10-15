@@ -409,6 +409,13 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - Left for lanes 2 and 3: Settings › Workspace, Sync, Ingest rules, the repo drawer and the Ingest detail.
   - `npm run check` 0 errors, 0 warnings; vitest 803 passed in 65 files. Not run: the app.
 
+- **UI lane 2: four Settings sections, Workspace table → detail** (`a18768d`, `e775043`, `3f861bc`). Changes 2 and 4 of the UI audit.
+  - Settings is General, Workspace, AI and Agents (`a18768d`): 6 sections → 4. Ingest rules is deleted (7 → 0, Chris approved) and Sync's paragraph with it (1 → 0); `SettingsSection` loses `sync` and `rules`.
+  - Sync lives beside the knowledge base's row in Workspace (`e775043`): one line under it reads the remote and branch, when it last pulled and pushed, what blocks it, and how many files changed outside Ken, with "Commit my other changes…" listing the files before it commits them. `sync_status` and `sync_commit_others` take an optional project id, so the line reads the knowledge base whichever repo is focused. `SyncStatus` gains `lastPull` (`FETCH_HEAD`) and `lastPush` (the upstream's newest "update by push"), from `sync::last_pull_push`. The sync-state details are short labels ("sync failed: …", "two versions wait in the Inbox"), and `app.syncStates` keeps each member's.
+  - Workspace is table → detail (`3f861bc`): the whole row opens the repo's detail (`RepoDrawer` is `RepoDetail`, in place of the table, one way back); the sliders icon and the row's remove cross are gone, and the source cell is the name and its file count. The detail's header carries Analyse again (with where it stands), Sync now for the knowledge base, Open in Files, Reindex and Remove; its form carries index, kind, health, what it is for, the watched folders, cloud files, video transcription and the sync switch; Save is pinned at the bottom. The repo analysis list went into each detail's header.
+  - Descriptive strings before → after: Workspace 24 → 4 (the editors' one-line syntax placeholders), the repo drawer 11 → 1 ("No remote", now on the sync line). Dividers read name · count, empty lists say "none", no `.ken/knowledge.json` text. Kept against the copy rule: the paths of the files "Commit my other changes" commits, since the files are listed first by design.
+  - `npm run check` 0 errors, 0 warnings; vitest 807 passed in 65 files; `cargo check --workspace --all-targets` no warnings; ken-core `sync::` 18 passed (a new test for `last_pull_push`); ken-app 17 passed. Not run: the app.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
