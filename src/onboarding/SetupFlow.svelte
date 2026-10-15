@@ -146,10 +146,6 @@
 
   {#if step === "name"}
     <h2 class="t-heading">Name the workspace</h2>
-    <p class="note">
-      A workspace is the sources Ken knows and the knowledge base it keeps beside them. Its name is how Ken and the
-      knowledge base call it.
-    </p>
     <label class="field">
       <span class="t-label">Workspace name</span>
       <input
@@ -172,10 +168,7 @@
     </div>
   {:else if step === "base"}
     <h2 class="t-heading">Where the knowledge base is saved</h2>
-    <p class="note">
-      The knowledge base is one repo: the library, the decisions log, the tickets and its settings. Ken writes and
-      commits only there, never in a source.
-    </p>
+    <p class="note">Ken commits only in the knowledge base.</p>
     <div class="k-card choice">
       <label class="check-row">
         <input type="radio" name="kb" checked={kb.mode === "new"} onchange={() => (kb = defaultKb(name, commonParent(rows)))} />
@@ -196,12 +189,6 @@
             <span class="where-path">{c.parent ?? "Choose a folder…"}</span>
           </button>
         </div>
-        {#if c.parent}
-          <p class="note indent">
-            Ken makes <span class="mono">{newWikiPath(c.parent, c.name || `${name}-Wiki`)}</span> from the template, with one
-            git commit. It stays on this computer; adding a remote and pushing is yours to do.
-          </p>
-        {/if}
       {/if}
       <label class="check-row">
         <input type="radio" name="kb" checked={kb.mode === "existing"} onchange={() => void chooseExisting()} />
@@ -216,7 +203,6 @@
           </button>
         </div>
         {#if c.path}
-          <p class="note indent">Ken adds only the files it lacks (the sections' indexes, the decisions log, the templates, its settings). Nothing there is changed or deleted.</p>
           {#if mapPlan}
             {#if mapPlan.moves.length > 0}
               <label class="check-row indent">
@@ -231,7 +217,6 @@
                   <div class="move"><span class="mono">{page}</span> <span class="evidence">stays: {why}</span></div>
                 {/each}
               </div>
-              <p class="note indent">Links are rewritten where Ken is sure of the target; the rest are listed. One commit and a log line.</p>
             {:else}
               <p class="note indent">Every page is already in a section.</p>
             {/if}
@@ -245,11 +230,6 @@
     </div>
   {:else}
     <h2 class="t-heading">Sources</h2>
-    <p class="note">
-      Pick each repo or folder, wherever it lives; pick a folder of repos to add every repo in it. Ken reads what is in
-      each to propose its kind, and reads nothing until you confirm. Say in a line what each is for: the knowledge
-      base lists it. Connectors come later.
-    </p>
     <div class="actions">
       <button class="btn btn-primary" disabled={busy} onclick={addRepos}>
         {busy ? "Reading…" : rows.length === 0 ? "Pick sources…" : "Add more…"}
@@ -292,11 +272,6 @@
           </div>
         {/each}
       </div>
-      <p class="note">
-        A source is indexed or left out: searched, in the code index and read by Claude when asked. Ken never commits
-        into a source. Dependencies, build output, tests, generated files, binaries and secrets are never indexed; more
-        rules go in the knowledge base's settings.
-      </p>
     {/if}
     <p class="counts"><strong>{summary.indexed}</strong> indexed · <strong>{summary.left}</strong> left out</p>
     <div class="actions">
@@ -305,10 +280,6 @@
       </button>
       <button class="btn btn-ghost" onclick={() => (step = "base")}>Back</button>
     </div>
-    <p class="note">
-      Confirm lays the knowledge base down and indexes every source in the background, so search and the code index
-      work at once. Building the library from the sources is its own step, in Settings, at the pace you set there.
-    </p>
   {/if}
 
   {#if error}<div class="k-notice danger">{error}</div>{/if}

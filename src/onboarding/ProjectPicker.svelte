@@ -82,10 +82,6 @@
       <span class="t-heading">Ken</span>
     </div>
     <h1 class="t-title">Your team's knowledge, in one calm place.</h1>
-    <p class="t-lead lede">
-      Point Ken at a folder — notes, documents, spreadsheets, anything. Ken
-      reads it, keeps watch, and makes every fact findable.
-    </p>
 
     {#if setupOpen}
       <SetupFlow onclose={() => (setupOpen = false)} />
@@ -97,17 +93,9 @@
       <div class="choices">
         <button class="k-card choice" onclick={openWorkspaceFolder}>
           <span class="t-heading">Open a workspace</span>
-          <span class="t-small">
-            Pick the folder of a workspace set up before, on this machine or
-            by a teammate.
-          </span>
         </button>
         <button class="k-card choice" onclick={() => (setupOpen = true)}>
           <span class="t-heading">Set up a new workspace</span>
-          <span class="t-small">
-            Pick the repos Ken should know, wherever they live. It proposes what
-            each is; nothing is written until you confirm.
-          </span>
         </button>
       </div>
       {#if noWorkspaceAt}
@@ -185,10 +173,6 @@
   h1 {
     margin: 8px 0 0;
   }
-  .lede {
-    margin: 0;
-    color: var(--ink-2);
-  }
   .choices {
     display: flex;
     flex-direction: column;
@@ -211,9 +195,6 @@
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft);
-  }
-  .choice .t-small {
-    line-height: 1.5;
   }
   .grow {
     flex: 1;
