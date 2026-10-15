@@ -14,9 +14,14 @@
 //!   memories and journal, and opening a file in Ken. Only Ken's own chat
 //!   registers it, beside the knowledge server.
 //!
-//! Scoping: `ken-mcp --project <path>` makes that project the one a path
-//! is read in; unscoped, a project-relative path needs a `project` argument
-//! matched against Ken's registry. Search covers every repo either way.
+//! Scoping: `ken-mcp --workspace <dir>` serves that workspace, whatever Ken
+//! has open: search, repos, tickets and the knowledge base are its sources,
+//! and a path with no `project` is read in its knowledge base. Without it
+//! the workspace is the one Ken last had open. `ken-mcp --project <path>`
+//! makes that project the one a path is read in (Ken's own chat); with
+//! neither, a project-relative path needs a `project` argument matched
+//! against Ken's registry. Search covers every source of the workspace
+//! either way.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -50,6 +55,9 @@ struct Server {
     base_dir: PathBuf,
     /// Root the server is locked to (`--project <path>`), if any.
     scoped: Option<PathBuf>,
+    /// The workspace the server serves (`--workspace <dir>`, the folder
+    /// holding its `.ken-workspace`), if any; else the one Ken last had open.
+    workspace: Option<PathBuf>,
     /// The personal tool set (`--personal`) rather than the knowledge server.
     personal: bool,
     /// The embedding model, loaded by the first search that needs it.
@@ -68,6 +76,7 @@ enum Meaning {
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut scoped = None;
+    let mut workspace = None;
     let mut personal = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,13 +87,20 @@ fn main() {
                     std::process::exit(2);
                 }
             },
+            "--workspace" => match args.next() {
+                Some(dir) => workspace = Some(PathBuf::from(dir)),
+                None => {
+                    eprintln!("ken-mcp: --workspace needs a folder");
+                    std::process::exit(2);
+                }
+            },
             "--personal" => personal = true,
             "--version" => {
                 eprintln!("ken-mcp {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             other => {
-                eprintln!("ken-mcp: unknown argument {other:?}\nusage: ken-mcp [--project <path>] [--personal]");
+                eprintln!("ken-mcp: unknown argument {other:?}\nusage: ken-mcp [--workspace <dir>] [--project <path>] [--personal]");
                 std::process::exit(2);
             }
         }
@@ -103,7 +119,12 @@ fn main() {
     ken_core::local_llm::init(base_dir.clone());
     let use_gpu = AppSettings::load(&base_dir).extra.get("useGpu").and_then(Value::as_bool);
     ken_core::compute::set_use_gpu(use_gpu.unwrap_or(true));
-    let mut server = Server { base_dir, scoped, personal, ..Default::default() };
+    if let Some(dir) = &workspace {
+        if let Err(e) = ken_core::workspace::Workspace::open(dir) {
+            eprintln!("ken-mcp: {} is not a Ken workspace ({e}); its folder is searched as one", dir.display());
+        }
+    }
+    let mut server = Server { base_dir, scoped, workspace, personal, ..Default::default() };
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -2345,6 +2366,13 @@ fn resolve_project(server: &Server, args: &Value) -> Result<(Project, Option<Str
     };
 
     let Some(requested) = requested.filter(|r| !r.is_empty()) else {
+        // A workspace's server reads a bare path in its knowledge base.
+        if server.workspace.is_some() {
+            if let Ok((_, name, root)) = knowledge_base(server) {
+                let project = Project::open(&root).map_err(|e| format!("could not open the knowledge base \"{name}\": {e}"))?;
+                return Ok((project, None));
+            }
+        }
         return Err(format!(
             "This server is not locked to a project, so the \"project\" \
 argument is required (a name or folder path). {available}"
@@ -2369,17 +2397,28 @@ argument is required (a name or folder path). {available}"
     Ok((project, None))
 }
 
-/// Whether a registered project belongs to the workspace open in Ken: its
-/// folder is inside the workspace's. With no workspace open, every project
-/// does. A search with no project named stays inside the workspace the person
-/// has open, so another client's files are never found or cited.
+/// The folder of the workspace this server serves: the one `--workspace`
+/// names, else the one Ken last had open (the registry's `last_workspace`).
+fn workspace_folder(server: &Server, registry: &Registry) -> Option<PathBuf> {
+    if let Some(dir) = &server.workspace {
+        return Some(dir.clone());
+    }
+    let id = registry.last_workspace?;
+    registry.workspaces.iter().find(|w| w.id == id).map(|w| w.path.clone())
+}
+
+/// Whether a registered project belongs to the workspace this server serves
+/// ([`workspace_folder`]): its folder is inside the workspace's, or it is
+/// one of the workspace's sources. With no workspace, every project does. A
+/// search with no project named stays inside that workspace, so another
+/// client's files are never found or cited.
 fn in_open_workspace(server: &Server, registry: &Registry) -> impl Fn(&std::path::Path) -> bool {
-    let ws = registry.last_workspace.and_then(|id| registry.workspaces.iter().find(|w| w.id == id));
-    let root = ws.map(|w| norm_path(&w.path));
+    let folder = workspace_folder(server, registry);
+    let root = folder.as_deref().map(norm_path);
     // A workspace set up from picked repos lives in Ken's app data and its
     // repos anywhere: its members count as inside it.
-    let members: Vec<String> = ws
-        .and_then(|w| ken_core::workspace::Workspace::open(&w.path).ok())
+    let members: Vec<String> = folder
+        .and_then(|f| ken_core::workspace::Workspace::open(&f).ok())
         .map(|o| {
             o.members
                 .iter()
@@ -2390,7 +2429,6 @@ fn in_open_workspace(server: &Server, registry: &Registry) -> impl Fn(&std::path
                 .collect()
         })
         .unwrap_or_default();
-    let _ = server;
     move |path: &std::path::Path| match &root {
         Some(r) => {
             let p = norm_path(path);
@@ -2413,24 +2451,13 @@ fn norm_path(path: &std::path::Path) -> String {
 }
 
 /// The workspace ken-mcp should read/write memories and the journal for:
-/// Ken's registry `lastWorkspace` entry, or a clear "no workspace" message.
-/// There is no `--project`-style scoping flag for a workspace to fall back
-/// on: ken-mcp only ever knows the workspace Ken last had open, as the app
-/// itself reopens `lastWorkspace` on launch.
+/// the one `--workspace` names, else Ken's registry `lastWorkspace` entry
+/// (the app itself reopens it on launch), or a clear "no workspace" message.
 fn resolve_workspace_root(server: &Server) -> Result<PathBuf, String> {
     let registry = Registry::load(&server.base_dir)
         .map_err(|e| format!("could not read Ken's project registry: {e}"))?;
-    let id = registry.last_workspace.ok_or_else(|| {
-        "No Ken workspace is open — open a workspace folder in the Ken app first.".to_string()
-    })?;
-    registry
-        .workspaces
-        .iter()
-        .find(|w| w.id == id)
-        .map(|w| w.path.clone())
-        .ok_or_else(|| {
-            "No Ken workspace is open — open a workspace folder in the Ken app first.".to_string()
-        })
+    workspace_folder(server, &registry)
+        .ok_or_else(|| "No Ken workspace is open — open a workspace folder in the Ken app first.".to_string())
 }
 
 /// Resolve a project-scoped memory's project (id, root, name) by name from
@@ -3455,6 +3482,60 @@ mod tests {
         let (text, is_err) = tool(&mut server, "repos", json!({}));
         assert!(!is_err, "{text}");
         assert!(text.contains("\nWiki (knowledge base) — ") && text.contains("\nGame — "), "{text}");
+    }
+
+    /// `--workspace` serves the workspace it names, whatever Ken last had
+    /// open: search, repos and the knowledge base are its sources, and a
+    /// bare path is read in its knowledge base. Without it the server
+    /// follows the workspace Ken last had open.
+    #[test]
+    fn a_workspace_server_serves_its_whole_workspace() {
+        let base = tempfile::tempdir().unwrap();
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        // The knowledge base is the source holding the ingest inbox.
+        std::fs::create_dir_all(ws_a.path().join("wiki").join(ken_core::ingest::RAW)).unwrap();
+        std::fs::create_dir_all(ws_a.path().join("game")).unwrap();
+        std::fs::create_dir_all(ws_b.path().join("zeus")).unwrap();
+        std::fs::write(ws_a.path().join("wiki/plan.md"), "The launch schedule is in May.\n").unwrap();
+        std::fs::write(ws_a.path().join("game/notes.md"), "Game notes about the launch schedule.\n").unwrap();
+        std::fs::write(ws_b.path().join("zeus/b.md"), "Zeus notes about the launch schedule.\n").unwrap();
+        let a = ken_core::workspace::Workspace::create(ws_a.path(), "A", &["wiki".to_string(), "game".to_string()]).unwrap();
+        let b = ken_core::workspace::Workspace::create(ws_b.path(), "B", &["zeus".to_string()]).unwrap();
+        let mut registry = Registry::default();
+        for root in [ws_a.path().join("wiki"), ws_a.path().join("game"), ws_b.path().join("zeus")] {
+            let project = Project::open(&root).unwrap();
+            let mut db = Db::open(base.path(), project.config.id).unwrap();
+            scan::scan(&project, &mut db).unwrap();
+            index_semantically(&project, &mut db);
+            registry.add(&project);
+        }
+        registry.add_workspace(&a, None, 0);
+        registry.add_workspace(&b, None, 0);
+        // Ken last had the other workspace open.
+        registry.last_workspace = Some(b.config.id);
+        registry.save(base.path()).unwrap();
+        AppSettings::default().save(base.path()).unwrap();
+
+        let mut server = Server { base_dir: base.path().to_path_buf(), workspace: Some(ws_a.path().to_path_buf()), ..Default::default() };
+        let (text, is_err) = tool(&mut server, "search", json!({"query": "launch schedule"}));
+        assert!(!is_err, "{text}");
+        assert!(text.contains("plan.md") && text.contains("notes.md"), "every source of the workspace: {text}");
+        assert!(!text.contains("b.md"), "never the other workspace: {text}");
+        let (text, _) = tool(&mut server, "repos", json!({}));
+        assert!(text.contains("wiki") && text.contains("game") && !text.contains("zeus"), "{text}");
+        let (text, is_err) = tool(&mut server, "read", json!({"path": "plan.md"}));
+        assert!(!is_err, "a bare path is read in the knowledge base: {text}");
+        assert!(text.contains("The launch schedule is in May."), "{text}");
+        let instructions = instructions(&server);
+        assert!(instructions.contains("The knowledge base of the open workspace is wiki"), "{instructions}");
+
+        // Without `--workspace`: the workspace Ken last had open.
+        let mut server = Server { base_dir: base.path().to_path_buf(), ..Default::default() };
+        let (text, _) = tool(&mut server, "search", json!({"query": "launch schedule"}));
+        assert!(text.contains("b.md") && !text.contains("plan.md"), "{text}");
+        let (text, is_err) = tool(&mut server, "read", json!({"path": "plan.md"}));
+        assert!(is_err && text.contains("\"project\" argument is required"), "{text}");
     }
 
     // --- ken-memory (task 3.2) ---

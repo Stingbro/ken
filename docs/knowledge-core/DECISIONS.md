@@ -169,6 +169,7 @@ On top of that base:
     - **Claude adds topic tags at write time only.** No background local-model extraction, no federation merge, no person-centred entities.
     - **Exposed as `related`.** There's no Map view.
 22. **MCP tools:** `search`, `read`, `related`, `code_definition`, `code_usages`, `code_outline`, `code_imports`, `history`, `tickets`, `propose_decision`, `add_source`, `repos`, plus server `instructions`. Memory, task and family tools leave the knowledge server.
+    - **Scope:** an agent connected from Settings › Agents gets the whole workspace, its knowledge base and every source: `ken-mcp --workspace <dir>` serves that workspace whatever Ken opens later, and reads a bare path in the knowledge base. Without it the server follows the workspace Ken last had open; Ken's own chat keeps `--project` for the repo it runs in (Chris, 2026-10-15).
 
 ### Priority
 

@@ -4405,7 +4405,7 @@ fn import_cancel(state: State<SharedState>, import_id: String) -> CmdResult<()> 
 #[serde(rename_all = "camelCase")]
 struct McpInfo {
     binary_path: Option<String>,
-    project_root: String,
+    workspace_root: String,
     add_command: String,
     json_config: String,
     llm_instruction: String,
@@ -4486,38 +4486,46 @@ fn shell_word(s: &str) -> String {
     }
 }
 
+/// How an agent outside Ken connects to it (Settings › Agents): the
+/// knowledge server for the whole open workspace, its knowledge base and
+/// every source (`ken-mcp --workspace`), not the focused repo (Chris,
+/// 2026-10-15). The server stays on this workspace whatever Ken opens later.
 #[tauri::command(async)]
 fn mcp_info(state: State<SharedState>) -> CmdResult<McpInfo> {
     let guard = state.lock().unwrap();
-    let active = member(&guard, None)?;
-    let root = active.project.root.to_string_lossy().into_owned();
+    let ws = guard.workspace.as_ref().ok_or("no workspace open")?;
+    let root = ws.ws.root.to_string_lossy().into_owned();
+    let name = ws.ws.config.name.clone();
     let binary_path = find_ken_mcp().map(|p| p.to_string_lossy().into_owned());
     // When the binary isn't found the strings still render with the bare
     // name so copied configs work once it lands on PATH.
     let command = binary_path.clone().unwrap_or_else(|| "ken-mcp".into());
     let add_command = format!(
-        "claude mcp add ken -- {} --project {}",
+        "claude mcp add ken -- {} --workspace {}",
         shell_word(&command),
         shell_word(&root)
     );
     let json_config = serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {
-            "ken": { "command": command, "args": ["--project", root] }
+            "ken": { "command": command, "args": ["--workspace", root] }
         }
     }))
     .map_err(err)?;
     // The knowledge server only (decision 22): the person's tasks and memory
     // are the personal set, which only Ken's own chat registers.
     let llm_instruction = format!(
-        "Set up the Ken MCP server so you can search this workspace's knowledge base.\n\n\
-Ken is a local knowledge app that indexes the project folder at {root}. Its MCP \
-server binary, ken-mcp, runs on demand over stdio and tells you how to use it in its \
-instructions. Its tools: search (every repo of the workspace), read (a hit, a file or \
-a folder), related (what a page, ruling, ticket or file is tied to), the code index \
-(code_definition, code_usages, code_outline, code_imports), history, tickets and \
-repos. It never edits the person's files. Two tools only queue for a person: \
-propose_decision files a ruling in Ken's Inbox for one click into the decisions log, \
-and add_source puts a source in the knowledge base's inbox for the next ingest.\n\n\
+        "Set up the Ken MCP server so you can search the workspace \"{name}\": its knowledge base \
+and every source.\n\n\
+Ken is a local knowledge app. The workspace's folder is {root}; Ken indexes its knowledge \
+base and each of its sources, and the server covers them all. Its MCP server binary, \
+ken-mcp, runs on demand over stdio and tells you how to use it in its instructions. Its \
+tools: search (every source of the workspace), read (a hit, a file or a folder; a bare \
+path is read in the knowledge base), related (what a page, ruling, ticket or file is \
+tied to), the code index (code_definition, code_usages, code_outline, code_imports), \
+history, tickets and repos (the workspace's sources). It never edits the person's \
+files. Two tools only queue for a person: propose_decision files a ruling in Ken's \
+Inbox for one click into the decisions log, and add_source puts a source in the \
+knowledge base's inbox for the next ingest.\n\n\
 If you are Claude Code, register it by running:\n\n  {add_command}\n\n\
 Otherwise, add this to your MCP configuration:\n\n{json_config}\n\n\
 Once connected, start with search to find what answers a question, and read to \
@@ -4525,7 +4533,7 @@ read it."
     );
     Ok(McpInfo {
         binary_path,
-        project_root: root,
+        workspace_root: root,
         add_command,
         json_config,
         llm_instruction,

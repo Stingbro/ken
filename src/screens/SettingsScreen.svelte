@@ -480,7 +480,7 @@
             </div>
           </div>
           <div class="mcp-chips">
-            <span class="mcp-chip"><strong>Scope</strong>: this repo</span>
+            <span class="mcp-chip" title={mcp.workspaceRoot}><strong>Scope</strong>: workspace</span>
             <button class="mcp-chip mcp-chip-btn" onclick={() => mcp && copy(mcp.llmInstruction, "instruction")}>
               <strong>Instructions for the agent</strong>: paste them in ·
               <span class="mcp-chip-action">

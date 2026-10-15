@@ -715,7 +715,8 @@ export interface PtyChunk {
 
 export interface McpInfo {
   binaryPath: string | null;
-  projectRoot: string;
+  /** The open workspace's folder: the connect command serves all of it. */
+  workspaceRoot: string;
   addCommand: string;
   jsonConfig: string;
   llmInstruction: string;
