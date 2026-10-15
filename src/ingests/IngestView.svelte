@@ -27,7 +27,7 @@
   import { app } from "../lib/app.svelte";
   import { record } from "../lib/record.svelte";
   import { rail } from "../lib/rail.svelte";
-  import { renderMarkdown } from "../lib/markdown";
+  import { renderMarkdown, renderTitle } from "../lib/markdown";
   import { timeAgo } from "../lib/format";
   import { errorText } from "../lib/toast.svelte";
   import { claudeInstallHelp } from "../lib/platform";
@@ -37,6 +37,7 @@
     commitLine,
     ingestBusy,
     pageName,
+    raidDetail,
     rawActions,
     rawStateLabel,
     stagingLine,
@@ -545,7 +546,7 @@
         <button class="srow" class:sel={s.id === selected} onclick={() => selectCard(s.id)}>
           <span class="sicon"><FileText size={15} strokeWidth={1.75} aria-hidden="true" /></span>
           <span class="stext">
-            <span class="stitle">{s.title}</span>
+            <span class="stitle">{@html renderTitle(s.title)}</span>
             <span class="sline">{s.kind || "source"} · {timeAgo(s.at)}{#if !s.open} · seen{/if}</span>
           </span>
           {#if s.waiting > 0}<span class="count">{s.waiting}</span>{/if}
@@ -568,7 +569,7 @@
             {#if card.takeaways.present.length > 0}<span class="chip">{card.takeaways.present.join(" · ")}</span>{/if}
             {#if !card.open}<span class="chip">seen</span>{/if}
           </div>
-          <h2>{card.takeaways.title || card.note.split("/").pop()}</h2>
+          <h2>{@html renderTitle(card.takeaways.title || (card.note.split("/").pop() ?? ""))}</h2>
           <div class="t-small">{card.note}</div>
         </div>
         <div class="cacts">
@@ -604,7 +605,7 @@
             {#each rulings as p (p.id)}
               <div class="dcard">
                 <div class="dkind"><Gavel size={14} strokeWidth={1.75} aria-hidden="true" />Ruling{p.who ? ` · ${p.who}` : ""}</div>
-                <div class="dshort">“{rulingOf(p)}”</div>
+                <div class="dshort">“{@html renderTitle(rulingOf(p))}”</div>
                 <div class="ddetail">Ready for the decisions log; adding it gives it the next number.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
@@ -619,7 +620,8 @@
                 <div class="dkind">
                   {#if p.kind === "risk"}<TriangleAlert size={14} strokeWidth={1.75} aria-hidden="true" />Risk{:else}<CircleAlert size={14} strokeWidth={1.75} aria-hidden="true" />Issue{/if}{p.who ? ` · ${p.who}` : ""}
                 </div>
-                <div class="dshort">{raidOf(p)}</div>
+                <div class="dshort">{@html renderTitle(raidOf(p))}</div>
+                {#if raidDetail(p.payload)}<div class="dquote">{raidDetail(p.payload)}</div>{/if}
                 <div class="ddetail">For the RAID register; adding it gives it the next number.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
@@ -632,7 +634,7 @@
             {#each tickets as p (p.id)}
               <div class="dcard">
                 <div class="dkind"><Ticket size={14} strokeWidth={1.75} aria-hidden="true" />Ticket</div>
-                <div class="dshort">{p.title}</div>
+                <div class="dshort">{@html renderTitle(p.title)}</div>
                 <div class="ddetail">Accepting writes the ticket in the knowledge base's tickets folder.</div>
                 {#if openDiff === p.id}<ProposalDetail payload={p.payload} />{/if}
                 <div class="dacts">
@@ -1170,6 +1172,13 @@
     font-size: 14.5px;
     font-weight: 600;
     line-height: 1.35;
+  }
+  .dquote {
+    padding-left: 10px;
+    border-left: 2px solid var(--line);
+    font-size: 13px;
+    color: var(--ink-2);
+    line-height: 1.5;
   }
   .ddetail {
     font-size: 13px;

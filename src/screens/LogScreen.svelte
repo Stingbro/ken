@@ -11,6 +11,7 @@
   import { api, type RaidItem, type RaidLog } from "../lib/api";
   import { app } from "../lib/app.svelte";
   import { counts, highlightMatches, statusTone, viewOf } from "../lib/log";
+  import { renderTitle } from "../lib/markdown";
   import Search from "@lucide/svelte/icons/search";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
 
@@ -70,7 +71,7 @@
   <div class="item" class:closed={it.closed}>
     {#if it.id}<span class="id mono">{@html highlightMatches(it.id, query)}</span>{/if}
     <div class="main">
-      <div class="title">{@html highlightMatches(it.title, query)}</div>
+      <div class="title">{@html renderTitle(it.title, (s) => highlightMatches(s, query))}</div>
       <div class="meta">
         <span class="pill {statusTone(it)}">{it.status}</span>
         {#if it.owner}<span class="owner">{it.owner}</span>{/if}

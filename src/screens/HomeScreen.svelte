@@ -10,7 +10,7 @@
   import { shortTarget, taskDetail, ticketDetail } from "../lib/day";
   import { inbox, type InboxItem } from "../lib/inbox.svelte";
   import { digestMarkdown } from "../lib/assist";
-  import { renderMarkdown } from "../lib/markdown";
+  import { renderMarkdown, renderTitle } from "../lib/markdown";
   import { parseCitation } from "../lib/citation";
   import { loadRecents, mergeWorkspaceRecents, fallbackRecents } from "../lib/recent";
   import { kindForPath, timeAgo } from "../lib/format";
@@ -240,7 +240,7 @@
           <div class="row">
             <button class="rmain plain" title="{t.repo}/{t.relPath}" onclick={() => void openInRepo(t.projectId, t.relPath)}>
               <span class="tid">{t.id}</span>
-              <span class="rtitle">{t.title}</span>
+              <span class="rtitle">{@html renderTitle(t.title)}</span>
               <span class="rdetail">{ticketDetail(t)}</span>
             </button>
             <select
@@ -318,7 +318,7 @@
       {#each needs as n (n.id)}
         <div class="k-action">
           <div class="kind {n.tone}"><InboxKindIcon item={n} bare />{n.kind} · {n.from}</div>
-          <button class="title plain" onclick={() => openInbox(n)}>{n.title}</button>
+          <button class="title plain" onclick={() => openInbox(n)}>{@html renderTitle(n.title)}</button>
           {#if n.short}<div class="short">{n.short}</div>{/if}
           <div class="acts">
             <button class="btn btn-primary btn-small" onclick={() => openInbox(n)}>Open</button>

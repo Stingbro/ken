@@ -25,6 +25,7 @@
   import { app } from "../lib/app.svelte";
   import { scope } from "../lib/scope.svelte";
   import { timeAgo } from "../lib/format";
+  import { renderTitle } from "../lib/markdown";
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import { toast } from "../lib/toast.svelte";
   import { rail } from "../lib/rail.svelte";
@@ -652,7 +653,7 @@
           <div class="entry">
             <span class="tag">{findingLabel(f.kind)}</span>
             <span class="finding">
-              <span class="ftitle">{f.title}</span>
+              <span class="ftitle">{@html renderTitle(f.title)}</span>
               {#if f.detail}<span class="sub">{f.detail}</span>{/if}
             </span>
             {#if f.path}

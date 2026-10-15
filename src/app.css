@@ -322,6 +322,11 @@ option {
 .mono {
   font-family: var(--font-mono);
 }
+/* A `code` span in a title (renderTitle): the title's size, in mono. */
+.title-code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
 
 /* ── Buttons: 28 small, 34 default, 40 large. One primary per group, first.
       Destructive actions are never primary. ────────────────────────────── */

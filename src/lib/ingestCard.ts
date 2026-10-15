@@ -13,6 +13,17 @@ export function writtenLine(pages: number, waiting: number): string {
   return line;
 }
 
+/** The line or two ingest wrote for a waiting risk or issue (its entry's
+ *  text), read from the proposal; empty for anything else. */
+export function raidDetail(payload: string | null): string {
+  try {
+    const raid = (JSON.parse(payload ?? "{}") as { raid?: { text?: unknown } }).raid;
+    return typeof raid?.text === "string" ? raid.text.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 /** A wiki page as a row names it: `Current/Project.md` → "Current › Project". */
 export function pageName(path: string): string {
   return path

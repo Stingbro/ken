@@ -10,6 +10,8 @@
   import { openInRepo } from "../lib/day.svelte";
   import { toast } from "../lib/toast.svelte";
   import { timeAgo } from "../lib/format";
+  import { renderTitle } from "../lib/markdown";
+  import { raidDetail } from "../lib/ingestCard";
   import ProposalDetail from "../ingests/ProposalDetail.svelte";
   import ConflictDetail from "../files/ConflictDetail.svelte";
   import InboxKindIcon from "./InboxKindIcon.svelte";
@@ -161,7 +163,7 @@
         <button class="row" class:sel={sel?.id === it.id} onclick={() => selectItem(it.id)}>
           <InboxKindIcon item={it} />
           <span class="rtext">
-            <span class="rtitle">{it.title}</span>
+            <span class="rtitle">{@html renderTitle(it.title)}</span>
             <span class="rmeta">{it.kind} · {it.from}{when(it) ? ` · ${when(it)}` : ""}</span>
           </span>
         </button>
@@ -178,7 +180,7 @@
         {#each inbox.done as it (it.id)}
           <button class="done" class:sel={sel?.id === it.id} onclick={() => selectItem(it.id)}>
             <CircleCheck size={14} strokeWidth={1.75} aria-hidden="true" />
-            <span>{it.title}</span>
+            <span>{@html renderTitle(it.title)}</span>
           </button>
         {/each}
       {/if}
@@ -189,7 +191,7 @@
     {#if sel}
       <div class="dinner">
         <div class="dkind {sel.tone}"><InboxKindIcon item={sel} bare />{sel.kind}</div>
-        <h2>{sel.title}</h2>
+        <h2>{@html renderTitle(sel.title)}</h2>
         <div class="t-small">
           From {sel.from}{when(sel) ? ` · ${when(sel)}` : ""}{sel.where ? ` · ${sel.where.split("/").pop()}` : ""}
         </div>
@@ -197,6 +199,9 @@
         {#if sel.source.type === "proposal"}
           {#if sel.source.proposal.body.trim()}
             <p class="body">{sel.source.proposal.body}</p>
+          {/if}
+          {#if (sel.source.proposal.kind === "risk" || sel.source.proposal.kind === "issue") && raidDetail(sel.source.proposal.payload)}
+            <p class="quote">{raidDetail(sel.source.proposal.payload)}</p>
           {/if}
           {#if sel.source.proposal.payload && (sel.source.proposal.kind === "page" || sel.source.proposal.kind === "new page")}
             <ProposalDetail payload={sel.source.proposal.payload} />
@@ -409,6 +414,15 @@
     line-height: 1.65;
     color: var(--ink-2);
     white-space: pre-wrap;
+  }
+  /* What ingest wrote for a risk or issue, as a ruling's card quotes it. */
+  .quote {
+    margin: 0;
+    padding-left: 12px;
+    border-left: 2px solid var(--line);
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--ink-2);
   }
   .plist {
     margin: 0;

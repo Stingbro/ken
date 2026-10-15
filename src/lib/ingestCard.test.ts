@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { canReadNow, commitLine, ingestBusy, pageName, rawActions, rawStateLabel, stagingLine, writtenLine } from "./ingestCard";
+import { canReadNow, commitLine, ingestBusy, pageName, raidDetail, rawActions, rawStateLabel, stagingLine, writtenLine } from "./ingestCard";
 import type { RawSource } from "./api";
 
 describe("writtenLine", () => {
@@ -64,5 +64,19 @@ describe("Read now", () => {
   it("keeps the screen reading while anything moves", () => {
     expect(ingestBusy({ running: false, raw: [raw("transcribing")] })).toBe(true);
     expect(ingestBusy({ running: false, raw: [raw("waiting"), raw("read")] })).toBe(false);
+  });
+});
+
+describe("raidDetail", () => {
+  it("reads the text ingest wrote for a risk or issue", () => {
+    expect(raidDetail(JSON.stringify({ raid: { kind: "risk", title: "Friday may slip", text: " The build waits on QA. " } }))).toBe(
+      "The build waits on QA.",
+    );
+  });
+
+  it("is empty for anything else", () => {
+    expect(raidDetail(JSON.stringify({ append: { ruling: "x" } }))).toBe("");
+    expect(raidDetail(null)).toBe("");
+    expect(raidDetail("not json")).toBe("");
   });
 });
