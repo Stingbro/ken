@@ -297,7 +297,7 @@
     title={isFailed
       ? `Could not read — ${node.file?.error ?? "no reason given"}`
       : node.file?.status === "cloud_only"
-        ? "Stored online only — open it and Ken will download it"
+        ? "Online only"
         : node.relPath}
   >
     <FileGlyph kind={node.file?.kind ?? "binary"} size="sm" />
@@ -307,7 +307,7 @@
     {:else if node.file?.status === "cloud_only"}
       <CloudIcon class="cloud-dot" size={12} strokeWidth={1.75} />
     {:else if isUnread}
-      <span class="unread-dot" title="Changed since you last looked"></span>
+      <span class="unread-dot" title="Changed"></span>
     {/if}
   </button>
 {/if}

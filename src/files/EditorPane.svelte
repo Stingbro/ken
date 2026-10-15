@@ -398,8 +398,6 @@
     {#if readOnly}
       <span
         class="read-only"
-        title="This file can't be edited in Ken"
-        aria-label="Read only — this file can't be edited in Ken"
       >
         <Lock size={12} strokeWidth={1.75} />
         <span>Read only</span>

@@ -79,7 +79,7 @@
               {s.name}
             </button>
             <span class="lines">{s.line}</span>
-            <button class="uses-btn" onclick={() => showUsages(s.name)} title="Every place this is used">usages</button>
+            <button class="uses-btn" onclick={() => showUsages(s.name)}>usages</button>
           </li>
         {/each}
       </ul>

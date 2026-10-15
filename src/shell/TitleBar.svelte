@@ -15,14 +15,6 @@
   updater.start();
 
   const workspaceLabel = $derived(app.workspace?.name ?? app.project?.name ?? "");
-  const updateTitle = $derived.by(() => {
-    if (updater.phase === "downloading") {
-      return updater.progress === null
-        ? "Downloading the update"
-        : `Downloading the update: ${Math.round(updater.progress * 100)}%`;
-    }
-    return `Restart Ken to update to v${updater.version}`;
-  });
 </script>
 
 <header data-tauri-drag-region>
@@ -39,7 +31,6 @@
     <button
       class="recording"
       class:paused={record.phase === "paused"}
-      title="Recording a meeting. Open Ingest to stop it."
       onclick={() => (app.screen = "ingests")}
     >
       <span class="rec-dot"></span>
@@ -54,14 +45,14 @@
   {/if}
 
   {#if updater.phase === "downloading"}
-    <span class="update" title={updateTitle}>
+    <span class="update">
       <RefreshCw size={14} strokeWidth={1.75} aria-hidden="true" />
-      Downloading update
+      Downloading update{updater.progress === null ? "" : ` ${Math.round(updater.progress * 100)}%`}
     </span>
   {:else if updater.phase === "ready"}
-    <button class="update" title={updateTitle} onclick={() => updater.restart()}>
+    <button class="update" onclick={() => updater.restart()}>
       <RefreshCw size={14} strokeWidth={1.75} aria-hidden="true" />
-      Update ready
+      Restart for v{updater.version}
     </button>
   {/if}
 
@@ -70,7 +61,6 @@
     class:open={chats.open}
     aria-pressed={chats.open}
     onclick={() => (chats.open = !chats.open)}
-    title={chats.open ? "Close Ask Ken" : "Ask Ken"}
   >
     <Sparkles size={15} strokeWidth={1.75} aria-hidden="true" />
     Ask Ken

@@ -95,20 +95,20 @@
   {#each items as item (item.key)}
     {@const Icon = item.icon}
     {@const on = app.screen === item.key}
-    <button class="nav" class:on onclick={() => (app.screen = item.key)} title={item.label} aria-current={on ? "page" : undefined}>
+    <button class="nav" class:on onclick={() => (app.screen = item.key)} title={collapsed ? item.label : undefined} aria-current={on ? "page" : undefined}>
       <Icon size={17} strokeWidth={1.75} aria-hidden="true" />
       {#if !collapsed}<span class="label">{item.label}</span>{/if}
       {#if item.key === "inbox" && inbox.count > 0}
-        <span class="count" class:float={collapsed} title="{inbox.count} waiting on you">{inbox.count}</span>
+        <span class="count" class:float={collapsed}>{inbox.count}</span>
       {/if}
       {#if item.key === "files" && app.unread.length > 0 && !on}
-        <span class="dot-new" class:float={collapsed} title="{app.unread.length} files changed since you last looked"></span>
+        <span class="dot-new" class:float={collapsed} title="{app.unread.length} changed"></span>
       {/if}
       {#if item.key === "ingests"}
         {#if ingestNote && !collapsed}
           <span class="note">{ingestNote}</span>
         {:else if rail.ingestWaiting > 0}
-          <span class="count" class:float={collapsed} title="{rail.ingestWaiting} {rail.ingestWaiting === 1 ? 'source has' : 'sources have'} something waiting">{rail.ingestWaiting}</span>
+          <span class="count" class:float={collapsed}>{rail.ingestWaiting}</span>
         {/if}
       {/if}
     </button>
@@ -116,7 +116,7 @@
 
   <span class="grow" data-tauri-drag-region></span>
 
-  <button class="nav" class:on={app.screen === "settings"} onclick={() => app.openSettings()} title="Settings">
+  <button class="nav" class:on={app.screen === "settings"} onclick={() => app.openSettings()} title={collapsed ? "Settings" : undefined}>
     <Settings size={17} strokeWidth={1.75} aria-hidden="true" />
     {#if !collapsed}<span class="label">Settings</span>{/if}
   </button>

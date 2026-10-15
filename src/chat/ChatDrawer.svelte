@@ -238,7 +238,6 @@
     {/if}
     <button
       class="research"
-      title="Start a deep research run"
       onclick={() => (researchOpen = true)}
     >
       <Telescope size={14} strokeWidth={1.75} />
@@ -306,7 +305,6 @@
         <div class="terminal-bar">
           <button
             class="btn btn-small back"
-            title="Hide terminal, back to conversation (Ctrl+`)"
             onclick={() => chats.exitTerminal()}
           >
             <ArrowLeft size={14} strokeWidth={1.75} /> Back to conversation
@@ -336,7 +334,6 @@
           <div class="composer-bar">
             <button
               class="composer-btn"
-              title="Show terminal (Ctrl+`)"
               onclick={toggleTerminal}
             >
               <Terminal size={14} strokeWidth={1.75} />
@@ -347,7 +344,7 @@
                  upkeep. Applies to the next message/session. -->
             <select
               class="model-select"
-              title="Model for this chat (applies to your next message)"
+              aria-label="Model"
               value={chats.active?.model ?? ""}
               onchange={(e) =>
                 chats.setModel(

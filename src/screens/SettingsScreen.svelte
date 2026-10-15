@@ -364,7 +364,6 @@
         {#if doctor?.found}
           <p class="note">
             <span class="ok-dot"></span>Found{#if doctor.version}, version {doctor.version}{/if}
-            {#if doctor.path}<span class="mono small path">{doctor.path}</span>{/if}
           </p>
         {:else if doctor}
           <p class="note warn">Not found</p>
@@ -408,7 +407,7 @@
             <div class="list">
               {#each c.sources as src}
                 {@const reason = unopenableReason(toWorkspaceAddress(src))}
-                <span class="mono small" class:disabled-link={!!reason} title={reason ?? src}>{src}</span>
+                <span class="mono small" class:disabled-link={!!reason} title={reason ?? undefined}>{src}</span>
               {/each}
             </div>
           {/if}
@@ -626,10 +625,6 @@
   }
   .note.warn {
     color: var(--needs-input-text);
-  }
-  .path {
-    display: block;
-    overflow-wrap: anywhere;
   }
   /* Where a feature applies, and its code name for anyone editing JSON. */
   .flag-meta {

@@ -121,9 +121,6 @@
         label={record.transcribePct === null ? "Transcribing…" : `Transcribing… ${record.transcribePct}%`}
       />
     {/if}
-    {#if record.savedPath && !record.recording && !record.transcribing}
-      <p class="note done">Saved to Raw. Ken reads it now.</p>
-    {/if}
     {#if record.error}
       <p class="warn">{record.error}</p>
     {/if}
@@ -249,9 +246,6 @@
     margin: 0;
     font-size: 12px;
     color: var(--ink-tertiary);
-  }
-  .note.done {
-    color: var(--healthy-text);
   }
   .warn {
     margin: 0;
