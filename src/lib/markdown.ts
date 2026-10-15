@@ -63,3 +63,23 @@ export function pageLinkTarget(href: string | null): string | null {
   if (!href?.startsWith(PAGE_HREF)) return null;
   return decodeURIComponent(href.slice(PAGE_HREF.length)) || null;
 }
+
+/** A search hit's snippet as plain text: the Markdown's syntax (headings,
+ *  table pipes and rules, emphasis, code ticks, quotes, links) taken out,
+ *  the words and the backend's <mark> tags kept. */
+export function plainSnippet(snippet: string): string {
+  return snippet
+    .replace(/(^|\s)#{1,6}\s+/g, "$1")
+    .replace(/\|?(\s*:?-{3,}:?\s*\|)+(\s*:?-{3,}:?\s*)?/g, " ")
+    .replace(/\s*\|\s*/g, " · ")
+    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2")
+    .replace(/\[\[([^\]]+)\]\]/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/`/g, "")
+    .replace(/(^|\s)>\s+/g, "$1")
+    .replace(/(\s*·\s*)+/g, " · ")
+    .replace(/\s+/g, " ")
+    .replace(/^\s*·\s*|\s*·\s*$/g, "")
+    .trim();
+}

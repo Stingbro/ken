@@ -15,7 +15,7 @@
   const workspaceName = $derived(app.workspace?.name ?? "the workspace");
   import { chats } from "../lib/chats.svelte";
   import { isQuestionQuery, stripStreamingBody } from "../lib/assist";
-  import { renderMarkdown, renderSearchSnippet } from "../lib/markdown";
+  import { plainSnippet, renderMarkdown, renderSearchSnippet } from "../lib/markdown";
   import { kindForPath } from "../lib/format";
   import { inMember, parseCitation } from "../lib/citation";
   import FileGlyph from "../files/FileGlyph.svelte";
@@ -466,13 +466,9 @@
     </div>
   {/if}
 
-  {#if scope === "all" && searched && routedPlan}
+  {#if scope === "all" && searched && routedProgress && routedProgress.state === "searching"}
     <div class="scope-info">
-      <span class="scope-chip routed">routed</span>
-      <span class="plan-line">{planLine}</span>
-      {#if routedProgress && routedProgress.state === "searching"}
-        <span class="progress">searching {routedProgress.done}/{routedProgress.total}…</span>
-      {/if}
+      <span class="progress">searching {routedProgress.done}/{routedProgress.total}…</span>
     </div>
   {/if}
   {#if searched}
@@ -482,7 +478,8 @@
   {/if}
 
   {#if results.length > 0}
-    <div class="section">Matches</div>
+    <!-- How many sources were searched is the count's tooltip. -->
+    <div class="section" title={scope === "all" ? (planLine ?? undefined) : undefined}>Matches · {results.length}</div>
     <div class="results">
       {#each results as hit, i (hit.key)}
         <button
@@ -493,7 +490,7 @@
         >
           <FileGlyph kind={kindForPath(hit.path)} />
           <span class="hit-body">
-            <span class="snippet">{@html renderSearchSnippet(hit.snippet)}</span>
+            <span class="snippet">{@html renderSearchSnippet(kindForPath(hit.path) === "code" ? hit.snippet : plainSnippet(hit.snippet))}</span>
             <span class="meta">
               <!-- Show only the basename; full path stays in the tooltip so same-named files in different folders remain distinguishable. -->
               <span class="path mono" title={hit.path}>{hit.path.split("/").pop() || hit.path}</span>
@@ -507,7 +504,7 @@
                 <span class="tag tag-member" title={hit.path}>{hit.memberName}</span>
               {/if}
               {#if hit.source === "semantic" || hit.source === "both"}
-                <span class="tag tag-semantic">semantic</span>
+                <span class="by-meaning" title="Found by meaning" aria-label="Found by meaning"></span>
               {/if}
             </span>
           </span>
@@ -646,26 +643,6 @@
     font-size: 11.5px;
     color: var(--ink-secondary);
   }
-  .scope-chip {
-    flex: none;
-    font-size: 9.5px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: var(--sunken);
-    color: var(--ink-tertiary);
-  }
-  .scope-chip.routed {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-  }
-  .plan-line {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
   .progress {
     margin-left: auto;
     flex: none;
@@ -755,9 +732,14 @@
     color: var(--ink-tertiary);
     background: var(--sunken);
   }
-  .tag-semantic {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  /* A hit found by meaning: a small dot, explained by its tooltip. */
+  .by-meaning {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.7;
   }
   .tag-kind {
     color: var(--ink-tertiary);

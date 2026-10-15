@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pageLinkTarget, renderBody, renderSearchSnippet, renderTitle } from "./markdown";
+import { pageLinkTarget, plainSnippet, renderBody, renderSearchSnippet, renderTitle } from "./markdown";
 
 describe("renderSearchSnippet", () => {
   it("escapes plain text with no markup", () => {
@@ -62,5 +62,20 @@ describe("renderBody", () => {
     const href = /href="([^"]+)"/.exec(html)?.[1] ?? null;
     expect(pageLinkTarget(href)).toBe("Current/Project");
     expect(pageLinkTarget("https://example.com")).toBeNull();
+  });
+});
+
+describe("plainSnippet", () => {
+  it("takes out headings, table pipes and rules, and emphasis", () => {
+    expect(plainSnippet("## Pages | page | decides | |---|---| | [[Save Format]] | Why the world")).toBe(
+      "Pages · page · decides · Save Format · Why the world",
+    );
+    expect(plainSnippet("## D-001 · world save **The whole world** saves to `saves/world.json`")).toBe(
+      "D-001 · world save The whole world saves to saves/world.json",
+    );
+  });
+
+  it("keeps the highlight marks", () => {
+    expect(plainSnippet("# Why the <mark>world</mark> saves")).toBe("Why the <mark>world</mark> saves");
   });
 });
