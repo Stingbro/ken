@@ -400,6 +400,15 @@ The approach is **import, then remove.** The whole `knowledge-layer` feature set
   - The compile check and svelte-check report no warnings. Tests: ken-core 840 passed, 0 failed, 38 ignored (five tests went with the code they tested; the llama.cpp smoke test ignored); ken-mcp 45 passed; ken-app 17 passed; vitest 803 passed in 65 files.
   - Not run: the app.
 
+- **UI lane 1: copy rule, empty state, header, words out** (`602ec3e`, `5dbf48e`, `cea4627`, `0385cb0`, `8a41fc4`, `46589c4`, `5c604a7`, `dbf4e33`, `295ae35`, `b1050de`). Changes 1 and 3 of the UI audit (`claude-scratch/ken-ui-audit.md`), and the shared header.
+  - The copy rule (`602ec3e`): rules 1–6 in `docs/design/design-tokens.md`, from the SR page how-to.
+  - `EmptyState` (`5dbf48e`, `src/lib/ui/`): a short title, or "none" inside a list, and at most one action. It replaces the hand-made empty states on Home, Inbox, Files and its tree, Log, the Ingest column, chat, conflicts, the ticket column, the code index, Background and the model lists. `.k-empty .body` is gone, and `log.ts`'s per-group explainers with it.
+  - `ScreenHeader` (`cea4627`, `src/lib/ui/`): the title, at most a count or an id beside it, and on the right the actions and the count ("4 of 4"). Home, Inbox, Files (atop the tree), Ingest, Log (its count moved up from the search box) and Settings (no repeated h2) use it; no screen has a lede.
+  - Words out, descriptive strings before → after: start page 4 → 0, set-up 10 → 1 (what it writes), Home 7 → 0, Inbox 7 → 0, Files 2 → 0, Log 7 → 0, Settings nav 6 → 0, General 3 → 0, AI 14 → 3 (the install line, the flags' own descriptions, the calls-per-hour line), Agents 4 → 1 (not installed), Search 8 → 1 ("Claude Code not found"), chat and drawers 9 → 0. In all 81 → 6. The Ingest column: 6 → 1 ("Claude Code not found"); its detail is lane 3's, touched only to drop the two `.k-empty .body` lines.
+  - "Needs Claude Code" is one short line where it blocks: Ingest's reading and Search's quick answer say "Claude Code not found"; Home's Write it now is disabled with that as its tooltip; Settings › AI reads "Not found" with the install line.
+  - Left for lanes 2 and 3: Settings › Workspace, Sync, Ingest rules, the repo drawer and the Ingest detail.
+  - `npm run check` 0 errors, 0 warnings; vitest 803 passed in 65 files. Not run: the app.
+
 ## Decided by Chris, 2026-10-14
 
 Chris answered the open questions. Slice 15 builds the ones that change code; the rest stay as they are.
