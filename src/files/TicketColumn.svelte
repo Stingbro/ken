@@ -7,6 +7,7 @@
   import { day, openInRepo, ticketLink } from "../lib/day.svelte";
   import { shortTarget, stampLabel } from "../lib/day";
   import Check from "@lucide/svelte/icons/check";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   let { projectId, ticketId }: { projectId: string; ticketId: string } = $props();
 
@@ -131,7 +132,7 @@
       {/each}
     </div>
   {:else}
-    <p class="quiet">None linked to {ticketId}.</p>
+    <EmptyState />
   {/if}
 
   <div class="head second"><span class="overline">Wiki pages that cite it</span></div>
@@ -142,7 +143,7 @@
       {/each}
     </div>
   {:else if pagesLoaded}
-    <p class="quiet">None.</p>
+    <EmptyState />
   {/if}
 </aside>
 
@@ -257,10 +258,5 @@
   }
   .entry:hover {
     color: var(--accent-deep);
-  }
-  .quiet {
-    margin: 0;
-    font-size: 12px;
-    color: var(--ink-tertiary);
   }
 </style>

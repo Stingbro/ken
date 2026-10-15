@@ -46,6 +46,7 @@
   import ProposalDetail from "./ProposalDetail.svelte";
   import RecordPanel from "./RecordPanel.svelte";
   import ChatSource from "./ChatSource.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
   import { singleFlight } from "../lib/refresh";
 
   let overview = $state<IngestOverview | null>(null);
@@ -527,7 +528,7 @@
           {/if}
         </div>
       {:else}
-        <p class="note">Nothing waiting to be read.</p>
+        <EmptyState />
       {/each}
 
       {@const readRaw = overview.raw.filter((r) => r.state === "read" && r.cardId !== null)}
@@ -553,7 +554,7 @@
         </button>
       {/each}
       {#if readRaw.length === 0 && ingested.length === 0}
-        <p class="note">Nothing ingested yet.</p>
+        <EmptyState />
       {/if}
     {/if}
   </div>
@@ -757,14 +758,12 @@
           {/each}
         </div>
       </div>
-      <div class="k-empty soft">
-        <span class="head">{rawSelected.state === "failed" ? "Ken couldn't read this" : rawSelected.state === "waiting" ? "This waits for a transcript" : "Ken is still reading"}</span>
-        <span class="body">{rawSelected.detail ?? "The summary, what waits for you and the pages Ken updated appear here when it finishes. You can leave this screen."}</span>
+      <div class="soft">
+        <EmptyState title={rawSelected.state === "failed" ? "Ken couldn't read this" : rawSelected.state === "waiting" ? "This waits for a transcript" : "Ken is still reading"} />
       </div>
     {:else}
-      <div class="k-empty soft">
-        <span class="head">Add a source</span>
-        <span class="body">Drop a transcript, a recording, a document or a note. Ken reads it into a dated note, updates the pages it changes, and shows here what it did. Each ingest is one commit in the knowledge base, so git takes it back.</span>
+      <div class="soft">
+        <EmptyState title="Add a source" />
       </div>
     {/if}
     </div>

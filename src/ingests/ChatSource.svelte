@@ -9,6 +9,7 @@
   import { pickMessage, pickedIds, sendableMessages, type Pick } from "../lib/chatPick";
   import { errorText } from "../lib/toast.svelte";
   import Check from "@lucide/svelte/icons/check";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   let { onAdded }: { onAdded: (path: string) => void } = $props();
 
@@ -72,7 +73,7 @@
 
 <div class="chat-source">
   {#if rows.length === 0}
-    <p class="note">No chats in this repo yet.</p>
+    <EmptyState title="No chats" />
   {:else}
     <select bind:value={chatId} aria-label="Chat">
       {#each rows as r (r.id)}<option value={r.id}>{r.title}</option>{/each}
@@ -87,7 +88,7 @@
           <span class="text">{preview(m.content)}</span>
         </button>
       {:else}
-        <p class="note">Nothing said in this chat yet.</p>
+        <EmptyState />
       {/each}
     </div>
     <p class="note">Shift-click takes every message from the last one clicked.</p>

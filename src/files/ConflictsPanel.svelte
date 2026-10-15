@@ -7,6 +7,7 @@
   import { memberLeaf } from "../lib/api";
   import { timeAgo } from "../lib/format";
   import ConflictDetail from "./ConflictDetail.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   const item = $derived(conflicts.selectedItem);
 
@@ -53,7 +54,7 @@
       {/key}
     </div>
   {:else}
-    <p class="note">Nothing to resolve.</p>
+    <EmptyState title="Nothing to resolve" />
   {/if}
 </div>
 
@@ -136,10 +137,5 @@
     font-size: 13px;
     line-height: 1.65;
     color: var(--ink-secondary);
-  }
-  .note {
-    margin: 0;
-    font-size: 12.5px;
-    color: var(--ink-tertiary);
   }
 </style>

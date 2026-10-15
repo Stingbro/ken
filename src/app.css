@@ -629,11 +629,6 @@ option {
   font-size: 17px;
   font-weight: 500;
 }
-.k-empty .body {
-  font-size: 13.5px;
-  color: var(--ink-2);
-  line-height: 1.55;
-}
 /* A notice in the flow of a page: what went wrong, said plainly, with at most
    one action after it. A toast is for what happens out of view. */
 .k-notice {

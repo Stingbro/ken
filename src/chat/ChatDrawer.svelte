@@ -25,6 +25,7 @@
   import { app } from "../lib/app.svelte";
   import { clampChatWidth } from "../lib/chatWidth";
   import { shouldSend } from "../lib/keySend";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   // Research runs *are* chats (kind: "research") — they open as a terminal
   // session in this drawer and are cancelled from its foot, so this is where
@@ -281,10 +282,11 @@
 
   <div class="body">
     {#if !chats.activeId}
-      <div class="empty">
-        <p>Chat with Ken about everything this project knows.</p>
-        <button class="btn btn-primary" onclick={() => chats.newChat()}>Start a chat</button>
-      </div>
+      <EmptyState title="No chat open" center>
+        {#snippet action()}
+          <button class="btn btn-primary" onclick={() => chats.newChat()}>Start a chat</button>
+        {/snippet}
+      </EmptyState>
     {:else if inTerminal}
       {#key chats.activeId}
         <TerminalView chatId={chats.activeId} />
@@ -570,22 +572,6 @@
     flex-direction: column;
     background: var(--paper);
     border-top: 1px solid var(--border);
-  }
-  .empty {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    padding: 20px;
-  }
-  .empty p {
-    margin: 0;
-    font-size: 13px;
-    color: var(--ink-secondary);
-    text-align: center;
-    line-height: 1.6;
   }
   .send-error {
     flex: none;

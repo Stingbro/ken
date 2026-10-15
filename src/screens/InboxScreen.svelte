@@ -16,6 +16,7 @@
   import ConflictDetail from "../files/ConflictDetail.svelte";
   import InboxKindIcon from "./InboxKindIcon.svelte";
   import Loading from "../lib/ui/Loading.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
   import CircleCheck from "@lucide/svelte/icons/circle-check";
   import BellOff from "@lucide/svelte/icons/bell-off";
 
@@ -171,9 +172,7 @@
       {#if list.length === 0 && inbox.loading}
         <Loading label="Gathering what waits on you…" lines={3} />
       {:else if list.length === 0}
-        <p class="none">
-          {inbox.done.length > 0 ? "Nothing here. What you dealt with is under Done." : "Nothing here."}
-        </p>
+        <EmptyState title="Nothing here" />
       {/if}
       {#if inbox.done.length > 0}
         <div class="t-label donehead">Done · {inbox.done.length}</div>
@@ -255,10 +254,7 @@
         {/if}
       </div>
     {:else}
-      <div class="k-empty quiet">
-        <span class="head">{emptyHead}</span>
-        <span class="body">When Ken needs a decision, or sync needs you, it shows up here.</span>
-      </div>
+      <EmptyState title={emptyHead} />
     {/if}
   </main>
 </div>
@@ -335,13 +331,6 @@
   .rmeta {
     font-size: 12px;
     color: var(--ink-3);
-  }
-  .none {
-    padding: 24px 10px;
-    margin: 0;
-    font-size: 13.5px;
-    color: var(--ink-3);
-    line-height: 1.5;
   }
   .donehead {
     padding: 16px 10px 6px;
@@ -450,8 +439,5 @@
     color: var(--ok);
     font-size: 13.5px;
     font-weight: 600;
-  }
-  .quiet {
-    max-width: 520px;
   }
 </style>

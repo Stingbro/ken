@@ -4,6 +4,7 @@
   // across the workspace. "Go to definition" and "find usages" for people.
   import { api, type CodeFile, type CodeUsages, type CodeUse } from "../lib/api";
   import { app } from "../lib/app.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   let { relPath, refresh = 0 }: { relPath: string; refresh?: number } = $props();
 
@@ -108,7 +109,7 @@
               {#if u.within}<span class="muted">in {u.within}</span>{/if}
             </button>
           {:else}
-            <div class="muted">No uses found in the code index.</div>
+            <EmptyState />
           {/each}
         {/if}
       </div>

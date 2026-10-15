@@ -28,6 +28,7 @@
   import { conflicts } from "../lib/conflicts.svelte";
   import { bannerLine } from "../lib/conflicts";
   import ConflictsPanel from "../files/ConflictsPanel.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   // Sync conflicts and conflicted copies in the workspace's repos: a line at the
   // top of Files that opens the conflict view in place of the open file.
@@ -232,10 +233,7 @@
         {/if}
       </div>
     {:else}
-      <div class="empty">
-        <p>Select a file to read or edit it.</p>
-        <p class="hint">Markdown and text open in the editor; Word, Excel, PDF and images preview right here.</p>
-      </div>
+      <EmptyState title="No file open" center />
     {/if}
     </div>
   </div>
@@ -412,22 +410,5 @@
     color: color-mix(in srgb, var(--surface) 62%, transparent);
     font-size: 11px;
     overflow-wrap: anywhere;
-  }
-  .empty {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-  }
-  .empty p {
-    margin: 0;
-    color: var(--ink-secondary);
-    font-size: 14px;
-  }
-  .empty .hint {
-    color: var(--ink-tertiary);
-    font-size: 12.5px;
   }
 </style>

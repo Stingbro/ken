@@ -12,6 +12,7 @@
   import { app } from "../lib/app.svelte";
   import { counts, highlightMatches, statusTone, viewOf } from "../lib/log";
   import { renderTitle } from "../lib/markdown";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
   import Search from "@lucide/svelte/icons/search";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
 
@@ -102,14 +103,7 @@
     {/if}
 
     {#if log && count.total === 0}
-      <div class="empty-card">
-        <h2>Nothing in the log yet</h2>
-        <p>
-          Risks and issues come from ingest, as Inbox cards you add to the register. Actions are open tickets with an
-          assignee, decisions the rulings in the decisions log, and milestones the milestone tickets, the roadmap and
-          releases.
-        </p>
-      </div>
+      <EmptyState title="Nothing in the log yet" />
     {:else if log}
       <div class="search">
         <Search class="lens" size={14} strokeWidth={1.75} aria-hidden="true" />
@@ -123,10 +117,8 @@
             <h2>{g.label}</h2>
             <span class="gcount">{g.open.length}</span>
           </div>
-          {#if g.open.length === 0 && g.closed.length === 0}
-            <p class="none">{searching ? "Nothing matches." : g.empty}</p>
-          {:else if g.open.length === 0}
-            <p class="none">Nothing open.</p>
+          {#if g.open.length === 0}
+            <EmptyState />
           {/if}
           {#each g.open as it, i (`${g.key}-${i}`)}
             {@render row(it, g.key === "milestones")}
@@ -253,12 +245,6 @@
     font-weight: 600;
     color: var(--ink-tertiary);
   }
-  .none {
-    margin: 4px 0 8px;
-    font-size: 12.5px;
-    color: var(--ink-tertiary);
-  }
-
   .item {
     display: flex;
     gap: 12px;
@@ -344,32 +330,6 @@
     padding: 6px 0;
   }
   .folded summary:hover {
-    color: var(--ink-secondary);
-  }
-
-  .empty-card {
-    max-width: 420px;
-    margin: 48px auto 0;
-    text-align: center;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 28px 32px;
-    box-shadow: var(--shadow-card);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-  }
-  .empty-card h2 {
-    margin: 0;
-    font-family: var(--font-serif);
-    font-size: 19px;
-    font-weight: 500;
-  }
-  .empty-card p {
-    margin: 0;
-    font-size: 13.5px;
     color: var(--ink-secondary);
   }
 </style>

@@ -26,6 +26,7 @@
   import { openConfirm } from "../lib/ui/ConfirmMenu.svelte";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import ProgressBar from "../lib/ProgressBar.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
   import { whatsNew } from "../whats-new/whatsNew.svelte";
   import Copy from "@lucide/svelte/icons/copy";
   import Check from "@lucide/svelte/icons/check";
@@ -366,7 +367,7 @@
           {#each list as m (m.id)}
             {@render modelRow(cat, m, true)}
           {:else}
-            <p class="note">None on offer.</p>
+            <EmptyState />
           {/each}
         </div>
       {/snippet}

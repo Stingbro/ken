@@ -25,6 +25,7 @@
   import FileGlyph from "./FileGlyph.svelte";
   import InlineNameRow from "./InlineNameRow.svelte";
   import TreeNodeRow from "./TreeNodeRow.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   let { width }: { width: number } = $props();
 
@@ -288,13 +289,11 @@
       <TreeNodeRow {node} depth={0} expandAll={unreadOnly} />
     {/each}
     {#if tree.length === 0}
-      <div class="empty">
-        {#if unreadOnly}
-          Nothing new — every file is up to date.
-        {:else}
-          {app.scanning ? "Reading your folder…" : "This folder is empty."}
-        {/if}
-      </div>
+      {#if !unreadOnly && app.scanning}
+        <div class="empty">Reading your folder…</div>
+      {:else}
+        <div class="empty"><EmptyState /></div>
+      {/if}
     {/if}
   </div>
 </div>

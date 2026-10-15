@@ -9,6 +9,7 @@
   import { buildLine, jobLine, jobPct, kindLabel, PACES, waitLine } from "../lib/background";
   import { toast } from "../lib/toast.svelte";
   import ProgressBar from "../lib/ProgressBar.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
 
   let status = $state<BackgroundStatus | null>(null);
   let busy = $state(false);
@@ -93,7 +94,7 @@
       {#if jobPct(job) !== null}<ProgressBar pct={jobPct(job)} />{/if}
     </div>
   {:else}
-    <p class="note">Nothing is running.</p>
+    <EmptyState />
   {/each}
 
   <div class="section">Queued</div>
@@ -103,7 +104,7 @@
   {#each status?.queued ?? [] as q, i (i)}
     <div class="row"><span>{kindLabel(q.kind)} · {q.label} · {q.count}</span></div>
   {:else}
-    {#if waitingJobs.length === 0}<p class="note">Nothing waits.</p>{/if}
+    {#if waitingJobs.length === 0}<EmptyState />{/if}
   {/each}
 
   <div class="section">Building the library</div>
@@ -146,7 +147,7 @@
       <span class="why">{f.reason}</span>
     </div>
   {:else}
-    <p class="note">Nothing failed.</p>
+    <EmptyState />
   {/each}
 </div>
 

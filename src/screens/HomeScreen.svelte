@@ -20,6 +20,7 @@
   import FileGlyph from "../files/FileGlyph.svelte";
   import InboxKindIcon from "./InboxKindIcon.svelte";
   import Loading from "../lib/ui/Loading.svelte";
+  import EmptyState from "../lib/ui/EmptyState.svelte";
   import ModelDownloadDialog from "../files/previews/ModelDownloadDialog.svelte";
   import { api, type ModelStatus } from "../lib/api";
   import Check from "@lucide/svelte/icons/check";
@@ -212,10 +213,11 @@
       {:else if !day.claudeFound}
         <p class="digest quiet">The digest needs Claude Code. Settings › AI says how to install it.</p>
       {:else}
-        <p class="digest quiet">No digest yet. Ken writes one each morning.</p>
-        <div>
-          <button class="btn btn-small" title={indexing ? "Ken is still indexing; the digest may miss what it has not read." : undefined} onclick={() => void day.writeDigest()}>Write it now</button>
-        </div>
+        <EmptyState title="No digest yet">
+          {#snippet action()}
+            <button class="btn btn-small" title={indexing ? "Ken is still indexing; the digest may miss what it has not read." : undefined} onclick={() => void day.writeDigest()}>Write it now</button>
+          {/snippet}
+        </EmptyState>
       {/if}
       {#if day.digestError}
         <p class="t-small err">The last try did not finish: {day.digestError}</p>
@@ -273,7 +275,7 @@
           </div>
         {/each}
         {#if day.state && day.tickets.length === 0 && day.tasks.length === 0}
-          <p class="none">Nothing on your list. Add task puts one here, and so does Ken when you ask it to.</p>
+          <EmptyState title="Nothing on your list" />
         {/if}
       </div>
     </section>
@@ -325,10 +327,7 @@
         </div>
       {/each}
       {#if needs.length === 0}
-        <div class="k-empty card-empty">
-          <span class="head">Nothing waiting on you</span>
-          <span class="body">When a teammate sends you something, or Ken needs a decision, it shows up here.</span>
-        </div>
+        <EmptyState title="Nothing waiting on you" card />
       {/if}
       {#if meaningModel}
         <div class="k-action meaning">
@@ -533,12 +532,6 @@
     color: var(--accent-ink);
     font-weight: 600;
   }
-  .none {
-    margin: 0;
-    padding: 14px 0;
-    font-size: 13.5px;
-    color: var(--ink-3);
-  }
 
   .recent {
     gap: 10px;
@@ -602,10 +595,6 @@
   }
   .title.plain {
     text-wrap: pretty;
-  }
-  .card-empty {
-    background: var(--surface);
-    border: 1px solid var(--line);
   }
   .reading {
     display: flex;

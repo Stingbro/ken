@@ -14,18 +14,16 @@ export interface GroupInfo {
   label: string;
   /** What the folded items are called. */
   closedLabel: string;
-  /** What an empty group says. */
-  empty: string;
 }
 
 /** The groups, in the order the Log shows them: the RAID four, then the
  *  milestones. */
 export const GROUPS: GroupInfo[] = [
-  { key: "risks", label: "Risks", closedLabel: "closed", empty: "No risks yet. Ingest proposes them from a meeting or document, and each waits in the Inbox." },
-  { key: "actions", label: "Actions", closedLabel: "closed", empty: "No open ticket has an assignee." },
-  { key: "issues", label: "Issues", closedLabel: "closed", empty: "No issues yet. Ingest proposes them, and an open question can be raised as one from the Inbox." },
-  { key: "decisions", label: "Decisions", closedLabel: "superseded or refined", empty: "No rulings in the decisions log yet." },
-  { key: "milestones", label: "Milestones", closedLabel: "dropped", empty: "No milestones yet: a ticket with type: milestone, a row of the roadmap, or a release tag." },
+  { key: "risks", label: "Risks", closedLabel: "closed" },
+  { key: "actions", label: "Actions", closedLabel: "closed" },
+  { key: "issues", label: "Issues", closedLabel: "closed" },
+  { key: "decisions", label: "Decisions", closedLabel: "superseded or refined" },
+  { key: "milestones", label: "Milestones", closedLabel: "dropped" },
 ];
 
 /** Whether `item` holds `query` (case aside) in its id, title, status,
