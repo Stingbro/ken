@@ -1503,6 +1503,65 @@ mod tests {
         drop(engine);
     }
 
+    /// Decision 36, kept by Chris (2026-10-15): Ken may edit a code repo's
+    /// files and never commits there. The Files viewer's save tells sync it
+    /// wrote the file (`wrote`); a chat's accepted edit is written by
+    /// Claude Code and reaches sync as a change the watcher saw (`changed`).
+    /// In a repo that is not the knowledge base, even with a remote and sync
+    /// switched on, neither is committed or pushed, and Sync now does
+    /// nothing.
+    #[test]
+    fn engine_never_commits_in_a_code_repo() {
+        let (_d, bare, _a, b) = fixture();
+        let mut p = Project::create(&b, "Game").unwrap();
+        p.config.extra.insert("sync".into(), json!({"auto": true}));
+        p.save().unwrap();
+        assert!(!sync_active(&b), "a code repo never syncs");
+        let head = run_git(&b, &["rev-parse", "HEAD"]).unwrap().stdout;
+        let pushed = run_git(&bare, &["rev-parse", "main"]).unwrap().stdout;
+
+        let app = tempfile::tempdir().unwrap();
+        let db_path = app.path().join("sync.db");
+        drop(Db::open_at(&db_path).unwrap());
+        let (ntx, notices) = std_channel::<SyncNotice>();
+        let engine = SyncEngine::start(
+            b.clone(),
+            db_path,
+            SyncConfig {
+                binary: None,
+                pull_throttle: Duration::from_millis(0),
+                push_debounce: Duration::from_millis(100),
+                draft_timeout: Duration::from_secs(5),
+            },
+            move |n| {
+                let _ = ntx.send(n);
+            },
+        )
+        .unwrap();
+
+        fs::write(b.join("main.py"), "print('saved in the Files viewer')\n").unwrap();
+        fs::write(b.join("notes.md"), "an edit accepted in a chat\n").unwrap();
+        engine.wrote(vec!["main.py".into()]);
+        engine.changed(vec!["notes.md".into()]);
+        engine.sync_now();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(engine.pending().is_empty(), "nothing waits to be committed");
+        drop(engine);
+
+        assert_eq!(run_git(&b, &["rev-parse", "HEAD"]).unwrap().stdout, head, "no commit");
+        assert_eq!(run_git(&bare, &["rev-parse", "main"]).unwrap().stdout, pushed, "no push");
+        let status = run_git(&b, &["status", "--porcelain"]).unwrap().stdout;
+        assert!(status.contains("main.py") && status.contains("notes.md"), "both edits stay in the tree: {status}");
+        let states: Vec<SyncState> = notices
+            .try_iter()
+            .filter_map(|n| match n {
+                SyncNotice::State { state, .. } => Some(state),
+                SyncNotice::ReviewChanged => None,
+            })
+            .collect();
+        assert!(states.iter().all(|s| *s == SyncState::Off), "{states:?}");
+    }
+
     #[test]
     #[cfg_attr(windows, ignore = "runs the bash fake CLI; covered on macOS/Linux")]
     fn engine_files_conflict_item_with_draft() {
