@@ -298,6 +298,12 @@ pub fn rerank_with(query: &str, hits: Vec<HybridHit>, vec_hits: &[VecHit], extra
 /// (`authority`: path → what it adds; a path absent is neutral). A rule or
 /// ruling rises, a closed ticket or a Research note sinks, inside its own
 /// repo, before the members are merged (`crate::authority`).
+///
+/// A file its tier lowers (a note, ticket, Research page or draft) gets no
+/// filename or path words: its name is an event's (a meeting, a ticket, a
+/// dated finding), not the topic's, so a meeting note named
+/// `save-format-sync` does not outrank the ruling it records for "how does
+/// the world save".
 pub fn rerank_weighted(
     query: &str,
     hits: Vec<HybridHit>,
@@ -336,8 +342,10 @@ pub fn rerank_weighted(
 
     let score = |hit: &HybridHit| -> f64 {
         let mut s = 0.0;
+        let tier = authority.get(&hit.path).copied().unwrap_or(0.0);
 
         if q_tokens > 0 {
+            let named_for_topic = tier >= 0.0;
             let filename = hit.path.rsplit(['/', '\\']).next().unwrap_or(&hit.path);
             let filename_tokens: HashSet<String> = tokenize_lower(filename).into_iter().collect();
             // A code chunk's symbol is named with its path (the names
@@ -351,7 +359,8 @@ pub fn rerank_weighted(
             let mut covered = 0usize;
             for forms in &q_groups {
                 let any = |set: &HashSet<String>| forms.iter().any(|f| set.contains(f));
-                let (f, p, t) = (any(&filename_tokens), any(&path_tokens), any(&snippet_tokens));
+                let (f, p, t) =
+                    (named_for_topic && any(&filename_tokens), named_for_topic && any(&path_tokens), any(&snippet_tokens));
                 if f {
                     lexical += W_FILENAME;
                 }
@@ -378,7 +387,7 @@ pub fn rerank_weighted(
             s += W_AGREEMENT;
         }
 
-        s + authority.get(&hit.path).copied().unwrap_or(0.0)
+        s + tier
     };
 
     let mut scored: Vec<(f64, HybridHit)> = hits.into_iter().map(|h| (score(&h), h)).collect();
@@ -412,6 +421,24 @@ mod tests {
         assert_eq!(weighted.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), vec!["src/merge.rs", "decisions/DECISIONS.md", "tickets/SR-1.md"], "a nudge: the file named for it still leads");
         assert_eq!(score(&weighted, "src/merge.rs"), score(&plain, "src/merge.rs"), "code is neutral");
         assert_eq!(score(&weighted, "tickets/SR-1.md"), score(&plain, "tickets/SR-1.md") - 1.25);
+    }
+
+    /// A meeting note's file name is the meeting's, not the topic's: the
+    /// ruling it records comes first, and the note gets no name words.
+    #[test]
+    fn a_record_named_for_the_words_does_not_outrank_the_ruling() {
+        let hit = |path: &str, snippet: &str| HybridHit { path: path.into(), chunk_id: 1, snippet: snippet.into(), source: Source::Keyword, line: None, page: None, label: None, symbol: None, score: 0.0 };
+        let note = "Research/Ingestion/Ingested/Meetings/2026-10/save-format-sync-2026-10-14.md";
+        let hits = vec![
+            hit(note, "Ben to change save_world so the world saves to one file"),
+            hit("Decisions/DECISIONS.md", "D-001 · the whole world saves to a single file, saves/world.json"),
+            hit("Reference/Saving.md", "How the world is written to disk"),
+        ];
+        let weights: HashMap<String, f64> =
+            [(note.to_string(), -0.5), ("Decisions/DECISIONS.md".to_string(), 0.75)].into_iter().collect();
+        let ranked = rerank_weighted("how does the world save", hits, &[], &HashMap::new(), &weights);
+        let order: Vec<&str> = ranked.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(order, vec!["Reference/Saving.md", "Decisions/DECISIONS.md", note], "the page named for it, then the ruling, then the note");
     }
 
     #[test]

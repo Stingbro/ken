@@ -183,6 +183,7 @@ On top of that base:
     Teams override by path. The old band weighting is removed.
 24. **Score = base plus tier only.**
     - Base: word matches (title field weighted, path, text) × coverage, plus 1.5 × meaning, plus 0.75 when keyword and meaning both found it.
+    - A record (a note, ticket, Research page or draft) gets no file-name or path words: its name is the event's, not the topic's. On 2026-10-20 a meeting note named `save-format-sync` outranked the binding ruling it recorded for "how does the world save".
     - **Removed:** the symbol, link, intent, staleness and reference-data nudges.
     - Minified text and `Templates/` are excluded at index time.
 25. **Supersession, wired in.**
