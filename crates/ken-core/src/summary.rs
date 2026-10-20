@@ -35,6 +35,21 @@ pub struct Wanted {
     pub text: String,
 }
 
+/// Fewest chunks a call waits for before [`SMALL_BATCH_WAIT`] has passed.
+pub const SMALL_BATCH: usize = 10;
+/// How long a small batch waits for more to join it.
+pub const SMALL_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Whether `batch` is worth one of the hour's calls now, its first chunk
+/// seen waiting `waited` ago: ten chunks or a quarter of a batch's text, else
+/// once it has waited [`SMALL_BATCH_WAIT`]. Each ingest commit changes a
+/// chunk or two, and on 2026-10-20 three of a new knowledge base's ten
+/// calls in its first half hour summarized 1, 1 and 4 chunks.
+pub fn worth_a_call(batch: &[Wanted], waited: std::time::Duration) -> bool {
+    let bytes: usize = batch.iter().map(|w| w.text.len().min(PASSAGE_BYTES)).sum();
+    !batch.is_empty() && (batch.len() >= SMALL_BATCH || bytes >= BATCH_BYTES / 4 || waited >= SMALL_BATCH_WAIT)
+}
+
 /// The next batch of chunks to summarize, empty when none wait.
 pub fn next_batch(db: &Db) -> Result<Vec<Wanted>> {
     let mut out = Vec::new();
@@ -137,6 +152,20 @@ pub fn summarize_next(db: &mut Db, generate: &mut dyn FnMut(&str) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_batch_waits_for_more_or_for_time() {
+        use std::time::Duration;
+        let one = |n: usize| -> Vec<Wanted> {
+            (0..n).map(|i| Wanted { hash: i.to_string(), path: "Current/RAID.md".into(), title: String::new(), text: "R-001 · open".into() }).collect()
+        };
+        assert!(!worth_a_call(&[], SMALL_BATCH_WAIT), "nothing waits");
+        assert!(!worth_a_call(&one(1), Duration::from_secs(60)), "one chunk a minute old waits");
+        assert!(worth_a_call(&one(1), SMALL_BATCH_WAIT), "it goes once it has waited");
+        assert!(worth_a_call(&one(SMALL_BATCH), Duration::ZERO), "ten go at once");
+        let long = vec![Wanted { hash: "a".into(), path: "Design/A.md".into(), title: String::new(), text: "x".repeat(PASSAGE_BYTES) }; 5];
+        assert!(worth_a_call(&long, Duration::ZERO), "a quarter of a batch's text goes at once");
+    }
 
     fn page_db() -> Db {
         let mut db = Db::open_in_memory().unwrap();

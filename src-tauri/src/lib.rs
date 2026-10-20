@@ -10031,7 +10031,12 @@ enum SummaryTick {
 /// (kind wiki), each call a turn of the one background throttle
 /// (decision 34). Claude reads the prompt and answers, with no tools. The
 /// local model never writes them.
-fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<AtomicBool>) -> SummaryTick {
+fn summarize_by_claude(
+    state: &SharedState,
+    project_id: uuid::Uuid,
+    stop: &Arc<AtomicBool>,
+    waiting_since: &mut Option<Instant>,
+) -> SummaryTick {
     let (base, root, name) = {
         let guard = lock_tolerant(state);
         let Some(active) = guard.members.get(&project_id) else {
@@ -10046,10 +10051,18 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
     let Ok(mut db) = Db::open(&base, project_id) else {
         return SummaryTick::Idle;
     };
-    // Nothing waiting: no Claude, and the pace is left for others.
-    if !ken_core::summary::next_batch(&db).is_ok_and(|b| !b.is_empty()) {
+    // Nothing waiting: no Claude, and the pace is left for others. A small
+    // batch waits for more to join it (`summary::worth_a_call`).
+    let batch = ken_core::summary::next_batch(&db).unwrap_or_default();
+    if batch.is_empty() {
+        *waiting_since = None;
         return SummaryTick::Idle;
     }
+    let since = *waiting_since.get_or_insert_with(Instant::now);
+    if !ken_core::summary::worth_a_call(&batch, since.elapsed()) {
+        return SummaryTick::Idle;
+    }
+    *waiting_since = None;
     let Some(binary) = ken_core::runner::discover_claude() else {
         return SummaryTick::Idle;
     };
@@ -10091,6 +10104,7 @@ fn summarize_by_claude(state: &SharedState, project_id: uuid::Uuid, stop: &Arc<A
 fn background_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid, stop: Arc<AtomicBool>) {
     let mut last_summary_check = Instant::now() - SUMMARY_CHECK;
     let mut summaries_after = Instant::now();
+    let mut summaries_waiting: Option<Instant> = None;
     // The first look at the checks a minute after the project opens, once
     // its first scan has had time to land.
     let soon = |wait: Duration| {
@@ -10111,7 +10125,7 @@ fn background_worker(app: AppHandle, state: SharedState, project_id: uuid::Uuid,
         // (knowledge-core decision 16): one batch per turn, while any wait.
         if last_summary_check.elapsed() >= SUMMARY_CHECK && Instant::now() >= summaries_after {
             last_summary_check = Instant::now();
-            match summarize_by_claude(&state, project_id, &stop) {
+            match summarize_by_claude(&state, project_id, &stop, &mut summaries_waiting) {
                 // More may wait: look again on the next turn.
                 SummaryTick::Ran => last_summary_check = Instant::now() - SUMMARY_CHECK,
                 SummaryTick::Failed => summaries_after = Instant::now() + SUMMARY_BACKOFF,
