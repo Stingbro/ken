@@ -1,7 +1,11 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DayState, DayTask } from "./api";
 
-const listeners: { dayChanged?: () => void; indexUpdated?: () => void } = {};
+const listeners: {
+  dayChanged?: () => void;
+  indexUpdated?: () => void;
+  semantic?: (ev: { state: string }) => void;
+} = {};
 
 vi.mock("./api", () => ({
   memberLeaf: (name: string) => name.split("/").pop() ?? name,
@@ -14,6 +18,9 @@ vi.mock("./api", () => ({
     onDayDigestError: vi.fn(async () => {}),
     onIndexUpdated: vi.fn(async (cb: () => void) => {
       listeners.indexUpdated = cb;
+    }),
+    onSemanticIndexState: vi.fn(async (cb: (ev: { state: string }) => void) => {
+      listeners.semantic = cb;
     }),
     claudeDoctor: vi.fn(async () => ({ found: true })),
     dayState: vi.fn(async () => ({ tickets: [], tasks: [], me: { name: null, email: null }, hasTickets: false })),
@@ -98,6 +105,18 @@ describe("refresh on events", () => {
     vi.advanceTimersByTime(1);
     expect(vi.mocked(api.dayState).mock.calls.length).toBe(states + 1);
     expect(vi.mocked(api.indexHealth).mock.calls.length).toBe(health + 1);
+  });
+
+  it("reads health again when a meaning build is ready, not while it builds", async () => {
+    const health = vi.mocked(api.indexHealth).mock.calls.length;
+    const states = vi.mocked(api.dayState).mock.calls.length;
+    listeners.semantic!({ state: "building" });
+    vi.advanceTimersByTime(REFRESH_DEBOUNCE_MS);
+    expect(vi.mocked(api.indexHealth).mock.calls.length).toBe(health);
+    listeners.semantic!({ state: "ready" });
+    vi.advanceTimersByTime(REFRESH_DEBOUNCE_MS);
+    expect(vi.mocked(api.indexHealth).mock.calls.length).toBe(health + 1);
+    expect(vi.mocked(api.dayState).mock.calls.length).toBe(states);
   });
 
   it("leaves health alone after day-changed alone", async () => {

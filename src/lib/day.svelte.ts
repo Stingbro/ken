@@ -94,6 +94,11 @@ class DayStore {
       this.digestError = message;
     });
     await api.onIndexUpdated(() => this.queueRefresh({ state: true, health: true }));
+    // A meaning build ends by running the controls, which the health line
+    // counts: accepted controls read 5 of 5 here while Settings said 9 of 9.
+    await api.onSemanticIndexState((ev) => {
+      if (ev.state === "ready") this.queueRefresh({ health: true });
+    });
     // A change of workspace reads everything again.
     $effect.root(() => {
       $effect(() => {
