@@ -1559,6 +1559,100 @@ fn cite(section: &str, note_stem: &str) -> String {
     }
 }
 
+/// The code files `text` names as `repo:path` (or `repo:path:line`), each a
+/// file in a repo the workspace holds other than this one, as
+/// `repo@sha:path` at the head of the branch drift measures it against: a
+/// page that says what code does rests on that code, so drift re-reads it
+/// when the code moves.
+pub fn code_sources(root: &Path, text: &str) -> Vec<String> {
+    static CITED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let cited = CITED.get_or_init(|| {
+        regex::Regex::new(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:@[0-9a-fA-F]{4,40})?:[A-Za-z0-9_.][A-Za-z0-9_./-]*\.[A-Za-z0-9]+(?::\d+)?").unwrap()
+    });
+    let mut out: Vec<String> = Vec::new();
+    for m in cited.find_iter(text) {
+        let crate::drift::Citation::Code(c) = crate::drift::classify(m.as_str()) else { continue };
+        let Some(repo) = crate::drift::resolve_repo(root, &c.repo) else { continue };
+        if repo == root || !repo.join(&c.path).is_file() {
+            continue;
+        }
+        let (branch, _) = crate::drift::branch_for(root, &c.repo, &repo);
+        let Some(sha) = crate::git::output(&repo, &["rev-parse", "--short=12", &branch]).filter(|s| !s.is_empty()) else { continue };
+        let source = format!("{}@{sha}:{}", c.repo, c.path);
+        if !out.contains(&source) {
+            out.push(source);
+        }
+    }
+    out
+}
+
+/// `page` with each of `add` in its frontmatter's `sources:` list, unless
+/// it is there already (a code file counts as there at any commit: drift
+/// owns its pin), and with the template's `{{placeholder}}` entries gone. A
+/// page with no frontmatter is left as it is.
+pub fn add_sources(page: &str, add: &[String]) -> String {
+    let crlf = page.contains("\r\n");
+    let text = page.replace("\r\n", "\n");
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(close) = (lines.first() == Some(&"---")).then(|| lines.iter().skip(1).position(|l| l.trim_end() == "---").map(|p| p + 1)).flatten() else {
+        return page.to_string();
+    };
+    let unquote = |s: &str| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    let same = |a: &str, b: &str| {
+        use crate::drift::{classify, Citation};
+        match (classify(a), classify(b)) {
+            (Citation::Code(x), Citation::Code(y)) => x.repo.eq_ignore_ascii_case(&y.repo) && x.path == y.path,
+            _ => unquote(a) == unquote(b),
+        }
+    };
+    // The list as it stands, from a block list or an inline `[a, b]`.
+    let key = (1..close).find(|&i| lines[i].starts_with("sources:"));
+    let mut items: Vec<String> = Vec::new();
+    let mut end = key.map_or(close, |k| k + 1);
+    if let Some(k) = key {
+        let inline = lines[k]["sources:".len()..].trim();
+        // A template's `# comment` after the key is not an entry.
+        let inline = if inline.starts_with('#') { "" } else { inline.split(" #").next().unwrap_or("").trim() };
+        if let Some(list) = inline.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            items.extend(list.split(',').map(unquote).filter(|s| !s.is_empty()));
+        } else if !inline.is_empty() {
+            items.push(unquote(inline));
+        }
+        while end < close && lines[end].trim_start().starts_with('-') {
+            items.push(unquote(lines[end].trim_start().trim_start_matches('-')));
+            end += 1;
+        }
+    }
+    let before = items.clone();
+    items.retain(|s| !s.contains("{{"));
+    for a in add {
+        if !items.iter().any(|s| same(s, a)) {
+            items.push(unquote(a));
+        }
+    }
+    if items == before {
+        return page.to_string();
+    }
+    let mut out: Vec<String> = lines[..key.unwrap_or(close)].iter().map(|l| l.to_string()).collect();
+    if items.is_empty() {
+        out.push("sources: []".into());
+    } else {
+        out.push("sources:".into());
+        out.extend(items.iter().map(|s| format!("  - \"{}\"", s.replace('"', "'"))));
+    }
+    out.extend(lines[end..].iter().map(|l| l.to_string()));
+    let text = out.join("\n") + "\n";
+    if crlf { text.replace('\n', "\r\n") } else { text }
+}
+
+/// `page` with what `section` rests on in its `sources:`: the note it came
+/// from, and the code it names.
+fn source_section(root: &Path, page: &str, section: &str, note_stem: &str) -> String {
+    let mut add = vec![format!("[[{note_stem}]]")];
+    add.extend(code_sources(root, section));
+    add_sources(page, &add)
+}
+
 /// The size rule: an edit that rewrites more than a fifth of its page, by
 /// changed lines against the page's lines, is held for a person.
 pub fn rewrites_a_fifth(base: &str, proposed: &str) -> bool {
@@ -2275,8 +2369,12 @@ pub fn follow_ups(
         if proposed.replace("\r\n", "\n") == base.replace("\r\n", "\n") {
             continue;
         }
+        // Sized before its sources are listed: the size rule weighs what the
+        // edit says, not the bookkeeping.
+        let sized = proposed;
+        let proposed = source_section(root, &sized, &section, &stem);
         let on_disk = fs::read_to_string(root.join(page)).unwrap_or_default();
-        let held = match hold(page, &base, &on_disk, &proposed, &change.against) {
+        let held = match hold(page, &base, &on_disk, &sized, &change.against) {
             None if out.dirty.contains(page) => Some(Held::Uncommitted),
             why => why,
         };
@@ -2290,7 +2388,7 @@ pub fn follow_ups(
                 // Held against the page as it is now: the same section, put
                 // into a person's newer page, applies without undoing them.
                 let proposed = match why {
-                    Held::Changed => stamp_updated(&replace_section(&on_disk, &section), date),
+                    Held::Changed => source_section(root, &stamp_updated(&replace_section(&on_disk, &section), date), &section, &stem),
                     _ => proposed,
                 };
                 let p = Proposal { from: from.clone(), ..Proposal::new(page.clone(), on_disk, proposed) };
@@ -2311,6 +2409,7 @@ pub fn follow_ups(
         let reply = generate(&page_prompt(&new.path, &new.purpose, &stem, note, blank.as_deref(), date)).and_then(|r| finish_page(&r));
         let Ok(proposed) = reply else { continue };
         let proposed = cite_page(&proposed, &stem);
+        let proposed = source_section(root, &proposed, &proposed, &stem);
         let path = root.join(&new.path);
         let made = fs::read_to_string(&path).ok();
         let why = match &made {
@@ -3315,7 +3414,7 @@ Ana: \"we ship on Friday\". Ben will fix the save bug.
         // page from its blank, in its index.
         let project = fs::read_to_string(r.root.join("Current/Project.md")).unwrap();
         assert!(project.contains("We ship on Friday ([[2026-09-24-standup]])") && !project.contains("Monday"));
-        assert!(project.starts_with("---\ntitle: Project\nupdated: 2026-09-24\n---\n# Project\n"), "{project}");
+        assert!(project.starts_with("---\ntitle: Project\nupdated: 2026-09-24\nsources:\n  - \"[[2026-09-24-standup]]\"\n---\n# Project\n"), "{project}");
         let release = fs::read_to_string(r.root.join("Reference/Platform/Release-dates.md")).unwrap();
         assert!(release.contains("status: draft") && !release.contains("checked:") && release.contains("[[2026-09-24-standup]]"), "{release}");
         assert!(fs::read_to_string(r.root.join("Reference/Index.md")).unwrap().contains("| [[Release-dates]] | when we ship |"));
@@ -3465,6 +3564,44 @@ Ana: \"we ship on Friday\". Ben will fix the save bug.
         git(root, &["config", "user.email", "t@t"]);
         git(root, &["add", "-A"]);
         git(root, &["commit", "-q", "-m", "start"]);
+    }
+
+    /// A page edit that says what code does lists that code, pinned, so
+    /// drift re-reads it when the code moves; the note joins too, and the
+    /// template's placeholder goes (2026-10-20: Current/Project.md named
+    /// `tiny-game:src/world.py` and kept `{{repo@sha:path ...}}`).
+    #[test]
+    fn an_edit_lists_the_note_and_the_code_it_names() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("savegame-x7");
+        fs::create_dir_all(code.join("src")).unwrap();
+        fs::write(code.join("src/world.py"), "def save_world(): pass\n").unwrap();
+        git_repo(&code);
+        let kb = parent.path().join("kb");
+        fs::create_dir_all(&kb).unwrap();
+        let page = "---\ntitle: \"Project\"\nstatus: current\nsources:\n  - \"{{repo@sha:path of the README}}\"\n---\n\n# Project\n";
+        let section = "## Saves\n\n`save_world` in `savegame-x7:src/world.py` writes one file, not `savegame-x7:src/gone.py`.\n";
+        let out = source_section(&kb, page, section, "sync-2026-10-14");
+        let sha = crate::git::output(&code, &["rev-parse", "--short=12", "HEAD"]).unwrap();
+        assert!(
+            out.contains(&format!("sources:\n  - \"[[sync-2026-10-14]]\"\n  - \"savegame-x7@{sha}:src/world.py\"\n---")),
+            "the note, then the code file that exists, pinned; no placeholder, no missing file: {out}"
+        );
+        // Once there, at any commit, a code file is not added again.
+        assert_eq!(source_section(&kb, &out, section, "sync-2026-10-14"), out);
+    }
+
+    #[test]
+    fn add_sources_reads_inline_lists_and_comments() {
+        let inline = "---\ntitle: x\nsources: [\"[[a]]\", \"[[b]]\"]\n---\nBody.\n";
+        assert_eq!(add_sources(inline, &["[[b]]".into(), "[[c]]".into()]), "---\ntitle: x\nsources:\n  - \"[[a]]\"\n  - \"[[b]]\"\n  - \"[[c]]\"\n---\nBody.\n");
+        let commented = "---\ntitle: x\nsources:                # with none, drift never flags it\n---\nBody.\n";
+        assert_eq!(add_sources(commented, &["[[n]]".into()]), "---\ntitle: x\nsources:\n  - \"[[n]]\"\n---\nBody.\n");
+        let none = "---\ntitle: x\n---\nBody.\n";
+        assert_eq!(add_sources(none, &["[[n]]".into()]), "---\ntitle: x\nsources:\n  - \"[[n]]\"\n---\nBody.\n");
+        assert_eq!(add_sources("No frontmatter.\n", &["[[n]]".into()]), "No frontmatter.\n");
+        let pinned = "---\nsources:\n  - \"app@abc1234:src/a.rs\"\n---\n";
+        assert_eq!(add_sources(pinned, &["app@def5678:src/a.rs".into()]), pinned, "drift owns the pin");
     }
 
     #[test]
