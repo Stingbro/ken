@@ -81,7 +81,7 @@
       <KenMark size={30} />
       <span class="t-heading">Ken</span>
     </div>
-    <h1 class="t-title">Your team's knowledge, in one calm place.</h1>
+    <h1 class="t-title">{setupOpen ? "New Workspace" : "Workspaces"}</h1>
 
     {#if setupOpen}
       <SetupFlow onclose={() => (setupOpen = false)} />
