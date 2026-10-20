@@ -44,10 +44,38 @@ pub fn gather(db: &Db, since: i64) -> Result<DigestSources> {
     })
 }
 
+/// [`gather`] for the repo at `root`. In a git repo a file changed when a
+/// commit since `since` touched it, or it has changes not yet committed and
+/// was written since: a fresh clone or a newly added repo has every file
+/// new on disk, and read by date the digest told that as a day of changes
+/// ("the README has been updated to match", 2026-10-20). A folder without
+/// git is read by date.
+pub fn gather_in(db: &Db, root: &std::path::Path, since: i64) -> Result<DigestSources> {
+    let log = ["log", &format!("--since=@{since}"), "--name-only", "--format=", "--no-renames", "--relative"];
+    let Some(committed) = crate::git::output_raw(root, &log) else {
+        return gather(db, since);
+    };
+    let committed: std::collections::HashSet<&str> = committed.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let pending: std::collections::HashSet<String> = crate::git::uncommitted(root).into_iter().collect();
+    let mut changed: Vec<(String, i64)> = Vec::new();
+    for f in db.list_files()? {
+        if committed.contains(f.rel_path.as_str()) || (f.mtime >= since && pending.contains(&f.rel_path)) {
+            changed.push((f.rel_path, f.mtime));
+        }
+    }
+    changed.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(DigestSources {
+        changed_files: changed.into_iter().map(|(p, _)| p).collect(),
+        finished_runs: db.runs_finished_since(since)?,
+    })
+}
+
 /// What a digest never says: it is written once a day, so what waits on
 /// the person, or a count of it, would go stale; Home shows that live.
 const NOT_WAITING: &str = "Never mention the Inbox, what is waiting on the user, or their tasks and \
-tickets, and give no count of them: the digest is written once a day, and Ken shows those live.";
+tickets, and give no count of them: the digest is written once a day, and Ken shows those live. \
+Say only what the listed changes show: never say a file was changed or updated unless it is listed, \
+and never guess at a change you cannot see in the files.";
 
 /// The morning-digest prompt: one warm paragraph plus a SOURCES line.
 pub fn compose_digest_prompt(project_name: &str, sources: &DigestSources) -> String {
@@ -211,6 +239,50 @@ mod tests {
         db.insert_review_item("conflict", "Merge conflict — Decisions.md", "", "Decisions.md", None, 980)
             .unwrap();
         db
+    }
+
+    /// In a git repo, new on disk is not changed: a commit in the window or
+    /// work not yet committed is. Without git, the date decides.
+    #[test]
+    fn gather_in_a_git_repo_reads_commits_not_file_dates() {
+        let git = |dir: &std::path::Path, args: &[&str], date: &str| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for (f, t) in [("README.md", "# Game\n"), ("src/world.py", "def save(): pass\n"), ("src/combat.py", "x = 1\n")] {
+            std::fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            std::fs::write(root.join(f), t).unwrap();
+        }
+        git(root, &["init", "-q"], "");
+        git(root, &["config", "user.name", "t"], "");
+        git(root, &["config", "user.email", "t@t"], "");
+        git(root, &["add", "-A"], "");
+        git(root, &["commit", "-q", "-m", "start"], "2026-01-01T10:00:00");
+        std::fs::write(root.join("src/world.py"), "def save(): return 1\n").unwrap();
+        git(root, &["commit", "-qam", "save"], "2026-10-20T10:00:00");
+        std::fs::write(root.join("src/combat.py"), "x = 2\n").unwrap();
+
+        let since = 1_792_400_000; // 2026-10-19, before the second commit
+        let now = since + 3_600;
+        let mut db = Db::open_in_memory().unwrap();
+        for f in ["README.md", "src/world.py", "src/combat.py"] {
+            db.upsert_file(f, "md", 10, now, "indexed", None, "x").unwrap();
+        }
+        let s = gather_in(&db, root, since).unwrap();
+        let mut got = s.changed_files.clone();
+        got.sort();
+        assert_eq!(got, vec!["src/combat.py", "src/world.py"], "committed in the window, or edited and not committed; the README is only new on disk");
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(gather_in(&db, plain.path(), since).unwrap().changed_files.len(), 3, "no git: by date");
     }
 
     #[test]

@@ -9296,7 +9296,7 @@ fn digest_job(state: &SharedState) -> CmdResult<DigestJob> {
     let since = engine::now_epoch() - 86_400;
     let mut out = Vec::new();
     for r in &repos {
-        let sources = with_index(&live, &base_dir, r.id, |db| ken_core::digest::gather(db, since).ok()).flatten();
+        let sources = with_index(&live, &base_dir, r.id, |db| ken_core::digest::gather_in(db, &r.root, since).ok()).flatten();
         out.push((r.name.clone(), sources.unwrap_or_default()));
     }
     let roots = repos.iter().map(|r| r.root.clone()).collect();
