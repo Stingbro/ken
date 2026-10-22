@@ -250,8 +250,35 @@ pub fn ignore_lines(kb_root: &Path) -> Vec<String> {
 pub fn base(kb_root: &Path, repo: &str) -> Option<String> {
     let value = read(kb_root)?;
     let repos = value.get("repos")?.as_object()?;
-    let entry = repos.iter().find(|(k, _)| k.eq_ignore_ascii_case(repo)).map(|(_, v)| v)?;
+    let entry = repos.get(repo_key(repos, repo)?)?;
     entry.get("base")?.as_str().map(str::trim).filter(|b| !b.is_empty()).map(str::to_string)
+}
+
+/// The `repos` key `name` means: the key itself, matched ignoring case, or
+/// the key whose `aliases` list it. A wiki that predates Ken already cites
+/// its repos by short names (`mod:src/Save.java` for `Shattered-Realms`);
+/// listing them as aliases makes those citations resolve without rewriting
+/// them.
+fn repo_key<'a>(repos: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a String> {
+    let name = name.trim();
+    repos.keys().find(|k| k.eq_ignore_ascii_case(name)).or_else(|| {
+        repos
+            .iter()
+            .find(|(_, v)| {
+                v.get("aliases")
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|a| a.iter().filter_map(|x| x.as_str()).any(|x| x.trim().eq_ignore_ascii_case(name)))
+            })
+            .map(|(k, _)| k)
+    })
+}
+
+/// The repo `name` names in the knowledge base's settings, by its key or one
+/// of its `aliases`: the key as written. None when no `repos` entry names it.
+pub fn canonical_repo(kb_root: &Path, name: &str) -> Option<String> {
+    let value = read(kb_root)?;
+    let repos = value.get("repos")?.as_object()?;
+    repo_key(repos, name).cloned()
 }
 
 /// The key a source's `repos` entry carries once its older ignore files have

@@ -300,9 +300,39 @@ pub fn classify(raw: &str) -> Citation {
     Citation::Code(CodeCitation { repo: repo.to_string(), at, path, line })
 }
 
+/// [`classify`], and also a `sources:` entry written `Repo/path` when `Repo`
+/// is a repo the knowledge base's settings list, by name or alias: the form
+/// a wiki that predates Ken often cites code in
+/// (`Shattered-Realms/src/main/java/Save.java`). A first folder no `repos`
+/// entry names (`Design/Saves.md`) stays what [`classify`] says.
+pub fn classify_at(kb_root: &Path, raw: &str) -> Citation {
+    let c = classify(raw);
+    let slashed = match &c {
+        Citation::Skip => true,
+        Citation::Code(c) => c.repo.contains('/'),
+        Citation::Cross => false,
+    };
+    if !slashed {
+        return c;
+    }
+    let t = raw.trim().trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`').trim();
+    let Some((repo, rest)) = t.split_once('/') else { return c };
+    if rest.is_empty() || repo.is_empty() || repo.contains([' ', ':', '@']) || crate::knowledge_settings::canonical_repo(kb_root, repo).is_none() {
+        return c;
+    }
+    match classify(&format!("{repo}:{rest}")) {
+        code @ Citation::Code(_) => code,
+        _ => c,
+    }
+}
+
 /// The folder a citation's repo names: this project if it is named so,
 /// a registered project of that name, or a sibling folder of that name.
 pub fn resolve_repo(project_root: &Path, repo: &str) -> Option<PathBuf> {
+    // A short name the knowledge base cites a repo by (`mod:path`), listed
+    // under that repo's `aliases`, means the repo.
+    let named = crate::knowledge_settings::canonical_repo(project_root, repo);
+    let repo = named.as_deref().unwrap_or(repo);
     let own = project_root.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if own.eq_ignore_ascii_case(repo) {
         return Some(project_root.to_path_buf());
@@ -434,7 +464,28 @@ pub struct Ruling {
     pub id: String,
     pub date: Option<String>,
     pub sources: Vec<String>,
+    /// Code the entry's own line names as `repo:path` (`repo@sha:path`,
+    /// `repo:path:line`): in a log kept one entry a line, the sources field
+    /// sits inline. Measured only where the repo resolves, so a word with a
+    /// colon in the ruling's prose is never a missing repo.
+    pub cited: Vec<String>,
     pub superseded: bool,
+}
+
+/// The `repo:path` locators in one line of a decisions log.
+fn cited_in(line: &str) -> Vec<String> {
+    static CITED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let cited = CITED.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[\s`(\[;,])([A-Za-z][A-Za-z0-9_.-]*(?:@[0-9a-fA-F]{4,40})?:[A-Za-z0-9_.][A-Za-z0-9_./-]*\.[A-Za-z0-9]+(?::\d+)?)").unwrap()
+    });
+    let mut out: Vec<String> = Vec::new();
+    for m in cited.captures_iter(line).filter_map(|c| c.get(1)) {
+        let s = m.as_str().to_string();
+        if !s.contains("://") && matches!(classify(&s), Citation::Code(_)) && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Entries of a decisions log (the fenced format example skipped).
@@ -458,7 +509,7 @@ pub fn parse_rulings(text: &str) -> Vec<Ruling> {
             let mut fields = t.split(sep);
             let id = fields.next().unwrap_or("").trim().to_string();
             let date = fields.next().map(str::trim).filter(|d| d.len() >= 10).map(|d| d[..10].to_string());
-            out.push(Ruling { id, date, sources: Vec::new(), superseded: t.contains("[SUPERSEDED BY") });
+            out.push(Ruling { id, date, sources: Vec::new(), cited: cited_in(t), superseded: t.contains("[SUPERSEDED BY") });
             continue;
         }
         let Some(r) = out.last_mut() else { continue };
@@ -628,7 +679,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
     // the page, its `checked` stamp is the pin instead: `checked_sha` where
     // the cited repo has that commit, else the last commit on `since`.
     let mut measure_one = |subject: &str, raw: &str, since: &str, exact: bool, checked_sha: Option<&str>, research: bool, run: &mut DriftRun| {
-        let c = match classify(raw) {
+        let c = match classify_at(&project.root, raw) {
             Citation::Code(c) => c,
             Citation::Cross => {
                 run.cross_references += 1;
@@ -793,6 +844,12 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             for src in &r.sources {
                 measure_one(&subject, src, &since, true, None, false, &mut run);
             }
+            for src in r.cited.iter().filter(|c| !r.sources.contains(c)) {
+                let Citation::Code(c) = classify_at(&project.root, src) else { continue };
+                if resolve_repo(&project.root, &c.repo).is_some() {
+                    measure_one(&subject, src, &since, true, None, false, &mut run);
+                }
+            }
         }
     }
 
@@ -952,7 +1009,7 @@ pub fn stamp_checked(text: &str, today: &str, sha: Option<&str>) -> String {
 /// slice 3 chose).
 fn head_for(project_root: &Path, sources: &[String]) -> Option<String> {
     sources.iter().find_map(|raw| {
-        let Citation::Code(c) = classify(raw) else { return None };
+        let Citation::Code(c) = classify_at(project_root, raw) else { return None };
         let repo = resolve_repo(project_root, &c.repo)?;
         let (branch, _) = branch_for(project_root, &c.repo, &repo);
         git(&repo, &["rev-parse", "--short=12", &branch]).filter(|s| !s.is_empty())
@@ -996,7 +1053,7 @@ fn clip(s: &str, max: usize) -> String {
 fn evidence(project_root: &Path, changed: &[&Mismatch]) -> String {
     let mut out = String::new();
     for m in changed {
-        let Citation::Code(c) = classify(&m.citation) else { continue };
+        let Citation::Code(c) = classify_at(project_root, &m.citation) else { continue };
         let (Some(repo), Some(pin), Some(branch)) = (resolve_repo(project_root, &c.repo), m.pin.as_deref(), m.branch.as_deref()) else {
             continue;
         };
@@ -1122,7 +1179,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
 
         // Gone: followed when git names the one new path, else a finding.
         for m in found.iter().filter(|m| m.severity == Severity::Finding) {
-            let followed = match classify(&m.citation) {
+            let followed = match classify_at(root, &m.citation) {
                 Citation::Code(c) => resolve_repo(root, &c.repo).and_then(|repo| {
                     let (pin, branch) = (m.pin.as_deref()?, m.branch.as_deref()?);
                     renamed_to(&repo, pin, branch, &c.path).map(|new| (c.path.clone(), new))
@@ -1382,7 +1439,14 @@ mod tests {
         assert_eq!(r[0].id, "D-012");
         assert_eq!(r[0].date.as_deref(), Some("2026-09-01"));
         assert_eq!(r[0].sources, vec!["game:src/save.rs:10", "[[Save format]]"]);
+        assert!(r[0].cited.is_empty(), "the multi-line form keeps its sources on their line");
         assert!(r[1].superseded);
+
+        // One entry a line, sources inline: the code it names is cited.
+        let one = "**D-514** · 2026-10-21 · items — **BANDS RISE.** Chris, live play. — mod PR #225, `mod:src/data/ArmourBases.json`; tools@4f2a9c1:packages/ui/a.ts:12; see https://example.com/x.html and e.g: not code; [[SR-1467]] — **aliases** band low\n";
+        let r = parse_rulings(one);
+        assert_eq!(r[0].id, "D-514");
+        assert_eq!(r[0].cited, vec!["mod:src/data/ArmourBases.json", "tools@4f2a9c1:packages/ui/a.ts:12"]);
     }
 
     #[test]
@@ -1823,6 +1887,58 @@ updated: {{date}}
         assert!(r.commit.is_none(), "nothing written, nothing committed");
         assert!(!due(&db, later + 60).unwrap(), "waits for the hour");
         assert!(due(&db, later + RETRY_SECS).unwrap());
+    }
+
+    /// A wiki that predates Ken cites code its own way: a page's sources as
+    /// `Repo/path`, a one-line ruling's inline as `mod:path` where `mod` is
+    /// an alias the settings list. Both are measured; a prose word with a
+    /// colon, or a first folder no repo is named for, is not.
+    #[test]
+    fn a_wikis_own_citation_forms_are_measured() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("Realms-Mod");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&code, &["config", k, v]);
+        }
+        commit_at(&code, "src/save.rs", "fn save() {\n    write();\n}\n", "2026-09-01");
+        commit_at(&code, "src/save.rs", "fn save() {\n    write_all();\n}\n", "2026-09-10");
+
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Engine")).unwrap();
+        fs::create_dir_all(wiki.join("decisions")).unwrap();
+        fs::write(
+            wiki.join("Engine/Save.md"),
+            "---\ntitle: Save\nchecked: 2026-09-05\nsources:\n  - Realms-Mod/src/save.rs\n  - Design/Saves.md\n---\n# Save\n",
+        )
+        .unwrap();
+        fs::write(
+            wiki.join("decisions/DECISIONS.md"),
+            "# Decisions\n\n**D-002** · 2026-09-05 · save — **SAVES WRITE ALL.** — `mod:src/save.rs`; note: words.md — **aliases** save\n\n**D-001** · 2026-09-05 · old — **X.** — `elsewhere:src/x.rs`\n",
+        )
+        .unwrap();
+        fs::create_dir_all(wiki.join(".ken")).unwrap();
+        let all = serde_json::json!({ "repos": { "Realms-Mod": { "kind": "code", "base": "main", "aliases": ["mod"] } }, "drift": { "fetch": false } });
+        fs::write(wiki.join(crate::wikinew::KNOWLEDGE_FILE), all.to_string()).unwrap();
+        assert_eq!(crate::knowledge_settings::canonical_repo(&wiki, "MOD").as_deref(), Some("Realms-Mod"));
+        assert_eq!(crate::knowledge_settings::base(&wiki, "mod").as_deref(), Some("main"), "an alias reads its repo's base");
+        assert!(matches!(classify_at(&wiki, "Design/Saves.md"), Citation::Skip), "no repo is named Design");
+
+        let project = Project::create(&wiki, "wiki").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let run = sweep(&project, &db, chrono_free_epoch("2026-09-24").unwrap()).unwrap();
+        let mut hit: Vec<(String, String)> = run.mismatches.iter().map(|m| (m.subject.clone(), m.citation.clone())).collect();
+        hit.sort();
+        assert_eq!(
+            hit,
+            vec![
+                ("Engine/Save.md".to_string(), "Realms-Mod/src/save.rs".to_string()),
+                ("decisions/DECISIONS.md#D-002".to_string(), "mod:src/save.rs".to_string()),
+            ]
+        );
+        assert!(run.unmeasured.iter().all(|u| !u.contains("elsewhere") && !u.contains("note")), "{:?}", run.unmeasured);
     }
 
     /// A repo's `base` in `.ken/knowledge.json` is the branch drift measures

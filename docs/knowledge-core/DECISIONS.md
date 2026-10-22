@@ -74,6 +74,7 @@ On top of that base:
    - `superseded_by`: a retired page's successor, written by Ken when it retires the page;
    - `updated`;
    - `sources`: each `repo@sha:path` or `[[Note]]`, with the pin inside;
+     - A wiki that predates Ken is read in its own forms (2026-10-22, the SR wiki): a repo's `aliases` in `knowledge.json` (`mod:path` for `Shattered-Realms`), a source written `Repo/path` where `Repo` is a listed repo, and the code a one-line ruling names inline. Nothing is rewritten to Ken's form.
    - `checked`: date and sha, written by the check that re-read the page;
    - optional `reviewed_by`.
    - **Dropped:** `lens`, `changed_by`, `audience`, a separate `pin`, person-only `verified`.
