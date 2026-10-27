@@ -186,6 +186,10 @@ pub struct DriftRun {
     pub commit: Option<String>,
     #[serde(default)]
     pub commit_error: Option<String>,
+    /// The pages, and rulings as `log#id`, with a citation this sweep could
+    /// not measure: what an earlier run filed against them stands.
+    #[serde(skip)]
+    pub unmeasured_subjects: std::collections::BTreeSet<String>,
 }
 
 impl DriftRun {
@@ -689,6 +693,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
         };
         let Some(repo_root) = resolve_repo(&project.root, &c.repo) else {
             run.code_citations += 1;
+            run.unmeasured_subjects.insert(subject.to_string());
             let u = format!("repo `{}` (cited by {subject}) was not found beside this one or in Ken", c.repo);
             if !run.unmeasured.contains(&u) {
                 run.unmeasured.push(u);
@@ -708,6 +713,7 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
             .entry(repo_root.clone())
             .or_insert_with(|| git(&repo_root, &["rev-parse", "--is-inside-work-tree"]).is_some_and(|o| o == "true"));
         if !in_git {
+            run.unmeasured_subjects.insert(subject.to_string());
             let u = format!("`{}` is not a git repository, so its citations cannot be measured", c.repo);
             if !run.unmeasured.contains(&u) {
                 run.unmeasured.push(u);
@@ -794,7 +800,10 @@ pub fn sweep(project: &Project, db: &Db, now: i64) -> Result<DriftRun> {
                 branch: Some(branch.clone()),
             }),
             Measured::Clean => {}
-            Measured::Unmeasured(why) => run.unmeasured.push(format!("{subject} — {}: {why} ({since})", raw.trim())),
+            Measured::Unmeasured(why) => {
+                run.unmeasured_subjects.insert(subject.to_string());
+                run.unmeasured.push(format!("{subject} — {}: {why} ({since})", raw.trim()));
+            }
         }
     };
 
@@ -1142,6 +1151,7 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
     }
 
     let dirty = crate::git::uncommitted(root);
+    let mut filed: std::collections::HashSet<(String, String, String)> = Default::default();
     let mut touched: Vec<String> = Vec::new();
     let mut by_page: std::collections::BTreeMap<String, Vec<Mismatch>> = Default::default();
     for m in run.mismatches.iter().filter(|m| !m.research) {
@@ -1156,7 +1166,9 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
                     "{id} cites {}, which {what}: {}. A ruling is never edited: read it against the code, and supersede it if it no longer holds.",
                     m.citation, m.detail
                 );
-                crate::findings::file(db, &finding(log, id, "ruling", text), now)?;
+                let f = finding(log, id, "ruling", text);
+                filed.insert(f.key());
+                crate::findings::file(db, &f, now)?;
                 run.findings += 1;
             }
             None => by_page.entry(m.subject.clone()).or_default().push(m.clone()),
@@ -1199,7 +1211,9 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
                 }
                 _ => {
                     let text = format!("{page} cites {}: {}.", m.citation, m.detail);
-                    crate::findings::file(db, &finding(&page, &m.citation, "code", text), now)?;
+                    let f = finding(&page, &m.citation, "code", text);
+                    filed.insert(f.key());
+                    crate::findings::file(db, &f, now)?;
                     run.findings += 1;
                 }
             }
@@ -1309,6 +1323,22 @@ pub fn act(project: &Project, db: &mut Db, run: &mut DriftRun, today: &str, mut 
                 run.held.push(page.clone());
             }
         }
+    }
+
+    // What an earlier run filed against a citation and this one did not find
+    // again is resolved: the page was fixed, or the code came back. It stands
+    // while its page or ruling has a citation this sweep could not measure,
+    // or while its page holds a person's uncommitted work.
+    for (it, f) in crate::findings::open(db)? {
+        let cited = f.kind == "drift" && f.source == SOURCE && (f.against_kind == "code" || f.against_kind == "ruling");
+        if !cited || filed.contains(&f.key()) {
+            continue;
+        }
+        let subject = if f.against_kind == "ruling" { format!("{}#{}", f.subject, f.against) } else { f.subject.clone() };
+        if run.unmeasured_subjects.contains(&subject) || dirty.contains(&f.subject) {
+            continue;
+        }
+        db.resolve_review_item(it.id, now)?;
     }
 
     // One commit and one log line for what the run wrote (decisions 28, 36).
@@ -1887,6 +1917,60 @@ updated: {{date}}
         assert!(r.commit.is_none(), "nothing written, nothing committed");
         assert!(!due(&db, later + 60).unwrap(), "waits for the hour");
         assert!(due(&db, later + RETRY_SECS).unwrap());
+    }
+
+    /// A page cites a file that is gone, and the run files it. Once the page
+    /// cites the file that is there, the next run resolves the finding. One
+    /// whose page also cites a folder the sweep cannot measure stands.
+    #[test]
+    fn a_gone_citation_the_page_no_longer_makes_is_resolved() {
+        let parent = tempfile::tempdir().unwrap();
+        let code = parent.path().join("game");
+        fs::create_dir_all(&code).unwrap();
+        git_ok(&code, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&code, &["config", k, v]);
+        }
+        commit_at(&code, "src/real.rs", "fn real() {}\n", "2026-09-01");
+        fs::create_dir_all(parent.path().join("notes")).unwrap(); // no git: unmeasured
+
+        let wiki = parent.path().join("wiki");
+        fs::create_dir_all(wiki.join("Platform")).unwrap();
+        let page = |sources: &[&str]| {
+            let list: String = sources.iter().map(|s| format!("  - {s}\n")).collect();
+            format!("---\ntitle: P\nchecked: 2026-09-05\nsources:\n{list}---\n# P\n")
+        };
+        fs::write(wiki.join("Platform/Fixed.md"), page(&["game:src/gone.rs"])).unwrap();
+        fs::write(wiki.join("Platform/Stands.md"), page(&["game:src/gone2.rs", "notes:a.md"])).unwrap();
+        let project = Project::create(&wiki, "wiki").unwrap();
+        settings(&wiki, serde_json::json!({ "fetch": false }));
+        git_ok(&wiki, &["init", "-q", "-b", "main"]);
+        for (k, v) in [("user.email", "t@t"), ("user.name", "t"), ("core.autocrlf", "false")] {
+            git_ok(&wiki, &["config", k, v]);
+        }
+        git_ok(&wiki, &["add", "-A"]);
+        git_ok(&wiki, &["commit", "-q", "-m", "wiki"]);
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+        let open_on = |db: &Db| -> Vec<String> {
+            let mut v: Vec<String> = crate::findings::open(db)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, f)| f.kind == "drift" && f.against_kind == "code")
+                .map(|(_, f)| f.subject)
+                .collect();
+            v.sort();
+            v
+        };
+        run(&project, &mut db, chrono_free_epoch("2026-09-24").unwrap(), "2026-09-24", None).unwrap();
+        assert_eq!(open_on(&db), vec!["Platform/Fixed.md", "Platform/Stands.md"]);
+
+        fs::write(wiki.join("Platform/Fixed.md"), page(&["game:src/real.rs"])).unwrap();
+        fs::write(wiki.join("Platform/Stands.md"), page(&["notes:a.md"])).unwrap();
+        git_ok(&wiki, &["commit", "-qam", "fix the citations"]);
+        crate::scan::scan(&project, &mut db).unwrap();
+        run(&project, &mut db, chrono_free_epoch("2026-09-25").unwrap(), "2026-09-25", None).unwrap();
+        assert_eq!(open_on(&db), vec!["Platform/Stands.md"], "the fixed page's finding is resolved");
     }
 
     /// A wiki that predates Ken cites code its own way: a page's sources as
