@@ -166,12 +166,33 @@ pub fn extract(from: &str, text: &str) -> Vec<Link> {
         let target = raw.split('#').next().unwrap_or("");
         let is_url = target.contains("://") || target.starts_with("mailto:") || target.starts_with('/');
         if !target.is_empty() && !is_url && !target.contains("{{") {
-            let decoded = target.replace("%20", " ");
-            push(Link { kind: LinkKind::Path, target: join(from, &decoded) });
+            push(Link { kind: LinkKind::Path, target: join(from, &percent_decode(target)) });
         }
         i = open + close_off + 1;
     }
     out
+}
+
+/// A Markdown link target as the file name it stands for: every `%XX` escape
+/// decoded (`%20` for a space, `%2C` for a comma, `%28` for a bracket), the way
+/// GitHub and Obsidian read it. A `%` not followed by two hex digits stays.
+fn percent_decode(target: &str) -> String {
+    let b = target.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `target` relative to the folder of `from`, normalized.
@@ -618,6 +639,9 @@ mod tests {
     fn a_path_link_is_resolved_from_the_pages_folder() {
         assert_eq!(join("a/b/page.md", "../c/d.md"), "a/c/d.md");
         assert_eq!(join("page.md", "./x.md"), "x.md");
-        assert_eq!(join("a/page.md", "x%20y.md".replace("%20", " ").as_str()), "a/x y.md");
+        assert_eq!(join("a/page.md", &percent_decode("x%20y.md")), "a/x y.md");
+        assert_eq!(percent_decode("run%2C%20pass%202%20%28b%29.png"), "run, pass 2 (b).png");
+        assert_eq!(percent_decode("100%.md"), "100%.md", "a bare percent stays");
+        assert_eq!(percent_decode("x%2"), "x%2");
     }
 }
