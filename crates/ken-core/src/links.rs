@@ -254,25 +254,31 @@ impl Resolver {
 
     /// Every file under `root` as the index would name it, read from disk,
     /// for the links that reach a file the index leaves out ([`report`]).
+    /// A path link may also reach a folder, which GitHub opens as a listing.
     /// Hidden folders (`.git`, `.obsidian`) are skipped.
     pub fn on_disk(root: &Path) -> Resolver {
-        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        fn walk(root: &Path, dir: &Path, files: &mut Vec<String>, folders: &mut Vec<String>) {
             let Ok(entries) = std::fs::read_dir(dir) else { return };
             for e in entries.flatten() {
                 let path = e.path();
                 if e.file_name().to_string_lossy().starts_with('.') {
                     continue;
                 }
+                let Ok(rel) = path.strip_prefix(root) else { continue };
+                let rel = rel.to_string_lossy().replace('\\', "/");
                 if path.is_dir() {
-                    walk(root, &path, out);
-                } else if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                    folders.push(rel);
+                    walk(root, &path, files, folders);
+                } else {
+                    files.push(rel);
                 }
             }
         }
-        let mut files = Vec::new();
-        walk(root, root, &mut files);
-        Resolver::new(&files, &[])
+        let (mut files, mut folders) = (Vec::new(), Vec::new());
+        walk(root, root, &mut files, &mut folders);
+        let mut r = Resolver::new(&files, &[]);
+        r.paths.extend(folders);
+        r
     }
 
     /// The pages a link reaches: zero (missing or broken), one, or more
@@ -542,7 +548,11 @@ mod tests {
         fs::create_dir_all(root.join("_meta")).unwrap();
         fs::write(root.join("Design/art/herald.png"), [0u8; 8]).unwrap();
         fs::write(root.join("_meta/Home.md"), "# Home\n").unwrap();
-        fs::write(root.join("Design/Herald.md"), "# Herald\n![front](art/herald.png) ![[herald.png]] [[Home]] [[Nowhere]]\n").unwrap();
+        fs::write(
+            root.join("Design/Herald.md"),
+            "# Herald\n![front](art/herald.png) ![[herald.png]] [[Home]] [[Nowhere]] [the art](art/) [gone](old/)\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join(".ken")).unwrap();
         fs::write(root.join(".ken/knowledge.json"), r#"{"ignore": ["*.png", "/_meta/"]}"#).unwrap();
         let project = Project::create(root, "Lib").unwrap();
@@ -552,7 +562,8 @@ mod tests {
         let without = report(&db, None).unwrap();
         assert_eq!(without.missing_names.len(), 3, "{without:?}");
         let r = report(&db, Some(root)).unwrap();
-        assert!(r.broken_paths.is_empty(), "{r:?}");
+        let broken: Vec<&(String, String)> = r.broken_paths.values().flatten().collect();
+        assert_eq!(broken, vec![&("Design/Herald.md".to_string(), "Design/old".to_string())], "a folder that is there works");
         assert_eq!(r.missing_names, vec![("Nowhere".to_string(), vec!["Design/Herald.md".to_string()])]);
     }
 
