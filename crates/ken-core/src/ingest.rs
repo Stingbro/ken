@@ -2847,13 +2847,13 @@ Ana: \"we ship on Friday\". Ben will fix the save bug.
         assert!(fs::read_to_string(root.join("Current/Project.md")).unwrap().contains("[[meeting-2026-10-14]]"), "the ingest cited its note");
 
         crate::scan::scan(&project, &mut db).unwrap();
-        let links = crate::links::report(&db).unwrap();
+        let links = crate::links::report(&db, Some(root)).unwrap();
         assert!(links.duplicate_names.is_empty() && links.missing_names.is_empty() && links.broken_paths.is_empty(), "{links:?}");
         let resolver = crate::links::Resolver::from_db(&db).unwrap();
         let name = |t: &str| crate::links::Link { kind: crate::links::LinkKind::Name, target: t.into() };
         assert_eq!(resolver.resolve(&name("meeting-2026-10-14")), vec![p.note.clone()]);
         assert_eq!(resolver.resolve(&name(&p.source)), vec![p.source.clone()], "the note's sources: link");
-        let found = crate::lint::scan_findings(&db).unwrap();
+        let found = crate::lint::scan_findings(&db, root).unwrap();
         assert!(!found.iter().any(|f| f.kind == "ambiguous-name" || f.text.contains("meeting-2026-10-14")), "{found:#?}");
     }
 

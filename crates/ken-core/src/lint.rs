@@ -93,9 +93,10 @@ pub fn orphans(db: &Db) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// What the scan's lint finds now, at most [`MAX_PER_KIND`] of each kind.
-pub fn scan_findings(db: &Db) -> Result<Vec<Finding>> {
-    let report = crate::links::report(db)?;
+/// What the scan's lint finds now in the knowledge base at `root`, at most
+/// [`MAX_PER_KIND`] of each kind.
+pub fn scan_findings(db: &Db, root: &Path) -> Result<Vec<Finding>> {
+    let report = crate::links::report(db, Some(root))?;
     let base = |kind: &str| Finding { kind: kind.into(), source: SOURCE.into(), ..Default::default() };
     let mut out = Vec::new();
     for (name, askers) in report.missing_names.iter().take(MAX_PER_KIND) {
@@ -145,7 +146,7 @@ pub fn on_scan(db: &mut Db, root: &Path, now: i64, today: &str) -> Result<(usize
     if weekly_at(db)?.is_none() {
         db.store_check_state(WEEKLY_AT, &now.to_string())?;
     }
-    let found = scan_findings(db)?;
+    let found = scan_findings(db, root)?;
     let mut before: HashSet<(String, String, String)> = HashSet::new();
     for kind in SCAN_KINDS {
         before.extend(crate::findings::ever(db, kind)?.iter().map(Finding::key));
@@ -700,7 +701,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
 
-        let found = scan_findings(&db).unwrap();
+        let found = scan_findings(&db, &root).unwrap();
         assert!(found.is_empty(), "{found:#?}");
 
         // The weekly pass never files a page the knowledge base has: a blank

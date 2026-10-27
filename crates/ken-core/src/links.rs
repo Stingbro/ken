@@ -9,8 +9,14 @@
 //! Links are extracted per page at index time and stored raw; resolution
 //! runs when asked, against the pages and aliases the index holds then, so
 //! a rename or a new alias needs no re-extraction.
+//!
+//! Resolution follows Obsidian, where the links are written: a file name
+//! wins over an alias, a name with a folder (`[[Crafting/Index]]`) matches
+//! the end of a path, and a link to a file the index leaves out (an image,
+//! a folder the knowledge base ignores) still works when the file is there.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -191,8 +197,11 @@ fn stem(path: &str) -> String {
 
 /// Every page the index knows, with the names that reach it.
 pub struct Resolver {
-    /// Page file names and aliases. Two owners make a duplicate.
+    /// Page file names. Two owners make a duplicate.
     by_name: HashMap<String, Vec<String>>,
+    /// Aliases, reached only when no page has the name as its file name
+    /// (Obsidian opens the file). Two owners make a duplicate.
+    by_alias: HashMap<String, Vec<String>>,
     /// Other files by full file name (`world.png`), for `![[world.png]]`
     /// embeds; never reported as duplicates (every folder has a README).
     by_file: HashMap<String, Vec<String>>,
@@ -216,6 +225,7 @@ impl Resolver {
 
     pub fn new(pages: &[String], aliases: &[(String, Vec<String>)]) -> Resolver {
         let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_alias: HashMap<String, Vec<String>> = HashMap::new();
         let mut by_file: HashMap<String, Vec<String>> = HashMap::new();
         let mut by_path: HashMap<String, String> = HashMap::new();
         for p in pages {
@@ -233,13 +243,36 @@ impl Resolver {
         for (p, names) in aliases {
             for n in names {
                 let key = n.trim().to_lowercase();
-                let owners = by_name.entry(key).or_default();
+                let owners = by_alias.entry(key).or_default();
                 if !owners.contains(p) {
                     owners.push(p.clone());
                 }
             }
         }
-        Resolver { by_name, by_file, by_path, paths: pages.iter().cloned().collect() }
+        Resolver { by_name, by_alias, by_file, by_path, paths: pages.iter().cloned().collect() }
+    }
+
+    /// Every file under `root` as the index would name it, read from disk,
+    /// for the links that reach a file the index leaves out ([`report`]).
+    /// Hidden folders (`.git`, `.obsidian`) are skipped.
+    pub fn on_disk(root: &Path) -> Resolver {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let path = e.path();
+                if e.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(root, root, &mut files);
+        Resolver::new(&files, &[])
     }
 
     /// The pages a link reaches: zero (missing or broken), one, or more
@@ -253,9 +286,17 @@ impl Resolver {
                     if let Some(p) = self.by_path.get(key) {
                         return vec![p.clone()];
                     }
+                    // Obsidian's shortest form: the end of a path.
+                    let tail = format!("/{key}");
+                    let mut found: Vec<String> =
+                        self.by_path.iter().filter(|(k, _)| k.ends_with(&tail)).map(|(_, p)| p.clone()).collect();
+                    found.sort();
+                    found.dedup();
+                    return found;
                 }
                 self.by_name
                     .get(key)
+                    .or_else(|| self.by_alias.get(key))
                     .or_else(|| self.by_file.get(key))
                     .cloned()
                     .unwrap_or_default()
@@ -268,11 +309,14 @@ impl Resolver {
         }
     }
 
-    /// Names claimed by more than one page (file name or alias).
+    /// Names a link cannot settle: two pages with the file name, or, where
+    /// no page has it as its file name, two pages with the alias.
     pub fn duplicate_names(&self) -> Vec<(String, Vec<String>)> {
+        let aliases = self.by_alias.iter().filter(|(n, _)| !self.by_name.contains_key(*n));
         let mut out: Vec<(String, Vec<String>)> = self
             .by_name
             .iter()
+            .chain(aliases)
             .filter(|(_, owners)| owners.len() > 1)
             .map(|(n, owners)| {
                 let mut o = owners.clone();
@@ -331,9 +375,12 @@ impl LinkReport {
     }
 }
 
-/// Resolve every stored link against the pages the index holds now.
-pub fn report(db: &Db) -> Result<LinkReport> {
+/// Resolve every stored link against the pages the index holds now. With
+/// the knowledge base's `root`, a link to a file that is there but left out
+/// of the index (an image, an ignored folder) is not reported broken.
+pub fn report(db: &Db, root: Option<&Path>) -> Result<LinkReport> {
     let resolver = Resolver::from_db(db)?;
+    let on_disk = root.map(Resolver::on_disk);
     let mut r = LinkReport::default();
     let mut missing: HashMap<String, Vec<String>> = HashMap::new();
     // The names links use: two pages sharing a file name (every section's
@@ -352,7 +399,7 @@ pub fn report(db: &Db) -> Result<LinkReport> {
             }
             LinkKind::Path => r.path_links += 1,
         }
-        if !resolver.resolve(&link).is_empty() {
+        if !resolver.resolve(&link).is_empty() || on_disk.as_ref().is_some_and(|d| !d.resolve(&link).is_empty()) {
             continue;
         }
         match link.kind {
@@ -450,6 +497,65 @@ mod tests {
         assert_eq!(r.duplicate_names(), vec![("team".to_string(), vec!["Current/Team.md".to_string(), "Old/Team.md".to_string()])]);
     }
 
+    /// As Obsidian opens them: the file name before an alias, a name with a
+    /// folder by the end of a path, and two aliases with no file between them
+    /// ambiguous.
+    #[test]
+    fn a_file_name_beats_an_alias_and_a_folder_name_matches_a_path_end() {
+        let pages = vec![
+            "Research/DES-004-tissue.md".to_string(),
+            "tickets/SR-135.md".to_string(),
+            "Design/Game/Crafting/Index.md".to_string(),
+            "Design/Index.md".to_string(),
+            "Design/Game/Crafting/Old.md".to_string(),
+            "Design/Systems/Old.md".to_string(),
+        ];
+        let aliases = vec![
+            ("tickets/SR-135.md".to_string(), vec!["DES-004-tissue".to_string(), "connective tissue".to_string()]),
+            ("Design/Index.md".to_string(), vec!["connective tissue".to_string()]),
+        ];
+        let r = Resolver::new(&pages, &aliases);
+        let name = |t: &str| Link { kind: LinkKind::Name, target: t.into() };
+        assert_eq!(r.resolve(&name("DES-004-tissue")), vec!["Research/DES-004-tissue.md"], "the file, not the ticket's alias");
+        assert_eq!(r.resolve(&name("Crafting/Index")), vec!["Design/Game/Crafting/Index.md"]);
+        assert_eq!(r.resolve(&name("Game/Crafting/Old")), vec!["Design/Game/Crafting/Old.md"]);
+        assert!(r.resolve(&name("afting/Index")).is_empty(), "a whole folder name, not part of one");
+        assert_eq!(
+            r.duplicate_names(),
+            vec![
+                ("connective tissue".to_string(), vec!["Design/Index.md".to_string(), "tickets/SR-135.md".to_string()]),
+                ("index".to_string(), vec!["Design/Game/Crafting/Index.md".to_string(), "Design/Index.md".to_string()]),
+                ("old".to_string(), vec!["Design/Game/Crafting/Old.md".to_string(), "Design/Systems/Old.md".to_string()]),
+            ]
+        );
+    }
+
+    /// A link to a file the index leaves out (an image, an ignored folder)
+    /// works when the file is on disk: the report leaves it alone.
+    #[test]
+    fn a_link_to_a_file_the_index_leaves_out_is_not_broken() {
+        use crate::project::Project;
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("Design/art")).unwrap();
+        fs::create_dir_all(root.join("_meta")).unwrap();
+        fs::write(root.join("Design/art/herald.png"), [0u8; 8]).unwrap();
+        fs::write(root.join("_meta/Home.md"), "# Home\n").unwrap();
+        fs::write(root.join("Design/Herald.md"), "# Herald\n![front](art/herald.png) ![[herald.png]] [[Home]] [[Nowhere]]\n").unwrap();
+        fs::create_dir_all(root.join(".ken")).unwrap();
+        fs::write(root.join(".ken/knowledge.json"), r#"{"ignore": ["*.png", "/_meta/"]}"#).unwrap();
+        let project = Project::create(root, "Lib").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        crate::scan::scan(&project, &mut db).unwrap();
+
+        let without = report(&db, None).unwrap();
+        assert_eq!(without.missing_names.len(), 3, "{without:?}");
+        let r = report(&db, Some(root)).unwrap();
+        assert!(r.broken_paths.is_empty(), "{r:?}");
+        assert_eq!(r.missing_names, vec![("Nowhere".to_string(), vec!["Design/Herald.md".to_string()])]);
+    }
+
     #[test]
     fn an_embed_resolves_by_file_name_and_other_files_are_never_duplicates() {
         let pages = vec!["img/world.png".to_string(), "a/README.txt".to_string(), "b/README.txt".to_string()];
@@ -481,7 +587,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         crate::scan::scan(&project, &mut db).unwrap();
 
-        let r = report(&db).unwrap();
+        let r = report(&db, Some(root)).unwrap();
         assert_eq!((r.name_links, r.path_links), (5, 1));
         assert_eq!(r.missing_names[0], ("Ghost".to_string(), vec!["Current/Team.md".to_string(), "Ways-of-Working/Rules.md".to_string()]));
         assert_eq!(r.missing_names[1].0, "Phantom");
