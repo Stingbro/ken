@@ -124,11 +124,24 @@ impl Settings {
 pub fn for_repo(root: &Path) -> Option<Settings> {
     let name = repo_name(root);
     if let Some(value) = read(root) {
-        return Some(Settings { kb_root: root.to_path_buf(), name, own: true, value });
+        return Some(own(root, &name, value));
     }
     let registry = crate::registry::default_base_dir().and_then(|b| crate::registry::Registry::load(&b)).ok()?;
     let candidates: Vec<PathBuf> = registry.projects.iter().map(|e| e.path.clone()).collect();
     among(root, &name, &candidates)
+}
+
+/// A repo's own file, read under the name its `repos` entry is written
+/// with: the entry keyed by the repo's name, by one of an entry's
+/// `aliases`, or by its folder's name. A wiki registered as `sr-docs` in a
+/// folder called `Shattered-Realms-Docs` reads the `Shattered-Realms-Docs`
+/// entry; matching on the registry name alone left it with no index rules.
+fn own(root: &Path, name: &str, value: Value) -> Settings {
+    let key = value
+        .get("repos")
+        .and_then(|r| r.as_object())
+        .and_then(|repos| repo_key(repos, name).or_else(|| repo_key(repos, &folder_name(root))).cloned());
+    Settings { kb_root: root.to_path_buf(), name: key.unwrap_or_else(|| name.to_string()), own: true, value }
 }
 
 /// [`for_repo`]'s search, over the given repos: the one whose settings list
@@ -144,8 +157,7 @@ pub fn among(root: &Path, name: &str, candidates: &[PathBuf]) -> Option<Settings
         }
         let Some(value) = read(kb) else { continue };
         let Some(repos) = value.get("repos").and_then(|r| r.as_object()) else { continue };
-        let Some(key) = repos.keys().find(|k| k.eq_ignore_ascii_case(name)).or_else(|| repos.keys().find(|k| k.eq_ignore_ascii_case(&folder)))
-        else {
+        let Some(key) = repo_key(repos, name).or_else(|| repo_key(repos, &folder)) else {
             continue;
         };
         let shared = shared_prefix(kb, root);
@@ -613,6 +625,27 @@ mod tests {
         assert_eq!(s.controls().len(), 1, "only its own; one with no source is the knowledge base's");
         assert!(s.analyzed());
         assert!(among(&other, "Elsewhere", &[wiki.clone()]).is_none(), "not listed");
+    }
+
+    #[test]
+    fn a_repo_reading_its_own_file_finds_its_entry_by_folder_or_alias() {
+        let d = tempfile::tempdir().unwrap();
+        let wiki = d.path().join("Shattered-Realms-Docs");
+        kb(&wiki, r#"{ "repos": { "Shattered-Realms-Docs": { "kind": "wiki", "aliases": ["docs"], "ignore": ["*.png"] } } }"#);
+        let value = || read(&wiki).unwrap();
+        let by_folder = own(&wiki, "sr-docs", value());
+        assert_eq!(by_folder.name, "Shattered-Realms-Docs");
+        assert_eq!(by_folder.index_rules(), vec!["*.png"]);
+        assert_eq!(own(&wiki, "DOCS", value()).name, "Shattered-Realms-Docs", "an alias, ignoring case");
+        let elsewhere = d.path().join("Renamed");
+        kb(&elsewhere, r#"{ "repos": { "Game": { "kind": "code" } } }"#);
+        let unlisted = own(&elsewhere, "Renamed", read(&elsewhere).unwrap());
+        assert_eq!(unlisted.name, "Renamed", "no entry names it: the name stays");
+        assert!(unlisted.repo_entry().is_none());
+        let code = d.path().join("Shattered-Realms");
+        std::fs::create_dir_all(&code).unwrap();
+        kb(&wiki, r#"{ "repos": { "Shattered-Realms": { "kind": "code", "aliases": ["mod"] } } }"#);
+        assert_eq!(among(&code, "mod", &[wiki.clone()]).unwrap().name, "Shattered-Realms", "a listed repo by alias");
     }
 
     #[test]
