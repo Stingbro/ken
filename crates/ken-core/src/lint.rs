@@ -27,7 +27,7 @@
 //! earlier pass already filed (a finding a person marked done that is
 //! still there).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -484,13 +484,15 @@ fn in_comment(line: &str, at: usize) -> bool {
 }
 
 /// The ruling ids each comment in a code file cites, as (line, id), for
-/// ids in the shape of the log's (one of `prefixes`, a dash, digits).
-pub fn code_citations(text: &str, prefixes: &BTreeSet<String>) -> Vec<(usize, String)> {
+/// ids in the shape of the log's: one of `prefixes`, a dash, and at least as
+/// many digits as the log's shortest id with that prefix. A log numbered
+/// `D-001` is never cited as `D-1`, so `z D-2` in a comment is arithmetic.
+pub fn code_citations(text: &str, prefixes: &BTreeMap<String, usize>) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         for id in crate::git::cited_ids(line) {
-            let Some((prefix, _)) = id.rsplit_once('-') else { continue };
-            if !prefixes.contains(prefix) {
+            let Some((prefix, digits)) = id.rsplit_once('-') else { continue };
+            if prefixes.get(prefix).is_none_or(|width| digits.len() < *width) {
                 continue;
             }
             if line.find(&id).is_some_and(|at| in_comment(line, at)) {
@@ -528,10 +530,14 @@ pub fn rulings_in_code(db: &Db, root: &Path, code: &[crate::ingest::CodeSource])
             ids.extend(crate::drift::parse_rulings(&text).into_iter().map(|r| r.id));
         }
     }
-    let prefixes: BTreeSet<String> = ids.iter().filter_map(|id| id.rsplit_once('-').map(|(p, _)| p.to_string())).collect();
+    let mut prefixes: BTreeMap<String, usize> = BTreeMap::new();
+    for (prefix, digits) in ids.iter().filter_map(|id| id.rsplit_once('-')) {
+        let width = prefixes.entry(prefix.to_string()).or_insert(digits.len());
+        *width = (*width).min(digits.len());
+    }
     let mut out: Vec<CodeRuling> = Vec::new();
     for source in code {
-        for prefix in &prefixes {
+        for prefix in prefixes.keys() {
             for (path, text) in source.db.code_texts_containing(&format!("{prefix}-"))? {
                 for (line, id) in code_citations(&text, &prefixes) {
                     if out.iter().any(|c| c.repo == source.name && c.path == path && c.line == line && c.id == id) {
@@ -767,12 +773,18 @@ mod tests {
 
     #[test]
     fn a_comment_citing_a_ruling_the_log_lacks_is_a_finding() {
-        let prefixes: BTreeSet<String> = ["D".to_string()].into();
+        let prefixes: BTreeMap<String, usize> = [("D".to_string(), 1)].into();
         let text = "// Per D-012 regions save apart.\nlet s = \"D-999\"; // see D-404\n# D-7 in a script\nlet x = UTF-8;\n/* SR-12 */\n";
         assert_eq!(
             code_citations(text, &prefixes),
             vec![(1, "D-012".to_string()), (2, "D-404".to_string()), (3, "D-7".to_string())],
             "a string is no comment; another series is not the log's"
+        );
+        let padded: BTreeMap<String, usize> = [("D".to_string(), 3)].into();
+        assert_eq!(
+            code_citations("// far wall at z D-2, see D-012\n", &padded),
+            vec![(1, "D-012".to_string())],
+            "a log numbered D-001 is not cited as D-2"
         );
 
         let (dir, _p, db) = library(&[(
