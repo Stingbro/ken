@@ -575,11 +575,17 @@ pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
     let mut fm_done = false;
     // Inside a `sources:` block list the model wrote: its items are dropped.
     let mut in_sources = false;
+    // A Markdown page dropped in Raw may already be linked by its name; the
+    // note answers to that name once the page has moved beside it.
+    let mut old_name = raw_page_name(&placement.raw);
     for (i, line) in t.lines().enumerate() {
         if line.trim_end() == "---" {
             if i == 0 {
                 in_fm = true;
             } else if in_fm && !fm_done {
+                if let Some(name) = old_name.take() {
+                    out.push_str(&format!("aliases: [\"{name}\"]\n"));
+                }
                 out.push_str(&format!("sources:\n  - \"[[{}]]\"\n", placement.source));
                 in_fm = false;
                 fm_done = true;
@@ -600,6 +606,21 @@ pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
             if trimmed.starts_with("kind:") {
                 continue;
             }
+            if let (Some(rest), Some(name)) = (trimmed.strip_prefix("aliases:"), old_name.as_deref()) {
+                let rest = rest.trim();
+                if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                    let inner = inner.trim();
+                    let sep = if inner.is_empty() { "" } else { ", " };
+                    out.push_str(&format!("aliases: [{inner}{sep}\"{name}\"]\n"));
+                    old_name = None;
+                    continue;
+                }
+                if rest.is_empty() {
+                    out.push_str(&format!("aliases:\n  - \"{name}\"\n"));
+                    old_name = None;
+                    continue;
+                }
+            }
         }
         out.push_str(line);
         out.push('\n');
@@ -608,6 +629,14 @@ pub fn finish_note(reply: &str, placement: &Placement) -> Result<String> {
         return Err(Error::Other("the note's frontmatter was never closed".into()));
     }
     Ok(out)
+}
+
+/// The name a Markdown page dropped in Raw was linked by: its file name
+/// without `.md`. None for any other kind of source.
+fn raw_page_name(raw: &str) -> Option<String> {
+    let name = raw.rsplit('/').next().unwrap_or(raw);
+    let stem = name.strip_suffix(".md").or_else(|| name.strip_suffix(".markdown"))?;
+    (!stem.is_empty()).then(|| stem.replace('"', "'"))
 }
 
 fn strip_fences(reply: &str) -> &str {
@@ -2807,6 +2836,26 @@ mod tests {
         assert_eq!(undated.note, format!("{INGESTED}/Meetings/2026-10/2026-10-15-standup-notes.md"));
         let bare = place(d.path(), &format!("{RAW}/README"), "2026-10-15", SourceKind::Document);
         assert_eq!(bare.source, format!("{INGESTED}/Documents/2026-10/2026-10-15-readme/2026-10-15-readme.source"));
+    }
+
+    /// A Markdown page in Raw may already be linked by its name (an index,
+    /// a ticket). Once it moves beside its note, the note answers to that
+    /// name: added to the aliases the model wrote, in either list form, or as
+    /// the only one. Any other kind of source has no name to keep.
+    #[test]
+    fn a_note_answers_to_the_name_its_raw_page_was_linked_by() {
+        let d = tempfile::tempdir().unwrap();
+        let p = place(d.path(), &format!("{RAW}/INV-004-role-data.md"), "2026-10-27", SourceKind::Document);
+        let note = |fm: &str| finish_note(&format!("---\ntitle: \"INV-004\"\n{fm}---\n# INV-004\n"), &p).unwrap();
+        let inline = note("aliases: [\"role data\"]\n");
+        assert!(inline.contains("aliases: [\"role data\", \"INV-004-role-data\"]\n"), "{inline}");
+        let block = note("aliases:\n  - role data\n");
+        assert!(block.contains("aliases:\n  - \"INV-004-role-data\"\n  - role data\n"), "{block}");
+        let none = note("");
+        assert!(none.contains("aliases: [\"INV-004-role-data\"]\nsources:\n"), "{none}");
+        assert_eq!(none.matches("aliases:").count(), 1);
+        let p = place(d.path(), &format!("{RAW}/standup.txt"), "2026-10-27", SourceKind::Meeting);
+        assert!(!finish_note("---\ntitle: S\n---\n# S\n", &p).unwrap().contains("aliases:"));
     }
 
     /// The walkthrough's `meeting-2026-10-14.md`: its note keeps the name,
