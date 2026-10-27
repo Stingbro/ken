@@ -2872,8 +2872,15 @@ impl Db {
 
     /// Extract the links of every indexed Markdown page that has none stored,
     /// from its stored text. A page with no links is re-read each time,
-    /// which costs a parse, not a file read.
+    /// which costs a parse, not a file read. Links stored by an older reading
+    /// ([`crate::links::LINKS_VERSION`]) are all read again first, so a fix
+    /// to how links are read reaches pages that have not changed.
     pub fn backfill_page_links(&mut self) -> Result<usize> {
+        let version = crate::links::LINKS_VERSION.to_string();
+        if self.meta_get("page_links_version")?.as_deref() != Some(version.as_str()) {
+            self.conn.execute("DELETE FROM page_links", [])?;
+            self.meta_set("page_links_version", &version)?;
+        }
         let rows: Vec<(String, String)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT f.rel_path, c.text FROM files f JOIN contents c ON c.file_id = f.id
@@ -4647,6 +4654,21 @@ mod tests {
         assert_eq!(db.backfill_code_index().unwrap(), 1, "b.py, not the mapped one or the page");
         assert_eq!(db.code_symbols(Some("beta"), None, Some(true), 5).unwrap().len(), 1);
         assert_eq!(db.backfill_code_index().unwrap(), 0, "once");
+    }
+
+    /// Links stored by an older reading are read again from the stored text
+    /// on the next open, once; the page itself never changed.
+    #[test]
+    fn links_stored_by_an_older_reading_are_read_again_once() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_file("Kit/Wall.md", "md", 1, 1, "indexed", None, "![run](Wall%20-%20run%2C%20pass%202.png)\n").unwrap();
+        let stale = crate::links::Link { kind: crate::links::LinkKind::Path, target: "Kit/Wall - run%2C pass 2.png".into() };
+        db.set_page_links("Kit/Wall.md", &[stale]).unwrap();
+        db.meta_set("page_links_version", "1").unwrap();
+        assert_eq!(db.backfill_page_links().unwrap(), 1);
+        let links: Vec<String> = db.all_page_links().unwrap().into_iter().map(|(_, l)| l.target).collect();
+        assert_eq!(links, vec!["Kit/Wall - run, pass 2.png"]);
+        assert_eq!(db.backfill_page_links().unwrap(), 0, "once");
     }
 
     #[test]

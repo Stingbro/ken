@@ -129,6 +129,12 @@ pub fn is_template(path: &str) -> bool {
     lower.starts_with("templates/") || lower.contains("/templates/")
 }
 
+/// How [`extract`] reads links. Raise it whenever a change would read a
+/// page's links differently: the index reads every stored page's links
+/// again on its next open (`Db::backfill_page_links`). 2: every `%XX`
+/// escape in a Markdown link is decoded.
+pub const LINKS_VERSION: u32 = 2;
+
 /// The links on the page at `from` (its repo-relative path), code and
 /// template placeholders stripped.
 pub fn extract(from: &str, text: &str) -> Vec<Link> {
