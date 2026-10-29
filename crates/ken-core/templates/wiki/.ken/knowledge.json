@@ -9,7 +9,7 @@
   "ignore": [],
   "_ignore_note": "The index rules: one gitignore-style pattern a line, and a ! line brings a path back. They hold for every source, and a repos entry may carry its own. Built in and fixed: VCS folders, dependencies, build output, secrets, tests, minified and generated files, binaries. Three states will replace in or out: ignored, searchable only, and read by the AI, with big checkouts and code starting as searchable only (ruled, not yet in Ken).",
   "controls": [],
-  "_controls_note": "A few known questions per source, each with the file it has to return near the top: { \"question\": \"how are worlds saved\", \"expect\": \"src/world/save.ts\", \"source\": \"Game\" }. Ken proposes them when a source is added and writes them here once a person accepts. They run after every rebuild and count on the health line.",
+  "_controls_note": "A few known questions per source, each with the file it has to return near the top: { \"question\": \"how are worlds saved\", \"expect\": \"src/world/save.ts\", \"source\": \"Shattered-Realms\" }. Ken proposes them when a source is added and writes them here once a person accepts. They run after every rebuild and count on the health line.",
   "search": {
     "weights": {}
   },

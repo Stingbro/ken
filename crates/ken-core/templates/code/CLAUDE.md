@@ -17,3 +17,7 @@ This repo's code is the truth about how it works today. The knowledge base holds
 **A ruling is settled.** When this code doesn't match one, say so and cite both.
 
 **An empty search proves nothing.** Before you report that something doesn't exist, read the repo directly, and say where you looked.
+
+## Traps
+
+- {{the thing that costs the most time if you do not know it, and the page that holds it}}
