@@ -1,7 +1,8 @@
 ---
 title: "Vocabulary"
-aliases: ["Vocabulary", "Glossary", "what do we call it", "what does the platform call it"]
+aliases: ["Vocabulary", "Glossary", "what do we call it", "what does the platform call it", "why does my search find nothing"]
 status: current
+audience: business
 updated: {{date}}
 sources:
   - "{{repo@sha:path of the code, config or doc that shows each row}}"
@@ -9,7 +10,7 @@ sources:
 
 # Vocabulary
 
-The words where a search misses: our word and the code's or the platform's word differ, one word means two things, or a name changed. Search tries these words too, so add a row when a search missed because of a word.
+Searched and found nothing? You may have used a different word from the code or the platform. Here are the words where a search misses: our word and the code's or the platform's word differ, one word means two things, or a name changed. Search tries these words too, so add a row when a search missed because of a word.
 
 [[#Words That Differ]] · [[#Words With Two Meanings]] · [[#Renames]]
 

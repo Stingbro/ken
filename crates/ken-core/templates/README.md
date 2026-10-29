@@ -1,6 +1,6 @@
 # Templates
 
-What Ken lays down. `wiki/` is the knowledge base: one repo holding the library, the decisions log, the RAID register (`Current/RAID.md`, the risks and issues), the tickets, `log.md` and `.ken/knowledge.json`. `code/CLAUDE.md` is the short pointer Ken proposes for a code repo the knowledge base covers; a person adds it, and Ken never overwrites one.
+What Ken lays down. `wiki/` is the knowledge base: one repo holding the library, the decisions log, the RAID register (`Current/RAID.md`, the risks and issues), the tickets, `log.md` and `.ken/knowledge.json`. `code/CLAUDE.md` is the short pointer for a code repo the knowledge base covers: the Level 2 part of the code brief in Ways of Working (`templates/code/CLAUDE.md`). A person adds it, and Ken never overwrites one; Ken will propose it when a code repo is added (ruled, not yet built).
 
 The method these follow is the Knowledge page of Ways of Working (`docs/manual/docs-system.html`); this folder is the one copy of the templates, and the method links here.
 

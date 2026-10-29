@@ -39,9 +39,11 @@ pub const TEMPLATE: &[(&str, &str)] = template![
     "Research/Index.md",
     "Research/Ingestion/Index.md",
     "Research/Ingestion/Ingested/.gitkeep",
+    "Research/Findings/.gitkeep",
     "Research/Ingestion/Raw/.gitkeep",
     "Rules/Index.md",
     "Templates/Index.md",
+    "Templates/Component-Library.md",
     "Templates/Design-Note.md",
     "Templates/Feature-Status.md",
     "Templates/Finding.md",
@@ -376,7 +378,7 @@ pub(crate) mod tests {
     #[test]
     fn start_here_lists_this_knowledge_base_and_its_repos() {
         let t = fill("START-HERE.md", template("START-HERE.md"), "Realms", "Realms-Wiki", &repos(), "2026-09-25");
-        assert!(t.contains("The Realms knowledge base"));
+        assert!(t.contains("New to the Realms knowledge base?"));
         assert!(t.contains(
             "| `Realms-Wiki` | this repo · the knowledge base |\n| `Game` | The game client. Built nightly. |\n| `Tools` | (not said yet) |"
         ));

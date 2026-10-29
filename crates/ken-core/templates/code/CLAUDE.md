@@ -2,12 +2,18 @@
 
 {{One line: what this repo is.}}
 
-The team's knowledge base is `../{{wiki_repo}}`: start at `START-HERE.md`. It holds why the code is the way it is, what was decided (`Decisions/DECISIONS.md`), the tickets, and what is true now. This repo's code is the truth for how it works today.
+## Where Everything Else Lives
 
-- **Search with Ken first.** For code, use Ken's code index (definition, usages, outline, imports) before grep, and read the lines around a hit, not the whole file. For why code changed, read its git history.
-- **A ruling is settled.** Where this code does not match one, say so and cite both.
-- **An empty search proves nothing.** Read the repo directly before saying something is not there, and say where you looked.
+| what | where |
+|---|---|
+| the knowledge base | `../{{wiki_repo}}` · start at `START-HERE.md` |
+| what was decided | `../{{wiki_repo}}/Decisions/DECISIONS.md` |
+| tickets | `../{{wiki_repo}}/tickets/` |
 
-## Traps
+This repo's code is the truth about how it works today. The knowledge base holds why the code is the way it is and what was decided.
 
-- {{the thing that costs the most time if you do not know it, and the page that holds it}}
+**Search with Ken first.** For code, use Ken's code index (definition, usages, outline, imports) before grep, then read the lines around a hit. Don't read a long file from top to bottom. To find out why code changed, read its git history.
+
+**A ruling is settled.** When this code doesn't match one, say so and cite both.
+
+**An empty search proves nothing.** Before you report that something doesn't exist, read the repo directly, and say where you looked.

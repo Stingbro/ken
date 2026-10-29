@@ -1,21 +1,28 @@
 ---
 title: "{{The Rule as a Sentence}}"
-aliases: ["{{The Rule as a Sentence}}", "{{the question someone asks before breaking it}}"]
+aliases: ["{{The Rule as a Sentence}}", "{{the-rule-as-a-sentence}}", "{{the question someone asks before breaking it}}"]
 status: current
+audience: {{business or dev}}
 updated: {{date}}
 sources:
-  - "{{the ticket, note or repo@sha:path that shows the incident}}"
+  - "{{repo@sha:path, ticket id or [[Ingested note]] that shows the incident}}"
 ---
 
 # {{The Rule as a Sentence}}
 
-{{The rule, in one imperative line. Its short form goes in CLAUDE.md too.}}
+{{The rule, in one imperative line. The filename is the rule too, so it reads as one in a backlink. Its short form goes in CLAUDE.md as well.}}
 
-[[#Incident]] · [[#Symptom]]
+[[#Incident]] · [[#Missed By]] · [[#Symptom]]
 
 ## Incident
 
-{{What happened, when, and what it cost.}}
+{{What happened, when, and what it cost, and the change that caused it.}}
+
+## Missed By
+
+| step | why it missed | where the fix landed |
+|---|---|---|
+| {{the step that should have caught it: kickoff · spec · review · smoke · live-verify · QA walk}} | {{what it could not see}} | {{what that step reads: a skill · a Rules page · a lane prompt · a test}} |
 
 ## Symptom
 

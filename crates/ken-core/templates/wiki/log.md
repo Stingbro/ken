@@ -1,5 +1,5 @@
 # Log
 
-One line per ingest, drift run and lint pass, newest last, so anyone can see what changed recently. Written by Ken; never edited.
+Want to see what changed recently? Ken writes one line here per ingest, per lint pass that acted and per drift run that changed a page, newest last. Nobody edits it.
 
 `## [YYYY-MM-DD] kind | title`

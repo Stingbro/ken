@@ -2,14 +2,16 @@
 title: "Project"
 aliases: ["Project", "what are we building", "who is it for", "what is the goal", "what is out of scope"]
 status: current
+audience: business
 updated: {{date}}
 sources:
   - "{{repo@sha:path of the README or brief that says what the product is}}"
+  - "[[{{the Ingested note or design page that set the goal}}]]"
 ---
 
 # Project
 
-What the product is, who it is for, the goal and what is out of scope, for a reader who never opens the code.
+Never going to open the code? Start here, with what the product is, who it's for, the goal and what's out of scope. Not here: the risks and issues → [[RAID]]; what's built → `Current/Feature-Status.md`.
 
 [[#Product]] · [[#Users]] · [[#Goal]] · [[#Out of Scope]]
 

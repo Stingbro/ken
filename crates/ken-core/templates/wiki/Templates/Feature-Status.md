@@ -2,6 +2,7 @@
 title: "Feature Status"
 aliases: ["Feature Status", "is it built", "does the product do this"]
 status: current
+audience: business
 updated: {{date}}
 sources:
   - "{{repo@sha:path of the changelog or the code that registers each feature}}"
@@ -9,7 +10,9 @@ sources:
 
 # Feature Status
 
-Each feature and whether it is built, so "is X built?" is answered here first. Copy to `Current/Feature-Status.md`; drift flags a row when the code it cites moves.
+Is it built? Each feature gets one row here, so that question gets answered here first. Not here: why it was built this way → [[Design]]; what's planned → [[Roadmap]].
+
+A change that lands or retires a feature updates its row in the same branch. Drift measures the code in this page's `sources:`, so list there every file the evidence column cites.
 
 | feature | built | evidence |
 |---|---|---|

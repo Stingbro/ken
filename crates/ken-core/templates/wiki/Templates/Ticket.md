@@ -9,16 +9,19 @@ updated: {{date}}
 
 ## What and Why
 
-One paragraph, written so somebody with no memory of the conversation can act on it.
+Write one paragraph that somebody with no memory of the conversation can act
+on. On a team with agents, that's who picks it up.
 
 ## Evidence
 
-The log line, the reproduction, the measurement, the note it came from.
+Put the log line, the reproduction, the measurement and the note it came from
+here.
 
 ## What Not to Do
 
-The wrong turns already taken and why they failed.
+List the wrong turns already taken and why they failed. It's usually the most
+valuable paragraph in the ticket, because wrong turns are what gets repeated.
 
 ## How You Would Know It Worked
 
-The observable success condition, named before the work starts.
+Name the success condition you'll be able to see, before anyone starts.
